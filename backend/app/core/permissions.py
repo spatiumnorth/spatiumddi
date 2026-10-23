@@ -810,9 +810,60 @@ def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
     return False
 
 
+def _instance_scoped_admit(
+    request: Request,
+    user: User,
+    action: str,
+    instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]],
+) -> bool:
+    """True when ``user`` holds ``action`` on the ONE resource the route's path
+    names, via a grant scoped to that resource (or an unscoped one).
+
+    ``instance_routes`` maps a path parameter (``subnet_id``) to
+    ``(resource_type, list_route, read_routes, write_routes)``. Every route is
+    a ``"METHOD /path"`` template relative to the router's ``/ipam`` prefix,
+    and the lists are allow-lists: a route added later is NOT reachable by a
+    scoped grant until someone decides it should be (#2438).
+
+    * ``read_routes`` / ``write_routes``: admitted when the caller holds the
+      method's action on the resource the path names.
+    * ``list_route``: the type's collection, admitted for a ``read`` when the
+      caller holds any read grant on the type; its handler must narrow the
+      rows to the granted ones.
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path", "") or ""
+    key = f"{request.method.upper()} {template.split('/ipam', 1)[-1]}"
+    for pname, (rtype, list_route, read_routes, write_routes) in instance_routes.items():
+        raw = request.path_params.get(pname)
+        if raw is None:
+            if action == "read" and key == list_route and _has_any_read_grant(user, rtype):
+                return True
+            continue
+        try:
+            rid = str(UUID(str(raw)))
+        except ValueError:
+            continue
+        allowed = read_routes if action == "read" else write_routes
+        if key in allowed and user_has_permission(user, action, rtype, rid):
+            return True
+    return False
+
+
+def _has_any_read_grant(user: User, resource_type: str) -> bool:
+    """Any read grant on ``resource_type`` (scoped or not) that a resource-scoped
+    API token (#374) does not narrow away, the coarse half of
+    :func:`user_has_permission`."""
+    if not has_any_grant_for(user, "read", resource_type):
+        return False
+    grants = _token_grants_for(user)
+    return not grants or _token_grants_allow(grants, "read", resource_type, None)
+
+
 def require_any_resource_or_scoped(
     unscoped_types: tuple[str, ...],
     scoped_types: tuple[str, ...],
+    instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Coarse router gate that also admits instance-scoped delegates.
 
@@ -828,6 +879,11 @@ def require_any_resource_or_scoped(
     gate. It is restricted to write/delete so a scoped *read* grant can never
     widen read access to the aggregate router's data; read still requires a
     normal (typically type-level) read grant.
+
+    ``instance_routes`` (#2438) additionally admits a grant scoped to ONE
+    resource on an allow-list of routes that name that resource in their path
+    (see :func:`_instance_scoped_admit`), and on its collection route, whose
+    handler narrows the rows.
     """
 
     async def _dep(
@@ -843,6 +899,10 @@ def require_any_resource_or_scoped(
             for rt in scoped_types:
                 if has_any_grant_for(current_user, action, rt):
                     return current_user
+        if instance_routes and _instance_scoped_admit(
+            request, current_user, action, instance_routes
+        ):
+            return current_user
         all_types = list(unscoped_types) + list(scoped_types)
         first = all_types[0] if all_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
