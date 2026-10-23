@@ -92,7 +92,7 @@ Notes worth carrying:
 
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
-| [k3s](https://k3s.io/) | v1.36.4+k3s1 | Apache 2.0 | Appliance OS | `appliance/scripts/fetch-k3s.sh` |
+| [k3s](https://k3s.io/) | v1.36.5+k3s1 | Apache 2.0 | Appliance OS | `appliance/scripts/fetch-k3s.sh` |
 | [containerd](https://containerd.io/) + [runc](https://github.com/opencontainers/runc) | embedded in k3s | Apache 2.0 | Appliance OS | (k3s bundle) |
 | [CoreDNS](https://coredns.io/) | k3s airgap bundle | Apache 2.0 | Appliance OS | (k3s bundle) |
 | [Flannel](https://github.com/flannel-io/flannel) | embedded in k3s, `host-gw` backend | Apache 2.0 | Appliance OS | `appliance/mkosi.extra/etc/rancher/k3s/config.yaml` |

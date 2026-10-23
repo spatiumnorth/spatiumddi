@@ -128,6 +128,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Appliance k3s v1.36.4+k3s1 → v1.36.5+k3s1 (#2224).** A patch on
+  the same Kubernetes minor (1.36.5, Go 1.26.8), so a slot revert to
+  the previous release still works: etcd stays on the 3.6.14 data
+  format (k3s's fork goes from `v3.6.14-k3s1` to `v3.6.14-k3s3`,
+  confirmed in the tag's `go.mod`; the release's backport titles
+  mention etcd 3.7.1 / kine 0.17.1, and neither is in it), with kine
+  0.16.5, CoreDNS 1.14.7 and helm-controller v0.17.9. klipper-helm
+  stays at v0.13.3. Upstream it brings a grpc CVE fix, an etcd
+  compressed-snapshot restore fix, an end to the spurious "node
+  password secret already exists" on restart, anonymous requests to
+  the supervisor router refused, and a stricter CA-hash check on join
+  (k3s-io/k3s#14706). That check does not change our join: the
+  published token is the full `K10<hash>` token over k3s's own
+  single-certificate CA, which takes the unchanged path. A joiner
+  whose hash does not match the seed's CA now fails on an x509 error
+  instead of "token CA hash does not match", and the Fleet join
+  reason still reads it as a rejected token. helm-controller v0.17.8
+  / v0.17.9 create a chart's values Secret and content ConfigMap
+  before its Job, no longer resume a Job they are about to delete and
+  recreate (a values change landing while a new Job is still
+  suspended), and prefer control-plane nodes for chart Jobs;
+  `failurePolicy: retry` is untouched. The kind node image in the
+  agent e2e stays at v1.36.4: kind publishes no v1.36.5 image.
+
 - **A DHCP config change reaches a parked agent on the wake, not
   on the long-poll timeout (#2040).** The agent's `/config` long-poll
   keeps one database session for its whole wait, and a re-query
