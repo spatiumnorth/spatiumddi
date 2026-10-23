@@ -208,17 +208,28 @@ def _readme_text(manifest: dict[str, Any]) -> str:
         if dump_format == "custom"
         else "pg_dump --format=plain (no-owner, no-privileges)"
     )
+    if manifest.get("secrets_excluded"):
+        secrets_summary = (
+            "passphrase-wrapped envelope of archive metadata only. This is\n"
+            "                     an exclude-secrets archive: credentials, keys and\n"
+            "                     credential digests were scrubbed from the dump and\n"
+            "                     the source install's SECRET_KEY is NOT included."
+        )
+    else:
+        secrets_summary = (
+            "passphrase-wrapped envelope containing the source\n"
+            "                     install's SECRET_KEY (and credential_encryption_key\n"
+            "                     if separately set). Required for cross-install\n"
+            "                     restores to be able to read Fernet-encrypted rows.\n"
+            "                     DO NOT lose your passphrase — there is no recovery."
+        )
     return f"""SpatiumDDI backup — {manifest.get("created_at", "(unknown time)")}
 
 This archive contains a snapshot of one SpatiumDDI install:
 
   manifest.json   -  the table of contents below
   {dump_member}   -  {dump_summary}
-  secrets.enc     -  passphrase-wrapped envelope containing the source
-                     install's SECRET_KEY (and credential_encryption_key
-                     if separately set). Required for cross-install
-                     restores to be able to read Fernet-encrypted rows.
-                     DO NOT lose your passphrase — there is no recovery.
+  secrets.enc     -  {secrets_summary}
 
 Source install:
   app version    {manifest.get("app_version", "?")}
@@ -291,13 +302,14 @@ def _scrub_dump_text(dump_text: str) -> str:
     (backup-driver credentials, SNMPv3 passphrases, syslog TLS CAs, APT GPG
     keys + mirror passwords).
 
-    Not every encrypted column: ``redactable_columns()`` withholds machine
-    identity an operator cannot re-enter — the appliance CA and Web-UI TLS
-    private keys, k3s join tokens, pairing-code reveals, the ACME account
-    key. An empty bytea satisfies their NOT NULL constraints, so blanking
-    them yields an archive whose restore SUCCEEDS and then permanently
-    breaks supervisor approval, with no rotate endpoint (#781). What IS
-    scrubbed is the credentials an operator can simply type back in.
+    Machine identity is scrubbed too, in the shape its reader treats as
+    "absent, regenerate" rather than as an empty bytea (which would restore
+    and then permanently break supervisor approval, #781): the appliance CA
+    row is left out, the k3s join tokens, cluster kubeconfig and pairing-code
+    reveal are written as NULL. Stored digests of a credential (local
+    password hashes, API-token / session / pairing-code / agent-token
+    digests) are NULLed or replaced with a value nothing hashes to. See
+    ``SCRUB_*`` in :mod:`app.services.backup.rewrap`.
 
     Inside a ``COPY public.foo (col1, col2, ...) FROM stdin;`` →
     ``\\.`` block, columns are tab-separated and bytea values are
@@ -312,6 +324,9 @@ def _scrub_dump_text(dump_text: str) -> str:
     from app.services.backup.rewrap import (  # noqa: PLC0415
         JSONB_ENCRYPTED_FIELDS,
         LEGACY_PLAINTEXT_SECRET_COLUMNS,
+        SCRUB_CREDENTIAL_DIGEST_COLUMNS,
+        SCRUB_NULLED_ENCRYPTED_COLUMNS,
+        SCRUB_OMITTED_TABLES,
         _jsonb_secret_sites,
         redactable_columns,
     )
@@ -325,10 +340,9 @@ def _scrub_dump_text(dump_text: str) -> str:
         jsonb_by_table.setdefault(spec.table.strip('"'), {})[spec.column] = spec
 
     by_table: dict[str, set[str]] = {}
-    # NOT ENCRYPTED_COLUMNS: machine identity (appliance CA / TLS keys,
-    # k3s tokens, pairing codes) is excluded, because blanking it yields
-    # an archive whose restore succeeds and then permanently breaks
-    # supervisor approval with no way to regenerate (#781).
+    # Not every ENCRYPTED_COLUMNS entry: machine identity is NULLed or left
+    # out below instead, because an empty bytea there restores and then
+    # permanently breaks supervisor approval (#781).
     for table, _pk, enc_col in redactable_columns():
         bare = table.strip('"')
         by_table.setdefault(bare, set()).add(enc_col)
@@ -337,6 +351,12 @@ def _scrub_dump_text(dump_text: str) -> str:
     null_by_table: dict[str, set[str]] = {}
     for table, column in LEGACY_PLAINTEXT_SECRET_COLUMNS:
         null_by_table.setdefault(table, set()).add(column)
+    for table, column in SCRUB_NULLED_ENCRYPTED_COLUMNS:
+        null_by_table.setdefault(table, set()).add(column)
+    unmatchable_by_table: dict[str, set[str]] = {}
+    for (table, column), mode in SCRUB_CREDENTIAL_DIGEST_COLUMNS.items():
+        target = null_by_table if mode == "null" else unmatchable_by_table
+        target.setdefault(table, set()).add(column)
 
     # ``COPY "public"."foo" ("a", "b", ...) FROM stdin;`` — we use
     # ``--quote-all-identifiers`` on the dump, so every name is
@@ -346,7 +366,9 @@ def _scrub_dump_text(dump_text: str) -> str:
     in_copy_table: str | None = None
     cols_to_scrub: list[int] = []
     cols_to_null: list[int] = []
+    cols_to_unmatch: list[int] = []
     jsonb_cols: list[tuple[int, Any]] = []
+    omit_rows = False
 
     for line in dump_text.splitlines(keepends=False):
         if in_copy_table is None:
@@ -358,20 +380,28 @@ def _scrub_dump_text(dump_text: str) -> str:
                 cols_to_scrub = [i for i, c in enumerate(cols_list) if c in scrub_set]
                 null_set = null_by_table.get(table, set())
                 cols_to_null = [i for i, c in enumerate(cols_list) if c in null_set]
+                unmatch_set = unmatchable_by_table.get(table, set())
+                cols_to_unmatch = [i for i, c in enumerate(cols_list) if c in unmatch_set]
                 jsonb_cols = [
                     (i, spec)
                     for i, c in enumerate(cols_list)
                     if (spec := jsonb_by_table.get(table, {}).get(c)) is not None
                 ]
-                if cols_to_scrub or cols_to_null or jsonb_cols:
+                omit_rows = table in SCRUB_OMITTED_TABLES
+                if cols_to_scrub or cols_to_null or cols_to_unmatch or jsonb_cols or omit_rows:
                     in_copy_table = table
             out.append(line)
         elif line == r"\.":
             in_copy_table = None
             cols_to_scrub = []
             cols_to_null = []
+            cols_to_unmatch = []
             jsonb_cols = []
+            omit_rows = False
             out.append(line)
+        elif omit_rows:
+            # The whole row is the secret (the appliance CA): leave it out.
+            continue
         else:
             parts = line.split("\t")
             for i in cols_to_scrub:
@@ -380,6 +410,11 @@ def _scrub_dump_text(dump_text: str) -> str:
             for i in cols_to_null:
                 if i < len(parts):
                     parts[i] = r"\N"
+            for i in cols_to_unmatch:
+                if i < len(parts) and parts[i] != r"\N":
+                    # Never a hex digest or a bcrypt hash, so no credential
+                    # matches it; random so UNIQUE columns stay unique.
+                    parts[i] = f"scrubbed-{secrets.token_hex(16)}"
             for idx, spec in jsonb_cols:
                 if not (0 <= idx < len(parts)):
                     continue
@@ -442,14 +477,14 @@ async def build_backup_archive(
     operator. Filename pattern:
     ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip``.
 
-    ``exclude_secrets`` (Phase 3 diagnostic mode): every
-    Fernet-encrypted column + every ``__enc__:`` JSONB field is
-    NULLed inside a REPEATABLE READ transaction whose snapshot is
-    fed to pg_dump via ``--snapshot=``. The transaction is
-    rolled back after the dump finishes, so the live database
-    never observes the NULL state. Restoring such an archive
-    yields an install with empty credential fields — the operator
-    re-enters integration / auth-provider creds by hand. Useful
+    ``exclude_secrets`` (Phase 3 diagnostic mode): the plain dump is
+    post-processed by :func:`_scrub_dump_text` so every secret —
+    Fernet-encrypted columns, JSONB-embedded secrets, machine
+    identity and stored credential digests — is gone from it, and
+    ``secrets.enc`` carries no keys. The live database is never
+    touched. Restoring such an archive yields an install with empty
+    credential fields — the operator re-enters integration /
+    auth-provider creds and resets local passwords by hand. Useful
     for sharing snapshots with support / consultants without
     leaking the install's secrets. The manifest carries
     ``secrets_excluded: true`` so restore can show a heads-up.
@@ -497,22 +532,28 @@ async def build_backup_archive(
         # every persistent section.
         "included_sections": ["all_persistent"],
         "secret_passphrase_hint": (passphrase_hint or "").strip()[:200],
-        # Phase 3: when set, every Fernet-encrypted column was
-        # scrubbed to empty bytes at dump time. The archive is
-        # shareable but operators restoring it must re-enter
-        # integration / auth-provider creds by hand.
+        # Phase 3: when set, every secret was scrubbed at dump time
+        # (see ``_scrub_dump_text``) and secrets.enc carries no keys.
+        # Operators restoring it must re-enter integration /
+        # auth-provider creds and reset local passwords by hand.
         "secrets_excluded": bool(exclude_secrets),
     }
 
     # secrets.enc bundles enough metadata for an offline operator to
     # know what they're decrypting, plus the SECRET_KEY they need to
-    # restore on a different install. When ``secrets_excluded`` is
-    # true, the SECRET_KEY is still bundled so cross-install
-    # restores can rewrap any *non-stripped* encrypted columns the
-    # operator added between scrub and dump (race-window edge).
-    secrets_payload = {
-        "platform_secret_key": settings.secret_key,
-        "platform_credential_encryption_key": (settings.credential_encryption_key or ""),
+    # restore on a different install. A ``secrets_excluded`` archive
+    # carries no keys: every value they decrypt has been scrubbed, so
+    # they would add nothing to a restore and would hand whoever holds
+    # the archive the key to this install's live credentials, sessions
+    # and agent tokens. The envelope stays, since restore verifies the
+    # passphrase against it.
+    secrets_payload: dict[str, Any] = {}
+    if not exclude_secrets:
+        secrets_payload["platform_secret_key"] = settings.secret_key
+        secrets_payload["platform_credential_encryption_key"] = (
+            settings.credential_encryption_key or ""
+        )
+    secrets_payload |= {
         "schema_version": schema_head,
         "app_version": settings.version,
         "created_at": created_at.isoformat(),
@@ -620,6 +661,42 @@ def read_backup_manifest(archive_bytes: bytes) -> dict[str, Any]:
     return manifest
 
 
+def resolve_dump_format(manifest: dict[str, Any], names: set[str]) -> str | None:
+    """``"plain"`` / ``"custom"`` for an archive, or None when neither
+    the manifest nor the member names say.
+
+    The manifest's ``dump_format`` wins; an archive that pre-dates the
+    field is sniffed by member name (``database.dump`` → custom,
+    ``database.sql`` → plain). ``format_version`` says nothing about it:
+    every archive since Phase 2a is version 2, an *Exclude secrets* one
+    included, and that one is plain SQL (#2201). The restore and the
+    manifest preview both answer through here, so the console's "can this
+    be restored selectively?" and the restore's refusal cannot disagree.
+    """
+    declared = manifest.get("dump_format")
+    if declared in ("plain", "custom"):
+        return str(declared)
+    if "database.dump" in names:
+        return "custom"
+    if "database.sql" in names:
+        return "plain"
+    return None
+
+
+def preview_backup_archive(archive_bytes: bytes) -> tuple[dict[str, Any], str | None]:
+    """``(manifest, dump_format)`` without inflating the dump. For the
+    restore preview: the manifest as :func:`read_backup_manifest` reads
+    it, plus the dump format the restore will act on (None when the
+    archive does not say — the restore then refuses it outright)."""
+    manifest = read_backup_manifest(archive_bytes)
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
+            names = set(zf.namelist())
+    except _MALFORMED_MANIFEST_ERRORS as exc:
+        raise BackupArchiveError(f"archive is malformed: {exc}") from exc
+    return manifest, resolve_dump_format(manifest, names)
+
+
 def extract_archive_members(
     archive_bytes: bytes,
 ) -> tuple[dict[str, Any], bytes, str, bytes]:
@@ -646,13 +723,9 @@ def extract_archive_members(
                 raise BackupArchiveError("manifest.json is not a JSON object")
             # Format detection — manifest field if present,
             # otherwise fall back to member-name sniffing.
-            declared = manifest.get("dump_format")
-            if declared in ("plain", "custom"):
-                dump_format = declared
-            elif "database.dump" in names:
-                dump_format = "custom"
-            elif "database.sql" in names:
-                dump_format = "plain"
+            resolved = resolve_dump_format(manifest, names)
+            if resolved is not None:
+                dump_format = resolved
             else:
                 raise BackupArchiveError(
                     "archive is missing the database dump member "

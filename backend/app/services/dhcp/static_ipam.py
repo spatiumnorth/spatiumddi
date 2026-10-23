@@ -212,11 +212,20 @@ async def upsert_ipam_for_static(
     st.ip_address_id = row.id
     # Fire DNS sync so forward/reverse records follow the static.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+    from app.services.dns.sync_check import address_own_forward_zone_id  # noqa: PLC0415
 
     subnet_row = await db.get(Subnet, scope.subnet_id)
     if subnet_row is not None and row.hostname:
         try:
-            await _sync_dns_record(db, row, subnet_row, action=action)
+            # #2104 — keep the row in the zone it was put in (#493): with no
+            # zone the sync resolves the subnet's and re-homes the host.
+            await _sync_dns_record(
+                db,
+                row,
+                subnet_row,
+                zone_id=await address_own_forward_zone_id(db, row),
+                action=action,
+            )
         except Exception:  # noqa: BLE001 — DNS sync is best-effort
             pass
     # Last, with the reservation already at its new address: DDNS lets a

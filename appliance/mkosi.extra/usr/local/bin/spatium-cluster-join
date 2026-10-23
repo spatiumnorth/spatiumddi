@@ -532,7 +532,13 @@ classify_join_failure() {
         # unreachable seed — k3s wraps the /cacerts fetch as a token failure
         # (pkg/cluster/bootstrap.go), so a DROP reads as a token error it never
         # got to judge. Reserve "rejected" for a bare token failure or a CA
-        # hash mismatch: a seed that answered.
+        # hash mismatch: a seed that answered. From k3s v1.36.5 (k3s-io/k3s
+        # #14706) a joiner whose token hash does not match the seed's CA never
+        # reaches the "token CA hash does not match" message: it trusts only
+        # the CA its hash names, so the /cacerts re-fetch fails "CA cert
+        # validation failed: ... x509: certificate signed by unknown authority"
+        # under "failed to validate token". No transport marker, so it lands
+        # here as rejected, which is what it is.
         *"failed to validate token"*)
             if [ "$transport" = 1 ]; then kind=unreachable; else kind=rejected; fi ;;
         *"token CA hash does not match"*) kind=rejected ;;
@@ -893,10 +899,12 @@ do_leave() {
     # non-seed members of a three-node cluster (the only demote the odd-count
     # rule allows there) cost the seed its quorum. The runner removes this
     # node's own member while it still votes and stops k3s. It returns 0 once
-    # the member is gone: either a survivor no longer lists it, or etcd
-    # accepted the removal and no survivor could be reached to confirm it in
-    # time (bfbf79d: etcd's acceptance is the removal, so waiting on an
-    # unreachable survivor only strands the leave). etcd-evict.log says which.
+    # the member is gone: either a survivor no longer lists it, or no survivor
+    # could be reached to confirm it in time and etcd accepted the removal
+    # (bfbf79d: etcd's acceptance is the removal, so waiting on an unreachable
+    # survivor only strands the leave) or, after an error answer, k3s left its
+    # tombstone (#2394: this node's etcd can apply its own removal and stop
+    # before it answers). etcd-evict.log says which.
     # 2 means this node joined nobody. Anything else keeps the node as it is:
     # k3s back up, still a member, the leave reported failed.
     "$ETCD_EVICT" --leave-self

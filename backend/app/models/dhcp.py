@@ -261,6 +261,14 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # status: active | unreachable | syncing | error | pending
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2306 — why the most recent scheduled lease pull failed (agentless
+    # drivers). NULL = the last pull succeeded (or none has run); cleared by
+    # every successful pull. Kept apart from ``status``, which the health
+    # probe owns and rewrites every cycle.
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_sync_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -1120,6 +1128,34 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
         Index("ix_dhcp_lease_server_mac", "server_id", "mac_address"),
         Index("ix_dhcp_lease_server_duid", "server_id", "duid"),
         Index("ix_dhcp_lease_state", "state"),
+        # #2262 — one row per lease identity per server, matching
+        # ``agents._lease_identity``: a DHCPv4 lease is (address, MAC), a
+        # DHCPv6 lease (address, DUID, IAID). Deliberately NOT unique on
+        # (server_id, ip_address) alone: the Kea lease-event path keeps one row
+        # per client on an address, because an agent restart replays an old
+        # client's grant and release after the address has moved to a new one
+        # (#1110, #1318). The agentless pull path keeps a single row per address
+        # itself (it overwrites the MAC on supersede) and is serialised per
+        # server; these indexes are what make a race fail as a conflict rather
+        # than as a second row.
+        Index(
+            "uq_dhcp_lease_server_ip_mac",
+            "server_id",
+            "ip_address",
+            "mac_address",
+            unique=True,
+            postgresql_where=sa_text("duid IS NULL"),
+        ),
+        Index(
+            "uq_dhcp_lease_server_ip_duid",
+            "server_id",
+            "ip_address",
+            "duid",
+            "iaid",
+            unique=True,
+            postgresql_where=sa_text("duid IS NOT NULL"),
+            postgresql_nulls_not_distinct=True,
+        ),
         CheckConstraint(
             "mac_address IS NOT NULL OR duid IS NOT NULL", name="ck_dhcp_lease_identity"
         ),

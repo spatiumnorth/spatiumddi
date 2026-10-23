@@ -11,7 +11,7 @@ deliberate choice, and is now honoured. The downgrade restores the old
 column default only; rewritten rows cannot be told apart afterwards.
 
 Revision ID: e7b3d19a4c26
-Revises: d3a7f19c52e8
+Revises: e2b6f81d4a37
 Create Date: 2026-10-21 10:00:00.000000
 """
 
@@ -20,7 +20,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e7b3d19a4c26"
-down_revision = "d3a7f19c52e8"
+down_revision = "e2b6f81d4a37"
 branch_labels = None
 depends_on = None
 

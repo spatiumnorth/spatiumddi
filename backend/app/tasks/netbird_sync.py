@@ -21,6 +21,8 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.netbird import NetbirdInstance
 from app.models.settings import PlatformSettings
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -73,7 +75,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # A crash leaves the shared session in a failed
                     # transaction; roll back so the next instance still syncs.
                     await db.rollback()
-                    errors.append(f"{instance_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        NetbirdInstance,
+                        instance_id,
+                        resource_type="netbird_instance",
+                        action="netbird.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{instance_name}: {crash}")
                     logger.warning(
                         "netbird_reconcile_crash",
                         instance=str(instance_id),
@@ -114,7 +124,21 @@ async def _run_one(instance_id: str) -> dict[str, Any]:
             instance = await db.get(NetbirdInstance, _uuid.UUID(instance_id))
             if instance is None:
                 return {"status": "not_found"}
-            summary = await reconcile_instance(db, instance)
+            row_id = instance.id
+            try:
+                summary = await reconcile_instance(db, instance)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    NetbirdInstance,
+                    row_id,
+                    resource_type="netbird_instance",
+                    action="netbird.reconcile",
+                    exc=exc,
+                )
+                logger.warning("netbird_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
@@ -136,6 +160,7 @@ async def _run_one(instance_id: str) -> dict[str, Any]:
     name="app.tasks.netbird_sync.sweep_netbird_instances",
     bind=True,
 )
+@module_gated("integrations.netbird")
 def sweep_netbird_instances(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 
