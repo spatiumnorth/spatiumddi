@@ -7,7 +7,7 @@ import ipaddress
 import re
 import uuid
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
 
@@ -59,6 +59,7 @@ from app.core.dns_names import (
     contains_control_chars,
     contains_zonefile_unsafe,
     primary_ns_error,
+    structured_rdata_error,
     validate_fqdn,
     validate_hostname,
     validate_record_owner,
@@ -66,6 +67,7 @@ from app.core.dns_names import (
 from app.core.permissions import (
     _token_grants_for,
     is_effective_superadmin,
+    require_any_permission,
     require_any_resource_permission,
     require_permission,
     token_scope_allows,
@@ -88,6 +90,7 @@ from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
@@ -253,6 +256,14 @@ logger = structlog.get_logger(__name__)
 # `user_has_permission`.
 router = APIRouter(
     dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))]
+)
+
+# The router gate takes the action from the HTTP method, so a POST asks for
+# ``write``. A POST that answers with the zone's existing records (an import
+# preview / commit, a sync-with-server) also needs what a GET of those records
+# needs: ``read`` on any of the three types, as the export and record list ask.
+_DNS_RECORDS_READ = require_any_permission(
+    ("read", "dns_group"), ("read", "dns_zone"), ("read", "dns_record")
 )
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
@@ -1834,7 +1845,15 @@ async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, valu
         raise HTTPException(status_code=422, detail=err)
 
 
-def _validate_address_record_value(record_type: str, value: str) -> None:
+def _validate_address_record_value(
+    record_type: str,
+    value: str,
+    *,
+    priority: int | None = None,
+    weight: int | None = None,
+    port: int | None = None,
+    origin: str | None = None,
+) -> None:
     """Reject rdata that would break — or inject into — a rendered zone (#467, #597).
 
     Three checks, in order of the record's shape:
@@ -1878,6 +1897,11 @@ def _validate_address_record_value(record_type: str, value: str) -> None:
         return
 
     if rtype not in ("A", "AAAA"):
+        err = structured_rdata_error(
+            rtype, value, priority=priority, weight=weight, port=port, origin=origin
+        )
+        if err is not None:
+            raise HTTPException(status_code=422, detail=err)
         return
     candidate = value.strip()
     family_ok = True
@@ -4103,6 +4127,21 @@ async def update_options(
                 + ". Move the Technitium server to its own group, or leave these at "
                 "their defaults.",
             )
+    # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
+    # setting either, so refuse a changed non-default value rather than store
+    # one the daemon ignores (same rule as the Technitium gate above).
+    if (
+        "allow_query_cache" in changes
+        and list(changes["allow_query_cache"] or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
+        and list(changes["allow_query_cache"] or []) != list(opts.allow_query_cache or [])
+        and "powerdns" in await _group_driver_names(db, group_id)
+    ):
+        raise HTTPException(
+            422,
+            "allow_query_cache: this group has a PowerDNS server, which has no "
+            "cache-access ACL, so the value would be ignored. Move the PowerDNS "
+            "server to its own group, or leave it at its default.",
+        )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
@@ -4211,6 +4250,26 @@ async def add_trust_anchor(
         added_by_user_id=current_user.id,
     )
     db.add(anchor)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_trust_anchor",
+            resource_id=str(anchor.id),
+            resource_display=f"{anchor.zone_name} (key tag {anchor.key_tag})",
+            new_value={
+                "group_id": str(group_id),
+                "zone_name": anchor.zone_name,
+                "key_tag": anchor.key_tag,
+                "algorithm": anchor.algorithm,
+                "is_initial_key": anchor.is_initial_key,
+            },
+            result="success",
+        )
+    )
     collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(anchor)
@@ -4230,6 +4289,25 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_trust_anchor",
+            resource_id=str(anchor.id),
+            resource_display=f"{anchor.zone_name} (key tag {anchor.key_tag})",
+            old_value={
+                "group_id": str(group_id),
+                "zone_name": anchor.zone_name,
+                "key_tag": anchor.key_tag,
+                "algorithm": anchor.algorithm,
+                "is_initial_key": anchor.is_initial_key,
+            },
+            result="success",
+        )
+    )
     collect_wake(dns_group_channel(group_id))
     await db.delete(anchor)
     await db.commit()
@@ -8159,6 +8237,44 @@ async def _refuse_cname_conflict(
         )
 
 
+async def _enforce_views_in_zone_group(
+    db: DB, zone: DNSZone, view_ids: Iterable[uuid.UUID | None]
+) -> None:
+    """422 a record ``view_id`` that is not a view of the zone's own group (#2501).
+
+    A record carrying another group's view id puts an id into the set the
+    renderer matches the group's views against, so every operator view of the
+    group then skips the zone: it stops being served, silently. A record in a
+    different view from the zone's own pinned one is never rendered either.
+    The zone-file import's check (``_diff_zone_file``) is the same rule.
+    """
+    wanted = {v for v in view_ids if v is not None}
+    if not wanted:
+        return
+    found = set(
+        (
+            await db.execute(
+                select(DNSView.id).where(DNSView.group_id == zone.group_id, DNSView.id.in_(wanted))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if wanted - found:
+        raise HTTPException(
+            status_code=422,
+            detail="view_id does not name a view in this zone's server group",
+        )
+    if zone.view_id is not None and wanted != {zone.view_id}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "view_id differs from the view this zone is pinned to, so the "
+                "record would never be rendered"
+            ),
+        )
+
+
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/records",
     response_model=RecordResponse,
@@ -8175,12 +8291,20 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
     body.priority, body.weight, body.port = _normalize_record_struct_fields(
         body.record_type, body.priority, body.weight, body.port
     )
-    _validate_address_record_value(body.record_type, body.value)
+    _validate_address_record_value(
+        body.record_type,
+        body.value,
+        priority=body.priority,
+        weight=body.weight,
+        port=body.port,
+        origin=zone.name,
+    )
     await _enforce_absolute_target(db, zone, body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
     _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
@@ -8282,6 +8406,8 @@ async def update_record(
         clearable={"view_id", "ttl"},
         non_nullable={"name", "value", "tags"},
     )
+    if "view_id" in changes and zone is not None:
+        await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -8298,7 +8424,14 @@ async def update_record(
     # only) would 422 a pre-existing row whose value predates the rule —
     # blocking edits to legacy data, contrary to the validate-on-write stance.
     if "value" in changes:
-        _validate_address_record_value(record.record_type, record.value)
+        _validate_address_record_value(
+            record.record_type,
+            record.value,
+            priority=record.priority,
+            weight=record.weight,
+            port=record.port,
+            origin=zone.name if zone is not None else None,
+        )
         # Resubmitting a row's own value (a TTL edit) does not re-judge a row
         # that predates the rule, as for check-names below.
         if zone is not None and (record.value or "").strip() != (before_value or "").strip():
@@ -8830,6 +8963,8 @@ async def bulk_create_records(
     if any(r.record_type == "CNAME" and is_apex(r.name) for r in body.records):
         raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
 
+    await _enforce_views_in_zone_group(db, zone, {r.view_id for r in body.records})
+
     names = sorted({r.name.lower() for r in body.records})
     existing_keys: set[tuple[Any, ...]] = set()
     # #1381 — what each submitted name already holds (view, type), for the
@@ -8890,7 +9025,14 @@ async def bulk_create_records(
         dotless_target(r.record_type, r.value) is not None for r in accepted
     ) and await group_needs_absolute_targets(db, zone.group_id)
     for r in accepted:
-        _validate_address_record_value(r.record_type, r.value)
+        _validate_address_record_value(
+            r.record_type,
+            r.value,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+            origin=zone.name,
+        )
         if needs_absolute:
             target_err = dotless_target_error(r.record_type, r.value, zone.name)
             if target_err is not None:
@@ -9063,11 +9205,7 @@ async def _diff_zone_file(
         (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
     )
     view_names = {v.id: v.name for v in views}
-    if body.view_id is not None and body.view_id not in view_names:
-        raise HTTPException(
-            status_code=422,
-            detail="view_id does not name a view in this zone's server group",
-        )
+    await _enforce_views_in_zone_group(db, zone, [body.view_id])
     replace = body.conflict_strategy == "replace"
     diff = diff_records(
         parsed,
@@ -9135,6 +9273,7 @@ async def _queue_import_ops(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def import_zone_preview(
     group_id: uuid.UUID,
@@ -9174,7 +9313,10 @@ async def import_zone_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/commit",
     response_model=ImportCommitResponse,
-    dependencies=[Depends(require_permission("write", "dns_record"))],
+    dependencies=[
+        Depends(require_permission("write", "dns_record")),
+        Depends(_DNS_RECORDS_READ),
+    ],
 )
 async def import_zone_commit(
     group_id: uuid.UUID,
@@ -9399,6 +9541,7 @@ class SyncWithServerResponse(BaseModel):
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/sync-with-server",
     response_model=SyncWithServerResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def sync_zone_with_server_endpoint(
     group_id: uuid.UUID,
@@ -9711,7 +9854,14 @@ def _sheet_row_validator(
                 body.record_type, body.priority, body.weight, body.port
             )
             if value_changed:
-                _validate_address_record_value(body.record_type, body.value)
+                _validate_address_record_value(
+                    body.record_type,
+                    body.value,
+                    priority=prio,
+                    weight=weight,
+                    port=port,
+                    origin=zone.name,
+                )
                 if needs_absolute:
                     err = dotless_target_error(body.record_type, body.value, zone.name)
                     if err is not None:
@@ -9817,6 +9967,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
     response_model=SheetImportPreviewResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
@@ -9872,7 +10023,10 @@ async def import_zone_spreadsheet_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit",
     response_model=SheetImportCommitResponse,
-    dependencies=[Depends(require_permission("write", "dns_record"))],
+    dependencies=[
+        Depends(require_permission("write", "dns_record")),
+        Depends(_DNS_RECORDS_READ),
+    ],
 )
 async def import_zone_spreadsheet_commit(
     group_id: uuid.UUID,

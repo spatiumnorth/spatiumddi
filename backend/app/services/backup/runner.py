@@ -425,6 +425,41 @@ async def _retention_sweep(
     return deleted
 
 
+async def _stamp_end_on_fresh_session(
+    *,
+    target_id: Any,
+    started: datetime,
+    stamp: dict[str, Any],
+    audit_kwargs: dict[str, Any],
+    original: BaseException,
+) -> None:
+    """Record a run's end when its own session was closed under it (#2353).
+
+    The stamp is conditional on the row still carrying THIS run's
+    claim (``in_progress`` at ``started``), so it never overwrites a
+    newer run, or a claim a restore replaced and #2175 already settled.
+    The audit row is written regardless: the run happened. Re-raises
+    ``original`` when even a fresh session cannot write.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    try:
+        async with AsyncSessionLocal() as fresh:
+            await fresh.execute(
+                update(BackupTarget)
+                .where(
+                    BackupTarget.id == target_id,
+                    BackupTarget.last_run_status == "in_progress",
+                    BackupTarget.last_run_at == started,
+                )
+                .values(**stamp)
+            )
+            fresh.add(AuditLog(**audit_kwargs))
+            await fresh.commit()
+    except Exception as exc:
+        raise original from exc
+
+
 async def run_backup_for_target(
     db: AsyncSession,
     *,
@@ -556,25 +591,63 @@ async def run_backup_for_target(
             error=str(exc),
         )
 
-    db.add(
-        AuditLog(
-            action=action,
-            resource_type="backup_target",
-            resource_id=str(target.id),
-            resource_display=target.name,
-            user_id=actor_id,
-            user_display_name=actor_display,
-            result=result_state,
-            # No ``error`` here: this row is forwarded, and the text can name
-            # the destination (#1617). ``failure_category`` says why.
-            new_value={
-                "triggered_by": triggered_by,
-                "kind": target.kind,
-                **{k: v for k, v in result.items() if k != "error"},
-            },
-            error_detail=result.get("error"),
+    audit_kwargs: dict[str, Any] = {
+        "action": action,
+        "resource_type": "backup_target",
+        "resource_id": str(target.id),
+        "resource_display": target.name,
+        "user_id": actor_id,
+        "user_display_name": actor_display,
+        "result": result_state,
+        # No ``error`` here: this row is forwarded, and the text can name
+        # the destination (#1617). ``failure_category`` says why.
+        "new_value": {
+            "triggered_by": triggered_by,
+            "kind": target.kind,
+            **{k: v for k, v in result.items() if k != "error"},
+        },
+        "error_detail": result.get("error"),
+    }
+    # Captured before the commit: if the commit fails the session is
+    # unusable and the row's attributes may be expired (#2353).
+    target_id = target.id
+    stamp = {
+        "last_run_status": target.last_run_status,
+        "last_run_filename": target.last_run_filename,
+        "last_run_node": target.last_run_node,
+        "last_run_bytes": target.last_run_bytes,
+        "last_run_duration_ms": target.last_run_duration_ms,
+        "last_run_error": target.last_run_error,
+        "next_run_at": target.next_run_at,
+    }
+    try:
+        db.add(AuditLog(**audit_kwargs))
+        await db.commit()
+        await db.refresh(target)
+    except Exception as exc:  # noqa: BLE001
+        # #2353 — a restore ends every other session on the database
+        # (``pg_terminate_backend``), including this run's, so the
+        # terminal stamp cannot be written on it. Left alone the claim
+        # stays ``in_progress`` and every later Run now answers 409
+        # until the 2 h presumed-dead reap. The run knows how it ended,
+        # so record that on a fresh session.
+        logger.warning(
+            "backup_run_stamp_session_lost",
+            target_id=str(target_id),
+            error=str(exc)[:200],
         )
-    )
-    await db.commit()
-    await db.refresh(target)
+        await _stamp_end_on_fresh_session(
+            target_id=target_id,
+            started=started,
+            stamp=stamp,
+            audit_kwargs=audit_kwargs,
+            original=exc,
+        )
+        try:
+            await db.rollback()
+            await db.refresh(target)
+        except Exception:  # noqa: BLE001
+            # The caller's session is gone; the result dict carries
+            # everything the caller renders, and the row is stamped.
+            logger.debug("backup_run_refresh_after_session_loss_failed")
     return result

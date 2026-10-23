@@ -22,6 +22,7 @@ from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
 from app.services.dns_blocklist import parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 # If an agent hasn't heartbeat'd in this long, we fall back to an active probe.
 AGENT_STALE_AFTER = timedelta(seconds=120)
@@ -393,6 +394,7 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.dns.agent_stale_sweep")
+@module_gated("core.dns")
 def agent_stale_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, flips stale agents to 'unreachable'."""
     return asyncio.run(_dns_agent_stale_sweep_async())
@@ -424,6 +426,7 @@ async def _agentless_op_retry_sweep_async() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.dns.agentless_op_retry_sweep")
+@module_gated("core.dns")
 def agentless_op_retry_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, replays due agentless record ops."""
     return asyncio.run(_agentless_op_retry_sweep_async())
@@ -582,6 +585,7 @@ async def _enqueue_all() -> None:
 
 
 @celery_app.task(name="app.tasks.dns.check_all_dns_servers_health", bind=True)
+@module_gated("core.dns")
 def check_all_dns_servers_health(self: object) -> None:  # type: ignore[type-arg]
     """Fan-out task: enqueue one health check per registered DNS server.
 

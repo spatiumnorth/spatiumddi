@@ -619,9 +619,23 @@ async def agent_config_longpoll(
         # published config change wakes this poll immediately; Redis-down
         # degrades to the old LONGPOLL_POLL_INTERVAL sleep (see the DNS agent).
         while True:
+            # #2040 — this session lives for the whole wait, and the sessionmaker
+            # sets expire_on_commit=False with no commit inside the loop. A
+            # re-query hands back the instances already in the identity map
+            # WITHOUT overwriting their loaded attributes, so on every pass
+            # after the first the bundle was rebuilt from the group, its
+            # member servers, scopes, pools, classes and PlatformSettings as
+            # they were when the poll parked. The wake arrived and changed
+            # nothing; the edit reached the agent only when the long-poll timed
+            # out and the agent reconnected on a fresh session. Expiring
+            # everything makes each pass read committed state — the same thing
+            # the first pass of a fresh request reads. Nothing in the loop
+            # writes before the final commit, so no pending change is lost.
+            db.expire_all()
             # Pick up server-row column changes a wake signals (fleet markers,
-            # group, maintenance) — read off this cached instance, since the
-            # bundle re-queries collections but not the server row.
+            # group, maintenance). The bundle re-queries the group and its
+            # collections, which repopulates them; the server row it is handed
+            # rather than re-selecting, so it is refreshed here.
             await refresh_agent_server(db, server)
             bundle = await build_config_bundle(db, server)
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
