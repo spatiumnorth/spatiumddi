@@ -4886,13 +4886,18 @@ export function SubnetDetail({
   // #1155 — the header's write actions, each on the check the server makes
   // for it, so a read-only operator is not handed a form that ends in
   // "Permission denied":
-  //   * Edit — write on subnets at the type level (PUT /subnets/{id}); the
-  //     reshaping tools (resize / split / merge / clean orphans) change the
-  //     subnet itself and ask for the same;
+  //   * Edit — write on THIS subnet (PUT /subnets/{id} takes a grant scoped
+  //     to it, #2438); the reshaping tools (resize / split / merge / clean
+  //     orphans) change the subnet itself and ask for write on subnets at
+  //     the type level, which is what their routes still want;
   //   * Allocate IP, Bulk allocate, Import addresses — write on this subnet
   //     or on an address set in it (#103), as the allocation routes do;
   //   * Scan with nmap — the nmap scan permission.
   const canWriteSubnets = perms.can("write", "subnet");
+  // Edit asks what ``PUT /subnets/{id}`` asks, and that route takes a grant
+  // scoped to this one subnet (#2438, #2569). The reshaping tools below keep
+  // the type-level ask: the server still refuses them to a scoped holder.
+  const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
   // Bulk delete and Clean Orphans are deletes: the router gate wants
@@ -5629,7 +5634,7 @@ export function SubnetDetail({
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSubnet(true)}
-              {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+              {...permissionGate(canEditSubnet, NEEDS_SUBNET_WRITE)}
             >
               Edit
             </HeaderButton>
@@ -16396,7 +16401,7 @@ export function IPAMPage() {
   });
 
   // Fetch ALL blocks so deep-link can look up any block by ID
-  const { data: allBlocks } = useQuery({
+  const { data: allBlocks, error: blocksError } = useQuery({
     queryKey: ["blocks"],
     queryFn: () => ipamApi.listBlocks(),
   });
@@ -16458,6 +16463,28 @@ export function IPAMPage() {
       setPendingHighlightAddress(null);
     }
   }, [selectedSubnet, pendingHighlightAddress]);
+
+  // #2569 — a holder whose grant names one subnet reads that subnet but not
+  // the spaces or blocks above it (both lists answer 403), so the restore
+  // below, which waits for all three lists, never fires and ``?subnet=X`` shows
+  // an empty page. When a parent list is refused, open the URL's subnet from
+  // ``GET /ipam/subnets/X`` itself; the tree may stay empty.
+  const urlSubnetId = searchParams.get("subnet");
+  const parentsRefused = spacesError != null || blocksError != null;
+  const { data: urlSubnet } = useQuery({
+    queryKey: ["subnet", urlSubnetId],
+    queryFn: () => ipamApi.getSubnet(urlSubnetId!),
+    enabled: !!urlSubnetId && parentsRefused,
+    retry: false,
+  });
+  useEffect(() => {
+    if (urlRestored.current || !urlSubnet || !parentsRefused) return;
+    if (urlSubnet.id !== urlSubnetId) return;
+    urlRestored.current = true;
+    setSelectedSubnet(urlSubnet);
+    setSelectedBlock(null);
+    setSelectedSpace(null);
+  }, [urlSubnet, urlSubnetId, parentsRefused]);
 
   // URL-state restore: reopen last-visited space/block/subnet on back-navigation
   // Depends on searchParams so that when `useStickyLocation` navigates from
