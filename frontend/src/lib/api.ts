@@ -16570,8 +16570,10 @@ export const nmapApi = {
    *  Existing rows in ``available`` / ``discovered`` get bumped to
    *  ``discovered``; integration / operator-owned rows get a
    *  ``last_seen`` stamp only. New rows land as ``discovered``.
+   *  ``spaceId`` picks the IP space; without it, hosts that fall in
+   *  subnets of more than one space are skipped as ambiguous.
    *  Returns counters for the UI to render. */
-  stampDiscovered: (scanId: string) =>
+  stampDiscovered: (scanId: string, spaceId?: string) =>
     api
       .post<{
         created: number;
@@ -16579,7 +16581,12 @@ export const nmapApi = {
         refreshed: number;
         skipped_no_subnet: number;
         skipped_addresses: string[];
-      }>(`/nmap/scans/${scanId}/stamp-discovered`)
+        /** Hosts inside subnets of several IP spaces, skipped because no
+         *  space was chosen (#2577). */
+        skipped_ambiguous: string[];
+      }>(`/nmap/scans/${scanId}/stamp-discovered`, null, {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
       .then((r) => r.data),
   // SECURITY (#400, M8): the SSE stream is consumed via `streamScan`
   // (fetch + ReadableStream) so the access token rides the

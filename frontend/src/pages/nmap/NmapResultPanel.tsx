@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Copy, Loader2, MapPin } from "lucide-react";
 import {
+  ipamApi,
   nmapApi,
   type NmapHostResult,
   type NmapPortResult,
@@ -148,8 +149,16 @@ function StampDiscoveredModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // Overlapping IP spaces are independent (#2577): the operator picks
+  // which space the sweep belongs to. "" = let the server decide, which
+  // skips any host whose address exists in more than one space.
+  const [spaceId, setSpaceId] = useState("");
+  const { data: spaces } = useQuery({
+    queryKey: ["spaces"],
+    queryFn: ipamApi.listSpaces,
+  });
   const stamp = useMutation({
-    mutationFn: () => nmapApi.stampDiscovered(scanId),
+    mutationFn: () => nmapApi.stampDiscovered(scanId, spaceId || undefined),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
@@ -183,6 +192,25 @@ function StampDiscoveredModal({
             subnet are skipped.
           </p>
         )}
+        {!result && !stamp.isPending && (spaces?.length ?? 0) > 1 && (
+          <label className="mt-3 block text-sm">
+            <span className="text-muted-foreground">IP space</span>
+            <select
+              value={spaceId}
+              onChange={(e) => setSpaceId(e.target.value)}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+            >
+              <option value="">
+                Automatic — skip addresses found in more than one space
+              </option>
+              {spaces?.map((sp) => (
+                <option key={sp.id} value={sp.id}>
+                  {sp.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {stamp.isPending && (
           <p className="mt-2 inline-flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Stamping…
@@ -212,6 +240,20 @@ function StampDiscoveredModal({
                 Skipped (not in any subnet):{" "}
                 <strong>{result.skipped_no_subnet}</strong>
               </div>
+            )}
+            {result.skipped_ambiguous?.length > 0 && (
+              <details className="text-[11px] text-amber-700 dark:text-amber-400">
+                <summary className="cursor-pointer">
+                  Skipped — address exists in more than one IP space (
+                  {result.skipped_ambiguous.length}); pick a space and stamp
+                  again
+                </summary>
+                <ul className="mt-1 list-disc pl-4 font-mono">
+                  {result.skipped_ambiguous.slice(0, 50).map((a) => (
+                    <li key={a}>{a}</li>
+                  ))}
+                </ul>
+              </details>
             )}
             {result.skipped_addresses.length > 0 && (
               <details className="text-[11px] text-muted-foreground">

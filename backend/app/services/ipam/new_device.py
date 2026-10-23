@@ -36,7 +36,7 @@ from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
-from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist
+from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist, Subnet
 from app.services.oui import _prefix_from_mac, normalize_mac_key
 
 logger = structlog.get_logger(__name__)
@@ -105,7 +105,9 @@ def oui_prefix_of(mac: str | None) -> str | None:
     return _prefix_from_mac(mac)
 
 
-async def classify_mac(db: AsyncSession, mac_address: str | None) -> str:
+async def classify_mac(
+    db: AsyncSession, mac_address: str | None, *, space_id: uuid.UUID | None = None
+) -> str:
     """Classify a MAC as ``known`` or ``new`` at observation time.
 
     ``acknowledged`` is never returned here — it is only ever set by an explicit
@@ -116,6 +118,10 @@ async def classify_mac(db: AsyncSession, mac_address: str | None) -> str:
       everywhere;
     * the MAC already sits on an operator-allocated IP (``allocated`` /
       ``reserved`` / ``static_dhcp``) — it is part of the known fleet.
+      That fleet is per IP space when ``space_id`` is given (#2577): spaces
+      are independent networks, so a MAC allocated in one must not mask a
+      first sighting in another. The allowlist stays platform-wide by
+      design — it is the operator's "trust this MAC everywhere".
 
     Everything else is ``new``.
     """
@@ -132,16 +138,15 @@ async def classify_mac(db: AsyncSession, mac_address: str | None) -> str:
     if allow_hit is not None:
         return CLASSIFICATION_KNOWN
 
-    fleet_hit = (
-        await db.execute(
-            select(IPAddress.id)
-            .where(
-                IPAddress.mac_address == mac_address,
-                IPAddress.status.in_(_KNOWN_FLEET_STATUSES),
-            )
-            .limit(1)
+    fleet_q = select(IPAddress.id).where(
+        IPAddress.mac_address == mac_address,
+        IPAddress.status.in_(_KNOWN_FLEET_STATUSES),
+    )
+    if space_id is not None:
+        fleet_q = fleet_q.join(Subnet, Subnet.id == IPAddress.subnet_id).where(
+            Subnet.space_id == space_id
         )
-    ).first()
+    fleet_hit = (await db.execute(fleet_q.limit(1))).first()
     if fleet_hit is not None:
         return CLASSIFICATION_KNOWN
 

@@ -52,6 +52,7 @@ from app.models.ipam import (
     IP_STATUSES_INTEGRATION_OWNED,
     IP_STATUSES_OPERATOR_SETTABLE,
     IPAddress,
+    IPSpace,
     Subnet,
 )
 from app.models.nmap import NmapScan
@@ -362,6 +363,17 @@ async def stamp_discovered(
     scan_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
+    space_id: uuid.UUID | None = Query(
+        None,
+        description=(
+            "IP space to stamp into. Overlapping spaces are independent "
+            "(#2577), so an address that falls inside subnets of more "
+            "than one space is ambiguous: without this (and without a "
+            "scan pinned to an IPAM row) such hosts are skipped and "
+            "listed in ``skipped_ambiguous`` rather than written into "
+            "whichever space's subnet happened to match first."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Stamp every alive host from a multi-host scan into IPAM.
 
@@ -372,6 +384,12 @@ async def stamp_discovered(
     only get the ``last_seen`` stamp (status is left alone). New rows
     land as ``discovered``. IPs that don't fall inside any known
     subnet are skipped — there's no obvious place to put them.
+
+    Space context (#2577): the target space is ``space_id`` when
+    given, else the space of the IPAM row the scan was launched from
+    (``scan.ip_address_id``). With neither, a host whose address sits
+    in subnets of two or more spaces is skipped as ambiguous — the
+    scan alone cannot say which network it swept.
 
     Permission gate: the user must be able to write IPAM
     (``ip_address`` write). This is intentionally a different gate
@@ -403,12 +421,26 @@ async def stamp_discovered(
             ),
         )
 
+    context_space_id: uuid.UUID | None = space_id
+    if context_space_id is not None:
+        if await db.get(IPSpace, context_space_id) is None:
+            raise HTTPException(status_code=422, detail="space_id not found")
+    elif scan.ip_address_id is not None:
+        context_space_id = (
+            await db.execute(
+                select(Subnet.space_id)
+                .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+                .where(IPAddress.id == scan.ip_address_id)
+            )
+        ).scalar_one_or_none()
+
     now = datetime.now(UTC)
     created = 0
     bumped = 0  # status flipped to discovered
     refreshed = 0  # last_seen stamped, status preserved
     skipped_no_subnet = 0
     skipped_address: list[str] = []
+    skipped_ambiguous: list[str] = []
 
     for host in hosts:
         if host.get("host_state") != "up":
@@ -427,13 +459,22 @@ async def stamp_discovered(
             skipped_address.append(str(addr))
             continue
 
-        subnet_res = await db.execute(
-            select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(addr)))
+        # Never take the first containing subnet across spaces (#2577):
+        # overlapping spaces are independent, so that would write the
+        # host into an arbitrary network's IPAM.
+        subnet_q = select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(addr)))
+        if context_space_id is not None:
+            subnet_q = subnet_q.where(Subnet.space_id == context_space_id)
+        candidates = list(
+            (await db.execute(subnet_q.order_by(sa_func.masklen(Subnet.network).desc()))).scalars()
         )
-        subnet = subnet_res.scalars().first()
-        if subnet is None:
+        if not candidates:
             skipped_no_subnet += 1
             continue
+        if len({c.space_id for c in candidates}) > 1:
+            skipped_ambiguous.append(str(addr))
+            continue
+        subnet = candidates[0]
 
         ipam_res = await db.execute(
             select(IPAddress).where(
@@ -491,6 +532,8 @@ async def stamp_discovered(
             "refreshed": refreshed,
             "skipped_no_subnet": skipped_no_subnet,
             "skipped_addresses": skipped_address[:50],
+            "skipped_ambiguous": skipped_ambiguous[:50],
+            "space_id": str(context_space_id) if context_space_id else None,
         },
     )
     await db.commit()
@@ -500,6 +543,7 @@ async def stamp_discovered(
         "refreshed": refreshed,
         "skipped_no_subnet": skipped_no_subnet,
         "skipped_addresses": skipped_address,
+        "skipped_ambiguous": skipped_ambiguous,
     }
 
 

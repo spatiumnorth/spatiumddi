@@ -509,6 +509,7 @@ async def _check_ip_collisions(
     role: str | None = None,
     subnet: Subnet | None = None,
     address: str | None = None,
+    space_id: uuid.UUID | None = None,
 ) -> list[dict[str, Any]]:
     """Return FQDN + MAC + PTR collision warnings for a pending IP assignment.
 
@@ -533,6 +534,11 @@ async def _check_ip_collisions(
       name from a *different* IP row (a manual PTR, or pre-existing
       cross-space data from before the #844 space guards), warn rather than
       silently stacking a second value onto the RRset.
+    - The MAC check is confined to the pending row's IP space (#2577):
+      spaces are independent networks, so the same MAC in another space is
+      not a collision. The space comes from ``space_id``, else ``subnet``,
+      else the row being updated (``exclude_ip_id``); with none of those
+      the check stays platform-wide.
     """
     warnings: list[dict[str, Any]] = []
 
@@ -561,11 +567,24 @@ async def _check_ip_collisions(
     mac_norm = _normalize_mac(mac_address)
     skip_mac_check = role in IP_ROLES_SHARED
     if mac_norm and mac_address is not None and not skip_mac_check:
+        mac_space_id = space_id
+        if mac_space_id is None and subnet is not None:
+            mac_space_id = subnet.space_id
+        if mac_space_id is None and exclude_ip_id is not None:
+            mac_space_id = (
+                await db.execute(
+                    select(Subnet.space_id)
+                    .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+                    .where(IPAddress.id == exclude_ip_id)
+                )
+            ).scalar_one_or_none()
         q = (
             select(IPAddress, Subnet.network)
             .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(IPAddress.mac_address == mac_address)
         )
+        if mac_space_id is not None:
+            q = q.where(Subnet.space_id == mac_space_id)
         if exclude_ip_id is not None:
             q = q.where(IPAddress.id != exclude_ip_id)
         for ip, subnet_network in (await db.execute(q)).all():
@@ -10471,6 +10490,7 @@ async def allocate_next_ip(
             forward_zone_id=effective_zone,
             mac_address=body.mac_address,
             role=body.role,
+            space_id=subnet.space_id,
         )
         if warnings:
             raise _collision_http_exc(warnings)

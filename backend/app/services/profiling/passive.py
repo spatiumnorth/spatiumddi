@@ -14,14 +14,16 @@ a fresh-cache hit on the second run and exits.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.dhcp_fingerprint import DHCPFingerprint
-from app.models.ipam import IPAddress
+from app.models.ipam import IPAddress, Subnet
 from app.services.profiling.fingerbank import lookup as fingerbank_lookup
 
 logger = structlog.get_logger(__name__)
@@ -99,8 +101,9 @@ async def stamp_matching_ips(
     db: AsyncSession,
     *,
     fingerprint: DHCPFingerprint,
+    server_id: uuid.UUID | None = None,
 ) -> int:
-    """Copy fingerbank result onto every IPAddress row sharing the MAC.
+    """Copy fingerbank result onto the IPAddress rows sharing the MAC.
 
     Respects the ``user_modified_at`` lock — if the operator has
     manually edited the row's soft fields we leave the device columns
@@ -108,24 +111,64 @@ async def stamp_matching_ips(
     description by hand. Returns the number of rows actually stamped
     (the caller doesn't strictly need this, but it's cheap and useful
     for the structlog event).
+
+    Space scoping (#2577): IP spaces are independent, and the same MAC
+    can sit on rows in several of them. The fingerprint was observed by
+    one DHCP server (``server_id``), so only rows in the IP spaces that
+    server's group serves (any space holding a subnet one of the
+    group's scopes is bound to) are stamped. Without a server — a task
+    enqueued before this change — the rows are stamped only when they
+    all sit in one space; a MAC spread across spaces is skipped rather
+    than written into every one of them.
     """
     if fingerprint.fingerbank_device_name is None:
         return 0
 
-    stmt = (
-        update(IPAddress)
-        .where(
-            IPAddress.mac_address == fingerprint.mac_address,
-            IPAddress.user_modified_at.is_(None),
+    stmt = update(IPAddress).where(
+        IPAddress.mac_address == fingerprint.mac_address,
+        IPAddress.user_modified_at.is_(None),
+    )
+    if server_id is not None:
+        group_id = (
+            select(DHCPServer.server_group_id).where(DHCPServer.id == server_id).scalar_subquery()
         )
-        .values(
+        served_spaces = (
+            select(Subnet.space_id)
+            .join(DHCPScope, DHCPScope.subnet_id == Subnet.id)
+            .where(DHCPScope.group_id == group_id, DHCPScope.deleted_at.is_(None))
+        )
+        stmt = stmt.where(
+            IPAddress.subnet_id.in_(select(Subnet.id).where(Subnet.space_id.in_(served_spaces)))
+        )
+    else:
+        spaces = set(
+            (
+                await db.execute(
+                    select(Subnet.space_id)
+                    .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+                    .where(
+                        IPAddress.mac_address == fingerprint.mac_address,
+                        IPAddress.user_modified_at.is_(None),
+                    )
+                    .distinct()
+                )
+            ).scalars()
+        )
+        if len(spaces) > 1:
+            logger.info(
+                "fingerprint_stamp_skipped_ambiguous_space",
+                mac=fingerprint.mac_address,
+                spaces=len(spaces),
+            )
+            return 0
+
+    result = await db.execute(
+        stmt.values(
             device_type=fingerprint.fingerbank_device_name,
             device_class=fingerprint.fingerbank_device_class,
             device_manufacturer=fingerprint.fingerbank_manufacturer,
-        )
-        .execution_options(synchronize_session=False)
+        ).execution_options(synchronize_session=False)
     )
-    result = await db.execute(stmt)
     return int(result.rowcount or 0)
 
 
@@ -133,8 +176,12 @@ async def run_lookup_and_stamp(
     db: AsyncSession,
     *,
     mac_address: str,
+    server_id: uuid.UUID | None = None,
 ) -> bool:
     """Celery-task body: fetch the fingerprint, hit fingerbank, stamp matching IPs.
+
+    ``server_id`` is the DHCP server that reported the fingerprint; it
+    scopes the stamp to the IP spaces that server serves (#2577).
 
     Idempotent + safe to retry. Returns True if a stamp happened (so
     the task can log a useful counter), False otherwise.
@@ -153,7 +200,7 @@ async def run_lookup_and_stamp(
         await db.commit()
         return False
 
-    stamped = await stamp_matching_ips(db, fingerprint=fingerprint)
+    stamped = await stamp_matching_ips(db, fingerprint=fingerprint, server_id=server_id)
     await db.commit()
     logger.info(
         "fingerprint_stamp_done",
