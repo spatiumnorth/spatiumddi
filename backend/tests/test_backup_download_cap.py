@@ -178,6 +178,11 @@ class _AzureStream:
 
 
 def _azure(monkeypatch: pytest.MonkeyPatch, stream: _AzureStream) -> None:
+    # ``download`` imports the SDK's exception types lazily; CI can carry only
+    # a namespace stub of ``azure`` (no ``azure-core``), so skip rather than fail.
+    exceptions = pytest.importorskip("azure.core.exceptions")
+    if not hasattr(exceptions, "AzureError"):
+        pytest.skip("azure-core is not installed")
     blob = types.SimpleNamespace(download_blob=lambda: stream)
     container = types.SimpleNamespace(get_blob_client=lambda _n: blob)
     monkeypatch.setattr(AzureBlobDestination, "_container_client", lambda self, _c: container)
