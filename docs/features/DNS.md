@@ -2757,6 +2757,18 @@ got through.
 > stored, shipped, and rendered nowhere. The lesson from §8.2 applies
 > unchanged — **assert on the rendered config, not the stored row**.
 
+### 21.1 Reading a whole group at once (issue #2120)
+
+A group behind one load-balanced address spreads a client's queries
+across its servers, so "did this client ask for this name?" has no
+single-server answer. Logs → DNS Queries therefore reads one server, one
+server group, or every server: `POST /logs/dns-queries` and
+`/logs/dns-queries/analytics` take an optional `server_id` and an
+optional `group_id`, each row names the server that logged it, and the
+analytics roll up across the selection. The selection is always narrowed
+to the servers the caller may read. See
+[`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
+
 ---
 
 ## 22. Zone name scope — public, private, undelegated (issue #986)
