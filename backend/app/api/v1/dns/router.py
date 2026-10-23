@@ -35,6 +35,7 @@ from pydantic import (
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
@@ -67,6 +68,7 @@ from app.core.dns_names import (
 from app.core.permissions import (
     _token_grants_for,
     is_effective_superadmin,
+    require_any_permission,
     require_any_resource_permission,
     require_permission,
     token_scope_allows,
@@ -210,7 +212,12 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
-from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
+from app.services.dns.tsig import (
+    RESERVED_TSIG_PREFIX,
+    group_key_names,
+    normalize_tsig_name,
+    rotate_group_tsig_key,
+)
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_move import (
@@ -255,6 +262,14 @@ logger = structlog.get_logger(__name__)
 # `user_has_permission`.
 router = APIRouter(
     dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))]
+)
+
+# The router gate takes the action from the HTTP method, so a POST asks for
+# ``write``. A POST that answers with the zone's existing records (an import
+# preview / commit, a sync-with-server) also needs what a GET of those records
+# needs: ``read`` on any of the three types, as the export and record list ask.
+_DNS_RECORDS_READ = require_any_permission(
+    ("read", "dns_group"), ("read", "dns_zone"), ("read", "dns_record")
 )
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
@@ -4664,6 +4679,44 @@ _TSIG_ALGO_LENGTHS = {
 _TSIG_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?\.?$")
 
 
+async def _tsig_name_refusal(
+    db: AsyncSession, group_id: uuid.UUID, name: str, *, exclude_id: uuid.UUID | None = None
+) -> HTTPException | None:
+    """Refuse a TSIG key name that would render a second ``key {}`` for one name (#2295).
+
+    Names are compared the way BIND does (case-folded, trailing dot dropped),
+    and against the group's own generated key too. ``spatium-`` is reserved for
+    that generated key.
+    """
+    norm = normalize_tsig_name(name)
+    if norm.startswith(RESERVED_TSIG_PREFIX):
+        return HTTPException(
+            status_code=422,
+            detail=f"TSIG key name '{name}' uses the reserved '{RESERVED_TSIG_PREFIX}' prefix "
+            "(it is the group's generated key); choose another name",
+        )
+    group = await db.get(DNSServerGroup, group_id)
+    if group is not None and normalize_tsig_name(group.tsig_key_name) == norm:
+        return HTTPException(
+            status_code=422,
+            detail=f"TSIG key name '{name}' clashes with this group's generated key "
+            f"'{group.tsig_key_name}'",
+        )
+    rows = (
+        await db.execute(
+            select(DNSTSIGKey.id, DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)
+        )
+    ).all()
+    for rid, rname in rows:
+        if rid != exclude_id and normalize_tsig_name(rname) == norm:
+            return HTTPException(
+                status_code=409,
+                detail=f"A TSIG key named '{rname}' already exists in this group "
+                "(names are compared case-insensitively, ignoring a trailing dot)",
+            )
+    return None
+
+
 def _generate_tsig_secret(algorithm: str) -> str:
     import base64
     import secrets
@@ -4865,14 +4918,8 @@ async def create_tsig_key(
     # installed and left to fail every signed transfer with BADKEY.
     if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
         raise HTTPException(status_code=422, detail=refusal)
-    existing = await db.execute(
-        select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id, DNSTSIGKey.name == body.name)
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409,
-            detail="A TSIG key with that name already exists in this group",
-        )
+    if refusal_exc := await _tsig_name_refusal(db, group_id, body.name):
+        raise refusal_exc
 
     plaintext = body.secret.strip() if body.secret else _generate_tsig_secret(body.algorithm)
     key = DNSTSIGKey(
@@ -4939,15 +4986,10 @@ async def update_tsig_key(
         ):
             raise HTTPException(status_code=422, detail=refusal)
     if changes.get("name") and changes["name"] != key.name:
-        clash = await db.execute(
-            select(DNSTSIGKey).where(
-                DNSTSIGKey.group_id == group_id,
-                DNSTSIGKey.name == changes["name"],
-                DNSTSIGKey.id != key_id,
-            )
-        )
-        if clash.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Name already in use")
+        if refusal_exc := await _tsig_name_refusal(
+            db, group_id, changes["name"], exclude_id=key_id
+        ):
+            raise refusal_exc
         await _assert_tsig_key_is_unreferenced(group_id, key, db, action="rename")
     before = {k: getattr(key, k, None) for k in changes}
     for k, v in changes.items():
@@ -9277,6 +9319,7 @@ async def _queue_import_ops(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def import_zone_preview(
     group_id: uuid.UUID,
@@ -9316,7 +9359,10 @@ async def import_zone_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/commit",
     response_model=ImportCommitResponse,
-    dependencies=[Depends(require_permission("write", "dns_record"))],
+    dependencies=[
+        Depends(require_permission("write", "dns_record")),
+        Depends(_DNS_RECORDS_READ),
+    ],
 )
 async def import_zone_commit(
     group_id: uuid.UUID,
@@ -9541,6 +9587,7 @@ class SyncWithServerResponse(BaseModel):
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/sync-with-server",
     response_model=SyncWithServerResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def sync_zone_with_server_endpoint(
     group_id: uuid.UUID,
@@ -9966,6 +10013,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
     response_model=SheetImportPreviewResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
@@ -10021,7 +10069,10 @@ async def import_zone_spreadsheet_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit",
     response_model=SheetImportCommitResponse,
-    dependencies=[Depends(require_permission("write", "dns_record"))],
+    dependencies=[
+        Depends(require_permission("write", "dns_record")),
+        Depends(_DNS_RECORDS_READ),
+    ],
 )
 async def import_zone_spreadsheet_commit(
     group_id: uuid.UUID,
