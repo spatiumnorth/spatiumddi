@@ -258,3 +258,112 @@ async def test_auto_sync_deletes_only_in_subnet_orphans(
     # holds (and the v6 one, with no v6 subnet) belongs to none of them and is
     # left alone — before #2577 the first subnet to run deleted all five.
     assert await _surviving(db_session, env) == {"elsewhere", "ghost6"}
+
+
+# ── Orphans with no address in their value (review follow-up) ─────────
+
+
+def _rec(zone: DNSZone, name: str, rtype: str, value: str, *, auto: bool = True) -> DNSRecord:
+    return DNSRecord(
+        zone_id=zone.id,
+        name=name,
+        fqdn=f"{name}.{zone.name}",
+        record_type=rtype,
+        value=value,
+        auto_generated=auto,
+        ip_address_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_orphaned_alias_is_reported_by_the_subnet_its_host_is_in(
+    db_session: AsyncSession,
+) -> None:
+    """An IPAM CNAME alias carries its host's FQDN, not an address. It is the
+    subnet's orphan when that name resolves, in the same zone, only to
+    addresses inside the subnet — and nobody's when it resolves elsewhere,
+    to nothing, to a mix, or out of the zone."""
+    env = await _setup(db_session)
+    z = env.zone
+    db_session.add_all(
+        [
+            _rec(z, "host1", "A", "10.77.1.20", auto=False),
+            _rec(z, "host2", "A", "10.77.2.20", auto=False),
+            _rec(z, "dup", "A", "10.77.1.21", auto=False),
+            _rec(z, "dup", "A", "10.77.2.21", auto=False),
+            _rec(z, "alias1", "CNAME", "host1.shared.example."),
+            _rec(z, "alias1rel", "CNAME", "host1"),
+            _rec(z, "alias2", "CNAME", "host2.shared.example."),
+            _rec(z, "alias-ghost", "CNAME", "ghost1.shared.example."),
+            _rec(z, "alias-none", "CNAME", "nowhere.shared.example."),
+            _rec(z, "alias-dup", "CNAME", "dup.shared.example."),
+            _rec(z, "alias-out", "CNAME", "host1.other.example."),
+        ]
+    )
+    await db_session.commit()
+
+    a1 = await compute_subnet_dns_drift(db_session, env.sn_a1.id)
+    assert {s.name for s in a1.stale} == {"ghost1", "alias1", "alias1rel", "alias-ghost"}
+    b2 = await compute_subnet_dns_drift(db_session, env.sn_b2.id)
+    assert {s.name for s in b2.stale} == {"ghost2", "alias2"}
+    a3 = await compute_subnet_dns_drift(db_session, env.sn_a3.id)
+    assert {s.name for s in a3.stale} == {"ghost3"}
+
+
+async def _reverse_zone(db: AsyncSession, env: _Env, name: str, subnet: Subnet) -> DNSZone:
+    zone = DNSZone(
+        group_id=env.zone.group_id,
+        name=name,
+        zone_type="primary",
+        kind="reverse",
+        primary_ns="ns1.shared.example.",
+        admin_email="admin.shared.example.",
+        linked_subnet_id=subnet.id,
+    )
+    db.add(zone)
+    await db.flush()
+    return zone
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_ptr_is_reported_only_when_its_zone_is_inside_the_subnet(
+    db_session: AsyncSession,
+) -> None:
+    """A PTR whose owner name is not a full reverse pointer names no address.
+    It is the subnet's only when the WHOLE reverse zone lies inside the subnet,
+    so no other subnet can share the zone; a /25 shares its /24 zone with its
+    sibling and so reports nothing."""
+    env = await _setup(db_session)
+    whole = await _reverse_zone(db_session, env, "1.77.10.in-addr.arpa.", env.sn_a1)
+    half_subnet = Subnet(
+        space_id=env.space_a.id,
+        block_id=env.block_a.id,
+        network="10.77.4.0/25",
+        name="half",
+        dns_zone_id=str(env.zone.id),
+        dns_inherit_settings=False,
+    )
+    db_session.add(half_subnet)
+    await db_session.flush()
+    shared = await _reverse_zone(db_session, env, "4.77.10.in-addr.arpa.", half_subnet)
+    db_session.add_all(
+        [
+            _rec(whole, "odd-label", "PTR", "x.shared.example."),
+            _rec(whole, "9", "PTR", "ghost1.shared.example."),
+            _rec(shared, "odd-label2", "PTR", "y.shared.example."),
+            _rec(shared, "9", "PTR", "z.shared.example."),
+            _rec(shared, "200", "PTR", "far.shared.example."),
+        ]
+    )
+    await db_session.commit()
+
+    a1 = await compute_subnet_dns_drift(db_session, env.sn_a1.id)
+    assert {(s.record_type, s.name) for s in a1.stale} == {
+        ("A", "ghost1"),
+        ("PTR", "odd-label"),
+        ("PTR", "9"),
+    }
+    half = await compute_subnet_dns_drift(db_session, half_subnet.id)
+    # Its own parseable PTR only: not the sibling half's (.200), and not the
+    # unparseable one — the /24 zone is shared with 10.77.4.128/25.
+    assert {(s.record_type, s.name) for s in half.stale} == {("PTR", "9")}
