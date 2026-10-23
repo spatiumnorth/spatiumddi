@@ -211,17 +211,21 @@ def test_section_catalog_gap_does_not_grow() -> None:
 
 
 def test_scrub_list_excludes_non_regenerable_machine_identity() -> None:
-    """`archive.py` shares ENCRYPTED_COLUMNS as its exclude-secrets redaction
-    list, so widening the rewrap list widened what a diagnostic archive
-    destroys. Blanking these yields an empty bytea that satisfies NOT NULL,
-    so restoring such an archive SUCCEEDS and then permanently breaks the
-    install: `ensure_ca` returns the existing row without regenerating and
-    every approval fails on `decrypt_str(b"")`, with no rotate endpoint."""
-    from app.services.backup.rewrap import NON_REDACTABLE_COLUMNS, redactable_columns
+    """Machine identity must not be blanked to an empty bytea: that satisfies
+    NOT NULL, so restoring the archive SUCCEEDS and then permanently breaks
+    the install — `ensure_ca` returns the existing row without regenerating
+    and every approval fails on `decrypt_str(b"")` (#781). It is scrubbed in
+    the shape its reader regenerates from instead (row left out, or NULL)."""
+    from app.services.backup.rewrap import (
+        SCRUB_NULLED_ENCRYPTED_COLUMNS,
+        SCRUB_OMITTED_TABLES,
+        redactable_columns,
+    )
 
     scrubbed = {(t.strip('"'), c) for t, _pk, c in redactable_columns()}
-    assert not (scrubbed & NON_REDACTABLE_COLUMNS)
+    assert not (scrubbed & SCRUB_NULLED_ENCRYPTED_COLUMNS)
     assert ("appliance_ca", "key_encrypted") not in scrubbed, "no CA rotate endpoint exists"
+    assert "appliance_ca" in SCRUB_OMITTED_TABLES
 
 
 def test_scrub_list_still_redacts_operator_re_enterable_credentials() -> None:

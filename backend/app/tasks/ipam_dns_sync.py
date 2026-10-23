@@ -35,6 +35,7 @@ from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
 from app.tasks._interval_gate import interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -328,6 +329,7 @@ async def _run_auto_sync() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.ipam_dns_sync.auto_sync_ipam_dns", bind=True)
+@module_gated("core.dns")
 def auto_sync_ipam_dns(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval."""
