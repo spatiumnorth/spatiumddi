@@ -72,7 +72,7 @@
 
   "components": {
     "k3s": {
-      "version": "v1.36.4+k3s1",
+      "version": "v1.36.5+k3s1",
       "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): v1.37 is a Kubernetes MINOR, which is not slot-revertible (see note) and lands on the clustering/upgrade path the freeze holds. Bump with a 1.1.0 slot-image cut, together with kind-node and kubeconform-k8s-target.",
       "pinned_in": [
         { "path": "Makefile", "match": "K3S_VERSION ?= {version}", "count": 1 },
@@ -362,9 +362,9 @@
     },
 
     "technitium": {
-      "version": "15.4.0",
-      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): 15.4.0 -> 15.5.x is a minor release, not a patch, and the freeze takes only bug and security fixes. Move it after 1.0.0, tag and digest together.",
-      "digest": "sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41",
+      "version": "15.6.2",
+      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): the freeze takes only bug and security fixes. 15.4.0 -> 15.6.2 was taken under the freeze as a security fix (#2238: cache poisoning, a DNSSEC validation bypass, an authorization bypass via the record `ptr` option, a session-token oracle and several DoS fixes in Technitium itself, none of which Trivy can see). Hold any further NON-security minor until after 1.0.0; a security release moves the same way #2238 did. Always move tag and digest together.",
+      "digest": "sha256:eb48ac5c135f4ab936b536f74f853d53e15ab39ef37fdbc9598a089b90d9f245",
       "pinned_in": [
         {
           "path": "agent/dns/images/technitium/Dockerfile",

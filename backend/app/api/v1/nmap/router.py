@@ -36,16 +36,15 @@ from typing import Annotated, Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from jose import JWTError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, authenticate_bearer
 from app.api.pagination import MAX_PAGE
+from app.api.stream_auth import StreamAuthGuard
 from app.api.v1.probe_guard import enforce_probe_target
 from app.core.permissions import require_permission, user_has_permission
 from app.core.responses import EventStreamResponse
-from app.core.security import decode_access_token, live_access_session
 from app.db import get_db
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -533,40 +532,13 @@ async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: 
     """Validate a JWT or API token presented to the SSE endpoint.
 
     The token is sourced by :func:`_extract_stream_token` (header
-    preferred, ``?token=`` query arg as a back-compat fallback). We
-    re-implement the relevant branches of
-    :func:`app.api.deps.get_current_user` here rather than reach into
-    Security() — that dep is wired to the Bearer extractor and would
-    have 401'd the connection before our header/query resolution
-    runs. ``request`` is forwarded into ``_resolve_api_token`` so the
-    scope guard (issue #74) can inspect the SSE endpoint's path
-    before allowing the connection.
+    preferred, ``?token=`` query arg as a back-compat fallback), so the
+    ``get_current_user`` dependency — wired to the Bearer extractor — can't
+    be used directly; the same checks run through
+    :func:`app.api.deps.authenticate_bearer` instead (session, account
+    state, password-change gate, API-token scopes against this path).
     """
-    if token.startswith("sddi_"):
-        # API tokens — re-use the deps helper.
-        from app.api.deps import _resolve_api_token  # noqa: PLC0415
-
-        return await _resolve_api_token(db, token, request)
-
-    try:
-        payload = decode_access_token(token)
-        user_id: str = payload["sub"]
-    except (JWTError, KeyError) as exc:
-        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
-
-    # Force-logout (#72) must reach the stream too, as it does every other
-    # route through get_current_user: a revoked session's token is refused.
-    try:
-        await live_access_session(db, payload)
-    except JWTError as exc:
-        raise HTTPException(status_code=401, detail="Session revoked or expired") from exc
-
-    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="User account is disabled")
-    return user
+    return await authenticate_bearer(db, token, request)
 
 
 @router.get(
@@ -601,6 +573,10 @@ async def stream_scan(
     if row is None:
         raise HTTPException(status_code=404, detail="Scan not found")
 
+    # Re-validated on a bounded cadence while the scan streams; the stream
+    # ends once the caller is signed out, disabled or loses the permission.
+    guard = StreamAuthGuard(request, permission=("read", PERMISSION), credential=resolved_token)
+
     async def _event_stream() -> Any:
         # Re-import inside the coroutine so the streaming generator
         # owns its own engine — the request session is closed as soon
@@ -612,6 +588,8 @@ async def stream_scan(
         deadline = time.monotonic() + 600.0
         try:
             async for line in stream_scan_lines(scan_id, poll_interval=0.5, cap_seconds=600.0):
+                if not await guard.still_authorized():
+                    return
                 if time.monotonic() > deadline:
                     yield "event: done\ndata: timeout\n\n"
                     return

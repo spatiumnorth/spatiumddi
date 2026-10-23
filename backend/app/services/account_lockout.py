@@ -10,6 +10,13 @@ Windowed counter semantics: the threshold counts failures inside the
 rolling ``reset_minutes`` window. If the previous failure is older
 than that, the counter starts fresh — so 1 fail every 6 minutes never
 accumulates into a lockout while 5 fails inside 5 minutes does.
+
+Separately, the MFA step of sign-in has a per-account wrong-code budget
+that applies whether or not lockout is enabled (``MFA_FAIL_MAX`` wrong
+codes per ``MFA_FAIL_WINDOW_MINUTES``). It lives on the user row rather
+than in Redis so it holds when Redis is unavailable, and the login
+handler reads it under a row lock so concurrent attempts cannot all see
+an under-budget count.
 """
 
 from __future__ import annotations
@@ -23,6 +30,13 @@ from app.models.auth import User
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
+
+# Wrong second-factor answers (TOTP or recovery code) allowed per account
+# inside the window before the MFA step refuses further attempts. Applies
+# even with lockout disabled. A person mistyping gets several goes; a
+# script guessing codes gets five per quarter-hour.
+MFA_FAIL_MAX = 5
+MFA_FAIL_WINDOW_MINUTES = 15
 
 
 @dataclass(frozen=True)
@@ -100,6 +114,44 @@ def register_success(user: User) -> None:
         user.failed_login_count = 0
         user.failed_login_locked_until = None
         user.last_failed_login_at = None
+    if user.mfa_failed_count or user.mfa_last_failed_at:
+        user.mfa_failed_count = 0
+        user.mfa_last_failed_at = None
+
+
+def _mfa_window_open(user: User, now: datetime) -> bool:
+    return user.mfa_last_failed_at is not None and (now - user.mfa_last_failed_at) <= timedelta(
+        minutes=MFA_FAIL_WINDOW_MINUTES
+    )
+
+
+def mfa_attempts_exhausted(user: User, now: datetime | None = None) -> bool:
+    """True while the account has used its wrong-code budget for the MFA
+    step. The budget frees up ``MFA_FAIL_WINDOW_MINUTES`` after the last
+    counted failure; refused attempts are not counted, so waiting is
+    enough."""
+    now = now or datetime.now(UTC)
+    return (user.mfa_failed_count or 0) >= MFA_FAIL_MAX and _mfa_window_open(user, now)
+
+
+def mfa_retry_after_seconds(user: User, now: datetime | None = None) -> int:
+    """Seconds until ``mfa_attempts_exhausted`` turns false."""
+    now = now or datetime.now(UTC)
+    if user.mfa_last_failed_at is None:
+        return 0
+    left = user.mfa_last_failed_at + timedelta(minutes=MFA_FAIL_WINDOW_MINUTES) - now
+    return max(1, int(left.total_seconds()) + 1)
+
+
+def register_mfa_failure(user: User, now: datetime | None = None) -> bool:
+    """Count one wrong MFA answer against the per-account budget. Returns
+    True iff this failure used up the budget. Caller commits."""
+    now = now or datetime.now(UTC)
+    if not _mfa_window_open(user, now):
+        user.mfa_failed_count = 0
+    user.mfa_failed_count = (user.mfa_failed_count or 0) + 1
+    user.mfa_last_failed_at = now
+    return user.mfa_failed_count == MFA_FAIL_MAX
 
 
 def unlock(user: User) -> bool:
@@ -110,9 +162,13 @@ def unlock(user: User) -> bool:
         user.failed_login_count == 0
         and user.failed_login_locked_until is None
         and user.last_failed_login_at is None
+        and not user.mfa_failed_count
+        and user.mfa_last_failed_at is None
     ):
         return False
     user.failed_login_count = 0
     user.failed_login_locked_until = None
     user.last_failed_login_at = None
+    user.mfa_failed_count = 0
+    user.mfa_last_failed_at = None
     return True

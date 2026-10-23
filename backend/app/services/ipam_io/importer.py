@@ -941,6 +941,7 @@ async def commit_address_import(
     """
     from app.api.v1.ipam.router import _sync_dns_record
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+    from app.services.dns.sync_check import address_own_forward_zone_id
 
     subnet = await _load_subnet(db, subnet_id)
     result_obj = AddressImportResult(subnet_id=str(subnet.id))
@@ -1060,14 +1061,26 @@ async def commit_address_import(
                 if existing_ip.hostname and not had_hostname:
                     # Hostname was just assigned — publish new DNS record.
                     try:
-                        await _sync_dns_record(db, existing_ip, subnet, action="create")
+                        await _sync_dns_record(
+                            db,
+                            existing_ip,
+                            subnet,
+                            zone_id=await address_own_forward_zone_id(db, existing_ip),
+                            action="create",
+                        )
                         result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
                 elif had_hostname and "hostname" in fields:
                     # Hostname changed — republish (sync handles update via re-create).
                     try:
-                        await _sync_dns_record(db, existing_ip, subnet, action="create")
+                        await _sync_dns_record(
+                            db,
+                            existing_ip,
+                            subnet,
+                            zone_id=await address_own_forward_zone_id(db, existing_ip),
+                            action="create",
+                        )
                         result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
