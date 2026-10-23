@@ -20,7 +20,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { CustomField, IPAddress, IPAMTemplate } from "@/lib/api";
+import type { CustomField, DNSZone, IPAddress, IPAMTemplate } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 /** Per API object, the calls a test answers. Anything else stays pending. */
@@ -757,5 +757,51 @@ describe("Allocate IP offers only the statuses its requests accept (#1422)", () 
       ]),
     );
     expect(control<HTMLSelectElement>("Type / Status").value).toBe("allocated");
+  });
+});
+
+// ── #2472 — a forward zone whose name contains "arpa" is offered ─────────────
+describe("the zone pickers tell reverse zones by suffix, not by substring (#2472)", () => {
+  const z = (id: string, name: string) =>
+    ({ id, group_id: "g1", name, kind: "forward" }) as DNSZone;
+  const zones = [
+    z("zp", "plain.test."),
+    z("zs", "scarpa.test."),
+    z("zr", "5.10.in-addr.arpa."),
+    z("z6", "8.b.d.0.1.0.0.2.ip6.arpa."),
+  ];
+
+  function dnsAnswers() {
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: null,
+        dns_additional_zone_ids: [],
+      }),
+    );
+    answer("dnsApi", "listZones", () => Promise.resolve(zones));
+  }
+
+  async function offered(): Promise<string[]> {
+    await findControl("DNS Zone");
+    const picker = await waitFor(() => {
+      const s = control("DNS Zone").querySelector("select");
+      expect(s).toBeTruthy();
+      return s as HTMLSelectElement;
+    });
+    return [...picker.options].map((o) => o.value).filter(Boolean);
+  }
+
+  it("Allocate IP offers both forward zones and no reverse zone", async () => {
+    dnsAnswers();
+    allocateIp();
+    expect(await offered()).toEqual(["zp", "zs"]);
+  });
+
+  it("Edit address offers both forward zones and no reverse zone", async () => {
+    dnsAnswers();
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    open(<EditAddressModal address={address()} onClose={() => {}} />);
+    expect(await offered()).toEqual(["zp", "zs"]);
   });
 });
