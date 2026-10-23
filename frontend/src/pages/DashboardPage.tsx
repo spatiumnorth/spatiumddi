@@ -1023,11 +1023,17 @@ function VrfSummaryCard() {
 // ── Domains Summary card ──────────────────────────────────────────────────────
 
 function DomainsSummaryCard() {
+  const { enabled, ready } = useFeatureModules();
+  // Wait for the real module state: ``enabled`` is optimistically true while
+  // loading, which would fire one 404 on a hard load with the module off.
+  const moduleOn = ready && enabled("network.domains");
   const { data, isLoading, isError } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
+    enabled: moduleOn,
   });
+  if (!moduleOn) return null;
 
   const inner = (() => {
     if (isLoading) {
