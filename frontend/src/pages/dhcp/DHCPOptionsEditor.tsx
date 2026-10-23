@@ -22,7 +22,6 @@ interface StandardDef {
   label: string;
   hint?: string;
   kind: "ip-list" | "string" | "ip";
-  max?: number;
 }
 
 const STANDARD_OPTIONS: StandardDef[] = [
@@ -43,8 +42,9 @@ const STANDARD_OPTIONS: StandardDef[] = [
     name: "dns-servers",
     label: "DNS Servers (option 6)",
     kind: "ip-list",
-    max: 3,
-    hint: "Up to 3 DNS resolver IPs.",
+    // #2482 — no cap: the cut on blur dropped a stored 4th server while the
+    // input still showed it. The API stores the whole list, and so do we.
+    hint: "DNS resolver IPs; clients commonly use the first 3.",
   },
   {
     code: 15,
@@ -305,7 +305,6 @@ export function DHCPOptionsEditor({
       next.push({ code: def.code, name: def.name, value: clean });
     } else if (def.kind === "ip" || def.kind === "ip-list") {
       const list = splitList(clean);
-      if (def.max) list.splice(def.max);
       next.push({ code: def.code, name: def.name, value: list });
     }
     onChange(next);

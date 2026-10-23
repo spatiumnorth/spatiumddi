@@ -389,6 +389,12 @@ export function ExportButton({
             />
             Include IP addresses
           </label>
+          {includeAddrs && (
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              With this ticked the .csv is the address list only. Use .json,
+              .xlsx or Print / PDF for subnets and addresses together.
+            </p>
+          )}
           <div className="space-y-1">
             {(["csv", "json", "xlsx"] as const).map((fmt) => (
               <button

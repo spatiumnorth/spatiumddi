@@ -711,6 +711,33 @@ def _normalize_mac_for_kea(raw: str) -> str | None:
     return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
 
 
+def _add_mac_blocklist_class(
+    rendered_classes: list[dict[str, Any]], drop_expr: str, *, family: str
+) -> None:
+    """Add the MAC blocklist to ``rendered_classes`` as Kea's ``DROP`` class.
+
+    Kea drops any packet in a class named ``DROP``, and only that name does
+    it, so the blocklist cannot be rendered under another name. An operator
+    class already called ``DROP`` (stored before the API refused the name,
+    #2296) is not skipped and not renamed: renaming it would stop it
+    dropping the packets it drops today, and skipping the blocklist would
+    leave every blocked MAC served. Instead the one ``DROP`` class matches
+    either: the operator's test OR the blocklist. A ``DROP`` with no test
+    (assigned only by reservations) takes the blocklist as its test, which
+    keeps those assignments working. Two classes of one name would make Kea
+    reject the whole config, so this is the only shape that keeps both.
+    """
+    if not drop_expr:
+        return
+    existing = next((c for c in rendered_classes if c.get("name") == "DROP"), None)
+    if existing is None:
+        rendered_classes.append({"name": "DROP", "test": drop_expr})
+        return
+    own = existing.get("test")
+    existing["test"] = f"({own}) or ({drop_expr})" if own else drop_expr
+    _log.warning("mac_blocklist_merged_into_operator_drop_class", family=family)
+
+
 def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
     """Build a Kea client-class ``test`` expression for the DROP list.
 
@@ -1412,12 +1439,12 @@ def render(
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently
     # dropped before allocation. ``DROP`` is a Kea built-in name, not
-    # something the operator can reuse — so if a user-defined class is
-    # already named ``DROP`` we skip blocklist rendering to avoid
-    # clobbering it (defensive; the API already reserves the name).
+    # something the operator can reuse. The API refuses the name since #2296,
+    # but a class stored before that may still carry it: see
+    # ``_add_mac_blocklist_class``, which keeps that class dropping what it
+    # dropped and enforces the blocklist too.
     drop_expr = _build_drop_expression(bundle.get("mac_blocks") or [])
-    if drop_expr and not any(c.get("name") == "DROP" for c in rendered_classes):
-        rendered_classes.append({"name": "DROP", "test": drop_expr})
+    _add_mac_blocklist_class(rendered_classes, drop_expr, family="ipv4")
 
     if rendered_classes:
         dhcp4["client-classes"] = rendered_classes
@@ -1558,8 +1585,7 @@ def render(
             if _class_in_family(c, "ipv6")
         ]
         drop_expr_v6 = _build_drop_expression_v6(bundle.get("mac_blocks") or [])
-        if drop_expr_v6 and not any(c.get("name") == "DROP" for c in rendered_classes_v6):
-            rendered_classes_v6.append({"name": "DROP", "test": drop_expr_v6})
+        _add_mac_blocklist_class(rendered_classes_v6, drop_expr_v6, family="ipv6")
         if rendered_classes_v6:
             dhcp6["client-classes"] = rendered_classes_v6
     out["Dhcp6"] = dhcp6

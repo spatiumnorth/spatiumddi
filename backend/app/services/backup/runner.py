@@ -31,7 +31,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -225,6 +225,36 @@ async def reap_stale_backup_run(
     now = datetime.now(UTC)
     if not backup_run_is_stale(target, now):
         return False
+    # #2097 — a restore puts back the claim its archive holds, two hours old
+    # if the archive is, and settles it only after the replay has committed.
+    # Reaping in between stamps a run that succeeded ``failed`` and lets the
+    # caller fire a new one, which the settle then leaves alone as live. So:
+    # lock the row and read it again (the caller's copy may predate the
+    # replay or the settle), then refuse while a restore holds its lock. The
+    # row lock is what makes the order safe: the settle commits before the
+    # restore lock is released, and it cannot commit this row while we hold
+    # it, so either the re-read sees the settled row or the lock is still
+    # held when we look.
+    from app.services.backup.restore import restore_lock_held  # noqa: PLC0415
+
+    current = (
+        await db.execute(
+            select(BackupTarget)
+            .where(BackupTarget.id == target.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if current is None or not backup_run_is_stale(current, now):
+        # commit, not rollback: a rollback expires every loaded object, and
+        # the sweep goes on reading the rest of its rows.
+        await db.commit()
+        return False
+    target = current
+    if await restore_lock_held(db):
+        await db.commit()
+        logger.info("backup_stale_reap_deferred_restore", target_id=str(target.id))
+        return False
     started_at = target.last_run_at
     error = (
         f"run marked in progress since {started_at.isoformat() if started_at else 'an unknown time'} "
@@ -272,6 +302,146 @@ async def reap_stale_backup_run(
     return True
 
 
+async def reconcile_restored_run_claims(
+    db: AsyncSession,
+    *,
+    manifest: dict[str, Any],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Settle the ``in_progress`` claims a restore brought back (#2097).
+
+    The runner commits its claim BEFORE the dump, so every archive a
+    target's own run writes holds that target ``in_progress``; restoring
+    it put the claim back with no process behind it. The target then
+    refused Run now (409) and was held off its schedule until the 2 h
+    reap stamped a run that had succeeded ``failed``.
+
+    Only claims the archive can have produced are touched: ``in_progress``
+    with ``last_run_at`` at or before the archive's ``created_at``. A
+    claim made after the dump was not restored from it, so it is a live
+    run's and is left alone (a restore that skips the backup-target table
+    never reaches here). Of those:
+
+    * the target named by ``manifest["run"]`` wrote this archive, so its
+      run succeeded: ``success`` with the archive's filename and node
+      (``last_run_node``, #1838/#1901). Bytes and duration are unknown.
+      Its claim is recognised by the exact ``claimed_at`` the manifest
+      records (by the window, for a record without one). ``success`` is
+      honest because every destination writes atomically (temp + rename,
+      or one PUT) and the archive leaves the process only through that
+      write: an intact archive under its name exists only where the
+      write landed;
+    * any other (a run in flight when the dump was taken, or an archive
+      from before the manifest recorded its run) has an unknown outcome:
+      ``failed`` with a message saying so. If its process is in fact
+      still alive its own terminal stamp overwrites this.
+
+    ``next_run_at`` is recomputed so a scheduled target is not held.
+    Returns one dict per settled target, for the restore's audit.
+    """
+    now = now or datetime.now(UTC)
+    created_raw = manifest.get("created_at")
+    try:
+        created_at = datetime.fromisoformat(str(created_raw))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+    except ValueError:
+        return []
+    raw_run = manifest.get("run")
+    run: dict[str, Any] = raw_run if isinstance(raw_run, dict) else {}
+    owner_id = str(run.get("target_id") or "")
+    # The exact ``last_run_at`` the writing run's claim stamped. When
+    # present the owner is recognised by it rather than by the window
+    # below, so a clock stepped between the claim and the dump cannot
+    # turn the archive's own claim into "unknown outcome".
+    claimed_at: datetime | None = None
+    if run.get("claimed_at"):
+        try:
+            claimed_at = datetime.fromisoformat(str(run["claimed_at"]))
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+        except ValueError:
+            claimed_at = None
+    rows = (
+        (
+            await db.execute(
+                select(BackupTarget).where(BackupTarget.last_run_status == "in_progress")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    settled: list[dict[str, Any]] = []
+    for target in rows:
+        is_owner = (
+            bool(owner_id)
+            and str(target.id) == owner_id
+            and bool(run.get("filename"))
+            and (claimed_at is None or target.last_run_at == claimed_at)
+        )
+        # Anything else must predate the dump to have come from it. A
+        # claim stamped later is a live run's (the restore replaced the
+        # table, so only a run started since can have made it) and is
+        # left alone. Claims are stamped by the clock of whichever node
+        # ran them: an archived claim from a node running ahead reads as
+        # newer and is left for the 2 h reap (the old behaviour, not a
+        # wrong stamp), and a live claim reads as archived only from a
+        # clock lagging by more than the archive's age.
+        if (
+            not (is_owner and claimed_at is not None)
+            and target.last_run_at is not None
+            and target.last_run_at > created_at
+        ):
+            continue
+        if is_owner:
+            target.last_run_status = "success"
+            target.last_run_filename = str(run["filename"])
+            target.last_run_node = run.get("node") or None
+            target.last_run_error = None
+            outcome = "success"
+        else:
+            target.last_run_status = "failed"
+            target.last_run_error = (
+                "this run was in progress when the restored archive was taken; "
+                "its outcome was not recorded in the archive. If it was running "
+                "on another node it will stamp its own result when it ends."
+            )
+            outcome = "failed"
+        if target.schedule_cron:
+            try:
+                target.next_run_at = compute_next_run(target.schedule_cron, after=now)
+            except Exception:  # noqa: BLE001 — a bad cron must not wedge the restore
+                target.next_run_at = None
+        db.add(
+            AuditLog(
+                action="backup_target_run_reconciled",
+                resource_type="backup_target",
+                resource_id=str(target.id),
+                resource_display=target.name,
+                user_id=None,
+                user_display_name="system (restore reconcile)",
+                result="success",
+                new_value={
+                    "reason": "in_progress claim restored from an archive",
+                    "settled_as": outcome,
+                    "filename": target.last_run_filename,
+                    "node": target.last_run_node,
+                },
+            )
+        )
+        settled.append(
+            {
+                "target_id": str(target.id),
+                "name": target.name,
+                "settled_as": outcome,
+                "filename": target.last_run_filename,
+            }
+        )
+    if settled:
+        await db.commit()
+    return settled
+
+
 def _decrypt_passphrase(target: BackupTarget) -> str:
     """Pull the operator's per-target passphrase out of the
     Fernet-encrypted column. Surfaces a clean
@@ -293,6 +463,7 @@ async def _retention_sweep(
     *,
     target: BackupTarget,
     config: dict[str, Any],
+    just_written: str | None = None,
 ) -> int:
     """Drop archives outside the target's retention window. One of
     ``retention_keep_last_n`` / ``retention_keep_days`` may be set
@@ -396,13 +567,33 @@ async def _retention_sweep(
         return True
 
     deleted = 0
+    # Retention never removes the newest backup, nor the archive this run
+    # just wrote, whatever the stored policy says (#2503). A stored 0 (the
+    # API used to accept it) or a keep-days cutoff at "now" would otherwise
+    # match the whole listing and leave the target with no backup at all
+    # while the run reported success.
+    backups = sorted(backups, key=lambda a: a.created_at, reverse=True)
+    protected: set[str] = {backups[0].filename} if backups else set()
+    if just_written:
+        protected.add(just_written)
+        if target.retention_keep_last_n is not None and target.retention_keep_last_n < 1:
+            # A legacy stored 0 reads as 1, which would keep only the file
+            # just written and prune the newest archive that existed before
+            # this run. Keep that one too; keep-last-N >= 1 counts as before.
+            previous = next((a.filename for a in backups if a.filename != just_written), None)
+            if previous:
+                protected.add(previous)
     if target.retention_keep_last_n is not None:
-        keep_n = max(target.retention_keep_last_n, 0)
+        keep_n = max(target.retention_keep_last_n, 1)
         for stale in backups[keep_n:]:
+            if stale.filename in protected:
+                continue
             deleted += 1 if await _prune(stale.filename) else 0
     elif target.retention_keep_days is not None:
         cutoff = datetime.now(UTC).timestamp() - target.retention_keep_days * 86400
         for archive in backups:
+            if archive.filename in protected:
+                continue
             if archive.created_at.timestamp() < cutoff:
                 deleted += 1 if await _prune(archive.filename) else 0
     # Safety dumps: their own keep-last-N, independent of which (if
@@ -506,13 +697,39 @@ async def run_backup_for_target(
             db,
             passphrase=passphrase,
             passphrase_hint=target.passphrase_hint or None,
+            run_target_id=str(target.id),
+            run_claimed_at=started,
         )
         await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
-        deleted = await _retention_sweep(db, target=target, config=plain_config)
+        # The archive is already on the destination here, so a retention
+        # failure (listing refused, driver bug) must not stamp the run
+        # failed: the backup exists. It is logged and surfaced on the
+        # target's ``last_run_error`` instead (#2503).
+        deleted = 0
+        retention_error: str | None = None
+        retention_exc: Exception | None = None
+        try:
+            deleted = await _retention_sweep(
+                db, target=target, config=plain_config, just_written=filename
+            )
+        except Exception as exc:  # noqa: BLE001
+            retention_exc = exc
+            retention_error = str(exc)
+            logger.warning(
+                "backup_retention_sweep_failed",
+                target_id=str(target.id),
+                kind=target.kind,
+                error=retention_error,
+            )
 
         finished = datetime.now(UTC)
         duration_ms = int((finished - started).total_seconds() * 1000)
         target.last_run_status = "success"
+        target.last_run_error = (
+            f"Backup written, but retention could not run: {retention_error}"[:5000]
+            if retention_error
+            else None
+        )
         target.last_run_filename = filename
         # #1838 — where the archive physically is when the destination
         # is node-local (a ``local_volume`` hostPath on a multi-node
@@ -532,6 +749,8 @@ async def run_backup_for_target(
                 "node_name": target.last_run_node,
             }
         )
+        if retention_exc is not None:
+            result["retention_failure_category"] = backup_failure_category(retention_exc)
         action = "backup_target_run_success"
         result_state = "success"
     except (BackupArchiveError, BackupDestinationError, SecretFieldError) as exc:

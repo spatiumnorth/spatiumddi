@@ -28,6 +28,32 @@ _BUILTIN_PREFIXES = ("HA_", "VENDOR_CLASS_", "SPAWN_")
 _GENERATED_RE = re.compile(r"^(pxe-[0-9a-f]{8}-[0-9a-f]{8}|voip-[0-9a-f]{8})$")
 
 
+# Prefix of the class a device policy compiles to (``slugify_class_name``).
+_DEVICE_POLICY_PREFIX = "spatium-device-"
+
+
+def reserved_name_reason(name: str) -> str | None:
+    """Why an operator client class may not carry ``name`` (#2296), else None.
+
+    An operator class with one of these names would either replace a class the
+    renderer generates (``DROP`` is the MAC blocklist: the agent skips the
+    generated one when a user class already has the name, so the blocklist
+    would silently stop blocking) or redefine one Kea owns, which Kea rejects
+    for the WHOLE config. Built-ins are matched case-insensitively so ``drop``
+    cannot be mistaken for a distinct, harmless class.
+    """
+    upper = name.upper()
+    if upper in KEA_BUILTIN_CLASSES:
+        return f"'{name}' is a Kea built-in client class"
+    if name.upper().startswith(_BUILTIN_PREFIXES):
+        return f"names starting with {name[: name.index('_') + 1].upper()} are reserved by Kea"
+    if name.startswith(_DEVICE_POLICY_PREFIX):
+        return f"names starting with '{_DEVICE_POLICY_PREFIX}' are generated from device policies"
+    if _GENERATED_RE.match(name):
+        return f"'{name}' is a name generated for a PXE / phone profile"
+    return None
+
+
 def is_builtin_or_generated(name: str) -> bool:
     return (
         name in KEA_BUILTIN_CLASSES

@@ -395,7 +395,13 @@ async def create_pool(
     )
     await db.commit()
     await db.refresh(pool)
-    existing = await _existing_ips_in_range(db, scope.subnet_id, body.start_ip, body.end_ip)
+    # #2445 — the "may conflict with dynamic leases" notice is only true of a
+    # dynamic pool; excluded / reserved pools hand out no dynamic leases.
+    existing = (
+        await _existing_ips_in_range(db, scope.subnet_id, body.start_ip, body.end_ip)
+        if body.pool_type == "dynamic"
+        else []
+    )
     resp = PoolResponse.model_validate(pool, from_attributes=True)
     resp.existing_ips_in_range = existing or None
     return resp
