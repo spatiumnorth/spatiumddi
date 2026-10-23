@@ -41,7 +41,7 @@ _REDIS = "app.services.nettools.throttle.make_async_redis"
 
 class _CountingRedis:
     """Just enough of the async Redis client for the throttle: a shared
-    ``incr`` counter, so successive calls really accumulate."""
+    counter script, so successive calls really accumulate."""
 
     def __init__(self) -> None:
         self.counts: dict[str, int] = {}
@@ -49,12 +49,10 @@ class _CountingRedis:
     def __call__(self, *_a: Any, **_kw: Any) -> _CountingRedis:
         return self
 
-    async def incr(self, key: str) -> int:
+    async def eval(self, _script: str, _numkeys: int, key: str, *_args: Any) -> int:
+        # The throttle's INCR-and-open-window script.
         self.counts[key] = self.counts.get(key, 0) + 1
         return self.counts[key]
-
-    async def expire(self, key: str, seconds: int) -> None:
-        return None
 
     async def aclose(self) -> None:
         return None
