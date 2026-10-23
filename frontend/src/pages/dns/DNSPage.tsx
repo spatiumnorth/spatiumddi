@@ -1832,8 +1832,8 @@ function ServerModal({
                 <span className="block text-xs text-muted-foreground">
                   The server DDNS and record writes are applied at. Exactly one
                   per group &mdash; ticking this demotes whichever server holds
-                  it now. A group with no primary silently drops every record
-                  write to its zones, so it can only be moved, not cleared.
+                  it now. A group left without one has a primary re-elected
+                  automatically, so the flag can only be moved, not cleared.
                 </span>
               </span>
             </label>
