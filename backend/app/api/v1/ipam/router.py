@@ -89,6 +89,10 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.address_set_gate import (
     user_can_write_ip as _user_can_write_ip,
 )
+from app.services.ipam.custom_field_rules import (
+    enforce_required_custom_fields,
+    inherited_block_custom_fields,
+)
 from app.services.ipam.hygiene import (
     DEFAULT_FREE_RESPONDING_DAYS,
     DEFAULT_SQUAT_DAYS,
@@ -4499,6 +4503,16 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 detail=f"{body.network} is not contained within parent block {parent.network}",
             )
 
+    # A Required custom field needs a value (#2478), after any template
+    # pre-fill above, counting what the parent chain already carries.
+    await enforce_required_custom_fields(
+        db,
+        "ip_block",
+        body.custom_fields,
+        inherited=await inherited_block_custom_fields(db, body.parent_block_id),
+        creating=True,
+    )
+
     # Reject duplicates / overlaps at the same tree level. Any
     # existing sibling that's a strict subset of the new block is
     # returned for reparenting — treat the new block as their parent
@@ -4638,6 +4652,25 @@ async def update_block(
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
         already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
     )
+
+    # Required custom fields (#2478): checked only when the request sends
+    # custom_fields, and only for a field it sends or the block already holds.
+    if body.custom_fields is not None:
+        await enforce_required_custom_fields(
+            db,
+            "ip_block",
+            body.custom_fields,
+            inherited=await inherited_block_custom_fields(
+                db,
+                (
+                    body.parent_block_id
+                    if "parent_block_id" in body.model_fields_set
+                    else block.parent_block_id
+                ),
+            ),
+            stored=block.custom_fields,
+            creating=False,
+        )
 
     old = {
         "name": block.name,
@@ -5536,6 +5569,16 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             )
         # Override to enforce consistency
         body.vlan_id = vlan_obj.vlan_id
+
+    # A Required custom field needs a value (#2478), after any template
+    # pre-fill above, counting what the block chain already carries.
+    await enforce_required_custom_fields(
+        db,
+        "subnet",
+        body.custom_fields,
+        inherited=await inherited_block_custom_fields(db, body.block_id),
+        creating=True,
+    )
 
     # spatiumddi#1065 — a subnet-level DDNS opt-in is a request for THIS
     # subnet's DDNS settings, so it turns the family's inheritance off:
@@ -6668,6 +6711,18 @@ async def update_subnet(
                     ),
                 )
             body.vlan_id = vlan_obj.vlan_id
+
+    # Required custom fields (#2478): checked only when the request sends
+    # custom_fields, and only for a field it sends or the subnet already holds.
+    if body.custom_fields is not None:
+        await enforce_required_custom_fields(
+            db,
+            "subnet",
+            body.custom_fields,
+            inherited=await inherited_block_custom_fields(db, body.block_id or subnet.block_id),
+            stored=subnet.custom_fields,
+            creating=False,
+        )
 
     old = {
         "name": subnet.name,
