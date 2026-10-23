@@ -128,6 +128,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A nightly no longer calls itself `nightly-YYYYMMDD` in the update
+  check, the upgrade pre-flight and the DNS bundle stamp (#2354).**
+  #2111 gave `GET /version` one spelling of a nightly
+  (`0.0.0-nightly-YYYYMMDD+sha`), but three places still read the bare
+  image tag, which names no build date: the daily update check offered a
+  nightly a release it already includes, the upgrade pre-flight called it
+  "not a release" instead of "already includes the target", and every DNS
+  server row's `bundle_app_version` named the build differently from
+  `/version`. All three now use `canonical_version`. Releases are
+  unaffected. Existing server rows pick up the new spelling on their next
+  render.
+
 - **PowerDNS agent answers on IPv6 as well as IPv4 (#2307).** The agent
   rendered `local-address=0.0.0.0`, which replaces pdns's default and so
   never bound `::`: IPv6 clients got no answer while BIND9 groups did, and
