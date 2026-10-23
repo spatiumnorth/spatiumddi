@@ -14,7 +14,9 @@ Drift buckets:
 - **stale**:      A DNSRecord exists with ``auto_generated=True`` and an
                   ``ip_address_id`` that no longer points at a live address in
                   this subnet. Most commonly: the IPAddress was deleted but
-                  the record was left behind by an earlier code path.
+                  the record was left behind by an earlier code path. Such an
+                  orphan is this subnet's only when the address it is for
+                  lies inside the subnet (#2577) — its zone is shared.
 
 The compute function is read-only. Apply happens via ``_sync_dns_record`` in
 the IPAM router (for create/update) or direct row delete (for stale).
@@ -265,6 +267,36 @@ def ptr_address(
     except ValueError:
         return None
     return None
+
+
+def _orphan_in_subnet(
+    rec: DNSRecord,
+    rev_zones_by_id: dict[uuid.UUID, DNSZone],
+    subnet_net: ipaddress.IPv4Network | ipaddress.IPv6Network | None,
+) -> bool:
+    """Whether an auto-generated record with no ``ip_address_id`` is for an
+    address inside ``subnet_net`` (#2577).
+
+    The address is the record's value for an A / AAAA and its owner name for
+    a PTR in one of the subnet's reverse zones. Anything else — another
+    record type, a value or owner name that is not an address, a subnet whose
+    network will not parse — cannot be attributed to this subnet and is not
+    reported: offering a record for deletion on the strength of the zone it
+    sits in alone is the over-reach this guards against.
+    """
+    if subnet_net is None:
+        return False
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address | None
+    if rec.record_type in ("A", "AAAA"):
+        try:
+            addr = ipaddress.ip_address(str(rec.value).strip())
+        except ValueError:
+            return False
+    elif rec.record_type == "PTR" and rec.zone_id in rev_zones_by_id:
+        addr = ptr_address(rec.name, rev_zones_by_id[rec.zone_id].name)
+    else:
+        return False
+    return addr is not None and addr.version == subnet_net.version and addr in subnet_net
 
 
 # #844 — log-dedupe for the cross-space skip. Per-IP call site, so an unfixed
@@ -762,7 +794,6 @@ async def compute_subnet_dns_drift(
     candidate_zone_ids = [
         z.id for z in (forward_zone, *subnet_rev_zones) if z is not None and ipam_authors_zone(z)
     ]
-    rev_zone_ids = {z.id for z in subnet_rev_zones}
     if candidate_zone_ids:
         orphan_res = await db.execute(
             select(DNSRecord).where(
@@ -779,15 +810,16 @@ async def compute_subnet_dns_drift(
             # recreate them on its next pass, flapping the name).
             if dns_record_owned_elsewhere(r):
                 continue
-            if r.record_type == "PTR" and r.zone_id in rev_zone_ids and subnet_net is not None:
-                # A reverse zone is shared by every subnet in its /24 (a /25
-                # pair, spatiumddi#1840): only a PTR for one of THIS subnet's
-                # addresses is this subnet's orphan.
-                addr = ptr_address(r.name, rev_zones_by_id[r.zone_id].name)
-                if addr is not None and (
-                    addr.version != subnet_net.version or addr not in subnet_net
-                ):
-                    continue
+            # A zone is shared: a reverse zone by every subnet in its /24 (a
+            # /25 pair, spatiumddi#1840), a forward zone by every subnet and
+            # every space that names it. An orphan has lost the link that said
+            # whose it was, so the only evidence left is the address it is
+            # for — and it is THIS subnet's stale record only when that
+            # address lies inside this subnet. Reporting the zone's orphans
+            # wholesale offered every other subnet's (and space's) orphans
+            # for deletion here, and the auto-sync deleted them (#2577).
+            if not _orphan_in_subnet(r, rev_zones_by_id, subnet_net):
+                continue
             zone_name = (
                 forward_zone.name
                 if forward_zone and r.zone_id == forward_zone.id

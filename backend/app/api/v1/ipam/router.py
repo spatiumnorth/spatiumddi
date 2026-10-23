@@ -7620,6 +7620,11 @@ class DnsSyncCommitResponse(BaseModel):
     updated: int
     deleted: int
     errors: list[str]
+    # #2577 — stale record IDs the request asked to delete that the scope's
+    # own drift report does not list (another subnet's or space's orphan, a
+    # record that is no longer stale, or one that does not exist). They are
+    # ignored, never deleted, and listed here so a client can tell.
+    skipped_stale_record_ids: list[uuid.UUID] = []
 
 
 class DnsSyncSummaryResponse(BaseModel):
@@ -7692,20 +7697,49 @@ async def dns_sync_preview(
     )
 
 
+def _stale_ids(report: Any) -> frozenset[uuid.UUID]:
+    """The record IDs a drift report lists as stale (#2577)."""
+    return frozenset(s.record_id for s in report.stale)
+
+
 async def _apply_dns_sync(
     db: AsyncSession,
     body: DnsSyncCommitRequest,
     *,
+    allowed_stale_ids: Iterable[uuid.UUID] = (),
     restrict_subnet_id: uuid.UUID | None = None,
+    skipped_stale_out: list[uuid.UUID] | None = None,
 ) -> tuple[int, int, int, list[str]]:
     """Apply create/update/delete actions, looking up each IP's owning subnet
     on the fly. ``restrict_subnet_id`` scopes the create/update set to a
     single subnet (used by the per-subnet endpoint); aggregate endpoints
-    leave it None."""
+    leave it None.
+
+    ``allowed_stale_ids`` is the stale set of the scope being synced, from
+    its own drift report computed server-side: a stale ID the client sends
+    is deleted only when that set also lists it (#2577). It defaults to
+    empty, so a caller that does not pass one deletes nothing (fail closed).
+    The client's list used to be trusted outright, so a commit could delete
+    any auto-generated record in the install — another subnet's, another
+    space's — by naming it. The rest are ignored rather than refused, so one
+    record that stopped being stale between preview and commit does not
+    fail the whole sync; they are appended to ``skipped_stale_out``."""
     created = 0
     updated = 0
     deleted = 0
     errors: list[str] = []
+
+    allowed = frozenset(allowed_stale_ids)
+    delete_ids = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid in allowed]
+    skipped = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid not in allowed]
+    if skipped:
+        logger.warning(
+            "dns_sync_stale_ids_outside_scope",
+            skipped=len(skipped),
+            restrict_subnet_id=str(restrict_subnet_id) if restrict_subnet_id else None,
+        )
+        if skipped_stale_out is not None:
+            skipped_stale_out.extend(skipped)
 
     ip_ids_to_sync: set[uuid.UUID] = set(body.create_for_ip_ids)
     skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
@@ -7803,7 +7837,7 @@ async def _apply_dns_sync(
             elif fip.id in ip_ids_to_sync:
                 updated = max(0, updated - 1)
 
-    if body.delete_stale_record_ids:
+    if delete_ids:
         from app.services.dns.record_ops import (  # noqa: PLC0415
             enqueue_record_ops_batch,
         )
@@ -7811,7 +7845,7 @@ async def _apply_dns_sync(
         stale_res = await db.execute(
             select(DNSRecord)
             .where(
-                DNSRecord.id.in_(body.delete_stale_record_ids),
+                DNSRecord.id.in_(delete_ids),
                 DNSRecord.auto_generated.is_(True),
             )
             .options(selectinload(DNSRecord.zone))
@@ -7956,10 +7990,20 @@ async def dns_sync_commit(
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
 
+    from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
+
+    # #2577 — the subnet's own stale set, recomputed here: only a record it
+    # lists may be deleted, whatever IDs the request names.
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(await compute_subnet_dns_drift(db, subnet_id))
+    skipped: list[uuid.UUID] = []
     created, updated, deleted, errors = await _apply_dns_sync(
         db,
         body,
+        allowed_stale_ids=allowed,
         restrict_subnet_id=subnet_id,
+        skipped_stale_out=skipped,
     )
 
     if created or updated or deleted:
@@ -7975,11 +8019,18 @@ async def dns_sync_commit(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 @router.get(
@@ -8023,7 +8074,21 @@ async def dns_sync_commit_block(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=404, detail="Block not found")
-    created, updated, deleted, errors = await _apply_dns_sync(db, body)
+    from app.services.dns.sync_check import compute_block_dns_drift  # noqa: PLC0415
+
+    # #2577 — deletable only what the block's own report lists (the same
+    # subnet scope the preview applied to this caller).
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(
+            await compute_block_dns_drift(
+                db, block_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+            )
+        )
+    skipped: list[uuid.UUID] = []
+    created, updated, deleted, errors = await _apply_dns_sync(
+        db, body, allowed_stale_ids=allowed, skipped_stale_out=skipped
+    )
     if created or updated or deleted:
         db.add(
             _audit(
@@ -8037,11 +8102,18 @@ async def dns_sync_commit_block(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 @router.get(
@@ -8084,7 +8156,20 @@ async def dns_sync_commit_space(
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
-    created, updated, deleted, errors = await _apply_dns_sync(db, body)
+    from app.services.dns.sync_check import compute_space_dns_drift  # noqa: PLC0415
+
+    # #2577 — deletable only what the space's own report lists.
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(
+            await compute_space_dns_drift(
+                db, space_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+            )
+        )
+    skipped: list[uuid.UUID] = []
+    created, updated, deleted, errors = await _apply_dns_sync(
+        db, body, allowed_stale_ids=allowed, skipped_stale_out=skipped
+    )
     if created or updated or deleted:
         db.add(
             _audit(
@@ -8098,11 +8183,18 @@ async def dns_sync_commit_space(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 # ── Reverse-zone backfill ──────────────────────────────────────────────────────
