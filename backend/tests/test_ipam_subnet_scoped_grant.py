@@ -95,29 +95,27 @@ async def test_scoped_grant_does_not_reach_other_subnets_or_aggregates(
 
     # The sibling subnet Y: every verb refused.
     assert (await client.get(f"/api/v1/ipam/subnets/{y.id}", headers=h)).status_code == 403
-    assert (
-        await client.put(f"/api/v1/ipam/subnets/{y.id}", json={"description": "no"}, headers=h)
-    ).status_code == 403
+    resp = await client.put(f"/api/v1/ipam/subnets/{y.id}", json={"description": "no"}, headers=h)
+    assert resp.status_code == 403
     assert (
         await client.get(f"/api/v1/ipam/subnets/{y.id}/addresses", headers=h)
     ).status_code == 403
-    assert (
-        await client.post(
-            f"/api/v1/ipam/subnets/{y.id}/addresses",
-            json={"address": "10.0.6.20", "hostname": "h1"},
-            headers=h,
-        )
-    ).status_code == 403
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{y.id}/addresses",
+        json={"address": "10.0.6.20", "hostname": "h1"},
+        headers=h,
+    )
+    assert resp.status_code == 403
     # Aggregates and structure above the subnet stay closed.
     assert (await client.get("/api/v1/ipam/spaces", headers=h)).status_code == 403
     assert (await client.get("/api/v1/ipam/blocks", headers=h)).status_code == 403
     # Write routes that are not on the allow-list stay refused even for X.
-    assert (await client.delete(f"/api/v1/ipam/subnets/{x.id}", headers=h)).status_code == 403
-    assert (
-        await client.post(
-            f"/api/v1/ipam/subnets/{x.id}/resize", json={"new_network": "10.0.5.0/23"}, headers=h
-        )
-    ).status_code in (403, 422)
+    resp = await client.delete(f"/api/v1/ipam/subnets/{x.id}", headers=h)
+    assert resp.status_code == 403
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{x.id}/resize", json={"new_network": "10.0.5.0/23"}, headers=h
+    )
+    assert resp.status_code in (403, 422)
     # Re-parenting X under another block touches a resource the grant does not name.
     mv = await client.put(
         f"/api/v1/ipam/subnets/{x.id}", json={"block_id": str(other.id)}, headers=h
@@ -133,16 +131,14 @@ async def test_scoped_read_only_cannot_write(db_session: AsyncSession, client: A
     )
     await db_session.commit()
     assert (await client.get(f"/api/v1/ipam/subnets/{x.id}", headers=h)).status_code == 200
-    assert (
-        await client.put(f"/api/v1/ipam/subnets/{x.id}", json={"description": "n"}, headers=h)
-    ).status_code == 403
-    assert (
-        await client.post(
-            f"/api/v1/ipam/subnets/{x.id}/addresses",
-            json={"address": "10.0.5.21", "hostname": "h1"},
-            headers=h,
-        )
-    ).status_code == 403
+    resp = await client.put(f"/api/v1/ipam/subnets/{x.id}", json={"description": "n"}, headers=h)
+    assert resp.status_code == 403
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{x.id}/addresses",
+        json={"address": "10.0.5.21", "hostname": "h1"},
+        headers=h,
+    )
+    assert resp.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -407,16 +403,14 @@ async def test_soft_deleted_subnet_is_not_reachable(
     # loads the subnet the way a fresh request session would.
     db_session.expunge_all()
     assert (await client.get(f"/api/v1/ipam/subnets/{xid}", headers=h)).status_code == 404
-    assert (
-        await client.put(f"/api/v1/ipam/subnets/{xid}", json={"description": "z"}, headers=h)
-    ).status_code == 404
-    assert (
-        await client.post(
-            f"/api/v1/ipam/subnets/{xid}/addresses",
-            json={"address": "10.0.5.60", "hostname": "h60"},
-            headers=h,
-        )
-    ).status_code == 404
+    resp = await client.put(f"/api/v1/ipam/subnets/{xid}", json={"description": "z"}, headers=h)
+    assert resp.status_code == 404
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{xid}/addresses",
+        json={"address": "10.0.5.60", "hostname": "h60"},
+        headers=h,
+    )
+    assert resp.status_code == 404
     lst = await client.get("/api/v1/ipam/subnets", headers=h)
     assert lst.status_code == 200 and lst.json() == []
 
