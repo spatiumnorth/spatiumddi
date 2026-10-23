@@ -190,7 +190,7 @@ _DB_MAX_OUTAGES_PER_STEP = 3
 # endpoints (its operator pod rescheduling off a cordoned node). One 500 used to
 # fail the step and the whole run at cnpg_maintenance_on. Only the writes that
 # are safe to repeat retry, and only a kubeapi helper's own answer.
-KUBEAPI_RETRY_STEPS: frozenset[StepName] = frozenset({"cnpg_maintenance_on"})
+KUBEAPI_RETRY_STEPS: frozenset[StepName] = frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})
 KUBEAPI_RETRY_BUDGET_S = 300.0
 _KUBEAPI_RETRY_INTERVAL_S = 15.0
 _KUBEAPI_TRANSIENT_STATUSES = frozenset({408, 409, 429})

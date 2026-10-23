@@ -13,8 +13,8 @@ which is how the kubeapi helpers report a 500 (``k8s.py`` catches the socket
 error and the HTTP status into ``(False, "kubeapi ...")``). The fix tries the
 idempotent writes again, within a budget, for a transient kubeapi answer only.
 
-* cnpg_maintenance_on rides out a transient 500/408/409/429 and a socket error,
-  and succeeds when it clears.
+* cnpg_maintenance_on, cordon and uncordon ride out a transient 500/408/409/429
+  and a socket error, and succeed when it clears.
 * An answer that never clears fails the step once the budget is spent, with the
   server's own error, as before.
 * A permission refusal, a sub-500 status, a non-kubeapi error, and a transient
@@ -94,6 +94,15 @@ async def test_a_socket_error_is_also_ridden_out(monkeypatch: pytest.MonkeyPatch
     assert len(calls) == 3
 
 
+@pytest.mark.parametrize("step", ["cordon", "uncordon"])
+async def test_cordon_and_uncordon_also_retry_a_transient_answer(
+    step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, calls = await _run(step, [WEBHOOK_500], monkeypatch)
+    assert result.ok is True
+    assert len(calls) == 2
+
+
 async def test_an_answer_that_never_clears_fails_with_its_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -164,5 +173,5 @@ def test_kubeapi_transient_classification(error: str | None, transient: bool) ->
 
 
 def test_the_retry_steps_are_the_idempotent_writes() -> None:
-    # The write step that holds the node's maintenance window; never a read or a wait.
-    assert per_node.KUBEAPI_RETRY_STEPS == frozenset({"cnpg_maintenance_on"})
+    # The write steps that hold or release the node; never a read or a wait.
+    assert per_node.KUBEAPI_RETRY_STEPS == frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})

@@ -13,7 +13,8 @@
   answer (a 5xx, 408, 409 or 429, or a socket error that never
   reached the server), in place, for up to five minutes from the
   first such answer, the way the shared-tag writes do (#2056). Only
-  a kubeapi helper's own answer is retried: a permission
+  the idempotent per-node writes retry, cnpg_maintenance_on, cordon
+  and uncordon, and only a kubeapi helper's own answer: a permission
   refusal, a sub-500 status, and a non-kubeapi error still fail at
   once, and an answer that never clears fails the step with the
   server's own error once the budget is spent.
