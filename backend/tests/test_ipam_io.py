@@ -425,3 +425,41 @@ async def test_export_xlsx_sanitizes_cells(db_session: AsyncSession) -> None:
     addr_ws = wb["addresses"]
     host_col = [c.value for c in addr_ws[1]].index("hostname")
     assert str(addr_ws[2][host_col].value).startswith("'+")
+
+
+@pytest.mark.asyncio
+async def test_export_csv_include_addresses_follows_the_box_not_the_data(
+    db_session: AsyncSession,
+) -> None:
+    """#2420: ticked + no address rows used to fall back to the subnet table."""
+    space = await _seed_space(db_session, "BoxShape")
+    block = IPBlock(space_id=space.id, network="10.20.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    db_session.add(
+        Subnet(
+            space_id=space.id,
+            block_id=block.id,
+            network="10.20.1.0/24",
+            name="lab",
+            description="desc",
+            total_ips=254,
+        )
+    )
+    await db_session.flush()
+
+    ticked, _, _ = await export_subtree(
+        db_session, block_id=block.id, format="csv", include_addresses=True
+    )
+    header = ticked.decode().splitlines()[0].split(",")
+    assert header[:2] == ["subnet", "address"]
+    assert "name" not in header
+
+    plain, _, _ = await export_subtree(db_session, block_id=block.id, format="csv")
+    rows = list(_csv.DictReader(io.StringIO(plain.decode())))
+    assert rows[0]["name"] == "lab" and rows[0]["description"] == "desc"
+
+    as_json, _, _ = await export_subtree(
+        db_session, block_id=block.id, format="json", include_addresses=True
+    )
+    assert json.loads(as_json)["subnets"][0]["name"] == "lab"

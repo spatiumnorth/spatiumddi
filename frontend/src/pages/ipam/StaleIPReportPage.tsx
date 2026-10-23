@@ -146,8 +146,10 @@ export function StaleIPReportPage() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Allocated IPs nothing has seen on the wire in {staleDays}+ days,
-            drawn from the discovery last-seen signal. Deprecate to reclaim
-            address space — it&rsquo;s reversible from the normal IP edit path.
+            drawn from the discovery last-seen signal. Deprecate marks an
+            address for review; it still counts as allocated and is not offered
+            by Next available. Delete the row to free the address. Deprecating
+            is reversible from the normal IP edit path.
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">

@@ -85,6 +85,9 @@ import {
 } from "./windowsFailover";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
+import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
+import { syncLabel } from "@/lib/dhcp-sync-label";
+import { scopePickerLabel } from "@/lib/dhcp-scope-label";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -1297,36 +1300,21 @@ function ScopeDeleteModal({
     queryFn: () => (groupId ? dhcpApi.listServers(groupId) : []),
     enabled: !!groupId,
   });
-  const references: string[] = [];
-  if (pools.length)
-    references.push(`${pools.length} pool${pools.length === 1 ? "" : "s"}`);
-  if (statics.length)
-    references.push(
-      `${statics.length} reservation${statics.length === 1 ? "" : "s"}`,
-    );
+  const copy = scopeDeleteCopy(
+    scope.name || scope.id.slice(0, 8),
+    pools.length,
+    statics.length,
+  );
   const windowsNote = groupServers.some((s) => s.driver === "windows_dhcp")
     ? " The scope is also removed from the Windows DHCP server via WinRM."
     : "";
   return (
     <DeleteConfirmModal
       title="Delete DHCP Scope"
-      description={
-        // The old copy — "All its pools and reservations will be removed as
-        // well" — described the permanent path, which the UI never takes. The
-        // default is a soft-delete: the scope and its children stop being served
-        // immediately (agents converge within seconds) but move to Trash
-        // together and restore together (#617).
-        `Delete scope "${scope.name || scope.id.slice(0, 8)}"? ` +
-        "Its pools and reservations go with it — they stop being served straight " +
-        "away, and are restorable as a set from Administration → Trash. Any " +
-        "dynamic clients (leases) it learned are released too, and their IPAM " +
-        "and DNS entries removed." +
-        windowsNote
-      }
-      referencesTitle={
-        references.length ? "This scope currently has:" : undefined
-      }
-      references={references.length ? references : undefined}
+      description={copy.description + windowsNote}
+      referencesTitle={copy.referencesTitle}
+      references={copy.references}
+      acknowledgement={copy.acknowledgement}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
@@ -1669,7 +1657,7 @@ function PoolOccupancyCell({
   );
 }
 
-function ServerPoolsOrStaticsTab({
+export function ServerPoolsOrStaticsTab({
   groupId,
   kind,
 }: {
@@ -1685,6 +1673,13 @@ function ServerPoolsOrStaticsTab({
     enabled: !!groupId,
   });
   const allScopes = groupScopes;
+  // #2447 — scopes are commonly left with the same name; the picker also
+  // names each one's subnet so the options can be told apart.
+  const { data: subnets = [] } = useQuery({
+    queryKey: ["subnets"],
+    queryFn: () => ipamApi.listSubnets(),
+  });
+  const subnetNetworkById = new Map(subnets.map((s) => [s.id, s.network]));
 
   const nestedQueries = useQueries({
     queries: allScopes.map((sc) => ({
@@ -1813,7 +1808,7 @@ function ServerPoolsOrStaticsTab({
               >
                 {allScopes.map((sc) => (
                   <option key={sc.id} value={sc.id}>
-                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
+                    {scopePickerLabel(sc, subnetNetworkById.get(sc.subnet_id))}
                   </option>
                 ))}
               </select>
@@ -3011,11 +3006,7 @@ function ServerDetailView({
                 {server.host}:{server.port}
               </span>
               {group && <span>Group: {group.name}</span>}
-              <span>
-                {server.last_sync_at
-                  ? `Last sync ${new Date(server.last_sync_at).toLocaleString()}`
-                  : "Never synced"}
-              </span>
+              <span>{syncLabel(server)}</span>
             </div>
           </div>
           <div className="flex items-center gap-2">
