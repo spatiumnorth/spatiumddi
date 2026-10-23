@@ -412,8 +412,8 @@ jobs:
   # The other half of the same problem the scan above solves: the CVE scan
   # tells us an image has a known vulnerability, this tells us a pin has gone
   # stale — and the two failure modes are different. A pin can sit years
-  # behind with no CVE against it (kube-rbac-proxy v0.12.0 was a 2022 release)
-  # and nothing anywhere notices, because Dependabot cannot see any of the
+  # behind (kube-rbac-proxy stayed on 2022's v0.12.0 until #2239) and nothing
+  # anywhere notices, because Dependabot cannot see any of the
   # pins in versions.json: it has no Helm ecosystem, does not read ARG values,
   # chart values.yaml, action `with:` inputs or the appliance bake arrays.
   #

@@ -3405,8 +3405,10 @@ async def _tailscale_token_subjects(
     from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
     from app.services.tailscale.client import is_auth_rejected  # noqa: PLC0415
 
-    ps = await db.get(PlatformSettings, 1)
-    if ps is None or not ps.integration_tailscale_enabled:
+    # The module is the integration's switch (#2196), not the derived
+    # ``PlatformSettings`` column — which a module turned on before the
+    # settings row existed never received.
+    if not await feature_modules.is_module_enabled(db, "integrations.tailscale"):
         return []
 
     cutoff = now + timedelta(days=threshold_days)

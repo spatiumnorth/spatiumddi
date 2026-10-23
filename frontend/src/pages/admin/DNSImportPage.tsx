@@ -35,6 +35,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   NEEDS_SUPERADMIN,
@@ -478,6 +479,7 @@ function WindowsDNSTab() {
             setState={setState}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             groups={groupsQ.data ?? []}
             views={viewsQ.data ?? []}
             onPreview={() => {
@@ -514,6 +516,7 @@ function WindowsDNSPullForm({
   setState,
   servers,
   serversLoading,
+  serversError,
   groups,
   views,
   onPreview,
@@ -523,6 +526,7 @@ function WindowsDNSPullForm({
   setState: React.Dispatch<React.SetStateAction<WindowsDNSState>>;
   servers: WindowsDNSServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   groups: { id: string; name: string }[];
   views: { id: string; name: string }[];
   onPreview: () => void;
@@ -565,9 +569,11 @@ function WindowsDNSPullForm({
             <option value="">
               {serversLoading
                 ? "Loading…"
-                : eligible.length === 0
-                  ? "— no eligible servers —"
-                  : "— select —"}
+                : serversError
+                  ? "— servers unavailable —"
+                  : eligible.length === 0
+                    ? "— no eligible servers —"
+                    : "— select —"}
             </option>
             {servers.map((srv) => (
               <option
@@ -580,6 +586,14 @@ function WindowsDNSPullForm({
               </option>
             ))}
           </select>
+          {serversError ? (
+            <p className="mt-1 text-xs">
+              <ListReadError
+                error={serversError}
+                what="the servers to import from"
+              />
+            </p>
+          ) : null}
           {hasIneligible && (
             <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
               Some servers are listed but disabled — they don't have WinRM
@@ -812,6 +826,7 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
             setState={setState}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             selectedServer={selectedServer}
             groups={groupsQ.data ?? []}
             views={viewsQ.data ?? []}
@@ -849,6 +864,7 @@ function CloudDNSPullForm({
   setState,
   servers,
   serversLoading,
+  serversError,
   selectedServer,
   groups,
   views,
@@ -859,6 +875,7 @@ function CloudDNSPullForm({
   setState: React.Dispatch<React.SetStateAction<CloudDNSState>>;
   servers: CloudDNSServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   selectedServer: CloudDNSServerOption | null;
   groups: { id: string; name: string }[];
   views: { id: string; name: string }[];
@@ -901,9 +918,11 @@ function CloudDNSPullForm({
             <option value="">
               {serversLoading
                 ? "Loading…"
-                : eligible.length === 0
-                  ? "— no eligible servers —"
-                  : "— select —"}
+                : serversError
+                  ? "— servers unavailable —"
+                  : eligible.length === 0
+                    ? "— no eligible servers —"
+                    : "— select —"}
             </option>
             {servers.map((srv) => (
               <option
@@ -916,6 +935,14 @@ function CloudDNSPullForm({
               </option>
             ))}
           </select>
+          {serversError ? (
+            <p className="mt-1 text-xs">
+              <ListReadError
+                error={serversError}
+                what="the servers to import from"
+              />
+            </p>
+          ) : null}
           {selectedServer && (
             <p className="mt-1 text-[11px] text-muted-foreground">
               Source provider:{" "}
