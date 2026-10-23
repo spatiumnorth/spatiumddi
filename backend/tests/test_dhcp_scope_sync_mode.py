@@ -111,7 +111,9 @@ async def test_update_clears_nullable_lease_time(
     await db_session.commit()
     h = {"Authorization": f"Bearer {token}"}
 
-    body = await _create(client, h, subnet, grp, min_lease_time=300, max_lease_time=600)
+    body = await _create(
+        client, h, subnet, grp, lease_time=450, min_lease_time=300, max_lease_time=600
+    )
     assert body["min_lease_time"] == 300
 
     # An explicit null must clear the column (exclude_none used to drop it).

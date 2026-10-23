@@ -67,6 +67,15 @@
 #                      itself do not (#1826).
 #                      The appliance's APPLIANCE_MODE reached only the api, so
 #                      the worker that runs alert evaluation saw it unset.
+#   dns-startup-probe — every render, plus a --require pass over the umbrella
+#                      and appliance DNS renders and a negative control: a DNS
+#                      container whose liveness probe checks :53 carries a
+#                      startup probe of at least 30 min (#2223), or a cold
+#                      start at scale is killed before the daemon listens.
+#   bind9 memory     — the appliance dns-bind9 container takes its memory from
+#                      ``dnsBind9.memory`` (sized from node RAM by the
+#                      supervisor, #2223) and an explicit memory in
+#                      ``dnsBind9.resources`` wins over it.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -149,6 +158,9 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     # #1725 — a BIND9 agent container must carry a memory limit.
     python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" "$file" \
+        || failures=$((failures + 1))
+    # #2223 — a DNS container's liveness probe must wait for a startup probe.
+    python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" "$file" \
         || failures=$((failures + 1))
     # #1510 — no two Services may ask MetalLB for the same address; only the
     # one created first would get it.
@@ -243,6 +255,8 @@ render umbrella-appliance-mirror "$UMBRELLA" \
     --set api.resources.limits.memory=2949Mi
 # #1541 — the appliance control plane's own values (``hard`` anti-affinity,
 # which the supervisor writes on every install) at one replica and at three.
+# #1805 — and the api Service's PreferSameNode, which firstboot renders and
+# the supervisor writes on every install too; the umbrella default is "".
 # One replica renders no anti-affinity of its own, but the pods a 3 → 1
 # demote replaces still carry the 3-node required term, which keeps a
 # surged pod off the only node for good — so api and worker must retire
@@ -252,6 +266,7 @@ APPLIANCE_CP_HARD=(
     --set worker.podAntiAffinity=hard
     --set frontend.podAntiAffinity=hard
     --set frontend.hostNetwork=true
+    --set api.service.trafficDistribution=PreferSameNode
 )
 for n in 1 3; do
     render "umbrella-appliance-cp-$n" "$UMBRELLA" "${APPLIANCE_CP_HARD[@]}" \
@@ -261,6 +276,46 @@ for n in 1 3; do
         --retire-first api --retire-first worker --retire-first frontend \
         "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
 done
+
+# #1805 — the api Service's PreferSameNode is the appliance's, not the
+# umbrella default's. The default render (a BYO-Kubernetes install) must omit
+# the field, as before #1805. The appliance's values must carry it, at one
+# replica and at three. A render below Kubernetes 1.34 must omit it even with
+# the appliance's values, because the API server refuses the value there.
+# --require on each, so none can pass by rendering no api Service at all.
+echo "── api Service trafficDistribution: off by default, PreferSameNode on the appliance (umbrella, #1805)"
+python3 "$ROOT/.github/scripts/chart-api-node-local.py" --require --absent \
+    "$OUT/umbrella-defaults.yaml" || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-api-node-local.py" --require \
+    "$OUT/umbrella-appliance-cp-1.yaml" "$OUT/umbrella-appliance-cp-3.yaml" \
+    || failures=$((failures + 1))
+if helm template umbrella-k8s-133 "$UMBRELLA" --kube-version 1.33.0 \
+        "${APPLIANCE_CP_HARD[@]}" > "$OUT/umbrella-k8s-133.yaml"; then
+    python3 "$ROOT/.github/scripts/chart-api-node-local.py" --require --absent \
+        "$OUT/umbrella-k8s-133.yaml" || failures=$((failures + 1))
+else
+    echo "   FAIL: umbrella chart did not render at Kubernetes 1.33" >&2
+    failures=$((failures + 1))
+fi
+# Negative controls: each guard must refuse the other's render, naming #1805,
+# or the checks above could be passing on renders they cannot read.
+echo "── negative controls: the #1805 guard must refuse each wrong render"
+neg1805() { # label manifest [chart-api-node-local.py flags...]
+    local label="$1" file="$2"; shift 2
+    local out rc
+    out="$(python3 "$ROOT/.github/scripts/chart-api-node-local.py" "$@" "$file" 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#1805"; then
+        echo "   ok: $label refused by the #1805 guard"
+    else
+        echo "   FAIL: expected the #1805 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg1805 "the default render read as the appliance's" "$OUT/umbrella-defaults.yaml" --require
+neg1805 "an appliance render read as the default" "$OUT/umbrella-appliance-cp-3.yaml" \
+    --require --absent
 # #1826 — the appliance's shared env, as firstboot writes it. Rendered with
 # the mirror on so its URL / secret are in the set too.
 render umbrella-shared-env "$UMBRELLA" \
@@ -376,6 +431,26 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+echo "── DNS startup probe (umbrella, #2223)"
+python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" --require \
+    "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+echo "── negative control: a DNS container with liveness and no startup probe must fail"
+if python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" \
+    <(python3 - "$OUT/umbrella-dns-agent-lb.yaml" <<'PYEOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d.get("kind") == "StatefulSet":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            c.pop("startupProbe", None)
+print(yaml.safe_dump_all(docs))
+PYEOF
+) >/dev/null 2>&1; then
+    echo "   FAIL: chart-dns-startup-probe.py passed a DNS container with no startup probe" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: DNS container with no startup probe refused"
+fi
 
 # ── Appliance chart ─────────────────────────────────────────────────────────
 # Every role + every feature on at once. This is not a valid appliance (one
@@ -420,6 +495,9 @@ python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" --require \
 echo "── BIND9 memory limit (appliance, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── DNS startup probe (appliance, #2223)"
+python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" --require \
+    "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
@@ -428,6 +506,40 @@ render appliance-full-stack "$APPLIANCE" \
 render appliance-offcluster-skip "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dnsBind9.controlPlaneUrl=https://cp.example \
     --set controlPlaneTls.insecureSkipVerify=true
+
+# #2223 — the dns-bind9 memory limit is sized from node RAM: the supervisor
+# writes ``dnsBind9.memory``, and an explicit memory in ``dnsBind9.resources``
+# (an operator's HelmChartConfig) must still win over it.
+bind9_mem() { # file want-limit want-request
+    python3 - "$@" <<'PYEOF'
+import sys, yaml
+path, want_limit, want_request = sys.argv[1:4]
+for d in yaml.safe_load_all(open(path)):
+    if d and d.get("kind") == "DaemonSet":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            if c["name"] == "dns-bind9":
+                r = c.get("resources") or {}
+                got = ((r.get("limits") or {}).get("memory"), (r.get("requests") or {}).get("memory"))
+                if got != (want_limit, want_request):
+                    sys.exit(f"   FAIL: {path}: dns-bind9 memory {got}, want {(want_limit, want_request)}")
+                if (r.get("requests") or {}).get("cpu") != "250m":
+                    sys.exit(f"   FAIL: {path}: dns-bind9 lost its CPU request")
+                print(f"   ok: dns-bind9 memory {got}")
+                sys.exit(0)
+sys.exit(f"   FAIL: {path}: no dns-bind9 container")
+PYEOF
+}
+echo "── dns-bind9 memory sizing (appliance, #2223)"
+bind9_mem "$OUT/appliance-full-stack.yaml" 2Gi 256Mi || failures=$((failures + 1))
+render appliance-bind9-sized "$APPLIANCE" \
+    --set dnsBind9.enabled=true \
+    --set dnsBind9.memory.limit=8Gi --set dnsBind9.memory.request=1024Mi
+bind9_mem "$OUT/appliance-bind9-sized.yaml" 8Gi 1024Mi || failures=$((failures + 1))
+render appliance-bind9-override "$APPLIANCE" \
+    --set dnsBind9.enabled=true \
+    --set dnsBind9.memory.limit=8Gi --set dnsBind9.memory.request=1024Mi \
+    --set dnsBind9.resources.limits.memory=6Gi
+bind9_mem "$OUT/appliance-bind9-override.yaml" 6Gi 1024Mi || failures=$((failures + 1))
 
 # #992 — the two release shapes this chart is ACTUALLY installed as, on every
 # appliance. Rendering the chart once (as everything above does) can never see

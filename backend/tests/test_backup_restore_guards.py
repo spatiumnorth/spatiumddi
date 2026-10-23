@@ -188,12 +188,22 @@ async def test_keep_days_does_not_delete_fresh_safety_dumps(monkeypatch) -> None
     # A 40-day-old backup goes under keep-days=30; a safety dump of
     # the same age is governed by its own allowance, not the days.
     old = datetime.now(UTC) - timedelta(days=40)
+    fresh = datetime.now(UTC) - timedelta(days=1)
     driver = _ListingDriver(
-        ["pre-restore-20260825-020000.zip", "spatiumddi-backup-h-20260825-020000.zip"]
+        [
+            "pre-restore-20260825-020000.zip",
+            "spatiumddi-backup-h-20260825-020000.zip",
+            "spatiumddi-backup-h-20261020-020000.zip",
+        ]
     )
 
     async def _list(*, config):
         return [
+            # The newest backup is always kept (#2503), so the 40-day-old
+            # one is only pruned because a newer one exists.
+            ArchiveListing(
+                filename="spatiumddi-backup-h-20261020-020000.zip", size_bytes=1, created_at=fresh
+            ),
             ArchiveListing(
                 filename="pre-restore-20260825-020000.zip", size_bytes=1, created_at=old
             ),

@@ -177,18 +177,30 @@ export function BulkAllocateModal({
   const v6 = subnet.network.includes(":");
 
   // Sensible default range: skip the network address (IPv4) and broadcast,
-  // start two in. For /24 192.168.0.0/24 that's 192.168.0.10 → 192.168.0.20.
-  const defaultStart = useMemo(() => {
-    const networkOnly = subnet.network.split("/")[0];
+  // start ten in. For /24 192.168.0.0/24 that's 192.168.0.10 → 192.168.0.20.
+  // Clamped to the subnet's usable addresses so a small subnet (a /29 ends at
+  // .7) never opens with a range the server refuses (#2422).
+  const [defaultStart, defaultEnd] = useMemo(() => {
+    const [networkOnly, prefix] = subnet.network.split("/");
     const base = ipToBigInt(networkOnly);
-    if (base === null) return networkOnly;
-    return bigIntToIp(base + (v6 ? 1n : 10n), v6);
-  }, [subnet.network, v6]);
-  const defaultEnd = useMemo(() => {
-    const networkOnly = subnet.network.split("/")[0];
-    const base = ipToBigInt(networkOnly);
-    if (base === null) return networkOnly;
-    return bigIntToIp(base + (v6 ? 16n : 20n), v6);
+    if (base === null) return [networkOnly, networkOnly];
+    const bits = v6 ? 128 : 32;
+    const plen = Number(prefix);
+    const size = Number.isInteger(plen) ? 1n << BigInt(bits - plen) : null;
+    let lo = base + (v6 || (size !== null && size <= 2n) ? 0n : 1n);
+    let hi = size === null ? base + 20n : base + size - 1n;
+    if (!v6 && size !== null && size > 2n) hi -= 1n; // broadcast
+    if (hi < lo) {
+      lo = base;
+      hi = base;
+    }
+    const clamp = (n: bigint) => (n < lo ? lo : n > hi ? hi : n);
+    // Past the subnet's end the start falls back to its first usable address.
+    const first = base + (v6 ? 1n : 10n);
+    return [
+      bigIntToIp(first > hi ? lo : clamp(first), v6),
+      bigIntToIp(clamp(base + (v6 ? 16n : 20n)), v6),
+    ];
   }, [subnet.network, v6]);
 
   const [phase, setPhase] = useState<"form" | "previewed" | "committed">(
