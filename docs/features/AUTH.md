@@ -741,6 +741,14 @@ invalid JWT to avoid confirming token existence to an attacker.
 - Revoke softly via `PATCH /api/v1/api-tokens/{id}` with
   `{is_active: false}` — the row stays so `last_used_at` is still
   visible for incident forensics.
+- Re-enable an inactive token with `{is_active: true}`: superadmin only,
+  with the operator step-up (`stepup_password` / `stepup_totp_code`). An
+  owner who needs access back creates a new token. A non-superadmin gets
+  `403` and the refusal is audited (`reenable_requires_superadmin`).
+- Change `scopes` with the same `PATCH`. Narrowing (dropping a scope, or
+  restricting an unrestricted token) needs nothing more; widening (adding
+  a scope, or sending `[]` so the token is unrestricted) needs the step-up.
+  Renaming and revoking need neither.
 - Delete hard via `DELETE /api/v1/api-tokens/{id}` — same outward
   behaviour (401 on next use), audit row written on both paths.
 
