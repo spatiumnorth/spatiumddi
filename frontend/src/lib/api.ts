@@ -10554,12 +10554,12 @@ export const API_TOKEN_SCOPES: {
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
   },
   {
     value: "dhcp:write",
