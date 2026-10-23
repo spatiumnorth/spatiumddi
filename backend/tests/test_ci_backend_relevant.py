@@ -57,6 +57,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_seed_demo_templates.py": "scripts/seed_demo.py",
     "test_merge_test_durations.py": "scripts/merge_test_durations.py",
     "test_test_impact_selection.py": ".github/scripts/select_impacted_tests.py",
+    "test_ci_tested_on_pr_head.py": (
+        ".github/scripts/ci-tested-on-pr-head.sh",
+        ".github/scripts/ci-full-suite-passed.sh",
+        ".github/scripts/latest-main-artifact.sh",
+    ),
     # #1353 — the outbound-host guard scans the four shipped agent packages
     # as well as backend/app, so an agent-only PR adding a host must run it.
     "test_outbound_hosts_documented.py": (
@@ -73,6 +78,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
+    "test_changelog_assemble.py": "scripts/changelog_assemble.py",
     "test_format_release_notes.py": "scripts/format_release_notes.py",
     "test_release_tags_script.py": ".github/scripts/release-tags.sh",
     "test_trivy_scan_script.py": ("scripts/trivy-scan.sh", "Makefile"),
@@ -237,6 +243,9 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "perf/requirements.txt",
         "perf/README.md",
         "CHANGELOG.md",
+        # #2431 — a PR's changelog fragment is prose, like CHANGELOG.md.
+        "changelog.d/2431-merge-queue.md",
+        "changelog.d/README.md",
         "README.md",
         "CLAUDE.md",
         "NOTICE",

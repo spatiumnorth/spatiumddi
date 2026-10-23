@@ -193,6 +193,8 @@ class ServerResponse(BaseModel):
     server_group_id: uuid.UUID | None
     status: str
     last_sync_at: datetime | None
+    last_sync_error: str | None = None
+    last_sync_error_at: datetime | None = None
     last_health_check_at: datetime | None
     agent_registered: bool
     agent_approved: bool
@@ -285,6 +287,8 @@ class ServerResponse(BaseModel):
             server_group_id=s.server_group_id,
             status=s.status,
             last_sync_at=s.last_sync_at,
+            last_sync_error=s.last_sync_error,
+            last_sync_error_at=s.last_sync_error_at,
             last_health_check_at=s.last_health_check_at,
             agent_registered=s.agent_registered,
             # Agentless drivers have no agent to approve, so "approval" is
@@ -1168,6 +1172,13 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             ),
         )
     result = await pull_leases_from_server(db, s, apply=True)
+    if result.busy:
+        # #2262 — the scheduled pull (or another Sync) is reconciling this
+        # server right now; two at once used to insert the same lease twice.
+        raise HTTPException(
+            status_code=409,
+            detail="A lease pull for this server is already running; try again shortly.",
+        )
 
     # Reconcile the server's MAC deny-filter list against the group's
     # active blocks while we're already holding the WinRM session up.
