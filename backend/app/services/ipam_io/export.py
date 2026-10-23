@@ -62,6 +62,10 @@ class ExportBundle:
     blocks: list[dict[str, Any]]
     subnets: list[dict[str, Any]]
     addresses: list[dict[str, Any]]
+    # What the caller asked for, not whether any address rows turned up:
+    # the CSV shape follows the request so a scope with no addresses does
+    # not silently change table (#2420).
+    include_addresses: bool = False
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -184,6 +188,7 @@ async def _collect(
         blocks=blocks_payload,
         subnets=subnets_payload,
         addresses=addresses_payload,
+        include_addresses=include_addresses,
     )
 
 
@@ -254,14 +259,15 @@ def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
 
 
 def _to_csv(bundle: ExportBundle) -> bytes:
-    # When the caller asked for addresses, emit an addresses-only CSV.
-    # CSV is a single-table format, so we pick the table that carries the
-    # data the user was after — and crucially this matches the header
-    # shape accepted by ``POST /ipam/import/addresses/commit`` so the
-    # export round-trips through the importer without column renaming.
-    # Broader scopes (block / space) should use JSON or XLSX if they
-    # need both subnet metadata *and* addresses in the same file.
-    if bundle.addresses:
+    # CSV is a single-table format. With "Include IP addresses" ticked it
+    # is the address table ONLY — the header shape
+    # ``POST /ipam/import/addresses/commit`` accepts, so the export
+    # round-trips through the importer (extra subnet columns would land in
+    # the importer's custom fields). Subnet metadata for a block / space
+    # scope comes from the CSV without the box, or JSON / XLSX / PDF,
+    # which carry both (#2420). Keyed on the request, not on whether any
+    # address rows exist, so the shape never flips with the data.
+    if bundle.include_addresses:
         return _addresses_to_csv(bundle.addresses)
 
     buf = io.StringIO()

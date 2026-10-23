@@ -394,7 +394,8 @@ async def stamp_discovered(
         raise HTTPException(status_code=404, detail="Scan not found")
     summary = scan.summary_json or {}
     hosts: list[dict[str, Any]] = summary.get("hosts") or []
-    if not hosts:
+    # ``[]`` is a sweep that found nothing: stamps nothing, not an error.
+    if summary.get("hosts") is None:
         raise HTTPException(
             status_code=422,
             detail=(

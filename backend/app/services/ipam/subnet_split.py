@@ -415,6 +415,41 @@ async def preview_subnet_split(
                 )
             )
 
+    # Hosts that would land on a child's network or broadcast address
+    # (#2415). The commit leaves such a row where it is and skips the
+    # child's placeholder, so the host would sit on an address no client
+    # can use. network / broadcast rows are the placeholders themselves
+    # (or an operator's renamed one, which survives by design) — only a
+    # row with another status is a host.
+    boundary_of: dict[str, str] = {}
+    for child in children_nets:
+        if child.prefixlen >= 31:
+            continue
+        boundary_of[str(child.network_address)] = f"the network address of {child}"
+        if isinstance(child, ipaddress.IPv4Network):
+            boundary_of[str(child.broadcast_address)] = f"the broadcast address of {child}"
+    for row in addr_rows:
+        if row.status in ("network", "broadcast"):
+            continue
+        where = boundary_of.get(str(row.address))
+        if where is not None:
+            conflicts.append(
+                SplitConflict(
+                    type="host_on_child_boundary",
+                    detail=(
+                        f"{row.address} ({row.status}"
+                        f"{', ' + row.hostname if row.hostname else ''}) would sit on "
+                        f"{where}, which no client can use. Move or delete it "
+                        "before splitting."
+                    ),
+                )
+            )
+
+    warnings.append(
+        f"Hosts move into children with a /{new_prefix_length} netmask; "
+        "every client on the parent must be reconfigured with that netmask."
+    )
+
     # Warning when active leases would be impacted — they survive (the
     # FK is to scope, not subnet, and the scope rebinds), but operators
     # should know.

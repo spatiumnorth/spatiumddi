@@ -597,7 +597,7 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
 // again so we force the operator to copy it, and close the modal only
 // after explicit confirmation.
 
-function RevealTokenModal({
+export function RevealTokenModal({
   token,
   onClose,
 }: {
@@ -639,7 +639,14 @@ function RevealTokenModal({
           </div>
         )}
         <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
-          <code className="flex-1 truncate" title={token.token}>
+          {/* The raw token is carried only by the revealed view (and the copy
+              action). While masked, no attribute — title, aria-* or data-* —
+              names it, so a hover tooltip or an accessibility tree read
+              cannot surface it. */}
+          <code
+            className="flex-1 truncate"
+            title={visible ? token.token : undefined}
+          >
             {visible ? token.token : "•".repeat(40)}
           </code>
           <button
