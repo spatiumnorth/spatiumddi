@@ -85,6 +85,7 @@ import {
 } from "./windowsFailover";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
+import { syncLabel } from "@/lib/dhcp-sync-label";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -3011,11 +3012,7 @@ function ServerDetailView({
                 {server.host}:{server.port}
               </span>
               {group && <span>Group: {group.name}</span>}
-              <span>
-                {server.last_sync_at
-                  ? `Last sync ${new Date(server.last_sync_at).toLocaleString()}`
-                  : "Never synced"}
-              </span>
+              <span>{syncLabel(server)}</span>
             </div>
           </div>
           <div className="flex items-center gap-2">
