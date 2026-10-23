@@ -92,8 +92,8 @@ DHCPScope
     "bootfile-name": "pxelinux.0",
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
-  ddns_enabled: bool
-  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
+  ddns_enabled: bool                 -- INERT (#2270): DDNS is subnet-level; only false is accepted
+  ddns_hostname_policy: str          -- INERT (#2270): only the default "client" is accepted
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -335,6 +335,8 @@ DHCPPool
 > row — occupancy is derived at request time from mirrored lease and
 > reservation state, and is served by the endpoints below (#913, corrected
 > in #917).
+
+**Range validation (#2500).** `start_ip` / `end_ip` must be valid IPs of the subnet's address family, `start_ip <= end_ip`, and both must lie inside the scope's subnet, for every range type (`dynamic`, `reserved`, `excluded`); otherwise the API answers 422 naming the subnet. Kea rejects a pool outside its subnet's prefix and the whole group stops converging. On update the merged range (stored row under the patch) is checked, but only when `start_ip` / `end_ip` is edited, so pools stored by the importers or the Windows topology pull (which write rows directly, not through this endpoint) stay editable for other fields.
 
 ### Pool occupancy over REST (issue #913)
 
@@ -812,8 +814,10 @@ DHCPMACBlock
 
 | Driver | Enforcement | Update mechanism |
 |---|---|---|
-| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
+| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. On DHCPv6 scopes the same class is rendered best-effort (#2268), see below. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
 | Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. | 60 s Celery beat task diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
+
+**What a MAC block can and cannot catch on DHCPv6.** A DHCPv6 packet has no hardware address field (Kea has no `pkt6.mac`), so the Dhcp6 `DROP` class derives the MAC from what the client sends: the link-layer address inside an Ethernet DUID-LL (type 3) or DUID-LLT (type 1) client-id, and the client link-layer address option (79, RFC 6939) that a first-hop relay may add (checked on both the innermost relay, which is the first hop, and the outermost, so a chain of relays is covered). It does **not** catch a client using DUID-EN or DUID-UUID, a DUID it randomised (many OSes generate a stable but non-MAC-derived DUID), a client that changes DUID, or a relayed packet whose relay adds no option 79. Treat the v6 block as a partial control: for a hard guarantee also block the device at the switch or router. Windows DHCP's deny filter is IPv4-only and does not apply to DHCPv6 scopes.
 
 Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Windows doesn't support per-scope deny at all. A single "this device is bad, nowhere gets to serve it" rule is the usage pattern — per-scope precision is deferred until a concrete need surfaces.
 
@@ -1435,7 +1439,7 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 
 **Renewal / rebind timers (58 / 59)** cannot be set (#1690): the API refuses `dhcp-renewal-time`, `dhcp-rebinding-time` and `code:58` / `code:59` with a 422. Kea is rendered with `calculate-tee-times` so every lease gets T1 / T2 at 50% / 87.5% of its own lifetime (v6: 50% / 80% of the preferred lifetime). A Kea import drops `renew-timer` / `rebind-timer` and says so: a subnet's in that scope's `parse_warnings`, a global one in the preview's `warnings`.
 
-**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
+**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range. The API refuses (422, naming the field) any set that is not ordered `min_lease_time <= lease_time <= max_lease_time`, on create and on update (judged on the stored row merged with the patch), because Kea rejects the whole config for an out-of-order set (#2499).
 
 ---
 
@@ -1478,8 +1482,10 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 | Mode | Behavior |
 |---|---|
 | `disabled` | No hostname sync — IPAM hostname is managed manually |
-| `on_lease` | Hostname from every new DHCP lease is written to IPAM |
-| `on_static_only` | Only static DHCP assignments sync hostname to IPAM |
+| `on_lease` | Hostname from every DHCP lease is written to IPAM (the default) |
+| `on_static_only` | Lease hostnames are not written to IPAM; only static DHCP assignments set an IPAM hostname |
+
+The setting governs the **hostname only**. Every lease is still mirrored into IPAM as an `auto_from_lease` row (status, MAC, last-seen) in every mode, and the same rule applies to the Kea lease-event path, the Windows poll path and a reservation handing its address back to a live lease. Turning the setting off changes nothing already stored: existing mirror rows are not deleted and their hostnames are not blanked or overwritten by later lease events. A subnet with DDNS enabled still gets the hostname DDNS publishes; that is governed by the DDNS settings, not this one. Upgrade note (#2269): the setting used to be ignored, so scopes stored as `on_static_only` (the old default) were rewritten to `on_lease` to keep their behaviour; `disabled` is honoured as set.
 
 **Recommendation**: Set to `disabled` or `on_static_only` for large dynamic subnets (e.g., WiFi /16) where lease hostname data is noisy. Set to `on_lease` for server subnets where every IP should have a known hostname.
 
