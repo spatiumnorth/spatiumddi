@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import db as app_db
 from app.config import settings
 from app.core.redis_client import make_async_redis
+from app.core.task_attempts import DELIVERY_KEY_PREFIX
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
 from app.tasks import agent_bundles
 
@@ -496,3 +497,101 @@ async def test_a_resized_render_keeps_its_lock_frees_its_slot_and_renders_on_ret
     assert retry["status"] == "stored", retry
     assert len(published) == 1, "sized once, it did not go round again"
     assert await client.get(lock_key) is None and await client.get(keys["slot"]) is None
+
+
+# ── With the delivery bound (#2271) ─────────────────────────────────────────
+#
+# Main bounds how often one render message may be delivered, counting on the
+# message's task id (``_run_bounded``); this PR renders each message under the
+# limits it carries. A redelivery is the same message, so it carries both.
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"status": "deferred", "lock_token": "tok"},
+        {"status": "resize", "records": 3, "lock_token": "tok", "renders": 0},
+    ],
+)
+def test_a_deferral_or_a_resize_goes_out_as_a_new_message(
+    monkeypatch: pytest.MonkeyPatch, outcome: dict[str, Any]
+) -> None:
+    """A render waiting for a slot is republished every couple of seconds.
+    Sent again as the same message (its task id, as ``self.retry`` would),
+    each wait would count as a lost worker and the bound would abandon a
+    render that never started. Each republish is a new message instead, so
+    Celery gives it an id, and a delivery count, of its own."""
+    published = _capture_publish(monkeypatch)
+    counted: list[str | None] = []
+    seen: list[int | None] = []
+
+    async def _count(task_name: str, task_id: str | None) -> int:
+        counted.append(task_id)
+        return 1
+
+    async def _fake_run(server_id, lock_token=None, soft_limit=None):  # noqa: ANN001
+        seen.append(soft_limit)
+        return dict(outcome)
+
+    monkeypatch.setattr(agent_bundles, "count_delivery", _count)
+    monkeypatch.setattr(agent_bundles, "_run", _fake_run)
+    task = agent_bundles.render_dns_bundle
+    task.push_request(id="message-1", timelimit=[3180, 3120])
+    try:
+        task.run("srv")
+    finally:
+        task.pop_request()
+    assert counted == ["message-1"], "the task counts its own message's deliveries"
+    assert seen == [3120], "and renders under its own message's soft limit"
+    (again,) = published
+    assert "task_id" not in again, "a republish reused the message's id"
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_message_renders_under_its_limits_until_the_bound(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every delivery up to ``MAX_RENDER_DELIVERIES`` renders under the
+    message's soft limit; the next renders nothing, republishes nothing and
+    records why on the server."""
+    client, keys = redis_keys
+    server = await _server(db_session, await _group(db_session, records=3))
+    await db_session.commit()
+    # Three records "take" 120 + 3000 s here: a delivery that lost its
+    # message's 3120 s would resize instead of rendering.
+    monkeypatch.setattr(agent_bundles, "RENDER_SECONDS_PER_1000_RECORDS", 1_000_000.0)
+    published = _capture_publish(monkeypatch)
+    renders: list[int] = []  # one entry per render started
+
+    async def _lost(db, srv, *, rendered_by):  # noqa: ANN001, ARG001
+        renders.append(1)
+        raise MemoryError("simulated: the worker is lost mid-render")
+
+    monkeypatch.setattr(agent_bundles, "render_and_store", _lost)
+    task_id = uuid.uuid4().hex
+
+    def _deliver() -> dict[str, Any]:
+        # The same message each time: its id and its limits.
+        task = agent_bundles.render_dns_bundle
+        task.push_request(id=task_id, timelimit=[3180, 3120])
+        try:
+            return task.run(str(server.id))
+        finally:
+            task.pop_request()
+
+    try:
+        for n in range(1, agent_bundles.MAX_RENDER_DELIVERIES + 1):
+            with pytest.raises(MemoryError):
+                await asyncio.to_thread(_deliver)
+            assert len(renders) == n, f"delivery {n} did not render under its 3120 s"
+        last = await asyncio.to_thread(_deliver)
+        assert last["status"] == "abandoned", last
+        assert len(renders) == agent_bundles.MAX_RENDER_DELIVERIES, "no further render"
+        assert published == [], "nothing was deferred, resized or republished"
+        await db_session.refresh(server)
+        assert server.bundle_render_status == agent_bundles.RENDER_STATUS_FAILED
+        assert "delivered" in (server.bundle_render_error or "")
+        assert await client.get(keys["lock"] + str(server.id)) is None
+        assert await client.get(keys["slot"]) is None
+    finally:
+        await client.delete(f"{DELIVERY_KEY_PREFIX}{agent_bundles.TASK_RENDER}:{task_id}")
