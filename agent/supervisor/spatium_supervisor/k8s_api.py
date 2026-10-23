@@ -1357,11 +1357,11 @@ def _merge_owned_overrides(
 
 
 # Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
-# worker). Deliberately a separate constant from ``_FAST_EVICT_TOLERATIONS``,
-# which coredns uses: the two are the same 20 s today but answer different
-# questions (how fast must a control-plane replica leave a dead node, vs how
-# fast must cluster DNS), and collapsing them would make a future retune of
-# one silently retune the other.
+# worker). CoreDNS carried its own copy until #1753: with one CoreDNS replica
+# per node an evicted DNS pod has nowhere to go, and the copy was the one
+# template field k3s's manifest re-apply fought over. This one answers a
+# different question (how fast must a control-plane replica leave a dead
+# node) and is unchanged.
 _CONTROL_PLANE_FAST_EVICT = [
     {
         "key": "node.kubernetes.io/unreachable",
@@ -1376,6 +1376,24 @@ _CONTROL_PLANE_FAST_EVICT = [
         "tolerationSeconds": 20,
     },
 ]
+
+
+#: #1805 — the api Service's ``trafficDistribution`` on the appliance. The
+#: supervisor's heartbeat, the DNS and DHCP agents and the frontend's ``/api``
+#: proxy reach the api through that Service, and kube-proxy spread their
+#: connections over every api pod, so after a node's hard loss its api pod,
+#: still listed until the node reads NotReady, held a share of every other
+#: node's requests until their own timeout. ``PreferSameNode`` keeps a node's
+#: callers on its own api pod while that pod is ready.
+#:
+#: The appliance's and not the umbrella chart's (whose default is ``""``):
+#: here every control-plane node runs one api pod (``replicas`` = the
+#: control-plane size, hard anti-affinity), while on a BYO-Kubernetes cluster
+#: the field would pin each node's callers to whichever api pod shares their
+#: node. Written at every size, because a merge cannot remove a key and one
+#: api pod makes it inert. firstboot renders the same value, or the first
+#: heartbeat of every install would add a helm revision (#1005).
+_NODE_LOCAL_API = "PreferSameNode"
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -1770,7 +1788,9 @@ def apply_control_plane_overrides(
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
     plus the frontend control-plane VIP, plus the api / worker / Postgres
     memory limits, Postgres' shared_buffers and the worker concurrency,
-    sized from ``mem_total_mib`` (see ``control_plane_resources``). Written to the spatium-control
+    sized from ``mem_total_mib`` (see ``control_plane_resources``), plus the
+    api Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``).
+    Written to the spatium-control
     HelmChartConfig so it survives a k3s restart (#272).
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
@@ -1827,7 +1847,9 @@ def apply_control_plane_overrides(
         # The slot-image mirror latch (#787) reads the live document, so
         # the owned keys are computed from the same read the merge uses.
         return {
-            "api": dict(scaled) | sized.get("api", {}),
+            "api": dict(scaled)
+            | sized.get("api", {})
+            | {"service": {"trafficDistribution": _NODE_LOCAL_API}},
             "frontend": dict(scaled)
             | {
                 "controlPlaneVIP": vip,
@@ -2193,21 +2215,13 @@ def cluster_node_names(timeout: float = 5.0) -> tuple[list[str] | None, str | No
 
 
 _COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
+_KUBE_DNS_PATH = "/api/v1/namespaces/kube-system/services/kube-dns"
+#: #1718 — the kube-dns Service's ``trafficDistribution`` on a real cluster:
+#: a node's lookups go to the CoreDNS pod on that node while it is ready.
+_NODE_LOCAL_DNS = "PreferSameNode"
+#: The fast-evict tolerations earlier builds added (20 s on both keys). The
+#: reconciler now removes them wherever it finds them (#1753, below).
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
-_FAST_EVICT_TOLERATIONS = [
-    {
-        "key": "node.kubernetes.io/unreachable",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-    {
-        "key": "node.kubernetes.io/not-ready",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-]
 _COREDNS_SPREAD = {
     "podAntiAffinity": {
         "requiredDuringSchedulingIgnoredDuringExecution": [
@@ -2240,7 +2254,7 @@ def _merge_patch(target: Any, patch: Any) -> Any:
     return merged
 
 
-def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
+def ensure_coredns_ha() -> tuple[bool, str | None]:
     """Match the k3s-bundled CoreDNS to the cluster's NODE COUNT — returns
     (changed, error); ``(False, None)`` means converged or deferred.
 
@@ -2273,11 +2287,33 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
       REMOVED, pod anti-affinity REMOVED. Both buy exactly nothing with one
       hostname domain — worse, a 20 s unreachable toleration means a kubelet
       blip evicts the only DNS pod with nowhere to put it.
-    * **≥2 registered nodes → HA.** ``min(registered, max_replicas)``
-      replicas + fast-evict + required spread. The cap is 2 by default
-      because required anti-affinity places at most one pod per node, and
-      two is what surviving a node loss needs — a third on a 3-node cluster
-      costs memory for no extra failure tolerance.
+    * **≥2 registered nodes → HA.** One replica per registered node +
+      required spread, so every node runs its own CoreDNS.
+      This used to be capped at 2, on the reasoning that two survive a node
+      loss and a third buys no failure tolerance. #1718 showed what the
+      third buys. Until a lost node reads NotReady (about 40 s), its CoreDNS
+      pod stays a ready kube-dns endpoint, and kube-proxy keeps sending it
+      about half of every other node's lookups. Each one stalls for the
+      resolver's whole timeout. Redis Sentinel resolves its peers inside
+      its event loop, so the stalls put every surviving sentinel in TILT,
+      and the Redis failover took 77 s instead of seconds. With a replica
+      on every node and the kube-dns Service set to ``PreferSameNode``
+      (``ensure_kube_dns_node_local``), a pod's lookups stay on its own
+      node. A lost node then takes only its own pods' DNS with it.
+
+    #1753 — the HA shape no longer carries the fast-evict tolerations (20 s
+    on ``unreachable``/``not-ready``) that #590 added. ``tolerations`` is the
+    one pod-template field both this reconciler and k3s's bundled manifest
+    set. k3s force re-applies that manifest at every server start, which put
+    the list back to its own two entries: rollout one. The next seed
+    heartbeat patched the fast-evict pair back in: rollout two. So every
+    node's return replaced every CoreDNS pod twice, and lookups in flight to
+    the replaced pods stalled and put Redis Sentinel into TILT again. With one
+    replica per node, the eviction those tolerations hasten has nowhere to
+    go: the required spread leaves no node free for the evicted pod's
+    replacement. So the template now keeps k3s's own tolerations, and its
+    re-apply is a no-op. Any fast-evict entry found is removed, in both
+    shapes.
 
     The count is *registered* Node objects, deliberately, and deliberately
     NOT the ``control_plane_size`` that sizes every other appliance workload
@@ -2323,7 +2359,7 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         return False, "kubeapi reported no nodes"
 
     want_ha = registered >= 2
-    desired = min(registered, max_replicas) if want_ha else 1
+    desired = registered if want_ha else 1
 
     try:
         status, resp = _request("GET", _COREDNS_PATH)
@@ -2366,7 +2402,7 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         # above. Nulling the whole ``affinity`` here would take the operator's
         # other scheduling constraints with it.
         affinity_patch = {"podAntiAffinity": None}
-    want_tolerations = (keep + _FAST_EVICT_TOLERATIONS) if want_ha else keep
+    want_tolerations = keep
 
     # Whether the PATCH would actually rewrite the pod template, computed from
     # the body we are about to send rather than from ``template_ok``. The two
@@ -2429,6 +2465,67 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
             registered_nodes=registered,
             replicas=desired,
             shape="ha" if want_ha else "stock",
+        )
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+def ensure_kube_dns_node_local() -> tuple[bool, str | None]:
+    """Keep each pod's cluster-DNS lookups on its own node once the cluster has
+    a second node (#1718). Returns (changed, error), like ``ensure_coredns_ha``;
+    ``(False, None)`` means converged.
+
+    The kube-dns Service gets ``trafficDistribution: PreferSameNode``. With it,
+    kube-proxy sends a node's lookups to the CoreDNS pod on that node while that
+    pod is ready, and to every pod only while it is not. ``ensure_coredns_ha``
+    runs one replica per node, so a lost node's CoreDNS pod answers nobody
+    else's lookups. Without this, it stays a ready endpoint until the node reads
+    NotReady, and about half of every other node's lookups stall on it for the
+    resolver's whole timeout: Redis Sentinel's blocking peer lookups went into
+    TILT for over a minute, and the supervisor's own lookups failed with
+    EAI_AGAIN. On a single node the field is removed again: there every endpoint
+    is local, and stock is the target there (#750).
+
+    k3s's bundled ``coredns.yaml`` does not set the field, so k3s's re-apply at
+    every server start leaves it in place. It is still reconciled on every seed
+    heartbeat, like the Deployment.
+    """
+    registered, _schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        return False, "kubeapi reported no nodes"
+    want = _NODE_LOCAL_DNS if registered >= 2 else None
+    try:
+        status, resp = _request("GET", _KUBE_DNS_PATH)
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        svc = json.loads(resp)
+    except ValueError:
+        return False, "unparseable kube-dns service"
+    if not isinstance(svc, dict):
+        return False, "unparseable kube-dns service"
+    if (svc.get("spec") or {}).get("trafficDistribution") == want:
+        return False, None
+    # ``null`` deletes the key under a JSON merge-patch: stock again.
+    payload = json.dumps({"spec": {"trafficDistribution": want}}).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            _KUBE_DNS_PATH,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.kube_dns_traffic_reconciled",
+            registered_nodes=registered,
+            traffic_distribution=want,
         )
         return True, None
     return False, f"kubeapi status {status}: {resp[:200]!r}"

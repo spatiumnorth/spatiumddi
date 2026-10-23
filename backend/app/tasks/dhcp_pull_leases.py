@@ -155,6 +155,10 @@ async def _run_pull() -> dict[str, Any]:
                         driver=server.driver,
                         error=str(exc),
                     )
+                    # #2306 — persist on the row so the server list can show
+                    # it; a later successful pull clears it.
+                    server.last_sync_error = (str(exc) or type(exc).__name__)[:2000]
+                    server.last_sync_error_at = now
                     continue
 
                 if result.busy:

@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -5717,7 +5718,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   {s.last_sync_at &&
                     ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}
                   {s.last_health_check_at &&
-                    ` · health ${new Date(s.last_health_check_at).toLocaleTimeString()}`}
+                    ` · health ${humanTime(s.last_health_check_at)}`}
                 </p>
               </div>
             </div>
