@@ -13,7 +13,13 @@
 
 ### Fixed
 
-- **`GET /alerts/rules` and `GET /alerts/events` require read permission on
-  alerts.** They answered any signed-in user. The builtin Viewer role (read
-  on everything) and superadmin are unaffected; a custom role with no alert
-  read grant now gets 403 and needs one added.
+- **Every alerts read requires `read` on `alert`.** `GET /alerts/rules`,
+  `/alerts/rules/{id}`, `/alerts/rule-types` and `/alerts/events` answered any
+  signed-in user, and the events carry resource names. `alert` is now a grant
+  type in the Roles dialog and in `docs/PERMISSIONS.md`. The builtin Viewer
+  (read on everything) and superadmin are unaffected. The builtin IPAM, DNS,
+  DHCP and Network Editors, Auditor and Compliance Editor gain `read:alert`
+  (re-applied at startup), so the dashboard's alert panels keep working for
+  them. Address Set Editor, Change Approver, Requester and Appliance Operator
+  do not get it. A custom role with no alert read grant now gets 403 and needs
+  `read` on `alert` added.

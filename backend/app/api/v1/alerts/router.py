@@ -315,7 +315,11 @@ async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     return list(res.scalars().all())
 
 
-@router.get("/rule-types", response_model=list[RuleTypeSpec])
+@router.get(
+    "/rule-types",
+    response_model=list[RuleTypeSpec],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_rule_types(db: DB, current_user: CurrentUser) -> list[RuleTypeSpec]:
     """Every rule type, its label, and the parameters its evaluator reads (#1997).
 
@@ -363,7 +367,11 @@ async def create_rule(body: AlertRuleCreate, db: DB, current_user: SuperAdmin) -
     return rule
 
 
-@router.get("/rules/{rule_id}", response_model=AlertRuleResponse)
+@router.get(
+    "/rules/{rule_id}",
+    response_model=AlertRuleResponse,
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def get_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertRule:
     rule = await db.get(AlertRule, rule_id)
     if rule is None:

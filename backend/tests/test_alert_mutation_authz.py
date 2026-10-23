@@ -191,7 +191,22 @@ async def test_alert_reads_need_the_read_permission(
 ) -> None:
     other = await _user_with(db_session, [{"action": "read", "resource_type": "subnet"}])
     allowed = await _user_with(db_session, [{"action": "read", "resource_type": "alert"}])
-    for path in ("/api/v1/alerts/rules", "/api/v1/alerts/events"):
+    rule = AlertRule(
+        name="r",
+        description="",
+        rule_type="subnet_utilization",
+        severity="warning",
+        enabled=True,
+        threshold_percent=90,
+    )
+    db_session.add(rule)
+    await db_session.commit()
+    for path in (
+        "/api/v1/alerts/rules",
+        "/api/v1/alerts/events",
+        "/api/v1/alerts/rule-types",
+        f"/api/v1/alerts/rules/{rule.id}",
+    ):
         r = await client.get(path, headers={"Authorization": f"Bearer {other}"})
         assert r.status_code == 403, (path, r.text)
         r = await client.get(path, headers={"Authorization": f"Bearer {allowed}"})
