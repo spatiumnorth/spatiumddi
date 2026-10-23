@@ -50,7 +50,10 @@ from app.core.mac import canonicalize_mac
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import _resolve_lease_subnet_id
 
 logger = structlog.get_logger(__name__)
@@ -259,15 +262,19 @@ async def _release_moved_row(
     # The delete has to reach the database before the insert:
     # (subnet_id, address) is unique (uq_ip_address_subnet_address).
     await db.flush()
+    # #2269 — a scope not set to ``on_lease`` keeps the lease hostname out.
+    write_hostname = subnet_id not in await lease_hostname_suppressed_subnets(
+        db, subnet_ids=[subnet_id]
+    )
     candidate = IPAddress(subnet_id=subnet_id, address=str(address))
-    _mirror_lease_onto(candidate, lease)
+    _mirror_lease_onto(candidate, lease, write_hostname=write_hostname)
     mirror, created = await insert_ipam_mirror_row(db, candidate)
     if not created:
         # A concurrent writer's row won the insert. Take it over only when
         # the ingest would: a free row, or one a lease already owns.
         if not (mirror.status == "available" or mirror.auto_from_lease):
             return None
-        _mirror_lease_onto(mirror, lease)
+        _mirror_lease_onto(mirror, lease, write_hostname=write_hostname)
     subnet_row = await db.get(Subnet, subnet_id)
     if subnet_row is None:
         return None
@@ -317,7 +324,10 @@ async def detach_ipam_for_static(
     handovers: list[LeaseHandover] = []
 
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    for row in res.scalars().all():
+    rows = list(res.scalars().all())
+    # #2269 — one scope lookup for every row, not one per row.
+    suppressed = await lease_hostname_suppressed_subnets(db, subnet_ids={r.subnet_id for r in rows})
+    for row in rows:
         subnet_row = await db.get(Subnet, row.subnet_id)
         if subnet_row is not None:
             try:
@@ -328,7 +338,11 @@ async def detach_ipam_for_static(
         if row.status == "static_dhcp":
             lease = await _live_lease_at(db, row) if to_status == "available" else None
             if lease is not None:
-                _mirror_lease_onto(row, lease)
+                _mirror_lease_onto(
+                    row,
+                    lease,
+                    write_hostname=row.subnet_id not in suppressed,
+                )
                 if subnet_row is not None:
                     handovers.append(LeaseHandover(subnet_row, row, lease))
             else:
@@ -412,7 +426,7 @@ async def _live_lease_at(
     return None
 
 
-def _mirror_lease_onto(row: IPAddress, lease: DHCPLease) -> None:
+def _mirror_lease_onto(row: IPAddress, lease: DHCPLease, *, write_hostname: bool = True) -> None:
     """Make ``row`` the IPAM mirror of ``lease``.
 
     The fields the lease-event ingest stamps on a row it takes over
@@ -420,7 +434,8 @@ def _mirror_lease_onto(row: IPAddress, lease: DHCPLease) -> None:
     stored lease rather than an event. The sighting is the lease's own report;
     a later sighting already on the row (a discovery sweep) is kept.
     """
-    row.hostname = (lease.hostname or row.hostname or "")[:253]
+    if write_hostname:
+        row.hostname = (lease.hostname or row.hostname or "")[:253]
     row.mac_address = lease.mac_address or row.mac_address
     row.status = "dhcp"
     row.auto_from_lease = True
