@@ -3360,6 +3360,9 @@ export function AddAddressModal({
   const [reservedUntil, setReservedUntil] = useState<string>("");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  // #2469 — the pre-fill below may re-pick while zones are still arriving;
+  // it stops the moment the operator chooses (None included).
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   // Issue #25 — split-horizon publishing. Extra zone UUIDs to
   // publish beyond the singular primary. Only surfaced when the
   // subnet has ``dns_split_horizon`` on (effective).
@@ -3499,17 +3502,27 @@ export function AddAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
-  // Pre-select the primary zone (dns_zone_id) or first zone when there's only one
+  // Pre-select the primary zone (dns_zone_id), or the first zone when the
+  // subnet pins no primary. The zones of a subnet can come from several DNS
+  // groups, each its own request, so the primary may arrive after another
+  // group's zones (#2469): wait for it (falling back to the first zone only
+  // once every group has answered) and re-pick when it lands, until the
+  // operator has chosen.
+  const primaryZoneId = effectiveDns?.dns_zone_id;
+  const zonesSettled = zoneQueries.every(
+    (q: { isLoading: boolean }) => !q.isLoading,
+  );
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z: DNSZone) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (dnsZoneTouched || availableZones.length === 0) return;
+    const target =
+      primaryZoneId &&
+      availableZones.some((z: DNSZone) => z.id === primaryZoneId)
+        ? primaryZoneId
+        : !primaryZoneId || zonesSettled
+          ? availableZones[0].id
+          : null;
+    if (target && target !== dnsZoneId) setDnsZoneId(target);
+  }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
@@ -3796,7 +3809,10 @@ export function AddAddressModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}
