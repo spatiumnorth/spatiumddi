@@ -197,7 +197,11 @@ export function CreateScopeModal({
     queryFn: () => ipamApi.getSubnet(fixedSubnetId!),
     enabled: !!fixedSubnetId,
   });
-  const pinnedGroup = dhcpGroups.find((g) => g.id === defaultGroupId);
+  // #2479 — an existing scope's group is not editable (the API refuses a move),
+  // so Edit shows the stored group as a read-only pill like a pinned create.
+  const pinnedGroup = dhcpGroups.find(
+    (g) => g.id === (editing ? scope?.group_id : defaultGroupId),
+  );
   // Settings + specific subnet feed the auto-prefill for new scopes.
   const { data: settings } = useQuery({
     queryKey: ["settings"],
@@ -596,7 +600,7 @@ export function CreateScopeModal({
               else show a picker. Defaults to the DHCP group inherited
               from the subnet / block / space. Scopes belong to groups,
               and every server in the group serves this scope. */}
-          {defaultGroupId && pinnedGroup ? (
+          {(editing || defaultGroupId) && pinnedGroup ? (
             <Field label="DHCP Server Group">
               <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
                 <span className="font-medium">{pinnedGroup.name}</span>
