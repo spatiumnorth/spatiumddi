@@ -12,6 +12,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import (
+    has_any_grant_for,
     is_effective_superadmin,
     token_scoped_resource_ids,
     user_has_permission,
@@ -34,6 +35,12 @@ __all__ = ["execute", "visible_providers"]
 def _may_read(user: User, provider: SearchProvider) -> bool:
     if provider.superadmin_only:
         return is_effective_superadmin(user)
+    if provider.type == "subnet" and not provider.also_emits:
+        # A grant scoped to ONE subnet (#2569) is a read on that subnet: admit
+        # the subnet provider on any such grant and let ``_narrow_to_grants``
+        # cut the rows to the granted ones. Only this provider: the address,
+        # block and custom-field passes keep their type-level gate.
+        return has_any_grant_for(user, "read", "subnet")
     return any(user_has_permission(user, "read", rt) for rt in provider.resource_types)
 
 
@@ -83,6 +90,20 @@ def _narrow_to_token_scope(user: User, results: list[SearchResult]) -> list[Sear
                 continue
         kept.append(r)
     return kept
+
+
+def _narrow_to_grants(user: User, results: list[SearchResult]) -> list[SearchResult]:
+    """Keep only the subnet rows the caller may read when it holds no
+    type-level read on subnets (a grant scoped to individual subnets, #2569).
+
+    A no-op for anyone with a type-level (or wildcard) subnet read."""
+    if user_has_permission(user, "read", "subnet"):
+        return results
+    return [
+        r
+        for r in results
+        if r.type != "subnet" or user_has_permission(user, "read", "subnet", r.id)
+    ]
 
 
 def _emitted_types(providers: list[SearchProvider]) -> set[str]:
@@ -154,6 +175,7 @@ async def execute(
         r for r in results if r.type in allowed_types and (wanted is None or r.type in wanted)
     ]
     results = _narrow_to_token_scope(user, results)
+    results = _narrow_to_grants(user, results)
 
     # De-duplicate. The same row can arrive from a direct column match and
     # from the custom-field pass; keep the higher-scoring copy, preferring

@@ -290,6 +290,98 @@ prevent, and the resulting dropped writes are silent (a log line; no error
 reaches whoever made the change). Promote a replacement instead; that demotes
 the incumbent as a side effect.
 
+### Control-plane memory for large groups (#2227)
+
+Every DNS agent's config is rendered once per change by the Celery worker
+(the `bundles` queue) and stored; the long-poll serves the stored bytes (see
+"Stored bundles" in [`DNS_AGENT.md`](../deployment/DNS_AGENT.md)). The
+render used to hold the whole group at once: a row per record as fetched, a
+dict per record, then three whole serialisations (the body, the ETag payload,
+the structural payload). Since #2227 it reads the records a batch of zones at
+a time, writes each batch into the gzipped body as it goes, and hashes the
+two ETags from spool files, so what it holds no longer grows with the group's
+record count. The stored bytes and both ETags are unchanged, byte for byte.
+
+Measured on a synthetic group of 20,000 zones (a forward and a reverse zone
+per site, the scale-lab shape), one render and store, peak RSS of the worker
+process (about 127 MB before the render starts):
+
+| Records in the group | Before #2227 | After |
+|---|---|---|
+| 1,000,000 | 1,016 MB | 227 MB |
+| 2,000,000 | 1,799 MB | 231 MB |
+| 2,000,000, two views (4M record copies) | 2,810 MB | 244 MB |
+| 2,000,000, one view, 813,000 queued ops for the server | 3,768 MB | 231 MB |
+
+Before, that was about **850 MB per million records** on top of the process,
+for every render (most of it the fetched rows, about 700 B each). After, a
+render of a group without views needs about:
+
+- 130 MB for the worker process itself;
+- about **4 kB per zone** in the group (the zones are still read whole);
+- one batch of records (`RECORD_RENDER_BATCH`, 20,000 rows), about 15 MB;
+- twice the **compressed** body while it is stored: the stored bytes and the
+  copy the database driver sends. `dns_agent_bundle.body_gzip_bytes` is that
+  size; per record it is a few bytes, not hundreds.
+
+Under split-horizon views a zone's copies are cut from all of its records at
+once, so a render also holds the **largest zone** whole: roughly 1 - 1.5 kB
+per record in that zone, per view it renders into.
+
+The two spools move to a temporary file once they pass 8 MB (`TMPDIR`, the
+container's writable layer by default). Together they are a little larger
+than the uncompressed body, so rendering a two-million-record group needs a
+few hundred MB of scratch disk while it runs.
+
+A render the worker still cannot survive (killed mid-render by the OOM
+killer, or by the task's 960 s hard time limit) no longer takes the fleet
+with it. Its lease on the fleet-wide render slot lapses within
+`dns_agent_bundle_render_lease_seconds` (60 s). After two renders of one
+server have died that way, the next one records the reason on the server
+(`bundle_render_status = failed`, which raises the
+`agent_bundle_render_failed` alert) and holds that server for five minutes,
+then lets one more render through. Before, the broker redelivered the dead
+render's task and the sweep re-enqueued it, so it killed one worker process
+after another and nothing on the server row said why.
+
+**Renders at once, and fairness.** Renders used to run one at a time across
+the whole fleet, and a server whose group kept changing re-rendered in place
+up to 50 times while every other server waited. Now up to
+`dns_agent_bundle_render_slots` (`DNS_AGENT_BUNDLE_RENDER_SLOTS`, default 2)
+run at once, and a server that changed again while it rendered hands its
+slot to any render that is waiting before it renders again. Measured on the
+same 2,000,000-record group with seven servers: about 40 s per render, so a
+full pass took 283 s one at a time and 170 s two at a time (on a 6-core
+host; renders are CPU-bound in the worker, so more slots buy little past the
+worker's cores).
+
+**The op backlog, under split-horizon views.** Each record change queues one
+op per server in the group (#170), so 2M records on seven servers is about
+14M op rows, and they pile up while no render finishes. A group *without*
+views never reads them in a render: they ship a page at a time (5,000 ops,
+about 1.4 s) against the stored bundle that covers them. A group *with* views
+cannot apply a record op incrementally, so its render retires every queued op
+its body covers. That retire used to load the ops as ORM rows, about 4 kB
+each, and after a load it was the larger half of the render: measured on the
+2,000,000-record group with one view (the scale lab's shape) and 813,000
+queued ops for the server, the render peaked at 1,797 MB and the retire at
+3,768 MB, taking 132 s. It now locks and stamps them a chunk of ids at a time
+(`RETIRE_CHUNK`, 5,000) with one UPDATE each and loads none: the same render
+and retire peaked at 231 MB and the retire took 31 s.
+
+Bounded is not the same as keeping up. Under views every record change
+re-renders every server of the group in full, where a group without views
+ships the change as an op. With two views and the same backlog a
+2,000,000-record render took about four minutes here, so a seven-server
+group under a sustained write storm re-renders continuously and never sits
+settled; it converges once the writes stop. View-aware incremental ops is
+the follow-up that changes this (#2240).
+
+This is the control plane's side. The agent and its daemon have their own
+memory to size for the same group (#2223), and
+[`APPLIANCE.md`](../deployment/APPLIANCE.md) states what one group is
+supported at.
+
 ---
 
 ## 2. DNS Views (Split-Horizon)
