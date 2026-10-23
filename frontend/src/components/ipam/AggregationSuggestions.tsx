@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BellOff, Combine, Lightbulb, RotateCcw, X } from "lucide-react";
 import { ipamApi, type AggregationSuggestion } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useSessionState } from "@/lib/useSessionState";
 
 /**
@@ -18,8 +19,13 @@ import { useSessionState } from "@/lib/useSessionState";
  * doesn't have to re-click on every nav) is keyed on the block id —
  * different blocks remember their own popover state.
  */
+// The snooze map is platform-wide — it changes the badge for every
+// operator — so the API requires write on IP blocks for all three actions.
+const NEEDS_BLOCK_WRITE = "Requires write permission on IP blocks";
+
 export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
   const qc = useQueryClient();
+  const canEdit = usePermissions().can("write", "ip_block");
   const wrapperRef = useRef<HTMLDivElement | null>(null);
 
   const [open, setOpen] = useSessionState(
@@ -139,6 +145,7 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
                 <CandidateRow
                   key={s.candidate_key}
                   candidate={s}
+                  canEdit={canEdit}
                   onSnooze={() => snoozeMut.mutate(s.candidate_key)}
                   onDismiss={() => dismissMut.mutate(s.candidate_key)}
                   onClear={() => clearMut.mutate(s.candidate_key)}
@@ -168,17 +175,22 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
 
 function CandidateRow({
   candidate,
+  canEdit,
   onSnooze,
   onDismiss,
   onClear,
 }: {
   candidate: AggregationSuggestion;
+  canEdit: boolean;
   onSnooze: () => void;
   onDismiss: () => void;
   onClear: () => void;
 }) {
   const isSnoozed = candidate.snoozed_until !== null;
   const isPermanent = candidate.snoozed_until === "permanent";
+  const gate = permissionGate(canEdit, NEEDS_BLOCK_WRITE);
+  const btn =
+    "inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50";
 
   let snoozeLabel: string | null = null;
   if (isPermanent) {
@@ -205,11 +217,7 @@ function CandidateRow({
       ) : null}
       <div className="mt-2 flex items-center gap-1.5">
         {isSnoozed ? (
-          <button
-            type="button"
-            onClick={onClear}
-            className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
-          >
+          <button type="button" onClick={onClear} className={btn} {...gate}>
             <RotateCcw className="h-3 w-3" />
             Re-enable
           </button>
@@ -218,8 +226,9 @@ function CandidateRow({
             <button
               type="button"
               onClick={onSnooze}
-              className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+              className={btn}
               title="Hide for 30 days"
+              {...gate}
             >
               <BellOff className="h-3 w-3" />
               Snooze 30 days
@@ -227,8 +236,9 @@ function CandidateRow({
             <button
               type="button"
               onClick={onDismiss}
-              className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+              className={cn(btn, "text-muted-foreground hover:text-foreground")}
               title="Don't suggest this candidate again"
+              {...gate}
             >
               Don't suggest again
             </button>

@@ -386,6 +386,8 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
   scopes returns `401 "Token scope insufficient for this request"`.
+  Path prefixes match on a whole segment: `dns:write` covers
+  `/api/v1/dns/...` but not `/api/v1/dnsbl/...` or `/api/v1/dns-threat/...`.
   `read` permits only safe methods (`GET` / `HEAD` / `OPTIONS`) — plus
   a JSON-RPC `POST` to the read-only MCP endpoint.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
@@ -397,6 +399,10 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   the tools that narrow their answers to the bound zones / subnets
   (`honours_token_binding` in `app/services/ai/tools/base.py`); the rest
   are not listed and are refused if called.
+  Over REST, a bound token is served by the IPAM and DNS routers and a
+  short list of routes that narrow to its grants (see
+  [`features/AUTH.md`](features/AUTH.md)); every other endpoint answers
+  `403` to it.
 
 A token can never exceed its owner's RBAC: the scope / grant check is
 an *additional* gate, applied on top of the owning user's permissions.
@@ -440,6 +446,17 @@ feature simply isn't installed
 ```json
 { "detail": "Feature 'network.circuit' is disabled." }
 ```
+
+Disabling a module also stops its **scheduled work**, not just its routes
+([#2279](https://github.com/spatiumnorth/spatiumddi/issues/2279)): every
+module-owned Celery task carries `@module_gated("<module id>")`
+(`backend/app/tasks/module_gate.py`) and does nothing while the module,
+or a parent in its `requires=` chain, is off — no SNMP polls, TLS probes,
+conformity runs, RDAP / RPKI / RIPEstat fetches, or nmap auto-profile of
+new DHCP clients. Core, retention and prune tasks run regardless; each is
+listed with its reason in `UNGATED_BEAT_TASKS`, and
+`tests/test_module_gated_tasks_2279.py` fails any beat task that is in
+neither place.
 
 A module's shipped default lives in `default_enabled` on its catalog
 entry and nowhere else — a `feature_module` row means an operator

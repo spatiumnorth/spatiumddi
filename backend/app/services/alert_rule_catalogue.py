@@ -396,6 +396,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     ),
     (a.RULE_TYPE_DNSSEC_MULTI_SIGNER, "DNSSEC zone signed by several servers", "DNS", []),
     (a.RULE_TYPE_DNS_RECORD_OP_FAILED, "DNS record operation failed", "DNS", []),
+    (a.RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE, "Two DNS agents on one server", "DNS", []),
     # ── Servers, agents, appliance ─────────────────────────────────────
     (
         a.RULE_TYPE_SERVER_UNREACHABLE,
@@ -435,6 +436,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     ),
     (a.RULE_TYPE_CLUSTER_DNS_DEGRADED, "Cluster DNS (CoreDNS) degraded", "Infrastructure", []),
     (a.RULE_TYPE_APPLIANCE_STORAGE_DEGRADED, "Appliance storage degraded", "Infrastructure", []),
+    (a.RULE_TYPE_APPLIANCE_HEARTBEAT_STALE, "Appliance heartbeat lost", "Infrastructure", []),
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_SPOOL_TRIMMED, "Agent spool trimmed", "Infrastructure", []),

@@ -27,7 +27,7 @@ export function NmapResultPanel({ scan }: { scan: NmapScanRead }) {
   const summary = scan.summary;
   if (!summary) return null;
 
-  if (summary.hosts && summary.hosts.length > 0) {
+  if (Array.isArray(summary.hosts)) {
     return <MultiHostResult scan={scan} hosts={summary.hosts} />;
   }
   return <SingleHostResult scan={scan} />;

@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -26,6 +26,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.opnsense import OPNsenseRouter
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["opnsense"],
@@ -429,6 +430,11 @@ async def delete_router(
         )
     )
     _audit(db, user=user, action="delete", router_id=r.id, router_name=r.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="opnsense_router_id", target_id=r.id, user=user, target_name=r.name
+    )
     await db.delete(r)
     await db.commit()
 
@@ -437,10 +443,20 @@ async def delete_router(
     "/routers/{router_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_router(router_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="opnsense_router",
+        resource_id=r.id,
+        resource_display=str(getattr(r, "name", None) or r.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.opnsense_sync import sync_router_now  # noqa: PLC0415
 
