@@ -1,4 +1,7 @@
-"""Report an OOM kill the agent could not report itself (#2018).
+"""Report an OOM kill the agent could not report itself (#2018, #2023).
+
+#2023 extends this to the DHCP side: the ``dhcp-kea`` container is group-killed
+the same way, and :data:`DHCP_DRIVER_SERVICE` maps a ``kea`` row onto it.
 
 #1725 / #1898 made a DNS daemon killed by its container's memory limit read
 as *not serving* (``oom_killed: …``) and raise **Agent daemon not serving**.
@@ -67,10 +70,22 @@ DNS_DRIVER_SERVICE = {
     "technitium": "dns-technitium",
 }
 
+#: dhcp_server.driver -> the role chart's container (#2023). The DHCP side of
+#: the same kubelet group kill: ``kea-dhcp4`` / ``kea-dhcp6`` and the DHCP agent
+#: share the ``dhcp-kea`` container, so when Kea reaches its limit the agent dies
+#: with it. ``windows_dhcp`` is agentless and has no container.
+DHCP_DRIVER_SERVICE = {"kea": "dhcp-kea"}
+
+#: Both families in one lookup. The driver names are disjoint (``bind9`` /
+#: ``powerdns`` / ``technitium`` vs ``kea``), so a driver alone says which
+#: server table a row came from.
+DRIVER_SERVICE = {**DNS_DRIVER_SERVICE, **DHCP_DRIVER_SERVICE}
+
 _DAEMON_NAME = {
     "bind9": "named",
     "powerdns": "pdns_server",
     "technitium": "the Technitium DNS server",
+    "kea": "Kea",
 }
 
 #: The kubelet's word for a container its cgroup's OOM killer ended.
@@ -109,7 +124,7 @@ def container_oom_report(
     was last ended by the OOM killer and has not since stayed up for
     :data:`STABLE_SECONDS`; None otherwise (no report, another reason, or
     a kill the daemon has outlived)."""
-    service = DNS_DRIVER_SERVICE.get(driver or "")
+    service = DRIVER_SERVICE.get(driver or "")
     if service is None or not isinstance(role_health, dict):
         return None
     entry = role_health.get(service)
@@ -143,12 +158,25 @@ def container_oom_report(
         restarted = f"restarted {restarts} times, "
     daemon = _DAEMON_NAME.get(driver or "", "the DNS daemon")
     state = "up again" if running_since is not None else "not running"
+    if driver in DHCP_DRIVER_SERVICE:
+        # No "RPZ blocklists" advice here: a Kea over its limit is a lease
+        # table, a packet backlog or a very large number of subnets.
+        what = f"{daemon} and the DHCP agent with it"
+        advice = (
+            "raise the container's memory limit, or shrink what Kea holds (lease "
+            "table, subnets, reservations); see docs/features/DHCP.md."
+        )
+    else:
+        what = f"{daemon} and the DNS agent with it"
+        advice = (
+            "Large RPZ blocklists are the usual cause: raise the limit or shrink the "
+            "lists (docs/features/DNS.md 8.0)."
+        )
     reason = (
-        f"{REASON_PREFIX} the {service} container ({daemon} and the DNS agent with it) "
+        f"{REASON_PREFIX} the {service} container ({what}) "
         f"was killed for exceeding {limit_txt} ({restarted}last at "
         f"{killed_at.strftime('%Y-%m-%dT%H:%M:%SZ')}, {state}) and restarts into the same "
-        "config. Large RPZ blocklists are the usual cause: raise the limit or shrink the "
-        "lists (docs/features/DNS.md 8.0)."
+        f"config. {advice}"
     )
     return {"status": STATUS_DEGRADED, "reason": reason}, killed_at
 
@@ -172,7 +200,7 @@ def effective_daemon_report(
     driver: str | None,
     now: datetime,
 ) -> tuple[dict[str, Any] | None, datetime]:
-    """The daemon state to persist for a DNS agent heartbeat: the agent's
+    """The daemon state to persist for a DNS or DHCP agent heartbeat: the agent's
     own word, unless the kubelet saw an OOM kill the agent did not (its
     report is then ``ok``, a deferred start, anything but its own
     ``oom_killed:`` record). Returns ``(report, stamp)``; ``stamp`` is the
@@ -191,7 +219,8 @@ def apply_container_oom(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Stamp the kubelet's OOM verdict onto ``server`` (a DNSServer) when the
+    """Stamp the kubelet's OOM verdict onto ``server`` (a DNSServer or, since
+    #2023, a DHCPServer) when the
     row does not already say so. For the supervisor heartbeat, which is the
     only report there is while the container crash-loops. Never clears: the
     agent's next ``ok`` heartbeat does that once the verdict has expired.
@@ -204,7 +233,7 @@ def apply_container_oom(
     apply_reported_daemon_state(
         server,
         report,
-        agent_kind="dns",
+        agent_kind="dhcp" if getattr(server, "driver", None) in DHCP_DRIVER_SERVICE else "dns",
         server_id=str(server.id),
         now=min(killed_at, stamp),
     )
@@ -217,7 +246,9 @@ def apply_container_oom(
 
 
 __all__ = [
+    "DHCP_DRIVER_SERVICE",
     "DNS_DRIVER_SERVICE",
+    "DRIVER_SERVICE",
     "ROLE_HEALTH_FRESH_SECONDS",
     "REASON_PREFIX",
     "STABLE_SECONDS",

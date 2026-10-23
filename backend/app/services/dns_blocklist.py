@@ -11,12 +11,13 @@ this module.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -36,7 +37,7 @@ class EffectiveEntry:
     domain: str
     # action: block | redirect | nxdomain
     action: str
-    # block_mode inherited from the list: nxdomain | sinkhole | refused
+    # block_mode inherited from the list: nxdomain | sinkhole
     block_mode: str
     sinkhole_ip: str | None
     target: str | None
@@ -77,7 +78,6 @@ async def _collect_lists(
     db: AsyncSession, lists: list[DNSBlockList]
 ) -> tuple[list[EffectiveEntry], set[str], list[uuid.UUID]]:
     entries: list[EffectiveEntry] = []
-    exceptions: set[str] = set()
     list_ids: list[uuid.UUID] = []
 
     # Column rows, not ORM entities (#1109, the #948 pattern): a Family
@@ -111,11 +111,7 @@ async def _collect_lists(
             for domain, entry_type, target, is_wildcard in entry_result.tuples()
         )
 
-        exc_result = await db.execute(
-            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
-        )
-        exceptions.update(domain.lower() for domain in exc_result.scalars())
-
+    exceptions = await exception_domains(db, lists)
     return entries, exceptions, list_ids
 
 
@@ -225,8 +221,9 @@ async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> Ef
 # such a bundle took the whole 1 GiB worker. The render reads them through
 # these instead, one batch at a time, in exactly ``_collect_lists``'s order.
 
-#: (domain, action, block_mode, target, is_wildcard) — what the bundle ships.
-RenderEntry = tuple[str, str, str, str | None, bool]
+#: (domain, action, block_mode, target, is_wildcard, sinkhole_ip) — what the
+#: bundle ships.
+RenderEntry = tuple[str, str, str, str | None, bool, str | None]
 
 
 def _enabled(lists: list[DNSBlockList]) -> list[DNSBlockList]:
@@ -241,15 +238,122 @@ async def has_entries(db: AsyncSession, lists: list[DNSBlockList]) -> bool:
     return bool(await db.scalar(select(exists().where(DNSBlockListEntry.list_id.in_(ids)))))
 
 
-async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[str]:
-    """The exceptions of the enabled lists of ``lists``, as ``_collect_lists``
-    collects them."""
-    out: set[str] = set()
-    for bl in _enabled(lists):
+def _ancestors(name: str) -> list[str]:
+    """``a.b.example.com`` → ``[b.example.com, example.com, com]``."""
+    labels = name.split(".")
+    return [".".join(labels[i:]) for i in range(1, len(labels))]
+
+
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _pooled_feed_exceptions(
+    db: AsyncSession, enabled: list[DNSBlockList], feed: dict[uuid.UUID, set[str]]
+) -> set[str]:
+    """The feed exceptions (``source='feed'``, adblock ``@@``) that may join
+    the pooled exception set (#2123, decided on #2124).
+
+    Every renderer applies the pooled set to EVERY list of the zone: BIND
+    emits ``N`` and ``*.N`` as ``rpz-passthru`` and drops any entry equal to
+    ``N``; Technitium puts ``N`` in its allowed set, which unblocks ``N`` and
+    everything under it. A remote feed may only carve exceptions out of its
+    OWN blocks, so a feed's exception ``N`` is pooled only when:
+
+    * the feed's own list blocks it through a wildcard ancestor (``||p^``
+      with ``@@||n.p^``) — otherwise there is nothing of its own to carve
+      out of, and an exact block of ``N`` the parser already dropped;
+    * no OTHER list of the zone blocks ``N`` itself or through a wildcard
+      ancestor; and
+    * no other list blocks a name under ``N`` (Technitium's allowed set
+      covers the whole subtree).
+
+    Every other feed exception is stored, shown and has no effect. That
+    over-blocks rather than under-blocks: a carve-out lost to another list
+    is what that other list asked for.
+    """
+    candidates: dict[uuid.UUID, set[str]] = {}
+    for bl in enabled:
+        names = feed.get(bl.id)
+        if not names:
+            continue
+        lookup = {a for n in names for a in _ancestors(n)}
+        if not lookup:
+            continue
         rows = await db.execute(
-            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
+            select(DNSBlockListEntry.domain).where(
+                DNSBlockListEntry.list_id == bl.id,
+                DNSBlockListEntry.is_wildcard.is_(True),
+                DNSBlockListEntry.domain.in_(lookup),
+            )
         )
-        out.update(domain.lower() for domain in rows.scalars())
+        own = {d.lower() for d in rows.scalars()}
+        useful = {n for n in names if any(a in own for a in _ancestors(n))}
+        if useful:
+            candidates[bl.id] = useful
+
+    pooled: set[str] = set()
+    for list_id, names in candidates.items():
+        others = [bl.id for bl in enabled if bl.id != list_id]
+        if not others:
+            pooled |= names
+            continue
+        lookup = set(names) | {a for n in names for a in _ancestors(n)}
+        cover = await db.execute(
+            select(DNSBlockListEntry.domain, DNSBlockListEntry.is_wildcard).where(
+                DNSBlockListEntry.list_id.in_(others),
+                DNSBlockListEntry.domain.in_(lookup),
+            )
+        )
+        exact: set[str] = set()
+        wild: set[str] = set()
+        for d, is_wild in cover.tuples():
+            exact.add(d.lower())
+            if is_wild:
+                wild.add(d.lower())
+        safe = {n for n in names if n not in exact and not any(a in wild for a in _ancestors(n))}
+        if not safe:
+            continue
+        # A name UNDER a carve-out, blocked by another list. One pass over
+        # the other lists' entries, and only for the few carve-outs that
+        # survived the indexed checks above.
+        patterns = [f"%.{_like_escape(n)}" for n in sorted(safe)]
+        rows = await db.execute(
+            select(DNSBlockListEntry.domain).where(
+                DNSBlockListEntry.list_id.in_(others),
+                or_(*(DNSBlockListEntry.domain.like(p) for p in patterns)),
+            )
+        )
+        under = {d.lower() for d in rows.scalars()}
+        pooled |= {n for n in safe if not any(u.endswith("." + n) for u in under)}
+    return pooled
+
+
+async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[str]:
+    """The exceptions every renderer applies across all of ``lists``.
+
+    An operator's exception (``source='manual'``) applies to every list of
+    the zone, as it always has. A feed's own ``@@`` rule (``source='feed'``,
+    #2123) applies only to that feed's list: see
+    :func:`_pooled_feed_exceptions`.
+    """
+    enabled = _enabled(lists)
+    out: set[str] = set()
+    feed: dict[uuid.UUID, set[str]] = {}
+    for bl in enabled:
+        rows = await db.execute(
+            select(DNSBlockListException.domain, DNSBlockListException.source).where(
+                DNSBlockListException.list_id == bl.id
+            )
+        )
+        for domain, source in rows.tuples():
+            name = domain.lower().rstrip(".")
+            if source == "feed":
+                feed.setdefault(bl.id, set()).add(name)
+            else:
+                out.add(domain.lower())
+    if feed:
+        out |= await _pooled_feed_exceptions(db, enabled, feed)
     return out
 
 
@@ -260,12 +364,12 @@ async def stream_entries(
     at most ``batch`` at a time: one server-side cursor per list, so neither
     the driver nor this process ever holds more than a batch of a list."""
     for bl in _enabled(lists):
-        block_mode = bl.block_mode
+        block_mode, sinkhole_ip = bl.block_mode, bl.sinkhole_ip
         result = await db.stream(_entry_rows(bl.id).execution_options(yield_per=batch))
         try:
             async for rows in result.partitions():
                 yield [
-                    (domain.lower(), entry_type, block_mode, target, is_wildcard)
+                    (domain.lower(), entry_type, block_mode, target, is_wildcard, sinkhole_ip)
                     for domain, entry_type, target, is_wildcard in rows
                 ]
         finally:
@@ -276,19 +380,63 @@ async def stream_entries(
 
 
 @dataclass(frozen=True)
+class FeedSkipCounts:
+    """Rules an adblock-format feed carried that did not become entries (#2123).
+
+    Each is a rule the feed's author wrote and this list does not enforce,
+    so the operator is told how many rather than left to assume the list
+    is the whole feed:
+
+    * ``regex`` — ``/…/`` and ``@@/…/`` rules. RPZ matches names, not
+      patterns.
+    * ``modifier`` — a rule carrying a modifier DNS cannot express
+      (``$domain=``, ``$third-party``, ``$client=``, ``$dnstype=``, …).
+      Most of them NARROW a rule, so dropping the modifier and keeping the
+      name would block more than the feed asked for; the rule is skipped
+      instead. ``$important`` is the one exception: it only changes
+      precedence, so the rule is kept as a plain block.
+    * ``badfilter`` — ``$badfilter`` rules. Each disables the rule it
+      names, which is dropped with it; neither becomes an entry.
+    * ``malformed`` — anything else this parser cannot turn into a name:
+      a path (``||host/ads``), a ``*`` inside a name, a ``|`` anchor, a
+      bare word.
+    """
+
+    regex: int = 0
+    modifier: int = 0
+    badfilter: int = 0
+    malformed: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "regex": self.regex,
+            "modifier": self.modifier,
+            "badfilter": self.badfilter,
+            "malformed": self.malformed,
+        }
+
+
+@dataclass(frozen=True)
 class ParsedFeed:
     """A parsed feed plus what its syntax said about subdomains.
 
-    ``wildcard_count`` is how many lines arrived `*.`-prefixed. The
-    caller needs it because that prefix is the feed *declaring* it means
-    "and every subdomain" — so a list configured apex-only
-    (``feed_entries_are_wildcard=False``, #894) against such a feed is
-    overriding a stated intent, which is worth saying out loud rather
-    than doing silently.
+    ``wildcard_count`` is how many lines declared "this name and every
+    subdomain": ``*.``-prefixed lines, and in an adblock feed every
+    ``||name^`` rule, since that is what ``||`` means. The caller needs it
+    because a list configured apex-only (``feed_entries_are_wildcard=False``,
+    #894) against such a feed is overriding a stated intent, which is worth
+    saying out loud rather than doing silently.
+
+    ``exceptions`` are the feed's own allow rules (adblock ``@@||name^``,
+    #2123), stored as the list's exceptions. ``skipped`` counts the rules
+    an adblock feed carried that became neither; it is None for the other
+    formats, which have no rule syntax to lose.
     """
 
     domains: list[str]
     wildcard_count: int
+    exceptions: list[str] = field(default_factory=list)
+    skipped: FeedSkipCounts | None = None
 
 
 def parse_feed(content: str, feed_format: str) -> list[str]:
@@ -300,17 +448,144 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
     return parse_feed_detailed(content, feed_format).domains
 
 
+#: A hostname as an adblock ``||`` rule may name it: labels of letters,
+#: digits, ``-`` and ``_``, at least two of them, optionally ``*.``-led.
+_ADBLOCK_HOST_RE = re.compile(r"^(?:\*\.)?[a-z0-9_-]+(?:\.[a-z0-9_-]+)+\.?$")
+
+#: Modifiers that leave a rule's DNS meaning intact. ``important`` only
+#: raises a rule's precedence over exceptions in the same engine.
+_ADBLOCK_HARMLESS_MODIFIERS = frozenset({"important"})
+
+#: Element-hiding / scriptlet separators. Those rules are for browsers, never
+#: for DNS, so they are ignored rather than counted as lost.
+_ADBLOCK_COSMETIC_MARKERS = ("##", "#@#", "#?#", "#$#", "#%#", "#@$#", "#@%#", "#@?#")
+
+
+#: (is_exception, pattern, modifiers without badfilter) identifies a rule for
+#: ``$badfilter``, which cancels the rule that is otherwise identical.
+_RuleKey = tuple[bool, str, frozenset[str]]
+
+
+def _parse_adblock(content: str) -> ParsedFeed:
+    """The ``adblock`` branch of :func:`parse_feed_detailed` (#2123).
+
+    The old parser read only ``||`` lines and cut each at the first ``^``,
+    ``$`` or ``/``. So ``@@`` exceptions vanished (over-blocking whatever
+    another rule covered), ``||x^$badfilter`` — "disable the rule for x" —
+    became a block of x, and a ``$domain=`` rule, which narrows a block to
+    requests from one site, became an unconditional block. Each is now
+    handled for what it says, and every rule that cannot be honoured is
+    counted rather than silently dropped.
+    """
+    blocks: list[tuple[_RuleKey, str]] = []
+    allows: list[tuple[_RuleKey, str]] = []
+    cancelled: set[_RuleKey] = set()
+    regex = modifier = badfilter = malformed = 0
+    wildcard_count = 0
+
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("!", "#", "[")):
+            continue  # comment, or an ``[Adblock Plus 2.0]`` header
+        if any(marker in line for marker in _ADBLOCK_COSMETIC_MARKERS):
+            continue
+
+        is_exception = line.startswith("@@")
+        body = line[2:] if is_exception else line
+        if body.startswith("/"):
+            regex += 1
+            continue
+
+        pattern, sep, mod_text = body.partition("$")
+        mods = (
+            frozenset(m.strip().lower() for m in mod_text.split(",") if m.strip())
+            if sep
+            else frozenset()
+        )
+        pattern = pattern.lower()
+        if "badfilter" in mods:
+            badfilter += 1
+            cancelled.add((is_exception, pattern, mods - {"badfilter"}))
+            continue
+        if any(m.split("=", 1)[0] not in _ADBLOCK_HARMLESS_MODIFIERS for m in mods):
+            modifier += 1
+            continue
+
+        if not pattern.startswith("||"):
+            malformed += 1
+            continue
+        host = pattern[2:]
+        if host.endswith("|"):
+            host = host[:-1]
+        if host.endswith("^"):
+            host = host[:-1]
+        if not _ADBLOCK_HOST_RE.match(host):
+            malformed += 1
+            continue
+        host = host.strip(".")
+        if host.startswith("*."):
+            host = host[2:]
+        key: _RuleKey = (is_exception, pattern, mods)
+        (allows if is_exception else blocks).append((key, host))
+
+    # ``$important`` raises a block over every exception that is not itself
+    # ``$important`` — that is the modifier's whole meaning. So a plain
+    # ``@@`` for a name an important block names is overruled, and is not
+    # stored: a stored exception would unblock the name for every list on
+    # the group, inverting the feed's intent.
+    important_blocks = {
+        host for key, host in blocks if key not in cancelled and "important" in key[2]
+    }
+    exceptions: list[str] = []
+    excepted: set[str] = set()
+    for key, host in allows:
+        if key in cancelled or host in excepted:
+            continue
+        if host in important_blocks and "important" not in key[2]:
+            continue
+        excepted.add(host)
+        exceptions.append(host)
+
+    domains: list[str] = []
+    seen: set[str] = set()
+    for key, host in blocks:
+        if key in cancelled:
+            continue
+        # ``||name^`` is adblock's "name and every subdomain" (#894).
+        wildcard_count += 1
+        # A name the feed also excepts never renders (the RPZ renderers skip
+        # an entry equal to an exception), so storing it would only inflate
+        # ``entry_count`` past what the list enforces.
+        if host in seen or host in excepted:
+            continue
+        seen.add(host)
+        domains.append(host)
+
+    return ParsedFeed(
+        domains=domains,
+        wildcard_count=wildcard_count,
+        exceptions=exceptions,
+        skipped=FeedSkipCounts(
+            regex=regex, modifier=modifier, badfilter=badfilter, malformed=malformed
+        ),
+    )
+
+
 def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
     """Parse raw feed text into deduped domains + wildcard-syntax count.
 
     Accepts:
       - `hosts`: `0.0.0.0 ads.example.com` (or `127.0.0.1`)
       - `domains`: one domain per line, optionally `*.`-prefixed
-      - `adblock`: `||ads.example.com^`
+      - `adblock`: `||ads.example.com^`, with `@@` exceptions and
+        `$important` / `$badfilter`; see :func:`_parse_adblock`
 
     Ignores blank lines and comments (`#`, `!`). A leading `*.` is
     stripped rather than kept — see the comment at the strip site.
     """
+    if feed_format == "adblock":
+        return _parse_adblock(content)
+
     out: list[str] = []
     seen: set[str] = set()
     wildcard_count = 0
@@ -322,17 +597,7 @@ def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
 
         domain: str | None = None
 
-        if feed_format == "adblock":
-            # ||ads.example.com^  or ||ads.example.com
-            if line.startswith("||"):
-                rest = line[2:]
-                for sep in ("^", "$", "/"):
-                    idx = rest.find(sep)
-                    if idx != -1:
-                        rest = rest[:idx]
-                        break
-                domain = rest
-        elif feed_format == "hosts":
+        if feed_format == "hosts":
             # Strip inline comment
             line = line.split("#", 1)[0].strip()
             parts = line.split()

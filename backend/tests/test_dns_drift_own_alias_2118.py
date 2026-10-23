@@ -277,3 +277,68 @@ async def test_own_aaaa_alias_at_the_name_is_not_missing(db_session: AsyncSessio
     report = await compute_subnet_dns_drift(db_session, subnet.id)
     assert _fwd_missing(report) == []
     assert await _apply_report(db_session, subnet, report) == []
+
+
+@pytest.mark.asyncio
+async def test_own_alias_in_the_addresses_own_zone_is_not_missing(
+    db_session: AsyncSession,
+) -> None:
+    # #2104 + #2118 together: the address is published in its own zone T, not
+    # the subnet's, and renamed onto its own A alias in T. Drift reads T (the
+    # address's zone) and finds the name served there; the apply writes the
+    # missing PTR with no 409 and leaves the host in T.
+    subnet, zone, ip, alias = await _own_alias_setup(db_session, "A")
+    # The setup's alias sits in the subnet's zone. Drop it, or a check against
+    # the subnet's zone would pass by accident.
+    await db_session.delete(alias)
+    other = DNSZone(
+        group_id=zone.group_id,
+        name="other.test.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.other.test.",
+        admin_email="admin.other.test.",
+    )
+    db_session.add(other)
+    await db_session.flush()
+    await _sync_dns_record(db_session, ip, subnet, zone_id=other.id, action="update")
+    await db_session.flush()
+    assert ip.forward_zone_id == other.id
+
+    db_session.add(
+        DNSRecord(
+            zone_id=other.id,
+            name="www",
+            fqdn="www.other.test",
+            record_type="A",
+            value="10.81.1.30",
+            auto_generated=True,
+            ip_alias=True,
+            ip_address_id=ip.id,
+        )
+    )
+    ip.hostname = "www"
+    await _sync_dns_record(db_session, ip, subnet, zone_id=other.id, action="update")
+    for r in await _ptr_rows(db_session, ip):
+        await db_session.delete(r)
+    await db_session.flush()
+
+    report = await compute_subnet_dns_drift(db_session, subnet.id)
+    assert _fwd_missing(report) == []
+    assert [m for m in report.mismatched if m.ip_id == ip.id] == []
+    assert [s for s in report.stale if s.ip_id == ip.id] == []
+    assert [m for m in report.missing if m.record_type == "PTR" and m.ip_id == ip.id]
+
+    assert await _apply_report(db_session, subnet, report) == []
+    assert ip.forward_zone_id == other.id
+    assert [p.value for p in await _ptr_rows(db_session, ip)] == ["www.other.test."]
+    hosts = await db_session.execute(
+        select(DNSRecord.zone_id).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.ip_alias.is_(False),
+            DNSRecord.record_type == "A",
+        )
+    )
+    assert hosts.scalars().all() == []  # no twin in T, nothing moved to the subnet's zone
+    again = await compute_subnet_dns_drift(db_session, subnet.id)
+    assert [m for m in again.missing if m.ip_id == ip.id] == []

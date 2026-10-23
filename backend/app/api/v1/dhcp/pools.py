@@ -20,6 +20,7 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.class_refs import is_builtin_or_generated, known_class_names
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
@@ -49,6 +50,19 @@ LEASE_OVERRIDE_UNSUPPORTED = (
 )
 
 
+def _check_ip_literal(v: str | None) -> str | None:
+    """A non-IP start/end is a 422, not a ValueError out of the overlap scan
+    (#2500). Empty / null pass: pd pools ignore the range and create
+    reports a missing one itself."""
+    if v:
+        try:
+            ipaddress.ip_address(v.strip())
+        except ValueError as exc:
+            raise ValueError(f"{v!r} is not a valid IP address") from exc
+        return v.strip()
+    return v
+
+
 def _refuse_lease_override(v: int | None) -> int | None:
     if v is not None:
         raise ValueError(LEASE_OVERRIDE_UNSUPPORTED)
@@ -68,6 +82,11 @@ class PoolCreate(BaseModel):
     pd_prefix: str | None = None
     delegated_length: int | None = None
     excluded_prefix: str | None = None
+
+    @field_validator("start_ip", "end_ip")
+    @classmethod
+    def _ip_literal(cls, v: str | None) -> str | None:
+        return _check_ip_literal(v)
 
     @field_validator("pool_type")
     @classmethod
@@ -93,6 +112,11 @@ class PoolUpdate(BaseModel):
     pd_prefix: str | None = None
     delegated_length: int | None = None
     excluded_prefix: str | None = None
+
+    @field_validator("start_ip", "end_ip")
+    @classmethod
+    def _ip_literal(cls, v: str | None) -> str | None:
+        return _check_ip_literal(v)
 
     @field_validator("lease_time_override")
     @classmethod
@@ -183,8 +207,9 @@ def _validate_pd(
 async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | None) -> None:
     """422 when a pool restricts to an operator client class its daemon does
     not define (#1229). Kea accepts the reference, so the pool would silently
-    match no one. A name that is not an operator class (a generated PXE /
-    phone / device-policy class, or Kea's built-in ``KNOWN``) is not checked."""
+    match no one. A name that is not an operator class must be a device-policy class, a
+    generated PXE / phone class, or a Kea built-in such as ``KNOWN``; anything
+    else is a typo and a 422 (#2285)."""
     if not name:
         return
     cc = (
@@ -195,6 +220,19 @@ async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | No
         )
     ).scalar_one_or_none()
     family = scope.address_family or "ipv4"
+    if (
+        cc is None
+        and not is_builtin_or_generated(name)
+        and name not in await known_class_names(db, scope.group_id)
+    ):
+        # A typo (#2285): Kea accepts it and the pool would never match.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Client class '{name}' does not exist in this scope's server group, so "
+                "the pool would match no client. Create the class first, or pick an existing one."
+            ),
+        )
     if cc is not None and cc.address_family not in (family, "dual"):
         raise HTTPException(
             status_code=422,
@@ -233,6 +271,34 @@ async def _check_pool_overlap(
                 f"'{p.name or p.id}' ({p.start_ip}–{p.end_ip})"
             )
     return None
+
+
+async def _check_range_in_subnet(db: AsyncSession, scope: DHCPScope, start: str, end: str) -> None:
+    """422 unless ``start <= end`` and both lie inside the scope's subnet, in
+    the subnet's address family (#2500). Kea rejects a pool that does not
+    match its subnet's prefix, which stops the whole group converging while
+    the save reported success. Applies to every range type: an excluded or
+    reserved range outside the subnet is equally meaningless."""
+    subnet = await db.get(Subnet, scope.subnet_id)
+    if subnet is None:
+        return
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    a, b = ipaddress.ip_address(start), ipaddress.ip_address(end)
+    if a.version != net.version or b.version != net.version:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Pool range {start}-{end} is not an IPv{net.version} range, but the "
+                f"scope's subnet {net} is"
+            ),
+        )
+    if a > b:
+        raise HTTPException(status_code=422, detail=f"start_ip ({start}) must be <= end_ip ({end})")
+    if a not in net or b not in net:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pool range {start}-{end} is not inside the scope's subnet {net}",
+        )
 
 
 async def _existing_ips_in_range(
@@ -309,6 +375,7 @@ async def create_pool(
 
     if not body.start_ip or not body.end_ip:
         raise HTTPException(status_code=422, detail="start_ip and end_ip are required")
+    await _check_range_in_subnet(db, scope, body.start_ip, body.end_ip)
     overlap = await _check_pool_overlap(db, scope_id, body.start_ip, body.end_ip)
     if overlap:
         raise HTTPException(status_code=409, detail=overlap)
@@ -358,6 +425,12 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
         pool.start_ip = net_addr  # type: ignore[assignment]
         pool.end_ip = net_addr  # type: ignore[assignment]
     elif body.start_ip or body.end_ip:
+        # Merged range (stored row under the patch). Only checked when the
+        # range itself is edited, so renaming a pre-existing out-of-subnet
+        # pool (an importer / Windows-pull row) is not blocked (#2500).
+        parent = await db.get(DHCPScope, pool.scope_id)
+        if parent is not None:
+            await _check_range_in_subnet(db, parent, new_start, new_end)
         overlap = await _check_pool_overlap(
             db, pool.scope_id, new_start, new_end, exclude_id=pool.id
         )

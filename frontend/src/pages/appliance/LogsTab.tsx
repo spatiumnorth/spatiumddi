@@ -235,8 +235,10 @@ function DiagnosticBundleCard() {
           <p className="mt-0.5 text-[11px] text-muted-foreground">
             One-click zip of host logs, per-pod log tails (last 500 lines each
             via kubeapi), system info, and a redacted env dump. Useful for
-            support tickets. Secrets (passwords, tokens, keys) are stripped
-            before bundling.
+            support tickets. Environment values are kept only for known
+            non-secret settings, and logs are swept for credential-shaped values
+            (keys, tokens, passwords in URLs). The log sweep is best effort, so
+            review the bundle before sharing it.
           </p>
         </div>
         <a
