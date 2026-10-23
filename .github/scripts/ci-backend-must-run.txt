@@ -169,3 +169,10 @@ charts/spatiumddi/templates/frontend-tls-config.yaml
 # tested against; editing them must run the backend half, or the two sides
 # could disagree with only the frontend job noticing.
 frontend/src/lib/bulk-allocate-template.vectors.json
+
+# test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
+# watcher, and checks the Dockerfile copies it in and the chart's frontend
+# Deployment no longer rolls on a certificate change.
+frontend/40-tls-reload-watch.sh
+frontend/Dockerfile
+charts/spatiumddi/templates/frontend.yaml

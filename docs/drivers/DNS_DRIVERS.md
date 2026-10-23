@@ -379,6 +379,8 @@ dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
 ---
 
+**Unparseable records are skipped, not fatal (#2510).** Each stored record is checked with dnspython before it is written to the zone file. A row whose rdata does not parse (for example a CAA without a tag, or an MX with extra tokens, stored before the API refused them) is left out, because one such line makes `named-checkzone` refuse the whole zone. The rest of the zone renders, and every skipped record is named (zone, owner, type, value) in a `partial apply:` config-apply error on the server and in the `zone_record_unparseable_skipped` log line. Editing the row to valid rdata clears it on the next apply.
+
 ## 3. Windows DNS Driver
 
 Located at [`app/drivers/dns/windows.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.

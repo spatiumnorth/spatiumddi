@@ -810,6 +810,8 @@ CustomFieldDefinition
 
 Custom fields are exposed under the `custom_fields` JSONB key on all resource objects. They are validated against their `CustomFieldDefinition` on write.
 
+**Required fields (#2478).** A definition marked Required is enforced on IP block and subnet writes (create, allocate-subnet and update); a request that leaves one empty is refused with 422 naming it. A value inherited from the block chain above the row counts. The rule is deliberately narrow so that making a field Required later does not lock existing rows: a **create** needs every Required field; an **update** is checked only when the request sends `custom_fields`, and then only for a field it sends or the row already holds a value for. So a block or subnet that never had the field can still be renamed or saved untouched, but it cannot be given the field empty, and a value it holds cannot be blanked. Select fields always show an empty choice (not pickable for a Required field with nothing to inherit), and the New / Edit dialogs apply the same rule before sending. IP spaces and addresses are not covered yet, and neither are subnets a template's child layout carves.
+
 ---
 
 ## 7. Import / Export
