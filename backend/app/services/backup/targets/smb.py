@@ -45,11 +45,13 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
     describe_exc,
+    read_capped,
     safe_filename,
 )
 
@@ -243,7 +245,9 @@ class SmbDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         target = _unc(config, filename)
 
         def _do() -> bytes:
@@ -252,7 +256,11 @@ class SmbDestination(BackupDestination):
             self._register(config)
             try:
                 with open_file(target, mode="rb") as fh:
-                    return fh.read()
+                    return read_capped(
+                        fh.read, filename=safe_filename(filename), max_bytes=max_bytes
+                    )
+            except ArchiveTooLargeError:
+                raise
             except FileNotFoundError as exc:
                 raise BackupDestinationError(
                     f"archive {safe_filename(filename)!r} not found at {target}"
