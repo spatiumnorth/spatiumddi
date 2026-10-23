@@ -8,6 +8,7 @@ import {
   type StaleIPDeprecateRequest,
   type StaleIPDeprecateResponse,
   type StaleIPEntry,
+  formatApiError,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -387,36 +388,47 @@ export function StaleIPReportPage() {
         }
         loading={deprecate.isPending}
         message={
-          pending?.kind === "all" ? (
-            <>
-              This flips{" "}
-              <strong>
+          <>
+            {pending?.kind === "all" ? (
+              <>
+                This flips{" "}
+                <strong>
+                  {pending.count > BULK_CAP
+                    ? `the first ${BULK_CAP} of ${pending.count}`
+                    : `all ${pending.count}`}
+                </strong>{" "}
+                matching allocated IPs to <strong>deprecated</strong> in the
+                current filter ({staleDays}+ days stale
+                {includeNeverSeen ? ", including never-seen" : ""}). DHCP-lease
+                mirrors and system rows are skipped.
                 {pending.count > BULK_CAP
-                  ? `the first ${BULK_CAP} of ${pending.count}`
-                  : `all ${pending.count}`}
-              </strong>{" "}
-              matching allocated IPs to <strong>deprecated</strong> in the
-              current filter ({staleDays}+ days stale
-              {includeNeverSeen ? ", including never-seen" : ""}). DHCP-lease
-              mirrors and system rows are skipped.
-              {pending.count > BULK_CAP
-                ? " You'll need to run this again for the remainder."
-                : ""}{" "}
-              This is reversible — edit any row back from the IPAM page.
-            </>
-          ) : (
-            <>
-              This flips the{" "}
-              <strong>
-                {pending?.kind === "selected" ? pending.ids.length : 0}
-              </strong>{" "}
-              selected allocated IP(s) to <strong>deprecated</strong>. This is
-              reversible — edit any row back from the IPAM page.
-            </>
-          )
+                  ? " You'll need to run this again for the remainder."
+                  : ""}{" "}
+                This is reversible — edit any row back from the IPAM page.
+              </>
+            ) : (
+              <>
+                This flips the{" "}
+                <strong>
+                  {pending?.kind === "selected" ? pending.ids.length : 0}
+                </strong>{" "}
+                selected allocated IP(s) to <strong>deprecated</strong>. This is
+                reversible — edit any row back from the IPAM page.
+              </>
+            )}
+            {deprecate.isError && (
+              <span role="alert" className="mt-2 block text-destructive">
+                Could not deprecate:{" "}
+                {formatApiError(deprecate.error, "the request failed")}
+              </span>
+            )}
+          </>
         }
         onConfirm={confirmDeprecate}
-        onClose={() => setPending(null)}
+        onClose={() => {
+          deprecate.reset();
+          setPending(null);
+        }}
       />
     </div>
   );

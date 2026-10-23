@@ -4071,7 +4071,8 @@ function ZoneDetailView({
   // reintroduce a local one). The explicit ``showAddRecord`` check still
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
-    if (isForward || zone.tailscale_tenant_id) return;
+    // #2529 — the keyboard path must honour the same grant as the button.
+    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4082,7 +4083,7 @@ function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord]);
+  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
