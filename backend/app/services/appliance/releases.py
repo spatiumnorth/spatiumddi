@@ -42,6 +42,13 @@ logger = structlog.get_logger(__name__)
 
 _GITHUB_API = "https://api.github.com"
 _CACHE_TTL_SECONDS = 60
+# #2410 — one GitHub page is enough to see past a run of nightlies (two
+# architectures a day is ~50 releases a month), and 100 is the API's cap.
+_FETCH_PER_PAGE = 100
+# The upgrade-image window: walk the listing newest-first until this many
+# NON-nightly releases are seen, so a month of nightlies can never push
+# the last stable release out of the picker.
+_STABLE_WINDOW = 25
 
 # Appliance upgrade-image asset-name convention the release workflow
 # attaches to every cut (see .github/workflows/release.yml):
@@ -103,6 +110,52 @@ class UpgradeImageRelease:
 _RAW_CACHE: dict[str, tuple[datetime, list[dict]]] = {}
 
 
+def release_channel(tag: str, is_prerelease: bool = False) -> str:
+    """``nightly`` / ``prerelease`` / ``stable`` for a release tag (#2410).
+
+    Display-only: derived from the tag and GitHub's own prerelease flag,
+    not a subscription setting (that is #149).
+    """
+    t = tag.lower()
+    if t.startswith("nightly"):
+        return "nightly"
+    if is_prerelease or "-rc" in t or "-beta" in t or "-alpha" in t:
+        return "prerelease"
+    return "stable"
+
+
+def _upgrade_image_window(data: list[dict]) -> list[dict]:
+    """Newest-first slice holding ``_STABLE_WINDOW`` non-nightly releases."""
+    out: list[dict] = []
+    stable = 0
+    for r in data:
+        out.append(r)
+        if release_channel(r.get("tag_name", ""), bool(r.get("prerelease", False))) != "nightly":
+            stable += 1
+            if stable >= _STABLE_WINDOW:
+                break
+    return out
+
+
+def peek_upgrade_image_releases() -> list[UpgradeImageRelease]:
+    """Importable-image rows from the release cache, with NO network call.
+
+    Used to decorate the staged list: an air-gapped control plane must
+    not wait out a GitHub timeout on every page load. Stale entries are
+    fine here (the TTL only bounds how often the picker refetches), and a
+    cold cache is simply an empty list.
+    """
+    cached = _RAW_CACHE.get("raw")
+    if not cached:
+        return []
+    now = datetime.now(UTC)
+    installed = get_installed_version()
+    out: list[UpgradeImageRelease] = []
+    for r in _upgrade_image_window(cached[1]):
+        out.extend(_to_upgrade_image_releases(r, installed, now))
+    return out
+
+
 def get_installed_version() -> str:
     """The version currently running — read from settings.version, which
     the compose env populates from ``SPATIUMDDI_VERSION`` in .env."""
@@ -145,7 +198,7 @@ async def _fetch_raw_releases() -> list[dict] | None:
         # update notifier is worse than a loud failure; following the redirect
         # removes it and keeps a stale github_repo working.
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
+            resp = await client.get(url, headers=headers, params={"per_page": _FETCH_PER_PAGE})
             resp.raise_for_status()
             data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -265,7 +318,7 @@ async def list_available_upgrade_images() -> tuple[bool, list[UpgradeImageReleas
     now = datetime.now(UTC)
     installed = get_installed_version()
     out: list[UpgradeImageRelease] = []
-    for r in data[:25]:
+    for r in _upgrade_image_window(data):
         out.extend(_to_upgrade_image_releases(r, installed, now))
     return (True, out)
 

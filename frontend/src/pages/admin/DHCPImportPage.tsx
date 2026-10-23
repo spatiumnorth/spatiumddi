@@ -27,6 +27,20 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+
+/** Every import route (preview, test and commit) takes a superadmin, so the
+ *  controls that start one say so rather than letting a Viewer fill in the
+ *  form and be refused (#1940's DNS importer, #2523). Commit is reachable
+ *  only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
+}
 
 type TabId = DHCPImportSource;
 
@@ -268,6 +282,7 @@ function ImportTab({ source }: { source: DHCPImportSource }) {
             blocks={blocksQ.data ?? []}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             onPreview={() => {
               setState((s) => ({ ...s, phase: "previewing", error: null }));
               previewMut.mutate();
@@ -316,6 +331,7 @@ function ConfigureForm({
   blocks,
   servers,
   serversLoading,
+  serversError,
   onPreview,
   previewing,
 }: {
@@ -327,6 +343,7 @@ function ConfigureForm({
   blocks: { id: string; name: string; network: string }[];
   servers: WindowsDHCPServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   onPreview: () => void;
   previewing: boolean;
 }) {
@@ -337,6 +354,7 @@ function ConfigureForm({
     ? Boolean(state.file)
     : Boolean(state.serverId);
   const canPreview = sourceReady && Boolean(state.groupId) && !previewing;
+  const gate = useImportGate();
   const eligibleServers = servers.filter((s) => s.has_credentials);
 
   return (
@@ -408,9 +426,11 @@ function ConfigureForm({
                 <option value="">
                   {serversLoading
                     ? "Loading…"
-                    : eligibleServers.length === 0
-                      ? "— no eligible servers —"
-                      : "— select —"}
+                    : serversError
+                      ? "— servers unavailable —"
+                      : eligibleServers.length === 0
+                        ? "— no eligible servers —"
+                        : "— select —"}
                 </option>
                 {servers.map((srv) => (
                   <option
@@ -423,6 +443,14 @@ function ConfigureForm({
                   </option>
                 ))}
               </select>
+              {serversError ? (
+                <p className="mt-1 text-xs">
+                  <ListReadError
+                    error={serversError}
+                    what="the servers to import from"
+                  />
+                </p>
+              ) : null}
             </div>
           )}
 
@@ -514,7 +542,8 @@ function ConfigureForm({
           icon={previewing ? Loader2 : isFileSource ? Upload : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing
             ? isFileSource

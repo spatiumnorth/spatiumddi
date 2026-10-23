@@ -807,6 +807,19 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
 
     await materialise(tree, None, is_root=True)
 
+    # Every created subnet holds placeholder rows and every created block
+    # rolls them up; the counters were seeded at 0 (#2412). Deepest first.
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        _update_block_utilization,
+        _update_utilization,
+    )
+
+    for sid in created_subnets:
+        await _update_utilization(db, uuid.UUID(sid))
+    await db.flush()
+    for bid in reversed(created_blocks):
+        await _update_block_utilization(db, uuid.UUID(bid))
+
     plan.applied_at = datetime.now(UTC)
     plan.applied_resource_ids = {
         "block_ids": created_blocks,

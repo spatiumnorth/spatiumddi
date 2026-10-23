@@ -605,6 +605,22 @@ async def restore_row(
             )
         )
 
+    # A restored subnet / block is back in its parent chain's rollup (#2412).
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        _update_block_utilization,
+        _update_utilization,
+    )
+
+    await db.flush()
+    restored_subnets = [o for o in restored if isinstance(o, Subnet)]
+    for sn in restored_subnets:
+        await _update_utilization(db, sn.id)
+    await db.flush()
+    for bid in {sn.block_id for sn in restored_subnets} | {
+        o.id for o in restored if isinstance(o, IPBlock)
+    }:
+        await _update_block_utilization(db, bid)
+
     restore_wake_groups: set[uuid.UUID] = set()
     for zone_id, recs in records_by_zone.items():
         await push_records_restore(db, zone_id, recs)
