@@ -68,9 +68,11 @@ async def test_moved_gateway_is_reserved_and_not_offered(
     assert nxt.status_code == 200, nxt.text
     assert nxt.json()["address"] not in (None, "10.231.4.1")
 
-    # Utilisation counters follow the rows (network, broadcast, gateway).
+    # Utilisation counters follow the rows. Network and broadcast placeholders
+    # are not counted (#2411), so only the gateway is.
     sub = (await client.get(f"/api/v1/ipam/subnets/{sid}", headers=h)).json()
-    assert sub["allocated_ips"] == len(rows)
+    counted = [r for r in rows.values() if r["status"] not in ("network", "broadcast")]
+    assert sub["allocated_ips"] == len(counted) == 1
 
 
 async def test_without_move_gateway_row_is_untouched(client: AsyncClient, db_session: AsyncSession):
