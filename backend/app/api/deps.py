@@ -11,7 +11,13 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.api.token_binding import route_honours_token_binding
 from app.core.security import decode_access_token, hash_api_token, live_access_session
+from app.core.session_idle import (
+    activity_write_interval,
+    get_session_timeout_minutes,
+    request_activity_at,
+)
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
 from app.services.api_token_scopes import scope_matches_request
@@ -175,6 +181,18 @@ async def _resolve_api_token(
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.
     user._api_token_resource_grants = list(token.resource_grants or [])
+    # A coarse permission gate admits a bound token on a resource TYPE match
+    # alone, so only a route that narrows to the bound instances may serve
+    # one. Every other route refuses it, rather than answering for the whole
+    # estate (``app.api.token_binding``).
+    if user._api_token_resource_grants and not route_honours_token_binding(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This API token is restricted to specific subnets or DNS zones, "
+                "and this endpoint cannot be limited to them"
+            ),
+        )
     return user
 
 
@@ -244,19 +262,25 @@ async def authenticate_bearer(
         # (#1241). MFA enrolment reads it to ask an external-auth user, who
         # has no local password to re-enter, for a recent sign-in instead.
         request.state.signed_in_at = session.created_at
-        # Bump ``last_seen_at`` no more than once per minute per
-        # session — gives the admin viewer a recent timestamp without
-        # a write on every authenticated request. Not for a disabled
-        # account (#1383): its request is refused below, and the Sessions
-        # view must not show it as activity. Read as one column, so the
-        # commit still lands before the User is loaded.
+        # Bump ``last_seen_at`` no more than once per write interval per
+        # session (a minute, shorter under a short Session Timeout) — gives
+        # the admin viewer a recent timestamp without a write on every
+        # authenticated request. It is also what the idle timeout reads, so
+        # it records when the OPERATOR was last active: the console reports
+        # its idle time on background polls, and an open page that nobody
+        # touches must not keep the session alive (``app.core.session_idle``).
+        # Not for a disabled account (#1383): its request is refused below,
+        # and the Sessions view must not show it as activity. Read as one
+        # column, so the commit still lands before the User is loaded.
         now = datetime.now(UTC)
-        if session.last_seen_at is None or (now - session.last_seen_at) > timedelta(seconds=60):
+        activity_at = request_activity_at(request.headers, now)
+        interval = activity_write_interval(await get_session_timeout_minutes(db))
+        if session.last_seen_at is None or (activity_at - session.last_seen_at) > interval:
             active = (
                 await db.execute(select(User.is_active).where(User.id == user_id))
             ).scalar_one_or_none()
             if active:
-                session.last_seen_at = now
+                session.last_seen_at = activity_at
                 try:
                     await db.commit()
                 except Exception:  # noqa: BLE001 — last_seen is best-effort
@@ -310,8 +334,16 @@ async def _load_time_bound_grants(db: AsyncSession, user: User) -> None:
         user._active_time_bound_grants = []
 
 
-def require_superadmin(current_user: Annotated[User, Depends(get_current_user)]) -> User:
+async def require_superadmin(
+    request: Request,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> User:
     """FastAPI dependency: 403 unless the user is an *effective* superadmin.
+
+    A refusal writes a ``denied`` audit row through the same recorder the
+    ``require_permission`` family uses (#2304), so probing a superadmin-only
+    route is as visible as probing an IPAM one. The 403 body is unchanged.
 
     Delegates to :func:`app.core.permissions.is_effective_superadmin`, which
     admits both:
@@ -327,20 +359,36 @@ def require_superadmin(current_user: Annotated[User, Depends(get_current_user)])
     legacy flag and the RBAC model. The helper unifies them; this dependency
     is just the gate-style wrapper for routes that pre-Depend.
 
-    Endpoints that already have a hand-rolled ``_require_superadmin`` helper
-    should call ``is_effective_superadmin(user)`` directly from inside the
-    handler — same check, same behaviour.
+    Handlers must take ``SuperAdmin`` rather than hand-roll an
+    ``is_effective_superadmin`` check + 403, or the refusal is not audited.
     """
     # Lazy import: `app.core.permissions` imports ``CurrentUser`` / ``get_db``
     # from this module at top-level, so an eager import here triggers a
     # circular-import crash at uvicorn startup. Local import side-steps it
     # because by the time this function is called the module graph is fully
     # initialised.
-    from app.core.permissions import is_effective_superadmin
+    from app.core.permissions import _record_denial, is_effective_superadmin
 
     if is_effective_superadmin(current_user):
         return current_user
+    await _record_denial(db, current_user, request, "access", "superadmin", None)
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
+
+
+def ensure_superadmin(user: User) -> None:
+    """Imperative superadmin check for code that cannot take ``SuperAdmin``.
+
+    For a check that only applies on one branch of a handler (``?permanent=true``)
+    or inside an operation the approval engine applies outside any route. It
+    raises the same 403 as :func:`require_superadmin` but writes no audit row,
+    because it has no request to attribute one to. Never call
+    ``require_superadmin`` directly: it is an async dependency, so a bare call
+    returns an un-awaited coroutine and checks nothing.
+    """
+    from app.core.permissions import is_effective_superadmin
+
+    if not is_effective_superadmin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
 
 
 # Type aliases for injection

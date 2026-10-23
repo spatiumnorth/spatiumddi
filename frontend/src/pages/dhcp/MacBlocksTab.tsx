@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 
@@ -335,7 +336,7 @@ function MacBlockModal({
   const [description, setDescription] = useState(block?.description ?? "");
   const [enabled, setEnabled] = useState(block?.enabled ?? true);
   const [expiresAt, setExpiresAt] = useState(
-    block?.expires_at ? block.expires_at.slice(0, 16) : "",
+    toLocalInputValue(block?.expires_at),
   );
   const [error, setError] = useState("");
 
@@ -345,7 +346,7 @@ function MacBlockModal({
         reason,
         description,
         enabled,
-        expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
+        expires_at: fromLocalInputValue(expiresAt),
       };
       if (!editing) data.mac_address = mac;
       return editing

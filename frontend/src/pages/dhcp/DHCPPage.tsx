@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import {
@@ -83,6 +84,7 @@ import {
   useGroupFailover,
 } from "./windowsFailover";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -1089,10 +1091,10 @@ function GroupServersList({
             const seenLabel =
               s.driver === "kea"
                 ? seenAt
-                  ? `seen ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `seen ${humanTime(seenAt)}`
                   : "never heard from"
                 : seenAt
-                  ? `synced ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `synced ${humanTime(seenAt)}`
                   : "never synced";
             const pauseInFlight =
               (pauseMut.isPending || resumeMut.isPending) &&
@@ -1139,6 +1141,14 @@ function GroupServersList({
                           }
                         >
                           Maintenance
+                        </span>
+                      )}
+                      {s.last_sync_error && (
+                        <span
+                          className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                          title={`Lease pull failing since ${s.last_sync_error_at ? new Date(s.last_sync_error_at).toLocaleString() : "unknown"}: ${s.last_sync_error}`}
+                        >
+                          Sync failing
                         </span>
                       )}
                       <ConfigApplyChip server={s} />
@@ -2719,13 +2729,10 @@ function LeaseHistoryTab({ server }: { server: DHCPServer }) {
         <input
           type="datetime-local"
           className="rounded-md border bg-background px-2 py-1 text-xs"
-          // Slice off seconds + Z to satisfy the input control's local
-          // datetime format. Round-trip back to ISO Z on change.
-          value={since ? since.slice(0, 16) : ""}
+          // ``since`` is a UTC instant; the input is local wall-clock (#2260).
+          value={toLocalInputValue(since)}
           onChange={(e) => {
-            setSince(
-              e.target.value ? new Date(e.target.value).toISOString() : "",
-            );
+            setSince(fromLocalInputValue(e.target.value) ?? "");
             setPage(1);
           }}
           title="Show entries with expired_at on or after this time"

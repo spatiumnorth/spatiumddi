@@ -38,6 +38,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,6 +137,38 @@ _ROLE_LABEL_KEYS = {
     # via this label.
     "control-plane": "spatium.io/role-control-plane",
 }
+
+# #2190 — the agent DaemonSet each role label schedules, and the role-env key
+# whose value the chart renders into that DaemonSet's ``AGENT_GROUP``
+# (``serverGroupName`` in ``_build_values``). A label is only ever SET once the
+# DaemonSet's live template carries the group this node is assigned, so a label
+# flip cannot start a pod from the previous chart revision: the node labels
+# land in milliseconds, the values only once helm-controller's upgrade job has
+# run (~6-11 s), and a pod scheduled in between registered with the previous
+# group. Keep in lock-step with the per-role ``serverGroupName`` keys in
+# ``_build_values`` (a test asserts they agree).
+_ROLE_AGENT_GROUP: dict[str, tuple[str, str]] = {
+    "dns-bind9": ("dns-bind9", "AGENT_GROUP"),
+    "dns-powerdns": ("dns-powerdns", "AGENT_GROUP"),
+    "dns-technitium": ("dns-technitium", "AGENT_GROUP"),
+    "dhcp": ("dhcp-kea", "DHCP_AGENT_GROUP"),
+}
+
+# How long the apply waits, after its values write, for helm-controller to roll
+# the new template before it gives up for this tick (the next heartbeat's
+# reconcile sets the label once the template is current), and how often it
+# re-reads. And the longest a label is held across ticks before it is set
+# regardless: a template that never matches (a shared chart another node writes,
+# a template edited out of band) must not keep a role off a node for ever. The
+# control plane's registration is the backstop past that (#2190 backend half).
+_LABEL_WAIT_SECONDS = 30.0
+_LABEL_WAIT_STEP_SECONDS = 2.0
+_LABEL_HOLD_MAX_SECONDS = 300.0
+_sleep = time.sleep
+_monotonic = time.monotonic
+# role label -> monotonic time it was first held back.
+_label_held_since: dict[str, float] = {}
+
 
 # #272 — per-variant FORCED role set. The supervisor reads its variant
 # from ``/etc/spatiumddi-host/role-config:ROLE`` and always asserts
@@ -677,6 +710,62 @@ def role_label_diff(profiles: list[str]) -> dict[str, str | None]:
     return {label: ("true" if role in roles else None) for role, label in _ROLE_LABEL_KEYS.items()}
 
 
+def hold_stale_role_labels(
+    label_diff: dict[str, str | None], env_vars: dict[str, str]
+) -> tuple[dict[str, str | None], list[str]]:
+    """``(diff, held)`` — ``label_diff`` without the role labels whose agent
+    DaemonSet would still start a pod with the PREVIOUS group (#2190).
+
+    A held label is left out of the patch, not cleared: a node that already
+    carries it keeps it (its pod rolls with the DaemonSet), and a node that does
+    not gets it on a later write, once the template carries the group from
+    ``env_vars``. Clears are never held — taking a role away cannot start a pod.
+
+    Not held: a DaemonSet that does not exist (nothing to schedule from; helm
+    creates it from the new values), and one whose read FAILED — the label patch
+    goes through the same kubeapi, and holding on a failed read would keep a role
+    off for as long as one read keeps failing. A label held longer than
+    ``_LABEL_HOLD_MAX_SECONDS`` is set anyway, logged: past that the template is
+    not converging on its own, and the control plane's registration puts an
+    appliance's agent in its assigned group whatever its env says.
+    """
+    out = dict(label_diff)
+    held: list[str] = []
+    for role, (daemonset, env_key) in _ROLE_AGENT_GROUP.items():
+        label = _ROLE_LABEL_KEYS[role]
+        if out.get(label) != "true":
+            _label_held_since.pop(label, None)
+            continue
+        want = env_vars.get(env_key, "")
+        exists, have, err = k8s_api.daemonset_template_env(daemonset, env_name="AGENT_GROUP")
+        if exists is None:
+            log.warning(
+                "supervisor.k3s_lifecycle.label_gate_read_failed",
+                label=label,
+                daemonset=daemonset,
+                error=err,
+            )
+            _label_held_since.pop(label, None)
+            continue
+        if not exists or (have or "") == want:
+            _label_held_since.pop(label, None)
+            continue
+        first = _label_held_since.setdefault(label, _monotonic())
+        if _monotonic() - first >= _LABEL_HOLD_MAX_SECONDS:
+            log.warning(
+                "supervisor.k3s_lifecycle.label_hold_expired",
+                label=label,
+                daemonset=daemonset,
+                template_group=have,
+                assigned_group=want,
+            )
+            _label_held_since.pop(label, None)
+            continue
+        del out[label]
+        held.append(label)
+    return out, held
+
+
 def _resolve_node_name() -> str:
     """This node's k8s name, or "" when it cannot be determined."""
     node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
@@ -844,7 +933,24 @@ def apply_role_assignment(
     # This used to be `{p for p in profiles ...}`, which omitted the
     # variant-fixed roles and the promoted-member case, so this call CLEARED
     # the control-plane label that the reconcile had just asserted.
+    #
+    # #2190 — and only once the values just written are what a newly-labelled
+    # node would schedule from. helm-controller rolls the DaemonSet template a
+    # few seconds after this PATCH; a label set before that started a pod with
+    # the previous ``AGENT_GROUP``, which registered in the old group (a BIND9 →
+    # PowerDNS + group A → B save left the PowerDNS row in A). Wait a bounded
+    # while for the roll; what is still stale is left to the next heartbeat's
+    # reconcile, which applies the same gate.
     label_diff = role_label_diff(profiles)
+    deadline = _monotonic() + _LABEL_WAIT_SECONDS
+    while True:
+        gated_diff, held = hold_stale_role_labels(label_diff, env_vars)
+        if not held or _monotonic() >= deadline:
+            break
+        _sleep(_LABEL_WAIT_STEP_SECONDS)
+    if held:
+        log.info("supervisor.k3s_lifecycle.labels_held", held=held, reason="template not rolled")
+    label_diff = gated_diff
     node_name = _resolve_node_name()
     if node_name:
         label_ok, label_err = k8s_api.patch_node_labels(node_name, label_diff)
@@ -880,7 +986,9 @@ def apply_role_assignment(
     return LifecycleResult(state="ready", started=desired_services)
 
 
-def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
+def reconcile_node_labels(
+    profiles: list[str], env_file: Path | None = None
+) -> tuple[bool, str | None]:
     """Reconcile the node's per-role labels against ``profiles``.
 
     Idempotent — setting a label to its current value is a kubeapi
@@ -895,10 +1003,21 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     two copies of it, only one complete, made this function's work get
     undone on the same tick.
 
+    #2190 — with ``env_file`` (the rendered role env), a label is only SET once
+    its agent DaemonSet's template carries the assigned group
+    (:func:`hold_stale_role_labels`), the same gate ``apply_role_assignment``
+    applies: this is what sets a label the apply had to hold back.
+
     Returns ``(ok, error_or_None)`` — caller logs but doesn't act
     on failure (next heartbeat re-attempts).
     """
     label_diff = role_label_diff(profiles)
+    if env_file is not None:
+        label_diff, held = hold_stale_role_labels(label_diff, _parse_env_file(env_file))
+        if held:
+            log.info(
+                "supervisor.k3s_lifecycle.labels_held", held=held, reason="template not rolled"
+            )
     node_name = _resolve_node_name()
     if not node_name:
         return False, "node_name unknown"
