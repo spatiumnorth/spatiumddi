@@ -636,7 +636,15 @@ async def test_rbac_read_exports_write_imports(
     gone = _rec(zone, "gone", "A", "192.0.2.2")
     db_session.add(gone)
     reader = await _headers(db_session, [{"action": "read", "resource_type": "dns_zone"}])
-    writer = await _headers(db_session, [{"action": "write", "resource_type": "dns_record"}])
+    # The import answers with the zone's records, so it needs read as well.
+    writer = await _headers(
+        db_session,
+        [
+            {"action": "write", "resource_type": "dns_record"},
+            {"action": "read", "resource_type": "dns_record"},
+        ],
+    )
+    write_only = await _headers(db_session, [{"action": "write", "resource_type": "dns_record"}])
     await db_session.commit()
 
     r = await client.get(f"{_base(grp, zone)}/export", headers=reader, params={"format": "csv"})
@@ -648,6 +656,7 @@ async def test_rbac_read_exports_write_imports(
         files={"file": ("r.csv", data, "text/csv")},
     )
     assert r.status_code == 403
+    await _commit(client, write_only, grp, zone, data, expect=403)
     await _commit(client, writer, grp, zone, data)
     # A replace that deletes also needs delete on dns_record.
     await _commit(client, writer, grp, zone, data, mode="replace", confirm=ZONE, expect=403)

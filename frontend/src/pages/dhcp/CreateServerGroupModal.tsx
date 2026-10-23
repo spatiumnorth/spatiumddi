@@ -99,7 +99,10 @@ export function CreateServerGroupModal({
         heartbeat_delay_ms: parseInt(heartbeat, 10) || 10000,
         max_response_delay_ms: parseInt(maxResponse, 10) || 60000,
         max_ack_delay_ms: parseInt(maxAck, 10) || 10000,
-        max_unacked_clients: parseInt(maxUnacked, 10) || 5,
+        // #2480 — 0 is a valid value (the field's min); only a blank/NaN falls back.
+        max_unacked_clients: Number.isNaN(parseInt(maxUnacked, 10))
+          ? 5
+          : parseInt(maxUnacked, 10),
         auto_failover: autoFailover,
         lease_cache_threshold: parsedCacheThreshold,
         lease_cache_max_age: parsedCacheMaxAge,

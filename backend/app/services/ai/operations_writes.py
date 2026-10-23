@@ -1859,6 +1859,11 @@ async def _apply_commit_dhcp_import(
         conflict_actions={},
         current_user=user,
     )
+    # #2040 — same wake the REST commit route stashes; the dispatch site's
+    # collector publishes it now that commit_import has committed.
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+
+    collect_wake(dhcp_group_channel(args.target_group_id))
     return {
         "scopes_created": result.total_scopes_created,
         "scopes_skipped": result.total_scopes_skipped,
