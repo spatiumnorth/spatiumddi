@@ -336,6 +336,8 @@ DHCPPool
 > reservation state, and is served by the endpoints below (#913, corrected
 > in #917).
 
+**Range validation (#2500).** `start_ip` / `end_ip` must be valid IPs of the subnet's address family, `start_ip <= end_ip`, and both must lie inside the scope's subnet, for every range type (`dynamic`, `reserved`, `excluded`); otherwise the API answers 422 naming the subnet. Kea rejects a pool outside its subnet's prefix and the whole group stops converging. On update the merged range (stored row under the patch) is checked, but only when `start_ip` / `end_ip` is edited, so pools stored by the importers or the Windows topology pull (which write rows directly, not through this endpoint) stay editable for other fields.
+
 ### Pool occupancy over REST (issue #913)
 
 ```
@@ -1435,7 +1437,7 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 
 **Renewal / rebind timers (58 / 59)** cannot be set (#1690): the API refuses `dhcp-renewal-time`, `dhcp-rebinding-time` and `code:58` / `code:59` with a 422. Kea is rendered with `calculate-tee-times` so every lease gets T1 / T2 at 50% / 87.5% of its own lifetime (v6: 50% / 80% of the preferred lifetime). A Kea import drops `renew-timer` / `rebind-timer` and says so: a subnet's in that scope's `parse_warnings`, a global one in the preview's `warnings`.
 
-**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
+**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range. The API refuses (422, naming the field) any set that is not ordered `min_lease_time <= lease_time <= max_lease_time`, on create and on update (judged on the stored row merged with the patch), because Kea rejects the whole config for an out-of-order set (#2499).
 
 ---
 
@@ -1619,6 +1621,8 @@ Per poll:
 3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`. One pull per server runs at a time: the scheduled pass and the manual Sync share a per-server Postgres advisory lock, so a server another pull is already reconciling is skipped for that pass (#2262). If an address already carries more than one row (left by overlapping pulls before that lock existed), the pull keeps the most recently seen row and deletes the rest instead of failing.
 4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't appear in the wire response is deleted, along with its mirrored `auto_from_lease=True` IPAM row. The Windows DHCP driver only returns *currently-active* leases, so absence from the response is the server's way of saying "that lease is gone" (admin purged it, client released it, etc.). Before this fix, deleted-on-server leases persisted in our DB indefinitely because `pull_leases` was upsert-only and the time-based cleanup sweep only looked at `expires_at`. The response adds two counters — `removed` (lease rows dropped) and `ipam_revoked` (IPAM mirrors cleaned up alongside) — both surface in the scheduled-task audit row and the manual sync modal.
+**Failures are visible on the server row (#2306).** When a server's scheduled pull raises, the reason is stored on `dhcp_server.last_sync_error` (with `last_sync_error_at`) and the server list shows an amber **Sync failing** chip; the next successful pull clears it. `status` is not used for this because the health probe rewrites it every cycle.
+
 6. The existing time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls (e.g. when lease pull is disabled). The two mechanisms overlap harmlessly.
 
 **Scope absence** — not yet deleted. If an operator removes a scope on the Windows server, the `DHCPScope` row stays in SpatiumDDI's DB until deleted via the UI. Scope-absence cleanup is tracked separately.

@@ -805,6 +805,37 @@ def _strip_nul(value: Any, path: str, hits: list[str]) -> Any:
     return value
 
 
+#: #1805 — the first re-send after a heartbeat that never reached the control
+#: plane, doubled for each further one in a row up to the interval. A node
+#: loss makes such failures for a few seconds to a minute: a lookup routed to
+#: the lost node's DNS, a connection to its api pod, the api Service empty while
+#: the api waits for Redis. Each used to cost the whole interval (30 s) on top,
+#: so two in a row put a healthy node's heartbeat past the 90 s after which
+#: the demote guard and every other reader call it unhealthy.
+FAILED_RETRY_FIRST_S = 5.0
+
+
+def next_heartbeat_delay(
+    held: bool | None,
+    consecutive_failures: int,
+    interval_s: float,
+    rearm_floor_s: float,
+) -> float:
+    """Seconds to wait before the next heartbeat.
+
+    ``held`` is what ``heartbeat_once`` returned. A held heartbeat already
+    paced the loop server-side, so the next goes after ``rearm_floor_s``. One
+    answered without a hold (an old control plane) waits the interval. One that
+    never reached the control plane (``None``) is re-sent after
+    ``FAILED_RETRY_FIRST_S``, doubled for each further failure in a row
+    (``consecutive_failures`` counts this one), never beyond the interval.
+    """
+    if held is None:
+        step = FAILED_RETRY_FIRST_S * (2 ** max(0, consecutive_failures - 1))
+        return min(float(interval_s), step)
+    return rearm_floor_s if held else float(interval_s)
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -812,11 +843,16 @@ def heartbeat_once(
     identity: Identity,
     client: httpx.Client,
     log: structlog.stdlib.BoundLogger,
-) -> bool:
+) -> bool | None:
     """One heartbeat round-trip + trigger-file follow-up.
 
     Never raises. Logs every error path so a real outage shows up in
     journalctl without taking down the supervisor process.
+
+    Returns True when the control plane long-poll-held the heartbeat, False
+    when it answered without holding, and None when it never answered (a
+    transport error: DNS, connect, timeout). The loop re-sends a None sooner
+    than the interval (``next_heartbeat_delay``, #1805).
     """
     state = appliance_state.collect()
     # #358 Phase 1b — ask the control plane to long-poll-hold this
@@ -961,7 +997,7 @@ def heartbeat_once(
         # refuse if not (an interception). The next heartbeat uses the result.
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
-        return False
+        return None
     if resp.status_code == 403 or resp.status_code == 404:
         # 403 = approval revoked or cert no longer valid for any
         # known appliance row. 404 = appliance row deleted, or the
@@ -1565,6 +1601,14 @@ def heartbeat_once(
         _dns_changed, dns_err = k8s_api.ensure_coredns_ha()
         if dns_err:
             log.warning("supervisor.heartbeat.coredns_ha_failed", error=dns_err)
+        # #1718 — with a CoreDNS replica on every node, keep each node's
+        # lookups on its own: a lost node's CoreDNS pod, still a ready
+        # endpoint until the node reads NotReady, otherwise stalls half of
+        # every other node's lookups (Redis Sentinel into TILT, the
+        # supervisor's own heartbeat into EAI_AGAIN).
+        _local_changed, local_err = k8s_api.ensure_kube_dns_node_local()
+        if local_err:
+            log.warning("supervisor.heartbeat.kube_dns_node_local_failed", error=local_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually

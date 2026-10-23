@@ -92,7 +92,9 @@ _MAX_ERROR = 2000
 # 13 (#2124): a ``sinkhole`` entry whose list names an address carries
 #   ``sinkhole_ip`` (the agent renders it as A + AAAA local data). It is part
 #   of the entry, so it is inside ``rpz_sha256`` too.
-RENDERER_REVISION = 13
+# 14 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
+#   (the agent now renders ``allow-query-cache``); unchanged for default groups.
+RENDERER_REVISION = 14
 
 
 def _serves(revision: int | None) -> bool:

@@ -56,7 +56,7 @@ NAMED_CONF_SKELETON = """\
     listen-on-v6 {{ any; }};
 {encrypted_listeners}    recursion {recursion};
 {allow_recursion}    allow-query {{ {allow_query}; }};
-    {allow_transfer}
+{allow_query_cache}    {allow_transfer}
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
@@ -1891,6 +1891,32 @@ def _render_allow_recursion(
     return f"    allow-recursion {{ {'; '.join(kept)}; }};\n"
 
 
+def _render_allow_query_cache(
+    opts: dict[str, Any], acls: list[dict[str, Any]] | None = None
+) -> str:
+    """The group-level ``allow-query-cache`` line (#2264), or ``""``.
+
+    The control plane ships the key only when the operator set something other
+    than the stored default; absent renders nothing, so BIND keeps its own
+    default and an untouched group's named.conf is byte-identical. Elements
+    named-checkconf would refuse are dropped; if none survive the line is
+    ``none`` (fail closed: this setting exists to narrow cache access).
+    """
+    stored = opts.get("allow_query_cache")
+    if stored is None:
+        return ""
+    acl_names = {str(a.get("name") or "").strip() for a in acls or []}
+    kept: list[str] = []
+    for entry in (str(e).strip() for e in stored if str(e).strip()):
+        if _aml_element_ok(entry, acl_names):
+            kept.append(entry)
+        else:
+            log.warning("bind9_allow_query_cache_entry_dropped", entry=entry)
+    if not kept:
+        kept = ["none"]
+    return f"    allow-query-cache {{ {'; '.join(kept)}; }};\n"
+
+
 _TRUST_ANCHOR_LABEL = r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
 _TRUST_ANCHOR_NAME_RE = re.compile(rf"^(\.|{_TRUST_ANCHOR_LABEL}(\.{_TRUST_ANCHOR_LABEL})*\.?)$")
 _TRUST_ANCHOR_KEY_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
@@ -2065,6 +2091,7 @@ class Bind9Driver(DriverBase):
             recursion=recursion,
             allow_recursion=_render_allow_recursion(opts, bundle.get("acls")),
             allow_query=allow_query,
+            allow_query_cache=_render_allow_query_cache(opts, bundle.get("acls")),
             allow_transfer=allow_transfer_opt.rstrip(),
             dnssec=dnssec,
             forwarders=fwd_block,
