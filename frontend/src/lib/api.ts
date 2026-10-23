@@ -5132,6 +5132,16 @@ export interface DNSServerGroup {
   modified_at: string;
 }
 
+/** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
+ * the server echoes them (never the username or password). Seeds the edit
+ * dialog so an untouched save keeps what is stored. */
+export interface WinRMSettings {
+  winrm_port: number;
+  transport: string;
+  use_tls: boolean;
+  verify_tls: boolean;
+}
+
 export interface WindowsDNSCredentials {
   username: string;
   password: string;
@@ -5489,6 +5499,8 @@ export interface DNSServer {
    * the UI to show "Credentials set" / "Clear" and gate the Path B
    * affordances without exposing the password. */
   has_credentials: boolean;
+  /** Stored WinRM settings (windows_dns with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   /** True when the driver runs from the control plane (no agent). Used
    * by the UI to hide approval / agent-registration affordances. */
   is_agentless: boolean;
@@ -8480,6 +8492,8 @@ export interface DHCPServer {
   // seeds the checkbox from the stored value instead of resetting it (which
   // would silently re-disable verification). Null for non-cloud drivers.
   verify_tls?: boolean | null;
+  /** Stored WinRM settings (windows_dhcp with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   // Per-server maintenance mode (issue #182). When true the control
   // plane skips shipping pending DHCPConfigOp rows + suppresses the
   // heartbeat-stale alert; the UI renders an amber Maintenance chip.
