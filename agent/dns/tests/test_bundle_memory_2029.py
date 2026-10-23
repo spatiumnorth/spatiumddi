@@ -167,9 +167,12 @@ def test_taking_a_bundle_holds_it_about_once(rig, monkeypatch: pytest.MonkeyPatc
     zone = state / "rendered.new" / "zones" / "guest" / "spatium-blocklist-guest.rpz.db"
     lines = zone.read_text().splitlines()
     assert "ads1-tracker.list1.example-cdn.test CNAME ." in lines
-    assert "*.ads7-tracker.list2.example-cdn.test CNAME rpz-drop." in lines
+    # A sinkhole answers with A + AAAA local data (#2124), not rpz-drop.
+    assert "*.ads7-tracker.list2.example-cdn.test A 0.0.0.0" in lines
+    assert "*.ads7-tracker.list2.example-cdn.test AAAA ::" in lines
     assert "ok.example.test CNAME rpz-passthru." in lines
-    assert len(lines) == 3 + 2 * per_view + 2
+    sinkholes = len(range(0, per_view, 7))
+    assert len(lines) == 3 + 2 * per_view + 2 * sinkholes + 2
     # The DNSSEC re-read still sees the signed zone.
     assert loop._dnssec_bundle == {
         "zones": [{"name": "signed.test.", "type": "primary", "dnssec_enabled": True}]

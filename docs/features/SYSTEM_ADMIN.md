@@ -1139,7 +1139,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 
@@ -1392,6 +1392,15 @@ PEM private keys, JWTs, PSKs, API tokens, TSIG keys. Matched both by field
 name and by value shape, and removed in **every** mode including the
 unscrubbed one. There is no version of "let me read my own logs" that is
 improved by including the key that decrypts the database.
+
+The process environment (`system/env.txt`) is the exception to matching by
+name: a variable's **value** appears only when its name is on an allowlist
+of known non-secret settings (log level, timeouts, feature flags, versions,
+Kubernetes service links). Every other variable is listed with its value
+replaced, so the dump still shows what is set. Connection URLs such as
+`DATABASE_URL` and `REDIS_URL` are on the replaced side. The appliance
+diagnostic bundle applies the same rule to its env dumps and runs every
+file it contains, logs included, through the same secret-shape sweep.
 
 **Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
 become stable synthetic values, so the archive stays *readable*:

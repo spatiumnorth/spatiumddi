@@ -20,6 +20,8 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.meraki import MerakiOrg
 from app.models.settings import PlatformSettings
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -72,7 +74,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # A crash leaves the shared session in a failed
                     # transaction; roll back so the next org still syncs.
                     await db.rollback()
-                    errors.append(f"{org_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        MerakiOrg,
+                        org_id,
+                        resource_type="meraki_org",
+                        action="meraki.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{org_name}: {crash}")
                     logger.warning("meraki_reconcile_crash", org=str(org_id), error=str(exc))
                     continue
                 ran += 1
@@ -109,7 +119,21 @@ async def _run_one(org_id: str) -> dict[str, Any]:
             org = await db.get(MerakiOrg, _uuid.UUID(org_id))
             if org is None:
                 return {"status": "not_found"}
-            summary = await reconcile_org(db, org)
+            row_id = org.id
+            try:
+                summary = await reconcile_org(db, org)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    MerakiOrg,
+                    row_id,
+                    resource_type="meraki_org",
+                    action="meraki.reconcile",
+                    exc=exc,
+                )
+                logger.warning("meraki_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
@@ -129,6 +153,7 @@ async def _run_one(org_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.meraki_sync.sweep_meraki_orgs", bind=True)
+@module_gated("integrations.meraki")
 def sweep_meraki_orgs(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

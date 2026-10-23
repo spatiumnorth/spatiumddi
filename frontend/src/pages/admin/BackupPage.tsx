@@ -319,11 +319,17 @@ function RestoreBackupCard() {
     if (f) previewMut.mutate(f);
   }
 
-  const archiveIsCustomFormat =
-    preview?.manifest?.format_version === 2 ||
-    preview?.manifest?.format_version === undefined;
+  // The dump format decides whether a selective restore can run, and the
+  // API refuses one of a plain-SQL dump. ``format_version`` cannot tell:
+  // every archive is version 2, an Exclude-secrets one included, and that
+  // one's dump is plain (#2201). So read the format the server resolved
+  // with the restore's own helper, falling back to the manifest's field
+  // for a server too old to send it.
+  const dumpFormat = preview
+    ? (preview.dump_format ?? preview.manifest?.dump_format ?? null)
+    : null;
   const selectiveBlockedByPlainFormat =
-    mode === "selective" && preview && !archiveIsCustomFormat;
+    mode === "selective" && !!preview && dumpFormat !== "custom";
 
   const canSubmit =
     !!file &&
@@ -404,10 +410,18 @@ function RestoreBackupCard() {
         {selectiveBlockedByPlainFormat && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             Selective restore needs an archive whose database dump is in
-            pg_dump&rsquo;s custom format. This archive&rsquo;s dump is plain
-            SQL (an older build, or <em>Exclude secrets</em> diagnostic mode,
-            wrote it) — switch to <em>Full restore</em>, or take a regular
-            backup of the source install on a current build.
+            pg_dump&rsquo;s custom format.{" "}
+            {dumpFormat === "plain" ? (
+              <>
+                This archive&rsquo;s dump is plain SQL (an older build, or{" "}
+                <em>Exclude secrets</em> diagnostic mode, wrote it)
+              </>
+            ) : (
+              <>This archive does not say what format its dump is in</>
+            )}{" "}
+            — switch to <em>Full restore</em>, or take a regular backup of the
+            source install on a current build with <em>Exclude secrets</em>{" "}
+            unticked.
           </div>
         )}
 
