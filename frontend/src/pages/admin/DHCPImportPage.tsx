@@ -27,6 +27,19 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+
+/** Every import route (preview, test and commit) takes a superadmin, so the
+ *  controls that start one say so rather than letting a Viewer fill in the
+ *  form and be refused (#1940's DNS importer, #2523). Commit is reachable
+ *  only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
+}
 
 type TabId = DHCPImportSource;
 
@@ -337,6 +350,7 @@ function ConfigureForm({
     ? Boolean(state.file)
     : Boolean(state.serverId);
   const canPreview = sourceReady && Boolean(state.groupId) && !previewing;
+  const gate = useImportGate();
   const eligibleServers = servers.filter((s) => s.has_credentials);
 
   return (
@@ -514,7 +528,8 @@ function ConfigureForm({
           icon={previewing ? Loader2 : isFileSource ? Upload : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing
             ? isFileSource
