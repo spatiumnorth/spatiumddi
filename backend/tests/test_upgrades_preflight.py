@@ -474,3 +474,16 @@ async def test_run_all_to_dict_shape() -> None:
     }
     assert isinstance(out["results"], list)
     assert {"name", "level", "message", "detail"} <= set(out["results"][0])
+
+
+def test_version_path_reads_a_nightly_by_its_build_date(monkeypatch) -> None:
+    """#2354: the bare nightly image tag names no date, so a nightly was
+    reported as "not a release" instead of "already includes the target"."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "version", "nightly-20261020")
+    monkeypatch.setattr(settings, "app_version", "0.0.0-nightly-20261020+885ae97")
+    r = preflight.check_version_path(target_version="2026.10.02-1")
+    assert r.level == "fail"
+    assert "already includes" in r.message
+    assert r.detail["current"] == "0.0.0-nightly-20261020+885ae97"

@@ -124,6 +124,7 @@ import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
@@ -3513,7 +3514,10 @@ export function AddAddressModal({
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
-      const zoneParam = dnsZoneId || undefined;
+      // "None (no DNS record)" is sent as "" — an absent / null zone means
+      // "use the subnet's effective zone" to the API (#2466).
+      const zoneParam =
+        dnsZoneId || (availableZones.length > 0 ? "" : undefined);
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
         .filter((a) => a.name.length > 0);
@@ -16395,7 +16399,11 @@ export function IPAMPage() {
   // (one-shot semantics).
   const highlightTargetSubnetRef = useRef<string | null>(null);
 
-  const { data: spaces, isLoading } = useQuery({
+  const {
+    data: spaces,
+    isLoading,
+    error: spacesError,
+  } = useQuery({
     queryKey: ["spaces"],
     queryFn: ipamApi.listSpaces,
   });
@@ -16664,6 +16672,12 @@ export function IPAMPage() {
           {isLoading && (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading…</p>
           )}
+          {/* A refused or failed read says so, not an empty tree (#2437). */}
+          {!isLoading && !spaces && spacesError != null && (
+            <p className="px-2 py-3 text-xs">
+              <ListReadError error={spacesError} what="IP spaces" />
+            </p>
+          )}
           {spaces?.length === 0 && !isLoading && (
             <div className="flex flex-col items-center justify-center py-10 text-center">
               <Layers className="mb-2 h-8 w-8 text-muted-foreground/30" />
@@ -16752,7 +16766,11 @@ export function IPAMPage() {
           <div className="flex flex-1 flex-col items-center justify-center text-center">
             <Network className="mb-3 h-12 w-12 text-muted-foreground/20" />
             <p className="text-sm text-muted-foreground">
-              Select a space, block, or subnet from the tree.
+              {spacesError != null && !spaces ? (
+                <ListReadError error={spacesError} what="IP spaces" />
+              ) : (
+                "Select a space, block, or subnet from the tree."
+              )}
             </p>
           </div>
         )}

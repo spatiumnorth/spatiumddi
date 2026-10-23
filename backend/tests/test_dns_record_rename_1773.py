@@ -148,11 +148,13 @@ async def test_case_only_rename_is_a_single_update(
     """DNS names are case-insensitive: Web01 and web01 are one owner, so a
     case-only edit must not retract the name it is about to write."""
     _server, zone = await _make_zone(db_session, driver="bind9")
-    rec = await _add_record(db_session, zone, "web01")
+    # The API lower-cases an owner on write, so the stored mixed-case name is a
+    # legacy row; editing it to its lower-case form is the case-only change.
+    rec = await _add_record(db_session, zone, "Web01")
     headers = await _make_admin(db_session)
     await db_session.commit()
 
-    r = await client.put(_record_delete_url(zone, rec), json={"name": "Web01"}, headers=headers)
+    r = await client.put(_record_delete_url(zone, rec), json={"name": "web01"}, headers=headers)
     assert r.status_code == 200, r.text
     rows = (await db_session.execute(select(DNSRecordOp))).scalars().all()
     assert [o.op for o in rows] == ["update"]

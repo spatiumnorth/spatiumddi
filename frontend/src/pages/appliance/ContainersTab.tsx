@@ -292,19 +292,27 @@ function LogsStreamModal({
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     (async () => {
+      // The server ends a log stream periodically (it re-validates the
+      // session and the token's lifetime); reconnect without re-tailing
+      // so lines aren't repeated.
+      let tail = 200;
       try {
-        for await (const line of streamApplianceContainerLogs(
-          container.name,
-          ctrl.signal,
-          200,
-        )) {
-          setLines((prev) => {
-            // Cap buffer at 2000 lines so a chatty container doesn't
-            // blow up React memory + keep the DOM small.
-            const next = [...prev, line];
-            if (next.length > 2000) next.splice(0, next.length - 2000);
-            return next;
-          });
+        while (!ctrl.signal.aborted) {
+          for await (const line of streamApplianceContainerLogs(
+            container.name,
+            ctrl.signal,
+            tail,
+          )) {
+            setLines((prev) => {
+              // Cap buffer at 2000 lines so a chatty container doesn't
+              // blow up React memory + keep the DOM small.
+              const next = [...prev, line];
+              if (next.length > 2000) next.splice(0, next.length - 2000);
+              return next;
+            });
+          }
+          tail = 0;
+          await new Promise((r) => setTimeout(r, 2000));
         }
       } catch (e) {
         if (!ctrl.signal.aborted) {
