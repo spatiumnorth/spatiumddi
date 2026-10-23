@@ -945,3 +945,102 @@ describe('Allocate IP\'s DNS Zone "None" sends an explicit no-zone (#2466)', () 
     expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "z1" });
   });
 });
+
+// ── #2472 — a forward zone whose name contains "arpa" is offered ─────────────
+describe("the zone pickers tell reverse zones by suffix, not by substring (#2472)", () => {
+  const z = (id: string, name: string) =>
+    ({ id, group_id: "g1", name, kind: "forward" }) as DNSZone;
+  const zones = [
+    z("zp", "plain.test."),
+    z("zs", "scarpa.test."),
+    z("zr", "5.10.in-addr.arpa."),
+    z("z6", "8.b.d.0.1.0.0.2.ip6.arpa."),
+  ];
+
+  function dnsAnswers() {
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: null,
+        dns_additional_zone_ids: [],
+      }),
+    );
+    answer("dnsApi", "listZones", () => Promise.resolve(zones));
+  }
+
+  async function offered(): Promise<string[]> {
+    await findControl("DNS Zone");
+    const picker = await waitFor(() => {
+      const s = control("DNS Zone").querySelector("select");
+      expect(s).toBeTruthy();
+      return s as HTMLSelectElement;
+    });
+    return [...picker.options].map((o) => o.value).filter(Boolean);
+  }
+
+  it("Allocate IP offers both forward zones and no reverse zone", async () => {
+    dnsAnswers();
+    allocateIp();
+    expect(await offered()).toEqual(["zp", "zs"]);
+  });
+
+  it("Edit address offers both forward zones and no reverse zone", async () => {
+    dnsAnswers();
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    open(<EditAddressModal address={address()} onClose={() => {}} />);
+    expect(await offered()).toEqual(["zp", "zs"]);
+  });
+});
+
+// ── #2466 — Allocate IP's DNS Zone "None" ────────────────────────────────────
+
+describe('Allocate IP\'s DNS Zone "None" sends an explicit no-zone (#2466)', () => {
+  function allocateWithZones() {
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: "z1",
+        dns_additional_zone_ids: ["z2"],
+        inherited_from_block_id: null,
+      }),
+    );
+    answer("dnsApi", "listZones", () =>
+      Promise.resolve([
+        { id: "z1", name: "a.example.", zone_type: "primary" },
+        { id: "z2", name: "b.example.", zone_type: "primary" },
+      ]),
+    );
+    return allocateIp();
+  }
+
+  it("None goes out as dns_zone_id: '' (absent would mean the subnet's zone)", async () => {
+    const nextAddress = allocateWithZones();
+    const zone = (await findControl<HTMLDivElement>("DNS Zone")).querySelector(
+      "select",
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(zone.value).toBe("z1"));
+    fireEvent.change(zone, { target: { value: "" } });
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "" });
+  });
+
+  it("a chosen zone still goes out by id", async () => {
+    const nextAddress = allocateWithZones();
+    const zone = (await findControl<HTMLDivElement>("DNS Zone")).querySelector(
+      "select",
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(zone.value).toBe("z1"));
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "z1" });
+  });
+});

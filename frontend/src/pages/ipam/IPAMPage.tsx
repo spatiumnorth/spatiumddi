@@ -107,6 +107,7 @@ import {
   nameInZoneError,
   parseTtlInput,
   summarizeZoneNames,
+  zoneKindForName,
 } from "@/lib/dnsNames";
 import {
   GATEWAY_FORWARD_SKIPPED_LABEL,
@@ -1255,9 +1256,10 @@ function DnsSettingsSection({
   const allAvailableZones: DNSZone[] = zoneQueries.flatMap(
     (q: { data?: DNSZone[] }) => q.data ?? [],
   );
-  // Exclude reverse-lookup zones (in-addr.arpa, ip6.arpa) from primary/additional pickers
+  // Exclude reverse-lookup zones (under in-addr.arpa / ip6.arpa, by label —
+  // not a name that merely contains "arpa", #2472) from primary/additional pickers
   const availableZones = allAvailableZones.filter(
-    (z) => !z.name.toLowerCase().includes("arpa"),
+    (z) => zoneKindForName(z.name) !== "reverse",
   );
 
   // Displayed values when inheriting
@@ -3519,7 +3521,7 @@ export function AddAddressModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
 
   // When the block/subnet has an explicit primary zone and/or additional
   // zones, restrict the picker to just those. Falling back to every zone in
@@ -9241,7 +9243,7 @@ export function EditAddressModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
 
   // When the block/subnet has an explicit primary zone and/or additional
   // zones, restrict the picker to just those. Falling back to every zone in
@@ -10577,7 +10579,7 @@ function BulkEditAddressesModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
   const explicitZoneIds = [
     ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
     ...(effectiveDns?.dns_additional_zone_ids ?? []),
