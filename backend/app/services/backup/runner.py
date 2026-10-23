@@ -293,6 +293,7 @@ async def _retention_sweep(
     *,
     target: BackupTarget,
     config: dict[str, Any],
+    just_written: str | None = None,
 ) -> int:
     """Drop archives outside the target's retention window. One of
     ``retention_keep_last_n`` / ``retention_keep_days`` may be set
@@ -396,13 +397,33 @@ async def _retention_sweep(
         return True
 
     deleted = 0
+    # Retention never removes the newest backup, nor the archive this run
+    # just wrote, whatever the stored policy says (#2503). A stored 0 (the
+    # API used to accept it) or a keep-days cutoff at "now" would otherwise
+    # match the whole listing and leave the target with no backup at all
+    # while the run reported success.
+    backups = sorted(backups, key=lambda a: a.created_at, reverse=True)
+    protected: set[str] = {backups[0].filename} if backups else set()
+    if just_written:
+        protected.add(just_written)
+        if target.retention_keep_last_n is not None and target.retention_keep_last_n < 1:
+            # A legacy stored 0 reads as 1, which would keep only the file
+            # just written and prune the newest archive that existed before
+            # this run. Keep that one too; keep-last-N >= 1 counts as before.
+            previous = next((a.filename for a in backups if a.filename != just_written), None)
+            if previous:
+                protected.add(previous)
     if target.retention_keep_last_n is not None:
-        keep_n = max(target.retention_keep_last_n, 0)
+        keep_n = max(target.retention_keep_last_n, 1)
         for stale in backups[keep_n:]:
+            if stale.filename in protected:
+                continue
             deleted += 1 if await _prune(stale.filename) else 0
     elif target.retention_keep_days is not None:
         cutoff = datetime.now(UTC).timestamp() - target.retention_keep_days * 86400
         for archive in backups:
+            if archive.filename in protected:
+                continue
             if archive.created_at.timestamp() < cutoff:
                 deleted += 1 if await _prune(archive.filename) else 0
     # Safety dumps: their own keep-last-N, independent of which (if
@@ -423,6 +444,41 @@ async def _retention_sweep(
             ),
         )
     return deleted
+
+
+async def _stamp_end_on_fresh_session(
+    *,
+    target_id: Any,
+    started: datetime,
+    stamp: dict[str, Any],
+    audit_kwargs: dict[str, Any],
+    original: BaseException,
+) -> None:
+    """Record a run's end when its own session was closed under it (#2353).
+
+    The stamp is conditional on the row still carrying THIS run's
+    claim (``in_progress`` at ``started``), so it never overwrites a
+    newer run, or a claim a restore replaced and #2175 already settled.
+    The audit row is written regardless: the run happened. Re-raises
+    ``original`` when even a fresh session cannot write.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    try:
+        async with AsyncSessionLocal() as fresh:
+            await fresh.execute(
+                update(BackupTarget)
+                .where(
+                    BackupTarget.id == target_id,
+                    BackupTarget.last_run_status == "in_progress",
+                    BackupTarget.last_run_at == started,
+                )
+                .values(**stamp)
+            )
+            fresh.add(AuditLog(**audit_kwargs))
+            await fresh.commit()
+    except Exception as exc:
+        raise original from exc
 
 
 async def run_backup_for_target(
@@ -473,11 +529,35 @@ async def run_backup_for_target(
             passphrase_hint=target.passphrase_hint or None,
         )
         await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
-        deleted = await _retention_sweep(db, target=target, config=plain_config)
+        # The archive is already on the destination here, so a retention
+        # failure (listing refused, driver bug) must not stamp the run
+        # failed: the backup exists. It is logged and surfaced on the
+        # target's ``last_run_error`` instead (#2503).
+        deleted = 0
+        retention_error: str | None = None
+        retention_exc: Exception | None = None
+        try:
+            deleted = await _retention_sweep(
+                db, target=target, config=plain_config, just_written=filename
+            )
+        except Exception as exc:  # noqa: BLE001
+            retention_exc = exc
+            retention_error = str(exc)
+            logger.warning(
+                "backup_retention_sweep_failed",
+                target_id=str(target.id),
+                kind=target.kind,
+                error=retention_error,
+            )
 
         finished = datetime.now(UTC)
         duration_ms = int((finished - started).total_seconds() * 1000)
         target.last_run_status = "success"
+        target.last_run_error = (
+            f"Backup written, but retention could not run: {retention_error}"[:5000]
+            if retention_error
+            else None
+        )
         target.last_run_filename = filename
         # #1838 — where the archive physically is when the destination
         # is node-local (a ``local_volume`` hostPath on a multi-node
@@ -497,6 +577,8 @@ async def run_backup_for_target(
                 "node_name": target.last_run_node,
             }
         )
+        if retention_exc is not None:
+            result["retention_failure_category"] = backup_failure_category(retention_exc)
         action = "backup_target_run_success"
         result_state = "success"
     except (BackupArchiveError, BackupDestinationError, SecretFieldError) as exc:
@@ -556,25 +638,63 @@ async def run_backup_for_target(
             error=str(exc),
         )
 
-    db.add(
-        AuditLog(
-            action=action,
-            resource_type="backup_target",
-            resource_id=str(target.id),
-            resource_display=target.name,
-            user_id=actor_id,
-            user_display_name=actor_display,
-            result=result_state,
-            # No ``error`` here: this row is forwarded, and the text can name
-            # the destination (#1617). ``failure_category`` says why.
-            new_value={
-                "triggered_by": triggered_by,
-                "kind": target.kind,
-                **{k: v for k, v in result.items() if k != "error"},
-            },
-            error_detail=result.get("error"),
+    audit_kwargs: dict[str, Any] = {
+        "action": action,
+        "resource_type": "backup_target",
+        "resource_id": str(target.id),
+        "resource_display": target.name,
+        "user_id": actor_id,
+        "user_display_name": actor_display,
+        "result": result_state,
+        # No ``error`` here: this row is forwarded, and the text can name
+        # the destination (#1617). ``failure_category`` says why.
+        "new_value": {
+            "triggered_by": triggered_by,
+            "kind": target.kind,
+            **{k: v for k, v in result.items() if k != "error"},
+        },
+        "error_detail": result.get("error"),
+    }
+    # Captured before the commit: if the commit fails the session is
+    # unusable and the row's attributes may be expired (#2353).
+    target_id = target.id
+    stamp = {
+        "last_run_status": target.last_run_status,
+        "last_run_filename": target.last_run_filename,
+        "last_run_node": target.last_run_node,
+        "last_run_bytes": target.last_run_bytes,
+        "last_run_duration_ms": target.last_run_duration_ms,
+        "last_run_error": target.last_run_error,
+        "next_run_at": target.next_run_at,
+    }
+    try:
+        db.add(AuditLog(**audit_kwargs))
+        await db.commit()
+        await db.refresh(target)
+    except Exception as exc:  # noqa: BLE001
+        # #2353 — a restore ends every other session on the database
+        # (``pg_terminate_backend``), including this run's, so the
+        # terminal stamp cannot be written on it. Left alone the claim
+        # stays ``in_progress`` and every later Run now answers 409
+        # until the 2 h presumed-dead reap. The run knows how it ended,
+        # so record that on a fresh session.
+        logger.warning(
+            "backup_run_stamp_session_lost",
+            target_id=str(target_id),
+            error=str(exc)[:200],
         )
-    )
-    await db.commit()
-    await db.refresh(target)
+        await _stamp_end_on_fresh_session(
+            target_id=target_id,
+            started=started,
+            stamp=stamp,
+            audit_kwargs=audit_kwargs,
+            original=exc,
+        )
+        try:
+            await db.rollback()
+            await db.refresh(target)
+        except Exception:  # noqa: BLE001
+            # The caller's session is gone; the result dict carries
+            # everything the caller renders, and the row is stamped.
+            logger.debug("backup_run_refresh_after_session_loss_failed")
     return result

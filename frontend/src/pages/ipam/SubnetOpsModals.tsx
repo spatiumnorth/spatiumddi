@@ -137,6 +137,7 @@ export function FindFreeModal({
   onClose,
   onPickCidr,
   defaultBlockId,
+  defaultBlockLabel,
 }: {
   space: IPSpace;
   onClose: () => void;
@@ -144,7 +145,15 @@ export function FindFreeModal({
   onPickCidr?: (cidr: string, parentBlockId: string) => void;
   /** When set, the search is pre-scoped to this block. */
   defaultBlockId?: string;
+  /** The scoped block's CIDR (or name), so the dialog says what it searches. */
+  defaultBlockLabel?: string;
 }) {
+  // Opened from a block the search covers that block only, not the space (#2419).
+  const scope = defaultBlockId
+    ? defaultBlockLabel
+      ? `block ${defaultBlockLabel}`
+      : "this block"
+    : null;
   const [prefixLength, setPrefixLength] = useState(24);
   const [addressFamily, setAddressFamily] = useState<4 | 6>(4);
   const [count, setCount] = useState(5);
@@ -168,7 +177,11 @@ export function FindFreeModal({
 
   return (
     <ModalShell
-      title={`Find free space in ${space.name}`}
+      title={
+        scope
+          ? `Find free space in ${scope}`
+          : `Find free space in ${space.name}`
+      }
       onClose={onClose}
       footer={
         <button
@@ -229,8 +242,8 @@ export function FindFreeModal({
 
       {!submitted && (
         <p className="text-xs text-muted-foreground">
-          Pick a prefix length and run the search to find unused CIDRs in this
-          space.
+          Pick a prefix length and run the search to find unused CIDRs in{" "}
+          {defaultBlockId ? "this block" : "this space"}.
         </p>
       )}
       {submitted && isLoading && (
@@ -252,7 +265,8 @@ export function FindFreeModal({
           )}
           {data.candidates.length === 0 && !data.summary?.warning && (
             <p className="text-xs text-muted-foreground">
-              No free CIDRs of /{prefixLength} found in this space.
+              No free CIDRs of /{prefixLength} found in{" "}
+              {defaultBlockId ? "this block" : "this space"}.
             </p>
           )}
           {data.candidates.length > 0 && (

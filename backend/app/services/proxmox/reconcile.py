@@ -48,6 +48,7 @@ from app.services.integration_ownership import (
     owning_integration,
     subnet_has_surviving_addresses,
 )
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.proxmox.client import (
     ProxmoxClient,
     ProxmoxClientError,
@@ -223,7 +224,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
