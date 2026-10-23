@@ -1456,7 +1456,9 @@ zone-file replace does.
 **Validation.** Every row goes through the record API's own checks: the type
 list, the RFC 2181 owner rule, the TTL bounds (#2073), the structured-field
 rules (#424), the per-type value checks (one IP per A / AAAA row, a valid
-target name for CNAME / NS / PTR / DNAME), absolute targets on PowerDNS
+target name for CNAME / NS / PTR / DNAME, and rdata dnspython can read for
+the structured types such as CAA / TLSA / SSHFP / NAPTR / LOC / MX / SRV,
+#2502), absolute targets on PowerDNS
 (#2060), BIND's check-names and the full-name lengths (#1378, #2072), and the
 driver-gated types. A row that fails is reported in the preview's `errors` with
 its spreadsheet row number (the header is row 1), never as a 500. **The commit
@@ -1670,6 +1672,8 @@ Catches drift between IPAM's expected records (every IP with a hostname + DNS zo
 | `dns_auto_sync_delete_stale` | off | Also delete auto-generated records whose IP was deleted. Conservative default — leaves stale rows so you can review. |
 
 Implementation: `app.tasks.ipam_dns_sync.auto_sync_ipam_dns` (Celery beat fires every 60s, task gates on the `enabled` flag + interval).
+
+**Which zone an address is judged against.** The address's own zone (`ip_address.forward_zone_id`, set by Allocate, Edit and Bulk edit) when it has one that is still live, otherwise the subnet's effective zone ([#2104](https://github.com/spatiumnorth/spatiumddi/issues/2104)). The same rule applies to the manual Sync DNS at subnet, block and space scope, to auto-sync, and to the records a commit writes, so an address an operator placed in another zone stays there. `forward_zone_id` cannot tell a chosen zone from one inherited from the subnet, so **changing a subnet's zone does not move its existing addresses on Sync DNS, and removing it does not list their records as stale**. Move them with Bulk edit → DNS zone, or remove them by setting the address's DNS zone to None in Edit. Only addresses with no zone of their own, or whose zone was deleted, follow the subnet. DDNS is different: a lease's name goes into the DDNS domain override's zone, else the subnet's, on every rename.
 
 ### 14.2 Zone ↔ Server Reconciliation
 
