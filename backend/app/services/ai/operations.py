@@ -2826,6 +2826,7 @@ async def _apply_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
     from app.models.ipam import Subnet
 
@@ -2873,6 +2874,9 @@ async def _apply_create_dhcp_static(
             "via": "ai_proposal",
         },
     )
+    # #2040 — a reservation is in every group member's bundle; the dispatch
+    # site's collector publishes this after the commit below.
+    collect_wake(dhcp_group_channel(scope.group_id))
     await db.commit()
     await db.refresh(row)
     return {

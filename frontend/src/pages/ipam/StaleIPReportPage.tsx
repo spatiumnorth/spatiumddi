@@ -430,19 +430,17 @@ export function StaleIPReportPage() {
               </>
             )}
             {deprecate.isError && (
-              <p
-                role="alert"
-                className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-              >
-                {formatApiError(deprecate.error, "Deprecate failed")}
-              </p>
+              <span role="alert" className="mt-2 block text-destructive">
+                Could not deprecate:{" "}
+                {formatApiError(deprecate.error, "the request failed")}
+              </span>
             )}
           </>
         }
         onConfirm={confirmDeprecate}
         onClose={() => {
-          setPending(null);
           deprecate.reset();
+          setPending(null);
         }}
       />
     </div>

@@ -42,6 +42,7 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
     OPNsenseClient,
     OPNsenseClientError,
@@ -186,7 +187,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
