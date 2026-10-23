@@ -76,7 +76,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
@@ -2074,6 +2074,7 @@ async def update_group(
         group_drivers = (await _drivers_by_group(db, [group.id])).get(group.id, [])
         if set(group_drivers) & CATALOG_UNSUPPORTED_DRIVERS:
             raise HTTPException(status_code=422, detail=catalog_unsupported_message(group_drivers))
+    before = {k: getattr(group, k, None) for k in changes}
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -2086,7 +2087,7 @@ async def update_group(
             resource_type="dns_server_group",
             resource_id=str(group.id),
             resource_display=group.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -2471,6 +2472,7 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
         setattr(server, k, v)
 
@@ -2614,7 +2616,7 @@ async def update_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             new_value=move_result.as_audit_value() if move_result else None,
             result="success",
         )
@@ -4151,6 +4153,7 @@ async def update_options(
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
+    before = {k: getattr(opts, k, None) for k in changes}
     for k, v in changes.items():
         setattr(opts, k, v)
 
@@ -4193,7 +4196,7 @@ async def update_options(
             resource_type="dns_server_options",
             resource_id=str(opts.id),
             resource_display=f"options for group {group_id}",
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -4988,6 +4991,7 @@ async def update_tsig_key(
         ):
             raise refusal_exc
         await _assert_tsig_key_is_unreferenced(group_id, key, db, action="rename")
+    before = {k: getattr(key, k, None) for k in changes}
     for k, v in changes.items():
         setattr(key, k, v)
     db.add(
@@ -4999,7 +5003,7 @@ async def update_tsig_key(
             resource_type="dns_tsig_key",
             resource_id=str(key.id),
             resource_display=key.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -5216,6 +5220,7 @@ async def update_view(
         },
     )
     changes.update(await _validated_view_fields(group_id, body, db))
+    before = {k: getattr(view, k, None) for k in changes}
     for k, v in changes.items():
         setattr(view, k, v)
     db.add(
@@ -5227,7 +5232,7 @@ async def update_view(
             resource_type="dns_view",
             resource_id=str(view.id),
             resource_display=view.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -6236,6 +6241,7 @@ async def update_zone(
         k in changes and (changes[k] or "") != (getattr(zone, k) or "")
         for k in ("primary_ns", "admin_email")
     ) or any(k in changes and changes[k] != getattr(zone, k) for k in _ZONE_FILE_TIMER_FIELDS)
+    before = {k: getattr(zone, k, None) for k in changes}
     for k, v in changes.items():
         setattr(zone, k, v)
     if soa_changed:
@@ -6253,7 +6259,7 @@ async def update_zone(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=zone.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -8439,6 +8445,13 @@ async def update_record(
         clearable={"view_id", "ttl"},
         non_nullable={"name", "value", "tags"},
     )
+    # An untouched Save sends every field the dialog shows; only a field whose
+    # value differs is a change (#2463). Nothing changed → nothing to bump,
+    # queue or audit.
+    changes = {k: v for k, v in changes.items() if getattr(record, k) != v}
+    if not changes:
+        record.provider_warning = None  # type: ignore[attr-defined]
+        return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     before_name, before_value = record.name, record.value
