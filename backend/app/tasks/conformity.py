@@ -17,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.celery_app import celery_app
 from app.db import task_session
 from app.services.conformity import evaluate_due_policies, resolve_orphaned_policy_alerts
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -32,6 +33,7 @@ logger = structlog.get_logger(__name__)
     retry_jitter=True,
     max_retries=3,
 )
+@module_gated("compliance.conformity")
 def evaluate_conformity(self: object) -> dict[str, int]:  # type: ignore[type-arg]
     return asyncio.run(_run())
 
