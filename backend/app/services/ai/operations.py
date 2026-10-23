@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import bind_check_names_error, primary_ns_error
+from app.core.dns_names import bind_check_names_error, primary_ns_error, structured_rdata_error
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
@@ -2023,6 +2023,17 @@ async def _preview_create_dns_record(
     names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
     if names_err is not None:
         return PreviewResult(ok=False, detail=names_err)
+    # #2502 — nor rdata dnspython cannot read.
+    rdata_err = structured_rdata_error(
+        rtype,
+        args.value,
+        priority=args.priority,
+        weight=args.weight,
+        port=args.port,
+        origin=zone.name,
+    )
+    if rdata_err is not None:
+        return PreviewResult(ok=False, detail=rdata_err)
     # #2060 — nor a dot-less target the group's PowerDNS would refuse.
     target_err = await absolute_target_error(db, zone.group_id, rtype, args.value, zone.name)
     if target_err is not None:
@@ -2108,6 +2119,17 @@ async def _apply_create_dns_record(
     names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
     if names_err is not None:
         raise ValueError(names_err)
+    # #2502 — the same unreadable-rdata refusal as the REST create path.
+    rdata_err = structured_rdata_error(
+        rtype,
+        args.value,
+        priority=args.priority,
+        weight=args.weight,
+        port=args.port,
+        origin=zone.name,
+    )
+    if rdata_err is not None:
+        raise ValueError(rdata_err)
     # #2060 — the same dot-less-target refusal as the REST create path.
     target_err = await absolute_target_error(db, zone.group_id, rtype, args.value, zone.name)
     if target_err is not None:
@@ -2804,6 +2826,7 @@ async def _apply_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
     from app.models.ipam import Subnet
 
@@ -2851,6 +2874,9 @@ async def _apply_create_dhcp_static(
             "via": "ai_proposal",
         },
     )
+    # #2040 — a reservation is in every group member's bundle; the dispatch
+    # site's collector publishes this after the commit below.
+    collect_wake(dhcp_group_channel(scope.group_id))
     await db.commit()
     await db.refresh(row)
     return {
