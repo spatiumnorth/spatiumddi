@@ -5641,7 +5641,10 @@ async def allocate_subnet(
     # through create_subnet's commit, which releases it).
     create_body = SubnetCreate(
         **{
-            **body.model_dump(exclude={"prefix_len"}),
+            # exclude_unset: the rebuilt body's ``model_fields_set`` must hold
+            # only what the caller sent, or the template pre-fill reads every
+            # default as an explicit value and fills nothing (#2566).
+            **body.model_dump(exclude={"prefix_len"}, exclude_unset=True),
             "network": str(chosen),
             "space_id": block.space_id,
             "block_id": block_id,
