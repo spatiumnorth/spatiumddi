@@ -24,6 +24,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 from collections.abc import Callable, Iterable
@@ -528,13 +529,19 @@ class RedisReclaim:
     they are not counted again); ``nodes``: the hostnames the reclaimed
     claims were pinned to; ``sources``: per reclaimed claim, whether the
     bound PV's node affinity (``pv``) or the scheduler's selected-node
-    annotation (``annotation``) decided it was stranded."""
+    annotation (``annotation``) decided it was stranded; ``error``: why the
+    sweep stopped, quoting the start of the answer's body when it was
+    refused; ``error_kind``: the same without the body (the request, and
+    its status when the sweep has it), set wherever ``error`` can quote
+    one. The heartbeat logs a failure once per kind, and an apiserver can
+    answer every tick with another body (review of #2433)."""
 
     reclaimed: list[str] = field(default_factory=list)
     error: str | None = None
     terminating: list[str] = field(default_factory=list)
     nodes: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
+    error_kind: str = ""
 
     def __iter__(self):
         # ``reclaimed, err = ...``, the shape #590's callers unpack.
@@ -558,8 +565,18 @@ def _waits_on_redis_claim(pod: dict) -> bool:
     return False
 
 
+def _k3s_node_names(names: str | Iterable[str]) -> set[str]:
+    """PURE: the names as k3s registers its Nodes, lowercased with no trailing
+    dot (#1757), as delete_node sends them. A bare string is one name."""
+    given = [names] if isinstance(names, str) else names
+    return {str(n).strip().rstrip(".").lower() for n in given if n} - {""}
+
+
 def reclaim_stranded_redis_storage(
-    evicted_nodes: str | Iterable[str] = (), namespace: str = "spatium"
+    evicted_nodes: str | Iterable[str] = (),
+    namespace: str = "spatium",
+    *,
+    owed_nodes: str | Iterable[str] = (),
 ) -> RedisReclaim:
     """Delete Redis PVCs (and their Pending consumer pods) stranded on a
     node that no longer exists. Returns a :class:`RedisReclaim`, which
@@ -598,11 +615,17 @@ def reclaim_stranded_redis_storage(
     three-node cluster, Redis still ran two of three 37 minutes after a
     replace). The seed calls it on every tick now:
 
-    * ``evicted_nodes``: the names the caller deleted this tick, and any a
-      failed sweep left owed (a bare name is one node). They are
-      authoritative, as for Postgres: their claims go at once, with no
-      Node read (the DELETE is milliseconds old and the Node can still be
-      listed).
+    * ``evicted_nodes``: the names the caller deleted this tick (a bare
+      name is one node). They are authoritative, as for Postgres: their
+      claims go at once, with no Node read (the DELETE is milliseconds old
+      and the Node can still be listed).
+    * ``owed_nodes``: the names a failed sweep left owed. They were evicted
+      on an earlier tick, and a run of failed sweeps can keep them owed
+      while the node rejoins under the same hostname, its replica running
+      on the claim again (review of #2433). So one Node read decides: a
+      name the list no longer has goes as if evicted now, and one it lists
+      again keeps its claim and pod. A Node list that cannot be read is an
+      error, and nothing is freed.
     * otherwise one read, the namespace's Pending pods. Only while a pod
       that mounts a ``-redis-`` claim is Pending does the sweep read the
       Node list, and it reclaims each claim whose every pinned hostname
@@ -616,10 +639,15 @@ def reclaim_stranded_redis_storage(
     fails is an error, never a guess. A claim an earlier sweep deleted is
     reported ``terminating``, not reclaimed again, and its pod DELETE is
     retried."""
-    names = [evicted_nodes] if isinstance(evicted_nodes, str) else list(evicted_nodes)
-    # #1757: k3s registers the host's name lowercased, as delete_node sends it.
-    forced = {str(n).strip().rstrip(".").lower() for n in names if n} - {""}
+    forced = _k3s_node_names(evicted_nodes)
+    owed = _k3s_node_names(owed_nodes) - forced
     base = f"/api/v1/namespaces/{quote(namespace)}"
+    if owed:
+        # Owed, not evicted this tick: only while the Node list lacks the name.
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
+        forced |= owed - set(listed)
     live: set[str] | None = None
     if not forced:
         try:
@@ -627,7 +655,10 @@ def reclaim_stranded_redis_storage(
         except (RuntimeError, OSError) as exc:
             return RedisReclaim(error=str(exc))
         if status != 200:
-            return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+            return RedisReclaim(
+                error=f"kubeapi status {status}: {resp[:200]!r}",
+                error_kind=f"list Pending pods: status {status}",
+            )
         try:
             pending = json.loads(resp).get("items") or []
         except (ValueError, AttributeError):
@@ -636,7 +667,7 @@ def reclaim_stranded_redis_storage(
             return RedisReclaim()
         listed, nodes_err = cluster_node_names()
         if listed is None:
-            return RedisReclaim(error=nodes_err)
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
         live = set(listed)
 
     try:
@@ -644,7 +675,10 @@ def reclaim_stranded_redis_storage(
     except (RuntimeError, OSError) as exc:
         return RedisReclaim(error=str(exc))
     if status != 200:
-        return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+        return RedisReclaim(
+            error=f"kubeapi status {status}: {resp[:200]!r}",
+            error_kind=f"list claims: status {status}",
+        )
     try:
         items = json.loads(resp).get("items", [])
     except (ValueError, AttributeError):
@@ -658,7 +692,7 @@ def reclaim_stranded_redis_storage(
             continue
         pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
         if pin_err:
-            out.error = f"{name}: {pin_err}"
+            out.error, out.error_kind = f"{name}: {pin_err}", f"read the volume of {name}"
             break
         # Stranded: every hostname the volume is pinned to is gone, i.e. one
         # the caller evicted, or (on a sweep) one the Node list no longer has.
@@ -678,6 +712,7 @@ def reclaim_stranded_redis_storage(
                 break
             if status not in (200, 202, 404):
                 out.error = f"kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete claim {name}: status {status}"
                 break
             if status != 404:  # 404: gone between the list and the delete
                 out.reclaimed.append(name)
@@ -697,6 +732,7 @@ def reclaim_stranded_redis_storage(
                 break
             if status not in (200, 202, 404):
                 out.error = f"pod {pod}: kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete pod {pod}: status {status}"
                 break
     out.nodes = sorted(gone)
     return out
@@ -1774,6 +1810,108 @@ def sizing_memory_mib(state_dir: Path | None = None) -> int | None:
     except OSError as exc:
         log.warning("supervisor.sizing_memory_unpersisted", error=str(exc))
     return current
+
+
+# #2223 — the dns-bind9 memory limit, sized from node RAM. named holds every
+# zone and RPZ in memory, so a fixed limit that fits a lab is OOM-killed at
+# scale: ddi-pg's lab hit the old fixed 2Gi at about 2M records. A quarter of
+# the node, floor 2Gi (the old fixed value, so no node gets less than it did),
+# cap 8Gi (the rest of the node is the control plane's and the kernel's). The
+# request keeps the chart's old ratio, an eighth of the limit (256Mi at 2Gi).
+# Rounded to whole GiB so the value moves only when the node really changes
+# size: a MiB-resolution limit would change with every few MiB of MemTotal,
+# and every change is a rollout of named on every DNS node.
+_DNS_BIND9_MEM_SHARE = 0.25
+_DNS_BIND9_MEM_MIN_GIB = 2
+_DNS_BIND9_MEM_MAX_GIB = 8
+_DNS_BIND9_REQUEST_DIVISOR = 8
+
+
+def dns_bind9_memory(mem_total_mib: int | None) -> dict[str, str]:
+    """PURE: the ``dnsBind9.memory`` values (``limit`` / ``request``) for a
+    node with ``mem_total_mib`` of RAM; ``{}`` when the size is unknown, so
+    the chart's own default (2Gi / 256Mi) stands.
+
+    The chart applies these only where ``dnsBind9.resources`` does not set
+    the memory limit or request itself, so an operator's explicit override
+    always wins (``templates/dns-bind9.yaml``)."""
+    if not mem_total_mib or mem_total_mib <= 0:
+        return {}
+    quarter_gib = int(mem_total_mib * _DNS_BIND9_MEM_SHARE / 1024 + 0.5)
+    limit_gib = min(max(quarter_gib, _DNS_BIND9_MEM_MIN_GIB), _DNS_BIND9_MEM_MAX_GIB)
+    return {
+        "limit": f"{limit_gib}Gi",
+        "request": f"{limit_gib * 1024 // _DNS_BIND9_REQUEST_DIVISOR}Mi",
+    }
+
+
+_QUANTITY_UNITS = {
+    "": 1, "k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12,
+    "Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40,
+}  # fmt: skip
+
+
+def quantity_mib(value: Any) -> int | None:
+    """PURE: a Kubernetes memory quantity (``"16374512Ki"``) in MiB; ``None``
+    when it does not parse."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]*)", str(value or "").strip())
+    if not m or m.group(2) not in _QUANTITY_UNITS:
+        return None
+    return int(float(m.group(1)) * _QUANTITY_UNITS[m.group(2)]) >> 20
+
+
+_DNS_BIND9_ROLE_LABEL = "spatium.io/role-dns-bind9"
+
+
+def dns_sizing_memory_of(nodes_doc: Any) -> int | None:
+    """PURE — #2223: the RAM (MiB) to size dns-bind9 from, out of a
+    ``/api/v1/nodes`` list: the SMALLEST ``status.capacity.memory`` among the
+    nodes labelled for dns-bind9, or among every node when none is yet.
+
+    One value for the cluster, not this node's own: the role chart is ONE
+    HelmChart every member applies whole, and a value two nodes render
+    differently restarts named on every DNS node each time the other applies
+    (#1137). The DaemonSet also takes one limit for all its pods, so the
+    smallest node it runs on decides — a limit sized for a bigger node would
+    let named take a small one down. The kubelet reads the capacity once at
+    start, so a virtio balloon does not move it (#1585). ``None`` when no node
+    reports a capacity."""
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    labelled: list[int] = []
+    every: list[int] = []
+    for node in items or []:
+        node = node or {}
+        mib = quantity_mib(((node.get("status") or {}).get("capacity") or {}).get("memory"))
+        if mib is None or mib <= 0:
+            continue
+        every.append(mib)
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        if labels.get(_DNS_BIND9_ROLE_LABEL) == "true":
+            labelled.append(mib)
+    pool = labelled or every
+    return min(pool) if pool else None
+
+
+def dns_sizing_memory_mib(timeout: float = 5.0) -> tuple[int | None, str | None]:
+    """``(mib, error)``: :func:`dns_sizing_memory_of` over ``GET /api/v1/nodes``.
+
+    ``None`` with an error means unknown, never "unsized": the role apply then
+    writes nothing rather than dropping the sizing, which would put every DNS
+    node back on the chart's 2Gi default and restart named cluster-wide."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    mib = dns_sizing_memory_of(doc)
+    if mib is None:
+        return None, "no node reports a memory capacity"
+    return mib, None
 
 
 def apply_control_plane_overrides(

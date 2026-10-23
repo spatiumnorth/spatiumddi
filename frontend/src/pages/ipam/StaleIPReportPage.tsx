@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { History, RefreshCw, Trash2 } from "lucide-react";
 
 import {
+  formatApiError,
   ipamApi,
   type StaleIPDeprecateRequest,
   type StaleIPDeprecateResponse,
@@ -13,6 +14,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { SeenDot } from "@/pages/ipam/SeenDot";
 import { humanTime } from "@/pages/network/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 200;
@@ -20,6 +22,11 @@ const PAGE_SIZE = 200;
 // processes at most this many rows, then reports ``capped`` so the
 // operator knows to run it again for the remainder.
 const BULK_CAP = 5000;
+
+// The route's own coarse gate (#2521): write on any of the IPAM resource
+// types. A hand-picked or all-matching deprecate rewrites address rows.
+const DEPRECATE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
+const DEPRECATE_DENIED = "Requires write permission on IPAM addresses";
 
 const inputCls =
   "rounded-md border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring";
@@ -33,6 +40,11 @@ const inputCls =
  */
 export function StaleIPReportPage() {
   const qc = useQueryClient();
+  const perms = usePermissions();
+  const deprecateGate = permissionGate(
+    DEPRECATE_TYPES.some((t) => perms.can("write", t)),
+    DEPRECATE_DENIED,
+  );
   const [staleDays, setStaleDays] = useState(90);
   const [includeNeverSeen, setIncludeNeverSeen] = useState(false);
   const [spaceId, setSpaceId] = useState<string>("");
@@ -134,8 +146,10 @@ export function StaleIPReportPage() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Allocated IPs nothing has seen on the wire in {staleDays}+ days,
-            drawn from the discovery last-seen signal. Deprecate to reclaim
-            address space — it&rsquo;s reversible from the normal IP edit path.
+            drawn from the discovery last-seen signal. Deprecate marks an
+            address for review; it still counts as allocated and is not offered
+            by Next available. Delete the row to free the address. Deprecating
+            is reversible from the normal IP edit path.
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -153,6 +167,7 @@ export function StaleIPReportPage() {
             variant="destructive"
             disabled={total === 0 || deprecate.isPending}
             onClick={() => setPending({ kind: "all", count: total })}
+            {...deprecateGate}
           >
             <Trash2 className="h-4 w-4" />
             Deprecate all {total}
@@ -247,6 +262,7 @@ export function StaleIPReportPage() {
             variant="destructive"
             disabled={deprecate.isPending}
             onClick={() => setPending({ kind: "selected", ids: [...selected] })}
+            {...deprecateGate}
           >
             <Trash2 className="h-4 w-4" />
             Deprecate selected
@@ -387,36 +403,47 @@ export function StaleIPReportPage() {
         }
         loading={deprecate.isPending}
         message={
-          pending?.kind === "all" ? (
-            <>
-              This flips{" "}
-              <strong>
+          <>
+            {pending?.kind === "all" ? (
+              <>
+                This flips{" "}
+                <strong>
+                  {pending.count > BULK_CAP
+                    ? `the first ${BULK_CAP} of ${pending.count}`
+                    : `all ${pending.count}`}
+                </strong>{" "}
+                matching allocated IPs to <strong>deprecated</strong> in the
+                current filter ({staleDays}+ days stale
+                {includeNeverSeen ? ", including never-seen" : ""}). DHCP-lease
+                mirrors and system rows are skipped.
                 {pending.count > BULK_CAP
-                  ? `the first ${BULK_CAP} of ${pending.count}`
-                  : `all ${pending.count}`}
-              </strong>{" "}
-              matching allocated IPs to <strong>deprecated</strong> in the
-              current filter ({staleDays}+ days stale
-              {includeNeverSeen ? ", including never-seen" : ""}). DHCP-lease
-              mirrors and system rows are skipped.
-              {pending.count > BULK_CAP
-                ? " You'll need to run this again for the remainder."
-                : ""}{" "}
-              This is reversible — edit any row back from the IPAM page.
-            </>
-          ) : (
-            <>
-              This flips the{" "}
-              <strong>
-                {pending?.kind === "selected" ? pending.ids.length : 0}
-              </strong>{" "}
-              selected allocated IP(s) to <strong>deprecated</strong>. This is
-              reversible — edit any row back from the IPAM page.
-            </>
-          )
+                  ? " You'll need to run this again for the remainder."
+                  : ""}{" "}
+                This is reversible — edit any row back from the IPAM page.
+              </>
+            ) : (
+              <>
+                This flips the{" "}
+                <strong>
+                  {pending?.kind === "selected" ? pending.ids.length : 0}
+                </strong>{" "}
+                selected allocated IP(s) to <strong>deprecated</strong>. This is
+                reversible — edit any row back from the IPAM page.
+              </>
+            )}
+            {deprecate.isError && (
+              <span role="alert" className="mt-2 block text-destructive">
+                Could not deprecate:{" "}
+                {formatApiError(deprecate.error, "the request failed")}
+              </span>
+            )}
+          </>
         }
         onConfirm={confirmDeprecate}
-        onClose={() => setPending(null)}
+        onClose={() => {
+          deprecate.reset();
+          setPending(null);
+        }}
       />
     </div>
   );

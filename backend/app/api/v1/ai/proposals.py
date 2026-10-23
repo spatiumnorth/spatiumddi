@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.core.agent_wake import collecting_wakes
 from app.models.ai import AIOperationProposal
 from app.services.ai import operations
 from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
@@ -198,7 +199,13 @@ async def apply_proposal(
             )
 
     try:
-        result = await op.apply(db, current_user, args)
+        # #2040 — /ai mounts without ``wake_publishing``, so an op's own
+        # ``collect_wake`` (DHCP scope delete, static create, …) was a silent
+        # no-op here and its agents converged only on the safety tick. Open the
+        # collector around the apply: it publishes after apply() commits and
+        # drops the batch if it raises.
+        async with collecting_wakes():
+            result = await op.apply(db, current_user, args)
     except operations.OperationPermissionError as exc:
         # SECURITY (#400, C2): a permission failure raised by the op's
         # own defense-in-depth check surfaces as a clean 403, not a

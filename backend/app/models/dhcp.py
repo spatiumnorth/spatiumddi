@@ -735,7 +735,7 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     ddns_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     ddns_hostname_policy: Mapped[str] = mapped_column(String(30), nullable=False, default="client")
     hostname_to_ipam_sync: Mapped[str] = mapped_column(
-        String(30), nullable=False, default="on_static_only"
+        String(30), nullable=False, default="on_lease"
     )
     # When False, the IPAM↔DNS drift check ignores this scope's dynamic-pool
     # lease mirrors (``auto_from_lease`` IPs inside a ``dynamic`` pool). Pulled
