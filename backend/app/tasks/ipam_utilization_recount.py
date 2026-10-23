@@ -41,6 +41,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_session
 from app.models.audit import AuditLog
+from app.services.ipam.utilization import COUNTS_TOWARD_UTILIZATION_SQL
 
 logger = structlog.get_logger(__name__)
 
@@ -72,7 +73,7 @@ async def _recount_subnets(db: AsyncSession) -> int:
         await db.execute(
             text(
                 "SELECT subnet_id, COUNT(*) FROM ip_address "
-                "WHERE status != 'available' GROUP BY subnet_id"
+                f"WHERE {COUNTS_TOWARD_UTILIZATION_SQL} GROUP BY subnet_id"
             )
         )
     ).all():
