@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An API token bound to specific subnets or DNS zones is held to them
+  outside the IPAM and DNS routers too.** Its permission check sees only
+  the resource type, so routes mounted elsewhere answered it for the
+  whole estate: `GET /reports/top-subnets-by-utilization` listed every
+  subnet, and `GET /metrics/dns/timeseries` summed every server. Such a
+  token is now refused (403) on every route outside the IPAM and DNS
+  routers except those that narrow to its grants or return nothing about
+  the estate (`/auth/me`, `/auth/me/permissions`, `/search`,
+  `/search/types`, `/ai/mcp`, `/dns/tools/*`), and `/metrics` refuses it
+  as a scrape credential. Sessions and tokens without resource grants
+
 - **An "Exclude secrets" backup now leaves out every secret.** The
   diagnostic mode blanked the credentials an operator types in but
   kept the appliance CA private key, the k3s join tokens, the cluster

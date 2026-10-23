@@ -19,6 +19,7 @@ from sqlalchemy import select, update
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
+from app.api.token_binding import honours_token_binding
 from app.config import settings
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
@@ -1073,6 +1074,7 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
 
 
 @router.get("/me", response_model=UserResponse)
+@honours_token_binding
 async def get_me(current_user: CurrentUser) -> UserResponse:
     # #351 — ``is_superadmin`` here reports the *effective* status (the legacy
     # column OR a group → Superadmin-role ``{*, *}`` wildcard), NOT the raw
@@ -1096,6 +1098,7 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
 
 
 @router.get("/me/permissions", response_model=MyPermissionsResponse)
+@honours_token_binding
 async def get_my_permissions(current_user: CurrentUser) -> MyPermissionsResponse:
     """Return the calling credential's effective permission grants (issue #449).
 

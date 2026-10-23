@@ -602,6 +602,22 @@ subnets, since free space is a fact about every subnet in the container.
 `backend/tests/test_token_path_scope_sweep.py` walks the route table for
 each of these rules, so a route added later is covered without an edit.
 
+Outside those routers a resource-scoped token is refused with `403`.
+A report, dashboard or metrics series mounted elsewhere answers about
+every subnet, zone or server it aggregates over, and its permission gate
+sees only the resource type, so it cannot serve a token bound to one
+instance. The only exceptions are routes that narrow their own answer to
+the token's grants or return nothing about the estate: `GET /auth/me`,
+`GET /auth/me/permissions`, global search (`GET /search`,
+`GET /search/types`), the MCP endpoint (`/ai/mcp`, which applies the
+per-tool rule below), and the DNS tools that query public resolvers
+(`/dns/tools/*`). A route joins that list by being mounted with
+`include_token_scoped` (`app/api/token_path_scope.py`) or by declaring
+`@honours_token_binding` (`app/api/token_binding.py`); a route added
+anywhere else refuses such a token until it does. The same rule covers
+`/metrics` when it is read with an API token. Sessions and tokens without
+`resource_grants` are not affected.
+
 A resource-scoped token is held to its grants beyond the URL path too. An
 IPAM write that names a DNS zone in its body (`dns_zone_id`,
 `extra_zone_ids`, the zone bindings of a subnet, block or space) may name
