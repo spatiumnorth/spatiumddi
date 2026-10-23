@@ -307,8 +307,9 @@ class FindDnsServersArgs(BaseModel):
         "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Answers 'which group is this server in?', 'which server is "
         "primary for that group?' and "
-        "'which groups have no primary?' — the last of which silently "
-        "drops every record write to that group's zones. Read-only: "
+        "'which groups have no primary?' (one is re-elected automatically "
+        "within a minute; until then writes go to the server it will "
+        "pick). Read-only: "
         "moving a server between groups is done over the REST API or the "
         "DNS → Server Groups UI, not from here."
     ),

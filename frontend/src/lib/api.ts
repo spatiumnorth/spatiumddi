@@ -447,6 +447,17 @@ export interface ProbePolicy {
   inherited: boolean;
 }
 
+/** What a subnet's DDNS resolves to and where from (#2475). */
+export interface EffectiveDdns {
+  enabled: boolean;
+  hostname_policy: DdnsHostnamePolicy;
+  domain_override: string | null;
+  ttl: number | null;
+  source: "subnet" | "block" | "space" | "none";
+  source_id: string | null;
+  source_name: string | null;
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -1554,6 +1565,14 @@ export const ipamApi = {
   getEffectiveSubnetDns: (subnetId: string) =>
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
+      .then((r) => r.data),
+  getEffectiveBlockDdns: (blockId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)
+      .then((r) => r.data),
+  getEffectiveSubnetDdns: (subnetId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/subnets/${subnetId}/effective-ddns`)
       .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
     api
@@ -9795,6 +9814,8 @@ export interface DHCPClientClass {
   // each option to whichever family it is valid in.
   address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
+  // #2296 — a row stored before its name became reserved; rename it.
+  reserved_name?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -10572,12 +10593,12 @@ export const API_TOKEN_SCOPES: {
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
   },
   {
     value: "dhcp:write",
@@ -13510,7 +13531,29 @@ export interface UpgradeImage {
   uploaded_by_user_id: string | null;
   uploaded_at: string;
   notes: string | null;
+  // #2410 — derived server-side from columns that already exist. The
+  // release is null when GitHub has not been reached recently (the list
+  // is served from the release cache, never a live call).
+  release?: {
+    published_at: string;
+    is_prerelease: boolean;
+    html_url: string;
+  } | null;
+  channel?: UpgradeImageChannel;
+  fleet_architecture?: UpgradeImageFleetVerdict;
+  fleet_nodes?: number | null;
+  // Version is on a slot of these nodes. NOT in use: the bytes are written.
+  installed_on?: string[];
+  // These nodes are scheduled to fetch it, and a delete is refused (409).
+  scheduled_for?: string[];
+  rolling_run_id?: string | null;
 }
+
+export type UpgradeImageChannel = "stable" | "prerelease" | "nightly";
+// #2399's verdict: some node runs this architecture / the whole fleet has
+// reported and none does / not knowable (unlabelled image, a node that has
+// not reported, or no nodes yet).
+export type UpgradeImageFleetVerdict = "matches" | "no_node" | "unknown";
 
 // A GitHub release carrying an importable appliance upgrade image.
 export interface AvailableUpgradeImage {
@@ -13527,11 +13570,24 @@ export interface AvailableUpgradeImage {
   // #1026 — a release publishing both architectures appears as two
   // rows, one per architecture.
   architecture: string;
+  // #2410
+  staged_image_id?: string | null;
+  channel?: UpgradeImageChannel;
+  fleet_architecture?: UpgradeImageFleetVerdict;
+  fleet_nodes?: number | null;
+}
+
+export interface FleetArchitectures {
+  architectures: string[];
+  unknown_count: number;
+  counts: Record<string, number>;
+  restricted: boolean;
 }
 
 export interface AvailableUpgradeImages {
   github_reachable: boolean;
   available: AvailableUpgradeImage[];
+  fleet: FleetArchitectures;
 }
 
 export const applianceUpgradeImagesApi = {
@@ -13541,9 +13597,11 @@ export const applianceUpgradeImagesApi = {
       .then((r) => r.data.images),
   // Connected-install picker source — releases with an importable
   // upgrade-image asset + its .sha256 sidecar.
-  listAvailable: () =>
+  listAvailable: (allArchitectures = false) =>
     api
-      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available")
+      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available", {
+        params: allArchitectures ? { all_architectures: true } : undefined,
+      })
       .then((r) => r.data),
   // Control plane downloads + verifies + stores the release asset.
   importFromGithub: (release_tag: string, architecture?: string) =>
@@ -13582,8 +13640,14 @@ export const applianceUpgradeImagesApi = {
       })
       .then((r) => r.data);
   },
-  remove: (id: string) =>
-    api.delete<void>(`/appliance/upgrade-images/${id}`).then((r) => r.data),
+  // ``force`` deletes an image an appliance is scheduled to fetch or an
+  // active run names (otherwise a 409); audited server-side (#2410).
+  remove: (id: string, force = false) =>
+    api
+      .delete<void>(`/appliance/upgrade-images/${id}`, {
+        params: force ? { force: true } : undefined,
+      })
+      .then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────

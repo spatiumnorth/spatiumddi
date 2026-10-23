@@ -285,10 +285,112 @@ registrar still points at the old group's, so issuance fails until repointed.
 applied at. It is auto-elected on create and on first agent registration when
 the group has none; send `is_primary: true` on the same PUT to move it, which
 demotes whichever server currently holds it. **Clearing the last primary is
-refused (422)** — it re-creates the footgun the auto-election exists to
-prevent, and the resulting dropped writes are silent (a log line; no error
-reaches whoever made the change). Promote a replacement instead; that demotes
-the incumbent as a side effect.
+refused (422)** — it would not stick, because a group without a primary has
+one re-elected automatically (below). Promote a replacement instead; that
+demotes the incumbent as a side effect.
+
+**Deleting the primary elects a successor (#2276)** in the same transaction:
+the oldest enabled, unpaused survivor, or any survivor if every one is disabled
+or paused. Revoking an appliance that owned the primary does the same. The
+delete's audit row names the server elected. A group that is still left with
+no primary (one that lost it on an older build) keeps receiving record writes:
+agent-based groups fan out to every enabled server regardless, an agentless
+group writes through the server the election would pick, and a 60 s beat
+sweep marks that server primary. Only a group with no servers at all queues
+nothing, and nothing is lost there: a server added later receives the zone's
+records in its bundle.
+
+### Control-plane memory for large groups (#2227)
+
+Every DNS agent's config is rendered once per change by the Celery worker
+(the `bundles` queue) and stored; the long-poll serves the stored bytes (see
+"Stored bundles" in [`DNS_AGENT.md`](../deployment/DNS_AGENT.md)). The
+render used to hold the whole group at once: a row per record as fetched, a
+dict per record, then three whole serialisations (the body, the ETag payload,
+the structural payload). Since #2227 it reads the records a batch of zones at
+a time, writes each batch into the gzipped body as it goes, and hashes the
+two ETags from spool files, so what it holds no longer grows with the group's
+record count. The stored bytes and both ETags are unchanged, byte for byte.
+
+Measured on a synthetic group of 20,000 zones (a forward and a reverse zone
+per site, the scale-lab shape), one render and store, peak RSS of the worker
+process (about 127 MB before the render starts):
+
+| Records in the group | Before #2227 | After |
+|---|---|---|
+| 1,000,000 | 1,016 MB | 227 MB |
+| 2,000,000 | 1,799 MB | 231 MB |
+| 2,000,000, two views (4M record copies) | 2,810 MB | 244 MB |
+| 2,000,000, one view, 813,000 queued ops for the server | 3,768 MB | 231 MB |
+
+Before, that was about **850 MB per million records** on top of the process,
+for every render (most of it the fetched rows, about 700 B each). After, a
+render of a group without views needs about:
+
+- 130 MB for the worker process itself;
+- about **4 kB per zone** in the group (the zones are still read whole);
+- one batch of records (`RECORD_RENDER_BATCH`, 20,000 rows), about 15 MB;
+- twice the **compressed** body while it is stored: the stored bytes and the
+  copy the database driver sends. `dns_agent_bundle.body_gzip_bytes` is that
+  size; per record it is a few bytes, not hundreds.
+
+Under split-horizon views a zone's copies are cut from all of its records at
+once, so a render also holds the **largest zone** whole: roughly 1 - 1.5 kB
+per record in that zone, per view it renders into.
+
+The two spools move to a temporary file once they pass 8 MB (`TMPDIR`, the
+container's writable layer by default). Together they are a little larger
+than the uncompressed body, so rendering a two-million-record group needs a
+few hundred MB of scratch disk while it runs.
+
+A render the worker still cannot survive (killed mid-render by the OOM
+killer, or by the task's 960 s hard time limit) no longer takes the fleet
+with it. Its lease on the fleet-wide render slot lapses within
+`dns_agent_bundle_render_lease_seconds` (60 s). After two renders of one
+server have died that way, the next one records the reason on the server
+(`bundle_render_status = failed`, which raises the
+`agent_bundle_render_failed` alert) and holds that server for five minutes,
+then lets one more render through. Before, the broker redelivered the dead
+render's task and the sweep re-enqueued it, so it killed one worker process
+after another and nothing on the server row said why.
+
+**Renders at once, and fairness.** Renders used to run one at a time across
+the whole fleet, and a server whose group kept changing re-rendered in place
+up to 50 times while every other server waited. Now up to
+`dns_agent_bundle_render_slots` (`DNS_AGENT_BUNDLE_RENDER_SLOTS`, default 2)
+run at once, and a server that changed again while it rendered hands its
+slot to any render that is waiting before it renders again. Measured on the
+same 2,000,000-record group with seven servers: about 40 s per render, so a
+full pass took 283 s one at a time and 170 s two at a time (on a 6-core
+host; renders are CPU-bound in the worker, so more slots buy little past the
+worker's cores).
+
+**The op backlog, under split-horizon views.** Each record change queues one
+op per server in the group (#170), so 2M records on seven servers is about
+14M op rows, and they pile up while no render finishes. A group *without*
+views never reads them in a render: they ship a page at a time (5,000 ops,
+about 1.4 s) against the stored bundle that covers them. A group *with* views
+cannot apply a record op incrementally, so its render retires every queued op
+its body covers. That retire used to load the ops as ORM rows, about 4 kB
+each, and after a load it was the larger half of the render: measured on the
+2,000,000-record group with one view (the scale lab's shape) and 813,000
+queued ops for the server, the render peaked at 1,797 MB and the retire at
+3,768 MB, taking 132 s. It now locks and stamps them a chunk of ids at a time
+(`RETIRE_CHUNK`, 5,000) with one UPDATE each and loads none: the same render
+and retire peaked at 231 MB and the retire took 31 s.
+
+Bounded is not the same as keeping up. Under views every record change
+re-renders every server of the group in full, where a group without views
+ships the change as an op. With two views and the same backlog a
+2,000,000-record render took about four minutes here, so a seven-server
+group under a sustained write storm re-renders continuously and never sits
+settled; it converges once the writes stop. View-aware incremental ops is
+the follow-up that changes this (#2240).
+
+This is the control plane's side. The agent and its daemon have their own
+memory to size for the same group (#2223), and
+[`APPLIANCE.md`](../deployment/APPLIANCE.md) states what one group is
+supported at.
 
 ---
 
@@ -748,6 +850,8 @@ On lease expiry, `dhcp_lease_cleanup` sweeps the DHCPLease row past its grace pe
 ### Subnet-level configuration
 
 DDNS is opt-in per subnet. A subnet can also inherit its DDNS settings from its enclosing block / space: `IPSpace` and `IPBlock` carry the same four DDNS fields, and when `ddns_inherit_settings` is true `resolve_effective_ddns` (in `backend/app/services/dns/ddns.py`) walks subnet → block → space to find the effective values.
+
+The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle like the DNS and DHCP tabs. While it is ticked the tab shows what the subnet resolves to and from where (read-only, from `GET /ipam/subnets/{id}/effective-ddns`, or `GET /ipam/blocks/{id}/effective-ddns` for a subnet that does not exist yet), and a Save sends only `ddns_inherit_settings`, so it keeps the inheritance. Unticking it shows the subnet's own settings.
 
 | Field | Default | Purpose |
 |---|---|---|
