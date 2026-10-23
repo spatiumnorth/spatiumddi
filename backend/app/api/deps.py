@@ -97,7 +97,9 @@ async def _record_api_token_use(token: APIToken, now: datetime) -> None:
     set_committed_value(token, "last_used_at", now)
 
 
-async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> User:
+async def _resolve_api_token(
+    db: AsyncSession, raw: str, request: Request, *, record_activity: bool = True
+) -> User:
     """Validate an ``sddi_*`` bearer and return the owning user.
 
     Raises the same 401/403 pattern as JWT auth so callers can't
@@ -110,6 +112,9 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     RBAC check downstream — see ``app.services.api_token_scopes``. A
     "read-only" token can never reach a write handler, even if the
     owner's RBAC would allow it.
+
+    ``record_activity=False`` skips the ``last_used_at`` bump, for a
+    re-check of a credential already accepted (a long-lived stream).
     """
     token_hash = hash_api_token(raw)
     token = (
@@ -170,7 +175,8 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
         )
     # Record the use in a transaction of its own (#1158): a read handler
     # never commits the request's session, so a bump left on it was lost.
-    await _record_api_token_use(token, now)
+    if record_activity:
+        await _record_api_token_use(token, now)
     await _load_time_bound_grants(db, user)
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.
@@ -206,13 +212,26 @@ async def get_current_user(
     """
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return await authenticate_bearer(db, credentials.credentials, request)
 
-    raw = credentials.credentials
+
+async def authenticate_bearer(
+    db: AsyncSession, raw: str, request: Request, *, record_activity: bool = True
+) -> User:
+    """Resolve a raw bearer credential (JWT access token or ``sddi_*`` API
+    token) to its User, applying every check :func:`get_current_user` does.
+
+    Raises ``HTTPException`` (401 / 403) on any failure. Shared by the auth
+    dependency and :mod:`app.api.stream_auth`, which re-runs it periodically
+    for a stream that outlives the request that opened it.
+    ``record_activity=False`` skips the ``last_seen_at`` / ``last_used_at``
+    bumps: a re-check is not the user doing anything.
+    """
     # Fast path for API tokens — they carry a distinct prefix so we
     # never try to JWT-decode one (which would just 401 on signature
     # mismatch anyway, but this is cleaner error messaging).
     if raw.startswith(_API_TOKEN_PREFIX):
-        return await _resolve_api_token(db, raw, request)
+        return await _resolve_api_token(db, raw, request, record_activity=record_activity)
 
     try:
         payload = decode_access_token(raw)
@@ -238,7 +257,7 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session revoked or expired",
         )
-    if session is not None:
+    if session is not None and record_activity:
         # When this session's user actually signed in — a refresh keeps it
         # (#1241). MFA enrolment reads it to ask an external-auth user, who
         # has no local password to re-enter, for a recent sign-in instead.
