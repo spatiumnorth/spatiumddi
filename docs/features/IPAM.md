@@ -80,8 +80,8 @@ Subnet
   -- Status / Metadata
   status: enum(active, deprecated, reserved, quarantine)
   utilization_percent: float (computed)
-  total_ips: int (computed)
-  allocated_ips: int (computed)
+  total_ips: int (computed — usable addresses; IPv4 network + broadcast excluded)
+  allocated_ips: int (computed — non-available rows, excluding the IPv4 network / broadcast placeholders, so allocated ≤ total)
   
   -- Custom Fields (see section 6)
   custom_fields: JSONB
@@ -809,6 +809,8 @@ CustomFieldDefinition
 ### Custom Fields in the API
 
 Custom fields are exposed under the `custom_fields` JSONB key on all resource objects. They are validated against their `CustomFieldDefinition` on write.
+
+**Required fields (#2478).** A definition marked Required is enforced on IP block and subnet writes (create, allocate-subnet and update); a request that leaves one empty is refused with 422 naming it. A value inherited from the block chain above the row counts. The rule is deliberately narrow so that making a field Required later does not lock existing rows: a **create** needs every Required field; an **update** is checked only when the request sends `custom_fields`, and then only for a field it sends or the row already holds a value for. So a block or subnet that never had the field can still be renamed or saved untouched, but it cannot be given the field empty, and a value it holds cannot be blanked. Select fields always show an empty choice (not pickable for a Required field with nothing to inherit), and the New / Edit dialogs apply the same rule before sending. IP spaces and addresses are not covered yet, and neither are subnets a template's child layout carves.
 
 ---
 
@@ -1918,6 +1920,8 @@ confirmation gates and pg advisory locks held through commit:
   unallocated CIDRs of the requested prefix length. Optional
   `parent_block_id` scope (Find Free… on the block detail
   pre-restricts to that block) and a `min_free_addresses` filter.
+  Each candidate carries `free_addresses` (its usable host count, as
+  the subnet would hold) and the filter compares against it.
   "Create subnet here" files the subnet under the block the row names
   (which may be a child of the searched block).
   Service layer in `app.services.ipam.free_space`.
@@ -1926,15 +1930,24 @@ confirmation gates and pg advisory locks held through commit:
   subnet into 2^k aligned children at a longer prefix. Preview
   reports the prospective children + any IP-address conflicts
   (rows that wouldn't fit cleanly into one child or the other);
-  commit refuses if the typed CIDR doesn't match. Service in
-  `app.services.ipam.subnet_split`.
+  commit refuses if the typed CIDR doesn't match. Children inherit
+  the parent's compliance and discovery settings (PCI / HIPAA scope,
+  internet-facing, role, do-not-probe, kind, customer, site, discovery
+  and split-horizon); integration ownership and import provenance are
+  not carried, and the preview warns when the parent has any. Service
+  in `app.services.ipam.subnet_split`.
 
 - `POST /ipam/subnets/{id}/merge/preview` + `/commit` — collapse
   contiguous siblings back into one supernet via
   `ipaddress.collapse_addresses`. Preview reports the prospective
   merged CIDR + any conflicts. Single-source gateways are
   preserved; differing source gateways are nulled (operator must
-  re-set). Service in `app.services.ipam.subnet_merge`.
+  re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
+  are the safe union (true when any source has it, and the preview
+  says so); sources that disagree on kind, customer or site are a
+  conflict; any other disagreeing setting (role, discovery, ...) is a
+  preview warning and the target's value is kept. Service in
+  `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the
 bulk-action toolbar on the block- and space-level subnet tables:
