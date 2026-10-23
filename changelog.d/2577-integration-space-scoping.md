@@ -16,8 +16,12 @@
   across spaces. A pure mirror row it created and nobody touched is
   deleted and re-created in the new space; anything else (an adopted
   operator row, one with an operator edit or audit entry, a subnet still
-  holding other rows or a DHCP scope) is un-claimed in place, keeping its
-  `user_modified_at`. When the evidence is unclear the row is un-claimed,
+  holding other rows or a DHCP scope, and any row an operator registry
+  points at — an OT or BACnet device, an E911 binding, a multicast
+  membership, a DNS record, an address set or OT zone on a subnet, tags
+  or custom fields) is un-claimed in place, keeping its
+  `user_modified_at`. That last list is the same test a target delete
+  applies (#2334), shared by both. When the evidence is unclear the row is un-claimed,
   not deleted. The same release frees operator rows an earlier build
   claimed in their home space without moving them.
 - **A release is reported, and counted.** Each release writes its own

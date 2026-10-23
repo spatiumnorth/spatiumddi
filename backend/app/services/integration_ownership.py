@@ -129,6 +129,74 @@ async def subnet_has_surviving_addresses(
     return bool(count)
 
 
+def address_registry_ref(address_id: Any) -> Any:
+    """An operator registry row points at this address (#2334, #2577).
+
+    OT devices, BACnet devices, E911 bindings and multicast memberships all
+    reference ``ip_address`` with ``ON DELETE CASCADE``: deleting the address
+    deletes the operator's registry row with it. So an address one of them
+    points at is operator content, however purely mirrored it otherwise is.
+    ``address_id`` is a column (correlated) or a value."""
+    from app.models.bacnet import BACnetDevice  # noqa: PLC0415
+    from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.multicast import MulticastMembership  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
+
+    return or_(
+        exists().where(OTDevice.ip_address_id == address_id),
+        exists().where(BACnetDevice.ip_address_id == address_id),
+        exists().where(ERLBinding.ip_address_id == address_id),
+        exists().where(MulticastMembership.ip_address_id == address_id),
+    )
+
+
+def address_operator_ref(address_id: Any) -> Any:
+    """Anything operator-made hangs off this address: a registry row
+    (:func:`address_registry_ref`), a DNS record or a DHCP static
+    reservation. The one test both :func:`release_integration_rows` (target
+    delete) and :func:`release_outside_space` (re-target) use to decide that
+    an address must be un-claimed rather than deleted, so the two cannot
+    drift."""
+    from app.models.dhcp import DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
+
+    return or_(
+        exists().where(DNSRecord.ip_address_id == address_id),
+        exists().where(DHCPStaticAssignment.ip_address_id == address_id),
+        address_registry_ref(address_id),
+    )
+
+
+def subnet_registry_ref(subnet_id: Any) -> Any:
+    """An operator registry row hangs off this subnet with ``ON DELETE
+    CASCADE``: an OT zone, an E911 binding or an address set (#2334, #2577)."""
+    from app.models.address_set import AddressSet  # noqa: PLC0415
+    from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.ot import OTZone  # noqa: PLC0415
+
+    return or_(
+        exists().where(OTZone.subnet_id == subnet_id),
+        exists().where(ERLBinding.subnet_id == subnet_id),
+        exists().where(AddressSet.subnet_id == subnet_id),
+    )
+
+
+def subnet_operator_ref(subnet_id: Any) -> Any:
+    """:func:`subnet_registry_ref` plus a subnet-domain link: what makes a
+    subnet operator content regardless of the addresses in it."""
+    from app.models.ipam import SubnetDomain  # noqa: PLC0415
+
+    return or_(
+        subnet_registry_ref(subnet_id),
+        exists().where(SubnetDomain.subnet_id == subnet_id),
+    )
+
+
+def _jsonb_nonempty(col: Any) -> Any:
+    """SQL twin of ``bool(row.tags)`` / ``bool(row.custom_fields)``."""
+    return and_(col.is_not(None), cast(col, String).not_in(("{}", "[]", "null")))
+
+
 @dataclass
 class ReleaseSummary:
     """What :func:`release_integration_rows` did, for the audit row."""
@@ -177,34 +245,21 @@ async def release_integration_rows(
     """
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
-    from app.models.address_set import AddressSet  # noqa: PLC0415
-    from app.models.bacnet import BACnetDevice  # noqa: PLC0415
-    from app.models.dhcp import DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
-    from app.models.dns import DNSRecord  # noqa: PLC0415
-    from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
     from app.models.ipam import IPBlock, Subnet, SubnetDomain  # noqa: PLC0415
-    from app.models.multicast import MulticastMembership  # noqa: PLC0415
-    from app.models.ot import OTDevice, OTZone  # noqa: PLC0415
 
     summary = ReleaseSummary()
     fk_addr = getattr(IPAddress, own_fk)
 
     # Operator registries whose FK to ip_address / subnet is ON DELETE CASCADE:
     # a row one of them points at is operator content even when purely mirrored.
-    registry_ref = or_(
-        exists().where(OTDevice.ip_address_id == IPAddress.id),
-        exists().where(BACnetDevice.ip_address_id == IPAddress.id),
-        exists().where(ERLBinding.ip_address_id == IPAddress.id),
-        exists().where(MulticastMembership.ip_address_id == IPAddress.id),
-    )
+    registry_ref = address_registry_ref(IPAddress.id)
 
     # 1. Addresses. A purely mirrored one is left for the FK cascade.
     survivor = or_(
         IPAddress.user_modified_at.is_not(None),
         *(getattr(IPAddress, fk).is_not(None) for fk in INTEGRATION_OWNERSHIP if fk != own_fk),
-        exists().where(DNSRecord.ip_address_id == IPAddress.id),
-        exists().where(DHCPStaticAssignment.ip_address_id == IPAddress.id),
-        registry_ref,
+        address_operator_ref(IPAddress.id),
     )
     summary.addresses_removed = (
         await db.scalar(
@@ -247,15 +302,7 @@ async def release_integration_rows(
                     .where(registry_ref)
                 )
             )
-            or bool(
-                await db.scalar(
-                    select(
-                        exists().where(OTZone.subnet_id == sn.id)
-                        | exists().where(ERLBinding.subnet_id == sn.id)
-                        | exists().where(AddressSet.subnet_id == sn.id)
-                    )
-                )
-            )
+            or bool(await db.scalar(select(subnet_registry_ref(sn.id))))
             or bool(
                 await db.scalar(
                     select(func.count())
@@ -588,8 +635,13 @@ async def release_outside_space(
     other integration's FK, and created after the target itself (an
     integration cannot have created a row older than itself). An address
     also needs no ``user_modified_at``, no ``created_by_user_id``, no import
-    provenance and no DHCP reservation; a subnet or block must hold nothing —
-    no addresses, DHCP scopes, subnets or child blocks — to be deleted.
+    provenance, and nothing operator-made hanging off it — no DNS record, DHCP
+    reservation, OT / BACnet device, E911 binding or multicast membership
+    (:func:`address_operator_ref`, the same test a target delete uses). A
+    subnet or block must hold nothing — no addresses, DHCP scopes, subnets or
+    child blocks — and carry no tags or custom fields to be deleted; a subnet
+    also no address set, OT zone, E911 binding or domain link
+    (:func:`subnet_operator_ref`).
 
     An empty space list releases nothing: a target always has a space, and
     treating "unknown" as "everything is outside" would release it all.
@@ -626,6 +678,9 @@ async def release_outside_space(
         IPAddress.static_assignment_id.is_(None),
         IPAddress.created_at >= target_created,
         not_(_operator_touched("ip_address", IPAddress.id)),
+        # An operator registry row, DNS record or reservation on it (#2334's
+        # test, shared): deleting the address would cascade into them.
+        not_(address_operator_ref(IPAddress.id)),
         *_no_other_owner(IPAddress, own_fk),
     )
     rows = (
@@ -651,6 +706,9 @@ async def release_outside_space(
             not_(_operator_touched("subnet", Subnet.id)),
             not_(exists().where(IPAddress.subnet_id == Subnet.id)),
             not_(exists().where(DHCPScope.subnet_id == Subnet.id)),
+            not_(subnet_operator_ref(Subnet.id)),
+            not_(_jsonb_nonempty(Subnet.tags)),
+            not_(_jsonb_nonempty(Subnet.custom_fields)),
             *_no_other_owner(Subnet, own_fk),
         )
         subnets = (
@@ -677,6 +735,8 @@ async def release_outside_space(
             not_(_operator_touched("ip_block", IPBlock.id)),
             not_(exists().where(Subnet.block_id == IPBlock.id)),
             not_(exists().where(child.parent_block_id == IPBlock.id)),
+            not_(_jsonb_nonempty(IPBlock.tags)),
+            not_(_jsonb_nonempty(IPBlock.custom_fields)),
             *_no_other_owner(IPBlock, own_fk),
         )
         blocks = (
@@ -878,6 +938,8 @@ __all__ = [
     "DNS_RECORD_OWNER_FKS",
     "INTEGRATION_OWNERSHIP",
     "INTEGRATION_OWNERSHIP_FKS",
+    "address_operator_ref",
+    "address_registry_ref",
     "address_taken",
     "addresses_in_space",
     "dns_record_owned_elsewhere",
@@ -893,4 +955,6 @@ __all__ = [
     "release_integration_rows",
     "scope_addresses_to_space",
     "subnet_has_surviving_addresses",
+    "subnet_operator_ref",
+    "subnet_registry_ref",
 ]

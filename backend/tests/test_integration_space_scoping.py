@@ -579,6 +579,98 @@ async def test_owned_subnet_in_another_space_is_never_updated_or_reparented(
     assert getattr(row, fk) is None
 
 
+@pytest.mark.parametrize("kind", _SUBNET_KINDS)
+async def test_space_change_never_deletes_rows_an_operator_registry_points_at(
+    db_session: AsyncSession, kind: str
+) -> None:
+    """Re-target an integration from ``old`` to ``new`` after the operator has
+    hung registry rows off its mirror rows in ``old``: an OT device, a BACnet
+    device and an E911 binding on three owned addresses, and an address set on
+    an owned subnet. Each of those FKs is ``ON DELETE CASCADE``, so deleting
+    the mirror row would delete the operator's registry row with it. The rows
+    are un-claimed in place instead — the same test a target delete applies
+    (#2334). A pure mirror address and a pure mirror subnet beside them are
+    still deleted."""
+
+    from app.models.address_set import AddressSet  # noqa: PLC0415
+    from app.models.bacnet import BACnetDevice  # noqa: PLC0415
+    from app.models.e911 import EmergencyResponseLocation, ERLBinding  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
+
+    fk, run = _CASES[kind]
+    old = await _space(db_session, "old")
+    new = await _space(db_session, "new")
+    target = _targets(old.id)[kind]
+    db_session.add(target)
+    await db_session.flush()
+
+    nets = ["10.250.0.0/24", "10.251.0.0/24", "10.252.0.0/24"]
+    addrs = ["10.250.0.10", "10.250.0.11", "10.250.0.12", "10.250.0.13", "10.251.0.7"]
+    await _run_subnet_phase(db_session, kind, target, nets)
+    await run(db_session, target, addrs + ["10.252.0.7"])
+    await db_session.commit()
+
+    subnets = {
+        str(s.network): s
+        for s in (
+            await db_session.execute(select(Subnet).where(Subnet.space_id == old.id))
+        ).scalars()
+    }
+    rows = {
+        str(a.address): a
+        for a in (
+            await db_session.execute(select(IPAddress).where(getattr(IPAddress, fk) == target.id))
+        ).scalars()
+    }
+    assert set(rows) == set(addrs + ["10.252.0.7"])
+    assert all(getattr(subnets[n], fk) == target.id for n in nets)
+
+    erl = EmergencyResponseLocation(name=_n("erl"), country="US", a1="NY", a3="New York")
+    db_session.add(erl)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            OTDevice(ip_address_id=rows["10.250.0.10"].id, ot_protocol="profinet"),
+            BACnetDevice(
+                ip_address_id=rows["10.250.0.11"].id,
+                subnet_id=subnets["10.250.0.0/24"].id,
+                device_instance=4243,
+            ),
+            ERLBinding(erl_id=erl.id, rule_kind="ip", ip_address_id=rows["10.250.0.12"].id),
+            # The only address in this subnet is a pure mirror row; without the
+            # address set the subnet would be empty after it goes, and deleted.
+            AddressSet(subnet_id=subnets["10.251.0.0/24"].id, name="ops-range"),
+        ]
+    )
+    await db_session.commit()
+    kept_addr = {a: rows[a].id for a in ("10.250.0.10", "10.250.0.11", "10.250.0.12")}
+    gone_addr = {a: rows[a].id for a in ("10.250.0.13", "10.251.0.7", "10.252.0.7")}
+    set_subnet_id = subnets["10.251.0.0/24"].id
+    pure_subnet_id = subnets["10.252.0.0/24"].id
+    old_id = old.id
+
+    target.ipam_space_id = new.id
+    await db_session.commit()
+    await _run_subnet_phase(db_session, kind, target, nets)
+    await run(db_session, target, addrs + ["10.252.0.7"])
+    await db_session.commit()
+    db_session.expire_all()
+
+    for addr, pk in kept_addr.items():
+        row = await db_session.get(IPAddress, pk)
+        assert row is not None, f"{kind} deleted {addr}, which a registry row points at"
+        assert getattr(row, fk) is None, f"{kind} kept its claim on {addr}"
+    for model in (OTDevice, BACnetDevice, ERLBinding, AddressSet):
+        assert (await db_session.scalar(select(model))) is not None, model.__name__
+    set_subnet = await db_session.get(Subnet, set_subnet_id)
+    assert set_subnet is not None, f"{kind} deleted the subnet carrying an address set"
+    assert set_subnet.space_id == old_id and getattr(set_subnet, fk) is None
+
+    for addr, pk in gone_addr.items():
+        assert await db_session.get(IPAddress, pk) is None, f"pure mirror {addr} survived"
+    assert await db_session.get(Subnet, pure_subnet_id) is None
+
+
 async def test_release_helper_ignores_an_empty_space_list(db_session: AsyncSession) -> None:
     """ "No space" is never read as "everything is outside"."""
     from app.services.integration_ownership import release_outside_space
