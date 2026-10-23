@@ -910,7 +910,9 @@ def _subnet_write_is_scoped(user: Any) -> bool:
 
 
 def _binding_value(value: Any) -> Any:
-    if value is None:
+    # null, an empty list and an empty string are all "no binding": the Edit
+    # dialog sends null for a subnet whose stored default is [] (#2438).
+    if value is None or value == [] or value == "":
         return None
     if isinstance(value, list):
         return sorted(str(v) for v in value)

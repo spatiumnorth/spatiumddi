@@ -449,3 +449,31 @@ async def test_token_narrowed_away_from_subnets_is_still_refused_the_list(
     await db_session.commit()
     r = await client.get("/api/v1/ipam/subnets", headers={"Authorization": f"Bearer {raw}"})
     assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_null_and_empty_dns_group_ids_are_the_same_no_binding(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The Edit dialog sends null for a subnet storing the create default [] (#2438)."""
+    x, y, _o = await _two_subnets(db_session)
+    x.dns_group_ids = []
+    y.dns_group_ids = None
+    h = await _user(db_session, _rw(x) + _rw(y))
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/ipam/subnets/{x.id}", json={"dns_group_ids": None, "name": "x2"}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        f"/api/v1/ipam/subnets/{y.id}", json={"dns_group_ids": [], "name": "y2"}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    # A real change is still refused.
+    r = await client.put(
+        f"/api/v1/ipam/subnets/{x.id}",
+        json={"dns_group_ids": [str(uuid.uuid4())]},
+        headers=h,
+    )
+    assert r.status_code == 403, r.text
