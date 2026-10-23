@@ -1751,6 +1751,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1770,6 +1772,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1789,6 +1793,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
