@@ -98,6 +98,8 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   customFieldChecked,
+  missingRequiredCustomFields,
+  requiredFieldsMessage,
   withCustomFieldDefaults,
 } from "@/lib/customFieldValues";
 import {
@@ -850,13 +852,23 @@ function CustomFieldsSection({
                     value={String(val)}
                     onChange={(e) => onChange(def.name, e.target.value)}
                   >
-                    {!def.is_required && (
-                      <option value="">
-                        {localUnset && hasInherited
-                          ? `— inherited: ${String(inheritedVal)} —`
+                    {/* Always offer the empty choice: without it the browser
+                        shows the first option for a value that matches none,
+                        and an option nobody chose is what the Save looks like
+                        it sends (#2478). A Required field with nothing to
+                        inherit cannot be left on it, so it is not pickable. */}
+                    <option
+                      value=""
+                      disabled={
+                        def.is_required && !(localUnset && hasInherited)
+                      }
+                    >
+                      {localUnset && hasInherited
+                        ? `— inherited: ${String(inheritedVal)} —`
+                        : def.is_required
+                          ? "— Select —"
                           : "— None —"}
-                      </option>
-                    )}
+                    </option>
                     {def.options.map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
@@ -2670,6 +2682,15 @@ export function CreateSubnetModal({
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
+  // Values the new subnet inherits from its block chain count towards a
+  // Required field (#2478).
+  const { data: parentFields } = useQuery({
+    queryKey: ["block-effective-fields", blockId],
+    queryFn: () => ipamApi.effectiveBlockFields(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
+  const cfInherited = parentFields?.custom_fields ?? {};
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -3014,6 +3035,7 @@ export function CreateSubnetModal({
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
+            inherited={cfInherited}
           />
         </div>
       )}
@@ -3115,6 +3137,15 @@ export function CreateSubnetModal({
             setError(null);
             if (typeof ddnsTtl === "string") {
               setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              shownCustomFields,
+              cfInherited,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
               return;
             }
             mutation.mutate();
@@ -8628,6 +8659,16 @@ export function EditSubnetModal({
               setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
               return;
             }
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              customFields,
+              cfInheritedValues,
+              subnet.custom_fields,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={mutation.isPending}
@@ -12041,6 +12082,15 @@ export function CreateBlockModal({
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
+  // Values inherited from the parent block chain count towards a Required
+  // field (#2478).
+  const { data: parentFields } = useQuery({
+    queryKey: ["block-effective-fields", parentBlockId],
+    queryFn: () => ipamApi.effectiveBlockFields(parentBlockId),
+    enabled: !!parentBlockId,
+    staleTime: 30_000,
+  });
+  const cfInherited = parentFields?.custom_fields ?? {};
 
   const { data: blockTemplates } = useQuery({
     queryKey: ["ipam-templates", "block"],
@@ -12207,6 +12257,7 @@ export function CreateBlockModal({
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
+            inherited={cfInherited}
           />
         </div>
       )}
@@ -12279,6 +12330,15 @@ export function CreateBlockModal({
         <button
           onClick={() => {
             setError(null);
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              shownCustomFields,
+              cfInherited,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={!network || mutation.isPending}
@@ -12705,6 +12765,16 @@ export function EditBlockModal({
         <button
           onClick={() => {
             setError(null);
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              customFields,
+              cfInheritedValues,
+              block.custom_fields,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={mutation.isPending}
