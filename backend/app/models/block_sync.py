@@ -121,8 +121,8 @@ class NetworkBlockPush(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     cascades from a target delete — instead the OPNsense / UniFi delete
     handlers explicitly sweep the matching push rows (and an operator is
     expected to *disarm* a target first, which lifts the blocks off the
-    device via ``lift_all_for_target``; a bare delete removes the rows but
-    leaves the device state).
+    device via ``lift_all_for_target``; the delete handlers refuse while the target
+    is armed or rows remain (#2291), and ``force`` leaves the device state).
 
     ``block_id`` IS ``ON DELETE CASCADE``: a block is normally *lifted*
     (``enabled=False``, row kept) rather than hard-deleted, and the

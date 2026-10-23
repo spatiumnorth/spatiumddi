@@ -54,6 +54,9 @@ async def test_stored_text_with_markup_renders(
 ) -> None:
     h = await _headers(db_session)
     fw = "<?fw"
+    # The PDF reports a policy's most recent pass (#2278), so the result
+    # must carry the policy's ``last_evaluated_at`` to reach the renderer.
+    when = datetime.now(UTC)
     pol = ConformityPolicy(
         name="a<b & <legacy>",
         description="desc <b>unclosed",
@@ -62,6 +65,7 @@ async def test_stored_text_with_markup_renders(
         severity="warn",
         target_kind="subnet",
         check_kind="has_field",
+        last_evaluated_at=when,
     )
     db_session.add(pol)
     await db_session.flush()
@@ -71,7 +75,7 @@ async def test_stored_text_with_markup_renders(
             resource_kind="subnet",
             resource_id="x",
             resource_display="<net> & co",
-            evaluated_at=datetime.now(UTC),
+            evaluated_at=when,
             status="fail",
             detail="bad <thing",
             diagnostic={"k": "<v>&"},

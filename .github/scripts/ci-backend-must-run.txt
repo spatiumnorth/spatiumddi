@@ -90,6 +90,11 @@ scripts/lint_image_upgrades.py
 # whether a tag becomes :latest.
 scripts/release_version.py
 
+# test_changelog_assemble.py loads the script that folds changelog
+# fragments into CHANGELOG.md (#2431): release prep runs it, and
+# release.yml's --pending gate calls it.
+scripts/changelog_assemble.py
+
 # test_format_release_notes.py loads the release-body formatter and pins the
 # two ways it can break a release: notes over GitHub's 125,000-character body
 # limit fail the publish step after every image is built, so they must come
@@ -164,3 +169,10 @@ charts/spatiumddi/templates/frontend-tls-config.yaml
 # tested against; editing them must run the backend half, or the two sides
 # could disagree with only the frontend job noticing.
 frontend/src/lib/bulk-allocate-template.vectors.json
+
+# test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
+# watcher, and checks the Dockerfile copies it in and the chart's frontend
+# Deployment no longer rolls on a certificate change.
+frontend/40-tls-reload-watch.sh
+frontend/Dockerfile
+charts/spatiumddi/templates/frontend.yaml

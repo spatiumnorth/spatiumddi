@@ -18,7 +18,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -28,6 +28,7 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
 from app.models.meraki import MerakiOrg
 from app.models.panos import FirewallObject
+from app.services.integration_ownership import release_integration_rows
 from app.services.meraki.client import MerakiClient, MerakiClientError
 
 router = APIRouter(
@@ -336,10 +337,21 @@ async def update_org(org_pk: uuid.UUID, body: OrgUpdate, db: DB, user: SuperAdmi
 
 
 @router.delete("/orgs/{org_pk}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False) -> None:
     o = await db.get(MerakiOrg, org_pk)
     if o is None:
         raise HTTPException(status_code=404, detail="Meraki org not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="meraki",
+        target_id=o.id,
+        armed=o.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target (polymorphic
     # target_id, so nothing cascades). Does NOT restore blocked clients — disarm
     # the target first if it should stop enforcing them.
@@ -354,6 +366,11 @@ async def delete_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         )
     )
     _audit(db, user=user, action="delete", org_id=o.id, org_name=o.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="meraki_org_id", target_id=o.id, user=user, target_name=o.name
+    )
     await db.delete(o)
     await db.commit()
 
@@ -361,10 +378,20 @@ async def delete_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin) -> None:
 @router.post(
     "/orgs/{org_pk}/sync", status_code=status.HTTP_202_ACCEPTED, response_model=StatusResponse
 )
-async def sync_org(org_pk: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     o = await db.get(MerakiOrg, org_pk)
     if o is None:
         raise HTTPException(status_code=404, detail="Meraki org not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="meraki_org",
+        resource_id=o.id,
+        resource_display=str(getattr(o, "name", None) or o.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.meraki_sync import sync_org_now  # noqa: PLC0415
 

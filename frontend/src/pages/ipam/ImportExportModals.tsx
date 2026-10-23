@@ -16,6 +16,7 @@ import {
   type ImportStrategy,
   type IPSpace,
   type Subnet,
+  formatApiError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { permissionGate } from "@/hooks/usePermissions";
@@ -67,11 +68,7 @@ export function ImportModal({
       });
       setPreview(result);
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+      setError(formatApiError(e, "Preview failed"));
     } finally {
       setBusy(false);
     }
@@ -94,11 +91,7 @@ export function ImportModal({
       });
       onCommitted();
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+      setError(formatApiError(e, "Import failed"));
     } finally {
       setBusy(false);
     }
@@ -396,6 +389,12 @@ export function ExportButton({
             />
             Include IP addresses
           </label>
+          {includeAddrs && (
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              With this ticked the .csv is the address list only. Use .json,
+              .xlsx or Print / PDF for subnets and addresses together.
+            </p>
+          )}
           <div className="space-y-1">
             {(["csv", "json", "xlsx"] as const).map((fmt) => (
               <button
@@ -461,11 +460,7 @@ export function AddressImportModal({
       });
       setPreview(result);
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+      setError(formatApiError(e, "Preview failed"));
     } finally {
       setBusy(false);
     }
@@ -483,11 +478,7 @@ export function AddressImportModal({
       setCommitted(result);
       onCommitted();
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+      setError(formatApiError(e, "Import failed"));
     } finally {
       setBusy(false);
     }

@@ -291,7 +291,7 @@ async def _apply_delete_subnet(
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_subnet."""
 
-    from app.api.deps import require_superadmin
+    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import (
         _audit,
         _enforce_subnet_token_scope,
@@ -337,6 +337,9 @@ async def _apply_delete_subnet(
         wake_group_ids = await _push_agentless_scope_deletes(db, batch)
         await _purge_leases_for_scope_batch(db, batch)
         deleted_at = await apply_soft_delete(db, batch, user.id)
+        # The parent block's rollup must stop counting the trashed subnet (#2412).
+        await db.flush()
+        await _update_block_utilization(db, subnet.block_id)
         # spatiumddi#1906 — the subnet's own A / PTR / gateway PTR in zones that
         # STAY (a reverse zone kept for a sibling, the forward zone) are
         # retracted and ride the batch; restore re-asserts them.
@@ -365,7 +368,7 @@ async def _apply_delete_subnet(
             collect_wake(dns_group_channel(gid))
         return {"subnet_id": str(args.subnet_id), "mode": "soft_delete"}
 
-    require_superadmin(user)
+    ensure_superadmin(user)
 
     if not args.force:
         detail = await _subnet_not_empty_detail(db, args.subnet_id)
@@ -547,8 +550,8 @@ async def _apply_delete_block(
     db: AsyncSession, user: User, args: DeleteBlockArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_block."""
-    from app.api.deps import require_superadmin
-    from app.api.v1.ipam.router import _audit
+    from app.api.deps import ensure_superadmin
+    from app.api.v1.ipam.router import _audit, _update_block_utilization
     from app.models.ipam import IPBlock
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
@@ -557,7 +560,7 @@ async def _apply_delete_block(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
     if args.permanent:
-        require_superadmin(user)
+        ensure_superadmin(user)
         detail = await _block_not_empty_detail(db, args.block_id, block.network)
         if detail is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -584,6 +587,10 @@ async def _apply_delete_block(
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
     deleted_at = await apply_soft_delete(db, batch, user.id)
+    # The ancestors' rollups stop counting the trashed subtree (#2412).
+    if block.parent_block_id is not None:
+        await db.flush()
+        await _update_block_utilization(db, block.parent_block_id)
     # spatiumddi#1906 — every trashed subnet's DNS records are retracted with it.
     from app.core.agent_wake import dns_group_channel  # noqa: PLC0415
     from app.services.dns.record_ops import retract_trashed_subnet_records  # noqa: PLC0415
@@ -693,7 +700,7 @@ async def _apply_delete_space(
     db: AsyncSession, user: User, args: DeleteSpaceArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_space."""
-    from app.api.deps import require_superadmin
+    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import _audit
     from app.models.ipam import IPSpace
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
@@ -703,7 +710,7 @@ async def _apply_delete_space(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     if args.permanent:
-        require_superadmin(user)
+        ensure_superadmin(user)
         detail = await _space_not_empty_detail(db, args.space_id, space.name)
         if detail is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -814,7 +821,7 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
 
 async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs) -> dict[str, Any]:
     """Body factored verbatim from dns/router.py:delete_zone."""
-    from app.api.deps import require_superadmin
+    from app.api.deps import ensure_superadmin
     from app.api.v1.dns.router import (
         _push_zone_to_agentless_servers,
         _reject_if_synthesised_zone,
@@ -828,9 +835,9 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # default soft-delete (#1861), and only the permanent branch takes a
     # superadmin, as on the IPAM deletes. The approve path bypasses the route's
     # dependencies, so this is where it is enforced for it. Checked before any
-    # side effect; require_superadmin raises HTTPException(403).
+    # side effect; ensure_superadmin raises HTTPException(403).
     if args.permanent:
-        require_superadmin(user)
+        ensure_superadmin(user)
 
     zone = await _require_zone(args.group_id, args.zone_id, db)  # raises 404 if absent
     _reject_if_synthesised_zone(zone, "delete")
@@ -962,7 +969,7 @@ async def _apply_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/scopes.py:delete_scope."""
-    from app.api.deps import require_superadmin
+    from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.core.agent_wake import collect_wake, dhcp_group_channel
     from app.models.dhcp import DHCPScope
@@ -975,7 +982,7 @@ async def _apply_delete_scope(
     # (#1861), the permanent branch superadmin-only, checked before any side
     # effect.
     if args.permanent:
-        require_superadmin(user)
+        ensure_superadmin(user)
 
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
@@ -1127,12 +1134,12 @@ async def _apply_delete_group(
     db: AsyncSession, user: User, args: DeleteGroupArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/server_groups.py:delete_group."""
-    from app.api.deps import require_superadmin
+    from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.models.dhcp import DHCPServer, DHCPServerGroup
 
     # The original DELETE route was fully SuperAdmin-gated (#8).
-    require_superadmin(user)
+    ensure_superadmin(user)
 
     g = await db.get(DHCPServerGroup, args.group_id)
     if g is None:

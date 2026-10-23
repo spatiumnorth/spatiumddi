@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -36,7 +36,7 @@ from sqlalchemy import (
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.util import await_only
 
@@ -519,14 +519,133 @@ async def sweep_zone_ops(db: AsyncSession, zone: DNSZone, group_id: uuid.UUID) -
     return int(res.rowcount or 0)
 
 
+async def primary_candidate(
+    db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID | None = None
+) -> DNSServer | None:
+    """The server a group that has no primary should treat as one (#2276).
+
+    Read-only: picks, never writes. The one ordering every election uses —
+    :func:`app.services.dns.server_move.elect_primary` (a move or a delete
+    taking the primary out), the beat self-heal, and the write path below
+    when a group has no primary at all — so all three name the same server.
+
+    Prefers a server that can actually accept writes: enabled, not paused,
+    oldest first so the choice is deterministic. Falls back to any member when
+    every one is disabled or paused, because a paused primary still beats none:
+    a disabled one is visible in the UI, a missing one is not.
+    ``exclude_id`` names a server still in the group in this session that is
+    on its way out (see ``elect_primary``).
+    """
+    conditions = [DNSServer.group_id == group_id]
+    if exclude_id is not None:
+        conditions.append(DNSServer.id != exclude_id)
+    base = select(DNSServer).where(*conditions).order_by(DNSServer.created_at, DNSServer.id)
+    candidate = (
+        await db.execute(
+            base.where(
+                DNSServer.is_enabled.is_(True),
+                DNSServer.maintenance_mode.is_(False),
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if candidate is None:
+        candidate = (await db.execute(base.limit(1))).scalar_one_or_none()
+    return candidate
+
+
 async def resolve_primary_server(db: AsyncSession, zone: DNSZone) -> DNSServer | None:
-    """Find the `is_primary=True` server in the zone's group."""
+    """The server that stands for the zone's group on the write path.
+
+    The ``is_primary=True`` server when the group has one. When it has none —
+    the group's primary was deleted on a build that did not re-elect, or the
+    flag was cleared some other way — the server the election would pick
+    (:func:`primary_candidate`) rather than ``None`` (#2276). ``None`` used to
+    make every record write to the group's zones a logged no-op behind a 200,
+    and it did so BEFORE the agent fan-out, so the surviving agents got
+    nothing either. The beat self-heal stamps the flag on that same server
+    within a minute; until then this keeps writes flowing to it.
+
+    ``None`` now means the group has no servers at all, where nothing is lost:
+    a server added later receives the zone's records in its config bundle.
+    """
     res = await db.execute(
         select(DNSServer)
         .where(DNSServer.group_id == zone.group_id, DNSServer.is_primary.is_(True))
         .limit(1)
     )
-    return res.scalar_one_or_none()
+    primary = res.scalar_one_or_none()
+    if primary is not None:
+        return primary
+    candidate = await primary_candidate(db, zone.group_id)
+    if candidate is not None:
+        logger.warning(
+            "dns_group_has_no_primary",
+            zone=zone.name,
+            group_id=str(zone.group_id),
+            standing_in=str(candidate.id),
+            driver=candidate.driver,
+            hint="Writing through the server the election picks; the beat self-heal marks it.",
+        )
+    return candidate
+
+
+async def heal_primaryless_groups(db: AsyncSession) -> int:
+    """Mark a primary in every group that has servers and no primary (#2276).
+
+    Self-heal for installs left without one — by deleting the primary on a
+    build that did not re-elect. Run from the 60 s agent stale sweep.
+    Idempotent: a group that has a primary is untouched. The UPDATE re-checks
+    "no primary in this group" in the same statement, which closes the gap
+    between the scan and the write and makes two concurrent sweeps converge
+    on one server (the pick is deterministic). It does NOT serialise against
+    an operator promotion that is still uncommitted — READ COMMITTED cannot
+    see it, and the promotion takes no group lock — so that narrow window can
+    still leave two primaries, exactly as two concurrent promotions or a
+    promotion racing create-time auto-election always could. Every primary
+    lookup caps at one row, so that state mis-picks rather than 500s (#934),
+    and only a group already without a primary is ever touched, which after
+    this fix means one left over from an older build. Returns the number of
+    groups healed.
+    """
+    primaried = select(DNSServer.group_id).where(DNSServer.is_primary.is_(True))
+    group_ids = (
+        (
+            await db.execute(
+                select(DNSServer.group_id).where(DNSServer.group_id.not_in(primaried)).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    healed = 0
+    for group_id in group_ids:
+        candidate = await primary_candidate(db, group_id)
+        if candidate is None:
+            continue
+        other = aliased(DNSServer)
+        res = await db.execute(
+            update(DNSServer)
+            .where(
+                DNSServer.id == candidate.id,
+                ~select(other.id)
+                .where(other.group_id == group_id, other.is_primary.is_(True))
+                .exists(),
+            )
+            .values(is_primary=True)
+            .execution_options(synchronize_session=False)
+        )
+        if res.rowcount:
+            healed += 1
+            logger.warning(
+                "dns_group_primary_healed",
+                group_id=str(group_id),
+                server_id=str(candidate.id),
+                server=candidate.name,
+            )
+    # No wake: the agents' bundles pick the flag up on the 12 s safety tick,
+    # and record writes already reach the stand-in through
+    # ``resolve_primary_server`` in the meantime.
+    return healed
 
 
 def rrset_from_payload(record: dict[str, Any]) -> RRsetData | None:
@@ -637,13 +756,54 @@ class _DispatchState:
     committed: bool = False
 
 
+def _applied_values(now: datetime) -> dict[str, Any]:
+    """The columns an applied op carries, besides one more attempt (#2108):
+    ``_mark_applied`` sets them on a loaded row and ``mark_ops_applied`` in
+    one UPDATE, so the two cannot stamp an applied op differently."""
+    return {
+        "state": "applied",
+        "applied_at": now,
+        "last_error": None,
+        "next_attempt_at": None,
+        "updated_at": now,
+    }
+
+
 def _mark_applied(row: DNSRecordOp, now: datetime) -> None:
     row.attempts = (row.attempts or 0) + 1
-    row.state = "applied"
-    row.applied_at = now
-    row.last_error = None
-    row.next_attempt_at = None
-    row.updated_at = now
+    for name, value in _applied_values(now).items():
+        setattr(row, name, value)
+
+
+async def mark_ops_applied(
+    db: AsyncSession,
+    ids: Sequence[uuid.UUID],
+    now: datetime,
+    loaded: dict[uuid.UUID, DNSRecordOp] | None = None,
+) -> None:
+    """``_mark_applied`` for ``ids`` as one UPDATE, without loading the rows
+    (#2227: a split-horizon render retiring 800k queued ops as ORM objects
+    held about 4 kB each, 3.7 GB, in the worker). The caller has locked the
+    rows. ``loaded`` are rows of these ids already in the session: they get
+    the same values as committed state, so a later read of one in this
+    session sees the op applied and a flush does not write it again."""
+    if not ids:
+        return
+    values = _applied_values(now)
+    await db.execute(
+        update(DNSRecordOp)
+        .where(DNSRecordOp.id.in_(ids))
+        .values(attempts=func.coalesce(DNSRecordOp.attempts, 0) + 1, **values)
+        .execution_options(synchronize_session=False)
+    )
+    for op_id in ids:
+        row = (loaded or {}).get(op_id)
+        if row is None:
+            continue
+        if "attempts" in row.__dict__:
+            set_committed_value(row, "attempts", (row.attempts or 0) + 1)
+        for name, value in values.items():
+            set_committed_value(row, name, value)
 
 
 _MIRRORED_OP_FIELDS = (
@@ -1396,28 +1556,26 @@ async def enqueue_record_op(
       secondaries' on-disk zone files stayed frozen at the bundle
       they received on initial register.
 
-    Returns the op for the primary server (or ``None`` if no primary
-    + agent-based path didn't run either). Callers that need to ack
+    Returns the op for the primary server (or ``None`` when nothing was
+    queued: an empty group, or every eligible server disabled). A group with
+    servers but no ``is_primary`` flag writes through the server the election
+    would pick (#2276), never drops. Callers that need to ack
     every server's apply outcome should query ``DNSRecordOp`` directly
     by ``server_id``; the singular return preserves the prior
     contract for the typed-event audit path.
     """
     primary = await resolve_primary_server(db, zone)
     if primary is None:
-        # Silent drop was a footgun: frontend got a 200, nothing landed. Log
-        # it loudly so the symptom shows up in `docker compose logs -f api`
-        # and in the audit log via the caller.
-        logger.warning(
-            "record_op_dropped_no_primary",
+        # The group has no servers at all (a group with servers but no
+        # primary resolves to the election's stand-in, #2276). Nothing is
+        # lost: a server added later gets the zone's records in its bundle.
+        logger.info(
+            "record_op_skipped_empty_group",
             zone=zone.name,
             group_id=str(zone.group_id),
             op=op,
             name=record.get("name"),
             type=record.get("type"),
-            hint=(
-                "No DNS server in this zone's group has is_primary=True. "
-                "Edit the server in DNS → Server Groups and mark one as primary."
-            ),
         )
         return None
 
@@ -1682,8 +1840,9 @@ async def enqueue_record_ops_batch(
 
     primary = await resolve_primary_server(db, zone)
     if primary is None:
-        logger.warning(
-            "record_op_batch_dropped_no_primary",
+        # Empty group — see enqueue_record_op (#2276).
+        logger.info(
+            "record_op_batch_skipped_empty_group",
             zone=zone.name,
             group_id=str(zone.group_id),
             count=len(ops),
@@ -1733,12 +1892,13 @@ async def enqueue_record_ops_bulk(
 
     primary = await resolve_primary_server(db, zone)
     if primary is None:
-        logger.warning(
+        # Empty group — see enqueue_record_op (#2276).
+        logger.info(
             "record_op_bulk_dropped",
             zone=zone.name,
             group_id=str(zone.group_id),
             count=len(ops),
-            reason="no primary configured for zone",
+            reason="the zone's group has no servers",
         )
         return 0
 

@@ -17,7 +17,7 @@ over 230k ops on a scratch Postgres 16, so a few seconds at the 1.4M of the
 largest backlog measured.
 
 Revision ID: f27379a82b17
-Revises: d3a7f19c52e8
+Revises: e7b3d19a4c26
 Create Date: 2026-10-21 04:00:00.000000
 """
 
@@ -26,7 +26,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "f27379a82b17"
-down_revision = "d3a7f19c52e8"
+down_revision = "e7b3d19a4c26"
 branch_labels = None
 depends_on = None
 

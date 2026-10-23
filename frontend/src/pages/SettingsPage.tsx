@@ -1104,10 +1104,9 @@ const SECTIONS: SectionDef[] = [
   },
 
   // Integrations were removed from this page in favor of a unified
-  // toggle in Settings → Features → Integrations. The corresponding
-  // ``PlatformSettings.integration_*_enabled`` columns are still
-  // mirrored by the toggle endpoint so reconciler tasks gating on
-  // them keep working.
+  // toggle in Settings → Features → Integrations. That feature module is
+  // the integration's only switch (#2196): ``GET /settings`` reports each
+  // ``integration_*_enabled`` from it, and the reconcilers gate on it.
 ];
 
 export function SettingsPage() {

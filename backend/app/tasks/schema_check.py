@@ -283,7 +283,10 @@ async def _async_check_and_alert() -> dict:
             },
         )
         db.add(evt)
-        await db.flush()
+        # #2261 — commit the event BEFORE delivering it. Delivering first
+        # meant a failed commit (and this task's autoretry) re-paged for an
+        # event that was never stored; now a retry finds it open and dedupes.
+        await db.commit()
         # #1576 — deliver to forward targets; the generic evaluator
         # skips externally-driven rule types, so without this the
         # event only ever showed in-app.

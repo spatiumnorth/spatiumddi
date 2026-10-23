@@ -38,10 +38,14 @@ from app.models.netbird import NetbirdInstance
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
 from app.models.proxmox import ProxmoxNode
-from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
-from app.services.integration_credentials import CredentialStatus, credential_status
+from app.services.feature_modules import get_enabled_modules
+from app.services.integration_credentials import (
+    CREDENTIAL_PROBLEM_STATES,
+    CredentialStatus,
+    credential_status,
+)
 from app.services.tailscale.client import is_auth_rejected
 
 router = APIRouter()
@@ -80,6 +84,13 @@ class IntegrationPanel(BaseModel):
     stale_count: int
     error_count: int
     warning_count: int
+    # #2192 — counted over EVERY target, not the capped ``targets`` list, so
+    # the card's counts stay right when the row list is trimmed. A "problem"
+    # is a credential that is rejected / expired / expiring, or a sync error;
+    # ``credential_dead_count`` is rejected + expired.
+    problem_count: int = 0
+    credential_dead_count: int = 0
+    credential_expiring_count: int = 0
     targets: list[IntegrationTargetRow]
 
 
@@ -99,6 +110,10 @@ class IntegrationsDashboardSummary(BaseModel):
 
 
 _TARGET_LIMIT = 20
+# #2192 — problem rows are listed past ``_TARGET_LIMIT``, but not without
+# bound: 200 failing nodes must not become a 200-row payload. Beyond this the
+# card says "+N more with problems" from ``problem_count``.
+_PROBLEM_TARGET_LIMIT = 50
 _RECENT_ERROR_LIMIT = 20
 
 # Resource_type values audit-logged by each integration's reconciler.
@@ -128,6 +143,23 @@ def _is_stale(last: datetime | None, interval_seconds: int, now: datetime) -> bo
         return True
     threshold = max(60, interval_seconds * 2)
     return (now - last) > timedelta(seconds=threshold)
+
+
+def _has_problem(r: IntegrationTargetRow) -> bool:
+    return r.credential_state in CREDENTIAL_PROBLEM_STATES or bool(r.last_sync_error)
+
+
+def _cap_rows(rows: list[IntegrationTargetRow]) -> list[IntegrationTargetRow]:
+    """Cap the row list, but never let the cap hide a problem first (#2192).
+
+    Targets with a credential problem or a sync error come first (stable
+    within each group) and are kept past ``_TARGET_LIMIT``, up to the hard
+    ``_PROBLEM_TARGET_LIMIT``; healthy rows only fill what ``_TARGET_LIMIT``
+    leaves. The panel's ``problem_count`` carries the true total.
+    """
+    problems = [r for r in rows if _has_problem(r)][:_PROBLEM_TARGET_LIMIT]
+    rest = [r for r in rows if not _has_problem(r)]
+    return problems + rest[: max(0, _TARGET_LIMIT - len(problems))]
 
 
 def _build_panel(
@@ -165,9 +197,9 @@ def _build_panel(
             warnings += 1
         else:
             healthy += 1
-        # A disabled target syncs nothing, so a lapsed credential breaks
-        # nothing and ``secret_expiring`` skips it; the dashboard does too.
-        cred = credential(t) if credential is not None and getattr(t, "enabled", True) else None
+        # A disabled target reads ``disabled`` (#2191): the rule lives in
+        # integration_credentials.credential_status.
+        cred = credential(t) if credential is not None else None
         rows.append(
             IntegrationTargetRow(
                 id=str(t.id),
@@ -191,15 +223,20 @@ def _build_panel(
         stale_count=stale,
         error_count=errors,
         warning_count=warnings,
-        targets=rows[:_TARGET_LIMIT],
+        problem_count=sum(1 for r in rows if _has_problem(r)),
+        credential_dead_count=sum(1 for r in rows if r.credential_state in ("rejected", "expired")),
+        credential_expiring_count=sum(1 for r in rows if r.credential_state == "expiring"),
+        targets=_cap_rows(rows),
     )
 
 
 # ── Route ───────────────────────────────────────────────────────────
 
 
-# One row per integration: (panel kind, label, settings toggle, target
-# model, the resource_type its own router gates on). A caller sees a panel
+# One row per integration: (panel kind, label, feature module, target
+# model, the resource_type its own router gates on). A panel reads as
+# enabled when its feature module does — the module is the integration's
+# switch (#2196), the same answer its beat sweep acts on. A caller sees a panel
 # only when it may read that integration's targets through the integration's
 # own router, so this rollup never shows more than those routes would.
 def _tailscale_credential(now: datetime) -> Callable[[Any], CredentialStatus]:
@@ -210,6 +247,7 @@ def _tailscale_credential(now: datetime) -> Callable[[Any], CredentialStatus]:
             expires_at=t.api_key_expires_at,
             rejected=is_auth_rejected(t.last_sync_error),
             now=now,
+            enabled=bool(getattr(t, "enabled", True)),
         )
 
     return status
@@ -219,46 +257,46 @@ _PANELS: tuple[tuple[str, str, str, Any, str], ...] = (
     (
         "kubernetes",
         "Kubernetes",
-        "integration_kubernetes_enabled",
+        "integrations.kubernetes",
         KubernetesCluster,
         "kubernetes_cluster",
     ),
-    ("docker", "Docker", "integration_docker_enabled", DockerHost, "docker_host"),
+    ("docker", "Docker", "integrations.docker", DockerHost, "docker_host"),
     # ProxmoxNode has `name`/`host`, not `hostname` — the panel uses `name` so
     # the Integrations dashboard shows the same node label as the IPAM panel.
-    ("proxmox", "Proxmox VE", "integration_proxmox_enabled", ProxmoxNode, "proxmox_node"),
+    ("proxmox", "Proxmox VE", "integrations.proxmox", ProxmoxNode, "proxmox_node"),
     (
         "tailscale",
         "Tailscale",
-        "integration_tailscale_enabled",
+        "integrations.tailscale",
         TailscaleTenant,
         "tailscale_tenant",
     ),
-    ("unifi", "UniFi", "integration_unifi_enabled", UnifiController, "unifi_controller"),
+    ("unifi", "UniFi", "integrations.unifi", UnifiController, "unifi_controller"),
     (
         "cloud",
         "Cloud (AWS / Azure / GCP)",
-        "integration_cloud_enabled",
+        "integrations.cloud",
         CloudEndpoint,
         "cloud_endpoint",
     ),
-    ("opnsense", "OPNsense", "integration_opnsense_enabled", OPNsenseRouter, "opnsense_router"),
-    ("netbird", "NetBird", "integration_netbird_enabled", NetbirdInstance, "netbird_instance"),
+    ("opnsense", "OPNsense", "integrations.opnsense", OPNsenseRouter, "opnsense_router"),
+    ("netbird", "NetBird", "integrations.netbird", NetbirdInstance, "netbird_instance"),
     (
         "paloalto",
         "Palo Alto (PAN-OS / Panorama)",
-        "integration_panos_enabled",
+        "integrations.paloalto",
         PANOSFirewall,
         "panos_firewall",
     ),
     (
         "fortinet",
         "Fortinet (FortiGate)",
-        "integration_fortinet_enabled",
+        "integrations.fortinet",
         FortinetFirewall,
         "fortinet_firewall",
     ),
-    ("meraki", "Cisco Meraki (MX)", "integration_meraki_enabled", MerakiOrg, "meraki_org"),
+    ("meraki", "Cisco Meraki (MX)", "integrations.meraki", MerakiOrg, "meraki_org"),
 )
 
 
@@ -277,17 +315,17 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
     error row is included only for an integration the caller may read.
     """
     now = datetime.now(UTC)
-    settings = await db.get(PlatformSettings, 1)
+    enabled_modules = await get_enabled_modules(db)
 
     readable = [row for row in _PANELS if user_has_permission(current_user, "read", row[4])]
     panels = []
-    for kind, label, toggle, model, _rtype in readable:
+    for kind, label, module_id, model, _rtype in readable:
         targets = list((await db.execute(select(model))).scalars().all())
         panels.append(
             _build_panel(
                 kind=kind,
                 label=label,
-                enabled=getattr(settings, toggle, False),
+                enabled=module_id in enabled_modules,
                 targets=targets,
                 display_attr="name",
                 now=now,
