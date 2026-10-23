@@ -1026,7 +1026,9 @@ The spool file needs free disk in the state directory for one bundle.
 
 Before #1725 the pod had no memory limit, so that peak was the node's: the
 kubelet evicted the worker, Postgres and the api, then the kernel killed
-named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
+named. The pod now carries a memory request and a limit (on the appliance
+sized from node RAM since #2223: a quarter of the smallest DNS node, 2Gi to
+8Gi, request an eighth of it; 2Gi / 256Mi on the other paths), so an
 overload kills named inside its own cgroup and leaves the control plane
 alone. That is a DNS outage on that node, not a platform outage, but it is
 still an outage: **size the limit for the lists you subscribe to.**
@@ -1069,10 +1071,11 @@ Entry counts are on each list after its first sync.
 
 Where to change it:
 
-- Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
+- Appliance: sized for you from node RAM (#2223); to pin it, set
+  `dnsBind9.resources.limits.memory` on the role chart, as a HelmChartConfig
   (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
-  is one value for the whole cluster; the role chart renders the same on
-  every node.
+  is one value for the whole cluster, from its smallest DNS node; the role
+  chart renders the same on every node.
 - Umbrella chart: `dnsAgents.servers[].resources`.
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
@@ -1126,6 +1129,55 @@ lived) the bundle is quarantined and only retried on a backoff; on the
 appliance today the OOM kill takes the agent with named (#2018), so there the
 agent stops at syncing first and the kubelet backs off the crash loop. See `docs/deployment/DNS_AGENT.md` (last-known-good revert) for what
 serves meanwhile.
+
+**Many zones and many records (#2223).** The same container holds a large
+zone set the same way: named keeps every record in memory and the agent
+parses the whole bundle on each poll. Measured on a synthetic bundle of
+20,005 zones and 1,000,000 A / PTR records (a 126 MB bundle; the agent on
+Python 3.14, named 9.20.29):
+
+| | Measured |
+|---|---|
+| named, resident with every zone loaded | 868 MB (the scale lab saw 952 MB anon on its nodes) |
+| named, start to "all zones loaded" | about 5 s |
+| `named-checkzone`, per zone | about 70 ms, so ~23 min for every zone of a cold start, run one zone at a time |
+| agent, peak while it takes a bundle | 461 - 480 MB (was 682 - 713 MB, and 884 MB during a startup hold) |
+| agent, between polls | 95 - 116 MB (was 431 - 473 MB) |
+
+ddi-pg's scale lab hit this with 1M records in 20,000 zones on a 2Gi limit:
+5 of 7 `dns-bind9` containers were OOM-killed with the agent at 1.1 GB anon,
+and none came back. Four things in the agent made it that large, and are
+fixed: it parsed the cached bundle's whole text beside the objects it built
+(about 125 MB at this size); the zone list it keeps for the DNSSEC re-read
+and its per-zone serial map held on to the memory of every bundle it had
+parsed, because CPython returns memory to the system only in whole arenas
+(~370 MB that stayed resident between polls); a startup hold (#2019) kept
+the cached bundle parsed while the first fetch parsed the next one; and the
+ingest thread re-parsed the whole cache, records included, every 180 s
+after a change, which at a steady stream of record edits is every sweep, so
+it could overlap the sync loop's own parse (about 530 MB of its own).
+
+Rule of thumb for zone data, from those numbers: about 1 kB of named memory
+per record, plus about 0.5 kB per record for the agent while it takes a
+bundle, plus the resolver cache below if the group recurses. A million
+records is therefore about 1.35 GB before the cache, which fits a 2Gi
+limit only while the resolver cache stays well under its `512m` share; a
+group that serves that many records and also recurses for clients wants
+3Gi. On the appliance the limit is sized from node RAM (#2223: a quarter of
+the smallest DNS node, 2Gi to 8Gi), so a node of 12 GB or more gets 3Gi
+without any override, and 2M records want about 4Gi, a 16 GB node. These are measurements of one bundle shape (short names, A and PTR
+records), so treat them as a starting point rather than a guarantee.
+
+**A cold start takes a while, and the probes allow for it.** A restarted
+container renders and `named-checkzone`s every zone before named starts. At
+20,000 zones that is tens of minutes (see the table), and the liveness probe
+used to start checking :53 30 s after the container did, so it killed the
+container before named listened, on every attempt. The DNS containers now
+carry a startup probe on the same :53 check with a 60-minute budget (10 s x
+360); liveness and readiness start once it has passed. A daemon that never
+listens is still restarted, after the budget. Raise it for a larger group:
+`dns.startupProbe.failureThreshold` on the appliance role chart,
+`dnsAgents.startupProbe` (or `servers[].startupProbe`) on the umbrella chart.
 
 **Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
 recursion has its own, and the default is 90 % of physical memory for each:
@@ -1401,7 +1453,7 @@ XLSX**. Over REST:
 |---|---|
 | Export | `GET /api/v1/dns/groups/{gid}/zones/{zid}/export?format=csv\|xlsx` (`format=zone`, the default, is the zone file). File name `dns-zone-<zone>-<YYYYMMDD-HHMMSS>.<ext>`, UTC. Needs read. |
 | Template | `GET …/zones/{zid}/import/template?format=csv\|xlsx` |
-| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record`; a replace that deletes also needs delete. |
+| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record` and read (as the export does); a replace that deletes also needs delete. |
 
 The zone-file export writes a record target (MX, SRV, CNAME, NS, PTR, DNAME) exactly as stored: a target with no trailing dot stays relative to `$ORIGIN`. Import compares names absolute and case-insensitive, and TXT bare or quoted, so re-importing your own export plans no changes (#2187).
 
@@ -1557,6 +1609,8 @@ Every DNS server group has a **Sync with Servers** button on its detail header. 
 3. **Push DB-only zones back to the server** — any SpatiumDDI zone not present on the wire is created via the driver's `apply_zone_change`. For Windows Path B, this is `Add-DnsServerPrimaryZone -ReplicationScope Domain -DynamicUpdate Secure`.
 4. **Per-zone record sync** — for each zone, `pull_zone_records` reads what the server actually serves, reconciles against DB records, and applies the delta. Additive-only — never deletes. Only the drivers that implement it participate: AXFR for BIND9 and Technitium, `Get-DnsServerResourceRecord` over WinRM for Windows Path B, the provider API for cloud. **PowerDNS does not implement `pull_zone_records` at all** — `_resolve_primary_and_driver` guards on `hasattr` and raises, so record sync and the record-level drift report are both unavailable on a PowerDNS group today.
 
+> **TSIG key names are unique the way BIND reads them (#2295).** `foo`, `Foo` and `foo.` are one key, and the group's own generated key is `spatium-<label>`, so creating or renaming an operator key to a name that clashes with another key or the generated one is refused (409 / 422 naming the key), and the `spatium-` prefix is reserved. A clashing key stored earlier renders once (the group key first, then operator keys by name) and the skip is logged.
+
 > **AXFR against an agent-managed BIND9 or Technitium group is TSIG-signed** ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)). Both agents grant `allow-transfer` to the group's TSIG *key* rather than to a source address — behind an HA VIP the request can come from any control-plane node, and on the appliance the address isn't knowable at render time — so the control plane signs with the group key, resolved by `resolve_group_transfer_key`. A group with **no** TSIG key can't be transferred from at all; that surfaces as `unsupported` naming the missing key, not as a generic error pointing at an `allow-transfer` the agent owns and you can't edit. A refused transfer is always surfaced as an error rather than an empty diff — an empty diff would read as "in sync", which is the worst possible answer.
 
 The UI surfaces per-server results with zones-imported / zones-pushed / errors, plus a per-zone table.
@@ -1672,6 +1726,8 @@ Catches drift between IPAM's expected records (every IP with a hostname + DNS zo
 | `dns_auto_sync_delete_stale` | off | Also delete auto-generated records whose IP was deleted. Conservative default — leaves stale rows so you can review. |
 
 Implementation: `app.tasks.ipam_dns_sync.auto_sync_ipam_dns` (Celery beat fires every 60s, task gates on the `enabled` flag + interval).
+
+**Which zone an address is judged against.** The address's own zone (`ip_address.forward_zone_id`, set by Allocate, Edit and Bulk edit) when it has one that is still live, otherwise the subnet's effective zone ([#2104](https://github.com/spatiumnorth/spatiumddi/issues/2104)). The same rule applies to the manual Sync DNS at subnet, block and space scope, to auto-sync, and to the records a commit writes, so an address an operator placed in another zone stays there. `forward_zone_id` cannot tell a chosen zone from one inherited from the subnet, so **changing a subnet's zone does not move its existing addresses on Sync DNS, and removing it does not list their records as stale**. Move them with Bulk edit → DNS zone, or remove them by setting the address's DNS zone to None in Edit. Only addresses with no zone of their own, or whose zone was deleted, follow the subnet. DDNS is different: a lease's name goes into the DDNS domain override's zone, else the subnet's, on every rename.
 
 ### 14.2 Zone ↔ Server Reconciliation
 

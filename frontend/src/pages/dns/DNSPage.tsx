@@ -2572,6 +2572,17 @@ export function ZoneModal({
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
+  // Sub-zone opens with ".<parent>" pre-filled so the operator types the
+  // leading label first; a focused input puts the caret at the END of a
+  // pre-fill, which made "xp" read ".parentxp" (#2464). Park it at the start.
+  const nameRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!zone && initialName?.startsWith(".")) {
+      nameRef.current?.setSelectionRange(0, 0);
+    }
+    // Once, on open: later renders must not move a caret the operator placed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
@@ -2772,6 +2783,7 @@ export function ZoneModal({
         <Field label="Zone Name (FQDN)">
           <input
             className={inputCls}
+            ref={nameRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="example.com"

@@ -6,6 +6,7 @@ import {
   type AIPrompt,
   type AIPromptCreate,
   type AIPromptUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -226,8 +227,8 @@ export function AIPromptsPage() {
       setShowCreate(false);
       setError(undefined);
     },
-    onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
-      setError(err.response?.data?.detail ?? err.message);
+    onError: (err: Error) => {
+      setError(formatApiError(err));
     },
   });
 
@@ -239,8 +240,8 @@ export function AIPromptsPage() {
       setEditing(null);
       setError(undefined);
     },
-    onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
-      setError(err.response?.data?.detail ?? err.message);
+    onError: (err: Error) => {
+      setError(formatApiError(err));
     },
   });
 

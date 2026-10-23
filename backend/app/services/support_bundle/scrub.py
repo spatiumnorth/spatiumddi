@@ -39,6 +39,7 @@ import hashlib
 import hmac
 import ipaddress
 import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from app.config import settings
@@ -118,9 +119,16 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # SAFETY NET then reports a hit on text a collector had already
     # cleaned: a false bug report, from the mechanism whose whole value
     # is that a hit means a real one.
+    #
+    # The username may be EMPTY: every Redis URL the charts render is
+    # ``redis://:<password>@host`` / ``sentinel://:<password>@h1,h2``, and
+    # requiring a username let that password through. The password half
+    # may itself contain "@" (an operator's unencoded password), so it runs
+    # greedily to the LAST "@" before the path rather than the first, or
+    # the tail after the first "@" would survive.
     (
         "url-credentials",
-        re.compile(r"(?<=://)[^:/@\s\[\]]+:[^@/\s\[\]]+(?=@)"),
+        re.compile(r"(?<=://)[^:/@\s\[\]]*:[^/\s\[\]\"'<>]+(?=@)"),
         f"{_REDACTED}:{_REDACTED}",
     ),
     # Base64 TSIG secrets are indistinguishable from any other base64, so
@@ -198,6 +206,173 @@ SECRET_KEY_NAME_RE = re.compile(
 def looks_secret_key(name: str) -> bool:
     """True when a field name suggests its value is a credential."""
     return bool(SECRET_KEY_NAME_RE.search(name or ""))
+
+
+# ── Environment dumps ───────────────────────────────────────────────────
+#
+# Process-environment values are shown only for names on an ALLOWLIST;
+# every other variable is listed with its value replaced. The opposite of
+# the settings-row policy in ``collect.py``, on purpose: that table is a
+# schema this codebase owns, so a name-based denylist over it fails only
+# when a column is named carelessly. The environment is not ours — the
+# orchestrator, the base image, the chart and the operator all add to it —
+# so a denylist fails every time a credential is named in a way the list
+# did not anticipate, and that happened: ``LG_AGENT_KEY`` and every
+# ``*_URL`` carrying a password were each missed by a name rule. Listing
+# the key with a redacted value keeps the useful half ("is it set?").
+#
+# Connection URLs (DATABASE_URL, REDIS_URL, CELERY_*) are deliberately NOT
+# allowed: their host is fixed per deployment shape, while a credential can
+# sit in the userinfo, a query parameter or an encoding no pattern expects.
+_ENV_SHAREABLE_NAMES = frozenset(
+    {
+        # Runtime / image
+        "HOME",
+        "HOSTNAME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+        "PYTHONUNBUFFERED",
+        "PYTHON_VERSION",
+        "TZ",
+        "VIRTUAL_ENV",
+        "NODE_NAME",
+        "POD_NAME",
+        "POD_NAMESPACE",
+        "SPATIUMDDI_VERSION",
+        # app.config.Settings — the fields that are not credentials
+        "ACCESS_TOKEN_EXPIRE_MINUTES",
+        "ALLOW_INSECURE_SECRET_KEY",
+        "APPLIANCE_CERT_DIR",
+        "APPLIANCE_EXTRA_CERT_SANS",
+        "APPLIANCE_FRONTEND_CONTAINER",
+        "APPLIANCE_HOSTNAME",
+        "APPLIANCE_HOST_IPS",
+        "APPLIANCE_MODE",
+        "APPLIANCE_VERSION",
+        "APP_TITLE",
+        "APP_VERSION",
+        "BGP_RIS_LIVE_ENABLED",
+        "CORS_ORIGINS",
+        "DATABASE_MAX_OVERFLOW",
+        "DATABASE_POOL_SIZE",
+        "DEBUG",
+        "DEMO_MODE",
+        "DHCP_AGENT_LONGPOLL_TIMEOUT",
+        "DHCP_AGENT_TOKEN_TTL_HOURS",
+        "DHCP_LEASE_SYNC_INTERVAL_MINUTES",
+        "DHCP_REQUIRE_AGENT_APPROVAL",
+        "DHCP_SYNC_INTERVAL_SECONDS",
+        "DNS_AGENT_BUNDLE_ENQUEUE_RENDERS",
+        "DNS_AGENT_BUNDLE_INLINE_FALLBACK",
+        "DNS_AGENT_BUNDLE_INLINE_FALLBACK_AFTER_SECONDS",
+        "DNS_AGENT_BUNDLE_INLINE_FALLBACK_BACKOFF_SECONDS",
+        "DNS_AGENT_BUNDLE_KEEP_VERSIONS",
+        "DNS_AGENT_BUNDLE_RENDER_LEASE_SECONDS",
+        "DNS_AGENT_LONGPOLL_TIMEOUT",
+        "DNS_AGENT_OPS_BATCH",
+        "DNS_AGENT_TOKEN_TTL_HOURS",
+        "DNS_REQUIRE_AGENT_APPROVAL",
+        "E911_SELF_QUERY_ENABLED",
+        "FEATURE_DHCP_ENABLED",
+        "FEATURE_DISCOVERY_ENABLED",
+        "FEATURE_DNS_ENABLED",
+        "GITHUB_REPO",
+        "INITIAL_NTP_SERVERS",
+        "LG_AGENT_LONGPOLL_TIMEOUT",
+        "LOG_FORMAT",
+        "LOG_LEVEL",
+        "PROMETHEUS_METRICS_ENABLED",
+        "PROMETHEUS_METRICS_REQUIRE_AUTH",
+        "REDIS_SENTINEL_MASTER",
+        "REFRESH_TOKEN_EXPIRE_DAYS",
+        "SERVICE_CONTROL_ENABLED",
+        "SLOT_IMAGE_MIRROR_MODE",
+        "SPATIUM_DRILL_MAX_DB_BYTES",
+        "SPATIUM_KUBELET_CA_PATH",
+        "SPATIUM_PCAP_DIR",
+        "SPATIUM_SLOT_IMAGE_DIR",
+        "STRICT_SCHEMA_CHECK",
+        "STRICT_SECRET_KEY",
+        "TASK_DB_COMMAND_TIMEOUT",
+        "TASK_DB_CONNECT_TIMEOUT",
+        "TASK_DB_LONG_COMMAND_TIMEOUT",
+        "TRUSTED_HOSTS",
+        "TRUSTED_PROXY_CIDRS",
+        "VERSION",
+    }
+)
+# Shapes the orchestrator generates that carry addresses, ports or image
+# references only: Kubernetes service links (``FOO_SERVICE_HOST``,
+# ``FOO_PORT_6379_TCP_ADDR``) and image tags. Still subject to the
+# secret-name test, since a suffix rule cannot vouch for the prefix.
+_ENV_SHAREABLE_SHAPE_RE = re.compile(
+    r"^[A-Z0-9_]+_(?:SERVICE_HOST|SERVICE_PORT(?:_[A-Z0-9_]+)?|"
+    r"PORT(?:_\d+_(?:TCP|UDP|SCTP)(?:_ADDR|_PORT|_PROTO)?)?|IMAGE|TAG)$"
+)
+
+
+def env_value_is_shareable(name: str) -> bool:
+    """True when an environment variable's VALUE may go into a dump."""
+    if name in _ENV_SHAREABLE_NAMES:
+        return True
+    return bool(_ENV_SHAREABLE_SHAPE_RE.match(name)) and not looks_secret_key(name)
+
+
+def render_env(environ: Mapping[str, str], clean: Callable[[str], str]) -> str:
+    """``KEY=VALUE`` lines for an env dump, values outside the allowlist
+    replaced. ``clean`` still runs over every value that is shown.
+
+    An empty value stays visibly empty — "set but blank" is a common
+    misconfiguration and reveals nothing. Newlines are escaped so one
+    value cannot pose as further lines of the dump.
+    """
+    lines = []
+    for key in sorted(environ):
+        value = environ[key]
+        if not value:
+            lines.append(f"{key}=")
+        elif env_value_is_shareable(key):
+            lines.append(f"{key}={clean(value)}".replace("\n", "\\n"))
+        else:
+            lines.append(f"{key}={_REDACTED}")
+    return "\n".join(lines)
+
+
+_ENV_FILE_ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def render_env_file(text: str, clean: Callable[[str], str]) -> str:
+    """An ``.env`` file with the same allowlist applied per assignment.
+
+    Comments are dropped: a commented-out ``#SECRET_KEY=…`` is the usual
+    way an old credential stays in the file. Any other line that is not
+    an assignment — the continuation of a quoted multi-line value, or a
+    syntax this parser does not know — is replaced outright rather than
+    passed through, since it is most likely the middle of a value.
+    """
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if stripped.startswith("#"):
+            out.append("# [comment removed]")
+            continue
+        match = _ENV_FILE_ASSIGNMENT_RE.match(line)
+        if match is None:
+            out.append(_REDACTED)
+            continue
+        if not line[match.end() :].strip():
+            out.append(line)
+        elif env_value_is_shareable(match.group(1)):
+            out.append(clean(line))
+        else:
+            out.append(f"{line[: match.end()]}{_REDACTED}")
+    return "\n".join(out)
 
 
 def redact_secrets(text: str) -> tuple[str, list[str]]:

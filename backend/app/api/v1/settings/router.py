@@ -1470,6 +1470,13 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Must be >= 0 (0 = no timeout)")
         return v
 
+    @field_validator("auto_logout_minutes")
+    @classmethod
+    def validate_auto_logout(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Must be >= 0 (0 = no warning)")
+        return v
+
     @field_validator(
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
@@ -2594,6 +2601,12 @@ async def update_settings(
         from app.core import maintenance_mode as _maintenance_mode
 
         _maintenance_mode.invalidate_cache()
+
+    # Same for the idle-session timeout the auth layer enforces.
+    if "session_timeout_minutes" in changes:
+        from app.core import session_idle as _session_idle
+
+        _session_idle.invalidate_cache()
 
     # The settings router has no request-scoped wake collector, so
     # publish directly after the commit. Only fire when a host-config

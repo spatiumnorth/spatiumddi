@@ -132,9 +132,10 @@ OBSERVABILITY_IMAGES=(
 # itself (GPL v2 — flag distinctly in NOTICE), the frr-k8s reconciler
 # (Apache 2.0), and the kube-rbac-proxy metrics sidecar (present TWICE
 # per pod, same image, Apache 2.0) that the vendored charts/frr-k8s
-# templates/controller.yaml wires in unconditionally. Tags verified
-# against charts/frr-k8s/values.yaml inside the vendored
-# metallb-0.15.3.tgz (frr-k8s@0.0.21) — keep in lock-step with the
+# templates/controller.yaml wires in unconditionally. frr-k8s is the
+# vendored metallb-0.15.3.tgz's own subchart version (frr-k8s@0.0.21);
+# frr and kube-rbac-proxy are pinned past that subchart's defaults as a
+# security override (#2239, see versions.json) — keep in lock-step with the
 # charts/spatiumddi-metallb/values.yaml `metallb.frr-k8s.frrk8s.image` /
 # `.frr.image` pins, and `metallb.frr-k8s.prometheus.rbacProxy.*` for the
 # kube-rbac-proxy sidecar. #575 — kube-rbac-proxy moved off the sunset
@@ -149,11 +150,11 @@ METALLB_IMAGES=(
     "quay.io/metallb/controller:v0.15.3"
     "quay.io/metallb/speaker:v0.15.3"
     "quay.io/metallb/frr-k8s:v0.0.21"
-    "quay.io/frrouting/frr:10.4.1"
+    "quay.io/frrouting/frr:10.4.5"
     # #575 — was gcr.io/kubebuilder/kube-rbac-proxy (sunset → 404); same image,
     # maintained registry. Keep in lock-step with charts/spatiumddi-metallb
     # values.yaml `metallb.frr-k8s.prometheus.rbacProxy.repository`.
-    "quay.io/brancz/kube-rbac-proxy:v0.12.0"
+    "quay.io/brancz/kube-rbac-proxy:v0.23.0"
 )
 
 # CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance
