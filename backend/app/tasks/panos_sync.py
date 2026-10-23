@@ -1,7 +1,7 @@
 """Periodic Palo Alto PAN-OS / Panorama firewall reconcile.
 
 Mirrors ``opnsense_sync`` — 30 s beat tick, per-firewall interval gating,
-platform-wide kill switch via ``PlatformSettings.integration_panos_enabled``.
+platform-wide kill switch via the ``integrations.paloalto`` feature module (#2196).
 Plus a ``sync_firewall_now`` task for the UI's "Sync Now" button.
 """
 
@@ -19,13 +19,11 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
 from app.models.panos import PANOSFirewall
-from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
 from app.services.integration_sync_failure import record_sync_crash
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
-
-_PLATFORM_SINGLETON_ID = 1
 
 
 async def _run_sweep() -> dict[str, Any]:
@@ -37,8 +35,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_panos_enabled:
+            if not await is_module_enabled(db, "integrations.paloalto"):
                 return {"status": "disabled"}
 
             rows = (

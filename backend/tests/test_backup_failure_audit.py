@@ -158,3 +158,47 @@ async def test_the_stale_reaper_row_carries_a_category(db_session: AsyncSession)
 )
 def test_failure_category(exc: BaseException, category: str) -> None:
     assert runner_mod.backup_failure_category(exc) == category
+
+
+async def test_a_retention_listing_failure_after_a_write_keeps_the_run_successful(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive is on the destination, so the run is a success; the
+    retention problem is surfaced on the target, not by failing the run (#2503)."""
+
+    class _Driver:
+        def validate_config(self, config) -> None:
+            return None
+
+        async def write(self, *, config, filename, archive_bytes) -> None:
+            return None
+
+        async def list_archives(self, *, config):
+            raise BackupDestinationError("listing refused by nas.example.test")
+
+    async def _build(db, **kw):
+        return b"zip", "spatiumddi-backup-h-20261004-020000-ab12cd.zip"
+
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: _Driver())
+    monkeypatch.setattr(runner_mod, "decrypt_config_secrets", lambda driver, cfg: cfg)
+    monkeypatch.setattr(runner_mod, "build_backup_archive", _build)
+    target = BackupTarget(
+        name="nas2",
+        kind="nfs",
+        config={},
+        last_run_status="never",
+        retention_keep_last_n=3,
+        passphrase_encrypted=encrypt_str("hunter2hunter2"),
+    )
+    db_session.add(target)
+    await db_session.flush()
+
+    result = await runner_mod.run_backup_for_target(
+        db_session, target=target, triggered_by="manual"
+    )
+
+    assert result["success"] is True
+    assert target.last_run_status == "success"
+    assert target.last_run_filename == "spatiumddi-backup-h-20261004-020000-ab12cd.zip"
+    assert "retention could not run" in (target.last_run_error or "")
+    assert result["retention_failure_category"]
