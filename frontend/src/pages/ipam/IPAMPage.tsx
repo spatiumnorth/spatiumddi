@@ -4084,8 +4084,8 @@ export function AddAddressModal({
               <p className="text-[11px] text-muted-foreground -mt-0.5">
                 Extra records pointing to this IP. CNAMEs point to{" "}
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
-                records point to the IP. Deleted automatically when the IP is
-                purged.
+                records point to the IP. Withdrawn while the IP is an orphan and
+                back when it is restored; deleted when the IP is purged.
                 {!dnsZoneId && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
@@ -9744,8 +9744,9 @@ export function EditAddressModal({
           <Field label="DNS Aliases">
             <div className="space-y-1.5">
               <p className="text-[11px] text-muted-foreground -mt-0.5">
-                Extra records pointing to this IP. Added records are removed
-                automatically when the IP is purged.
+                Extra records pointing to this IP. Added records are withdrawn
+                while the IP is an orphan and come back when it is restored;
+                they are deleted when the IP is purged.
               </p>
               {existingAliases.length === 0 ? (
                 <p className="text-xs text-muted-foreground/60 italic">
@@ -11454,7 +11455,7 @@ function ConfirmDeleteModal({
  * (amber, reversible; DNS / DHCP cascades still happen but the IPAM row
  * stays so the address can be restored) or permanently delete (red, irreversible).
  * The two colors distinguish the tradeoff at a glance. */
-function DeleteOrOrphanModal({
+export function DeleteOrOrphanModal({
   address,
   onOrphan,
   onPurge,
@@ -11483,8 +11484,9 @@ function DeleteOrOrphanModal({
           <p className="mt-1 text-xs text-muted-foreground">
             The row is kept but marked <code>orphan</code>, greyed out in the
             list, and excluded from next-free allocation. DNS and DHCP cascades
-            still run. You can restore or permanently delete it later from the
-            orphans view.
+            still run: its DNS records and aliases leave the zone. You can
+            restore or permanently delete it later from the orphans view;
+            restoring it publishes its DNS records and aliases again.
           </p>
         </div>
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">

@@ -192,7 +192,7 @@ describe("IPAM delete confirmations", () => {
         "the bulk address delete's own purge option",
       ],
       [
-        ", greyed out in the list, and excluded from next-free allocation. DNS and DHCP cascades still run. You can restore or permanently delete it later from the orphans view.",
+        ", greyed out in the list, and excluded from next-free allocation. DNS and DHCP cascades still run: its DNS records and aliases leave the zone. You can restore or permanently delete it later from the orphans view; restoring it publishes its DNS records and aliases again.",
         "the orphan option: a purge is possible later",
       ],
       ["Delete Permanently (irreversible)", "the address purge option"],

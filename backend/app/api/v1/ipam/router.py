@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 from sqlalchemy import String, asc, desc, func, or_, select, text
 from sqlalchemy import cast as sa_cast
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -1830,6 +1831,186 @@ async def _create_alias_records(
         db.add(rec)
         await db.flush()
         await _enqueue_dns_op(db, zone, "create", name, rtype, value, None)
+
+
+# #2604 — the namespace of the deletion batch an orphaned address's aliases
+# are withdrawn under. One batch id per address, derived rather than stored,
+# so the restore finds exactly the aliases the orphan withdrew (and not one
+# the operator trashed by hand) with no column to carry it.
+_ORPHAN_ALIAS_BATCH_NS = uuid.UUID("5b0f3c2e-8a41-4d6e-9f27-2604a11a5e00")
+
+
+def orphan_alias_batch_id(ip_id: uuid.UUID) -> uuid.UUID:
+    """The ``deletion_batch_id`` Mark as Orphan stamps on the address's aliases."""
+    return uuid.uuid5(_ORPHAN_ALIAS_BATCH_NS, str(ip_id))
+
+
+async def _withdraw_aliases_for_orphan(db: AsyncSession, user: Any, ip: IPAddress) -> int:
+    """Take the address's aliases out of DNS without losing them (#2604).
+
+    Mark as Orphan is reversible, so the aliases are soft-deleted under the
+    address's orphan batch (:func:`orphan_alias_batch_id`) instead of being
+    deleted with its host record: the served zone loses them now, and the
+    row's Restore brings them back (:func:`_aliases_to_restore`).
+    Must run BEFORE ``_sync_dns_record(action="delete")``, which would
+    otherwise delete them for good. Returns how many were withdrawn.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(
+                    DNSRecord.ip_address_id == ip.id,
+                    DNSRecord.auto_generated.is_(True),
+                    DNSRecord.ip_alias.is_(True),
+                )
+                .options(selectinload(DNSRecord.zone))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+    now = datetime.now(UTC)
+    batch_id = orphan_alias_batch_id(ip.id)
+    for rec in rows:
+        zone = rec.zone
+        if zone is not None and ipam_authors_zone(zone):
+            await _enqueue_dns_op(
+                db,
+                zone,
+                "delete",
+                rec.name,
+                rec.record_type,
+                rec.value,
+                rec.ttl,
+                record_id=rec.id,
+            )
+        rec.deleted_at = now
+        rec.deleted_by_user_id = user.id
+        rec.deletion_batch_id = batch_id
+        db.add(
+            _audit(
+                user,
+                "soft_delete",
+                "dns_record",
+                str(rec.id),
+                rec.fqdn,
+                old_value={"deletion_batch_id": str(batch_id), "alias_of": str(ip.id)},
+            )
+        )
+    await db.flush()
+    return len(rows)
+
+
+async def _aliases_to_restore(
+    db: AsyncSession, ip: IPAddress, subnet: Subnet
+) -> list[tuple[DNSZone, list[DNSRecord]]]:
+    """The aliases Mark as Orphan withdrew that a restore brings back (#2604).
+
+    Checked here, before anything is written, as a new alias would be
+    (``_assert_alias_cname_rules``): a record that took an alias's name
+    while the address was an orphan is a 409 naming it, not an alias
+    silently left behind. With no hostname there is nothing for a CNAME to
+    name, and an alias whose zone is gone (or no longer IPAM-authored) has
+    nowhere to go; those stay in the trash.
+    """
+    if not ip.hostname:
+        return []
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(
+                    DNSRecord.ip_address_id == ip.id,
+                    DNSRecord.ip_alias.is_(True),
+                    DNSRecord.deleted_at.is_not(None),
+                    DNSRecord.deletion_batch_id == orphan_alias_batch_id(ip.id),
+                )
+                .order_by(DNSRecord.created_at)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+    for rec in rows:
+        by_zone.setdefault(rec.zone_id, []).append(rec)
+    out: list[tuple[DNSZone, list[DNSRecord]]] = []
+    for zone_id, recs in by_zone.items():
+        zone = await db.get(DNSZone, zone_id)
+        if zone is None or zone.deleted_at is not None or not ipam_authors_zone(zone):
+            continue
+        await _assert_alias_cname_rules(
+            db,
+            subnet,
+            recs,
+            hostname=ip.hostname,
+            address=ip.address,
+            zone_id=zone_id,
+            own_ip_id=ip.id,
+        )
+        out.append((zone, recs))
+    return out
+
+
+async def _restore_aliases_after_orphan(
+    db: AsyncSession,
+    user: Any,
+    ip: IPAddress,
+    restore: list[tuple[DNSZone, list[DNSRecord]]],
+) -> None:
+    """Publish again the aliases :func:`_aliases_to_restore` cleared (#2604).
+
+    A CNAME is re-pointed at the address's current name, so a restore that
+    also renames the address does not publish a CNAME to the old one.
+    """
+    for zone, recs in restore:
+        zone_domain = zone.name.rstrip(".")
+        for rec in recs:
+            if rec.record_type == "CNAME":
+                rec.value = f"{ip.hostname}.{zone_domain}."
+            else:
+                rec.value = str(ip.address)
+            rec.deleted_at = None
+            rec.deleted_by_user_id = None
+            rec.deletion_batch_id = None
+            await db.flush()
+            await _enqueue_dns_op(db, zone, "create", rec.name, rec.record_type, rec.value, rec.ttl)
+            db.add(
+                _audit(
+                    user,
+                    "restore",
+                    "dns_record",
+                    str(rec.id),
+                    rec.fqdn,
+                    new_value={"value": rec.value, "alias_of": str(ip.id)},
+                )
+            )
+
+
+async def _purge_withdrawn_aliases(db: AsyncSession, ip_ids: list[uuid.UUID]) -> None:
+    """Delete for good the aliases these orphans withdrew (#2604).
+
+    Called where an address is deleted permanently: the aliases left DNS when
+    it became an orphan, and without the address there is nothing to restore
+    them to. Without this they would sit in the trash until its retention
+    purge, restorable as aliases of nothing.
+    """
+    if not ip_ids:
+        return
+    await db.execute(
+        sa_delete(DNSRecord)
+        .where(
+            DNSRecord.ip_address_id.in_(ip_ids),
+            DNSRecord.ip_alias.is_(True),
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.in_([orphan_alias_batch_id(i) for i in ip_ids]),
+        )
+        .execution_options(include_deleted=True, synchronize_session=False)
+    )
 
 
 def _invalidate_ip_dns_cache(rec: DNSRecord, ip: IPAddress | None) -> None:
@@ -9416,6 +9597,12 @@ async def update_address(
         and ip.hostname
         and ip.forward_zone_id is not None
     )
+    # #2604 — the aliases Mark as Orphan withdrew come back with the row.
+    # Checked before any record is written, so a name taken meanwhile is a
+    # 409 and nothing is half-restored.
+    aliases_back: list[tuple[DNSZone, list[DNSRecord]]] = []
+    if subnet and old_status == "orphan" and ip.status != "orphan":
+        aliases_back = await _aliases_to_restore(db, ip, subnet)
     # Issue #25 — re-sync when ``extra_zone_ids`` changes too. The
     # sync helper handles fanout + cleanup-on-shrink in one call so a
     # pure extras edit (no hostname / zone change) still triggers the
@@ -9470,6 +9657,8 @@ async def update_address(
         await _sync_dns_record(
             db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
         )
+    if aliases_back:
+        await _restore_aliases_after_orphan(db, current_user, ip, aliases_back)
 
     # #1628 — keep the DHCP reservation in step with the row: a MAC /
     # hostname change lands on the linked DHCPStaticAssignment, flipping
@@ -9904,6 +10093,7 @@ async def delete_address(
         # but we want a clean delete and fqdn cleared)
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
+        await _purge_withdrawn_aliases(db, [ip.id])
         db.add(
             _audit(
                 current_user,
@@ -9920,7 +10110,10 @@ async def delete_address(
         if subnet:
             await _update_block_utilization(db, subnet.block_id)
     else:
-        # Soft-delete: mark as orphan; remove DNS record since the name is being released
+        # Soft-delete: mark as orphan; remove DNS record since the name is being
+        # released. The aliases are withdrawn, not deleted, so the row's
+        # Restore brings them back (#2604).
+        await _withdraw_aliases_for_orphan(db, current_user, ip)
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
         old_status = ip.status
@@ -9994,6 +10187,8 @@ async def purge_orphans(
     _require_static_delete(current_user, lingering_statics, "This purge")
     await _remove_linked_statics(db, current_user, lingering_statics)
 
+    # The aliases these orphans withdrew go with them (#2604).
+    await _purge_withdrawn_aliases(db, [ip.id for ip in rows])
     for ip in rows:
         # Best-effort DNS teardown (the FK would null it, but be explicit).
         try:
@@ -11462,7 +11657,13 @@ async def bulk_delete_addresses(
     await _remove_linked_statics(db, current_user, list(removed_statics.values()))
 
     # Pass 2: tear down DNS and delete / orphan the rows.
+    if body.permanent:
+        # Aliases an orphan among them withdrew go with it (#2604).
+        await _purge_withdrawn_aliases(db, [ip.id for ip in to_delete])
     for ip in to_delete:
+        if not body.permanent:
+            # Withdrawn, not deleted, so the row's Restore brings them back (#2604).
+            await _withdraw_aliases_for_orphan(db, current_user, ip)
         subnet = await db.get(Subnet, ip.subnet_id)
         if subnet is not None:
             try:
