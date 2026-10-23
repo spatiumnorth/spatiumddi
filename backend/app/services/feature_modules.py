@@ -512,10 +512,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # integration's sidebar entry + REST surface appear; the actual
     # poll only starts once the operator configures a target.
     #
-    # The matching ``PlatformSettings.integration_*_enabled`` columns
-    # are kept in lock-step by the toggle endpoint (Celery beat tasks
-    # gate on them and we don't want to fan out the read-feature_module
-    # change across every reconciler in one PR).
+    # The module is the integration's ONLY on/off switch (#2196 / #2197):
+    # its beat sweep, its alerts and its dashboard panels all ask
+    # ``is_module_enabled``. See ``INTEGRATION_SETTINGS_MIRROR`` below for
+    # what the ``PlatformSettings.integration_*_enabled`` columns are now.
     ModuleSpec(
         id="integrations.kubernetes",
         label="Kubernetes",
@@ -747,11 +747,27 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     ),
 )
 
-# Map a feature_module id to the ``PlatformSettings`` column whose
-# ``True``/``False`` value mirrors it. The toggle endpoint writes both
-# sides in the same transaction so reconciler tasks (which gate on the
-# settings column) see the change without a separate migration. New
-# integrations register here in the same PR that adds them.
+# Every integration module, mapped to the ``PlatformSettings`` column that
+# mirrors it.
+#
+# The MODULE is authoritative (#2196 / #2197). Each integration's beat sweep,
+# its alert subjects and both dashboard surfaces ask ``is_module_enabled`` for
+# the module id here — nothing in the application reads these columns. They
+# used to be the gate, kept in step by the toggle endpoint, and that was two
+# sources of truth that drifted two ways: a module turned on before
+# ``PlatformSettings(1)`` existed skipped the mirror for good, and Fortinet
+# and Meraki were never in this map at all, so their periodic sync never ran
+# on any install. A reader that consults the module cannot drift from it.
+#
+# The columns survive only as a derived copy, rewritten wholesale by
+# ``sync_integration_settings_mirror`` on every toggle and at API startup, for
+# anything outside the app that still reads them (a SQL report, a build older
+# than this change after a downgrade). ``GET /settings`` reports the module
+# state, not the column, and ``PUT /settings`` writes the module.
+#
+# Every ``integrations.*`` module must appear here — pinned by
+# ``tests/test_integration_module_gates.py`` — so a twelfth integration cannot
+# silently ship without a gate or a settings-API field.
 INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.kubernetes": "integration_kubernetes_enabled",
     "integrations.docker": "integration_docker_enabled",
@@ -762,6 +778,13 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.opnsense": "integration_opnsense_enabled",
     "integrations.netbird": "integration_netbird_enabled",
     "integrations.paloalto": "integration_panos_enabled",
+    "integrations.fortinet": "integration_fortinet_enabled",
+    "integrations.meraki": "integration_meraki_enabled",
+}
+
+# The reverse view: settings-API field name -> module id.
+INTEGRATION_FIELD_TO_MODULE: Final[dict[str, str]] = {
+    col: mid for mid, col in INTEGRATION_SETTINGS_MIRROR.items()
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}
@@ -959,6 +982,42 @@ async def set_module_enabled(
     )
     row = (await db.execute(stmt)).scalar_one()
     return row
+
+
+async def integration_flags(db: AsyncSession) -> dict[str, bool]:
+    """Every integration's on/off state, keyed by its settings-API field.
+
+    Read from the module state (uncached), so ``GET /settings`` and the
+    module list cannot disagree within the cache TTL.
+    """
+    own = (await load_module_states(db)).own
+    return {
+        col: _resolve_with_parents(mid, own) for mid, col in INTEGRATION_SETTINGS_MIRROR.items()
+    }
+
+
+async def sync_integration_settings_mirror(db: AsyncSession) -> bool:
+    """Rewrite every ``integration_*_enabled`` column from module state.
+
+    Get-or-creates ``PlatformSettings(1)``: skipping a missing row is what
+    left #2196's flags false for good. Idempotent; returns whether any column
+    changed. The caller commits. Nothing in the app reads these columns (see
+    ``INTEGRATION_SETTINGS_MIRROR``) — this keeps the derived copy honest.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    flags = await integration_flags(db)
+    ps = await db.get(PlatformSettings, 1)
+    if ps is None:
+        ps = PlatformSettings(id=1)
+        db.add(ps)
+        await db.flush()
+    changed = False
+    for col, value in flags.items():
+        if getattr(ps, col) != value:
+            setattr(ps, col, value)
+            changed = True
+    return changed
 
 
 # ── FastAPI dependency ─────────────────────────────────────────────────

@@ -34,7 +34,7 @@ Contract for ``resolve_update_changes(body, clearable, non_nullable)``:
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from typing import Any
 
 from fastapi import HTTPException
@@ -74,4 +74,14 @@ def resolve_update_changes(
     return {k: v for k, v in changes.items() if v is not None or k in clearable_set}
 
 
-__all__ = ["resolve_update_changes"]
+def changed_keys(before: Mapping[str, Any], changes: Mapping[str, Any]) -> list[str]:
+    """The keys of ``changes`` whose value differs from ``before`` (#2463).
+
+    An update dialog sends every field it shows, so ``changes`` holds keys the
+    operator never touched; the audit row names only those that moved. A key
+    absent from ``before`` was added by the handler itself and counts.
+    """
+    return [k for k, v in changes.items() if k not in before or before[k] != v]
+
+
+__all__ = ["changed_keys", "resolve_update_changes"]

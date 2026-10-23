@@ -5,6 +5,7 @@ import {
   getAuthSnapshot,
   markBooted,
   setAccessToken,
+  setMustChangePassword,
   subscribe,
 } from "@/lib/authToken";
 
@@ -42,6 +43,7 @@ function bootstrapAuth(): Promise<void> {
       // failure branch below, null it out).
       if (resp.access_token && !getAccessToken()) {
         setAccessToken(resp.access_token);
+        setMustChangePassword(!!resp.force_password_change);
       }
     })
     .catch(() => {
@@ -61,6 +63,7 @@ function bootstrapAuth(): Promise<void> {
 export function useAuth() {
   const snapshot = useSyncExternalStore(subscribe, getAuthSnapshot);
   const isAuthenticated = !!snapshot.accessToken;
+  const mustChangePassword = snapshot.mustChangePassword;
 
   // Fire the one-shot boot refresh. Skip it if we already have a token in
   // memory (a fresh login this tab) — there's nothing to restore.
@@ -80,6 +83,7 @@ export function useAuth() {
       const resp = await authApi.login(username, password);
       if (!resp.mfa_required && resp.access_token) {
         setAccessToken(resp.access_token);
+        setMustChangePassword(!!resp.force_password_change);
         markBooted();
       }
       return resp;
@@ -98,6 +102,7 @@ export function useAuth() {
       const resp = await authApi.loginMfa(mfa_token, body);
       if (resp.access_token) {
         setAccessToken(resp.access_token);
+        setMustChangePassword(!!resp.force_password_change);
         markBooted();
       }
       return resp;
@@ -115,6 +120,7 @@ export function useAuth() {
 
   return {
     isAuthenticated,
+    mustChangePassword,
     // True until the boot-time silent refresh resolves. A protected route
     // renders a loader while this is true so a real session isn't mistaken
     // for a logged-out one on reload.
