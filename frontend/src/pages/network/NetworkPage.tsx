@@ -23,6 +23,7 @@ import {
   type NetworkDeviceType,
   type NetworkPollStatus,
 } from "@/lib/api";
+import { formatApiError } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
@@ -473,6 +474,12 @@ export function NetworkPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
+        {toggleActiveMut.isError && (
+          <p role="alert" className="mb-3 text-xs text-destructive">
+            Could not change the device's Active setting:{" "}
+            {formatApiError(toggleActiveMut.error, "the request failed")}
+          </p>
+        )}
         <div className="rounded-lg border">
           {devices.length === 0 ? (
             <div className="flex flex-col items-center gap-2 p-10 text-center">
@@ -614,8 +621,10 @@ export function NetworkPage() {
                             <input
                               type="checkbox"
                               checked={d.is_active}
+                              aria-label={`Active ${d.name}`}
                               disabled={toggleActiveMut.isPending}
                               onChange={() => toggleActiveMut.mutate(d)}
+                              {...writeGate}
                             />
                           </label>
                         </td>

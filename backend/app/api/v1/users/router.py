@@ -5,13 +5,14 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.permissions import refuse_and_audit
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
@@ -31,7 +32,12 @@ from app.services.password_policy import (
 from app.services.password_policy import (
     validate as validate_password_policy,
 )
-from app.services.superadmin_grant import holds_superadmin, loaded_user_holds_superadmin
+from app.services.superadmin_grant import (
+    SuperadminModel,
+    holds_superadmin,
+    leaves_no_active_superadmin,
+    loaded_user_holds_superadmin,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -245,6 +251,26 @@ def _audit(actor: User, action: str, resource_id: str, summary: str) -> AuditLog
     )
 
 
+async def _refuse_last_superadmin(
+    db: DB, actor: User, request: Request, target: User, action: str
+) -> None:
+    await refuse_and_audit(
+        db,
+        actor,
+        request,
+        action=action,
+        resource_type="user",
+        resource_id=str(target.id),
+        resource_display=f"{action} user {target.username}",
+        reason="would leave no active superadmin",
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "This change would leave no active superadmin. Make another account a "
+            "superadmin first."
+        ),
+    )
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
@@ -275,7 +301,9 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
     existing = await db.execute(
         select(User).where((User.username == body.username) | (User.email == body.email))
     )
-    if existing.scalar_one_or_none():
+    # .first(), not scalar_one_or_none(): the username can belong to one row and
+    # the email to another, and two matches must still be a 409, not a 500.
+    if existing.scalars().first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username or email already in use",
@@ -385,6 +413,7 @@ async def get_user(user_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> User
 async def update_user(
     user_id: uuid.UUID,
     body: UpdateUserRequest,
+    request: Request,
     current_user: SuperAdmin,
     db: DB,
 ) -> User:
@@ -411,6 +440,21 @@ async def update_user(
                 "managed by the identity provider, so it cannot be required to change it here."
             ),
         )
+
+    # Disabling the account, or clearing its flag, must not leave the install
+    # without an active superadmin — only the CLI recovery recipe could then
+    # administer it. Checked before any field is touched.
+    if body.is_active is False or body.is_superadmin is False:
+        target_id = user.id
+
+        def _change(model: SuperadminModel) -> None:
+            if body.is_active is False:
+                model.active.discard(target_id)
+            if body.is_superadmin is False:
+                model.flagged.discard(target_id)
+
+        if await leaves_no_active_superadmin(db, _change):
+            await _refuse_last_superadmin(db, current_user, request, user, "update")
 
     method = None
     if body.is_superadmin and not user.is_superadmin:
@@ -667,7 +711,9 @@ async def link_provider(
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(user_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
+async def delete_user(
+    user_id: uuid.UUID, request: Request, current_user: SuperAdmin, db: DB
+) -> None:
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -677,6 +723,17 @@ async def delete_user(user_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> N
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account",
         )
+
+    target_id = user.id
+
+    def _change(model: SuperadminModel) -> None:
+        model.active.discard(target_id)
+        model.flagged.discard(target_id)
+        for members in model.group_members.values():
+            members.discard(target_id)
+
+    if await leaves_no_active_superadmin(db, _change):
+        await _refuse_last_superadmin(db, current_user, request, user, "delete")
 
     db.add(_audit(current_user, "delete", str(user.id), f"Deleted user {user.username}"))
     await db.delete(user)

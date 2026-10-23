@@ -178,6 +178,15 @@ export function CreatePoolModal({
                   {c.name}
                 </option>
               ))}
+              {/* #2481 — the API also takes names that are not a row of this
+                  group (Kea's built-in KNOWN, generated PXE / phone /
+                  device-policy classes). Show a stored one as itself. */}
+              {classRestriction &&
+                !classes.some((c) => c.name === classRestriction) && (
+                  <option value={classRestriction}>
+                    {classRestriction} (built-in or generated class)
+                  </option>
+                )}
             </select>
           </Field>
         </div>
