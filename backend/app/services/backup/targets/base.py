@@ -187,6 +187,13 @@ class ConfigFieldSpec:
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+    #: The value is made of LINES (a PEM key, a known_hosts file, one
+    #: header per line). The form renders a multi-line control for it,
+    #: masked when ``secret`` is also set. A one-line input cannot hold a
+    #: line break at all — the browser folds each one into a space — so a
+    #: field whose meaning depends on its lines and is rendered as an input
+    #: silently becomes a different value (#2199).
+    multiline: bool = False
 
 
 def safe_url(url: str) -> str:
@@ -354,6 +361,7 @@ def list_destination_kinds() -> list[dict[str, Any]]:
                         "required": f.required,
                         "description": f.description,
                         "secret": f.secret,
+                        "multiline": f.multiline,
                     }
                     for f in d.config_fields
                 ],

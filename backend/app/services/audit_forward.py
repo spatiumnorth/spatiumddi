@@ -60,6 +60,7 @@ from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
 from app.services.after_commit_dispatch import dispatch
+from app.services.audit_redact import redact_audit_payload
 from app.services.forward_secrets import redact, reveal, secret_url_in_flight
 
 logger = structlog.get_logger(__name__)
@@ -921,7 +922,16 @@ FAILED = "failed"
 async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) -> str:
     """Deliver ``payload`` to one target; return DELIVERED / FILTERED /
     FAILED. Never raises — a transport failure is a FAILED outcome,
-    logged here exactly as it was when the exception was swallowed."""
+    logged here exactly as it was when the exception was swallowed.
+
+    This is the ONE function every forwarded event reaches a transport
+    through — audit rows, alert events, the AI digest and the "Test
+    target" probe alike — so the read-side redaction the audit API applies
+    (#2009) is applied here, on a copy, before any renderer sees the
+    payload (#2015). Doing it in ``_serialize`` instead would cover audit
+    rows only, and a new caller of this function would bypass it.
+    """
+    payload = redact_audit_payload(payload)
     if not _target_accepts(target, payload):
         return FILTERED
     kind = target.get("kind")

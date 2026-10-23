@@ -21,6 +21,8 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.models.dns import DNSPool, DNSPoolMember
+from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ownership import SITE_KINDS, Site
 
 router = APIRouter(
@@ -259,15 +261,82 @@ async def update_site(site_id: uuid.UUID, body: SiteUpdate, db: DB, user: Curren
     return SiteRead.model_validate(row)
 
 
+async def _pool_member_referrers(db: DB, site_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
+    """DNS pool members geo-scoped to each site (``site_id`` is SET NULL, so a
+    delete would silently turn them into default answers for every client)."""
+    rows = (
+        await db.execute(
+            select(DNSPoolMember.site_id, DNSPool.name, DNSPoolMember.address)
+            .join(DNSPool, DNSPool.id == DNSPoolMember.pool_id)
+            .where(DNSPoolMember.site_id.in_(site_ids))
+            .order_by(DNSPool.name, DNSPoolMember.address)
+        )
+    ).all()
+    out: dict[uuid.UUID, list[str]] = {}
+    for sid, pool_name, address in rows:
+        out.setdefault(sid, []).append(f"{pool_name} ({address})")
+    return out
+
+
+def _refuse_if_referenced(row_name: str, refs: list[str]) -> None:
+    if refs:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Site '{row_name}' is the geo scope of DNS pool member(s): "
+                f"{', '.join(refs)}. Re-scope or remove them first."
+            ),
+        )
+
+
+async def _refuse_if_e911_bound(db: DB, sites: list[Site]) -> None:
+    """409 when any of ``sites`` still carries an E911 ``site_default`` binding.
+
+    ``erl_binding.site_id`` is ``ON DELETE CASCADE``, so deleting the site
+    would silently remove the coarsest-fallback location for every phone on
+    it (#2298). A wrong or missing emergency location is not something to
+    discover on the next conformity pass, so the operator removes the
+    binding deliberately (Network -> E911 -> Bindings) and then deletes.
+    """
+    if not sites:
+        return
+    by_id = {s.id: s for s in sites}
+    rows = (
+        await db.execute(
+            select(ERLBinding.site_id, EmergencyResponseLocation.name)
+            .join(EmergencyResponseLocation, EmergencyResponseLocation.id == ERLBinding.erl_id)
+            .where(ERLBinding.site_id.in_(list(by_id)))
+            .order_by(EmergencyResponseLocation.name)
+        )
+    ).all()
+    if not rows:
+        return
+    parts = [f'site "{by_id[sid].name}" -> ERL "{erl}"' for sid, erl in rows]
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cannot delete: E911 site-default binding(s) still point at "
+            + ("this site" if len(sites) == 1 else "these sites")
+            + f" ({'; '.join(parts)}). Deleting would silently remove the "
+            "fallback emergency location for every device there. Remove the "
+            "binding(s) under Network > E911 > Bindings first."
+        ),
+    )
+
+
 @router.delete("/{site_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_site(site_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     """Hard-delete (sites aren't soft-deletable). Children re-parent
     to NULL via ``ON DELETE SET NULL``; cross-refs on subnets /
-    blocks / network_devices null out the same way.
+    blocks / network_devices null out the same way. Refused (409) while an
+    E911 site-default binding points at the site (#2298).
     """
     row = await db.get(Site, site_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Site not found")
+    _refuse_if_referenced(row.name, (await _pool_member_referrers(db, [row.id])).get(row.id, []))
+
+    await _refuse_if_e911_bound(db, [row])
 
     write_audit(
         db,
@@ -289,6 +358,13 @@ async def bulk_delete_sites(body: SiteBulkDelete, db: DB, user: CurrentUser) -> 
     rows = (await db.execute(select(Site).where(Site.id.in_(body.ids)))).scalars().all()
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
+
+    refs = await _pool_member_referrers(db, [r.id for r in rows])
+    for r in rows:
+        _refuse_if_referenced(r.name, refs.get(r.id, []))
+    # All-or-nothing: a partial delete would leave the operator guessing
+    # which sites went.
+    await _refuse_if_e911_bound(db, list(rows))
 
     for r in rows:
         write_audit(

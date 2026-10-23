@@ -74,6 +74,7 @@ from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
 from app.services.dns.sync_check import (
+    address_own_forward_zone_id,
     forward_zone_ids_in_order,
     ipam_authors_zone,
     resolve_reverse_zone,
@@ -2034,6 +2035,10 @@ async def _sync_dns_record(
         return False
 
     zone = await db.get(DNSZone, effective_zone_id) if effective_zone_id else None
+    if zone is not None and zone.deleted_at is not None:
+        # ``db.get`` answers from the identity map without the soft-delete
+        # filter, so a zone trashed earlier in this session comes back (#2104).
+        zone = None
     if effective_zone_id and not zone:
         # Stale FK — primary zone deleted out from under us. Treat as
         # no-primary so the cleanup path still runs against extras.
@@ -7619,6 +7624,7 @@ async def _apply_dns_sync(
         ips_res = await db.execute(q)
         # Cache subnets so we don't re-fetch per IP in the same subnet.
         subnet_cache: dict[uuid.UUID, Subnet | None] = {}
+        wrote_ip_ids: set[uuid.UUID] = set()
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
@@ -7635,12 +7641,30 @@ async def _apply_dns_sync(
                     # #2072 — strict, so a name too long for its zone is
                     # reported in ``errors`` instead of counted as synced. The
                     # refusal comes before anything is written for this IP.
+                    # #2104 — the address's own zone (#493), which the drift
+                    # check judged it against. Passing none resolved the
+                    # subnet's zone and moved a host the operator had put in
+                    # another zone back into the subnet's.
                     # #2118 — an address whose own A / AAAA alias already
                     # serves its name is skipped there, not refused, so its
                     # missing PTR is still written.
+                    # #2352 — count only an address the sync wrote for: ops
+                    # queued in the batch collector. One whose records already
+                    # exist as desired queues nothing and counts as unchanged.
+                    collector = _dns_op_collector.get()
+                    ops_before = len(collector) if collector is not None else 0
                     await _sync_dns_record(
-                        db, ip, sn, action="create", strict=True, skip_own_alias=True
+                        db,
+                        ip,
+                        sn,
+                        zone_id=await address_own_forward_zone_id(db, ip),
+                        action="create",
+                        strict=True,
+                        skip_own_alias=True,
                     )
+                    if collector is not None and len(collector) == ops_before:
+                        continue
+                    wrote_ip_ids.add(ip.id)
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:
@@ -7667,6 +7691,8 @@ async def _apply_dns_sync(
                 f"{fip.address}: DNS create failed — "
                 f"{getattr(op_row, 'last_error', None) or 'unknown'}"
             )
+            if fip.id not in wrote_ip_ids:
+                continue
             if fip.id in body.create_for_ip_ids:
                 created = max(0, created - 1)
             elif fip.id in ip_ids_to_sync:
@@ -7900,7 +7926,7 @@ async def dns_sync_commit_block(
                 "dns-sync",
                 "block",
                 str(block.id),
-                block.network,
+                str(block.network),
                 new_value={
                     "created": created,
                     "updated": updated,
@@ -8727,6 +8753,32 @@ async def list_mac_history(
 # would be circular. See ``_register_network_context_endpoint`` below.
 
 
+async def _clear_ip_dns_zone(db: AsyncSession, ip: IPAddress, subnet: Subnet) -> bool:
+    """Remove an address's DNS presence: the operator picked "None" as its zone.
+
+    The one clear path, shared by single Edit and Bulk edit (#2172) so the two
+    cannot diverge. It deletes every auto-generated record the row owns — the
+    forward A/AAAA in its zone and in any extra zone, the PTR, and its aliases
+    (#2084) — queueing a delete op for each zone IPAM authors. It then nulls
+    ``forward_zone_id`` and empties ``extra_zone_ids``: with either left set,
+    the next Sync DNS (and the scheduled auto-sync) lists the record missing
+    there and publishes it again, as does a later unrelated edit. A subnet
+    that has a forward zone of its own still claims the host: the address
+    follows it, so Sync DNS offers the record there.
+
+    It must go through ``action="delete"``: an ``"update"`` with
+    ``zone_id=None`` means "resolve a zone", which falls back to the subnet's
+    zone (a move) or the row's own ``forward_zone_id`` (a re-publish in place),
+    and removes nothing (#502, #2172). An address with no records is a no-op.
+
+    Returns whether any record was removed.
+    """
+    removed = await _sync_dns_record(db, ip, subnet, action="delete")
+    ip.forward_zone_id = None
+    ip.extra_zone_ids = []
+    return removed
+
+
 @router.put("/addresses/{address_id}", response_model=IPAddressResponse)
 async def update_address(
     address_id: uuid.UUID, body: IPAddressUpdate, current_user: CurrentUser, db: DB
@@ -8801,14 +8853,29 @@ async def update_address(
             ],
             already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
         )
-    hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
-    mac_touched = "mac_address" in touched
+    # "Touched" means CHANGED, not merely present: the Edit dialog sends its
+    # hostname, MAC and zone on every Save, so presence alone re-ran every
+    # collision check and an untouched Save of a row that already shared a MAC
+    # or hostname (stored with a confirmation) was refused again (#2467).
+    hostname_changed = "hostname" in touched and (body.hostname or None) != (ip.hostname or None)
+    zone_changed = (
+        "dns_zone_id" in touched
+        and (uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None) != ip.forward_zone_id
+    )
+    hostname_or_zone_touched = hostname_changed or zone_changed
+    new_mac_norm = _normalize_mac(body.mac_address)
+    old_mac_norm = _normalize_mac(str(ip.mac_address) if ip.mac_address else None)
+    mac_touched = "mac_address" in touched and (
+        new_mac_norm != old_mac_norm or (new_mac_norm is None and bool(body.mac_address))
+    )
     # Effective role for the collision check — pending value if the
     # client touched it, otherwise the existing row's role. The role
     # exemption only matters when MAC was touched (otherwise no MAC
     # collision check runs anyway).
     effective_role = body.role if "role" in touched else ip.role
-    extra_zones_touched = "extra_zone_ids" in touched
+    extra_zones_touched = "extra_zone_ids" in touched and sorted(
+        body.extra_zone_ids or []
+    ) != sorted(ip.extra_zone_ids or [])
     if not body.force and (hostname_or_zone_touched or mac_touched or extra_zones_touched):
         subnet_for_check = await db.get(Subnet, ip.subnet_id)
         new_hostname = body.hostname if body.hostname is not None else ip.hostname
@@ -8909,11 +8976,17 @@ async def update_address(
         # falls back to the subnet's effective zone (and early-returns on an
         # empty hostname), so it would NOT actually remove the records
         # (#502, and the bot review of the #493 fix).
-        await _sync_dns_record(db, ip, subnet, action="delete")
         if zone_cleared:
-            # Make the removal stick: without this a later unrelated edit
-            # would preserve forward_zone_id and re-create the record.
-            ip.forward_zone_id = None
+            # Also nulls forward_zone_id and empties extra_zone_ids, so the
+            # removal sticks: otherwise Sync DNS, or a later unrelated edit,
+            # would publish the records there again (#2172). The clear wins
+            # over extra_zone_ids sent in the same request.
+            if ip.extra_zone_ids:
+                old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                changes_for_audit["extra_zone_ids"] = []
+            await _clear_ip_dns_zone(db, ip, subnet)
+        else:
+            await _sync_dns_record(db, ip, subnet, action="delete")
     elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
@@ -9174,6 +9247,9 @@ class ProfileScanResponse(BaseModel):
     "/addresses/{address_id}/profile",
     response_model=ProfileScanResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    # An nmap scan under the un-gated IPAM router (#2279): 404 with the
+    # nmap module off, exactly as /nmap/scans does.
+    dependencies=[Depends(require_module("tools.nmap"))],
 )
 async def profile_address(
     address_id: uuid.UUID,
@@ -10954,8 +11030,9 @@ class IPAddressBulkChanges(BaseModel):
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
     # Apply a forward DNS zone change to every selected IP. Triggers per-row
-    # record reconciliation (create / move / delete) via _sync_dns_record.
-    # Use the empty string ``""`` to clear a zone assignment.
+    # record reconciliation (create / move) via _sync_dns_record. The empty
+    # string ``""`` clears: each address's records are removed and its
+    # ``forward_zone_id`` nulled, as single Edit does for zone None (#2172).
     dns_zone_id: str | None = None
     # Role + reservation TTL — both opt-in like the other bulk fields.
     # Empty string on ``role`` clears (= "no specific role" for the
@@ -10990,6 +11067,9 @@ class IPAddressBulkEditResponse(BaseModel):
     updated_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
+    # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
+    # removed. An updated address absent from it had none to remove (#2172).
+    dns_cleared: list[uuid.UUID] = []
 
 
 @router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
@@ -11031,6 +11111,8 @@ async def bulk_edit_addresses(
     skipped: list[uuid.UUID] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
+    # Addresses whose DNS records a zone clear removed (#2172).
+    dns_cleared: list[uuid.UUID] = []
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
@@ -11164,9 +11246,20 @@ async def bulk_edit_addresses(
                         subnet_cache[ip.subnet_id] = subnet
                 if subnet is not None:
                     old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
-                    await _sync_dns_record(
-                        db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
-                    )
+                    if new_zone_id is None:
+                        if ip.extra_zone_ids:
+                            old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                        # ``""`` clears (#2172): the same removal single Edit
+                        # runs for zone None. An ``"update"`` with
+                        # ``zone_id=None`` would resolve a zone instead, moving
+                        # the records into the subnet's zone or re-publishing
+                        # them where they are.
+                        if await _clear_ip_dns_zone(db, ip, subnet):
+                            dns_cleared.append(ip.id)
+                    else:
+                        await _sync_dns_record(
+                            db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
+                        )
 
             db.add(
                 _audit(
@@ -11220,6 +11313,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        dns_cleared=dns_cleared,
     )
 
 

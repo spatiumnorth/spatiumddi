@@ -149,7 +149,7 @@ jobs:
         # on PATH before the chart-bake step.
         uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.1
       - name: Fetch k3s binary + airgap tarball
         run: |
           set -euo pipefail

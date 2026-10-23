@@ -40,9 +40,14 @@ _MAX_DEPTH = 12
 
 # Credential field names in this codebase that ``SECRET_KEY_NAME_RE`` does not
 # match. Anchored so ``communities`` (BGP route attributes) and
-# ``header_names`` stay readable.
+# ``header_names`` stay readable. ``*_enc`` is the SNMP v3 user's
+# ``auth_pass_enc`` / ``priv_pass_enc`` ciphertext, and
+# ``service_account_json`` the Google Cloud DNS key file — both are also
+# caught by value shape today (a Fernet token, a PEM private key), but the
+# name is the defence that does not depend on the value's encoding (#2015).
 _EXTRA_SECRET_KEY_RE = re.compile(
-    r"((^|_)community$|(^|_)pass$|key_pem$|otpauth|(^|_)creds?$|(^|_)headers?$)",
+    r"((^|_)community$|(^|_)pass$|key_pem$|otpauth|(^|_)creds?$|(^|_)headers?$"
+    r"|(^|_)enc$|service_account_json)",
     re.IGNORECASE,
 )
 _PEM_PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
@@ -79,3 +84,26 @@ def redact_audit_value(value: Any, _depth: int = 0) -> Any:
     if isinstance(value, str):
         return _redact_string(value)
     return value
+
+
+# The audit-row fields that carry writer-supplied content. Everything else on
+# a serialized audit row (action, resource_type, user display name, ...) is a
+# column the platform fills itself, and is shipped as is.
+AUDIT_CONTENT_FIELDS = ("old_value", "new_value", "error_detail")
+
+
+def redact_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """A shallow copy of a serialized audit payload with its content redacted.
+
+    For every surface that ships an audit row OUT of the box — the audit
+    forwarders (syslog / webhook / SMTP), the typed-event outbox, and the
+    copilot tools — so they show what the audit API shows (#2015). It returns
+    a copy: the stored ``audit_log`` row is append-only and hash-chained, and
+    is never touched. Idempotent, so a payload redacted upstream can pass
+    through again unchanged.
+    """
+    out = dict(payload)
+    for field in AUDIT_CONTENT_FIELDS:
+        if field in out and out[field] is not None:
+            out[field] = redact_audit_value(out[field])
+    return out
