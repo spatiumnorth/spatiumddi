@@ -272,3 +272,26 @@ async def test_endpoint_rejects_cross_space_block_id(
         },
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_candidates_carry_free_addresses_and_min_filter(
+    db_session: AsyncSession,
+) -> None:
+    """Every candidate reports its usable addresses; min_free_addresses
+    filters on that (0 never returns fewer than no filter) (#2418)."""
+    space = await _make_space(db_session)
+    db_session.add(IPBlock(space_id=space.id, network="10.0.0.0/16", name="t"))
+    await db_session.flush()
+
+    kw = dict(space_id=space.id, prefix_length=24, address_family=4, count=5)
+    base = await find_free_space(db_session, **kw)
+    assert len(base.candidates) == 5
+    assert all(c.free_addresses == 254 for c in base.candidates)
+
+    zero = await find_free_space(db_session, min_free_addresses=0, **kw)
+    assert len(zero.candidates) == 5
+    ok = await find_free_space(db_session, min_free_addresses=254, **kw)
+    assert len(ok.candidates) == 5
+    none = await find_free_space(db_session, min_free_addresses=255, **kw)
+    assert none.candidates == []

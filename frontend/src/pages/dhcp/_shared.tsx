@@ -147,9 +147,11 @@ export function DeleteConfirmModal({
   isPending,
   error,
   notice,
+  acknowledgement = "I understand this action cannot be undone.",
 }: {
   title: string;
   description: string;
+  acknowledgement?: string;
   referencesTitle?: string;
   references?: string[];
   onConfirm: () => void;
@@ -185,7 +187,7 @@ export function DeleteConfirmModal({
             onChange={(e) => setChecked(e.target.checked)}
             className="mt-0.5"
           />
-          <span>I understand this action cannot be undone.</span>
+          <span>{acknowledgement}</span>
         </label>
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">

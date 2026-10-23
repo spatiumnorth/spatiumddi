@@ -225,16 +225,12 @@ async def toggle_feature_module(
             )
 
     row = await fm_svc.set_module_enabled(db, module_id, body.enabled, user_id=current_user.id)
-    # Mirror the toggle into the matching ``PlatformSettings`` column
-    # for integrations. The Celery beat reconcilers gate on those
-    # columns directly; keeping both sides in lock-step lets the
-    # reconciler stop / start without touching every task. Non-
-    # integration ids skip this branch.
-    settings_col = fm_svc.INTEGRATION_SETTINGS_MIRROR.get(module_id)
-    if settings_col is not None:
-        ps = await db.get(PlatformSettings, 1)
-        if ps is not None:
-            setattr(ps, settings_col, body.enabled)
+    # Refresh the derived ``PlatformSettings.integration_*_enabled`` copy.
+    # Nothing in the app gates on it any more — the sweeps, alerts and
+    # dashboards read the module (#2196 / #2197) — and the helper creates
+    # the settings row when it is missing rather than skipping the write.
+    if module_id in fm_svc.INTEGRATION_SETTINGS_MIRROR:
+        await fm_svc.sync_integration_settings_mirror(db)
     db.add(
         AuditLog(
             user_id=current_user.id,
