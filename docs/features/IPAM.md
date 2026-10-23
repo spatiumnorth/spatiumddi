@@ -80,8 +80,8 @@ Subnet
   -- Status / Metadata
   status: enum(active, deprecated, reserved, quarantine)
   utilization_percent: float (computed)
-  total_ips: int (computed)
-  allocated_ips: int (computed)
+  total_ips: int (computed — usable addresses; IPv4 network + broadcast excluded)
+  allocated_ips: int (computed — non-available rows, excluding the IPv4 network / broadcast placeholders, so allocated ≤ total)
   
   -- Custom Fields (see section 6)
   custom_fields: JSONB
@@ -1928,15 +1928,24 @@ confirmation gates and pg advisory locks held through commit:
   a child's network or broadcast address (e.g. .127 / .128 of a /24
   split into /25s) is a `host_on_child_boundary` conflict naming the
   address, and the commit refuses it; the preview also warns that
-  every client needs the new netmask. Service in
-  `app.services.ipam.subnet_split`.
+  every client needs the new netmask. Children inherit
+  the parent's compliance and discovery settings (PCI / HIPAA scope,
+  internet-facing, role, do-not-probe, kind, customer, site, discovery
+  and split-horizon); integration ownership and import provenance are
+  not carried, and the preview warns when the parent has any. Service
+  in `app.services.ipam.subnet_split`.
 
 - `POST /ipam/subnets/{id}/merge/preview` + `/commit` — collapse
   contiguous siblings back into one supernet via
   `ipaddress.collapse_addresses`. Preview reports the prospective
   merged CIDR + any conflicts. Single-source gateways are
   preserved; differing source gateways are nulled (operator must
-  re-set). Service in `app.services.ipam.subnet_merge`.
+  re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
+  are the safe union (true when any source has it, and the preview
+  says so); sources that disagree on kind, customer or site are a
+  conflict; any other disagreeing setting (role, discovery, ...) is a
+  preview warning and the target's value is kept. Service in
+  `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the
 bulk-action toolbar on the block- and space-level subnet tables:

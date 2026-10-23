@@ -1069,6 +1069,15 @@ Admin UI lives at `/admin/alerts` — rules CRUD + live events viewer
 (15 s refetch) + per-event `Resolve` to manually silence a known-
 noisy event.
 
+A manual `Resolve` sticks (#2498): the event is stamped
+`last_observed_value.resolved_by = "manual"`, and while its subject keeps
+matching, the evaluator opens no new event and delivers nothing. Once the
+subject stops matching, the suppression ends, so a later re-match opens a
+fresh event. Same semantics as the conformity engine below; the
+evaluator's own auto-resolve is unchanged. This covers the threshold-style
+rules evaluated by the shared loop; the rule types with their own
+evaluator (transition-once, latch and similar) keep their own handling.
+
 Conformity evaluations (#106) also feed this surface: a
 `ConformityPolicy` can pin `fail_alert_rule_id`, and a `pass→fail`
 transition on a (policy, resource) pair opens an `AlertEvent` row
