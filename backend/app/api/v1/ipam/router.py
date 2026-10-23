@@ -5479,6 +5479,9 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
 
     if auto_created:
         await _update_utilization(db, subnet.id)
+        # The block rollup sums subnet.allocated_ips in SQL: flush the new
+        # count first or it reads the row as inserted (0) (#2532).
+        await db.flush()
 
     await _update_block_utilization(db, subnet.block_id)
 
