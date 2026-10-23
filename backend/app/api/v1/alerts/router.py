@@ -18,11 +18,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select, update
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.permissions import require_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
@@ -304,7 +305,11 @@ class EvaluateResponse(BaseModel):
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 
-@router.get("/rules", response_model=list[AlertRuleResponse])
+@router.get(
+    "/rules",
+    response_model=list[AlertRuleResponse],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     res = await db.execute(select(AlertRule).order_by(AlertRule.name))
     return list(res.scalars().all())
@@ -460,7 +465,11 @@ async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> N
 # ── Events ─────────────────────────────────────────────────────────────────
 
 
-@router.get("/events", response_model=list[AlertEventResponse])
+@router.get(
+    "/events",
+    response_model=list[AlertEventResponse],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_events(
     db: DB,
     current_user: CurrentUser,

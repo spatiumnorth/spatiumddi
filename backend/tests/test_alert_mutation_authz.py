@@ -163,3 +163,36 @@ async def test_manual_evaluate_is_audited(client: AsyncClient, db_session: Async
     assert len(rows) == 1
     assert rows[0].resource_type == "alert_rule"
     assert rows[0].result == "success"
+
+
+async def _user_with(db: AsyncSession, perms: list[dict]) -> str:
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@example.com",
+        display_name="U",
+        hashed_password=hash_password("x"),
+    )
+    db.add(u)
+    await db.flush()
+    role = Role(name=f"r-{uuid.uuid4().hex[:6]}", description="", permissions=perms)
+    db.add(role)
+    await db.flush()
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    group.users = [u]
+    db.add(group)
+    await db.flush()
+    await db.commit()
+    return create_access_token(str(u.id))
+
+
+async def test_alert_reads_need_the_read_permission(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    other = await _user_with(db_session, [{"action": "read", "resource_type": "subnet"}])
+    allowed = await _user_with(db_session, [{"action": "read", "resource_type": "alert"}])
+    for path in ("/api/v1/alerts/rules", "/api/v1/alerts/events"):
+        r = await client.get(path, headers={"Authorization": f"Bearer {other}"})
+        assert r.status_code == 403, (path, r.text)
+        r = await client.get(path, headers={"Authorization": f"Bearer {allowed}"})
+        assert r.status_code == 200, (path, r.text)
