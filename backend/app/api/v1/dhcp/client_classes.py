@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
@@ -20,6 +20,7 @@ from app.services.dhcp.class_refs import (
     classes_testing_membership,
     describe_pools,
     pools_restricted_to,
+    reserved_name_reason,
 )
 from app.services.dhcp.option_validation import normalize_options, validate_class_test
 
@@ -60,6 +61,22 @@ class ClientClassResponse(BaseModel):
     modified_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def reserved_name(self) -> bool:
+        """True for a row stored before #2296 whose name is now reserved.
+
+        Such a row keeps rendering (refusing to would break an existing
+        install's bundle); it is flagged so the operator can rename it.
+        """
+        return reserved_name_reason(self.name) is not None
+
+
+def _check_name(name: str) -> None:
+    reason = reserved_name_reason(name)
+    if reason is not None:
+        raise HTTPException(status_code=422, detail=f"Client class name is reserved: {reason}")
 
 
 def _check_test(expression: str, family: str) -> None:
@@ -151,6 +168,7 @@ async def create_class(
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
         raise HTTPException(status_code=404, detail="DHCP server group not found")
+    _check_name(body.name)
     existing = await db.execute(
         select(DHCPClientClass).where(
             DHCPClientClass.group_id == group_id, DHCPClientClass.name == body.name
@@ -192,6 +210,9 @@ async def update_class(
     family_changed = family != cc.address_family
     new_name = changes.get("name")
     if new_name is not None and new_name != cc.name:
+        # Only a RENAME is checked: a row already stored with a reserved name
+        # keeps saving its other fields (#2296).
+        _check_name(new_name)
         dupe = await db.execute(
             select(DHCPClientClass.id).where(
                 DHCPClientClass.group_id == cc.group_id, DHCPClientClass.name == new_name
