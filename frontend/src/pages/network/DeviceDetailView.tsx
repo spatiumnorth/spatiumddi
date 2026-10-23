@@ -23,6 +23,7 @@ import {
   type NetworkNeighbourQuery,
   type NetworkTestConnectionResult,
 } from "@/lib/api";
+import { formatApiError } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
@@ -261,8 +262,9 @@ export function DeviceDetailView() {
           </div>
         )}
         {pollMut.isError && (
-          <p role="alert" className="mt-3 text-sm text-destructive">
-            {errMsg(pollMut.error, "Poll failed")}
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            Poll Now was refused:{" "}
+            {formatApiError(pollMut.error, "the request failed")}
           </p>
         )}
         {pollMut.isSuccess && pollMut.data && (

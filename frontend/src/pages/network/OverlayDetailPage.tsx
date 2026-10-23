@@ -471,11 +471,6 @@ function SitesTab({ overlayId }: { overlayId: string }) {
         </HeaderButton>
       </div>
 
-      {detach.isError && (
-        <p role="alert" className="text-sm text-destructive">
-          {formatApiError(detach.error, "Detach failed")}
-        </p>
-      )}
       <SiteTable
         rows={sitesQ.data ?? []}
         onEdit={(r) => setEditing(r)}
@@ -499,14 +494,31 @@ function SitesTab({ overlayId }: { overlayId: string }) {
       <ConfirmModal
         open={confirmDetachId !== null}
         title="Detach site"
-        message="Detach this site from the overlay?"
+        loading={detach.isPending}
+        message={
+          <>
+            Detach this site from the overlay?
+            {detach.isError && (
+              <span role="alert" className="mt-2 block text-destructive">
+                Could not detach the site:{" "}
+                {formatApiError(detach.error, "the request failed")}
+              </span>
+            )}
+          </>
+        }
         confirmLabel="Detach"
         tone="destructive"
         onConfirm={() => {
-          if (confirmDetachId) detach.mutate(confirmDetachId);
+          // Stays open on a refusal, so it never reads as having worked.
+          if (confirmDetachId)
+            detach.mutate(confirmDetachId, {
+              onSuccess: () => setConfirmDetachId(null),
+            });
+        }}
+        onClose={() => {
+          detach.reset();
           setConfirmDetachId(null);
         }}
-        onClose={() => setConfirmDetachId(null)}
       />
     </div>
   );

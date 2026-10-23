@@ -37,6 +37,7 @@ from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
+from app.services.ipam.utilization import counts_toward_utilization
 
 _BIGINT_MAX = 2**63 - 1
 
@@ -381,7 +382,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )

@@ -51,6 +51,7 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     subnet_has_surviving_addresses,
 )
+from app.services.ipam.utilization import counts_toward_utilization
 
 logger = structlog.get_logger(__name__)
 
@@ -207,7 +208,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )

@@ -56,6 +56,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
     safe_filename,
     safe_url,
     scrub_url,
@@ -197,7 +198,7 @@ class WebDAVDestination(BackupDestination):
                 # https_put, so a malformed stored URL is a 502-shaped
                 # destination error, not a runner-escaping exception.
                 raise BackupDestinationError(
-                    f"WebDAV PUT failed: {scrub_url(str(exc), target)}"
+                    f"WebDAV PUT failed: {scrub_url(describe_exc(exc), target)}"
                 ) from exc
         if resp.status_code not in (200, 201, 204):
             raise BackupDestinationError(
@@ -221,7 +222,7 @@ class WebDAVDestination(BackupDestination):
                 )
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 raise BackupDestinationError(
-                    f"WebDAV PROPFIND failed: {scrub_url(str(exc), url)}"
+                    f"WebDAV PROPFIND failed: {scrub_url(describe_exc(exc), url)}"
                 ) from exc
         if resp.status_code == 404:
             raise BackupDestinationError(
@@ -234,7 +235,9 @@ class WebDAVDestination(BackupDestination):
         try:
             tree = ET.fromstring(resp.content)  # noqa: S314 - server-controlled XML
         except ET.ParseError as exc:
-            raise BackupDestinationError(f"WebDAV PROPFIND xml parse failed: {exc}") from exc
+            raise BackupDestinationError(
+                f"WebDAV PROPFIND xml parse failed: {describe_exc(exc)}"
+            ) from exc
 
         rows: list[ArchiveListing] = []
         for response in tree.findall(f"{_DAV_NS}response"):
@@ -287,7 +290,7 @@ class WebDAVDestination(BackupDestination):
             try:
                 resp = await client.get(target)
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
-                raise BackupDestinationError(f"WebDAV GET failed: {exc}") from exc
+                raise BackupDestinationError(f"WebDAV GET failed: {describe_exc(exc)}") from exc
         if resp.status_code == 404:
             raise BackupDestinationError(
                 f"archive {safe_filename(filename)!r} not found at {safe_url(target)}"
@@ -304,7 +307,7 @@ class WebDAVDestination(BackupDestination):
             try:
                 resp = await client.delete(target)
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
-                raise BackupDestinationError(f"WebDAV DELETE failed: {exc}") from exc
+                raise BackupDestinationError(f"WebDAV DELETE failed: {describe_exc(exc)}") from exc
         # 404 is idempotent; 200 / 204 are success
         if resp.status_code in (200, 204, 404):
             return
@@ -361,7 +364,10 @@ class WebDAVDestination(BackupDestination):
                         ),
                     }
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
-                return {"ok": False, "error": f"webdav: {exc}"}
+                return {
+                    "ok": False,
+                    "error": f"webdav: {scrub_url(describe_exc(exc), probe_target)}",
+                }
         return {
             "ok": True,
             "detail": f"wrote + verified + deleted probe at {safe_url(probe_target)}",
