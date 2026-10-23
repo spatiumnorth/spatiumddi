@@ -255,6 +255,11 @@ class Settings(BaseSettings):
     # so unversioned local builds are obvious in the sidebar and don't
     # misreport themselves as a release.
     version: str = "dev"
+    # The build's own stamp (``0.0.0-nightly-YYYYMMDD+<sha>`` on a nightly),
+    # baked by the image's ``APP_VERSION`` build arg. Only used to give
+    # ``/version`` the nightly's one canonical spelling (#2111); empty on a
+    # build that was given none.
+    app_version: str = ""
 
     # GitHub repo coordinates used by the release-check task. Overridable
     # so forks can point their update check at their own repo.

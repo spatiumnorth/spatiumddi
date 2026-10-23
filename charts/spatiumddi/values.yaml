@@ -85,6 +85,15 @@ auth:
 # APPLIANCE_MODE / hostname / host IPs live here. Same shape as ``api.env``.
 sharedEnv: []
 
+# #2004 / #2176 — the appliance's version, appended to the api, worker and beat
+# env as APPLIANCE_VERSION (``settings.appliance_version``: what system/info and
+# /version report). A value of its own rather than a ``sharedEnv`` entry, so a
+# cluster Rolling Upgrade can hold it with ``image.tag`` in the HelmChartConfig
+# until every node runs the target: a HelmChartConfig pins a scalar, but
+# replaces a list whole. Empty (the default, and every install that is not an
+# appliance) renders no APPLIANCE_VERSION, which the api reads as unknown.
+applianceVersion: ""
+
 api:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
@@ -937,6 +946,10 @@ dnsAgents:
     #   #   loadBalancerIP: 10.0.0.53
     #   #   loadBalancerSourceRanges: [192.0.2.0/24]
     #   #   ipFamilyPolicy: PreferDualStack  # + ipFamilies: [IPv4, IPv6]
+    #   # 512Mi is for a group with NO blocklists. One catalog feed (AdGuard DNS
+    #   # filter, ~186k entries) needs roughly 1 GB while an apply is in flight
+    #   # (estimate): size the limit from docs/features/DNS.md section 8.0
+    #   # before subscribing.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }

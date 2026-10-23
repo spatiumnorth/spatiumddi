@@ -61,7 +61,14 @@ control plane is doing without standing up a separate Prometheus
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
 - **Conformity** — promoted from the Compliance surface; shows
-  the latest conformity-evaluation rollup.
+  the latest conformity-evaluation rollup. "Latest" is each
+  **enabled** policy's most recent evaluation pass: a target deleted
+  or moved out of a policy's scope drops out at that policy's next
+  pass, a disabled policy counts towards `policies_total` but reports
+  no results, and editing what a policy checks (`target_kind`,
+  `target_filter`, `check_kind`, `check_args`) clears its last pass
+  until it runs again. The conformity PDF reports the same set and
+  prints each policy's as-of time (#2278).
 - **Copilot Usage** — Operator Copilot token / cost observability.
 
 Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
@@ -1125,7 +1132,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): a derived copy of each integration's on/off state (`integration_kubernetes_enabled`, `integration_docker_enabled`, …; the `integrations.*` feature module is the switch, #2196), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): a derived copy of each integration's on/off state (`integration_kubernetes_enabled`, `integration_docker_enabled`, …; the `integrations.*` feature module is the switch, #2196), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 

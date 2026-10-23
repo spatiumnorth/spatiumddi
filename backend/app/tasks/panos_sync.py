@@ -20,6 +20,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.panos import PANOSFirewall
 from app.services.feature_modules import is_module_enabled
+from app.services.integration_sync_failure import record_sync_crash
 
 logger = structlog.get_logger(__name__)
 
@@ -69,7 +70,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # A crash leaves the shared session in a failed
                     # transaction; roll back so the next firewall still syncs.
                     await db.rollback()
-                    errors.append(f"{fw_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        PANOSFirewall,
+                        firewall_id,
+                        resource_type="panos_firewall",
+                        action="panos.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{fw_name}: {crash}")
                     logger.warning(
                         "panos_reconcile_crash", firewall=str(firewall_id), error=str(exc)
                     )
@@ -108,7 +117,21 @@ async def _run_one(firewall_id: str) -> dict[str, Any]:
             fw = await db.get(PANOSFirewall, _uuid.UUID(firewall_id))
             if fw is None:
                 return {"status": "not_found"}
-            summary = await reconcile_firewall(db, fw)
+            row_id = fw.id
+            try:
+                summary = await reconcile_firewall(db, fw)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    PANOSFirewall,
+                    row_id,
+                    resource_type="panos_firewall",
+                    action="panos.reconcile",
+                    exc=exc,
+                )
+                logger.warning("panos_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,

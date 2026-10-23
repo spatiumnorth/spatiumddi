@@ -25,7 +25,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
@@ -3428,9 +3428,7 @@ def _audit_forward_target(
 
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
-async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_audit_targets(current_user: SuperAdmin, db: DB) -> list[AuditTargetResponse]:
     res = await db.execute(select(AuditForwardTarget).order_by(AuditForwardTarget.name))
     return [_target_to_response(t) for t in res.scalars().all()]
 
@@ -3441,11 +3439,9 @@ async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTar
     status_code=status.HTTP_201_CREATED,
 )
 async def create_audit_target(
-    body: AuditTargetBody, current_user: CurrentUser, db: DB
+    body: AuditTargetBody, current_user: SuperAdmin, db: DB
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     _require_webhook_url(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
@@ -3478,12 +3474,10 @@ async def update_audit_target(
     # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
     target_id: uuid.UUID,
     body: AuditTargetBody,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3512,9 +3506,7 @@ async def update_audit_target(
 
 
 @router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
@@ -3525,7 +3517,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
 
 @router.post("/audit-forward-targets/{target_id}/test")
 async def test_audit_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> dict[str, Any]:
     """Send a synthetic event to one target and report success / error.
 
@@ -3533,8 +3525,6 @@ async def test_audit_target(
     filter it out in the collector if they want. Doesn't land in
     ``audit_log`` — this is explicit probe traffic, not an audit.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3864,9 +3854,7 @@ def _audit_influx(
 
 
 @router.get("/influxdb-targets", response_model=list[InfluxDBTargetResponse])
-async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[InfluxDBTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_influxdb_targets(current_user: SuperAdmin, db: DB) -> list[InfluxDBTargetResponse]:
     res = await db.execute(select(InfluxDBTarget).order_by(InfluxDBTarget.name))
     return [_influx_to_response(t) for t in res.scalars().all()]
 
@@ -3877,11 +3865,9 @@ async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[Influ
     status_code=status.HTTP_201_CREATED,
 )
 async def create_influxdb_target(
-    body: InfluxDBTargetBody, current_user: CurrentUser, db: DB
+    body: InfluxDBTargetBody, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = InfluxDBTarget()
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
@@ -3901,12 +3887,10 @@ async def create_influxdb_target(
 async def update_influxdb_target(
     target_id: uuid.UUID,
     body: InfluxDBTargetBody,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3923,9 +3907,7 @@ async def update_influxdb_target(
 
 
 @router.delete("/influxdb-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_influxdb_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_influxdb_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         return
@@ -3942,7 +3924,7 @@ class InfluxDBTestResponse(BaseModel):
 
 @router.post("/influxdb-targets/{target_id}/test", response_model=InfluxDBTestResponse)
 async def test_influxdb_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTestResponse:
     """Write one synthetic point and report the server's verdict.
 
@@ -3953,8 +3935,6 @@ async def test_influxdb_target(
     contaminates a real series, and the watermarks are untouched — this
     is a probe, not a push.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -4105,7 +4085,7 @@ class BrandingLogoInfo(BaseModel):
 
 @router.put("/branding/logo", response_model=BrandingLogoInfo)
 async def upload_branding_logo(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     file: UploadFile = File(..., description="PNG image, 512 KB maximum."),
 ) -> BrandingLogoInfo:
@@ -4116,11 +4096,6 @@ async def upload_branding_logo(
     into stored XSS against every visitor, including unauthenticated ones.
     """
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     # Read with one byte of headroom so an oversized upload is detected
     # rather than silently truncated to the limit.
@@ -4194,14 +4169,9 @@ async def upload_branding_logo(
 
 
 @router.delete("/branding/logo", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_branding_logo(current_user: CurrentUser, db: DB) -> Response:
+async def delete_branding_logo(current_user: SuperAdmin, db: DB) -> Response:
     """Drop the custom logo; the UI falls back to the bundled asset."""
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     row = (
         await db.execute(

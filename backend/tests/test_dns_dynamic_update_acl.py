@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns.agents import _auth_agent
@@ -545,3 +546,111 @@ def test_windows_rejects_name_scope() -> None:
                 )
             ],
         )
+
+
+# ── Audit trail for ingested records (#2302) ────────────────────────────────
+
+
+async def _ingest_post(client: AsyncClient, server: DNSServer, zone_name: str, records: list[dict]):
+    app.dependency_overrides[_auth_agent] = lambda: (server, {})
+    try:
+        return await client.post(
+            "/api/v1/dns/agents/ingested-records",
+            json={"zone_name": zone_name, "records": records},
+        )
+    finally:
+        app.dependency_overrides.pop(_auth_agent, None)
+
+
+async def test_ingest_audits_adds_and_removes_by_name(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.audit import AuditLog
+
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(group)
+    await db_session.flush()
+    server = DNSServer(group_id=group.id, name="ns1", driver="bind9", host="10.0.0.53", port=53)
+    zone = DNSZone(
+        group_id=group.id,
+        name="aud.example.com.",
+        zone_type="primary",
+        kind="forward",
+        dynamic_update_enabled=True,
+    )
+    db_session.add_all([server, zone])
+    await db_session.commit()
+
+    r = await _ingest_post(
+        client,
+        server,
+        "aud.example.com",
+        [{"name": "dc01", "record_type": "A", "value": "10.0.0.5"}],
+    )
+    assert r.status_code == 200, r.text
+    # Next sweep: dc01 withdrawn, dc02 appears.
+    r = await _ingest_post(
+        client,
+        server,
+        "aud.example.com",
+        [{"name": "dc02", "record_type": "A", "value": "10.0.0.6"}],
+    )
+    assert r.status_code == 200, r.text
+    # Identical sweep: no change, no audit row.
+    r = await _ingest_post(
+        client,
+        server,
+        "aud.example.com",
+        [{"name": "dc02", "record_type": "A", "value": "10.0.0.6"}],
+    )
+    assert r.json()["added"] == 0 and r.json()["removed"] == 0
+
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "dns.record.external_ingest")
+                .order_by(AuditLog.timestamp)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2  # one summary row per changing batch
+    assert rows[0].resource_id == str(zone.id)
+    assert [a["fqdn"] for a in rows[0].new_value["added_records"]] == ["dc01.aud.example.com"]
+    assert [a["fqdn"] for a in rows[1].new_value["added_records"]] == ["dc02.aud.example.com"]
+    removed = rows[1].old_value["removed_records"]
+    assert [x["fqdn"] for x in removed] == ["dc01.aud.example.com"]
+    assert removed[0]["value"] == "10.0.0.5"
+    assert rows[1].new_value["removed"] == 1
+
+
+async def test_ingest_audit_names_are_capped(client: AsyncClient, db_session: AsyncSession) -> None:
+    from app.models.audit import AuditLog
+
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(group)
+    await db_session.flush()
+    server = DNSServer(group_id=group.id, name="ns1", driver="bind9", host="10.0.0.53", port=53)
+    zone = DNSZone(
+        group_id=group.id,
+        name="cap.example.com.",
+        zone_type="primary",
+        kind="forward",
+        dynamic_update_enabled=True,
+    )
+    db_session.add_all([server, zone])
+    await db_session.commit()
+
+    recs = [{"name": f"h{i}", "record_type": "A", "value": f"10.1.0.{i}"} for i in range(80)]
+    r = await _ingest_post(client, server, "cap.example.com", recs)
+    assert r.json()["added"] == 80
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == "dns.record.external_ingest")
+        )
+    ).scalar_one()
+    assert row.new_value["added"] == 80
+    assert len(row.new_value["added_records"]) == 50
+    assert row.new_value["truncated"] is True

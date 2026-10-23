@@ -809,6 +809,10 @@ def is_known(module_id: str) -> bool:
 _CACHE_TTL_S: Final[float] = 5.0
 _cache_loaded_at: float = 0.0
 _cached_enabled: set[str] = set()
+# The catalog the cached set was resolved against. A verdict computed under a
+# different ``MODULES`` (the suite swaps defaults per test; #2395) must not
+# answer for this one, TTL or not.
+_cached_for: object = None
 
 
 def invalidate_cache() -> None:
@@ -923,15 +927,16 @@ async def get_enabled_modules(db: AsyncSession) -> set[str]:
     A first row written elsewhere (a mirror in a Celery worker) is picked up
     at the next expiry.
     """
-    global _cache_loaded_at, _cached_enabled
+    global _cache_loaded_at, _cached_enabled, _cached_for
     now = time.monotonic()
-    if now - _cache_loaded_at < _CACHE_TTL_S and _cached_enabled:
+    if now - _cache_loaded_at < _CACHE_TTL_S and _cached_enabled and _cached_for is MODULES:
         return _cached_enabled
 
     own = (await load_module_states(db)).own
     enabled = {mid for mid in own if _resolve_with_parents(mid, own)}
 
     _cached_enabled = enabled
+    _cached_for = MODULES
     _cache_loaded_at = now
     return enabled
 

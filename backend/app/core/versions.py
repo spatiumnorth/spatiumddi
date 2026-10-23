@@ -86,6 +86,31 @@ def nightly_build_date(version: str | None) -> date | None:
         return None
 
 
+_BARE_NIGHTLY_RE = re.compile(r"^nightly-(\d{8})$")
+
+
+def canonical_version(version: str | None, build_stamp: str | None = None) -> str:
+    """The one spelling of a running build's version (#2111).
+
+    A nightly's images are tagged ``nightly-YYYYMMDD`` (the Helm ``image.tag``,
+    so ``VERSION`` in the api), while its agents, supervisor and appliance
+    slot report ``0.0.0-nightly-YYYYMMDD+<sha>``. This maps the bare tag onto
+    the second form, taking the ``+<sha>`` from ``build_stamp`` (the build's
+    own stamp, baked as ``APP_VERSION``) when that names the same night.
+    Anything that is not a bare nightly tag is returned unchanged.
+    """
+    value = (version or "").strip()
+    match = _BARE_NIGHTLY_RE.match(value)
+    if not match:
+        return value
+    stamp = (build_stamp or "").strip()
+    night = nightly_build_date(stamp)
+    if night is not None and f"{night:%Y%m%d}" == match.group(1):
+        return stamp
+    candidate = f"0.0.0-nightly-{match.group(1)}"
+    return candidate if nightly_build_date(candidate) is not None else value
+
+
 def includes_release(version: str | None, release: str) -> bool | None:
     """Whether a build reporting ``version`` has everything in ``release``.
 

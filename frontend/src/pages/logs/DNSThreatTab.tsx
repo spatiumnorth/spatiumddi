@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -16,6 +17,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
 import {
+  authApi,
   dnsThreatApi,
   type DNSClientWindow,
   type DNSTunnelSignal,
@@ -176,6 +178,13 @@ export function DNSThreatTab() {
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
   const qc = useQueryClient();
+  // Only a superadmin can change feature modules, so only they get the link.
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
+  const isSuperadmin = me?.is_superadmin ?? false;
   const refreshAll = () => {
     void qc.invalidateQueries({ queryKey: ["dns-threat-windows"] });
     void qc.invalidateQueries({ queryKey: ["dns-threat-summary"] });
@@ -234,9 +243,27 @@ export function DNSThreatTab() {
             <p className="mt-1 max-w-2xl text-xs text-muted-foreground">
               Scoring reads the <strong>names your clients look up</strong>, so
               it is disabled by default rather than switched on by an upgrade.
-              Enable the <strong>Security → DNS threat analytics</strong> module
-              in Settings to turn it on. It also needs query logging enabled on
-              at least one DNS server group before there is anything to score.
+              {isSuperadmin ? (
+                <>
+                  Enable <strong>DNS threat analytics</strong> (Security) on the{" "}
+                  <Link
+                    to="/admin/features"
+                    className="text-primary underline underline-offset-2"
+                  >
+                    Features &amp; Integrations
+                  </Link>{" "}
+                  page to turn it on.
+                </>
+              ) : (
+                <>
+                  Ask an administrator to enable{" "}
+                  <strong>DNS threat analytics</strong> (Security) on the
+                  Features &amp; Integrations page.
+                </>
+              )}{" "}
+              It also needs query logging enabled on at least one DNS server
+              group (DNS → Server Groups → the group → Options) before there is
+              anything to score.
             </p>
           </div>
         </div>
