@@ -17,6 +17,7 @@ import {
   type AlertSeverity,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn } from "@/lib/utils";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -133,6 +134,13 @@ export function AsnDetailPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("whois");
   const { enabled: featureEnabled } = useFeatureModules();
+  // #2518 — the refreshes are POSTs under the router's write gate on
+  // 'manage_asns', as the ASN list's buttons are.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
 
   const {
     data: asn,
@@ -320,6 +328,7 @@ export function AsnDetailPage() {
                   ? "Private ASN — no public WHOIS"
                   : undefined
               }
+              {...writeGate}
             >
               Refresh WHOIS
             </HeaderButton>
@@ -333,6 +342,7 @@ export function AsnDetailPage() {
                   ? "Private ASN — no RPKI ROAs issued"
                   : "Pull the global ROA dump and reconcile this ASN's ROAs"
               }
+              {...writeGate}
             >
               Refresh RPKI
             </HeaderButton>

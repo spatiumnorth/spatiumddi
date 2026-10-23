@@ -25,6 +25,7 @@ import {
 } from "@/lib/api";
 import { formatApiError } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 
@@ -67,6 +68,18 @@ export function DeviceDetailView() {
     queryFn: () => networkApi.getDevice(id),
     enabled: !!id,
   });
+
+  // #2518 — the router asks write (delete) on 'manage_network_devices', as
+  // the device list does since #1851.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_network_devices"),
+    "Requires write permission on network devices",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_network_devices"),
+    "Requires delete permission on network devices",
+  );
 
   const testMut = useMutation({
     mutationFn: () => networkApi.testConnection(id),
@@ -214,6 +227,7 @@ export function DeviceDetailView() {
               icon={TestTube2}
               onClick={() => testMut.mutate()}
               disabled={testMut.isPending}
+              {...writeGate}
             >
               Test Connection
             </HeaderButton>
@@ -221,16 +235,22 @@ export function DeviceDetailView() {
               icon={PlayCircle}
               onClick={() => pollMut.mutate()}
               disabled={pollMut.isPending}
+              {...writeGate}
             >
               Poll Now
             </HeaderButton>
-            <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+            <HeaderButton
+              icon={Pencil}
+              onClick={() => setShowEdit(true)}
+              {...writeGate}
+            >
               Edit
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={() => setShowDelete(true)}
+              {...deleteGate}
             >
               Delete
             </HeaderButton>
