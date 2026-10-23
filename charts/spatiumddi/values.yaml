@@ -567,6 +567,14 @@ worker:
   # #1111 — ``bundles`` carries the DNS agent bundle renders; give it its
   # own worker (concurrency 1, its own memory cap) on large-record estates.
   queues: "ipam,dns,dhcp,default,bundles"
+  # Memory (#2227, measured): each of the ``concurrency`` processes is about
+  # 130 MB at rest. A bundle render adds about 4 kB per zone in the group,
+  # ~15 MB for one batch of records and twice the compressed body, whatever
+  # the record count: ~100 MB for 20k zones at 1M or 2M records (it was
+  # ~850 MB per million records before #2227). Under split-horizon views add
+  # ~1 - 1.5 kB per record of the group's largest zone. At most
+  # ``DNS_AGENT_BUNDLE_RENDER_SLOTS`` (2) renders run at once fleet-wide. See
+  # docs/features/DNS.md, "Control-plane memory for large groups".
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 2000m, memory: 1Gi }

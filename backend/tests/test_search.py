@@ -747,3 +747,25 @@ def test_mac_index_expression_matches_the_query():
     # ip_address); the query qualifies it with the table name.
     queried = _mac_normalized_sql("ip_address").replace("ip_address.mac_address", "mac_address")
     assert indexed == queried
+
+
+async def test_a_grant_scoped_to_one_subnet_finds_that_subnet_and_no_other(
+    client: AsyncClient, db_session
+):
+    """#2569: the holder of read on ONE subnet found it by neither CIDR nor
+    name, because the provider gate asked for a type-level read."""
+    space = await _space(db_session)
+    mine = await _subnet(db_session, space, "10.77.1.0/24", name="team-lab")
+    other = await _subnet(db_session, space, "10.77.2.0/24", name="team-lab-other")
+    _, token = await _user(
+        db_session,
+        permissions=[{"action": "read", "resource_type": "subnet", "resource_id": str(mine.id)}],
+    )
+    await db_session.flush()
+
+    for q in ("10.77.1.0/24", "team-lab"):
+        r = await client.get("/api/v1/search", headers=_hdr(token), params={"q": q})
+        assert r.status_code == 200
+        subnets = {x["id"] for x in r.json()["results"] if x["type"] == "subnet"}
+        assert subnets == {str(mine.id)}, q
+        assert str(other.id) not in subnets
