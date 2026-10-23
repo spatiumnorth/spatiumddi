@@ -13,6 +13,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -78,12 +79,13 @@ describe("Tool Catalog Reset to defaults", () => {
     const b = screen.getByRole("button", {
       name: /Reset to defaults/,
     }) as HTMLButtonElement;
-    expect(b.disabled).toBe(false);
+    // The superadmin answer loads after the first render; wait for the gate
+    // to open rather than reading it on the first paint.
+    await waitFor(() => expect(b.disabled).toBe(false));
     await act(async () => {
       fireEvent.click(b);
     });
-    await act(async () => {});
-    expect(screen.getByRole("alert").textContent).toContain(
+    expect((await screen.findByRole("alert")).textContent).toContain(
       "Superadmin required",
     );
   });
