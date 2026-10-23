@@ -128,6 +128,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A backup run in flight during a restore now records its end (#2353).**
+  A restore ends every other database session, the running backup's
+  included, so the run could not stamp its own result: the target stayed
+  "in progress" and Run now answered 409 until the 2 hour presumed-dead
+  reap. The runner now writes the terminal state and its audit row on a
+  fresh session when its own was closed under it. The write only lands
+  while the row still carries that run's claim, so it never overwrites a
+  newer run.
+
 - **The DHCP MAC blocklist is now enforced on DHCPv6 scopes, best
   effort (#2268).** The reserved `DROP` client class was rendered into
   Dhcp4 only, so a blocked (rogue / lost_stolen / quarantine) device
