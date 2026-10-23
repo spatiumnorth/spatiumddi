@@ -49,6 +49,10 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "network.site": True,
     "network.service": False,
     "network.asn": False,
+    # #2325 — off on a FRESH install (it makes off-prem RDAP lookups), but
+    # ``default_on_if_rows_in="domain"`` resolves it on wherever Domain rows
+    # already exist, as ``ipam.nat`` does. See test_domains_module_gate.py.
+    "network.domains": False,
     "network.circuit": False,
     "network.device": False,
     "network.overlay": False,
