@@ -18,17 +18,16 @@ from email.utils import format_datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
-from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
@@ -145,14 +144,6 @@ def _assert_hint_keeps_passphrase_secret(passphrase: str | None, hint: str | Non
         raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
 
 
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Backup targets are restricted to superadmin",
-        )
-
-
 def _archive_name(filename: str) -> str:
     """Refuse a caller-supplied archive name that is not one of ours (#1243).
 
@@ -196,8 +187,8 @@ class BackupTargetCreate(BaseModel):
     passphrase: str = Field(..., min_length=8, max_length=512)
     passphrase_hint: str = Field("", max_length=200)
     schedule_cron: str | None = Field(default=None, max_length=120)
-    retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
-    retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
+    retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool = False
 
     @field_validator("kind")
@@ -224,8 +215,8 @@ class BackupTargetUpdate(BaseModel):
     passphrase: str | None = Field(default=None, min_length=8, max_length=512)
     passphrase_hint: str | None = None
     schedule_cron: str | None = None
-    retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
-    retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
+    retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool | None = None
     drill_enabled: bool | None = None
     drill_cron: str | None = None
@@ -323,27 +314,24 @@ class BackupTargetKinds(BaseModel):
 
 
 @router.get("/kinds", response_model=BackupTargetKinds)
-async def list_kinds(current_user: CurrentUser) -> BackupTargetKinds:
+async def list_kinds(current_user: SuperAdmin) -> BackupTargetKinds:
     """Catalog of available destination kinds + their config-field
     descriptors. The frontend reflects on these to render the
     per-kind config form.
     """
-    _require_superadmin(current_user)
     return BackupTargetKinds(kinds=list_destination_kinds())
 
 
 @router.get("", response_model=list[BackupTargetResponse])
-async def list_targets(db: DB, current_user: CurrentUser) -> list[BackupTargetResponse]:
-    _require_superadmin(current_user)
+async def list_targets(db: DB, current_user: SuperAdmin) -> list[BackupTargetResponse]:
     rows = (await db.execute(select(BackupTarget).order_by(BackupTarget.name))).scalars().all()
     return [_to_response(r) for r in rows]
 
 
 @router.get("/{target_id}", response_model=BackupTargetResponse)
 async def get_target(
-    target_id: uuid.UUID, db: DB, current_user: CurrentUser
+    target_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> BackupTargetResponse:
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -352,10 +340,9 @@ async def get_target(
 
 @router.post("", response_model=BackupTargetResponse, status_code=201)
 async def create_target(
-    body: BackupTargetCreate, db: DB, current_user: CurrentUser
+    body: BackupTargetCreate, db: DB, current_user: SuperAdmin
 ) -> BackupTargetResponse:
     forbid_in_demo_mode("Backup target creation is disabled")
-    _require_superadmin(current_user)
     if body.retention_keep_last_n is not None and body.retention_keep_days is not None:
         raise HTTPException(
             status_code=422,
@@ -448,9 +435,8 @@ async def update_target(
     target_id: uuid.UUID,
     body: BackupTargetUpdate,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> BackupTargetResponse:
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -599,8 +585,7 @@ async def update_target(
 
 
 @router.delete("/{target_id}", status_code=204)
-async def delete_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
-    _require_superadmin(current_user)
+async def delete_target(target_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -631,15 +616,16 @@ class RunNowResponse(BaseModel):
     error: str | None
     # The node whose pod wrote the archive (#1838); null off the appliance.
     node_name: str | None = None
+    # Set when the archive was written but the retention sweep failed.
+    retention_failure_category: str | None = None
 
 
 @router.post("/{target_id}/run-now", response_model=RunNowResponse)
-async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> RunNowResponse:
+async def run_target_now(target_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> RunNowResponse:
     """Kick a one-off backup against this target. Synchronous —
     blocks until ``pg_dump`` + driver write + retention prune
     finish. The schedule sweep uses the same code path.
     """
-    _require_superadmin(current_user)
     # #296 Phase H — refuse if a rolling upgrade is in flight (same
     # rationale as create-and-download: mid-upgrade snapshots are
     # internally inconsistent + surprise the operator on restore).
@@ -674,7 +660,7 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
 
 
 @router.post("/{target_id}/test")
-async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> dict[str, Any]:
+async def test_target(target_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> dict[str, Any]:
     """Connectivity probe — write a tiny file at the destination, verify
     it, and remove it. Doesn't touch the DB or build a real archive.
 
@@ -687,7 +673,6 @@ async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -
     probe is refused outright rather than run, because writing it would
     overwrite the stored archive.
     """
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -743,10 +728,9 @@ async def _set_listing_note(
 
 @router.get("/{target_id}/archives", response_model=list[ArchiveListingResponse])
 async def list_target_archives(
-    target_id: uuid.UUID, db: DB, current_user: CurrentUser, response: Response
+    target_id: uuid.UUID, db: DB, current_user: SuperAdmin, response: Response
 ) -> list[ArchiveListingResponse]:
     """List archives stored at this target, newest-first."""
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -786,7 +770,7 @@ async def list_target_archives(
 async def download_latest_target_archive(
     target_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     request: Request,
 ):
     """One-shot 'give me the newest archive at this target'
@@ -808,7 +792,6 @@ async def download_latest_target_archive(
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -897,7 +880,7 @@ async def download_target_archive(
     target_id: uuid.UUID,
     filename: str,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     request: Request,
 ):
     """Stream a stored archive back to the operator's browser as a
@@ -910,7 +893,6 @@ async def download_target_archive(
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -987,7 +969,7 @@ async def restore_from_archive(
     target_id: uuid.UUID,
     body: RestoreFromArchiveBody,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> dict[str, Any]:
     """Pull ``filename`` from the destination, decrypt + replay
     via the same code path as ``POST /backup/restore`` (Phase 1a).
@@ -996,7 +978,6 @@ async def restore_from_archive(
     operator knows the key, so a stolen session token can't roll
     back the install on a hunch.
     """
-    _require_superadmin(current_user)
     _archive_name(body.filename)
     row = await db.get(BackupTarget, target_id)
     if row is None:
@@ -1151,10 +1132,9 @@ async def delete_target_archive(
     target_id: uuid.UUID,
     filename: str,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> None:
     """Manually drop one archive at this target."""
-    _require_superadmin(current_user)
     _archive_name(filename)
     row = await db.get(BackupTarget, target_id)
     if row is None:

@@ -37,6 +37,8 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSZone
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -67,14 +69,9 @@ async def _run_sync() -> dict[str, Any]:
 
             now = datetime.now(UTC)
             interval = timedelta(minutes=max(1, ps.dns_pull_from_server_interval_minutes))
-            if ps.dns_pull_from_server_last_run_at is not None:
-                elapsed = now - ps.dns_pull_from_server_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(now, ps.dns_pull_from_server_last_run_at, interval)
+            if skip is not None:
+                return skip
 
             zones = list((await db.execute(select(DNSZone))).scalars().all())
 
@@ -186,6 +183,7 @@ async def _run_sync() -> dict[str, Any]:
 # Celery task name kept stable for backward-compatibility with any deployed
 # beat schedule / in-flight messages from the pull-only era.
 @celery_app.task(name="app.tasks.dns_pull.auto_pull_dns_from_servers", bind=True)
+@module_gated("core.dns")
 def auto_pull_dns_from_servers(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval. Runs the full

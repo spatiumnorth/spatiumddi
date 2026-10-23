@@ -599,11 +599,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_record_op_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
+    # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
+    # is inserted once by migration f4c2a8e61b93, so an operator who deletes
+    # it keeps it deleted (the #2138 pattern).
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
             seed_node_pressure_alert_rule,
@@ -614,6 +618,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Storage redundancy (#999 Part A) — cannot fire on an appliance
         # with no arrays, or on a supervisor too old to report them.
         await seed_appliance_storage_alert_rule()
+        # Silent supervisor (#2259) — cannot fire with no appliances.
+        await seed_appliance_heartbeat_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue
@@ -786,20 +792,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("multicast_blocks_backfilled", created=n)
     except Exception as exc:  # noqa: BLE001
         logger.debug("multicast_block_backfill_skipped", reason=str(exc))
-    # Demo-mode lockdown — force the restricted feature modules off
-    # and mirror the integration toggles into PlatformSettings so the
-    # beat reconcilers stop. Idempotent; failure-tolerant. The PATCH
+    # Demo-mode lockdown — force the restricted feature modules off,
+    # which stops the integration beat reconcilers (they gate on the
+    # module, #2196). Idempotent; failure-tolerant. The PATCH
     # endpoint refuses to re-enable any restricted module while
     # ``DEMO_MODE=1`` is in effect (see app.core.demo_mode).
     if settings.demo_mode:
         try:
-            from sqlalchemy import select  # noqa: PLC0415
-
             from app.core.demo_mode import (  # noqa: PLC0415
                 DEMO_RESTRICTED_MODULES,
             )
             from app.db import AsyncSessionLocal  # noqa: PLC0415
-            from app.models.settings import PlatformSettings  # noqa: PLC0415
             from app.services import feature_modules as fm_svc  # noqa: PLC0415
 
             async with AsyncSessionLocal() as session:
@@ -807,13 +810,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     if not fm_svc.is_known(module_id):
                         continue
                     await fm_svc.set_module_enabled(session, module_id, False, user_id=None)
-                    mirror = fm_svc.INTEGRATION_SETTINGS_MIRROR.get(module_id)
-                    if mirror is not None:
-                        ps = await session.scalar(
-                            select(PlatformSettings).where(PlatformSettings.id == 1)
-                        )
-                        if ps is not None:
-                            setattr(ps, mirror, False)
                 await session.commit()
             fm_svc.invalidate_cache()
             logger.info(
@@ -822,6 +818,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("demo_mode_lockdown_skipped", reason=str(exc))
+
+    # #2196 — bring the derived ``PlatformSettings.integration_*_enabled``
+    # copy in line with the feature modules that own those switches. An
+    # install upgraded from a build where the two drifted (a module turned on
+    # before the settings row existed; Fortinet / Meraki never mirrored) is
+    # corrected here. Nothing in the app reads the columns any more, so this
+    # is housekeeping, not a gate: idempotent, failure-tolerant.
+    try:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services import feature_modules as fm_svc  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as session:
+            if await fm_svc.sync_integration_settings_mirror(session):
+                await session.commit()
+                logger.info("integration_settings_mirror_reconciled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("integration_settings_mirror_reconcile_skipped", reason=str(exc))
 
     # #272 Phase 7c — periodic self-signed cert SAN reconcile. On a
     # multi-node appliance control plane the shared Web UI cert must

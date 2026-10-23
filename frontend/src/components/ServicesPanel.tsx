@@ -18,6 +18,7 @@
  * into a "reconnecting" state instead of reporting failure.
  */
 
+import { pollUnlessRefused } from "@/lib/refusal";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Info, Play, RefreshCw, Square } from "lucide-react";
@@ -78,7 +79,7 @@ export function ServicesPanel() {
   const query = useQuery({
     queryKey: ["service-control"],
     queryFn: serviceControlApi.list,
-    refetchInterval: 10_000,
+    refetchInterval: pollUnlessRefused(10_000),
   });
 
   const [pending, setPending] = useState<{

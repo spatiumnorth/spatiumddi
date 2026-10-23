@@ -296,10 +296,13 @@ fi
 # don't rename it (the .path unit fires on close-after-write, not on
 # every read) but we do touch a sibling marker + progress. From here on
 # we're in the apply region: arm the abrupt-exit trap and start the
-# liveness ticker (#421).
+# liveness ticker (#421). The trap is armed BEFORE the in-flight stamp
+# (#2424): armed after it, a SIGTERM in between left the state at
+# in-flight with nothing to record the failure. on_exit acts only on an
+# in-flight state, so arming it first changes no other path.
+trap on_exit EXIT
 mark_inflight
 write_progress "queued" "starting slot upgrade"
-trap on_exit EXIT
 start_inflight_ticker
 
 APPLY_ARGS=("apply" "$IMAGE_SRC")
@@ -350,6 +353,10 @@ else
     # the path to the image is stable again is the whole remedy.
     elif [ "$apply_rc" -eq 6 ]; then
         fail "apply failed: the image download was interrupted and did not complete after retries (rc=6) — nothing was written to the inactive slot; retry the upgrade (see slot-upgrade.log)"
+    # rc=7 is #2400: staging the image on /var would leave it under the
+    # kubelet's eviction margin (15% free), which evicts the control plane.
+    elif [ "$apply_rc" -eq 7 ]; then
+        fail "apply refused: not enough free space on /var to stage the image without the kubelet evicting the control plane (rc=7) — nothing was downloaded or written; free space on /var and retry (see slot-upgrade.log for the numbers)"
     else
         fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write / architecture)"
     fi

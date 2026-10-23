@@ -74,7 +74,7 @@ machine, and the failures then look like unrelated fixture errors.
 
 <!-- Tick what applies; leave the rest. Most of these also fail CI when missed. -->
 
-- [ ] `CHANGELOG.md` entry under `## Unreleased`
+- [ ] Changelog fragment `changelog.d/<issue>-<slug>.md` (see `changelog.d/README.md`). Don't edit `CHANGELOG.md` itself
 - [ ] Alembic migration included (DB models changed). Its `down_revision` is the current head; re-point it if another migration merges first
 - [ ] `charts/` and `k8s/` (+ `k8s/README.md`) updated (services, env or ports changed)
 - [ ] `NOTICE` + `docs/THIRD_PARTY.md` updated (new shipped third-party component)

@@ -31,6 +31,7 @@ from app.models.dns import (
 from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
+from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 
@@ -301,7 +302,9 @@ class FindDnsServersArgs(BaseModel):
     description=(
         "List individual DNS servers with the group each belongs to, its "
         "driver, the version its agent runs, whether it is the group's "
-        "primary, and its enabled / maintenance / config-apply state. "
+        "primary, its enabled / maintenance / config-apply state, and "
+        "whether two agent processes are polling as it at once "
+        "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Answers 'which group is this server in?', 'which server is "
         "primary for that group?' and "
         "'which groups have no primary?' (one is re-elected automatically "
@@ -356,6 +359,10 @@ async def find_dns_servers(
             # never "ok" — a silently reverted config is exactly what would
             # hide behind that assumption.
             "config_apply_status": s.config_apply_status,
+            # #2044 — a second live agent process polls as this server and is
+            # being refused (the one the row's alert and chip read).
+            "duplicate_agent": duplicate_agent_active(s),
+            "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
             "last_seen_at": s.last_seen_at.isoformat() if s.last_seen_at else None,
         }
         for s, group_name in rows
@@ -806,11 +813,15 @@ class ListDNSBlockListsArgs(BaseModel):
         "List DNS blocklists (RPZ rows). Each carries id, name, "
         "description, category, source_type (manual / url / "
         "file_upload), feed_url + feed_format when remote, "
-        "block_mode (nxdomain / sinkhole / refused), "
+        "block_mode (nxdomain / sinkhole — sinkhole answers with "
+        "sinkhole_ip, else 0.0.0.0 and ::), "
         "feed_entries_are_wildcard (whether feed entries block "
         "subdomains too — off means a list naming tracker.example "
         "leaves cdn.tracker.example resolving), enabled, "
-        "entry_count, last_synced_at + last_sync_status / error. "
+        "entry_count, feed_parse_skipped (adblock feeds only: how many "
+        "rules the last refresh could not enforce, by category regex / "
+        "modifier / badfilter / malformed; null = not recorded), "
+        "last_synced_at + last_sync_status / error. "
         "Use for 'which blocklists are active?', 'is the malware "
         "feed up to date?', or 'when did the ads blocklist last "
         "sync?'."
@@ -852,6 +863,7 @@ async def list_dns_blocklists(
             "sinkhole_ip": r.sinkhole_ip,
             "enabled": r.enabled,
             "entry_count": r.entry_count,
+            "feed_parse_skipped": r.feed_parse_skipped,
             "last_synced_at": (r.last_synced_at.isoformat() if r.last_synced_at else None),
             "last_sync_status": r.last_sync_status,
             "last_sync_error": r.last_sync_error,

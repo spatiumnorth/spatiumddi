@@ -670,6 +670,9 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         entries — so a 60-second UI poll cannot bury an operator's real
         query log. The zone count comes from a second call so the message
         says something useful about what the token can see.
+        That second call is also what proves the token when the request
+        reaches Technitium from loopback, which 15.5+ answers without
+        authentication on the health check (#2238).
         """
         try:
             creds = self._load_credentials(server)
@@ -697,11 +700,20 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         except Exception as exc:  # noqa: BLE001 — surface any transport error cleanly
             return CloudDNSProbe(ok=False, message=f"Technitium API error: {exc}")
 
-        # Auth is already proven; a failure counting zones is worth
-        # reporting but must not turn a working connection into a red X —
-        # a token scoped to Zones:View on a subset legitimately sees fewer.
+        # A failure counting zones is worth reporting but must not turn a
+        # working connection into a red X — a token scoped to Zones:View on
+        # a subset legitimately sees fewer.
+        #
+        # Except ``invalid-token``: from 15.5 the health check answers ``ok``
+        # WITHOUT any session when the request arrives from loopback (#2238;
+        # ``DnsWebService.WebServiceApiMiddleware``, there for Docker's own
+        # healthcheck). Behind a reverse proxy on the Technitium host every
+        # request arrives from loopback, so the health check no longer proves
+        # the token — this listing is the first call that does.
         try:
             zones = await self.pull_zones_from_server(server)
+        except TechnitiumTokenRejected as exc:
+            return CloudDNSProbe(ok=False, message=str(exc))
         except (CloudDNSError, httpx.HTTPError) as exc:
             return CloudDNSProbe(
                 ok=True,

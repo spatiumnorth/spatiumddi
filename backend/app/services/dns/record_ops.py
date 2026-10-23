@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -678,13 +678,54 @@ class _DispatchState:
     committed: bool = False
 
 
+def _applied_values(now: datetime) -> dict[str, Any]:
+    """The columns an applied op carries, besides one more attempt (#2108):
+    ``_mark_applied`` sets them on a loaded row and ``mark_ops_applied`` in
+    one UPDATE, so the two cannot stamp an applied op differently."""
+    return {
+        "state": "applied",
+        "applied_at": now,
+        "last_error": None,
+        "next_attempt_at": None,
+        "updated_at": now,
+    }
+
+
 def _mark_applied(row: DNSRecordOp, now: datetime) -> None:
     row.attempts = (row.attempts or 0) + 1
-    row.state = "applied"
-    row.applied_at = now
-    row.last_error = None
-    row.next_attempt_at = None
-    row.updated_at = now
+    for name, value in _applied_values(now).items():
+        setattr(row, name, value)
+
+
+async def mark_ops_applied(
+    db: AsyncSession,
+    ids: Sequence[uuid.UUID],
+    now: datetime,
+    loaded: dict[uuid.UUID, DNSRecordOp] | None = None,
+) -> None:
+    """``_mark_applied`` for ``ids`` as one UPDATE, without loading the rows
+    (#2227: a split-horizon render retiring 800k queued ops as ORM objects
+    held about 4 kB each, 3.7 GB, in the worker). The caller has locked the
+    rows. ``loaded`` are rows of these ids already in the session: they get
+    the same values as committed state, so a later read of one in this
+    session sees the op applied and a flush does not write it again."""
+    if not ids:
+        return
+    values = _applied_values(now)
+    await db.execute(
+        update(DNSRecordOp)
+        .where(DNSRecordOp.id.in_(ids))
+        .values(attempts=func.coalesce(DNSRecordOp.attempts, 0) + 1, **values)
+        .execution_options(synchronize_session=False)
+    )
+    for op_id in ids:
+        row = (loaded or {}).get(op_id)
+        if row is None:
+            continue
+        if "attempts" in row.__dict__:
+            set_committed_value(row, "attempts", (row.attempts or 0) + 1)
+        for name, value in values.items():
+            set_committed_value(row, name, value)
 
 
 _MIRRORED_OP_FIELDS = (

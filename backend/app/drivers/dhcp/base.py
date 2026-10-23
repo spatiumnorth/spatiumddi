@@ -194,8 +194,6 @@ class ScopeDef:
     options: dict[str, Any] = field(default_factory=dict)
     pools: tuple[PoolDef, ...] = ()
     statics: tuple[StaticAssignmentDef, ...] = ()
-    ddns_enabled: bool = False
-    ddns_hostname_policy: str = "client"
     is_active: bool = True
     # "ipv4" → Dhcp4 rendering, "ipv6" → Dhcp6 rendering. Defaults to "ipv4"
     # so legacy bundles (before address_family existed) keep working.

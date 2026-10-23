@@ -38,6 +38,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,6 +137,38 @@ _ROLE_LABEL_KEYS = {
     # via this label.
     "control-plane": "spatium.io/role-control-plane",
 }
+
+# #2190 — the agent DaemonSet each role label schedules, and the role-env key
+# whose value the chart renders into that DaemonSet's ``AGENT_GROUP``
+# (``serverGroupName`` in ``_build_values``). A label is only ever SET once the
+# DaemonSet's live template carries the group this node is assigned, so a label
+# flip cannot start a pod from the previous chart revision: the node labels
+# land in milliseconds, the values only once helm-controller's upgrade job has
+# run (~6-11 s), and a pod scheduled in between registered with the previous
+# group. Keep in lock-step with the per-role ``serverGroupName`` keys in
+# ``_build_values`` (a test asserts they agree).
+_ROLE_AGENT_GROUP: dict[str, tuple[str, str]] = {
+    "dns-bind9": ("dns-bind9", "AGENT_GROUP"),
+    "dns-powerdns": ("dns-powerdns", "AGENT_GROUP"),
+    "dns-technitium": ("dns-technitium", "AGENT_GROUP"),
+    "dhcp": ("dhcp-kea", "DHCP_AGENT_GROUP"),
+}
+
+# How long the apply waits, after its values write, for helm-controller to roll
+# the new template before it gives up for this tick (the next heartbeat's
+# reconcile sets the label once the template is current), and how often it
+# re-reads. And the longest a label is held across ticks before it is set
+# regardless: a template that never matches (a shared chart another node writes,
+# a template edited out of band) must not keep a role off a node for ever. The
+# control plane's registration is the backstop past that (#2190 backend half).
+_LABEL_WAIT_SECONDS = 30.0
+_LABEL_WAIT_STEP_SECONDS = 2.0
+_LABEL_HOLD_MAX_SECONDS = 300.0
+_sleep = time.sleep
+_monotonic = time.monotonic
+# role label -> monotonic time it was first held back.
+_label_held_since: dict[str, float] = {}
+
 
 # #272 — per-variant FORCED role set. The supervisor reads its variant
 # from ``/etc/spatiumddi-host/role-config:ROLE`` and always asserts
@@ -660,7 +693,33 @@ def role_release_fingerprint(env_file: Path) -> str:
         f"image_tag={tag}\nchart_sha256={_chart_digest()}\n"
         f"control_plane_url={role_control_plane_url(env_vars)}\n"
         f"skip_tls_verify={cp_tls.skip_verify()}\n"
+        f"dns_bind9_memory={_dns_bind9_memory_key()}\n"
     )
+
+
+def _dns_bind9_memory_key() -> str:
+    """The dns-bind9 memory sizing as the role apply would render it (#2223),
+    for the skip key: a node joining or leaving the cluster can move the
+    smallest DNS node, with nothing in the role env changing. ``unknown`` when
+    the node list cannot be read (the compose path, or a kubeapi that is
+    down), which is stable, so it does not re-apply on every heartbeat."""
+    mib, _err = k8s_api.dns_sizing_memory_mib()
+    sized = k8s_api.dns_bind9_memory(mib)
+    return sized.get("limit", "unknown")
+
+
+def size_dns_bind9(values: dict[str, object], mem_mib: int | None) -> dict[str, object]:
+    """PURE — #2223: ``values`` with ``dnsBind9.memory`` sized from
+    ``mem_mib`` (see :func:`k8s_api.dns_bind9_memory`). Applied after the
+    #1439 keep, so a block kept on for another node is sized too. A block that
+    is off, or a size that is unknown, is left as it is."""
+    block = values.get("dnsBind9")
+    sized = k8s_api.dns_bind9_memory(mem_mib)
+    if not isinstance(block, dict) or block.get("enabled") is not True or not sized:
+        return values
+    out = dict(values)
+    out["dnsBind9"] = {**block, "memory": sized}
+    return out
 
 
 def role_label_diff(profiles: list[str]) -> dict[str, str | None]:
@@ -675,6 +734,62 @@ def role_label_diff(profiles: list[str]) -> dict[str, str | None]:
     """
     roles = desired_role_set(profiles)
     return {label: ("true" if role in roles else None) for role, label in _ROLE_LABEL_KEYS.items()}
+
+
+def hold_stale_role_labels(
+    label_diff: dict[str, str | None], env_vars: dict[str, str]
+) -> tuple[dict[str, str | None], list[str]]:
+    """``(diff, held)`` — ``label_diff`` without the role labels whose agent
+    DaemonSet would still start a pod with the PREVIOUS group (#2190).
+
+    A held label is left out of the patch, not cleared: a node that already
+    carries it keeps it (its pod rolls with the DaemonSet), and a node that does
+    not gets it on a later write, once the template carries the group from
+    ``env_vars``. Clears are never held — taking a role away cannot start a pod.
+
+    Not held: a DaemonSet that does not exist (nothing to schedule from; helm
+    creates it from the new values), and one whose read FAILED — the label patch
+    goes through the same kubeapi, and holding on a failed read would keep a role
+    off for as long as one read keeps failing. A label held longer than
+    ``_LABEL_HOLD_MAX_SECONDS`` is set anyway, logged: past that the template is
+    not converging on its own, and the control plane's registration puts an
+    appliance's agent in its assigned group whatever its env says.
+    """
+    out = dict(label_diff)
+    held: list[str] = []
+    for role, (daemonset, env_key) in _ROLE_AGENT_GROUP.items():
+        label = _ROLE_LABEL_KEYS[role]
+        if out.get(label) != "true":
+            _label_held_since.pop(label, None)
+            continue
+        want = env_vars.get(env_key, "")
+        exists, have, err = k8s_api.daemonset_template_env(daemonset, env_name="AGENT_GROUP")
+        if exists is None:
+            log.warning(
+                "supervisor.k3s_lifecycle.label_gate_read_failed",
+                label=label,
+                daemonset=daemonset,
+                error=err,
+            )
+            _label_held_since.pop(label, None)
+            continue
+        if not exists or (have or "") == want:
+            _label_held_since.pop(label, None)
+            continue
+        first = _label_held_since.setdefault(label, _monotonic())
+        if _monotonic() - first >= _LABEL_HOLD_MAX_SECONDS:
+            log.warning(
+                "supervisor.k3s_lifecycle.label_hold_expired",
+                label=label,
+                daemonset=daemonset,
+                template_group=have,
+                assigned_group=want,
+            )
+            _label_held_since.pop(label, None)
+            continue
+        del out[label]
+        held.append(label)
+    return out, held
 
 
 def _resolve_node_name() -> str:
@@ -805,6 +920,21 @@ def apply_role_assignment(
             reason="another node serves them",
         )
 
+    # #2223 — named's memory limit, sized from the smallest DNS node's RAM.
+    # Only when the DaemonSet renders: a DHCP-only node has nothing to size,
+    # and failing its apply over a node list it does not need would be wrong.
+    # An unknown read fails the apply (retried next heartbeat) rather than
+    # writing the chart without the sizing, which would put every DNS node
+    # back on the chart default and restart named cluster-wide.
+    if _agent_block_on(values, "dnsBind9"):
+        dns_mib, dns_err = k8s_api.dns_sizing_memory_mib()
+        if dns_mib is None:
+            return LifecycleResult(
+                state="failed",
+                reason=f"not writing the role chart: node memory unreadable ({dns_err})",
+            )
+        values = size_dns_bind9(values, dns_mib)
+
     try:
         chart_bytes = _read_chart_tarball()
     except OSError as exc:
@@ -844,7 +974,24 @@ def apply_role_assignment(
     # This used to be `{p for p in profiles ...}`, which omitted the
     # variant-fixed roles and the promoted-member case, so this call CLEARED
     # the control-plane label that the reconcile had just asserted.
+    #
+    # #2190 — and only once the values just written are what a newly-labelled
+    # node would schedule from. helm-controller rolls the DaemonSet template a
+    # few seconds after this PATCH; a label set before that started a pod with
+    # the previous ``AGENT_GROUP``, which registered in the old group (a BIND9 →
+    # PowerDNS + group A → B save left the PowerDNS row in A). Wait a bounded
+    # while for the roll; what is still stale is left to the next heartbeat's
+    # reconcile, which applies the same gate.
     label_diff = role_label_diff(profiles)
+    deadline = _monotonic() + _LABEL_WAIT_SECONDS
+    while True:
+        gated_diff, held = hold_stale_role_labels(label_diff, env_vars)
+        if not held or _monotonic() >= deadline:
+            break
+        _sleep(_LABEL_WAIT_STEP_SECONDS)
+    if held:
+        log.info("supervisor.k3s_lifecycle.labels_held", held=held, reason="template not rolled")
+    label_diff = gated_diff
     node_name = _resolve_node_name()
     if node_name:
         label_ok, label_err = k8s_api.patch_node_labels(node_name, label_diff)
@@ -880,7 +1027,9 @@ def apply_role_assignment(
     return LifecycleResult(state="ready", started=desired_services)
 
 
-def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
+def reconcile_node_labels(
+    profiles: list[str], env_file: Path | None = None
+) -> tuple[bool, str | None]:
     """Reconcile the node's per-role labels against ``profiles``.
 
     Idempotent — setting a label to its current value is a kubeapi
@@ -895,10 +1044,21 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     two copies of it, only one complete, made this function's work get
     undone on the same tick.
 
+    #2190 — with ``env_file`` (the rendered role env), a label is only SET once
+    its agent DaemonSet's template carries the assigned group
+    (:func:`hold_stale_role_labels`), the same gate ``apply_role_assignment``
+    applies: this is what sets a label the apply had to hold back.
+
     Returns ``(ok, error_or_None)`` — caller logs but doesn't act
     on failure (next heartbeat re-attempts).
     """
     label_diff = role_label_diff(profiles)
+    if env_file is not None:
+        label_diff, held = hold_stale_role_labels(label_diff, _parse_env_file(env_file))
+        if held:
+            log.info(
+                "supervisor.k3s_lifecycle.labels_held", held=held, reason="template not rolled"
+            )
     node_name = _resolve_node_name()
     if not node_name:
         return False, "node_name unknown"
