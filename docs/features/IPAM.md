@@ -1924,6 +1924,8 @@ confirmation gates and pg advisory locks held through commit:
   the subnet would hold) and the filter compares against it.
   "Create subnet here" files the subnet under the block the row names
   (which may be a child of the searched block).
+  pre-restricts to that block) and a `min_free_addresses` filter. Opened from a block, the dialog's
+  title, hint and empty state say it searches that block, not the space.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
