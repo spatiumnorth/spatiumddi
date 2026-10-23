@@ -25,12 +25,13 @@ transaction so lease teardown lands atomically with the scope stamp / audit.
 from __future__ import annotations
 
 import ipaddress
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -319,9 +320,19 @@ SERVER_DELETE_BATCH = 500
 # mirrors are healed by the hourly ``sweep_orphaned_lease_mirrors``.
 SERVER_DELETE_INLINE_MAX = 1000
 
+# Wall-clock budget for the same inline teardown. The count cap alone assumed
+# ~15 ms a lease, but with DDNS on a teardown measured 87-102 ms, so 1,000
+# leases ran past the 60 s proxy read timeout (504) while the delete carried on.
+# Time is the real bound; the count cap stays as an upper limit. Well under 60 s.
+SERVER_DELETE_INLINE_DEADLINE_S = 20.0
+
 
 async def delete_leases_for_server(
-    db: AsyncSession, server_id: uuid.UUID, *, max_leases: int = SERVER_DELETE_INLINE_MAX
+    db: AsyncSession,
+    server_id: uuid.UUID,
+    *,
+    max_leases: int = SERVER_DELETE_INLINE_MAX,
+    deadline_s: float = SERVER_DELETE_INLINE_DEADLINE_S,
 ) -> tuple[int, int]:
     """Purge every lease held by ``server_id`` before the server row goes (#2290).
 
@@ -340,15 +351,17 @@ async def delete_leases_for_server(
     request; batching bounds memory and flushes so the per-lease peer checks
     see earlier batches' deletes. The caller owns the transaction.
 
-    At most ``max_leases`` are torn down here (bounded request time); the
-    remainder is left for the orphan sweep once the cascade removes them.
+    At most ``max_leases`` are torn down here, and none are started after
+    ``deadline_s`` seconds (bounded request time); the remainder is left for the orphan sweep once the cascade removes them.
 
     Returns ``(leases_removed, mirrors_removed)``.
     """
     now = datetime.now(UTC)
+    deadline = time.monotonic() + deadline_s
     subnet_cache = await _load_subnet_cache(db)
     leases_removed = 0
     mirrors_removed = 0
+    capped = False
     while leases_removed < max_leases:
         batch = list(
             (
@@ -365,6 +378,9 @@ async def delete_leases_for_server(
         if not batch:
             break
         for lease in batch:
+            if time.monotonic() >= deadline:
+                capped = True
+                break
             sid = await _resolve_lease_subnet_id(db, lease, subnet_cache)
             if await purge_lease(db, lease, subnet_id=sid, now=now):
                 mirrors_removed += 1
@@ -372,11 +388,21 @@ async def delete_leases_for_server(
         await db.flush()
         for lease in batch:
             db.expunge(lease)
+        if capped:
+            break
     else:
+        capped = True
+    if capped:
+        remaining = (
+            await db.execute(
+                select(func.count()).select_from(DHCPLease).where(DHCPLease.server_id == server_id)
+            )
+        ).scalar_one()
         logger.warning(
             "dhcp_server_delete_lease_teardown_capped",
             server=str(server_id),
             torn_down=leases_removed,
+            remaining=remaining,
         )
     return leases_removed, mirrors_removed
 

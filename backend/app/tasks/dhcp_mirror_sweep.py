@@ -57,10 +57,15 @@ async def _sweep() -> int:
         # Loop in committed batches under a time budget: a deleted server can
         # strand 100k mirrors and one batch per hour would take a week.
         deadline = time.monotonic() + _LEASE_SWEEP_BUDGET_S
+        capped = False
         while True:
             n = await sweep_orphaned_lease_mirrors(db, limit=_MAX_PER_RUN)
             freed += n
-            if n < _MAX_PER_RUN or time.monotonic() > deadline:
+            if n < _MAX_PER_RUN:
+                break
+            if time.monotonic() > deadline:
+                # A full batch and out of budget: mirrors may remain.
+                capped = True
                 break
             await db.commit()
         if freed:
@@ -76,9 +81,9 @@ async def _sweep() -> int:
                     action="dhcp-mirror-sweep",
                     resource_type="platform",
                     resource_id="dhcp-mirror-sweep",
-                    resource_display="orphaned reservation mirrors",
+                    resource_display="orphaned DHCP mirrors (reservation + lease)",
                     result="success",
-                    new_value={"mirrors_freed": freed, "capped": freed >= _MAX_PER_RUN},
+                    new_value={"mirrors_freed": freed, "capped": capped},
                 )
             )
         await db.commit()

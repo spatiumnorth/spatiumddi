@@ -221,3 +221,48 @@ async def test_inline_teardown_is_capped_and_sweep_heals_the_rest(
     await db_session.flush()
     assert await sweep_orphaned_lease_mirrors(db_session) == 3
     assert await _addrs(db_session, subid) == set()
+
+
+@pytest.mark.asyncio
+async def test_inline_teardown_stops_at_the_deadline(
+    db_session: AsyncSession, revoked: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2338 case 6 — with DDNS on a teardown costs ~100 ms, so the count cap
+    alone ran a 1,600-lease delete past the proxy timeout. Time bounds it."""
+    import app.services.dhcp.lease_cleanup as lc
+
+    subnet, scope, (srv,) = await _world(db_session)
+    sid, subid = srv.id, subnet.id
+    for i in range(6):
+        await _lease(db_session, srv, scope, f"10.77.1.{10 + i}", subnet=subnet)
+
+    clock = {"t": 0.0}
+    real_purge = lc.purge_lease
+
+    async def _slow_purge(*a, **kw):  # type: ignore[no-untyped-def]
+        clock["t"] += 10.0  # each teardown "costs" 10 s
+        return await real_purge(*a, **kw)
+
+    monkeypatch.setattr(lc, "purge_lease", _slow_purge)
+    monkeypatch.setattr(lc.time, "monotonic", lambda: clock["t"])
+
+    removed, mirrors = await lc.delete_leases_for_server(db_session, sid, deadline_s=25.0)
+    # t=0 start; checks at 0, 10, 20 pass; 30 >= 25 stops: 3 torn down.
+    assert removed == 3
+    assert mirrors == 3
+    assert len(await _addrs(db_session, subid)) == 3  # rest left for the sweep
+
+
+@pytest.mark.asyncio
+async def test_teardown_under_deadline_is_not_capped(
+    db_session: AsyncSession, revoked: list[str]
+) -> None:
+    from app.services.dhcp.lease_cleanup import delete_leases_for_server
+
+    subnet, scope, (srv,) = await _world(db_session)
+    sid, subid = srv.id, subnet.id
+    for i in range(3):
+        await _lease(db_session, srv, scope, f"10.77.1.{10 + i}", subnet=subnet)
+    removed, _ = await delete_leases_for_server(db_session, sid)
+    assert removed == 3
+    assert await _addrs(db_session, subid) == set()
