@@ -12,6 +12,7 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
   BgpRouteMiniTable,
   type VrfRtContext,
@@ -145,6 +146,12 @@ export function VRFDetailPage() {
   const [tab, setTab] = useState<Tab>("spaces");
   const [showEdit, setShowEdit] = useState(false);
   const { enabled: featureEnabled } = useFeatureModules();
+  // #2518 — the router asks write on 'vrf', as the VRF list does.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vrf"),
+    "Requires write permission on VRFs",
+  );
 
   const {
     data: vrf,
@@ -231,7 +238,11 @@ export function VRFDetailPage() {
               resourceId={vrf.id}
               label={vrf.name}
             />
-            <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+            <HeaderButton
+              icon={Pencil}
+              onClick={() => setShowEdit(true)}
+              {...writeGate}
+            >
               Edit
             </HeaderButton>
           </div>

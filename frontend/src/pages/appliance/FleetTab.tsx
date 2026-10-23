@@ -56,6 +56,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { isHeartbeatStale, silenceLabel } from "@/lib/heartbeat";
 import { releaseVerdict, upgradeDirection } from "@/lib/versions";
 import {
   formatEta,
@@ -184,13 +185,17 @@ function capabilityChips(caps: SupervisorCapabilities): {
 function serviceChips(row: ApplianceRow): {
   key: string;
   label: string;
-  status: "ready" | "failed" | "pending" | "neutral";
+  status: "ready" | "failed" | "pending" | "neutral" | "stale";
 }[] {
   const roles = row.assigned_roles ?? [];
   if (roles.length === 0) return [];
   const lifecycle = row.role_switch_state;
-  const serviceStatus: "ready" | "failed" | "pending" =
-    lifecycle === "ready"
+  // #2259 — a silent supervisor's last report is history, not state:
+  // every chip (observer included) renders as "stale" instead.
+  const stale = row.state === "approved" && isHeartbeatStale(row.last_seen_at);
+  const serviceStatus: "ready" | "failed" | "pending" | "stale" = stale
+    ? "stale"
+    : lifecycle === "ready"
       ? "ready"
       : lifecycle === "failed"
         ? "failed"
@@ -198,7 +203,7 @@ function serviceChips(row: ApplianceRow): {
   const out: {
     key: string;
     label: string;
-    status: "ready" | "failed" | "pending" | "neutral";
+    status: "ready" | "failed" | "pending" | "neutral" | "stale";
   }[] = [];
   if (roles.includes("dns-bind9"))
     out.push({ key: "dns-bind9", label: "DNS · BIND9", status: serviceStatus });
@@ -223,14 +228,20 @@ function serviceChips(row: ApplianceRow): {
       status: serviceStatus,
     });
   if (roles.includes("observer"))
-    out.push({ key: "observer", label: "Observer", status: "neutral" });
+    out.push({
+      key: "observer",
+      label: "Observer",
+      status: stale ? "stale" : "neutral",
+    });
   return out;
 }
 
 const SERVICE_CHIP_STYLES: Record<
-  "ready" | "failed" | "pending" | "neutral",
+  "ready" | "failed" | "pending" | "neutral" | "stale",
   string
 > = {
+  stale:
+    "bg-muted text-muted-foreground border-dashed border-border opacity-70",
   ready:
     "bg-emerald-500/15 text-emerald-700 border-emerald-500/40 dark:text-emerald-300",
   failed: "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
@@ -1946,13 +1957,15 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
             SERVICE_CHIP_STYLES[s.status],
           )}
           title={
-            s.status === "ready"
-              ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
-              : s.status === "failed"
-                ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
-                : s.status === "pending"
-                  ? `Assigned, supervisor hasn't reported ready yet`
-                  : `Assigned (no service container — supervisor is the runtime)`
+            s.status === "stale"
+              ? `Last reported state — no heartbeat for ${silenceLabel(row.last_seen_at!)}, so this may no longer be true`
+              : s.status === "ready"
+                ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
+                : s.status === "failed"
+                  ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
+                  : s.status === "pending"
+                    ? `Assigned, supervisor hasn't reported ready yet`
+                    : `Assigned (no service container — supervisor is the runtime)`
           }
         >
           {s.status === "ready" && <CheckCircle2 className="h-2.5 w-2.5" />}
@@ -2366,6 +2379,15 @@ function ApplianceTableRow({
       </td>
       <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.last_seen_at)}
+        {row.state === "approved" && isHeartbeatStale(row.last_seen_at) && (
+          <div
+            className="mt-0.5 inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300"
+            title="The supervisor has stopped heartbeating; role and service state shown for this node is its last report."
+          >
+            <AlertCircle className="h-2.5 w-2.5" />
+            no heartbeat for {silenceLabel(row.last_seen_at!)}
+          </div>
+        )}
       </td>
       <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
         <div className="inline-flex items-center gap-1">
@@ -3003,6 +3025,7 @@ const WATCHDOG_STATUS_STYLES: Record<
 };
 
 function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
+  const stale = isHeartbeatStale(row.last_seen_at);
   const entries = Object.entries(row.role_health ?? {});
   // Show services in a stable order — alphabetical by service name.
   entries.sort(([a], [b]) => a.localeCompare(b));
@@ -3017,7 +3040,22 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         didn&apos;t bring the container back; SSH in and check{" "}
         <code>docker logs &lt;service&gt;</code>.
       </p>
-      <div className="mt-2 overflow-hidden rounded-md border">
+      {stale && (
+        <div
+          role="alert"
+          className="mt-2 flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          No heartbeat for {silenceLabel(row.last_seen_at!)} — this is the last
+          snapshot the supervisor reported, not current state.
+        </div>
+      )}
+      <div
+        className={cn(
+          "mt-2 overflow-hidden rounded-md border",
+          stale && "opacity-60 grayscale",
+        )}
+      >
         <table className="w-full text-xs">
           <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
             <tr>

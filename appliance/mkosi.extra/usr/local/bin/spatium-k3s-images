@@ -192,9 +192,12 @@ def _epoch(stamp: object) -> float | None:
 
 def imported(tarball: Path, entry: dict | None) -> bool:
     """Did k3s import this file as it is now? Its entry must carry the
-    file's size, a modTime no older than the file's (k3s stores it to the
-    second), and an image list. watcher.go re-imports when any of those is
-    off, and writes the entry only after an import succeeded."""
+    file's size, a modTime the file's mtime does not pass, and an image
+    list. watcher.go re-imports when any of those is off (``file.ModTime().
+    After(cached.ModTime)``) and writes the entry only after an import
+    succeeded. k3s stores modTime to the second, so a file whose mtime has a
+    fraction is After its own entry and is re-imported on every start: the
+    comparison is exact, with no flooring (#2387)."""
     if not entry or not isinstance(entry.get("images"), list):
         return False
     try:
@@ -204,7 +207,7 @@ def imported(tarball: Path, entry: dict | None) -> bool:
     if entry.get("size") != st.st_size:
         return False
     cached = _epoch(entry.get("modTime"))
-    return cached is not None and math.floor(st.st_mtime) <= cached
+    return cached is not None and st.st_mtime_ns <= round(cached * 1_000_000_000)
 
 
 def present_images() -> set[str] | None:
@@ -410,9 +413,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     redo = sorted(wanted - busy)
     if redo:
         say(f"re-importing {len(redo)} tarball(s) through k3s: {_names(redo)}")
-    now = time.time()
+    # A whole second: k3s keeps modTime to the second and re-imports a file
+    # whose mtime is After it, so a fractional stamp is re-imported on every
+    # boot, never settling (#2387). The ceiling keeps it past the old entry.
+    now = math.ceil(time.time())
     for t in redo:
-        os.utime(t, (now, now))
+        os.utime(t, ns=(now * 1_000_000_000, now * 1_000_000_000))
 
     # Keep waiting past --repair-wait while k3s is importing (it may reach the
     # touched tarballs only after the ones ahead of them), never past --max-wait.

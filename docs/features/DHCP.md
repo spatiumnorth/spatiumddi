@@ -92,8 +92,8 @@ DHCPScope
     "bootfile-name": "pxelinux.0",
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
-  ddns_enabled: bool
-  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
+  ddns_enabled: bool                 -- INERT (#2270): DDNS is subnet-level; only false is accepted
+  ddns_hostname_policy: str          -- INERT (#2270): only the default "client" is accepted
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -335,6 +335,8 @@ DHCPPool
 > row — occupancy is derived at request time from mirrored lease and
 > reservation state, and is served by the endpoints below (#913, corrected
 > in #917).
+
+**Range validation (#2500).** `start_ip` / `end_ip` must be valid IPs of the subnet's address family, `start_ip <= end_ip`, and both must lie inside the scope's subnet, for every range type (`dynamic`, `reserved`, `excluded`); otherwise the API answers 422 naming the subnet. Kea rejects a pool outside its subnet's prefix and the whole group stops converging. On update the merged range (stored row under the patch) is checked, but only when `start_ip` / `end_ip` is edited, so pools stored by the importers or the Windows topology pull (which write rows directly, not through this endpoint) stay editable for other fields.
 
 ### Pool occupancy over REST (issue #913)
 
@@ -812,8 +814,10 @@ DHCPMACBlock
 
 | Driver | Enforcement | Update mechanism |
 |---|---|---|
-| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
+| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. On DHCPv6 scopes the same class is rendered best-effort (#2268), see below. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
 | Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. | 60 s Celery beat task diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
+
+**What a MAC block can and cannot catch on DHCPv6.** A DHCPv6 packet has no hardware address field (Kea has no `pkt6.mac`), so the Dhcp6 `DROP` class derives the MAC from what the client sends: the link-layer address inside an Ethernet DUID-LL (type 3) or DUID-LLT (type 1) client-id, and the client link-layer address option (79, RFC 6939) that a first-hop relay may add (checked on both the innermost relay, which is the first hop, and the outermost, so a chain of relays is covered). It does **not** catch a client using DUID-EN or DUID-UUID, a DUID it randomised (many OSes generate a stable but non-MAC-derived DUID), a client that changes DUID, or a relayed packet whose relay adds no option 79. Treat the v6 block as a partial control: for a hard guarantee also block the device at the switch or router. Windows DHCP's deny filter is IPv4-only and does not apply to DHCPv6 scopes.
 
 Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Windows doesn't support per-scope deny at all. A single "this device is bad, nowhere gets to serve it" rule is the usage pattern — per-scope precision is deferred until a concrete need surfaces.
 
@@ -1435,7 +1439,7 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 
 **Renewal / rebind timers (58 / 59)** cannot be set (#1690): the API refuses `dhcp-renewal-time`, `dhcp-rebinding-time` and `code:58` / `code:59` with a 422. Kea is rendered with `calculate-tee-times` so every lease gets T1 / T2 at 50% / 87.5% of its own lifetime (v6: 50% / 80% of the preferred lifetime). A Kea import drops `renew-timer` / `rebind-timer` and says so: a subnet's in that scope's `parse_warnings`, a global one in the preview's `warnings`.
 
-**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
+**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range. The API refuses (422, naming the field) any set that is not ordered `min_lease_time <= lease_time <= max_lease_time`, on create and on update (judged on the stored row merged with the patch), because Kea rejects the whole config for an out-of-order set (#2499).
 
 ---
 
@@ -1478,8 +1482,10 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 | Mode | Behavior |
 |---|---|
 | `disabled` | No hostname sync — IPAM hostname is managed manually |
-| `on_lease` | Hostname from every new DHCP lease is written to IPAM |
-| `on_static_only` | Only static DHCP assignments sync hostname to IPAM |
+| `on_lease` | Hostname from every DHCP lease is written to IPAM (the default) |
+| `on_static_only` | Lease hostnames are not written to IPAM; only static DHCP assignments set an IPAM hostname |
+
+The setting governs the **hostname only**. Every lease is still mirrored into IPAM as an `auto_from_lease` row (status, MAC, last-seen) in every mode, and the same rule applies to the Kea lease-event path, the Windows poll path and a reservation handing its address back to a live lease. Turning the setting off changes nothing already stored: existing mirror rows are not deleted and their hostnames are not blanked or overwritten by later lease events. A subnet with DDNS enabled still gets the hostname DDNS publishes; that is governed by the DDNS settings, not this one. Upgrade note (#2269): the setting used to be ignored, so scopes stored as `on_static_only` (the old default) were rewritten to `on_lease` to keep their behaviour; `disabled` is honoured as set.
 
 **Recommendation**: Set to `disabled` or `on_static_only` for large dynamic subnets (e.g., WiFi /16) where lease hostname data is noisy. Set to `on_lease` for server subnets where every IP should have a known hostname.
 
@@ -1608,7 +1614,7 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 |---|---|---|
 | `dhcp_pull_leases_enabled` | off | Master toggle. |
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
-| `dhcp_pull_leases_last_run_at` | — | Populated after each pass; visible in Settings. |
+| `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
 
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
@@ -1616,9 +1622,11 @@ Per poll:
 
 1. Enumerate agentless DHCP servers (`DHCPServer.driver in AGENTLESS_DRIVERS`).
 2. For each, call `driver.get_leases(server)` over WinRM.
-3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`.
+3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`. One pull per server runs at a time: the scheduled pass and the manual Sync share a per-server Postgres advisory lock, so a server another pull is already reconciling is skipped for that pass (#2262). If an address already carries more than one row (left by overlapping pulls before that lock existed), the pull keeps the most recently seen row and deletes the rest instead of failing.
 4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't appear in the wire response is deleted, along with its mirrored `auto_from_lease=True` IPAM row. The Windows DHCP driver only returns *currently-active* leases, so absence from the response is the server's way of saying "that lease is gone" (admin purged it, client released it, etc.). Before this fix, deleted-on-server leases persisted in our DB indefinitely because `pull_leases` was upsert-only and the time-based cleanup sweep only looked at `expires_at`. The response adds two counters — `removed` (lease rows dropped) and `ipam_revoked` (IPAM mirrors cleaned up alongside) — both surface in the scheduled-task audit row and the manual sync modal.
+**Failures are visible on the server row (#2306).** When a server's scheduled pull raises, the reason is stored on `dhcp_server.last_sync_error` (with `last_sync_error_at`) and the server list shows an amber **Sync failing** chip; the next successful pull clears it. `status` is not used for this because the health probe rewrites it every cycle.
+
 6. The existing time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls (e.g. when lease pull is disabled). The two mechanisms overlap harmlessly.
 
 **Scope absence** — not yet deleted. If an operator removes a scope on the Windows server, the `DHCPScope` row stays in SpatiumDDI's DB until deleted via the UI. Scope-absence cleanup is tracked separately.
@@ -1626,6 +1634,8 @@ Per poll:
 ### 15.4 Manual "Sync Leases" button
 
 Agentless DHCP servers have a **Sync Leases** button on the server detail header that runs the same lease pull immediately without waiting for the scheduled task. Useful after adding a new server, or when debugging a new lease. From the **subnet detail**, a `[Sync ▾]` dropdown with a **DHCP** entry fans out `POST /dhcp/servers/{id}/sync-leases` across every unique server backing a scope in that subnet and opens a result modal with per-server counters (active / refreshed / new / removed / IPAM revoked + any errors).
+
+While the scheduled pull (or another Sync) is reconciling the same server, `sync-leases` answers **409** rather than running a second pull alongside it; try again once that pass finishes (#2262).
 
 `sync-leases` is an agentless-only operation — agent-based Kea streams lease events continuously and converges scope/config via the ConfigBundle long-poll, so there is nothing to pull. As of `2026.06.25-1` (#453) calling it against an agent-based server is **no longer a 400**: the endpoint returns a no-op `SyncLeasesResponse` with an explanatory `note` (and nudges the agent to re-poll its config so the scope definition converges immediately), rendered as an info line in both the subnet sync modal and the server-detail banner.
 

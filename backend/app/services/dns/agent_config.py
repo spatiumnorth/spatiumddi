@@ -38,6 +38,7 @@ from app.core.crypto import decrypt_str
 from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
+    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     ZONE_DEFAULT_TTL,
     DNSAcl,
@@ -58,10 +59,12 @@ from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
 from app.services.dns.named_conf_validation import (
+    ADDRESS_MATCH_LIST_OPTIONS,
     UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
     ViewValidationError,
     is_name_reference,
+    key_reference,
     order_acls_for_render,
     split_zone_forwarders,
     validate_acl_name,
@@ -88,6 +91,7 @@ from app.services.dns.row_locks import ids_in, lock_ops
 from app.services.dns.rrset import RRSET_OPS
 from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import (
+    dedupe_tsig_keys,
     legacy_group_key,
     resolve_group_transfer_key,
     transfer_needs_tsig,
@@ -213,16 +217,31 @@ def _rpz_hash_value(hasher: Any) -> str:
 
 
 def _entry_dict(
-    domain: str, action: str, block_mode: str, target: str | None, is_wildcard: bool
+    domain: str,
+    action: str,
+    block_mode: str,
+    target: str | None,
+    is_wildcard: bool,
+    sinkhole_ip: str | None = None,
 ) -> dict[str, Any]:
-    """One blocklist entry as the bundle ships it."""
-    return {
+    """One blocklist entry as the bundle ships it.
+
+    ``sinkhole_ip`` rides only on a ``sinkhole`` entry whose list names an
+    address (#2124) — the agent never received it, so every sinkhole list
+    rendered as ``rpz-drop``. Leaving the key off everywhere else keeps the
+    bundle of a list that does not sinkhole byte-identical, ETag included,
+    and costs nothing on the ~600k-entry feeds the bundle is sized for.
+    """
+    out: dict[str, Any] = {
         "domain": domain,
         "action": action,
         "block_mode": block_mode,
         "target": target,
         "is_wildcard": is_wildcard,
     }
+    if block_mode == "sinkhole" and sinkhole_ip:
+        out["sinkhole_ip"] = sinkhole_ip
+    return out
 
 
 def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
@@ -298,6 +317,71 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
     except AclCycleError as exc:
         logger.error("dns_acl_cycle_in_bundle", error=str(exc))
         return sorted(prepared, key=lambda a: a["name"])
+
+
+def _key_name_norm(name: str) -> str:
+    """A TSIG key name as BIND compares it: a DNS name, so case-insensitive
+    and absolute (``Foo`` / ``foo.`` are one key)."""
+    return name.rstrip(".").lower()
+
+
+def _drop_undefined_key_refs(
+    elements: Any,
+    known_keys: frozenset[str],
+    *,
+    where: str,
+    known_acls: frozenset[str] | None = None,
+    deny_if_emptied: bool = False,
+) -> Any:
+    """``elements`` without any citation the bundle does not define (#2282, #2283).
+
+    Covers ``key <name>`` (``key_reference`` also reads ``also-notify``'s
+    ``<ip> key <name>``) and, when ``known_acls`` is given, a bare ACL name.
+    A citation of an undefined name is an undefined symbol: ``named-checkconf``
+    rejects the file and the agent declines the whole bundle. The write paths
+    refuse to create or orphan one (rename / delete of a cited key or ACL is a
+    409), so this covers a row stored before that guard, or an operator key
+    whose secret no longer decrypts and was therefore left out of ``tsig_keys``.
+    ``known_keys`` holds :func:`_key_name_norm` forms; ``known_acls`` holds ACL
+    names verbatim (BIND ACL names are case-sensitive). Returns the original
+    object untouched when nothing is dropped, so a healthy bundle keeps its
+    ETag.
+
+    Dropping must never widen access. Every renderer reads an empty
+    address-match list as "unset" and falls back to something wider: the
+    BIND9 agent renders an empty ``match-clients`` / options ``allow-query``
+    as ``any`` and omits an empty zone / view ``allow-query`` so it inherits
+    the server's (often ``any``). So for an access list
+    (``deny_if_emptied``) that ends up empty, ``["none"]`` is returned. A
+    dropped *negated* element (``!key x`` / ``!name``) collapses the list to
+    ``["none"]`` too — conservative for a key (an undefined key matches no
+    request), but it keeps one rule for every dropped negation. ``none`` is
+    never substituted in place (``["none", "10/8"]`` denies everyone).
+    ``also-notify`` is not an access list and ``none`` is not legal there;
+    ACL entries are not either, since an entry-less ACL already renders
+    ``{ none; }``.
+    """
+    if not isinstance(elements, list):
+        return elements
+    kept = []
+    widened = False
+    for el in elements:
+        text = str(el)
+        name = key_reference(text)
+        acl = is_name_reference(text) if known_acls is not None else None
+        if name is not None and _key_name_norm(name) not in known_keys:
+            logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
+        elif acl is not None and known_acls is not None and acl not in known_acls:
+            logger.warning("dns_bundle_entry_dropped_undefined_acl", where=where, acl=acl)
+        else:
+            kept.append(el)
+            continue
+        widened = widened or text.strip().startswith("!")
+    if len(kept) == len(elements):
+        return elements
+    if deny_if_emptied and (widened or not kept):
+        return ["none"]
+    return kept
 
 
 def _master_host(master: Any) -> str:
@@ -773,7 +857,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     ``encode_bundle_body`` to write in."""
     # Options (per group)
     opts_res = await db.execute(
-        select(DNSServerOptions).where(DNSServerOptions.group_id == server.group_id)
+        select(DNSServerOptions)
+        .where(DNSServerOptions.group_id == server.group_id)
+        .options(selectinload(DNSServerOptions.trust_anchors))
     )
     opts = opts_res.scalar_one_or_none()
 
@@ -1041,7 +1127,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 {
                     **base_zp,
                     "view_name": None,
-                    "records": [_rec_dict(r) for r in rec_rows],
+                    # A member scoped to a site with no subnets serves nobody
+                    # (#2292) — even when no geo view exists to carry it.
+                    "records": [
+                        _rec_dict(r)
+                        for r in rec_rows
+                        if str(r.pool_member_id) not in geo.unreachable_members
+                    ],
                 }
             )
             continue
@@ -1116,6 +1208,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # otherwise fail. Operator visibility is via the audit log.
             continue
         tsig_keys.append({"name": k.name, "secret": secret, "algorithm": k.algorithm})
+    # A stored operator key that duplicates another name (the legacy group
+    # key, or ``foo`` vs ``foo.``) would render two ``key {}`` statements and
+    # stop the whole group converging (#2295). One survives, deterministically.
+    tsig_keys = dedupe_tsig_keys(tsig_keys)
 
     # The DNS group's ``is_recursive=False`` is the high-level authoritative-only
     # intent (§4.9 DNS safety); it MUST force ``recursion no;`` regardless of the
@@ -1198,6 +1294,18 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if (
+        server.driver == "bind9"
+        and opts is not None
+        and list(opts.allow_query_cache or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
+    ):
+        # #2264: the group-level ``allow-query-cache`` was validated, stored
+        # and never shipped, so narrowing cache access (cache snooping) did
+        # nothing. Shipped only when it differs from the stored default, so a
+        # group nobody touched keeps its bundle (and etag) byte-identical and
+        # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
+        # no such setting and the API refuses a non-default value for them.
+        options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
     if server.driver in ("technitium", "bind9"):
         # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
         # renders ``allow-recursion`` from it, literally, #1817), so
@@ -1206,6 +1314,26 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             list(opts.allow_recursion if opts.allow_recursion is not None else [])
             if opts
             else list(DEFAULT_ALLOW_RECURSION)
+        )
+    if server.driver == "bind9" and opts is not None and opts.trust_anchors:
+        # DNSSEC trust anchors (#2266). Stored and listed since the options
+        # API shipped, shipped to nobody: ``dnssec-validation yes`` therefore
+        # validated nothing. BIND9-only, and only when there are some, so a
+        # group without anchors keeps a byte-identical bundle and etag.
+        # Sorted: the relationship has no order, and an unstable list would
+        # shift the etag on every poll.
+        options_block["trust_anchors"] = sorted(
+            (
+                {
+                    "zone_name": ta.zone_name,
+                    "algorithm": ta.algorithm,
+                    "key_tag": ta.key_tag,
+                    "public_key": ta.public_key,
+                    "is_initial_key": bool(ta.is_initial_key),
+                }
+                for ta in opts.trust_anchors
+            ),
+            key=lambda t: (t["zone_name"], t["algorithm"], t["key_tag"], t["public_key"]),
         )
     if server.driver == "powerdns":
         # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
@@ -1259,12 +1387,50 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # one was an undefined symbol that failed the entire bundle.
     acls_block = _safe_acls_block(acls)
 
+    # #2282 / #2283 — never ship a ``key <name>`` or ACL name the bundle does
+    # not define. Access lists that empty out become ``none``, not "inherit".
+    known_key_names = frozenset(_key_name_norm(k["name"]) for k in tsig_keys)
+    known_acl_names = frozenset(a["name"] for a in acls_block)
+    for a in acls_block:
+        a["entries"] = [
+            e
+            for e in a["entries"]
+            if _drop_undefined_key_refs([e["value"]], known_key_names, where=f"acl:{a['name']}")
+        ]
+    for ve in views_block:
+        for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+            ve[f] = _drop_undefined_key_refs(
+                ve.get(f),
+                known_key_names,
+                where=f"view:{ve['name']}.{f}",
+                known_acls=known_acl_names,
+                deny_if_emptied=True,
+            )
+    for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
+        if f in options_block:
+            options_block[f] = _drop_undefined_key_refs(
+                options_block[f],
+                known_key_names,
+                where=f"options.{f}",
+                known_acls=known_acl_names,
+                deny_if_emptied=f != "also_notify",
+            )
+    for zp in zone_payload:
+        for f in ("allow_query", "allow_transfer", "also_notify"):
+            zp[f] = _drop_undefined_key_refs(
+                zp.get(f),
+                known_key_names,
+                where=f"zone:{zp['name']}.{f}",
+                known_acls=known_acl_names,
+                deny_if_emptied=f != "also_notify",
+            )
+
     # Blocklists: one RPZ zone per view (if any) + one group-level zone.
     # Each assembled list has its entries resolved against view/group scope
     # with exceptions already applied by `build_effective_for_{view,group}`.
     def _entries_payload(eff_entries: list[Any]) -> list[dict[str, Any]]:
         return [
-            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard)
+            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard, e.sinkhole_ip)
             for e in eff_entries
         ]
 

@@ -379,6 +379,8 @@ dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
 ---
 
+**Unparseable records are skipped, not fatal (#2510).** Each stored record is checked with dnspython before it is written to the zone file. A row whose rdata does not parse (for example a CAA without a tag, or an MX with extra tokens, stored before the API refused them) is left out, because one such line makes `named-checkzone` refuse the whole zone. The rest of the zone renders, and every skipped record is named (zone, owner, type, value) in a `partial apply:` config-apply error on the server and in the `zone_record_unparseable_skipped` log line. Editing the row to valid rdata clears it on the next apply.
+
 ## 3. Windows DNS Driver
 
 Located at [`app/drivers/dns/windows.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.
@@ -639,6 +641,8 @@ class PowerDNSDriverConfig:
 ```
 
 There is no `host` / `ssh_user` / `ssh_key` / RNDC counterpart — PowerDNS configuration is entirely REST-driven, and the REST endpoint is bound to loopback. This is significantly less surface area than the BIND9 driver maintains.
+
+**Listen addresses (#2307).** The agent renders `local-address=0.0.0.0, ::` so the authoritative server answers on IPv4 and IPv6, matching BIND9's `listen-on` / `listen-on-v6 { any; }`. Setting the option replaces pdns's own default, so the IPv6 entry has to be named. On a host with no IPv6 stack at all (kernel `ipv6.disable=1`, no `AF_INET6` sockets) pdns aborts on a `::` entry, so the agent probes for an `AF_INET6` socket and renders `0.0.0.0` alone there. `net.ipv6.conf.*.disable_ipv6=1` is not that case: pdns still binds `::`.
 
 ### 4.8 LMDB cache + recovery
 
@@ -917,7 +921,7 @@ The gate covers the agent-managed `technitium` driver; the agentless `technitium
 
 ### 4B.3d Blocklists and the live-pull importer (issue #744)
 
-**Blocklists.** Technitium has no RPZ. It blocks natively, from subscribed URL lists or from a per-domain *blocked zones* set, so SpatiumDDI's effective blocklist entries map onto the latter and its exceptions onto the *allowed* set — Technitium's allowed set is exactly an RPZ passthru. `blockingType` derives from the entries' block modes (`nxdomain` → `NxDomain`, `sinkhole`/`redirect` → `CustomAddress`), and it has the same silent-ignore trap as `zoneTransfer`, so it is validated before sending.
+**Blocklists.** Technitium has no RPZ. It blocks natively, from subscribed URL lists or from a per-domain *blocked zones* set, so SpatiumDDI's effective blocklist entries map onto the latter and its exceptions onto the *allowed* set — Technitium's allowed set is exactly an RPZ passthru. `blockingType` derives from the entries' block modes (`nxdomain` → `NxDomain`; `sinkhole` → `CustomAddress` carrying the list's `sinkhole_ip` plus the other family's unspecified address, or `AnyAddress` — `0.0.0.0` / `::`, what the BIND9 renderer answers — when the list names no address, #2124), and it has the same silent-ignore trap as `zoneTransfer`, so it is validated before sending.
 
 Per-view blocklists **collapse into one flat set**: Technitium's native blocking is server-wide with no view concept, and the driver declines views outright. Collapsing is the honest reading of "block these names on this server" — the alternative would be silently applying one view's list to every client. `is_wildcard` is likewise dropped: Technitium blocks a domain *and* its subdomains by default, so exact-match and wildcard land identically.
 

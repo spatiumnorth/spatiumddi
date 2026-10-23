@@ -303,7 +303,7 @@ WinRM transport is `pywinrm` (`winrm.Session`), wrapped in `asyncio.to_thread` b
 
 ### Lease → IPAM mirror
 
-Leases drive a scheduled Celery beat task ([`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/tasks/dhcp_pull_leases.py)). Beat fires every 60s; the task gates on `PlatformSettings.dhcp_pull_leases_enabled` / `dhcp_pull_leases_interval_seconds`, so the UI can change cadence without restarting beat.
+Leases drive a scheduled Celery beat task ([`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/tasks/dhcp_pull_leases.py)). Beat fires every 10 s; the task gates on `PlatformSettings.dhcp_pull_leases_enabled` / `dhcp_pull_leases_interval_seconds`, so the UI can change cadence without restarting beat. A pass claims the interval when it starts, and each server's pull holds a per-server advisory lock that the manual `sync-leases` shares, so two pulls of one server never run at once (#2262).
 
 Per poll cycle:
 

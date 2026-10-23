@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -347,6 +347,21 @@ async def emit_upgrade_failed_alert(
     if stuck:
         detail["stuck"] = stuck
 
+    # #2261 — one OPEN event per (rule, subject) is now a unique index. A
+    # run that fails, is resumed and fails again still pages for the second
+    # failure: the earlier event is resolved first, rather than the insert
+    # tripping the index and taking the orchestrator's transaction with it.
+    now = datetime.now(UTC)
+    await db.execute(
+        update(AlertEvent)
+        .where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.subject_type == "system_upgrade_run",
+            AlertEvent.subject_id == str(run.id),
+            AlertEvent.resolved_at.is_(None),
+        )
+        .values(resolved_at=now)
+    )
     evt = AlertEvent(
         rule_id=rule.id,
         subject_type="system_upgrade_run",
@@ -354,7 +369,7 @@ async def emit_upgrade_failed_alert(
         subject_display=f"upgrade → {run.target_version}",
         severity=rule.severity,
         message=message,
-        fired_at=datetime.now(UTC),
+        fired_at=now,
         last_observed_value=detail,
     )
     db.add(evt)
