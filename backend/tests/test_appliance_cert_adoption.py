@@ -293,14 +293,13 @@ async def test_read_deployed_cert_rejects_blank_values(
 async def test_path_a_does_not_redeploy_an_already_deployed_cert(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An api restart must not roll the frontend (observed on the #767 VM).
+    """An api restart must not re-push the cert it finds deployed (#767).
 
-    Adoption deploys nothing, so the ``tls-secret-checksum`` pod-template
-    annotation doesn't exist yet. If Path A re-pushes the identical cert
-    on the next api start, ``reload_frontend_nginx`` writes that
-    annotation for the FIRST time — a template change — and the frontend
-    rolls for no reason. Live repro: the first api restart after a fresh
-    install moved the frontend to a new ReplicaSet.
+    Live on the #767 VM, before #1173: Path A re-pushed the identical cert
+    on the first api start after adoption, which wrote the frontend's old
+    ``tls-secret-checksum`` pod-template annotation for the first time and
+    rolled the frontend to a new ReplicaSet for no reason. The api no longer
+    rolls anything, but a re-push is still a Secret write nobody asked for.
     """
     _appliance_settings(monkeypatch)
     cert_pem, key_pem = _firstboot_cert()
@@ -399,51 +398,54 @@ async def test_existing_active_row_still_wins_over_the_secret(
     assert spy.calls == [(existing_pem, existing_key)]
 
 
-# ── #1219: the write-back after a #1215 revert must roll the frontend ──────
+# ── #1173: deploying a certificate writes the Secret and nothing else ──────
 
 
-def test_rollout_checksum_moves_with_the_secrets_resource_version() -> None:
-    """Content alone cannot tell "restored after a revert" from "unchanged"."""
-    same = deployment.rollout_checksum("Y3J0", "a2V5", "100")
-    assert deployment.rollout_checksum("Y3J0", "a2V5", "100") == same
-    assert deployment.rollout_checksum("Y3J0", "a2V5", "102") != same
-    assert deployment.rollout_checksum("b3RoZXI=", "a2V5", "100") != same
-
-
-def test_restoring_the_same_cert_after_a_revert_rolls_the_frontend(
+def test_deploying_a_certificate_leaves_the_frontend_deployment_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Live on the #1219 rig: after a control-plane reboot k3s re-applied the
-    first-boot certificate (#1215), the frontend started serving it, and the
-    api's write-back restored the SAME content the annotation already named —
-    so nothing rolled, nginx kept the first-boot certificate, and the pinned
-    remote supervisor refused the control plane until someone restarted it."""
+    """Live on a three-node control plane (#1173): each certificate change
+    bumped the frontend's pod template, and the roll that followed is
+    terminate-first on hostNetwork, so every node's web port refused
+    connections in turn, for about 23 s on the seed when a member joined.
+
+    The Secret is mounted into the frontend as a directory, so its running
+    pods see the new files, and the image reloads nginx when they change
+    (frontend/40-tls-reload-watch.sh). That also covers #1219's write-back
+    after a #1215 revert: the files change twice and nginx reloads twice,
+    with no annotation left to name the wrong certificate."""
     import json
 
     monkeypatch.setattr(deployment.settings, "appliance_mode", True)
-    secret = {"data": {"tls.crt": "QUNUSVZF", "tls.key": "S0VZ"}, "metadata": {}}
-    annotations: list[str] = []
+    patched: list[tuple[str, dict[str, str]]] = []
+    kubeapi: list[tuple[str, str]] = []
+    annotations: list[tuple[str, str, str]] = []
+    secret = {
+        "data": {"tls.crt": "QUNUSVZF", "tls.key": "S0VZ"},
+        "metadata": {"resourceVersion": "100"},
+    }
 
     class _Cfg:
         namespace = "spatium"
 
     monkeypatch.setattr(deployment.k8s, "get_config", lambda: _Cfg())
     monkeypatch.setattr(
-        deployment.k8s, "_request", lambda method, path: (200, json.dumps(secret).encode())
+        deployment.k8s,
+        "patch_secret",
+        lambda name, data, namespace=None: (patched.append((name, data)) or (True, None)),
+    )
+    monkeypatch.setattr(
+        deployment.k8s,
+        "_request",
+        lambda method, path: (kubeapi.append((method, path)) or (200, json.dumps(secret).encode())),
     )
     monkeypatch.setattr(
         deployment.k8s,
         "patch_deployment_annotation",
-        lambda name, key, value: (annotations.append(value) or (True, None)),
+        lambda name, key, value: (annotations.append((name, key, value)) or (True, None)),
     )
 
-    secret["metadata"]["resourceVersion"] = "100"  # deployed before the reboot
-    assert deployment.reload_frontend_nginx()
-    secret["metadata"]["resourceVersion"] = "102"  # k3s reverted, api wrote it back
-    assert deployment.reload_frontend_nginx()
-    assert annotations[0] != annotations[1], "the write-back must change the pod template"
-
-    # An unchanged Secret (a PATCH that changed nothing keeps its version)
-    # still rolls nothing.
-    assert deployment.reload_frontend_nginx()
-    assert annotations[1] == annotations[2]
+    assert deployment.deploy_and_reload("CERT", "KEY", name="operator-cert")
+    assert patched == [("spatium-appliance-tls", {"tls.crt": "CERT", "tls.key": "KEY"})]
+    assert annotations == [], "a certificate change must not roll the frontend"
+    assert not [path for _, path in kubeapi if "/deployments/" in path]

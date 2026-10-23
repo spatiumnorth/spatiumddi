@@ -135,10 +135,10 @@ export function FeaturesPage() {
       qc.invalidateQueries({ queryKey: ["feature-modules"] });
       // The lock can flip on at enable-time (protect_controls) — re-read it.
       qc.invalidateQueries({ queryKey: ["approvals-lock"] });
-      // Settings page also reads PlatformSettings.integration_*_enabled
-      // (the toggle endpoint mirrors the value). Bust that cache too
-      // so any open Settings tab catches the change without a manual
-      // refresh.
+      // ``GET /settings`` reports each integration_*_enabled from its
+      // feature module (#2196), and the Dashboard reads it there. Bust
+      // that cache too so an open Dashboard catches the change without a
+      // manual refresh.
       qc.invalidateQueries({ queryKey: ["settings"] });
     },
     // Without this a refusal is silent. Disabling core.dns / core.dhcp 422s

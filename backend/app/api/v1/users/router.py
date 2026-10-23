@@ -301,7 +301,9 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
     existing = await db.execute(
         select(User).where((User.username == body.username) | (User.email == body.email))
     )
-    if existing.scalar_one_or_none():
+    # .first(), not scalar_one_or_none(): the username can belong to one row and
+    # the email to another, and two matches must still be a 409, not a 500.
+    if existing.scalars().first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username or email already in use",

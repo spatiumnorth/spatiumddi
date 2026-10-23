@@ -188,7 +188,9 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
         (
             await db.execute(
                 select(APIToken)
+                .where(APIToken.is_active.is_(True))
                 .where(APIToken.expires_at.is_not(None))
+                .where(APIToken.expires_at > now)
                 .where(APIToken.expires_at <= expiry_cutoff)
                 .order_by(APIToken.expires_at.asc())
             )
