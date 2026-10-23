@@ -11744,7 +11744,7 @@ async def bulk_edit_addresses(
 # the IPAM page.
 
 from app.api.v1.network.schemas import NetworkContextEntry  # noqa: E402
-from app.core.celery_dispatch import dispatch
+from app.core.celery_dispatch import dispatch  # noqa: E402
 from app.models.network import (  # noqa: E402
     NetworkDevice as _NetworkDevice,
 )
