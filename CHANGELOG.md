@@ -128,6 +128,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **BGP-mode MetalLB runs newer FRRouting and kube-rbac-proxy images
+  (#2239).** BGP mode is off by default, so only installs that turn
+  it on are affected. kube-rbac-proxy moves from v0.12.0 to v0.23.0.
+  The old build had 7 CRITICAL and 96 HIGH findings, including
+  CVE-2022-1996 (an auth bypass in go-restful), and it is the one
+  BGP-mode container with an authenticated listener. v0.23.0 has 4
+  HIGH and no CRITICAL. FRRouting moves from 10.4.1 to 10.4.5, on the
+  same 10.4 line, clearing the OpenSSL CRITICAL CVE-2026-31789 (2
+  CRITICAL and 21 HIGH findings before, 20 HIGH after). Both are
+  image-only changes: the MetalLB 0.15.3 chart stays, because
+  metallb/metallb#3063 is still open. The chart's kube-rbac-proxy
+  arguments still work on v0.23: it ignores `--logtostderr` and logs
+  a warning. Metrics still answer 401 without a token, 403 for an
+  account without `/metrics` access, and 200 for one with it.
+  **frr-k8s stays at v0.0.21**, with its 6 CRITICAL findings, and
+  that is deliberate. From v0.0.23 the frr-k8s binary serves its
+  metrics over HTTPS and watches a new FRRK8sConfiguration CRD, and
+  the frr-k8s templates inside the 0.15.3 chart support neither.
+  Verified on k3s 1.36: with v0.0.27 the controller cannot start its
+  manager, and the FRR container fails its plain-HTTP startup probe
+  with a 400. v0.0.22, the newest version those templates can run,
+  scans the same as v0.0.21. Fixing frr-k8s needs a chart change,
+  not an image bump. That change would also remove the
+  kube-rbac-proxy sidecars.
+
 - **A DNS server holding a million records no longer OOM-kills
   itself, and a restarted one comes back (#2223).** ddi-pg's scale
   lab ran 1,000,000 records in 20,000 zones on 7 nodes: 5
