@@ -810,6 +810,8 @@ CustomFieldDefinition
 
 Custom fields are exposed under the `custom_fields` JSONB key on all resource objects. They are validated against their `CustomFieldDefinition` on write.
 
+**Required fields (#2478).** A definition marked Required is enforced on IP block and subnet writes (create, allocate-subnet and update); a request that leaves one empty is refused with 422 naming it. A value inherited from the block chain above the row counts. The rule is deliberately narrow so that making a field Required later does not lock existing rows: a **create** needs every Required field; an **update** is checked only when the request sends `custom_fields`, and then only for a field it sends or the row already holds a value for. So a block or subnet that never had the field can still be renamed or saved untouched, but it cannot be given the field empty, and a value it holds cannot be blanked. Select fields always show an empty choice (not pickable for a Required field with nothing to inherit), and the New / Edit dialogs apply the same rule before sending. IP spaces and addresses are not covered yet, and neither are subnets a template's child layout carves.
+
 ---
 
 ## 7. Import / Export
@@ -832,6 +834,7 @@ Import behavior:
 - Export a block, subnet, or entire space
 - Formats: CSV, JSON, Excel (`.xlsx`)
 - Includes: all subnet metadata + utilization + custom fields + IP address list (optional)
+- **What each format holds with "Include IP addresses" ticked (#2420):** JSON and XLSX carry the subnet metadata *and* the address list (XLSX as separate sheets); PDF keeps its subnet table and appends the addresses. **CSV is the address list only** (`subnet,address,status,hostname,fqdn,mac_address,description,last_seen_at` + custom fields), the shape the address importer reads, so it round-trips. For subnet metadata in CSV, download it with the box unticked. The CSV follows the box, not whether the scope happens to hold addresses
 
 ### DNS Zone Import / Export
 
@@ -1005,7 +1008,10 @@ hand-picked set, or `all_matching=true` with the report filter to
 deprecate every matching row in one shot (capped at `MAX_BULK_DEPRECATE`
 = 5000; the response `capped` flag tells the operator to re-run for the
 remainder). System placeholders and DHCP mirrors are skipped even if an
-id slips through. The page lives at **Stale IPs** in the sidebar.
+id slips through. **Deprecating does not free the address (#2421):** a
+`deprecated` row is a retained record, so it still counts as allocated on
+its subnet and Next available never offers it. Delete the row to give the
+address back. The page lives at **Stale IPs** in the sidebar.
 
 **Hygiene alert.** A `stale_ip_count` alert rule fires when any subnet
 holds at least `threshold_percent` (re-used as a raw count) allocated
@@ -1918,6 +1924,12 @@ confirmation gates and pg advisory locks held through commit:
   unallocated CIDRs of the requested prefix length. Optional
   `parent_block_id` scope (Find Free… on the block detail
   pre-restricts to that block) and a `min_free_addresses` filter.
+  Each candidate carries `free_addresses` (its usable host count, as
+  the subnet would hold) and the filter compares against it.
+  "Create subnet here" files the subnet under the block the row names
+  (which may be a child of the searched block).
+  pre-restricts to that block) and a `min_free_addresses` filter. Opened from a block, the dialog's
+  title, hint and empty state say it searches that block, not the space.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
