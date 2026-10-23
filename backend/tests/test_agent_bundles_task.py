@@ -251,3 +251,53 @@ async def test_a_server_deleted_mid_render_ends_the_render_as_gone(
     monkeypatch.setattr(agent_bundle_render.bundle_store, "store", _delete_then_store)
     result = await agent_bundles._run(str(server_id))
     assert result["status"] == "gone", result
+
+
+@pytest.mark.asyncio
+async def test_a_render_redelivered_past_the_bound_is_recorded_failed_not_rendered(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2271: a render whose worker keeps dying is redelivered with the same
+    task id. Past the bound it is recorded as failed (so the sweep's backoff
+    paces it) instead of rendering — and rendering is never attempted."""
+    if not await _redis_available(settings.redis_url):
+        pytest.skip("no Redis")
+    server, _zone = await _agent(db_session)
+    await db_session.commit()
+
+    calls: list[int] = []  # one entry per render attempt
+
+    async def _count_render(db, server, *, rendered_by):  # noqa: ANN001
+        calls.append(1)
+        raise MemoryError("simulated")
+
+    monkeypatch.setattr(agent_bundles, "render_and_store", _count_render)
+    task_id = uuid.uuid4().hex
+    limit = agent_bundles.MAX_RENDER_DELIVERIES
+    for _ in range(limit):
+        with pytest.raises(MemoryError):
+            await agent_bundles._run_bounded(str(server.id), None, task_id)
+    assert len(calls) == limit
+
+    result = await agent_bundles._run_bounded(str(server.id), None, task_id)
+    assert result["status"] == "abandoned"
+    assert len(calls) == limit  # no further render attempted
+    await db_session.refresh(server)
+    assert server.bundle_render_status == store.RENDER_STATUS_FAILED
+    assert "delivered" in (server.bundle_render_error or "")
+
+    # A fresh message for the same server (the sweep's re-enqueue) is a new id
+    # and gets its own budget.
+    with pytest.raises(MemoryError):
+        await agent_bundles._run_bounded(str(server.id), None, uuid.uuid4().hex)
+
+
+@pytest.mark.asyncio
+async def test_the_delivery_bound_fails_open_without_redis(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "redis_url", "redis://127.0.0.1:1/0")
+    server, _zone = await _agent(db_session)
+    await db_session.commit()
+    result = await agent_bundles._run_bounded(str(server.id), None, uuid.uuid4().hex)
+    assert result["status"] == "stored"

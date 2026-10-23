@@ -276,7 +276,9 @@ class ListTailscaleTargetsArgs(BaseModel):
         "expiry: api_key_expires_at (null = unknown), "
         "api_key_expiry_source ('api' = read from Tailscale, 'operator' = "
         "typed in), credential_state (ok / expiring / expired / rejected / "
-        "unknown — 'rejected' means the last sync got HTTP 401) and "
+        "unknown / disabled — 'rejected' means the last sync got HTTP 401; "
+        "'disabled' means the tenant is off, so its last_sync_error is history "
+        "from before it was switched off, not a live problem) and "
         "credential_days_left. Tailscale caps these tokens at 90 days. Use "
         "for 'which tailnets are connected?', 'is Tailscale syncing?' or "
         "'when does the Tailscale token expire?'. Tokens never appear."
@@ -308,6 +310,7 @@ async def list_tailscale_targets(
             expires_at=r.api_key_expires_at,
             rejected=is_auth_rejected(r.last_sync_error),
             now=now,
+            enabled=r.enabled,
         )
         out.append(
             {

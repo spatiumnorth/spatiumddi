@@ -19,7 +19,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.db import task_connect_args
-from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
+from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
 from app.services.dns_blocklist import parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
 from app.tasks.module_gate import module_gated
@@ -111,7 +111,8 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             wildcard = bool(bl.feed_entries_are_wildcard)
 
             # A `*.`-prefixed feed is DECLARING it means "and every
-            # subdomain". Honouring an apex-only list setting against such
+            # subdomain" — as is every adblock `||name^` rule, which is
+            # counted the same way (#2123). Honouring an apex-only list setting against such
             # a feed is the operator's call, but doing it silently would
             # leave them wondering why subdomains still resolve.
             if not wildcard and parsed.wildcard_count:
@@ -186,6 +187,61 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                     .execution_options(synchronize_session=False)
                 )
 
+            # The feed's own exceptions (adblock ``@@||name^``, #2123). Same
+            # diff as the entries, on ``source``: an exception the operator
+            # added by hand is never removed by a refresh, and one the feed
+            # also lists is left as the operator's row. Before #2123 they
+            # were dropped, so a name the feed said not to block stayed
+            # blocked by any broader rule or other list that covered it.
+            feed_exceptions = set(parsed.exceptions)
+            exc_feed_existing: set[str] = set()
+            exc_other_existing: set[str] = set()
+            exc_rows = await db.execute(
+                select(DNSBlockListException.domain, DNSBlockListException.source).where(
+                    DNSBlockListException.list_id == bl.id
+                )
+            )
+            for domain, source in exc_rows.tuples():
+                (exc_feed_existing if source == "feed" else exc_other_existing).add(domain)
+            exc_to_add = feed_exceptions - exc_feed_existing - exc_other_existing
+            exc_to_remove = exc_feed_existing - feed_exceptions
+            for batch in _batched(sorted(exc_to_add), _FEED_WRITE_BATCH):
+                await db.execute(
+                    pg_insert(DNSBlockListException).on_conflict_do_nothing(
+                        index_elements=["list_id", "domain"]
+                    ),
+                    [
+                        {
+                            "list_id": bl.id,
+                            "domain": d,
+                            "reason": "Exception rule in the feed",
+                            "source": "feed",
+                        }
+                        for d in batch
+                    ],
+                )
+            for batch in _batched(sorted(exc_to_remove), _FEED_WRITE_BATCH):
+                await db.execute(
+                    delete(DNSBlockListException)
+                    .where(
+                        DNSBlockListException.list_id == bl.id,
+                        DNSBlockListException.source == "feed",
+                        DNSBlockListException.domain.in_(batch),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+            # What the feed carried that the list does not enforce (#2123);
+            # NULL for a format with no rule syntax to lose.
+            skipped = parsed.skipped.as_dict() if parsed.skipped else None
+            bl.feed_parse_skipped = skipped
+            if skipped and sum(skipped.values()):
+                logger.info(
+                    "blocklist_feed_rules_skipped",
+                    list_id=list_id,
+                    list_name=bl.name,
+                    **skipped,
+                )
+
             # Recompute count — plain COUNT, no arithmetic on top: the
             # inserts and deletes above already ran in this transaction, so
             # the result ALREADY reflects them. Adding ``len(to_add)`` on top
@@ -209,7 +265,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             # relationships (no lazy access in async); published after.
             wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
             wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
-            feed_changed = bool(to_add or to_remove)
+            feed_changed = bool(to_add or to_remove or exc_to_add or exc_to_remove)
 
             # The entries went in and out through Core INSERT / DELETE, which
             # the bundle_dirty listener never sees (it watches the ORM unit of
@@ -237,6 +293,8 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 list_id=list_id,
                 added=len(to_add),
                 removed=len(to_remove),
+                exceptions_added=len(exc_to_add),
+                exceptions_removed=len(exc_to_remove),
             )
             return {
                 "status": "success",

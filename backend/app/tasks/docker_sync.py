@@ -21,6 +21,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.docker import DockerHost
 from app.models.settings import PlatformSettings
+from app.services.integration_sync_failure import record_sync_crash
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -74,7 +75,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # A crash leaves the shared session in a failed
                     # transaction; roll back so the next host still syncs.
                     await db.rollback()
-                    errors.append(f"{host_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        DockerHost,
+                        host_id,
+                        resource_type="docker_host",
+                        action="docker.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{host_name}: {crash}")
                     logger.warning(
                         "docker_reconcile_crash",
                         host=str(host_id),
@@ -115,7 +124,21 @@ async def _run_one(host_id: str) -> dict[str, Any]:
             host = await db.get(DockerHost, _uuid.UUID(host_id))
             if host is None:
                 return {"status": "not_found"}
-            summary = await reconcile_host(db, host)
+            row_id = host.id
+            try:
+                summary = await reconcile_host(db, host)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    DockerHost,
+                    row_id,
+                    resource_type="docker_host",
+                    action="docker.reconcile",
+                    exc=exc,
+                )
+                logger.warning("docker_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,

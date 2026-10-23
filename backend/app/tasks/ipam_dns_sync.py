@@ -34,6 +34,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -181,14 +182,9 @@ async def _run_auto_sync() -> dict[str, Any]:
 
             now = datetime.now(UTC)
             interval = timedelta(minutes=max(1, ps.dns_auto_sync_interval_minutes))
-            if ps.dns_auto_sync_last_run_at is not None:
-                elapsed = now - ps.dns_auto_sync_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(now, ps.dns_auto_sync_last_run_at, interval)
+            if skip is not None:
+                return skip
 
             # Only subnets with some DNS/DDNS binding do work (issue #522) —
             # skip the drift computation for the (common) no-binding majority.
