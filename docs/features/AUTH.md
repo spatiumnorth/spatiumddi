@@ -818,6 +818,12 @@ rather than swallowing the failure. Permission-related rejections
   its sessions is refused with `403` and is not recorded as activity
   (`last_seen_at` stays), and a refresh returns `401`.
   `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
+- **Open streams re-check their caller.** A streaming response (cluster
+  health, pod logs, nmap progress, AI chat) re-runs the same session,
+  account, API-token and permission checks every 15 seconds while it is
+  open, and ends once any of them fails, or once the access token it was
+  opened with expires. The UI reconnects with its current token.
+  `backend/app/api/stream_auth.py`.
 
 ### Password management
 

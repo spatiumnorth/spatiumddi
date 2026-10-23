@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
+  formatApiError,
   groupsApi,
   rolesApi,
   usersApi,
@@ -11,8 +12,10 @@ import {
   type InternalGroupCreate,
   type InternalGroupUpdate,
 } from "@/lib/api";
+import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { TimeBoundGrantsPanel } from "./TimeBoundGrantsPanel";
@@ -45,6 +48,8 @@ function MultiPicker<T extends { id: string }>({
   labelFor,
   secondaryFor,
   placeholder = "No items",
+  readError,
+  what = "items",
 }: {
   items: T[] | undefined;
   selected: string[];
@@ -52,6 +57,9 @@ function MultiPicker<T extends { id: string }>({
   labelFor: (item: T) => string;
   secondaryFor?: (item: T) => string | null;
   placeholder?: string;
+  /** The list's read failed (a 403, say): say so, never "No users" (#2437). */
+  readError?: unknown;
+  what?: string;
 }) {
   const [filter, setFilter] = useState("");
   const filtered = useMemo(() => {
@@ -78,7 +86,11 @@ function MultiPicker<T extends { id: string }>({
         onChange={(e) => setFilter(e.target.value)}
       />
       <div className="max-h-52 overflow-y-auto rounded-md border">
-        {filtered.length === 0 ? (
+        {readError != null && !items ? (
+          <p className="p-3 text-xs">
+            <ListReadError error={readError} what={what} />
+          </p>
+        ) : filtered.length === 0 ? (
           <p className="p-3 text-xs text-muted-foreground">{placeholder}</p>
         ) : (
           filtered.map((item) => {
@@ -118,11 +130,15 @@ function GroupModal({
   group,
   roles,
   users,
+  rolesError,
+  usersError,
   onClose,
 }: {
   group: InternalGroup | null;
-  roles: AppRole[];
-  users: AppUser[];
+  roles: AppRole[] | undefined;
+  users: AppUser[] | undefined;
+  rolesError?: unknown;
+  usersError?: unknown;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -204,6 +220,8 @@ function GroupModal({
               labelFor={(r) => r.name}
               secondaryFor={(r) => (r.is_builtin ? "built-in" : null)}
               placeholder="No roles defined"
+              readError={rolesError}
+              what="roles"
             />
           </div>
           <div>
@@ -217,6 +235,8 @@ function GroupModal({
               labelFor={(u) => u.username}
               secondaryFor={(u) => u.display_name}
               placeholder="No users"
+              readError={usersError}
+              what="users"
             />
           </div>
         </div>
@@ -280,6 +300,14 @@ function DeleteModal({
       qc.invalidateQueries({ queryKey: ["groups"] });
       onClose();
     },
+    // 404: already gone (another tab or admin), which is what was asked for,
+    // so refresh the list and close. Any other refusal is shown (#2436).
+    onError: (err: unknown) => {
+      if (apiErrorStatus(err) === 404) {
+        qc.invalidateQueries({ queryKey: ["groups"] });
+        onClose();
+      }
+    },
   });
   return (
     <Modal title="Delete Group" onClose={onClose}>
@@ -289,6 +317,11 @@ function DeleteModal({
           ? Users will lose any permissions carried by this group's roles. This
           cannot be undone.
         </p>
+        {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
+          <p className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -325,11 +358,11 @@ export function GroupsPage() {
     queryKey: ["groups"],
     queryFn: groupsApi.list,
   });
-  const { data: roles } = useQuery({
+  const { data: roles, error: rolesError } = useQuery({
     queryKey: ["roles"],
     queryFn: rolesApi.list,
   });
-  const { data: users } = useQuery({
+  const { data: users, error: usersError } = useQuery({
     queryKey: ["users"],
     queryFn: usersApi.list,
   });
@@ -450,16 +483,20 @@ export function GroupsPage() {
       {showCreate && (
         <GroupModal
           group={null}
-          roles={roles ?? []}
-          users={users ?? []}
+          roles={roles}
+          users={users}
+          rolesError={rolesError}
+          usersError={usersError}
           onClose={() => setShowCreate(false)}
         />
       )}
       {editGroup && (
         <GroupModal
           group={editGroup}
-          roles={roles ?? []}
-          users={users ?? []}
+          roles={roles}
+          users={users}
+          rolesError={rolesError}
+          usersError={usersError}
           onClose={() => setEditGroup(null)}
         />
       )}

@@ -76,29 +76,45 @@ function WarningList({ warnings }: { warnings: string[] }) {
   );
 }
 
-function BigYellowBanner({ newCidr }: { newCidr: string }) {
+export function BigYellowBanner({
+  newCidr,
+  kind,
+}: {
+  newCidr: string;
+  kind: "subnet" | "block";
+}) {
+  const isBlock = kind === "block";
   return (
     <div className="rounded border-2 border-yellow-400 bg-yellow-50 p-3 text-xs text-yellow-900 dark:border-yellow-700 dark:bg-yellow-900/20 dark:text-yellow-100">
       <div className="flex items-start gap-2">
         <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
         <div className="space-y-1">
           <p className="font-semibold">
-            This operation rewrites the authoritative network definition.
+            {isBlock
+              ? "This operation rewrites the block's container CIDR."
+              : "This operation rewrites the authoritative network definition."}
           </p>
           <ul className="list-disc pl-4 space-y-0.5">
-            <li>
-              Every client on this network must be reconfigured with the new
-              netmask (<span className="font-mono">{newCidr}</span>).
-            </li>
+            {isBlock ? (
+              <li>
+                Child subnets are unchanged; only the block&apos;s container
+                CIDR moves to <span className="font-mono">{newCidr}</span>. No
+                client needs reconfiguring.
+              </li>
+            ) : (
+              <li>
+                Every client on this network must be reconfigured with the new
+                netmask (<span className="font-mono">{newCidr}</span>).
+              </li>
+            )}
             <li>
               Routers, firewalls, and any hard-coded references to the old CIDR
               must be updated manually.
             </li>
             <li>
-              This cannot be automatically undone. To revert, you must run the
-              resize again with the original CIDR — which is only legal if the
-              new smaller subnet is still a valid grow-target of whatever is
-              there now.
+              Resize is grow-only, so this cannot be undone by resizing back to
+              the original CIDR. To return to a smaller size, delete the {kind}{" "}
+              and recreate it at the smaller size.
             </li>
           </ul>
         </div>
@@ -393,7 +409,9 @@ export function ResizeSubnetModal({
       {preview && (
         <div className="space-y-3">
           <ConflictList conflicts={preview.conflicts} />
-          {!hasConflicts && <BigYellowBanner newCidr={preview.new_cidr} />}
+          {!hasConflicts && (
+            <BigYellowBanner newCidr={preview.new_cidr} kind="subnet" />
+          )}
 
           <div className="rounded border bg-muted/30 p-3 text-xs space-y-2">
             <div className="font-semibold">Blast radius</div>
@@ -690,7 +708,9 @@ export function ResizeBlockModal({
       {preview && (
         <div className="space-y-3">
           <ConflictList conflicts={preview.conflicts} />
-          {!hasConflicts && <BigYellowBanner newCidr={preview.new_cidr} />}
+          {!hasConflicts && (
+            <BigYellowBanner newCidr={preview.new_cidr} kind="block" />
+          )}
 
           <div className="rounded border bg-muted/30 p-3 text-xs space-y-2">
             <div className="font-semibold">Blast radius</div>
