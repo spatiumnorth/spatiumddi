@@ -90,10 +90,25 @@ async def redis_keys(monkeypatch: pytest.MonkeyPatch):
         "slot": f"spatium:test:{tag}:render-slot",
         "lock": f"spatium:test:{tag}:render:",
         "dirty": f"spatium:test:{tag}:dirty:",
+        "waiting": f"spatium:test:{tag}:waiting",
     }
     monkeypatch.setattr(agent_bundles, "RENDER_SLOT_KEY", keys["slot"])
     monkeypatch.setattr(agent_bundles, "RENDER_LOCK_PREFIX", keys["lock"])
     monkeypatch.setattr(agent_bundles, "RENDER_DIRTY_PREFIX", keys["dirty"])
+    monkeypatch.setattr(
+        agent_bundles, "RENDER_WAITING_KEY", f"spatium:test:{tag}:waiting", raising=False
+    )
+    # One fleet slot: these tests are about what a held slot does to others.
+    if "dns_agent_bundle_render_slots" in type(settings).model_fields:
+        monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 1)
+    # #2227's per-server counters, kept out of the real key space too (absent
+    # from builds before it).
+    monkeypatch.setattr(
+        agent_bundles, "RENDER_ATTEMPTS_PREFIX", f"spatium:test:{tag}:attempts:", raising=False
+    )
+    monkeypatch.setattr(
+        agent_bundles, "RENDER_HOLD_PREFIX", f"spatium:test:{tag}:hold:", raising=False
+    )
     try:
         yield client, keys
     finally:
@@ -350,3 +365,151 @@ async def test_a_render_longer_than_its_lease_keeps_the_slot(
     assert (await agent_bundles._run(str(other.id)))["status"] == "deferred"
     result = await asyncio.wait_for(task, 30)
     assert result["status"] == "stored", result
+
+
+# ── #2227: more than one slot, and a holder that hands its slot on ────────────
+
+
+@pytest.mark.asyncio
+async def test_two_slots_let_two_servers_render_at_once(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With two slots a second server renders beside a long one; a third
+    waits."""
+    client, keys = redis_keys
+    monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 2)
+    slow = await _agent(db_session)
+    second = await _agent(db_session)
+    third = await _agent(db_session)
+    await db_session.commit()
+    real = agent_bundles._render_once
+    gate, entered = asyncio.Event(), asyncio.Event()
+
+    async def _held(server_id, *rest):  # noqa: ANN001
+        if server_id == slow.id:
+            entered.set()
+            await gate.wait()
+        return await real(server_id, *rest)
+
+    monkeypatch.setattr(agent_bundles, "_render_once", _held)
+    task = asyncio.create_task(agent_bundles._run(str(slow.id)))
+    await asyncio.wait_for(entered.wait(), 10)
+    # The second slot is free: another server renders now.
+    assert await client.get(keys["slot"]) is not None
+    blocker = asyncio.create_task(agent_bundles._run(str(second.id)))
+    result = await asyncio.wait_for(blocker, 30)
+    assert result["status"] == "stored", result
+    # Both slots taken (the slow one, and a stand-in): the next one waits.
+    assert await client.set(keys["slot"] + ":1", "someone-else", ex=60)
+    assert (await agent_bundles._run(str(third.id)))["status"] == "deferred"
+    gate.set()
+    assert (await asyncio.wait_for(task, 30))["status"] == "stored"
+
+
+@pytest.mark.asyncio
+async def test_a_holder_with_more_to_render_hands_its_slot_to_a_waiting_server(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that changed again while it rendered used to render again,
+    up to 50 times, while every other server waited for the one slot. With a
+    render waiting it hands the slot on and comes back through the queue,
+    keeping its server's lock so duplicates still coalesce into it."""
+    client, keys = redis_keys
+    busy = await _agent(db_session)
+    other = await _agent(db_session)
+    await db_session.commit()
+    busy_lock = keys["lock"] + str(busy.id)
+    real = agent_bundles._render_once
+    entered, gate = asyncio.Event(), asyncio.Event()
+    renders: list[uuid.UUID] = []
+
+    async def _storm(server_id, *rest):  # noqa: ANN001
+        renders.append(server_id)
+        if server_id == busy.id:
+            entered.set()
+            await gate.wait()
+            # A change landed while it rendered.
+            await client.set(keys["dirty"] + str(busy.id), "1", ex=60)
+        return await real(server_id, *rest)
+
+    monkeypatch.setattr(agent_bundles, "_render_once", _storm)
+    task = asyncio.create_task(agent_bundles._run(str(busy.id)))
+    await asyncio.wait_for(entered.wait(), 10)
+    waiting = await agent_bundles._run(str(other.id))
+    assert waiting["status"] == "deferred", waiting
+    gate.set()
+    result = await asyncio.wait_for(task, 30)
+
+    assert result["status"] == "handed_on", result
+    assert renders.count(busy.id) == 1, "it rendered again while another server waited"
+    assert await client.get(keys["slot"]) is None, "the slot was handed on"
+    token = result["lock_token"]
+    assert (await client.get(busy_lock)) == token.encode(), "its lock waits with the retry"
+
+    # The waiting server takes the slot; the busy one comes back after it
+    # (the storm over, nobody waiting).
+    monkeypatch.setattr(agent_bundles, "_render_once", real)
+    other_back = await agent_bundles._run(str(other.id), lock_token=waiting["lock_token"])
+    assert other_back["status"] == "stored", other_back
+    await client.delete(keys["waiting"])
+    back = await agent_bundles._run(str(busy.id), lock_token=token)
+    assert back["status"] in ("stored", "current"), back
+    assert await client.get(busy_lock) is None
+
+
+def test_a_handed_on_render_comes_back_after_the_waiters_next_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The task re-enqueues a render that handed its slot on, carrying its
+    lock token, LATER than a deferred render's retry: re-enqueued at once it
+    took back the slot it had just freed before the waiter (retrying every
+    ``SLOT_RETRY_SECONDS``) came round, so nothing was handed to anyone."""
+    sid = str(uuid.uuid4())
+
+    async def _handed(server_id, lock_token=None, soft_limit=None):  # noqa: ANN001
+        return {"status": "handed_on", "lock_token": "tok", "renders": 1}
+
+    requeued: list[dict] = []
+    monkeypatch.setattr(agent_bundles, "_run", _handed)
+    monkeypatch.setattr(
+        agent_bundles.render_dns_bundle, "apply_async", lambda *a, **kw: requeued.append(kw)
+    )
+    agent_bundles.render_dns_bundle.run(sid)
+    assert requeued == [
+        {
+            "args": [sid],
+            "kwargs": {"lock_token": "tok"},
+            "countdown": agent_bundles.HANDED_ON_RETRY_SECONDS,
+            "retry": False,
+            "queue": "bundles",
+            # The message's own limits go with it (#2240): here the floor.
+            "soft_time_limit": 900,
+            "time_limit": 960,
+        }
+    ], requeued
+    assert agent_bundles.HANDED_ON_RETRY_SECONDS > agent_bundles.SLOT_RETRY_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_with_nobody_waiting_a_holder_renders_again(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control: with no render waiting, the holder still renders its
+    server again in place, as before."""
+    client, keys = redis_keys
+    server = await _agent(db_session)
+    await db_session.commit()
+    real = agent_bundles._render_once
+    calls = 0
+
+    async def _dirty_once(server_id, *rest):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await client.set(keys["dirty"] + str(server.id), "1", ex=60)
+        return await real(server_id, *rest)
+
+    monkeypatch.setattr(agent_bundles, "_render_once", _dirty_once)
+    result = await agent_bundles._run(str(server.id))
+    assert result["renders"] == 2, result
+    assert result["status"] in ("stored", "current"), result

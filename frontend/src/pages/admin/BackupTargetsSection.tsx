@@ -1107,7 +1107,7 @@ function TargetFormModal({
               Keep the last
               <input
                 type="number"
-                min={0}
+                min={1}
                 max={10000}
                 value={retentionLastN}
                 onChange={(e) => setRetentionLastN(e.target.value)}
@@ -1125,7 +1125,7 @@ function TargetFormModal({
               Keep archives newer than
               <input
                 type="number"
-                min={0}
+                min={1}
                 max={10000}
                 value={retentionDays}
                 onChange={(e) => setRetentionDays(e.target.value)}

@@ -7,8 +7,9 @@ may run at once.
   (``render_time_limits``), and a render whose message is too short for the
   group as it is now republishes itself sized for it instead of starting.
 * One fleet-wide render slot queued seven servers' full renders behind each
-  other for hours. ``dns_agent_bundle_render_slots`` gives N slots; slot 0
-  keeps the old key, so one slot behaves exactly as before.
+  other for hours. #2252 (#2227) gives ``dns_agent_bundle_render_slots``
+  of them, 2 by default; the slot tests here check that slot 0 keeps the
+  old key and that each render frees only the slot it took.
 
 The first half needs neither Postgres nor Redis; the rest uses the suite's
 database and, where it says so, a real Redis on its own key names.
@@ -192,10 +193,10 @@ class _FakeRedis:
         return 1
 
 
-async def _take(client: _FakeRedis, server: str) -> tuple[str, list[str], str]:
+async def _take(client: _FakeRedis, server: str) -> tuple[str, str | None, str]:
     token = uuid.uuid4().hex
     value = f"{server}:{token}"
-    status, keys = await agent_bundles._acquire(
+    status, key = await agent_bundles._acquire(
         client,
         lock_key=f"lock:{server}",
         dirty_key=f"dirty:{server}",
@@ -204,7 +205,7 @@ async def _take(client: _FakeRedis, server: str) -> tuple[str, list[str], str]:
         lease_ms=60_000,
         resumed=False,
     )
-    return status, keys, value
+    return status, key, value
 
 
 @pytest.mark.asyncio
@@ -213,13 +214,13 @@ async def test_one_slot_is_the_original_key_and_nothing_else(
 ) -> None:
     monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 1)
     client = _FakeRedis()
-    status, keys, value = await _take(client, "a")
-    assert (status, keys) == ("held", ["spatium:bundle:render-slot"])
+    status, key, value = await _take(client, "a")
+    assert (status, key) == ("held", "spatium:bundle:render-slot")
     assert set(client.data) == {
         "lock:a",
         "spatium:bundle:render-slot",
     }, "one slot must take exactly the keys it always took"
-    assert (await _take(client, "b"))[:2] == ("deferred", [])
+    assert (await _take(client, "b"))[:2] == ("deferred", None)
     assert client.data["spatium:bundle:render-slot"] == value
 
 
@@ -231,16 +232,16 @@ async def test_n_slots_let_n_renders_run_and_each_releases_its_own(
     client = _FakeRedis()
     taken = [await _take(client, s) for s in ("a", "b", "c")]
     assert [t[:2] for t in taken] == [
-        ("held", ["spatium:bundle:render-slot"]),
-        ("held", ["spatium:bundle:render-slot:1"]),
-        ("held", ["spatium:bundle:render-slot:2"]),
+        ("held", "spatium:bundle:render-slot"),
+        ("held", "spatium:bundle:render-slot:1"),
+        ("held", "spatium:bundle:render-slot:2"),
     ]
-    assert (await _take(client, "d"))[:2] == ("deferred", [])
+    assert (await _take(client, "d"))[:2] == ("deferred", None)
 
     # b finishes: it frees slot 1 and nobody else's.
-    _status, b_keys, b_value = taken[1]
-    for key in b_keys:
-        await agent_bundles._release(client, key, b_value)
+    _status, b_key, b_value = taken[1]
+    assert b_key is not None
+    await agent_bundles._release(client, b_key, b_value)
     assert "spatium:bundle:render-slot:1" not in client.data
     assert client.data["spatium:bundle:render-slot"] == taken[0][2]
     assert client.data["spatium:bundle:render-slot:2"] == taken[2][2]
@@ -248,8 +249,8 @@ async def test_n_slots_let_n_renders_run_and_each_releases_its_own(
     await agent_bundles._release(client, "spatium:bundle:render-slot", b_value)
     assert client.data["spatium:bundle:render-slot"] == taken[0][2]
 
-    status, keys, _value = await _take(client, "e")
-    assert (status, keys) == ("held", ["spatium:bundle:render-slot:1"])
+    status, key, _value = await _take(client, "e")
+    assert (status, key) == ("held", "spatium:bundle:render-slot:1")
 
 
 @pytest.mark.parametrize("slots,expected", [(0, 1), (-3, 1), (1, 1), (4, 4)])
@@ -393,6 +394,11 @@ async def redis_keys(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agent_bundles, "RENDER_SLOT_KEY", keys["slot"])
     monkeypatch.setattr(agent_bundles, "RENDER_LOCK_PREFIX", keys["lock"])
     monkeypatch.setattr(agent_bundles, "RENDER_DIRTY_PREFIX", keys["dirty"])
+    # #2252's keys too, as its own fixtures name them: nothing here reads or
+    # leaves the real waiting flag, unfinished-render counts or holds.
+    monkeypatch.setattr(agent_bundles, "RENDER_WAITING_KEY", f"spatium:test:{tag}:waiting")
+    monkeypatch.setattr(agent_bundles, "RENDER_ATTEMPTS_PREFIX", f"spatium:test:{tag}:attempts:")
+    monkeypatch.setattr(agent_bundles, "RENDER_HOLD_PREFIX", f"spatium:test:{tag}:hold:")
     try:
         yield client, keys
     finally:
