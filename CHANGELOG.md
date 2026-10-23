@@ -128,14 +128,6 @@ the formatter handles the rest.
 
 ### Fixed
 
-- **Deleting a DHCP server stranded its IPAM mirrors and DDNS records
-  (#2290).** Leases cascade with the server, and the expiry sweep walks
-  leases, so the `status="dhcp"` rows and their A/PTR records were never
-  freed. The delete now runs the normal per-lease teardown first
-  (honouring an HA peer that still holds the address), and the hourly
-  mirror sweep also frees lease mirrors that no lease row backs, so
-  installs already stranded heal themselves.
-
 - **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
   Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
   and a Domain row is re-queried every 24 h by default. They now sit in
