@@ -128,6 +128,48 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An API token bound to specific subnets or DNS zones is held to them
+  outside the IPAM and DNS routers too.** Its permission check sees only
+  the resource type, so routes mounted elsewhere answered it for the
+  whole estate: `GET /reports/top-subnets-by-utilization` listed every
+  subnet, and `GET /metrics/dns/timeseries` summed every server. Such a
+  token is now refused (403) on every route outside the IPAM and DNS
+  routers except those that narrow to its grants or return nothing about
+  the estate (`/auth/me`, `/auth/me/permissions`, `/search`,
+  `/search/types`, `/ai/mcp`, `/dns/tools/*`), and `/metrics` refuses it
+  as a scrape credential. Sessions and tokens without resource grants
+
+- **An "Exclude secrets" backup now leaves out every secret.** The
+  diagnostic mode blanked the credentials an operator types in but
+  kept the appliance CA private key, the k3s join tokens, the cluster
+  kubeconfig, persistent pairing-code reveals and the ACME account
+  key, plus local password hashes and API-token / session /
+  pairing-code / agent-token digests, and its `secrets.enc` still
+  carried the install's `SECRET_KEY` and credential key. All of them
+  are now removed: the CA row is left out, the cluster credentials and
+  password hashes are NULL, the digests are replaced with values
+  nothing hashes to, and `secrets.enc` holds metadata only. Restoring
+  such an archive still succeeds: the CA is regenerated on the next
+  approval (approved appliances re-key), the supervisor re-reports the
+  kubeconfig and join token, agents re-bootstrap from their pre-shared
+  key, and the next ACME order mints a new account key. Local
+  passwords must be reset and API tokens re-issued after such a
+  restore. A normal backup is unchanged.
+
+- **The diagnostic and support bundles now keep secret environment
+  values out.** The appliance diagnostic bundle's env dump matched
+  secret names against a short list that missed `LG_AGENT_KEY` and
+  every connection URL carrying a password, and its pod and host log
+  files were copied without the credential sweep the support bundle
+  applies. Both bundles now show an environment value only for an
+  allowlist of known non-secret settings and list every other variable
+  with its value replaced; the appliance bundle runs every file it
+  writes through the support bundle's secret-shape sweep; and that
+  sweep now also strips a password from a URL with an empty username
+  (`redis://:password@host`, the form every Redis URL the charts
+  render takes). The bundle card says what is redacted and that the
+  log sweep is best effort.
+
 - **A node's hard loss no longer leaves a surviving node's heartbeat stale
   past the demote guard (#1805).** Every heartbeat reached the api through
   its Service, and so does every DNS and DHCP agent and the frontend's

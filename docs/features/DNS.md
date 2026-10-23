@@ -1673,6 +1673,8 @@ Catches drift between IPAM's expected records (every IP with a hostname + DNS zo
 
 Implementation: `app.tasks.ipam_dns_sync.auto_sync_ipam_dns` (Celery beat fires every 60s, task gates on the `enabled` flag + interval).
 
+**Which zone an address is judged against.** The address's own zone (`ip_address.forward_zone_id`, set by Allocate, Edit and Bulk edit) when it has one that is still live, otherwise the subnet's effective zone ([#2104](https://github.com/spatiumnorth/spatiumddi/issues/2104)). The same rule applies to the manual Sync DNS at subnet, block and space scope, to auto-sync, and to the records a commit writes, so an address an operator placed in another zone stays there. `forward_zone_id` cannot tell a chosen zone from one inherited from the subnet, so **changing a subnet's zone does not move its existing addresses on Sync DNS, and removing it does not list their records as stale**. Move them with Bulk edit → DNS zone, or remove them by setting the address's DNS zone to None in Edit. Only addresses with no zone of their own, or whose zone was deleted, follow the subnet. DDNS is different: a lease's name goes into the DDNS domain override's zone, else the subnet's, on every rename.
+
 ### 14.2 Zone ↔ Server Reconciliation
 
 Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire. Identical to pressing "Sync with Servers" on every group, on a timer. AXFR imports out-of-band edits, then any DB-only records are pushed back via RFC 2136. Additive only.

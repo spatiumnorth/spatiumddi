@@ -2572,6 +2572,17 @@ export function ZoneModal({
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
+  // Sub-zone opens with ".<parent>" pre-filled so the operator types the
+  // leading label first; a focused input puts the caret at the END of a
+  // pre-fill, which made "xp" read ".parentxp" (#2464). Park it at the start.
+  const nameRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!zone && initialName?.startsWith(".")) {
+      nameRef.current?.setSelectionRange(0, 0);
+    }
+    // Once, on open: later renders must not move a caret the operator placed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
@@ -2772,6 +2783,7 @@ export function ZoneModal({
         <Field label="Zone Name (FQDN)">
           <input
             className={inputCls}
+            ref={nameRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="example.com"
@@ -11753,6 +11765,23 @@ export function DNSPage() {
     queryFn: () => dnsApi.listGroups(),
   });
 
+  // The selection stores the group / zone object as it was when the tree was
+  // clicked. Edit Group / Edit Zone save and invalidate these two queries, so
+  // the page, and the dialogs seeded from it, read the live row from them and
+  // fall back to the clicked copy only until they resolve (#2462). Without
+  // this the next Save wrote the old values back.
+  const selectedGroupId = selection ? selection.group.id : null;
+  const selectedZoneId = selection?.type === "zone" ? selection.zone.id : null;
+  const { data: selectedGroupZones } = useQuery({
+    queryKey: ["dns-zones", selectedGroupId],
+    queryFn: () => dnsApi.listZones(selectedGroupId!),
+    enabled: !!selectedGroupId && !!selectedZoneId,
+  });
+  const liveGroup =
+    groups.find((g: DNSServerGroup) => g.id === selectedGroupId) ?? null;
+  const liveZone =
+    selectedGroupZones?.find((z: DNSZone) => z.id === selectedZoneId) ?? null;
+
   // Deep-link from global search: navigate("/dns", { state: { selectGroup, selectZone, highlightRecord? } })
   useEffect(() => {
     const state = location.state as {
@@ -12009,18 +12038,22 @@ export function DNSPage() {
         )}
         {selection?.type === "group" && (
           <GroupDetailView
-            group={selection.group}
+            group={liveGroup ?? selection.group}
             onSelectZone={(z) =>
-              setSelection({ type: "zone", group: selection.group, zone: z })
+              setSelection({
+                type: "zone",
+                group: liveGroup ?? selection.group,
+                zone: z,
+              })
             }
-            onEdit={() => setEditGroup(selection.group)}
-            onDelete={() => setConfirmDeleteGroup(selection.group)}
+            onEdit={() => setEditGroup(liveGroup ?? selection.group)}
+            onDelete={() => setConfirmDeleteGroup(liveGroup ?? selection.group)}
           />
         )}
         {selection?.type === "zone" && (
           <ZoneDetailView
-            group={selection.group}
-            zone={selection.zone}
+            group={liveGroup ?? selection.group}
+            zone={liveZone ?? selection.zone}
             highlightRecordId={pendingHighlightRecord}
             onDeleted={() =>
               setSelection({ type: "group", group: selection.group })

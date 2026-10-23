@@ -390,6 +390,13 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones. Clearing or replacing a webhook URL or header also blanks its leftover plaintext column in the same change, so a value an admin has removed does not stay in the database or in later full backups. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
 
+An "exclude secrets" archive removes every secret, not only the credentials an operator types in: the appliance CA private key, the k3s join tokens and the cluster kubeconfig, persistent pairing-code reveals, the ACME account key, and the stored digests of credentials (local password hashes, API-token, session, pairing-code and agent-token digests). Its `secrets.enc` carries no `SECRET_KEY` or `CREDENTIAL_ENCRYPTION_KEY`, only the archive metadata the passphrase check needs. Restoring one succeeds and leaves an install that regenerates what it can:
+
+- **Local sign-in.** Every local password is cleared, so sign in through an external provider or reset a password with the recipe in [Troubleshooting](../TROUBLESHOOTING.md#resetting-the-admin-password). API tokens and sessions no longer match anything; issue new tokens.
+- **Appliances.** The appliance CA is regenerated on the next approval, so appliances approved against the old one must be re-keyed. The supervisor re-reports the kubeconfig and the join token on its next heartbeat. Pairing codes cannot be claimed or revealed; create new ones.
+- **Agents** are refused on their next request and re-bootstrap from their pre-shared key.
+- **ACME.** The next certificate order mints a new account key and registers it with the CA.
+
 So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
 
 #### Passphrase rules
@@ -1385,6 +1392,15 @@ PEM private keys, JWTs, PSKs, API tokens, TSIG keys. Matched both by field
 name and by value shape, and removed in **every** mode including the
 unscrubbed one. There is no version of "let me read my own logs" that is
 improved by including the key that decrypts the database.
+
+The process environment (`system/env.txt`) is the exception to matching by
+name: a variable's **value** appears only when its name is on an allowlist
+of known non-secret settings (log level, timeouts, feature flags, versions,
+Kubernetes service links). Every other variable is listed with its value
+replaced, so the dump still shows what is set. Connection URLs such as
+`DATABASE_URL` and `REDIS_URL` are on the replaced side. The appliance
+diagnostic bundle applies the same rule to its env dumps and runs every
+file it contains, logs included, through the same secret-shape sweep.
 
 **Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
 become stable synthetic values, so the archive stays *readable*:
