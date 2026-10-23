@@ -616,6 +616,8 @@ class RunNowResponse(BaseModel):
     error: str | None
     # The node whose pod wrote the archive (#1838); null off the appliance.
     node_name: str | None = None
+    # Set when the archive was written but the retention sweep failed.
+    retention_failure_category: str | None = None
 
 
 @router.post("/{target_id}/run-now", response_model=RunNowResponse)

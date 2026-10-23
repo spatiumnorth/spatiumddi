@@ -406,6 +406,13 @@ async def _retention_sweep(
     protected: set[str] = {backups[0].filename} if backups else set()
     if just_written:
         protected.add(just_written)
+        if target.retention_keep_last_n is not None and target.retention_keep_last_n < 1:
+            # A legacy stored 0 reads as 1, which would keep only the file
+            # just written and prune the newest archive that existed before
+            # this run. Keep that one too; keep-last-N >= 1 counts as before.
+            previous = next((a.filename for a in backups if a.filename != just_written), None)
+            if previous:
+                protected.add(previous)
     if target.retention_keep_last_n is not None:
         keep_n = max(target.retention_keep_last_n, 1)
         for stale in backups[keep_n:]:
