@@ -5207,16 +5207,50 @@ async def _load_or_create_settings(db: AsyncSession) -> PlatformSettings:
     return settings
 
 
+def _aggregation_snooze_audit(
+    user: Any, action: str, candidate_key: str, old: str | None, new: str | None
+) -> AuditLog:
+    """Audit row for a change to the shared ``aggregation_snooze`` map.
+
+    The map lives on ``platform_settings`` and decides what every operator's
+    aggregation badge shows, so each change is recorded against the
+    candidate key it touched, with the entry's value before and after
+    (``None`` = no entry, an ISO timestamp = snoozed until, ``"permanent"``
+    = dismissed).
+    """
+    return _audit(
+        user,
+        action,
+        "aggregation_snooze",
+        candidate_key,
+        f"aggregation candidate {candidate_key}",
+        old_value={"snoozed_until": old},
+        new_value={"snoozed_until": new},
+    )
+
+
+# The snooze map is platform-wide (``platform_settings.aggregation_snooze``):
+# changing it changes the suggestions every operator sees. The router-level
+# gate admits any IPAM write grant (a ``custom_field`` writer, an address-set
+# delegate), so these routes require type-level write on ``ip_block`` — the
+# resource the suggestions are computed over — and audit every change.
 @router.post("/aggregation-snoozes/snooze", status_code=status.HTTP_204_NO_CONTENT)
 async def snooze_aggregation_candidate(
     body: AggregationSnoozeRequest, current_user: CurrentUser, db: DB
 ) -> None:
     """Hide a candidate from the badge for ``days`` days (default 30)."""
+    _require_type_write(current_user, "ip_block")
     settings = await _load_or_create_settings(db)
     until = datetime.now(UTC) + timedelta(days=body.days)
     snooze = dict(settings.aggregation_snooze)
+    old = snooze.get(body.candidate_key)
     snooze[body.candidate_key] = until.isoformat()
     settings.aggregation_snooze = snooze
+    db.add(
+        _aggregation_snooze_audit(
+            current_user, "snooze", body.candidate_key, old, until.isoformat()
+        )
+    )
     await db.commit()
 
 
@@ -5225,10 +5259,13 @@ async def dismiss_aggregation_candidate(
     body: AggregationDismissRequest, current_user: CurrentUser, db: DB
 ) -> None:
     """Hide a candidate permanently — operator-flagged "don't suggest again"."""
+    _require_type_write(current_user, "ip_block")
     settings = await _load_or_create_settings(db)
     snooze = dict(settings.aggregation_snooze)
+    old = snooze.get(body.candidate_key)
     snooze[body.candidate_key] = "permanent"
     settings.aggregation_snooze = snooze
+    db.add(_aggregation_snooze_audit(current_user, "dismiss", body.candidate_key, old, "permanent"))
     await db.commit()
 
 
@@ -5236,12 +5273,19 @@ async def dismiss_aggregation_candidate(
 async def clear_aggregation_snooze(
     body: AggregationClearRequest, current_user: CurrentUser, db: DB
 ) -> None:
-    """Remove a snooze / dismiss entry — operator changed their mind."""
+    """Remove a snooze / dismiss entry — operator changed their mind.
+
+    Clearing a key that has no entry changes nothing and writes no audit row.
+    """
+    _require_type_write(current_user, "ip_block")
     settings = await _load_or_create_settings(db)
     snooze = dict(settings.aggregation_snooze)
     if body.candidate_key in snooze:
-        snooze.pop(body.candidate_key)
+        old = snooze.pop(body.candidate_key)
         settings.aggregation_snooze = snooze
+        db.add(
+            _aggregation_snooze_audit(current_user, "clear_snooze", body.candidate_key, old, None)
+        )
         await db.commit()
 
 
