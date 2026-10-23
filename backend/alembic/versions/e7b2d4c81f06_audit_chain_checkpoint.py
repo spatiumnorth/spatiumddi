@@ -7,7 +7,7 @@ full pass). A single row, written by the verifier; a missing row just means
 "walk everything".
 
 Revision ID: e7b2d4c81f06
-Revises: d3a7f19c52e8
+Revises: e7b3d19a4c26
 Create Date: 2026-10-21 10:00:00.000000
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e7b2d4c81f06"
-down_revision = "d3a7f19c52e8"
+down_revision = "e7b3d19a4c26"
 branch_labels = None
 depends_on = None
 
