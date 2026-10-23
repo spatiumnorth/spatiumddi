@@ -28,6 +28,7 @@ from sqlalchemy import String, func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.asns._audit import write_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
@@ -247,7 +248,7 @@ async def create_asn(body: ASNCreate, db: DB, user: CurrentUser) -> ASNRead:
     try:
         from app.tasks.asn_whois_refresh import refresh_one_asn_by_id
 
-        refresh_one_asn_by_id.delay(str(row.id))
+        await dispatch(refresh_one_asn_by_id, str(row.id))
     except Exception as exc:  # noqa: BLE001
         logger.warning("asn_whois_refresh_dispatch_failed", asn=row.number, error=str(exc))
 

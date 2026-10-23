@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -374,7 +375,7 @@ async def sync_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> Sta
     from app.tasks.fortinet_sync import sync_firewall_now  # noqa: PLC0415
 
     try:
-        result = sync_firewall_now.delay(str(f.id))
+        result = await dispatch(sync_firewall_now, str(f.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

@@ -22,6 +22,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -427,7 +428,7 @@ async def sync_host(host_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusRespo
     from app.tasks.docker_sync import sync_host_now  # noqa: PLC0415
 
     try:
-        result = sync_host_now.delay(str(h.id))
+        result = await dispatch(sync_host_now, str(h.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
@@ -443,7 +444,7 @@ async def post_start(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Up
     )
     await db.commit()
 
-    drive_upgrade_run.delay(str(run.id))
+    await dispatch(drive_upgrade_run, str(run.id))
     logger.info(
         "upgrade_run_enqueued",
         run_id=str(run.id),
@@ -493,7 +494,7 @@ async def post_resume(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> U
     # Re-enqueue the orchestrator celery task to pick up from progress.
     from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
 
-    drive_upgrade_run.delay(str(run.id))
+    await dispatch(drive_upgrade_run, str(run.id))
     return _row_to_schema(run)
 
 

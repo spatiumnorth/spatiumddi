@@ -31,6 +31,7 @@ from app.core.agent_wake import (
     dhcp_wake_channels,
     wake_subscription,
 )
+from app.core.celery_dispatch import dispatch
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dhcp.kea import option_defs_for_option_maps
@@ -2033,7 +2034,7 @@ async def agent_dhcp_fingerprints(
             from app.tasks.dhcp_fingerprint import lookup_fingerprint_task
 
             for mac in enqueue_macs:
-                lookup_fingerprint_task.delay(mac)
+                await dispatch(lookup_fingerprint_task, mac)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",

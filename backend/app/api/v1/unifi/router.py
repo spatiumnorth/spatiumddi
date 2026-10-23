@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -827,7 +828,7 @@ async def sync_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) ->
     from app.tasks.unifi_sync import sync_controller_now  # noqa: PLC0415
 
     try:
-        result = sync_controller_now.delay(str(c.id))
+        result = await dispatch(sync_controller_now, str(c.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")
