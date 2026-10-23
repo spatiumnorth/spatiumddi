@@ -87,6 +87,7 @@ import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { syncLabel } from "@/lib/dhcp-sync-label";
+import { scopePickerLabel } from "@/lib/dhcp-scope-label";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -1656,7 +1657,7 @@ function PoolOccupancyCell({
   );
 }
 
-function ServerPoolsOrStaticsTab({
+export function ServerPoolsOrStaticsTab({
   groupId,
   kind,
 }: {
@@ -1672,6 +1673,13 @@ function ServerPoolsOrStaticsTab({
     enabled: !!groupId,
   });
   const allScopes = groupScopes;
+  // #2447 — scopes are commonly left with the same name; the picker also
+  // names each one's subnet so the options can be told apart.
+  const { data: subnets = [] } = useQuery({
+    queryKey: ["subnets"],
+    queryFn: () => ipamApi.listSubnets(),
+  });
+  const subnetNetworkById = new Map(subnets.map((s) => [s.id, s.network]));
 
   const nestedQueries = useQueries({
     queries: allScopes.map((sc) => ({
@@ -1800,7 +1808,7 @@ function ServerPoolsOrStaticsTab({
               >
                 {allScopes.map((sc) => (
                   <option key={sc.id} value={sc.id}>
-                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
+                    {scopePickerLabel(sc, subnetNetworkById.get(sc.subnet_id))}
                   </option>
                 ))}
               </select>
