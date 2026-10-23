@@ -128,6 +128,42 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS server holding a million records no longer OOM-kills
+  itself, and a restarted one comes back (#2223).** ddi-pg's scale
+  lab ran 1,000,000 records in 20,000 zones on 7 nodes: 5
+  `dns-bind9` containers were OOM-killed at their 2Gi limit with
+  the agent at 1.1 GB, and none recovered, because the `:53`
+  liveness probe started 30 s after the container did and killed it
+  before named listened. Two fixes. The DNS containers in both
+  charts (bind9, PowerDNS, Technitium) gain a startup probe on the
+  same `:53` check with a 60-minute budget, which liveness and
+  readiness wait for: a cold start at that size checks every zone
+  file first (~70 ms each, measured), so it takes tens of minutes.
+  A daemon that never listens is still restarted, after the budget;
+  `dns.startupProbe` / `dnsAgents.startupProbe` raise it. And the
+  agent's memory: measured on a synthetic bundle of that shape (126
+  MB), its peak while taking a bundle fell from ~700 MB to ~480 MB,
+  from 884 MB to 461 MB during a startup hold, and what it keeps
+  between polls from ~450 MB to ~110 MB. The bundle is parsed
+  a zone at a time instead of from its whole text; the zone list
+  kept for the DNSSEC re-read, the per-zone serial map and the
+  startup report are kept as compact JSON, because as parsed objects
+  they held most of the freed bundle resident (CPython returns
+  memory an arena at a time); a startup hold (#2019) keeps the held
+  bundle as a hard link on disk rather than parsed; and the ingest
+  thread reads the zone list without the records, where it re-parsed
+  the whole cache every 180 s after a change, beside the sync
+  loop's own parse. And on the appliance the `dns-bind9` memory
+  limit is no longer a fixed 2Gi, which the lab hit at about 2M
+  records: the supervisor sizes it from node RAM, a quarter of the
+  smallest node labelled for dns-bind9, rounded to whole GiB, floor
+  2Gi, cap 8Gi, with the request an eighth of it as before (so 4 GB
+  → 2Gi / 256Mi, 16 GB → 4Gi / 512Mi, 64 GB → 8Gi / 1Gi). One
+  value for the cluster, because the role chart must render the same
+  on every node (#1137). A memory value in `dnsBind9.resources` in
+  the `spatiumddi-appliance` HelmChartConfig still wins. Sizing in
+  `docs/features/DNS.md` §8.0 and `docs/deployment/APPLIANCE.md`.
+
 - **Appliance k3s v1.36.4+k3s1 → v1.36.5+k3s1 (#2224).** A patch on
   the same Kubernetes minor (1.36.5, Go 1.26.8), so a slot revert to
   the previous release still works: etcd stays on the 3.6.14 data
