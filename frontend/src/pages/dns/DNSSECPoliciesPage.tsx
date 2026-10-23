@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Pencil, Plus, Trash2 } from "lucide-react";
 
-import { dnsApi, type DNSSECPolicy } from "@/lib/api";
+import { dnsApi, formatApiError, type DNSSECPolicy } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -227,8 +227,7 @@ function PolicyModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

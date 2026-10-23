@@ -21,7 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from collections.abc import Callable, Sequence
+import tempfile
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
 from sqlalchemy import Boolean, Text, and_, cast, func, literal, not_, or_, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.types import UserDefinedType
@@ -38,6 +40,7 @@ from app.core.crypto import decrypt_str
 from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
+    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     ZONE_DEFAULT_TTL,
     DNSAcl,
@@ -80,7 +83,7 @@ from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
-    _mark_applied,
+    mark_ops_applied,
     op_rrset_key,
     queued_after,
     rrset_match_where,
@@ -90,6 +93,7 @@ from app.services.dns.row_locks import ids_in, lock_ops
 from app.services.dns.rrset import RRSET_OPS
 from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import (
+    dedupe_tsig_keys,
     legacy_group_key,
     resolve_group_transfer_key,
     transfer_needs_tsig,
@@ -630,6 +634,32 @@ class _StreamedEntries:
     hasher: Any = None
 
 
+@dataclass(frozen=True)
+class _StreamedZones:
+    """The group's zones, left out of the assembled body and structural
+    payload for ``encode_bundle_body`` to write in (#2227): ``mark`` stands in
+    for the body's ``zones`` list, ``structural_mark`` for the structural
+    payload's ``zones_structural``. ``base``, ``copies`` and ``record`` are the
+    assembly's own zone and record builders, so a zone is built exactly as the
+    whole render builds it; ``annotations`` are the keys a Technitium render
+    appends to a zone's copies (``_add_master_transfer_keys``), by the zone's
+    index."""
+
+    mark: str
+    structural_mark: str
+    zones: list[Any]
+    base: Callable[[Any], dict[str, Any]]
+    copies: Callable[[Any, dict[str, Any], list[Any]], list[dict[str, Any]]]
+    record: Callable[[Any], dict[str, Any]]
+    annotations: dict[int, dict[str, Any]]
+    has_views: bool
+
+
+def _zone_structural(zone: dict[str, Any], has_views: bool) -> dict[str, Any]:
+    """A zone copy as the structural payload carries it."""
+    return {k: val for k, val in zone.items() if has_views or k not in _RECORD_DRIVEN_KEYS}
+
+
 @dataclass
 class _Assembled:
     """Everything ``render_bundle_body`` builds before it hashes: the body
@@ -641,6 +671,7 @@ class _Assembled:
     records: int
     has_views: bool
     streamed: list[_StreamedEntries] = field(default_factory=list)
+    zones: _StreamedZones | None = None
 
 
 def _placeholder() -> str:
@@ -737,115 +768,408 @@ async def _stream_zone_entries(
     write(b"]")
 
 
+async def _zone_record_batches(
+    db: AsyncSession, zones: list[Any]
+) -> AsyncGenerator[tuple[int, Any, list[Any] | None], None]:
+    """``(index, zone, its records)`` for every zone, in ``zones``' order,
+    reading the records of a batch of zones per query (#2227).
+
+    Each zone's records come in the order ``_records_query`` gives them, which
+    within a zone is exactly the whole render's order. A batch is cut when its
+    zones' records reach ``RECORD_RENDER_BATCH`` (counted first, per zone) or
+    it holds ``ZONE_RENDER_BATCH`` zones, so what is held is one batch's rows
+    whatever the group's size. A zone that alone has more records than a
+    batch comes with ``None`` instead: the caller reads it in chunks
+    (``_zone_record_chunks``). Every query runs after the render's snapshot
+    statement, as the single records query did, so each sees at least every
+    transaction that snapshot does (``agent_bundle_render``'s ordering).
+    """
+    if not zones:
+        return
+    group_ids = list({z.group_id for z in zones})
+    counts: dict[Any, int] = {
+        zone_id: int(n)
+        for zone_id, n in (
+            await db.execute(
+                select(DNSRecord.zone_id, func.count())
+                .where(
+                    DNSRecord.zone_id.in_(select(DNSZone.id).where(DNSZone.group_id.in_(group_ids)))
+                )
+                .group_by(DNSRecord.zone_id)
+            )
+        ).all()
+    }
+
+    async def _flush(batch: list[tuple[int, Any]]) -> list[tuple[int, Any, list[Any]]]:
+        by_zone: dict[Any, list[Any]] = {}
+        result = await db.execute(_records_query(DNSRecord.zone_id.in_([z.id for _, z in batch])))
+        for rec in result:
+            by_zone.setdefault(rec.zone_id, []).append(rec)
+        return [(i, z, by_zone.pop(z.id, [])) for i, z in batch]
+
+    batch: list[tuple[int, Any]] = []
+    held = 0
+    for i, z in enumerate(zones):
+        count = counts.get(z.id, 0)
+        if count > RECORD_RENDER_BATCH:
+            # Too big for any batch: what is pending goes first, in order.
+            if batch:
+                for item in await _flush(batch):
+                    yield item
+                batch, held = [], 0
+            yield i, z, None
+            continue
+        batch.append((i, z))
+        held += count
+        if held >= RECORD_RENDER_BATCH or len(batch) >= ZONE_RENDER_BATCH:
+            for item in await _flush(batch):
+                yield item
+            batch, held = [], 0
+    if batch:
+        for item in await _flush(batch):
+            yield item
+
+
+async def _zone_record_chunks(db: AsyncSession, zone: Any) -> AsyncGenerator[list[Any], None]:
+    """One zone's records in ``_records_query`` order, ``RECORD_RENDER_BATCH``
+    rows at a time, over a server-side cursor (#2227)."""
+    result = await db.stream(
+        _records_query(DNSRecord.zone_id == zone.id).execution_options(
+            yield_per=RECORD_RENDER_BATCH
+        )
+    )
+    try:
+        async for chunk in result.partitions(RECORD_RENDER_BATCH):
+            yield list(chunk)
+    finally:
+        await result.close()
+
+
+class _Spool:
+    """Bytes written now and read back once, in order: in memory up to
+    ``SPOOL_MEMORY_BYTES``, on disk past it (#2227)."""
+
+    def __init__(self) -> None:
+        self._file = tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY_BYTES)  # noqa: SIM115
+
+    def write(self, data: bytes) -> None:
+        self._file.write(data)
+
+    def drain(self, sink: Callable[[bytes], None]) -> None:
+        self._file.seek(0)
+        while chunk := self._file.read(1 << 20):
+            sink(chunk)
+
+    def close(self) -> None:
+        self._file.close()
+
+
+#: What a zone spool keeps in memory before it moves to a temporary file.
+SPOOL_MEMORY_BYTES = 8 << 20
+
+
+def _join(first: bool, sep: bytes, data: bytes) -> bytes:
+    return data if first else sep + data
+
+
+async def _stream_flat_zone(
+    db: AsyncSession,
+    plan: _StreamedZones,
+    zone: Any,
+    base: dict[str, Any],
+    extra: dict[str, Any] | None,
+    first: bool,
+    write: Callable[[bytes], None],
+    etag_spool: _Spool,
+    structural_spool: _Spool,
+) -> int:
+    """A zone too large for a batch, in a group without views: its one copy,
+    with the records read and written a chunk at a time (#2227). The copy is
+    serialised with a placeholder for its ``records`` and cut there, as
+    ``encode_bundle_body`` does for the whole body; the structural copy leaves
+    the records out, so it needs no cut. Returns the records written."""
+    mark = _placeholder()
+    copy: dict[str, Any] = {**base, "view_name": None, "records": mark}
+    if extra:
+        copy.update(extra)
+    wire_sep = WIRE_JSON["separators"][0].encode("utf-8")
+    wire_head, wire_tail = _cut(json.dumps(copy, **WIRE_JSON), [mark], WIRE_JSON)
+    etag_head, etag_tail = _cut(json.dumps(copy, **_ETAG_JSON), [mark], _ETAG_JSON)
+    structural_spool.write(
+        _join(
+            first,
+            b", ",
+            json.dumps(_zone_structural(copy, False), **_ETAG_JSON).encode("utf-8"),
+        )
+    )
+    write(_join(first, wire_sep, wire_head) + b"[")
+    etag_spool.write(_join(first, b", ", etag_head) + b"[")
+    records = 0
+    chunk_first = True
+    async with aclosing(_zone_record_chunks(db, zone)) as chunks:
+        async for rows in chunks:
+            items = [plan.record(r) for r in rows]
+            del rows
+            records += len(items)
+            # A JSON list is its items joined by the item separator, so a
+            # chunk serialised on its own, minus its brackets, joins the next
+            # exactly where the whole list would have.
+            write(
+                _join(chunk_first, wire_sep, json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8"))
+            )
+            etag_spool.write(
+                _join(chunk_first, b", ", json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8"))
+            )
+            chunk_first = False
+            del items
+    write(b"]" + wire_tail)
+    etag_spool.write(b"]" + etag_tail)
+    return records
+
+
+async def _stream_zones(
+    db: AsyncSession,
+    plan: _StreamedZones,
+    write: Callable[[bytes], None],
+    etag_spool: _Spool,
+    structural_spool: _Spool,
+) -> int:
+    """Write the group's zone copies: into the body (``write``) as
+    ``WIRE_JSON`` serialises the ``zones`` list, and into the two spools as
+    ``_ETAG_JSON`` serialises the ETag payload's ``zones`` and the structural
+    payload's ``zones_structural``. A JSON list is its items joined by the item
+    separator, so each copy serialised on its own joins the next exactly where
+    the whole list would have. Returns the records written."""
+    wire_sep = WIRE_JSON["separators"][0].encode("utf-8")
+    write(b"[")
+    etag_spool.write(b"[")
+    structural_spool.write(b"[")
+    first = True
+    records = 0
+    # ``aclosing``: a failure in a caller's sink must not leave the generator
+    # holding a batch until the event loop finalises it.
+    async with aclosing(_zone_record_batches(db, plan.zones)) as batches:
+        async for index, zone, rows in batches:
+            base = plan.base(zone)
+            extra = plan.annotations.get(index)
+            if rows is None:
+                if not plan.has_views:
+                    records += await _stream_flat_zone(
+                        db, plan, zone, base, extra, first, write, etag_spool, structural_spool
+                    )
+                    first = False
+                    continue
+                # Under views a zone's copies are cut from all of its records
+                # at once (which views it renders in depends on them), so the
+                # largest zone is what such a render holds.
+                rows = []
+                async with aclosing(_zone_record_chunks(db, zone)) as chunks:
+                    async for chunk in chunks:
+                        rows.extend(chunk)
+            copies = plan.copies(zone, base, rows)
+            del rows
+            for copy in copies:
+                if extra:
+                    copy.update(extra)
+                records += len(copy["records"])
+                write(_join(first, wire_sep, json.dumps(copy, **WIRE_JSON).encode("utf-8")))
+                etag_spool.write(
+                    _join(first, b", ", json.dumps(copy, **_ETAG_JSON).encode("utf-8"))
+                )
+                structural_spool.write(
+                    _join(
+                        first,
+                        b", ",
+                        json.dumps(_zone_structural(copy, plan.has_views), **_ETAG_JSON).encode(
+                            "utf-8"
+                        ),
+                    )
+                )
+                first = False
+            del copies
+    write(b"]")
+    etag_spool.write(b"]")
+    structural_spool.write(b"]")
+    return records
+
+
 async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody:
     """``render_bundle_body``, serialised and gzipped as the store keeps it:
-    the same bytes, ETag and structural ETag, without ever holding a
-    blocklist whole (#1662).
+    the same bytes, ETag and structural ETag, without ever holding the group's
+    records (#2227) or a blocklist (#1662) whole.
 
-    The entries of the catalog's largest feed (~582k) are most of a bundle
-    that carries one, and building them as dicts, then serialising the
-    payload three times over (the structural ETag, the ETag, the body), took
-    the whole 1 GiB worker. Here every RPZ zone's ``entries`` is a placeholder
-    while the rest is serialised once per document; each document is cut
-    where its placeholders landed, and the entries are read from the
-    database a batch at a time (``stream_entries``, a server-side cursor per
-    list) and written into all three at once — two running SHA-256 hashes and
-    the gzip stream. The structural ETag is placeholdered too: it goes into
-    the body and the ETag's payload, and is known only once every entry has
-    been hashed.
+    Building every record of a group as a row and a dict, then serialising the
+    payload three times over (the structural ETag, the ETag and the body), is
+    what took a million-record group's render past 1 GB and a two-million
+    record one past the worker's 4 GiB. Here the group's ``zones`` (and the
+    structural ``zones_structural``) and every RPZ zone's ``entries`` are
+    placeholders while the rest is serialised once per document; each
+    document is cut where its placeholders landed, and the zones and entries
+    are read from the database a batch at a time and written into all three.
 
-    Placeholders serialise exactly once each and in the same order in all
-    three documents: the zones are one list in every one of them, each zone
-    holds one ``entries``, and ``structural_etag`` sorts after
-    ``blocklists`` and is the body's last key.
+    The three documents order their large parts differently, and SHA-256 only
+    runs forwards, so two of them are spooled (``_Spool``). In the body
+    (``WIRE_JSON``, insertion order) the zones come before the blocklists; in
+    the ETag payload and the structural payload (``_ETAG_JSON``, sorted keys)
+    the blocklists come first, then ``structural_etag`` (the ETag payload
+    only, known once the structural payload is hashed), then the zones. So
+    the zones are written straight into the gzip stream and spooled for the
+    two hashes; the entries then go into all three at once; then the two
+    spools are hashed in behind them.
+
+    Placeholders serialise exactly once each: the zones are one list, each RPZ
+    zone holds one ``entries`` (and, in a BIND9 bundle, one content hash,
+    #2157, which follows its entries in every document), and
+    ``structural_etag`` is one key.
     """
     assembled = await _assemble(db, server, stream=True)
     body = assembled.body
-    if not assembled.streamed:
-        rendered = _finish_whole(assembled)
-        body_json = json.dumps(rendered.body, **WIRE_JSON).encode("utf-8")
-        writer = BodyWriter()
-        writer.write(body_json)
-        del body_json
-        return EncodedBody(
-            body_gz=writer.finish(),
-            body_bytes=writer.size,
-            etag=rendered.etag,
-            structural_etag=rendered.structural_etag,
-            records=rendered.records,
-            has_views=rendered.has_views,
-        )
-
-    # Every placeholder in document order: each zone's entries, then (#2157)
-    # its content hash, which is known only once those entries have streamed.
+    plan = assembled.zones
+    assert plan is not None  # stream=True always plans the zones
+    # Every blocklist placeholder in document order: each RPZ zone's entries,
+    # then (#2157) its content hash, which is known only once those entries
+    # have streamed.
     seq: list[tuple[str, _StreamedEntries, bool]] = []
     for zone in assembled.streamed:
         seq.append((zone.mark, zone, False))
         if zone.hash_mark is not None:
             seq.append((zone.hash_mark, zone, True))
-    marks = [mark for mark, _zone, _is_hash in seq]
+    bl_marks = [mark for mark, _zone, _is_hash in seq]
+    n = len(bl_marks)
     structural_mark = _placeholder()
     body["structural_etag"] = structural_mark
-    structural_hash = hashlib.sha256()
-    etag_hash = hashlib.sha256()
-    writer = BodyWriter()
-    # One document at a time, each part consumed (and dropped) as soon as the
-    # stream reaches it: the body's records come before its blocklists.
-    structural_parts = _cut(json.dumps(assembled.structural, **_ETAG_JSON), marks, _ETAG_JSON)
-    structural_hash.update(structural_parts[0])
-    structural_parts[0] = b""
+    # The order each placeholder appears in each document (see above).
+    wire_parts = _cut(
+        json.dumps(body, **WIRE_JSON), [plan.mark, *bl_marks, structural_mark], WIRE_JSON
+    )
     etag_parts = _cut(
         json.dumps({**body, "pending_record_ops": [], "pending_ops_remaining": 0}, **_ETAG_JSON),
-        [*marks, structural_mark],
+        [*bl_marks, structural_mark, plan.mark],
         _ETAG_JSON,
     )
-    etag_hash.update(etag_parts[0])
-    etag_parts[0] = b""
-    wire_parts = _cut(json.dumps(body, **WIRE_JSON), [*marks, structural_mark], WIRE_JSON)
-    writer.write(wire_parts[0])
-    wire_parts[0] = b""
-    # All of it but the entries is serialised now: the dicts (a large group's
-    # records among them) go before the entries are read.
+    structural_parts = _cut(
+        json.dumps(assembled.structural, **_ETAG_JSON),
+        [*bl_marks, plan.structural_mark],
+        _ETAG_JSON,
+    )
     body.clear()
     assembled.structural.clear()
 
-    for i, (_mark, zone, is_hash) in enumerate(seq):
-        if i:
+    structural_hash = hashlib.sha256()
+    etag_hash = hashlib.sha256()
+    writer = BodyWriter()
+    etag_spool, structural_spool = _Spool(), _Spool()
+    try:
+        writer.write(wire_parts[0])
+        records = await _stream_zones(db, plan, writer.write, etag_spool, structural_spool)
+        for i, (_mark, zone, is_hash) in enumerate(seq):
             structural_hash.update(structural_parts[i])
             etag_hash.update(etag_parts[i])
-            writer.write(wire_parts[i])
-        if is_hash:
-            value = _rpz_hash_value(zone.hasher)
-            hashed = json.dumps(value, **_ETAG_JSON).encode("utf-8")
-            structural_hash.update(hashed)
-            etag_hash.update(hashed)
-            writer.write(json.dumps(value, **WIRE_JSON).encode("utf-8"))
-            continue
-        hashes = (structural_hash.update, etag_hash.update)
-        if zone.hasher is not None:
-            hashes = (*hashes, zone.hasher.update)
-        await _stream_zone_entries(db, zone.lists, hashes, writer.write)
+            writer.write(wire_parts[1 + i])
+            if is_hash:
+                value = _rpz_hash_value(zone.hasher)
+                hashed = json.dumps(value, **_ETAG_JSON).encode("utf-8")
+                structural_hash.update(hashed)
+                etag_hash.update(hashed)
+                writer.write(json.dumps(value, **WIRE_JSON).encode("utf-8"))
+                continue
+            hashes = (structural_hash.update, etag_hash.update)
+            if zone.hasher is not None:
+                hashes = (*hashes, zone.hasher.update)
+            await _stream_zone_entries(db, zone.lists, hashes, writer.write)
 
-    last = len(marks)
-    structural_hash.update(structural_parts[last])
-    structural_etag = "sha256:" + structural_hash.hexdigest()
-    etag_hash.update(
-        etag_parts[last]
-        + json.dumps(structural_etag, **_ETAG_JSON).encode("utf-8")
-        + etag_parts[last + 1]
-    )
-    writer.write(
-        wire_parts[last]
-        + json.dumps(structural_etag, **WIRE_JSON).encode("utf-8")
-        + wire_parts[last + 1]
-    )
+        structural_hash.update(structural_parts[n])
+        structural_spool.drain(structural_hash.update)
+        structural_hash.update(structural_parts[n + 1])
+        structural_etag = "sha256:" + structural_hash.hexdigest()
+
+        etag_hash.update(
+            etag_parts[n]
+            + json.dumps(structural_etag, **_ETAG_JSON).encode("utf-8")
+            + etag_parts[n + 1]
+        )
+        etag_spool.drain(etag_hash.update)
+        etag_hash.update(etag_parts[n + 2])
+
+        writer.write(
+            wire_parts[n + 1]
+            + json.dumps(structural_etag, **WIRE_JSON).encode("utf-8")
+            + wire_parts[n + 2]
+        )
+    finally:
+        etag_spool.close()
+        structural_spool.close()
     return EncodedBody(
         body_gz=writer.finish(),
         body_bytes=writer.size,
         etag="sha256:" + etag_hash.hexdigest(),
         structural_etag=structural_etag,
-        records=assembled.records,
+        records=records,
         has_views=assembled.has_views,
+    )
+
+
+#: The record count at which the streamed render (#2227) stops adding zones
+#: to one records query, and the most zones it puts in one: a batch holds
+#: about this many rows (~700 B each as fetched), however many records the
+#: group has. A zone with more records than this is read on its own over a
+#: server-side cursor, this many rows at a time — and, in a group without
+#: views, written that way too. Under split-horizon a zone's copies are cut
+#: from all of its records at once, so there the largest zone is the bound.
+RECORD_RENDER_BATCH = 20_000
+ZONE_RENDER_BATCH = 1000
+
+
+# The records the bundle ships, as column rows rather than ORM instances.
+# This was once one ``select(DNSRecord)`` per zone inside ``_assemble``'s zone
+# loop (N+1), and each row came back as a tracked ORM object — on
+# the sizing campaign's 250k A+PTR zone the build held ~500k instances
+# in the identity map for the life of the request, most of the api's
+# working set on every long-poll (2026-09-02/03). Only the eight fields
+# the bundle and the view filter read are fetched.
+#
+# The ordering exists so the rendered payload — and therefore the ETag —
+# is the same from one poll to the next. #1111: it is now the
+# ``ix_dns_record_zone_name`` prefix followed by every remaining shipped
+# column, not ``(zone_id, id)``. Stability needs a total order on what
+# the payload CARRIES — two rows identical in every shipped column
+# render identically whichever comes first — so ``id`` buys nothing,
+# and it cost a lot: no index covers ``(zone_id, id)`` and ``id`` is a
+# random UUID, so at 1.09 M rows the planner sorted the whole table
+# (an external merge at the shipped ``work_mem``) inside asyncpg's 30 s
+# ``command_timeout``, and every poll of every agent answered 503
+# (seven-node probe, 2026-09-21). With the index prefix the planner can
+# walk ``(zone_id, name)`` and finish the tie-break with an incremental
+# sort on the tiny per-name groups instead of sorting the table. The
+# streamed render (#2227) runs it per batch of zones or per zone, whose
+# records come back in the same order.
+def _records_query(where: Any) -> Any:
+    return (
+        select(
+            DNSRecord.zone_id,
+            DNSRecord.name,
+            DNSRecord.record_type,
+            DNSRecord.ttl,
+            DNSRecord.value,
+            DNSRecord.priority,
+            DNSRecord.weight,
+            DNSRecord.port,
+            DNSRecord.view_id,
+            DNSRecord.pool_member_id,
+        )
+        .where(where)
+        .order_by(
+            DNSRecord.zone_id,
+            DNSRecord.name,
+            DNSRecord.record_type,
+            DNSRecord.value,
+            DNSRecord.ttl,
+            DNSRecord.priority,
+            DNSRecord.weight,
+            DNSRecord.port,
+            DNSRecord.view_id,
+            DNSRecord.pool_member_id,
+        )
     )
 
 
@@ -939,56 +1263,12 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             for zone_id, entries in update_acls_by_zone.items()
         }
 
-    # Every record of every zone in ONE query, as column rows rather than
-    # ORM instances. This was one ``select(DNSRecord)`` per zone inside the
-    # loop below (N+1), and each row came back as a tracked ORM object — on
-    # the sizing campaign's 250k A+PTR zone the build held ~500k instances
-    # in the identity map for the life of the request, most of the api's
-    # working set on every long-poll (2026-09-02/03). Only the eight fields
-    # the bundle and the view filter read are fetched.
-    #
-    # The ordering exists so the rendered payload — and therefore the ETag —
-    # is the same from one poll to the next. #1111: it is now the
-    # ``ix_dns_record_zone_name`` prefix followed by every remaining shipped
-    # column, not ``(zone_id, id)``. Stability needs a total order on what
-    # the payload CARRIES — two rows identical in every shipped column
-    # render identically whichever comes first — so ``id`` buys nothing,
-    # and it cost a lot: no index covers ``(zone_id, id)`` and ``id`` is a
-    # random UUID, so at 1.09 M rows the planner sorted the whole table
-    # (an external merge at the shipped ``work_mem``) inside asyncpg's 30 s
-    # ``command_timeout``, and every poll of every agent answered 503
-    # (seven-node probe, 2026-09-21). With the index prefix the planner can
-    # walk ``(zone_id, name)`` and finish the tie-break with an incremental
-    # sort on the tiny per-name groups instead of sorting the table.
+    # Every record of every zone in ONE query (``_records_query``). The
+    # streamed render (#2227) reads them a batch of zones at a time instead
+    # (``_zone_record_batches``), so it never holds the group's record set.
     records_by_zone: dict[Any, list[Any]] = {}
-    if zone_ids:
-        rec_res = await db.execute(
-            select(
-                DNSRecord.zone_id,
-                DNSRecord.name,
-                DNSRecord.record_type,
-                DNSRecord.ttl,
-                DNSRecord.value,
-                DNSRecord.priority,
-                DNSRecord.weight,
-                DNSRecord.port,
-                DNSRecord.view_id,
-                DNSRecord.pool_member_id,
-            )
-            .where(DNSRecord.zone_id.in_(zone_ids))
-            .order_by(
-                DNSRecord.zone_id,
-                DNSRecord.name,
-                DNSRecord.record_type,
-                DNSRecord.value,
-                DNSRecord.ttl,
-                DNSRecord.priority,
-                DNSRecord.weight,
-                DNSRecord.port,
-                DNSRecord.view_id,
-                DNSRecord.pool_member_id,
-            )
-        )
+    if zone_ids and not stream:
+        rec_res = await db.execute(_records_query(DNSRecord.zone_id.in_(zone_ids)))
         for rec in rec_res:
             records_by_zone.setdefault(rec.zone_id, []).append(rec)
 
@@ -1027,8 +1307,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         )
     )
 
-    zone_payload: list[dict[str, Any]] = []
-    for z in zones:
+    def _base_zone(z: Any) -> dict[str, Any]:
         base_zp: dict[str, Any] = {
             "id": str(z.id),
             "name": getattr(z, "name", None) or getattr(z, "fqdn", None),
@@ -1113,15 +1392,19 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         if getattr(z, "zone_type", None) == "forward" and zone_transport != "do53":
             base_zp["forward_transport"] = zone_transport
             base_zp["forward_tls_hostname"] = getattr(z, "forward_tls_hostname", None)
+        return base_zp
+
+    def _zone_copies(z: Any, base_zp: dict[str, Any], rec_rows: list[Any]) -> list[dict[str, Any]]:
+        """The zone's copies as the bundle ships them: one, or one per view
+        that renders it. ``rec_rows`` is every record of the zone."""
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
         # files for serving — primary/secondary distinction matters for
         # accepting RFC 2136 updates, not for which server gets the data.
-        rec_rows: list[Any] = records_by_zone.get(z.id, [])
-
+        copies: list[dict[str, Any]] = []
         if not has_views:
             # Flat render — one zone copy, all records, no view (today's path).
-            zone_payload.append(
+            copies.append(
                 {
                     **base_zp,
                     "view_name": None,
@@ -1134,7 +1417,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                     ],
                 }
             )
-            continue
+            return copies
 
         # Split-horizon expansion (issue #24) composed with geo steering
         # (issue #530). Operator views: the zone materialises in every
@@ -1153,13 +1436,19 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             if not view_renders_zone(vd, operator_target_ids):
                 continue
             recs = records_for_view(rec_rows, vd, geo)
-            zone_payload.append(
+            copies.append(
                 {
                     **base_zp,
                     "view_name": vd["name"],
                     "records": [_rec_dict(r) for r in recs],
                 }
             )
+        return copies
+
+    zone_payload: list[dict[str, Any]] = []
+    if not stream:
+        for z in zones:
+            zone_payload.extend(_zone_copies(z, _base_zone(z), records_by_zone.get(z.id, [])))
 
     # The ops page is not part of the body — see ``page_pending_ops`` /
     # ``retire_queued_ops`` below (#1111).
@@ -1206,6 +1495,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # otherwise fail. Operator visibility is via the audit log.
             continue
         tsig_keys.append({"name": k.name, "secret": secret, "algorithm": k.algorithm})
+    # A stored operator key that duplicates another name (the legacy group
+    # key, or ``foo`` vs ``foo.``) would render two ``key {}`` statements and
+    # stop the whole group converging (#2295). One survives, deterministically.
+    tsig_keys = dedupe_tsig_keys(tsig_keys)
 
     # The DNS group's ``is_recursive=False`` is the high-level authoritative-only
     # intent (§4.9 DNS safety); it MUST force ``recursion no;`` regardless of the
@@ -1288,6 +1581,18 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if (
+        server.driver == "bind9"
+        and opts is not None
+        and list(opts.allow_query_cache or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
+    ):
+        # #2264: the group-level ``allow-query-cache`` was validated, stored
+        # and never shipped, so narrowing cache access (cache snooping) did
+        # nothing. Shipped only when it differs from the stored default, so a
+        # group nobody touched keeps its bundle (and etag) byte-identical and
+        # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
+        # no such setting and the API refuses a non-default value for them.
+        options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
     if server.driver in ("technitium", "bind9"):
         # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
         # renders ``allow-recursion`` from it, literally, #1817), so
@@ -1397,7 +1702,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
             )
-    for zp in zone_payload:
+
+    def _drop_zone_refs(zp: dict[str, Any]) -> dict[str, Any]:
         for f in ("allow_query", "allow_transfer", "also_notify"):
             zp[f] = _drop_undefined_key_refs(
                 zp.get(f),
@@ -1406,6 +1712,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
             )
+        return zp
+
+    # The streamed render (#2227) builds its zones later, through
+    # ``_StreamedZones.base``, which applies the same drop to each zone's base
+    # (every copy of a zone carries its base's values).
+    for zp in zone_payload:
+        _drop_zone_refs(zp)
 
     # Blocklists: one RPZ zone per view (if any) + one group-level zone.
     # Each assembled list has its entries resolved against view/group scope
@@ -1695,7 +2008,43 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                     "fingerprint_sha256": cert_row.fingerprint_sha256,
                 }
 
-    if server.driver == "technitium":
+    zones_streamed: _StreamedZones | None = None
+    if stream:
+        # #2227 — the zones are read, built and written a batch at a time by
+        # ``encode_bundle_body``; here they are one placeholder in the body and
+        # one in the structural payload.
+        annotations: dict[int, dict[str, Any]] = {}
+        if server.driver == "technitium":
+            # ``_add_master_transfer_keys`` reads only a zone's name, type and
+            # masters, and appends its keys after everything else in the zone's
+            # dict. Run it over a probe per zone and keep what it added, to be
+            # appended to each copy of that zone exactly where it would be.
+            probes = [
+                {
+                    "name": getattr(z, "name", None),
+                    "type": getattr(z, "zone_type", "primary"),
+                    "masters": list(getattr(z, "masters", []) or []),
+                }
+                for z in zones
+            ]
+            await _add_master_transfer_keys(db, probes, catalog_block, tsig_keys)
+            for i, probe in enumerate(probes):
+                added = {k: v for k, v in probe.items() if k not in ("name", "type", "masters")}
+                if added:
+                    annotations[i] = added
+        zones_streamed = _StreamedZones(
+            mark=_placeholder(),
+            structural_mark=_placeholder(),
+            zones=list(zones),
+            # #2282 / #2283 — the same undefined key / ACL drops the whole
+            # render applies to ``zone_payload`` above.
+            base=lambda z: _drop_zone_refs(_base_zone(z)),
+            copies=_zone_copies,
+            record=_rec_dict,
+            annotations=annotations,
+            has_views=has_views,
+        )
+    elif server.driver == "technitium":
         await _add_master_transfer_keys(db, zone_payload, catalog_block, tsig_keys)
 
     bundle_body: dict[str, Any] = {
@@ -1704,7 +2053,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "options": options_block,
         "views": views_block,
         "acls": acls_block,
-        "zones": zone_payload,
+        "zones": zone_payload if zones_streamed is None else zones_streamed.mark,
         "tsig_keys": tsig_keys,
         "forwarders": options_block["forwarders"],
         "blocklists": blocklists_payload,
@@ -1739,10 +2088,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # beside the RFC 2136 update. A change that should re-render moves a
         # field of its own (the TTL, the SOA timers, the apex); the serial bump
         # that comes with it is never the only difference.
-        "zones_structural": [
-            {k: val for k, val in z.items() if has_views or k not in _RECORD_DRIVEN_KEYS}
-            for z in zone_payload
-        ],
+        "zones_structural": (
+            [_zone_structural(z, has_views) for z in zone_payload]
+            if zones_streamed is None
+            else zones_streamed.structural_mark
+        ),
         # DNSSEC signing intent / policy params rewrite named.conf, so a
         # change must trigger a full reload (issue #49).
         "dnssec_policies": dnssec_policies_block,
@@ -1779,6 +2129,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         records=sum(len(z["records"]) for z in zone_payload),
         has_views=has_views,
         streamed=streamed,
+        zones=zones_streamed,
     )
 
 
@@ -1843,6 +2194,9 @@ def _covered_by(up_to: datetime | None, visible_xacts: str | None) -> Any | None
 # definition, so a new record op kind cannot be retired by one and not the other.
 RECORD_OP_KINDS: frozenset[str] = RRSET_OPS
 
+# Queued ops a split-horizon render retires per statement (#2227).
+RETIRE_CHUNK = 5000
+
 
 async def retire_queued_ops(
     db: AsyncSession,
@@ -1879,17 +2233,51 @@ async def retire_queued_ops(
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
         conds.append(covered)
-    # #1929 — locked in ``row_locks`` order (ascending id) before the write:
-    # a row a group move deletes meanwhile is skipped, not a StaleDataError.
-    stale_ops = await lock_ops(db, *conds)
-    # #2108 — stamp it the way every other applied op is (one helper, not a
-    # copy of its field list): the render delivered it, once.
+    # #2227 — a chunk of ids at a time, never the rows: a group that went
+    # unrendered while it was being loaded has a queue the size of its
+    # records (813k per server on the scale lab), and loading them as ORM
+    # objects to stamp them held about 4 kB each — 3.7 GB in one worker
+    # process, more than the render itself ever did.
+    # #1929 — locked in ``row_locks`` order (ascending id) before the write;
+    # each chunk takes ids above the last, so the whole retire still locks in
+    # one ascending order. A row a group move deletes meanwhile is skipped,
+    # not a StaleDataError.
+    # #2108 — stamped by ``mark_ops_applied``, which shares its field list with
+    # the helper every other applied op goes through: the render delivered
+    # it, once.
     now = datetime.now(UTC)
-    for op in stale_ops:
-        _mark_applied(op, now)
-    if stale_ops:
-        await db.flush()
-    return len(stale_ops)
+    # Rows of this server already in the session (read through the identity
+    # key: an expired ``id`` would be a lazy load, which async cannot do).
+    loaded = {
+        sa_inspect(obj).identity[0]: obj
+        for obj in list(db.identity_map.values())
+        if isinstance(obj, DNSRecordOp) and obj.__dict__.get("server_id") == server.id
+    }
+    retired = 0
+    after: Any = None
+    while True:
+        chunk = list(
+            (
+                await db.execute(
+                    select(DNSRecordOp.id)
+                    .where(*conds, *([DNSRecordOp.id > after] if after is not None else []))
+                    .order_by(DNSRecordOp.id)
+                    .limit(RETIRE_CHUNK)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not chunk:
+            break
+        await mark_ops_applied(db, chunk, now, loaded)
+        retired += len(chunk)
+        after = chunk[-1]
+        if len(chunk) < RETIRE_CHUNK:
+            # LIMIT counts rows after the lock re-check, so short is last.
+            break
+    return retired
 
 
 async def page_pending_ops(
