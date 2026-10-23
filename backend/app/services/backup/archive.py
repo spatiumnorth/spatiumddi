@@ -469,6 +469,8 @@ async def build_backup_archive(
     passphrase: str,
     passphrase_hint: str | None = None,
     exclude_secrets: bool = False,
+    run_target_id: str | None = None,
+    run_claimed_at: datetime | None = None,
 ) -> tuple[bytes, str]:
     """Build a complete backup zip in memory and return
     ``(archive_bytes, suggested_filename)``.
@@ -488,6 +490,15 @@ async def build_backup_archive(
     for sharing snapshots with support / consultants without
     leaking the install's secrets. The manifest carries
     ``secrets_excluded: true`` so restore can show a heads-up.
+
+    ``run_target_id`` is set by the scheduled / Run-now runner (#2097).
+    The runner commits its ``in_progress`` claim BEFORE the dump, so
+    this archive holds its own target in that state; the manifest
+    records which target wrote it, and under which filename and node,
+    so a restore can tell that claim is this very run's and settle it.
+    ``run_claimed_at`` is the ``last_run_at`` the claim stamped; the
+    restore matches it exactly, so recognising the claim does not
+    depend on two clock readings agreeing.
     """
     if not passphrase:
         raise BackupArchiveError("passphrase is required to build a backup")
@@ -501,6 +512,17 @@ async def build_backup_archive(
     schema_head = await _read_alembic_head(db)
     hostname = socket.gethostname()
     created_at = datetime.now(UTC)
+    safe_host = (
+        "".join(c if c.isalnum() or c in "-_" else "-" for c in hostname).strip("-") or "spatiumddi"
+    )
+    timestamp = created_at.strftime("%Y%m%d-%H%M%S")
+    # One-second resolution alone collided (#1571): two runs in the
+    # same second — two targets sharing a destination, or a manual
+    # run racing the schedule — wrote the SAME filename with
+    # different passphrases, and the survivor would not decrypt with
+    # the overwritten target's passphrase while both runs reported
+    # success. A short random suffix makes each name unique.
+    filename = f"spatiumddi-backup-{safe_host}-{timestamp}-{secrets.token_hex(3)}.zip"
 
     # Exclude-secrets archives use plain SQL format (Phase 3) so
     # the post-dump text scrub can find + replace encrypted column
@@ -538,6 +560,16 @@ async def build_backup_archive(
         # auth-provider creds and reset local passwords by hand.
         "secrets_excluded": bool(exclude_secrets),
     }
+    if run_target_id is not None:
+        # #2097 — which backup target's run wrote this archive. Read
+        # back by ``reconcile_restored_run_claims``; absent on a manual
+        # download, which claims no target.
+        manifest["run"] = {
+            "target_id": str(run_target_id),
+            "filename": filename,
+            "node": settings.node_name or None,
+            "claimed_at": run_claimed_at.isoformat() if run_claimed_at else None,
+        }
 
     # secrets.enc bundles enough metadata for an offline operator to
     # know what they're decrypting, plus the SECRET_KEY they need to
@@ -598,17 +630,6 @@ async def build_backup_archive(
             zf.writestr("README.txt", _readme_text(manifest))
         archive_bytes = buf.getvalue()
 
-    safe_host = (
-        "".join(c if c.isalnum() or c in "-_" else "-" for c in hostname).strip("-") or "spatiumddi"
-    )
-    timestamp = created_at.strftime("%Y%m%d-%H%M%S")
-    # One-second resolution alone collided (#1571): two runs in the
-    # same second — two targets sharing a destination, or a manual
-    # run racing the schedule — wrote the SAME filename with
-    # different passphrases, and the survivor would not decrypt with
-    # the overwritten target's passphrase while both runs reported
-    # success. A short random suffix makes each name unique.
-    filename = f"spatiumddi-backup-{safe_host}-{timestamp}-{secrets.token_hex(3)}.zip"
     logger.info(
         "backup_archive_built",
         bytes=len(archive_bytes),
