@@ -38,6 +38,7 @@ from app.models.dns import DNSServer, DNSZone
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
 from app.tasks._interval_gate import interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -88,10 +89,16 @@ async def _run_sync() -> dict[str, Any]:
                 # agent-based drivers just aren't in scope for this
                 # scheduler today.
                 primary_res = await db.execute(
-                    select(DNSServer).where(
+                    select(DNSServer)
+                    .where(
                         DNSServer.group_id == zone.group_id,
                         DNSServer.is_primary.is_(True),
                     )
+                    # A group holding two primaries (#2276's heal racing a
+                    # promotion) must mis-pick, not raise MultipleResultsFound
+                    # out of the whole sweep. Same cap every other lookup uses.
+                    .order_by(DNSServer.created_at, DNSServer.id)
+                    .limit(1)
                 )
                 primary = primary_res.scalar_one_or_none()
                 if primary is None:
@@ -176,6 +183,7 @@ async def _run_sync() -> dict[str, Any]:
 # Celery task name kept stable for backward-compatibility with any deployed
 # beat schedule / in-flight messages from the pull-only era.
 @celery_app.task(name="app.tasks.dns_pull.auto_pull_dns_from_servers", bind=True)
+@module_gated("core.dns")
 def auto_pull_dns_from_servers(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval. Runs the full

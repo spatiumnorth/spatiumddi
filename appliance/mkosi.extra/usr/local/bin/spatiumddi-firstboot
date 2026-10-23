@@ -499,6 +499,8 @@ fi
 # the shared /var and holds whatever the last boot wrote), so a slot upgrade
 # stamps the new version and a rollback the old one: this bootstrap manifest is
 # re-rendered each boot and helm-controller rolls the pods when the value moves.
+# Except while a cluster Rolling Upgrade holds it with the image tag (#2176):
+# then the pods keep the version they run until the run's flip moves both.
 # Empty (not a made-up "0.1.0") when the file is absent: the api reads "" as
 # unknown.
 APPLIANCE_VERSION_VAL=""
@@ -1013,8 +1015,8 @@ spec:
   # reinstall deleted the Secret, the install's 'lookup' found nothing, and
   # 'randAlphaNum 64' minted a new SECRET_KEY, orphaning everything
   # encrypted at rest (#1042's consequences, again). 'abort' was rejected in
-  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.7
-  # and klipper-helm v0.13.3, from k3s v1.36.4+k3s1) does not wait: it runs
+  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.9
+  # and klipper-helm v0.13.3, from k3s v1.36.5+k3s1) does not wait: it runs
   # 'helm upgrade' on a failed release, and deletes nothing.
   #
   # A HelmChartConfig's failurePolicy overrides this one, and its CRD
@@ -1025,6 +1027,15 @@ spec:
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # #2004 — the slot's version. The chart appends it to the api, worker and
+    # beat env as APPLIANCE_VERSION; without it settings.appliance_version is ""
+    # in every control-plane pod, so system/info and /version report unknown.
+    # #2176 — a value of its own beside image.tag, not a sharedEnv entry: a
+    # cluster Rolling Upgrade holds it with the tag in the HelmChartConfig,
+    # which can pin a scalar but replaces a list whole. As a sharedEnv entry,
+    # this render on the seed's new slot rolled the control plane mid-run, on
+    # the held image, and the worker that drives the run with it.
+    applianceVersion: "${APPLIANCE_VERSION_VAL:-}"
     # #1448 — SECRET_KEY lives in a Secret this chart does not own
     # (ensure_app_key_secret creates it), so no helm uninstall can delete it.
     # Both lines carry the marker: _strip_control_app_secret removes them if
@@ -1113,10 +1124,7 @@ spec:
     sharedEnv:
       - name: APPLIANCE_MODE
         value: "true"
-      # #2004 — the slot's version. Without it settings.appliance_version is ""
-      # in every control-plane pod, so system/info and /version report unknown.
-      - name: APPLIANCE_VERSION
-        value: "${APPLIANCE_VERSION_VAL:-}"
+      # (APPLIANCE_VERSION is the applianceVersion value above: #2176.)
       # #1003 item 2 — the installer's Time source answer. Seeds the
       # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
       # plane pushes what the operator typed instead of the platform
@@ -1173,6 +1181,19 @@ ${API_SIZING_YAML}
           operator: Exists
           effect: NoExecute
           tolerationSeconds: 20
+      # #1805 — each node's in-cluster callers (the supervisor's heartbeat,
+      # the DNS and DHCP agents, the frontend's /api proxy) use the api pod
+      # on their own node while it is ready, so a lost node's api pod cannot
+      # hold their requests until their timeout. The chart's default is empty
+      # (a BYO-Kubernetes install keeps the spread over every api pod); the
+      # appliance runs one api pod per control-plane node, so it sets the
+      # value here, and the seed supervisor writes the same value into the
+      # spatium-control HelmChartConfig (apply_control_plane_overrides),
+      # which is what a grown or upgraded cluster renders. Stated at one
+      # replica too, where it is inert, so the first heartbeat has nothing
+      # to add (#1005).
+      service:
+        trafficDistribution: PreferSameNode
       autoscaling:
         enabled: false
       env:

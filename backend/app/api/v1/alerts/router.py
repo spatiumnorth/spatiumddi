@@ -22,8 +22,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select, update
 
-from app.api.deps import DB, CurrentUser
-from app.core.permissions import is_effective_superadmin
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
@@ -305,14 +304,6 @@ class EvaluateResponse(BaseModel):
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Superadmin required to manage alerts",
-        )
-
-
 @router.get("/rules", response_model=list[AlertRuleResponse])
 async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     res = await db.execute(select(AlertRule).order_by(AlertRule.name))
@@ -342,8 +333,7 @@ async def list_rule_types(db: DB, current_user: CurrentUser) -> list[RuleTypeSpe
 
 
 @router.post("/rules", response_model=AlertRuleResponse, status_code=status.HTTP_201_CREATED)
-async def create_rule(body: AlertRuleCreate, db: DB, current_user: CurrentUser) -> AlertRule:
-    _require_superadmin(current_user)
+async def create_rule(body: AlertRuleCreate, db: DB, current_user: SuperAdmin) -> AlertRule:
     rule = AlertRule(**body.model_dump())
     db.add(rule)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
@@ -378,9 +368,8 @@ async def get_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> Ale
 
 @router.patch("/rules/{rule_id}", response_model=AlertRuleResponse)
 async def update_rule(
-    rule_id: uuid.UUID, body: AlertRuleUpdate, db: DB, current_user: CurrentUser
+    rule_id: uuid.UUID, body: AlertRuleUpdate, db: DB, current_user: SuperAdmin
 ) -> AlertRule:
-    _require_superadmin(current_user)
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -448,8 +437,7 @@ async def update_rule(
 
 
 @router.delete("/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
-    _require_superadmin(current_user)
+async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -511,19 +499,25 @@ async def list_events(
 
 
 @router.post("/events/{event_id}/resolve", response_model=AlertEventResponse)
-async def resolve_event(event_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertEvent:
+async def resolve_event(event_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> AlertEvent:
     """Manually mark an event resolved. Useful to silence a known-good
     alert while the underlying metric is still above threshold.
 
     Superadmin only, like the rule writes: for transition-once rules a
     resolve dismisses the signal for good. Audited.
     """
-    _require_superadmin(current_user)
     event = await db.get(AlertEvent, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
     if event.resolved_at is None:
         event.resolved_at = datetime.now(UTC)
+        # Reassign, not mutate: JSONB isn't change-tracked in place. The
+        # evaluator keeps a manually resolved event resolved while its
+        # subject still matches (#2498).
+        event.last_observed_value = {
+            **(event.last_observed_value or {}),
+            "resolved_by": alert_service.MANUAL_RESOLVED_BY,
+        }
         db.add(
             AuditLog(
                 action="resolve",
@@ -545,7 +539,7 @@ async def resolve_event(event_id: uuid.UUID, db: DB, current_user: CurrentUser) 
 
 
 @router.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate_now(db: DB, current_user: CurrentUser) -> EvaluateResponse:
+async def evaluate_now(db: DB, current_user: SuperAdmin) -> EvaluateResponse:
     """Run the evaluator pass immediately.
 
     Handy for "did that rule I just created fire?" workflows — skips
@@ -553,6 +547,5 @@ async def evaluate_now(db: DB, current_user: CurrentUser) -> EvaluateResponse:
     run, just synchronous. Superadmin only: a pass delivers to the
     configured syslog / webhook / SMTP targets.
     """
-    _require_superadmin(current_user)
     result = await alert_service.evaluate_all(db)
     return EvaluateResponse(**result)

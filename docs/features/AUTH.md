@@ -570,12 +570,18 @@ rejected with `422` rather than silently locking the operator out:
 
 - `read` — restricts the token to safe-method requests
   (`GET` / `HEAD` / `OPTIONS`); any mutation `401`s.
-- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans*`,
-  `/vrfs*`, `/network-devices*`.
-- `dns:write` — allows mutations under `/api/v1/dns/*`, `/dns-pools*`.
+- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
+  `/vrfs/*`, `/network-devices/*`.
+- `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,
+  groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
+  (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
+  that writes there needs an empty scope set, with RBAC as the gate.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
 - `agent` — allows only the agent push surface
   (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+Prefixes match on a whole path segment, so `/api/v1/dns` covers
+`/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
 
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still
@@ -601,6 +607,22 @@ Free-space queries over a block or space are refused to a token bound to
 subnets, since free space is a fact about every subnet in the container.
 `backend/tests/test_token_path_scope_sweep.py` walks the route table for
 each of these rules, so a route added later is covered without an edit.
+
+Outside those routers a resource-scoped token is refused with `403`.
+A report, dashboard or metrics series mounted elsewhere answers about
+every subnet, zone or server it aggregates over, and its permission gate
+sees only the resource type, so it cannot serve a token bound to one
+instance. The only exceptions are routes that narrow their own answer to
+the token's grants or return nothing about the estate: `GET /auth/me`,
+`GET /auth/me/permissions`, global search (`GET /search`,
+`GET /search/types`), the MCP endpoint (`/ai/mcp`, which applies the
+per-tool rule below), and the DNS tools that query public resolvers
+(`/dns/tools/*`). A route joins that list by being mounted with
+`include_token_scoped` (`app/api/token_path_scope.py`) or by declaring
+`@honours_token_binding` (`app/api/token_binding.py`); a route added
+anywhere else refuses such a token until it does. The same rule covers
+`/metrics` when it is read with an API token. Sessions and tokens without
+`resource_grants` are not affected.
 
 A resource-scoped token is held to its grants beyond the URL path too. An
 IPAM write that names a DNS zone in its body (`dns_zone_id`,
@@ -802,6 +824,12 @@ rather than swallowing the failure. Permission-related rejections
   its sessions is refused with `403` and is not recorded as activity
   (`last_seen_at` stays), and a refresh returns `401`.
   `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
+- **Open streams re-check their caller.** A streaming response (cluster
+  health, pod logs, nmap progress, AI chat) re-runs the same session,
+  account, API-token and permission checks every 15 seconds while it is
+  open, and ends once any of them fails, or once the access token it was
+  opened with expires. The UI reconnects with its current token.
+  `backend/app/api/stream_auth.py`.
 
 ### Password management
 

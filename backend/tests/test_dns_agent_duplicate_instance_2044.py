@@ -373,7 +373,9 @@ async def test_a_displaced_agents_heartbeat_keeps_its_reports_off_the_row(
     owner = await client.post(
         HEARTBEAT_URL,
         headers={**headers, INSTANCE: "agent-b"},
-        json={"config": {"status": "ok"}, "daemon": {"status": "ok"}},
+        # An ``ok`` carries the etag it applied; without one it is a
+        # pre-first-apply placeholder and is not stored (#2258).
+        json={"config": {"status": "ok", "etag": "e1"}, "daemon": {"status": "ok"}},
     )
     assert owner.status_code == 200, owner.text
     srv = await _reload_server(db_session, server_id)

@@ -307,8 +307,9 @@ class FindDnsServersArgs(BaseModel):
         "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Answers 'which group is this server in?', 'which server is "
         "primary for that group?' and "
-        "'which groups have no primary?' — the last of which silently "
-        "drops every record write to that group's zones. Read-only: "
+        "'which groups have no primary?' (one is re-elected automatically "
+        "within a minute; until then writes go to the server it will "
+        "pick). Read-only: "
         "moving a server between groups is done over the REST API or the "
         "DNS → Server Groups UI, not from here."
     ),
@@ -812,11 +813,15 @@ class ListDNSBlockListsArgs(BaseModel):
         "List DNS blocklists (RPZ rows). Each carries id, name, "
         "description, category, source_type (manual / url / "
         "file_upload), feed_url + feed_format when remote, "
-        "block_mode (nxdomain / sinkhole / refused), "
+        "block_mode (nxdomain / sinkhole — sinkhole answers with "
+        "sinkhole_ip, else 0.0.0.0 and ::), "
         "feed_entries_are_wildcard (whether feed entries block "
         "subdomains too — off means a list naming tracker.example "
         "leaves cdn.tracker.example resolving), enabled, "
-        "entry_count, last_synced_at + last_sync_status / error. "
+        "entry_count, feed_parse_skipped (adblock feeds only: how many "
+        "rules the last refresh could not enforce, by category regex / "
+        "modifier / badfilter / malformed; null = not recorded), "
+        "last_synced_at + last_sync_status / error. "
         "Use for 'which blocklists are active?', 'is the malware "
         "feed up to date?', or 'when did the ads blocklist last "
         "sync?'."
@@ -858,6 +863,7 @@ async def list_dns_blocklists(
             "sinkhole_ip": r.sinkhole_ip,
             "enabled": r.enabled,
             "entry_count": r.entry_count,
+            "feed_parse_skipped": r.feed_parse_skipped,
             "last_synced_at": (r.last_synced_at.isoformat() if r.last_synced_at else None),
             "last_sync_status": r.last_sync_status,
             "last_sync_error": r.last_sync_error,

@@ -462,7 +462,8 @@ def test_a_truncated_file_is_rendered_again(tmp_path: Path, monkeypatch) -> None
 def test_another_renderer_revisions_file_is_rendered_again(tmp_path: Path, monkeypatch) -> None:
     def older(p: Path) -> None:
         side = bind9._rpz_sidecar(p)
-        side.write_text(side.read_text().replace("r1:", "r0:", 1))
+        rev = bind9._RPZ_RENDER_REVISION
+        side.write_text(side.read_text().replace(f"r{rev}:", f"r{rev - 1}:", 1))
 
     assert _two_renders(tmp_path, older, monkeypatch) == [RPZ]
 

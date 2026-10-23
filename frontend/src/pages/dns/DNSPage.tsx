@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -1831,8 +1832,8 @@ function ServerModal({
                 <span className="block text-xs text-muted-foreground">
                   The server DDNS and record writes are applied at. Exactly one
                   per group &mdash; ticking this demotes whichever server holds
-                  it now. A group with no primary silently drops every record
-                  write to its zones, so it can only be moved, not cleared.
+                  it now. A group left without one has a primary re-elected
+                  automatically, so the flag can only be moved, not cleared.
                 </span>
               </span>
             </label>
@@ -2571,6 +2572,17 @@ export function ZoneModal({
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
+  // Sub-zone opens with ".<parent>" pre-filled so the operator types the
+  // leading label first; a focused input puts the caret at the END of a
+  // pre-fill, which made "xp" read ".parentxp" (#2464). Park it at the start.
+  const nameRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!zone && initialName?.startsWith(".")) {
+      nameRef.current?.setSelectionRange(0, 0);
+    }
+    // Once, on open: later renders must not move a caret the operator placed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
@@ -2771,6 +2783,7 @@ export function ZoneModal({
         <Field label="Zone Name (FQDN)">
           <input
             className={inputCls}
+            ref={nameRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="example.com"
@@ -4058,7 +4071,8 @@ function ZoneDetailView({
   // reintroduce a local one). The explicit ``showAddRecord`` check still
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
-    if (isForward || zone.tailscale_tenant_id) return;
+    // #2529 — the keyboard path must honour the same grant as the button.
+    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4069,7 +4083,7 @@ function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord]);
+  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
@@ -5717,7 +5731,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   {s.last_sync_at &&
                     ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}
                   {s.last_health_check_at &&
-                    ` · health ${new Date(s.last_health_check_at).toLocaleTimeString()}`}
+                    ` · health ${humanTime(s.last_health_check_at)}`}
                 </p>
               </div>
             </div>
@@ -6434,7 +6448,7 @@ function SubnetPickerModal({
 
 // ── ACLs Tab ──────────────────────────────────────────────────────────────────
 
-function AclsTab({ groupId }: { groupId: string }) {
+export function AclsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const { can } = useDnsGrants();
   const [showCreate, setShowCreate] = useState(false);
@@ -6447,6 +6461,9 @@ function AclsTab({ groupId }: { groupId: string }) {
   const [newDesc, setNewDesc] = useState("");
   const [newEntries, setNewEntries] = useState("");
   const [error, setError] = useState("");
+  // #2444 — the server refuses a delete of an ACL that another ACL or a zone
+  // cites (409); the reason is shown in the dialog, which stays open.
+  const [deleteError, setDeleteError] = useState("");
 
   const { data: acls = [] } = useQuery({
     queryKey: ["dns-acls", groupId],
@@ -6466,7 +6483,12 @@ function AclsTab({ groupId }: { groupId: string }) {
   });
   const delMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteAcl(groupId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-acls", groupId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-acls", groupId] });
+      setConfirmDelete(null);
+    },
+    onError: (e: ApiError) =>
+      setDeleteError(formatApiError(e, "Failed to delete the ACL")),
   });
 
   function createAcl(e: React.FormEvent) {
@@ -6573,7 +6595,10 @@ function AclsTab({ groupId }: { groupId: string }) {
               </div>
               <button
                 className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive disabled:opacity-0"
-                onClick={() => setConfirmDelete(acl)}
+                onClick={() => {
+                  setDeleteError("");
+                  setConfirmDelete(acl);
+                }}
                 title="Delete ACL"
                 {...permissionGate(
                   can("delete", "dns_group"),
@@ -6606,17 +6631,27 @@ function AclsTab({ groupId }: { groupId: string }) {
           confirmLabel="Delete ACL"
           tone="destructive"
           onClose={() => setConfirmDelete(null)}
+          loading={delMut.isPending}
           onConfirm={() => {
+            setDeleteError("");
             delMut.mutate(confirmDelete.id);
-            setConfirmDelete(null);
           }}
           message={
-            <p className="text-sm">
-              Any view or zone referencing{" "}
-              <span className="font-mono">{confirmDelete.name}</span> by name
-              will stop resolving it — check the Views tab before removing an
-              ACL that is in use.
-            </p>
+            <div className="space-y-2">
+              <p className="text-sm">
+                An ACL that another ACL, a view or a zone still cites by name
+                cannot be deleted — the server refuses it, and the reason is
+                shown here. Remove the references first.
+              </p>
+              {deleteError && (
+                <p
+                  role="alert"
+                  className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-sm text-destructive"
+                >
+                  {deleteError}
+                </p>
+              )}
+            </div>
           }
         />
       )}
@@ -7679,11 +7714,19 @@ function OptionsTab({ groupId }: { groupId: string }) {
               auto — validate using built-in managed keys (recommended)
             </option>
             <option value="yes">
-              yes — validate; trust anchors must be configured manually
+              yes — validate; only against trust anchors added via the API
+              (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
+          <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {opts?.dnssec_warnings?.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className={card}>
@@ -8332,39 +8375,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </span>
               </span>
             </label>
-            <Field label="Log channel">
-              <select
-                className={selCls}
-                value={queryLogChannel}
-                onChange={(e) => {
-                  setQueryLogChannel(e.target.value);
-                  setDirty(true);
-                }}
-              >
-                <option value="file">
-                  file — write to a log file (rotated by BIND)
-                </option>
-                <option value="syslog">
-                  syslog — send to local syslog (daemon facility)
-                </option>
-                <option value="stderr">
-                  stderr — write to container stderr (visible via docker logs)
-                </option>
-              </select>
-            </Field>
-            {queryLogChannel === "file" && (
-              <Field label="Log file path (inside container)">
-                <input
-                  className={inputCls}
-                  value={queryLogFile}
-                  onChange={(e) => {
-                    setQueryLogFile(e.target.value);
-                    setDirty(true);
-                  }}
-                  placeholder="/var/log/named/queries.log"
-                />
-              </Field>
-            )}
             <Field label="Severity">
               <select
                 className={selCls}
@@ -8380,19 +8390,20 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
-                <option value="notice">notice — only notable events</option>
-                <option value="warning">warning — warnings and above</option>
-                <option value="error">error — errors only</option>
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
               Logs the <code>queries</code> and <code>query-errors</code>{" "}
-              categories. View with{" "}
-              <code className="font-mono">docker logs</code> (stderr) or{" "}
+              categories to <code className="font-mono">{queryLogFile}</code>{" "}
+              inside the DNS container, which is the file the Logs page&apos;s
+              DNS Queries tab reads. The channel and path are fixed for that
+              reason, and so is the severity floor: named logs queries at{" "}
+              <code>info</code>, so anything quieter would empty the tab. View
+              raw with{" "}
               <code className="font-mono">
                 docker exec &lt;dns-container&gt; tail -f {queryLogFile}
-              </code>{" "}
-              (file).
+              </code>
+              .
             </p>
           </>
         )}
@@ -9499,6 +9510,24 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
+/** Rules the last adblock refresh could not enforce (#2123); 0 when the
+ *  counts were never recorded. */
+function feedSkippedTotal(l: DNSBlockList): number {
+  const s = l.feed_parse_skipped;
+  return s ? s.regex + s.modifier + s.badfilter + s.malformed : 0;
+}
+
+function feedSkippedTitle(l: DNSBlockList): string {
+  const s = l.feed_parse_skipped;
+  if (!s) return "";
+  return (
+    `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +
+    `enforce: ${s.regex} regex, ${s.modifier} with unsupported modifiers ` +
+    `($domain=, $third-party, …), ${s.badfilter} $badfilter, ` +
+    `${s.malformed} not a plain ||name^ rule.`
+  );
+}
+
 function BlocklistScopeModal({
   list,
   group,
@@ -10129,6 +10158,14 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         view: {viewName.get(id)}
                       </span>
                     ))}
+                    {feedSkippedTotal(l) > 0 && (
+                      <span
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        title={feedSkippedTitle(l)}
+                      >
+                        {feedSkippedTotal(l)} rules not enforced
+                      </span>
+                    )}
                     <span className="ml-auto text-xs text-muted-foreground">
                       {l.entry_count} entries
                     </span>
@@ -10352,7 +10389,6 @@ function BlocklistModal({
             >
               <option value="nxdomain">nxdomain</option>
               <option value="sinkhole">sinkhole</option>
-              <option value="refused">refused</option>
             </select>
           </Field>
         </div>
@@ -10364,6 +10400,10 @@ function BlocklistModal({
               onChange={(e) => setSinkholeIp(e.target.value)}
               placeholder="0.0.0.0"
             />
+            <p className="mt-1 text-xs text-muted-foreground">
+              Blocked names answer with this address. Blank answers 0.0.0.0 and
+              ::; an IPv4 address replaces 0.0.0.0 and an IPv6 one replaces ::.
+            </p>
           </Field>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -10615,6 +10655,9 @@ function BlocklistDetail({
             <span className="text-destructive"> ({list.last_sync_error})</span>
           )}
         </p>
+      )}
+      {feedSkippedTotal(list) > 0 && (
+        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
       )}
 
       {/* Blocked domains (the list itself) */}
@@ -11744,6 +11787,23 @@ export function DNSPage() {
     queryFn: () => dnsApi.listGroups(),
   });
 
+  // The selection stores the group / zone object as it was when the tree was
+  // clicked. Edit Group / Edit Zone save and invalidate these two queries, so
+  // the page, and the dialogs seeded from it, read the live row from them and
+  // fall back to the clicked copy only until they resolve (#2462). Without
+  // this the next Save wrote the old values back.
+  const selectedGroupId = selection ? selection.group.id : null;
+  const selectedZoneId = selection?.type === "zone" ? selection.zone.id : null;
+  const { data: selectedGroupZones } = useQuery({
+    queryKey: ["dns-zones", selectedGroupId],
+    queryFn: () => dnsApi.listZones(selectedGroupId!),
+    enabled: !!selectedGroupId && !!selectedZoneId,
+  });
+  const liveGroup =
+    groups.find((g: DNSServerGroup) => g.id === selectedGroupId) ?? null;
+  const liveZone =
+    selectedGroupZones?.find((z: DNSZone) => z.id === selectedZoneId) ?? null;
+
   // Deep-link from global search: navigate("/dns", { state: { selectGroup, selectZone, highlightRecord? } })
   useEffect(() => {
     const state = location.state as {
@@ -12000,18 +12060,22 @@ export function DNSPage() {
         )}
         {selection?.type === "group" && (
           <GroupDetailView
-            group={selection.group}
+            group={liveGroup ?? selection.group}
             onSelectZone={(z) =>
-              setSelection({ type: "zone", group: selection.group, zone: z })
+              setSelection({
+                type: "zone",
+                group: liveGroup ?? selection.group,
+                zone: z,
+              })
             }
-            onEdit={() => setEditGroup(selection.group)}
-            onDelete={() => setConfirmDeleteGroup(selection.group)}
+            onEdit={() => setEditGroup(liveGroup ?? selection.group)}
+            onDelete={() => setConfirmDeleteGroup(liveGroup ?? selection.group)}
           />
         )}
         {selection?.type === "zone" && (
           <ZoneDetailView
-            group={selection.group}
-            zone={selection.zone}
+            group={liveGroup ?? selection.group}
+            zone={liveZone ?? selection.zone}
             highlightRecordId={pendingHighlightRecord}
             onDeleted={() =>
               setSelection({ type: "group", group: selection.group })

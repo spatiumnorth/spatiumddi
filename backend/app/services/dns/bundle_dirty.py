@@ -104,6 +104,7 @@ from app.models.dns import (
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
+    DNSTrustAnchor,
     DNSTSIGKey,
     DNSView,
     DNSZone,
@@ -156,6 +157,7 @@ _CONTRIBUTORS: tuple[type, ...] = (
     *_GROUP_MODELS,
     *_ZONE_MODELS,
     DNSAclEntry,
+    DNSTrustAnchor,
     *_GLOBAL_MODELS,
 )
 
@@ -180,7 +182,13 @@ _NOT_RENDERED: dict[type, frozenset[str]] = {
     DNSPool: frozenset({"last_checked_at", "next_check_at"}),
     # Feed refresh bookkeeping; the entries themselves are their own rows.
     DNSBlockList: frozenset(
-        {"last_synced_at", "last_sync_status", "last_sync_error", "entry_count"}
+        {
+            "last_synced_at",
+            "last_sync_status",
+            "last_sync_error",
+            "entry_count",
+            "feed_parse_skipped",
+        }
     ),
 }
 # Models where the bundle reads a small, known set of columns: only these
@@ -207,6 +215,9 @@ class Affected:
     servers: set[uuid.UUID] = field(default_factory=set)
     zones: set[uuid.UUID] = field(default_factory=set)
     acls: set[uuid.UUID] = field(default_factory=set)
+    # DNSServerOptions ids whose trust anchors changed (an anchor carries no
+    # group_id of its own) — resolved to the options row's group.
+    options: set[uuid.UUID] = field(default_factory=set)
     # Sites whose subnet set changed — resolved to the groups whose pools
     # have a member scoped to one of them.
     sites: set[uuid.UUID] = field(default_factory=set)
@@ -214,7 +225,13 @@ class Affected:
 
     def is_empty(self) -> bool:
         return not (
-            self.groups or self.servers or self.zones or self.acls or self.sites or self.everyone
+            self.groups
+            or self.servers
+            or self.zones
+            or self.acls
+            or self.options
+            or self.sites
+            or self.everyone
         )
 
 
@@ -319,6 +336,10 @@ def collect_affected(session: Any) -> Affected:
             changed, old = _changed(obj, "zone_id")
             if changed:
                 aff.zones.update(v for v in old if v is not None)
+        elif isinstance(obj, DNSTrustAnchor):
+            oid = getattr(obj, "server_options_id", None)
+            if oid is not None:
+                aff.options.add(oid)
         elif isinstance(obj, DNSAclEntry):
             aid = getattr(obj, "acl_id", None)
             if aid is not None:
@@ -353,6 +374,16 @@ def _resolve(session: Any, aff: Affected) -> tuple[set[uuid.UUID], bool]:
         groups.update(
             g
             for g in conn.execute(select(DNSAcl.group_id).where(DNSAcl.id.in_(list(aff.acls))))
+            .scalars()
+            .all()
+            if g is not None
+        )
+    if aff.options:
+        groups.update(
+            g
+            for g in conn.execute(
+                select(DNSServerOptions.group_id).where(DNSServerOptions.id.in_(list(aff.options)))
+            )
             .scalars()
             .all()
             if g is not None
