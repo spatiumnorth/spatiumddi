@@ -224,11 +224,6 @@ class Settings(BaseSettings):
     # only together with worker memory. 1 is the single slot every release
     # before this one had (same Redis key, same behaviour).
     dns_agent_bundle_render_slots: int = 1
-    # #2240 — with more than one slot, at most this many renders run on one
-    # worker (one pod or container, so one memory limit) at a time; the
-    # worker's other processes leave further renders to other workers.
-    # 0 = no per-worker cap. Ignored with one slot.
-    dns_agent_bundle_renders_per_worker: int = 1
     # The long-poll serves stored bundles only. While this is on — the
     # migration release, whose worker may still be one release behind — a
     # missing or stale bundle is built inline in the request exactly as

@@ -49,10 +49,7 @@ duplicates out):
   worker at 1Gi. Slot 0 is ``spatium:bundle:render-slot``, the one key a
   single slot always was; slot i > 0 is ``spatium:bundle:render-slot:<i>``.
   A task that finds every slot taken re-enqueues itself a couple of
-  seconds later. With more than one slot a render also takes one of its
-  worker's ``dns_agent_bundle_renders_per_worker`` host slots, so two
-  renders never stack inside one worker's memory limit because two of its
-  processes happened to pick them up.
+  seconds later.
 
 Each is a short lease (``dns_agent_bundle_render_lease_seconds``) that a
 thread of the render's own renews while it runs, however long that is,
@@ -69,7 +66,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import socket
 import threading
 import uuid
 from collections.abc import Iterable
@@ -104,8 +100,6 @@ RENDER_LOCK_PREFIX = "spatium:bundle:render:"
 RENDER_DIRTY_PREFIX = "spatium:bundle:dirty:"
 # Fleet slot 0; slot i > 0 is ``f"{RENDER_SLOT_KEY}:{i}"`` (``_slot_keys``).
 RENDER_SLOT_KEY = "spatium:bundle:render-slot"
-# Per-worker slots: ``f"{RENDER_HOST_PREFIX}{hostname}:{j}"`` (``_host_keys``).
-RENDER_HOST_PREFIX = "spatium:bundle:render-host:"
 # A task that found the fleet-wide slot taken comes back this much later.
 SLOT_RETRY_SECONDS = 2
 # A server whose last render failed this recently is left to the explicit
@@ -397,16 +391,6 @@ def _slot_keys() -> list[str]:
     return [RENDER_SLOT_KEY] + [f"{RENDER_SLOT_KEY}:{i}" for i in range(1, slots)]
 
 
-def _host_keys() -> list[str]:
-    """This worker's own slots (its hostname is its pod or container), or
-    none: with one fleet slot, or no per-worker cap, nothing is taken."""
-    per_worker = int(settings.dns_agent_bundle_renders_per_worker)
-    if int(settings.dns_agent_bundle_render_slots) <= 1 or per_worker <= 0:
-        return []
-    host = socket.gethostname()
-    return [f"{RENDER_HOST_PREFIX}{host}:{j}" for j in range(per_worker)]
-
-
 async def _take_one(client: Any, keys: list[str], value: str, lease_ms: int) -> str | None:
     """Take the first free key of ``keys`` for ``value``; the key, or None
     when every one is held."""
@@ -427,9 +411,9 @@ async def _acquire(
     resumed: bool,
 ) -> tuple[str, list[str]]:
     """Take this render's keys: ``held`` (the server's lock and a fleet slot
-    — and, with several fleet slots, a slot of this worker's — are this
-    render's), ``coalesced`` or ``deferred``. With ``held``, the slot keys
-    this render took (each holds ``slot_value``); none otherwise."""
+    are this render's), ``coalesced`` or ``deferred``. With ``held``, the
+    fleet slot this render took, as a list (it holds ``slot_value``); none
+    otherwise."""
     owned = False
     if resumed:
         # A render deferred for the slot, back with the token its lock still
@@ -452,18 +436,7 @@ async def _acquire(
         # slot). The lease was just taken or renewed, so it outlives the
         # countdown by far.
         return "deferred", []
-    held = [slot_key]
-    host_keys = _host_keys()
-    if host_keys:
-        host_key = await _take_one(client, host_keys, slot_value, lease_ms)
-        if host_key is None:
-            # This worker already renders as much as it may: give the fleet
-            # slot back for a render on another worker and wait like any
-            # other deferral (the retry may land on any worker).
-            await _release(client, slot_key, slot_value)
-            return "deferred", []
-        held.append(host_key)
-    return "held", held
+    return "held", [slot_key]
 
 
 async def _run(

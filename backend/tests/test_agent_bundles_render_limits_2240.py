@@ -8,8 +8,7 @@ may run at once.
   group as it is now republishes itself sized for it instead of starting.
 * One fleet-wide render slot queued seven servers' full renders behind each
   other for hours. ``dns_agent_bundle_render_slots`` gives N slots; slot 0
-  keeps the old key, so one slot behaves exactly as before. With several, a
-  worker holds at most ``dns_agent_bundle_renders_per_worker`` of them.
+  keeps the old key, so one slot behaves exactly as before.
 
 The first half needs neither Postgres nor Redis; the rest uses the suite's
 database and, where it says so, a real Redis on its own key names.
@@ -213,14 +212,13 @@ async def test_one_slot_is_the_original_key_and_nothing_else(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 1)
-    monkeypatch.setattr(settings, "dns_agent_bundle_renders_per_worker", 1)
     client = _FakeRedis()
     status, keys, value = await _take(client, "a")
     assert (status, keys) == ("held", ["spatium:bundle:render-slot"])
     assert set(client.data) == {
         "lock:a",
         "spatium:bundle:render-slot",
-    }, "one slot must take exactly the keys it always took (no per-worker key)"
+    }, "one slot must take exactly the keys it always took"
     assert (await _take(client, "b"))[:2] == ("deferred", [])
     assert client.data["spatium:bundle:render-slot"] == value
 
@@ -230,7 +228,6 @@ async def test_n_slots_let_n_renders_run_and_each_releases_its_own(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 3)
-    monkeypatch.setattr(settings, "dns_agent_bundle_renders_per_worker", 0)
     client = _FakeRedis()
     taken = [await _take(client, s) for s in ("a", "b", "c")]
     assert [t[:2] for t in taken] == [
@@ -253,34 +250,6 @@ async def test_n_slots_let_n_renders_run_and_each_releases_its_own(
 
     status, keys, _value = await _take(client, "e")
     assert (status, keys) == ("held", ["spatium:bundle:render-slot:1"])
-
-
-@pytest.mark.asyncio
-async def test_with_several_slots_one_worker_runs_one_render(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Two of one worker's processes picking up two renders would put two
-    renders' peak memory under one memory limit."""
-    monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 2)
-    monkeypatch.setattr(settings, "dns_agent_bundle_renders_per_worker", 1)
-    monkeypatch.setattr(agent_bundles.socket, "gethostname", lambda: "worker-1")
-    client = _FakeRedis()
-    status, keys, value = await _take(client, "a")
-    assert (status, keys) == (
-        "held",
-        ["spatium:bundle:render-slot", "spatium:bundle:render-host:worker-1:0"],
-    )
-    assert (await _take(client, "b"))[:2] == ("deferred", [])
-    assert (
-        "spatium:bundle:render-slot:1" not in client.data
-    ), "the render deferred for its worker kept a fleet slot another worker could use"
-
-    monkeypatch.setattr(agent_bundles.socket, "gethostname", lambda: "worker-2")
-    status, keys, _ = await _take(client, "c")
-    assert (status, keys) == (
-        "held",
-        ["spatium:bundle:render-slot:1", "spatium:bundle:render-host:worker-2:0"],
-    )
 
 
 @pytest.mark.parametrize("slots,expected", [(0, 1), (-3, 1), (1, 1), (4, 4)])
@@ -420,12 +389,10 @@ async def redis_keys(monkeypatch: pytest.MonkeyPatch):
         "slot": f"spatium:test:{tag}:render-slot",
         "lock": f"spatium:test:{tag}:render:",
         "dirty": f"spatium:test:{tag}:dirty:",
-        "host": f"spatium:test:{tag}:render-host:",
     }
     monkeypatch.setattr(agent_bundles, "RENDER_SLOT_KEY", keys["slot"])
     monkeypatch.setattr(agent_bundles, "RENDER_LOCK_PREFIX", keys["lock"])
     monkeypatch.setattr(agent_bundles, "RENDER_DIRTY_PREFIX", keys["dirty"])
-    monkeypatch.setattr(agent_bundles, "RENDER_HOST_PREFIX", keys["host"])
     try:
         yield client, keys
     finally:
@@ -440,7 +407,6 @@ async def test_a_second_slot_renders_beside_the_first_and_leaves_it_alone(
 ) -> None:
     client, keys = redis_keys
     monkeypatch.setattr(settings, "dns_agent_bundle_render_slots", 2)
-    monkeypatch.setattr(settings, "dns_agent_bundle_renders_per_worker", 0)
     server = await _server(db_session, await _group(db_session))
     await db_session.commit()
     assert await client.set(keys["slot"], "someone-else", ex=60)

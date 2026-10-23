@@ -13,8 +13,7 @@
   - **Bundle renders:** the render's time limits scale with the group's
     record count (soft `120 s + 1.5 s per 1,000 records`, floor 900 s), and
     a render under-sized for its data resizes itself. The fleet-wide render
-    slot can be raised (`DNS_AGENT_BUNDLE_RENDER_SLOTS`, one render per
-    worker by default).
+    slot can be raised (`DNS_AGENT_BUNDLE_RENDER_SLOTS`, 1 by default).
   - **CNPG:** keeps `wal_keep_size: 2GB`, so a former primary can rewind
     after a partition instead of looping on `pg_rewind`.
   - **Upgrade cost:** an existing cluster takes one rolling restart of
