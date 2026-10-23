@@ -23,6 +23,7 @@ import {
   type NetworkNeighbourQuery,
   type NetworkTestConnectionResult,
 } from "@/lib/api";
+import { formatApiError } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -239,6 +240,12 @@ export function DeviceDetailView() {
           <div className="mt-3">
             <TestResultBanner result={testResult} />
           </div>
+        )}
+        {pollMut.isError && (
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            Poll Now was refused:{" "}
+            {formatApiError(pollMut.error, "the request failed")}
+          </p>
         )}
         {pollMut.isSuccess && pollMut.data && (
           <div className="mt-3 inline-flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-1.5 text-xs text-emerald-700 dark:text-emerald-300">

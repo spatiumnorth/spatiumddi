@@ -136,9 +136,11 @@ async def _resolve_failover(
     # Kea's listener cannot accept TLS and plaintext at once, so switching one
     # peer before its partner's agent understands the fields would stop the
     # pair talking for the length of the upgrade (ha_peer_auth module doc).
-    # Read fresh from the database, not off ``group`` / ``kea_peers``: in a
-    # parked long-poll those are identity-map objects that a wake does not
-    # refresh (``current_peer_credential`` says why that matters).
+    # Read fresh from the database, not off ``group`` / ``kea_peers``: a caller
+    # holding a long-lived session gets identity-map objects a re-query does
+    # not overwrite (``current_peer_credential`` says why that matters). The
+    # agent long-poll expires its session on every pass since #2040, so this is
+    # now belt-and-braces for any other caller.
     tls = await current_peer_credential(db, group, kea_peers)
     return FailoverConfig(
         tls_ca_pem=tls["ca_pem"] if tls else None,
@@ -360,8 +362,6 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 ),
                 pools=pools,
                 statics=statics,
-                ddns_enabled=sc.ddns_enabled,
-                ddns_hostname_policy=sc.ddns_hostname_policy,
                 is_active=sc.is_active,
                 address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                 v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",

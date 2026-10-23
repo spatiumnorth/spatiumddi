@@ -13,6 +13,11 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.token_binding import route_honours_token_binding
 from app.core.security import decode_access_token, hash_api_token, live_access_session
+from app.core.session_idle import (
+    activity_write_interval,
+    get_session_timeout_minutes,
+    request_activity_at,
+)
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
 from app.services.api_token_scopes import scope_matches_request
@@ -92,7 +97,9 @@ async def _record_api_token_use(token: APIToken, now: datetime) -> None:
     set_committed_value(token, "last_used_at", now)
 
 
-async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> User:
+async def _resolve_api_token(
+    db: AsyncSession, raw: str, request: Request, *, record_activity: bool = True
+) -> User:
     """Validate an ``sddi_*`` bearer and return the owning user.
 
     Raises the same 401/403 pattern as JWT auth so callers can't
@@ -105,6 +112,9 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     RBAC check downstream — see ``app.services.api_token_scopes``. A
     "read-only" token can never reach a write handler, even if the
     owner's RBAC would allow it.
+
+    ``record_activity=False`` skips the ``last_used_at`` bump, for a
+    re-check of a credential already accepted (a long-lived stream).
     """
     token_hash = hash_api_token(raw)
     token = (
@@ -165,7 +175,8 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
         )
     # Record the use in a transaction of its own (#1158): a read handler
     # never commits the request's session, so a bump left on it was lost.
-    await _record_api_token_use(token, now)
+    if record_activity:
+        await _record_api_token_use(token, now)
     await _load_time_bound_grants(db, user)
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.
@@ -201,13 +212,26 @@ async def get_current_user(
     """
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return await authenticate_bearer(db, credentials.credentials, request)
 
-    raw = credentials.credentials
+
+async def authenticate_bearer(
+    db: AsyncSession, raw: str, request: Request, *, record_activity: bool = True
+) -> User:
+    """Resolve a raw bearer credential (JWT access token or ``sddi_*`` API
+    token) to its User, applying every check :func:`get_current_user` does.
+
+    Raises ``HTTPException`` (401 / 403) on any failure. Shared by the auth
+    dependency and :mod:`app.api.stream_auth`, which re-runs it periodically
+    for a stream that outlives the request that opened it.
+    ``record_activity=False`` skips the ``last_seen_at`` / ``last_used_at``
+    bumps: a re-check is not the user doing anything.
+    """
     # Fast path for API tokens — they carry a distinct prefix so we
     # never try to JWT-decode one (which would just 401 on signature
     # mismatch anyway, but this is cleaner error messaging).
     if raw.startswith(_API_TOKEN_PREFIX):
-        return await _resolve_api_token(db, raw, request)
+        return await _resolve_api_token(db, raw, request, record_activity=record_activity)
 
     try:
         payload = decode_access_token(raw)
@@ -233,24 +257,30 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session revoked or expired",
         )
-    if session is not None:
+    if session is not None and record_activity:
         # When this session's user actually signed in — a refresh keeps it
         # (#1241). MFA enrolment reads it to ask an external-auth user, who
         # has no local password to re-enter, for a recent sign-in instead.
         request.state.signed_in_at = session.created_at
-        # Bump ``last_seen_at`` no more than once per minute per
-        # session — gives the admin viewer a recent timestamp without
-        # a write on every authenticated request. Not for a disabled
-        # account (#1383): its request is refused below, and the Sessions
-        # view must not show it as activity. Read as one column, so the
-        # commit still lands before the User is loaded.
+        # Bump ``last_seen_at`` no more than once per write interval per
+        # session (a minute, shorter under a short Session Timeout) — gives
+        # the admin viewer a recent timestamp without a write on every
+        # authenticated request. It is also what the idle timeout reads, so
+        # it records when the OPERATOR was last active: the console reports
+        # its idle time on background polls, and an open page that nobody
+        # touches must not keep the session alive (``app.core.session_idle``).
+        # Not for a disabled account (#1383): its request is refused below,
+        # and the Sessions view must not show it as activity. Read as one
+        # column, so the commit still lands before the User is loaded.
         now = datetime.now(UTC)
-        if session.last_seen_at is None or (now - session.last_seen_at) > timedelta(seconds=60):
+        activity_at = request_activity_at(request.headers, now)
+        interval = activity_write_interval(await get_session_timeout_minutes(db))
+        if session.last_seen_at is None or (activity_at - session.last_seen_at) > interval:
             active = (
                 await db.execute(select(User.is_active).where(User.id == user_id))
             ).scalar_one_or_none()
             if active:
-                session.last_seen_at = now
+                session.last_seen_at = activity_at
                 try:
                     await db.commit()
                 except Exception:  # noqa: BLE001 — last_seen is best-effort
