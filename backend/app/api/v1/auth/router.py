@@ -19,6 +19,7 @@ from sqlalchemy import select, update
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
+from app.api.token_binding import honours_token_binding
 from app.config import settings
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
@@ -48,6 +49,8 @@ from app.core.auth.user_sync import (
 from app.core.auth_throttle import (
     login_rate_limited,
     mfa_challenge_consume,
+    mfa_challenge_spent,
+    record_mfa_challenge_failure,
     record_stepup_password_failure,
     refund_stepup_attempt,
 )
@@ -76,9 +79,14 @@ from app.models.auth import User, UserSession
 from app.models.auth_provider import PASSWORD_PROVIDER_TYPES, AuthProvider
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
+    MFA_FAIL_MAX,
+    MFA_FAIL_WINDOW_MINUTES,
     LockoutPolicy,
     is_locked,
+    mfa_attempts_exhausted,
+    mfa_retry_after_seconds,
     register_failure,
+    register_mfa_failure,
     register_success,
 )
 from app.services.mfa import (
@@ -655,10 +663,19 @@ async def login_mfa(
     minted by ``/login`` plus a 6-digit TOTP code or a one-time recovery
     code. Either is accepted; both = 422.
 
-    The challenge token is single-use in spirit but stateless — once
-    spent it can technically be replayed within the 5 min TTL, but
-    only against a successful TOTP/recovery code, so an attacker who
-    captures the challenge token still needs the second factor.
+    Guessing is bounded three ways, checked before the code is:
+
+    * a locked account (#71) is refused exactly as ``/login`` refuses it,
+      and wrong codes count towards that lockout;
+    * each account has its own wrong-code budget
+      (``MFA_FAIL_MAX`` per ``MFA_FAIL_WINDOW_MINUTES``) that applies even
+      with lockout disabled and is kept on the user row, so it holds when
+      Redis is down;
+    * each challenge accepts ``MFA_CHALLENGE_FAIL_MAX`` wrong codes and is
+      single-use on success, after which sign-in restarts at the password.
+
+    The user row is read ``FOR UPDATE`` so concurrent attempts are counted
+    one at a time.
     """
     # Same per-IP budget as /login (#4) — the MFA step is the other half
     # of the credential surface.
@@ -684,7 +701,25 @@ async def login_mfa(
             detail="Invalid or expired MFA challenge",
         ) from exc
 
-    user = await db.get(User, user_id)
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        await _audit_login_failure(db, request, "<mfa>", reason="mfa_challenge_invalid")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge",
+        ) from exc
+    # Row lock: the budget checks below and the counters bumped on a wrong
+    # code must be read and written one attempt at a time, or a burst of
+    # concurrent guesses all see the same under-budget count.
+    user = (
+        await db.execute(
+            select(User)
+            .where(User.id == user_uuid)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -697,6 +732,36 @@ async def login_mfa(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="MFA not enabled for this user",
+        )
+
+    # ── Refusals that run before the second factor is checked ──────────────
+    # A locked account gets the same answer /login gives it, and a correct
+    # code here must not get as far as _issue_tokens, which would clear the
+    # lock. None of these refusals count as a failure: they check nothing.
+    if is_locked(user):
+        await _audit_login_failure(db, request, user.username, reason="account_locked", user=user)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is temporarily locked due to repeated failed logins.",
+        )
+    if mfa_attempts_exhausted(user):
+        retry_after = mfa_retry_after_seconds(user)
+        await _audit_login_failure(
+            db, request, user.username, reason="mfa_attempts_exhausted", user=user
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many incorrect MFA codes. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    challenge_jti = payload.get("jti")
+    if await mfa_challenge_spent(challenge_jti):
+        await _audit_login_failure(
+            db, request, user.username, reason="mfa_challenge_spent", user=user
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge",
         )
 
     # ── Validate the second factor ─────────────────────────────────────────
@@ -739,16 +804,41 @@ async def login_mfa(
                 )
 
     if not matched:
+        # Count against the account's own MFA budget (independent of the
+        # lockout setting) and the challenge's; _audit_login_failure also
+        # counts it towards the lockout and commits all of it.
+        budget_spent = register_mfa_failure(user)
+        await record_mfa_challenge_failure(challenge_jti)
+        if budget_spent:
+            db.add(
+                AuditLog(
+                    user_id=user.id,
+                    user_display_name=user.display_name,
+                    auth_source="local",
+                    source_ip=_client_ip(request),
+                    user_agent=clean_user_agent(request.headers.get("user-agent")),
+                    action="account.mfa_attempts_exhausted",
+                    resource_type="user",
+                    resource_id=str(user.id),
+                    resource_display=user.username,
+                    result="success",
+                    new_value={
+                        "failed_count": user.mfa_failed_count,
+                        "max": MFA_FAIL_MAX,
+                        "window_minutes": MFA_FAIL_WINDOW_MINUTES,
+                    },
+                )
+            )
         await _audit_login_failure(db, request, user.username, reason="mfa_code_invalid", user=user)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code")
 
     # Single-use guard (#7): claim the challenge jti now that the factor
-    # matched. A wrong code above never reaches here, so a legit user can
-    # still retry a fat-fingered code with the same challenge — but once a
-    # valid code is accepted, the challenge can't be replayed (the
-    # attacker who captured challenge+code loses the race / gets rejected).
-    # Fails open if Redis is down (reverts to the prior stateless behavior).
-    if not await mfa_challenge_consume(payload.get("jti")):
+    # matched. A legit user can retry a fat-fingered code on the same
+    # challenge until its wrong-code budget is spent — but once a valid
+    # code is accepted, the challenge can't be replayed (the attacker who
+    # captured challenge+code loses the race / gets rejected). Fails open
+    # if Redis is down (reverts to the prior stateless behavior).
+    if not await mfa_challenge_consume(challenge_jti):
         await _audit_login_failure(
             db, request, user.username, reason="mfa_challenge_replayed", user=user
         )
@@ -984,6 +1074,7 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
 
 
 @router.get("/me", response_model=UserResponse)
+@honours_token_binding
 async def get_me(current_user: CurrentUser) -> UserResponse:
     # #351 — ``is_superadmin`` here reports the *effective* status (the legacy
     # column OR a group → Superadmin-role ``{*, *}`` wildcard), NOT the raw
@@ -1007,6 +1098,7 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
 
 
 @router.get("/me/permissions", response_model=MyPermissionsResponse)
+@honours_token_binding
 async def get_my_permissions(current_user: CurrentUser) -> MyPermissionsResponse:
     """Return the calling credential's effective permission grants (issue #449).
 

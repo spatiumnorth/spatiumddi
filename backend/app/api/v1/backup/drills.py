@@ -21,9 +21,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import is_effective_superadmin
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.backup.drill import (
     compute_drill_readiness,
@@ -32,14 +31,6 @@ from app.services.backup.drill import (
 )
 
 router = APIRouter()
-
-
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=403,
-            detail="restore drills are restricted to superadmin users",
-        )
 
 
 class RestoreDrillResponse(BaseModel):
@@ -81,13 +72,12 @@ def _to_response(row: RestoreDrill, *, target_name: str | None = None) -> Restor
 @router.get("", response_model=list[RestoreDrillResponse])
 async def list_drills(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     target_id: uuid.UUID | None = Query(default=None),
     state: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> list[RestoreDrillResponse]:
     """Recent drills, newest first, optionally scoped to one target."""
-    _require_superadmin(current_user)
     stmt = (
         select(RestoreDrill, BackupTarget.name)
         .join(BackupTarget, BackupTarget.id == RestoreDrill.target_id)
@@ -117,7 +107,7 @@ class DrillReadinessSummary(BaseModel):
 
 
 @router.get("/readiness", response_model=DrillReadinessSummary)
-async def get_readiness(db: DB, current_user: CurrentUser) -> DrillReadinessSummary:
+async def get_readiness(db: DB, current_user: SuperAdmin) -> DrillReadinessSummary:
     """Per-target recovery readiness — "can I restore this, and how do
     I know?".
 
@@ -127,7 +117,6 @@ async def get_readiness(db: DB, current_user: CurrentUser) -> DrillReadinessSumm
     the UI and the assistant can't disagree about whether a backup is
     proven.
     """
-    _require_superadmin(current_user)
     rows = await compute_drill_readiness(db)
     verified = sum(1 for r in rows if r["verified"])
     return DrillReadinessSummary(
@@ -139,8 +128,7 @@ async def get_readiness(db: DB, current_user: CurrentUser) -> DrillReadinessSumm
 
 
 @router.get("/{drill_id}", response_model=RestoreDrillResponse)
-async def get_drill(drill_id: uuid.UUID, db: DB, current_user: CurrentUser) -> RestoreDrillResponse:
-    _require_superadmin(current_user)
+async def get_drill(drill_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> RestoreDrillResponse:
     row = await db.get(RestoreDrill, drill_id)
     if row is None:
         raise HTTPException(status_code=404, detail="restore drill not found")
@@ -150,7 +138,7 @@ async def get_drill(drill_id: uuid.UUID, db: DB, current_user: CurrentUser) -> R
 
 @router.post("/run/{target_id}", response_model=RestoreDrillResponse)
 async def run_drill_now(
-    target_id: uuid.UUID, db: DB, current_user: CurrentUser
+    target_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> RestoreDrillResponse:
     """Run one drill against this target now.
 
@@ -160,7 +148,6 @@ async def run_drill_now(
     large install; the UI polls the row rather than holding the
     request open where it matters.
     """
-    _require_superadmin(current_user)
     forbid_in_demo_mode("restore drills")
 
     # A drill replays into a throwaway database and never writes to

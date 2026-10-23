@@ -24,7 +24,9 @@ runs beat task (Phase D follow-up — not in this commit).
 Failure isolation: an uncaught exception inside ``drive_upgrade``
 gets caught here + the run row flips to ``state='failed'`` with the
 exception in ``last_error``. Otherwise a worker-side crash would
-strand the row in ``running`` forever.
+strand the row in ``running`` forever. The exception is a database that
+was unreachable (#2177): that is an outage, not a failed upgrade, so the
+drive releases its Lease, leaves the row ``running`` and is retried.
 """
 
 from __future__ import annotations
@@ -39,9 +41,9 @@ import structlog
 from celery import shared_task
 from redis.exceptions import RedisError
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
+from app.core.db_transient import is_transient_db_error
 from app.db import task_session
 from app.services.upgrades.orchestrator import OrchestratorError, drive_upgrade
 
@@ -56,6 +58,23 @@ _HANDOFF_HOP_DELAY_S = 5
 # (#1710): the flip rolls the workers one at a time, a minute or two each.
 _MAX_VERSION_HOPS = 120
 
+# #2177 — a drive that lost the database outside a step (the run row's own
+# writes between steps and nodes) is retried after these delays, its Lease
+# released first so the retry takes it over at once. ~90 s in all, plus each
+# attempt's own connect timeout: a CloudNativePG failover, with room. Celery's
+# exponential backoff from 1 s with full jitter put both of the old two
+# retries inside about a second.
+_DB_RETRY_COUNTDOWNS_S = (5, 10, 15, 30, 30)
+
+
+class DriveDatabaseUnavailable(RuntimeError):
+    """The drive stopped because the database was unreachable (#2177).
+
+    Raised once the drive has released its own Lease, so whatever carries the
+    run on next (this task's retry, else the orphan sweep) takes it over
+    without waiting out ``LEASE_DURATION_S``. The run row is left ``running``:
+    an outage is not the upgrade failing."""
+
 
 async def _async_drive(run_id: str) -> dict[str, str]:
     """Open a fresh async session + drive the run to terminal state."""
@@ -69,12 +88,44 @@ async def _async_drive(run_id: str) -> dict[str, str]:
     from app.services.upgrades import mutex  # noqa: PLC0415
 
     me = mutex.drive_identity()
+    try:
+        return await _drive_in_session(rid, run_id, me)
+    except OrchestratorError:
+        raise
+    except Exception as exc:
+        if not is_transient_db_error(exc):
+            raise
+        # #2177 — the database went away under the drive (a CNPG failover),
+        # or came back only to go again while the crash handler below wrote
+        # the row. Nothing about the run is known to be wrong, so the row is
+        # left ``running``; the Lease is released (only this drive's, a
+        # compare-and-swap; it is a kubeapi call, unaffected by the outage) so
+        # the retry, or else the orphan sweep, takes the run over at once
+        # instead of after the Lease's 600 s.
+        mutex.release_if_held(holder=me, attempts=3)
+        logger.warning(
+            "upgrade_drive_database_unavailable",
+            run_id=run_id,
+            exc_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise DriveDatabaseUnavailable(f"{type(exc).__name__}: {exc}") from exc
+
+
+async def _drive_in_session(rid: uuid.UUID, run_id: str, me: str) -> dict[str, str]:
+    from app.services.upgrades import mutex  # noqa: PLC0415
+
     async with task_session() as db:
         try:
             run = await drive_upgrade(db, rid, holder=me)
         except OrchestratorError:
             raise
         except Exception as exc:  # noqa: BLE001 — surface ANY error to the row
+            if is_transient_db_error(exc):
+                raise  # #2177 — an outage, not a crash: ``_async_drive`` handles it
+            # Logged before the row is written: when the database is lost
+            # during that write (#2177), the crash would otherwise go unlogged.
+            logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
             # Mark the row as failed so the UI doesn't show "running"
             # forever after the worker crashed. The orchestrator's own
             # halt-on-failure handles step-level failures; this catches
@@ -86,36 +137,39 @@ async def _async_drive(run_id: str) -> dict[str, str]:
             # raises PendingRollbackError, the row is never marked failed,
             # and the run sits in ``planned`` / ``running`` with no error
             # (#1449).
-            await db.rollback()
-            # Row-locked and holder-checked (#1704): the run is marked only
-            # while it is still this drive's. After a takeover it is the new
-            # drive's, and after a Halt or Abort the state is the operator's.
-            row = (
-                await db.execute(
-                    select(SystemUpgradeRun)
-                    .where(SystemUpgradeRun.id == rid)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalar_one_or_none()
-            if (
-                row is not None
-                and row.state in ("planned", "running")
-                and row.lease_holder in (None, me)
-            ):
-                row.state = "failed"
-                row.last_error = f"orchestrator crashed: {exc}"
-                from datetime import UTC, datetime  # noqa: PLC0415
+            try:
+                await db.rollback()
+                # Row-locked and holder-checked (#1704): the run is marked only
+                # while it is still this drive's. After a takeover it is the new
+                # drive's, and after a Halt or Abort the state is the operator's.
+                row = (
+                    await db.execute(
+                        select(SystemUpgradeRun)
+                        .where(SystemUpgradeRun.id == rid)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    row is not None
+                    and row.state in ("planned", "running")
+                    and row.lease_holder in (None, me)
+                ):
+                    row.state = "failed"
+                    row.last_error = f"orchestrator crashed: {exc}"
+                    from datetime import UTC, datetime  # noqa: PLC0415
 
-                row.finished_at = datetime.now(UTC)
-                await db.commit()
-            else:
-                await db.commit()  # ends the row lock; nothing to write
-            # A failed run holds the lease for nothing; left held, the next
-            # Start is refused until it expires. Only this drive's, never
-            # another drive's that took it over.
-            mutex.release_if_held(holder=me)
-            logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
+                    row.finished_at = datetime.now(UTC)
+                    await db.commit()
+                else:
+                    await db.commit()  # ends the row lock; nothing to write
+            finally:
+                # A failed run holds the lease for nothing; left held, the next
+                # Start is refused until it expires. Only this drive's, never
+                # another drive's that took it over. Released even when the
+                # row could not be written (#2177): the run is then left
+                # ``running``, and the orphan sweep re-drives it.
+                mutex.release_if_held(holder=me)
             return {"run_id": run_id, "state": "failed", "error": str(exc)}
 
     return {"run_id": str(run.id), "state": run.state}
@@ -124,21 +178,16 @@ async def _async_drive(run_id: str) -> dict[str, str]:
 @shared_task(
     name="app.tasks.upgrade_orchestrator.drive_upgrade_run",
     bind=True,
-    # Autoretry on transient classes. SQLAlchemyError catches connection
-    # blips against the upgrade row's session; ConnectionError / OSError
-    # catch kubeapi transients before the orchestrator's own
-    # KubeapiUnavailableError handling kicks in.
-    autoretry_for=(SQLAlchemyError, ConnectionError, OSError),
-    retry_backoff=True,
-    retry_backoff_max=300,
-    retry_jitter=True,
-    # NB: max_retries is kept LOW here — autoretrying a 30-min upgrade
-    # is rarely the right move. Operator can re-enqueue via the api's
-    # /resume endpoint with full agency.
-    max_retries=2,
+    # #2177 — retried only when the database was unreachable, after the
+    # explicit ``_DB_RETRY_COUNTDOWNS_S`` (not Celery's 1 s jittered backoff,
+    # which spent both retries inside a second of a CNPG failover). Any other
+    # error is the crash handler's: the run is marked failed, not retried.
+    # Re-running is safe (non-negotiable #9): the drive resumes from
+    # ``progress.per_node`` and every per-node step is idempotent.
+    max_retries=len(_DB_RETRY_COUNTDOWNS_S),
 )
 def drive_upgrade_run(  # type: ignore[type-arg]
-    self: object,
+    self: Any,
     run_id: str,
     avoid_node: str | None = None,
     hops: int = 0,
@@ -181,7 +230,20 @@ def drive_upgrade_run(  # type: ignore[type-arg]
             hops=hops + 1,
         )
         return {"run_id": run_id, "state": "passed_on"}
-    return asyncio.run(_async_drive(run_id))
+    try:
+        return asyncio.run(_async_drive(run_id))
+    except DriveDatabaseUnavailable as exc:
+        retries = int(getattr(self.request, "retries", 0) or 0)
+        if retries >= len(_DB_RETRY_COUNTDOWNS_S):
+            # The Lease is already released and the row left ``running``: the
+            # orphan sweep re-drives the run once the database is back.
+            logger.warning("upgrade_drive_database_retries_exhausted", run_id=run_id)
+            raise
+        raise self.retry(
+            exc=exc,
+            countdown=_DB_RETRY_COUNTDOWNS_S[retries],
+            max_retries=len(_DB_RETRY_COUNTDOWNS_S),
+        ) from exc
 
 
 async def _async_release_lingering_hold() -> dict[str, str] | None:
