@@ -3144,6 +3144,22 @@ slot is a spare, so a wrong-arch rootfs sitting in it costs nothing (the
 node keeps running on the active slot and the next apply overwrites it),
 whereas pointing the bootloader at it cannot be undone remotely.
 
+### Free space is checked before an upgrade image is stored (#2400)
+
+The kubelet evicts pods at `nodefs.available<5%` and then keeps evicting
+until a further 10% (`evictionMinimumReclaim`) is free, so a node that
+dips under 5% stays in DiskPressure, evicting the api, worker and
+supervisor, until **15% of `/var` is free**. An image that fits on disk
+can therefore still take the control plane down. Upload and
+import-from-GitHub now refuse with a 422 that names the numbers when
+storing the image would leave less than 15% of the volume free (the
+mirror's volume when the slot-image mirror is on), before any byte is
+written. The node-side staging download in `spatium-upgrade-slot` applies
+the same rule and exits 7, which the slot-upgrade wrapper reports as "not
+enough free space on /var". Free space by deleting unused upgrade images
+in Fleet, then retry. On a 15 GB `/var` that is about 2.25 GB of headroom
+on top of the image.
+
 **Two source modes for the upgrade image:**
 
 1. **Uploaded / imported image** (staged). Operator stages the image
