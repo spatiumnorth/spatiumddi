@@ -4206,7 +4206,10 @@ function SyncMenu({
   onSyncAll,
   hasDhcp,
   hasDns,
+  dnsGate,
 }: {
+  // #2571 — props spread onto the DNS item when the caller may not sync it.
+  dnsGate?: { disabled?: boolean; title?: string };
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
@@ -4220,7 +4223,15 @@ function SyncMenu({
       title="Sync IPAM with DNS and/or DHCP servers"
       items={[
         ...(hasDns
-          ? [{ key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns }]
+          ? [
+              {
+                key: "dns",
+                label: "DNS",
+                icon: Globe2,
+                onSelect: onSyncDns,
+                ...dnsGate,
+              },
+            ]
           : []),
         ...(hasDhcp
           ? [
@@ -4423,6 +4434,9 @@ const NEEDS_ADDRESS_WRITE =
 const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
 const NEEDS_ADDRESS_DELETE =
   "Requires delete permission in IPAM, and write on this subnet or on an address set in it";
+const NEEDS_DNS_SYNC =
+  "Requires read permission in IPAM and write permission on subnets";
+const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_ORPHAN_PURGE =
   "Requires delete permission in IPAM and write permission on subnets";
 
@@ -4934,6 +4948,12 @@ export function SubnetDetail({
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
+  // #2571 — DNS sync: the drift preview is a read on the IPAM router and the
+  // commit is write on subnets, both at the type level (a grant scoped to one
+  // subnet reaches neither, #2497).
+  const canDnsSync =
+    IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
+  const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
   // Bulk delete and Clean Orphans are deletes: the router gate wants
   // ``delete``, the handler write on the row's subnet or address set.
   const canDeleteIpam = canDeleteInIpam(
@@ -5611,6 +5631,7 @@ export function SubnetDetail({
             <SyncMenu
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
               hasDns={dnsOn}
+              dnsGate={dnsSyncGate}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -5848,7 +5869,8 @@ export function SubnetDetail({
               </div>
               <button
                 onClick={() => setShowDnsSync(true)}
-                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 dark:text-amber-200"
+                {...dnsSyncGate}
+                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-200"
               >
                 <Globe2 className="h-3 w-3" />
                 Open Sync DNS
@@ -7977,6 +7999,8 @@ export function EditSubnetModal({
   onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
+  const canDeleteSubnet = usePermissions().can("delete", "subnet");
   const [name, setName] = useState(subnet.name ?? "");
   const [description, setDescription] = useState(subnet.description ?? "");
   const [gateway, setGateway] = useState(subnet.gateway ?? "");
@@ -8661,7 +8685,8 @@ export function EditSubnetModal({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this subnet…
           </button>
