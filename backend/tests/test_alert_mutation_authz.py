@@ -144,3 +144,22 @@ async def test_superadmin_can_evaluate(client: AsyncClient, db_session: AsyncSes
     await db_session.commit()
     resp = await client.post("/api/v1/alerts/evaluate", headers={"Authorization": f"Bearer {tok}"})
     assert resp.status_code == 200, resp.text
+
+
+async def test_manual_evaluate_is_audited(client: AsyncClient, db_session: AsyncSession) -> None:
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+
+    _, tok = await _user(db_session, superadmin=True)
+    await db_session.commit()
+    resp = await client.post("/api/v1/alerts/evaluate", headers={"Authorization": f"Bearer {tok}"})
+    assert resp.status_code == 200, resp.text
+    rows = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.action == "evaluate")))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].resource_type == "alert_rule"
+    assert rows[0].result == "success"

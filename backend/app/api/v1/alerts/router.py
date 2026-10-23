@@ -548,4 +548,17 @@ async def evaluate_now(db: DB, current_user: SuperAdmin) -> EvaluateResponse:
     configured syslog / webhook / SMTP targets.
     """
     result = await alert_service.evaluate_all(db)
+    db.add(
+        AuditLog(
+            action="evaluate",
+            resource_type="alert_rule",
+            resource_id="*",
+            resource_display="alert evaluator (manual run)",
+            user_id=current_user.id,
+            user_display_name=current_user.username,
+            result="success",
+            new_value={k: result.get(k) for k in EvaluateResponse.model_fields},
+        )
+    )
+    await db.commit()
     return EvaluateResponse(**result)
