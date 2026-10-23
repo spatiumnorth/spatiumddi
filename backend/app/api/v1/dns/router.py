@@ -4227,6 +4227,26 @@ async def add_trust_anchor(
         added_by_user_id=current_user.id,
     )
     db.add(anchor)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_trust_anchor",
+            resource_id=str(anchor.id),
+            resource_display=f"{anchor.zone_name} (key tag {anchor.key_tag})",
+            new_value={
+                "group_id": str(group_id),
+                "zone_name": anchor.zone_name,
+                "key_tag": anchor.key_tag,
+                "algorithm": anchor.algorithm,
+                "is_initial_key": anchor.is_initial_key,
+            },
+            result="success",
+        )
+    )
     collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(anchor)
@@ -4246,6 +4266,25 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_trust_anchor",
+            resource_id=str(anchor.id),
+            resource_display=f"{anchor.zone_name} (key tag {anchor.key_tag})",
+            old_value={
+                "group_id": str(group_id),
+                "zone_name": anchor.zone_name,
+                "key_tag": anchor.key_tag,
+                "algorithm": anchor.algorithm,
+                "is_initial_key": anchor.is_initial_key,
+            },
+            result="success",
+        )
+    )
     collect_wake(dns_group_channel(group_id))
     await db.delete(anchor)
     await db.commit()
