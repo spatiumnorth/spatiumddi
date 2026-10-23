@@ -128,6 +128,77 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A backup destination that times out now says so instead of
+  storing an empty reason (#2402).** A WebDAV target whose server
+  accepted the connection and never answered failed the run with
+  `WebDAV PUT failed: ` and nothing after the colon, because httpx's
+  timeout exceptions carry no text. That string is what the target's
+  `last_run_error` and the Run now answer show. The error now names
+  the exception type and, for a timeout, says the destination timed
+  out. The same fallback covers the other destination drivers that
+  built their message from the exception text (WebDAV, HTTPS PUT, S3,
+  GCS, Azure Blob, FTP, SCP, SMB).
+
+- **A DHCP scope's DDNS toggle and hostname policy did nothing, yet
+  reloaded Kea whenever they changed (#2270).** DDNS is gated only by
+  the subnet's own settings; the scope's `ddns_enabled` and
+  `ddns_hostname_policy` reached neither Kea nor DNS, but were hashed
+  into the DHCP config ETag, so flipping one restarted Kea's HA state
+  for a byte-identical config. They no longer enter the bundle or the
+  agent wire, so such an edit converges nothing. The scope API now
+  refuses a change to either with a 422 naming the field and pointing
+  at the subnet's DDNS settings (values already stored are tolerated on
+  save), and the scope dialog and DHCP lists no longer show a DDNS
+  control or column.
+
+- **A scope's "Hostname → IPAM Sync" setting now does something
+  (#2269).** It was stored and never read: every lease's hostname
+  was written to IPAM whatever the scope said, so "Don't sync to
+  IPAM" still filled IPAM. Now only `on_lease` writes a lease's
+  hostname onto its IPAM mirror row; `disabled` and `on_static_only`
+  keep it out. This covers the Kea lease-event path, the Windows
+  poll path and a reservation handing its address back to a live
+  lease. The mirror row itself (status, MAC, last-seen) is still
+  created in every mode, and turning the setting off deletes
+  nothing: existing mirrors stay and their hostnames are not
+  blanked or overwritten. The old default `on_static_only` would
+  have stripped lease hostnames from every existing scope, so the
+  default is now `on_lease` and stored `on_static_only` values are
+  rewritten to it (migration `e7b3d19a4c26`); `disabled` is
+  honoured as set.
+
+- **A nightly no longer calls itself `nightly-YYYYMMDD` in the update
+  check, the upgrade pre-flight and the DNS bundle stamp (#2354).**
+  #2111 gave `GET /version` one spelling of a nightly
+  (`0.0.0-nightly-YYYYMMDD+sha`), but three places still read the bare
+  image tag, which names no build date: the daily update check offered a
+  nightly a release it already includes, the upgrade pre-flight called it
+  "not a release" instead of "already includes the target", and every DNS
+  server row's `bundle_app_version` named the build differently from
+  `/version`. All three now use `canonical_version`. Releases are
+  unaffected. Existing server rows pick up the new spelling on their next
+  render.
+
+- **PowerDNS agent answers on IPv6 as well as IPv4 (#2307).** The agent
+  rendered `local-address=0.0.0.0`, which replaces pdns's default and so
+  never bound `::`: IPv6 clients got no answer while BIND9 groups did, and
+  the firewall's open v6 port made it look like a network fault. It now
+  renders `0.0.0.0, ::`. On a host with no IPv6 stack at all (kernel
+  `ipv6.disable=1`) pdns aborts on a `::` entry, so there the line stays
+  IPv4-only, the same tolerance BIND shows for `listen-on-v6`. The dnsdist
+  front binds both families already.
+
+- **An unattended install no longer aborts when k3s unpacks its tools during the root copy (#2256).** The live-root rsync now skips `/var/lib/rancher/k3s/data/` (k3s's self-extraction area, regenerated on the installed system's first start; the baked air-gap images under `agent/` are still copied) and treats rsync exit 24 ("some files vanished") as success for that copy only, logging it. Every other rsync failure still aborts the install.
+
+- **A backup run in flight during a restore now records its end (#2353).**
+  A restore ends every other database session, the running backup's
+  included, so the run could not stamp its own result: the target stayed
+  "in progress" and Run now answered 409 until the 2 hour presumed-dead
+  reap. The runner now writes the terminal state and its audit row on a
+  fresh session when its own was closed under it. The write only lands
+  while the row still carries that run's claim, so it never overwrites a
+  newer run.
+
 - **The DHCP MAC blocklist is now enforced on DHCPv6 scopes, best
   effort (#2268).** The reserved `DROP` client class was rendered into
   Dhcp4 only, so a blocked (rogue / lost_stolen / quarantine) device

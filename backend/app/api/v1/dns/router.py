@@ -35,6 +35,7 @@ from pydantic import (
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
@@ -75,7 +76,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
@@ -211,7 +212,12 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
-from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
+from app.services.dns.tsig import (
+    RESERVED_TSIG_PREFIX,
+    group_key_names,
+    normalize_tsig_name,
+    rotate_group_tsig_key,
+)
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_move import (
@@ -2068,6 +2074,7 @@ async def update_group(
         group_drivers = (await _drivers_by_group(db, [group.id])).get(group.id, [])
         if set(group_drivers) & CATALOG_UNSUPPORTED_DRIVERS:
             raise HTTPException(status_code=422, detail=catalog_unsupported_message(group_drivers))
+    before = {k: getattr(group, k, None) for k in changes}
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -2080,7 +2087,7 @@ async def update_group(
             resource_type="dns_server_group",
             resource_id=str(group.id),
             resource_display=group.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -2465,6 +2472,7 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
         setattr(server, k, v)
 
@@ -2608,7 +2616,7 @@ async def update_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             new_value=move_result.as_audit_value() if move_result else None,
             result="success",
         )
@@ -4145,6 +4153,7 @@ async def update_options(
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
+    before = {k: getattr(opts, k, None) for k in changes}
     for k, v in changes.items():
         setattr(opts, k, v)
 
@@ -4187,7 +4196,7 @@ async def update_options(
             resource_type="dns_server_options",
             resource_id=str(opts.id),
             resource_display=f"options for group {group_id}",
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -4670,6 +4679,44 @@ _TSIG_ALGO_LENGTHS = {
 _TSIG_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?\.?$")
 
 
+async def _tsig_name_refusal(
+    db: AsyncSession, group_id: uuid.UUID, name: str, *, exclude_id: uuid.UUID | None = None
+) -> HTTPException | None:
+    """Refuse a TSIG key name that would render a second ``key {}`` for one name (#2295).
+
+    Names are compared the way BIND does (case-folded, trailing dot dropped),
+    and against the group's own generated key too. ``spatium-`` is reserved for
+    that generated key.
+    """
+    norm = normalize_tsig_name(name)
+    if norm.startswith(RESERVED_TSIG_PREFIX):
+        return HTTPException(
+            status_code=422,
+            detail=f"TSIG key name '{name}' uses the reserved '{RESERVED_TSIG_PREFIX}' prefix "
+            "(it is the group's generated key); choose another name",
+        )
+    group = await db.get(DNSServerGroup, group_id)
+    if group is not None and normalize_tsig_name(group.tsig_key_name) == norm:
+        return HTTPException(
+            status_code=422,
+            detail=f"TSIG key name '{name}' clashes with this group's generated key "
+            f"'{group.tsig_key_name}'",
+        )
+    rows = (
+        await db.execute(
+            select(DNSTSIGKey.id, DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)
+        )
+    ).all()
+    for rid, rname in rows:
+        if rid != exclude_id and normalize_tsig_name(rname) == norm:
+            return HTTPException(
+                status_code=409,
+                detail=f"A TSIG key named '{rname}' already exists in this group "
+                "(names are compared case-insensitively, ignoring a trailing dot)",
+            )
+    return None
+
+
 def _generate_tsig_secret(algorithm: str) -> str:
     import base64
     import secrets
@@ -4871,14 +4918,8 @@ async def create_tsig_key(
     # installed and left to fail every signed transfer with BADKEY.
     if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
         raise HTTPException(status_code=422, detail=refusal)
-    existing = await db.execute(
-        select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id, DNSTSIGKey.name == body.name)
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409,
-            detail="A TSIG key with that name already exists in this group",
-        )
+    if refusal_exc := await _tsig_name_refusal(db, group_id, body.name):
+        raise refusal_exc
 
     plaintext = body.secret.strip() if body.secret else _generate_tsig_secret(body.algorithm)
     key = DNSTSIGKey(
@@ -4945,16 +4986,12 @@ async def update_tsig_key(
         ):
             raise HTTPException(status_code=422, detail=refusal)
     if changes.get("name") and changes["name"] != key.name:
-        clash = await db.execute(
-            select(DNSTSIGKey).where(
-                DNSTSIGKey.group_id == group_id,
-                DNSTSIGKey.name == changes["name"],
-                DNSTSIGKey.id != key_id,
-            )
-        )
-        if clash.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Name already in use")
+        if refusal_exc := await _tsig_name_refusal(
+            db, group_id, changes["name"], exclude_id=key_id
+        ):
+            raise refusal_exc
         await _assert_tsig_key_is_unreferenced(group_id, key, db, action="rename")
+    before = {k: getattr(key, k, None) for k in changes}
     for k, v in changes.items():
         setattr(key, k, v)
     db.add(
@@ -4966,7 +5003,7 @@ async def update_tsig_key(
             resource_type="dns_tsig_key",
             resource_id=str(key.id),
             resource_display=key.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -5183,6 +5220,7 @@ async def update_view(
         },
     )
     changes.update(await _validated_view_fields(group_id, body, db))
+    before = {k: getattr(view, k, None) for k in changes}
     for k, v in changes.items():
         setattr(view, k, v)
     db.add(
@@ -5194,7 +5232,7 @@ async def update_view(
             resource_type="dns_view",
             resource_id=str(view.id),
             resource_display=view.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -6203,6 +6241,7 @@ async def update_zone(
         k in changes and (changes[k] or "") != (getattr(zone, k) or "")
         for k in ("primary_ns", "admin_email")
     ) or any(k in changes and changes[k] != getattr(zone, k) for k in _ZONE_FILE_TIMER_FIELDS)
+    before = {k: getattr(zone, k, None) for k in changes}
     for k, v in changes.items():
         setattr(zone, k, v)
     if soa_changed:
@@ -6220,7 +6259,7 @@ async def update_zone(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=zone.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -8406,6 +8445,13 @@ async def update_record(
         clearable={"view_id", "ttl"},
         non_nullable={"name", "value", "tags"},
     )
+    # An untouched Save sends every field the dialog shows; only a field whose
+    # value differs is a change (#2463). Nothing changed → nothing to bump,
+    # queue or audit.
+    changes = {k: v for k, v in changes.items() if getattr(record, k) != v}
+    if not changes:
+        record.provider_warning = None  # type: ignore[attr-defined]
+        return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     before_name, before_value = record.name, record.value
