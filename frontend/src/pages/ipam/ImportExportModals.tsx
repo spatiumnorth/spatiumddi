@@ -16,6 +16,7 @@ import {
   type ImportStrategy,
   type IPSpace,
   type Subnet,
+  formatApiError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { permissionGate } from "@/hooks/usePermissions";
@@ -67,11 +68,7 @@ export function ImportModal({
       });
       setPreview(result);
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+      setError(formatApiError(e, "Preview failed"));
     } finally {
       setBusy(false);
     }
@@ -94,11 +91,7 @@ export function ImportModal({
       });
       onCommitted();
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+      setError(formatApiError(e, "Import failed"));
     } finally {
       setBusy(false);
     }
@@ -467,11 +460,7 @@ export function AddressImportModal({
       });
       setPreview(result);
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+      setError(formatApiError(e, "Preview failed"));
     } finally {
       setBusy(false);
     }
@@ -489,11 +478,7 @@ export function AddressImportModal({
       setCommitted(result);
       onCommitted();
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+      setError(formatApiError(e, "Import failed"));
     } finally {
       setBusy(false);
     }

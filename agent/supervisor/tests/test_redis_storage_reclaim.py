@@ -147,10 +147,10 @@ FREED = [f"{PVC_PATH}/{R2}", f"{POD_PATH}/{REDIS}-2"]
 class _Kube:
     """A scripted kubeapi keyed by path. A GET answers from ``gets``: a list is
     one answer per call, its last answer repeating, and a path not scripted is
-    a 404. A DELETE answers 200 unless ``deletes`` says otherwise. Every call is
-    recorded in order."""
+    a 404. A DELETE answers 200 unless ``deletes`` says otherwise (a status, or
+    a status and a body). Every call is recorded in order."""
 
-    def __init__(self, gets: dict, deletes: dict[str, int] | None = None) -> None:
+    def __init__(self, gets: dict, deletes: dict[str, int | tuple[int, str]] | None = None) -> None:
         self._gets = {p: list(a) if isinstance(a, list) else [a] for p, a in gets.items()}
         self._deletes = deletes or {}
         self.calls: list[tuple[str, str]] = []
@@ -158,7 +158,9 @@ class _Kube:
     def __call__(self, method, path, body=None, content_type=None, timeout=None):
         self.calls.append((method, path))
         if method == "DELETE":
-            return self._deletes.get(path, 200), b"{}"
+            answer = self._deletes.get(path, 200)
+            status, payload = answer if isinstance(answer, tuple) else (answer, "{}")
+            return status, payload.encode()
         answers = self._gets.get(path)
         if method != "GET" or not answers:
             return 404, b"{}"
@@ -551,3 +553,179 @@ def test_a_failure_that_repeats_is_logged_once(seed_tick, monkeypatch) -> None:
     assert len(failed) == 2 and "503" in failed[0] and "500" in failed[1]
     assert [e["pvcs"] for e in _said(logs, "redis_storage_reclaimed")] == [[R2]]
     assert kube.deleted[-2:] == FREED
+
+
+# ---------------------------------------------------------------------------
+# Review of #2433, point 1: a name a failed sweep left owed is not this tick's
+# eviction. It can outlive a run of failed sweeps, and its node can rejoin under
+# the same hostname meanwhile, its Redis replica running on the claim again.
+# Only the Node list can say the name is still gone.
+# ---------------------------------------------------------------------------
+
+MEMBER_4 = "ddipg-member-4"
+
+
+def test_a_node_back_under_an_owed_name_keeps_its_claim_and_pod(seed_tick, monkeypatch) -> None:
+    # The eviction tick's claim list fails, so member-2 is owed. By the next
+    # tick member-2 is back under the same hostname and redis-2 runs there on
+    # its claim (no Redis pod is Pending). Handed back as evicted, the owed
+    # name cost it the claim and the running pod, for a replica resync.
+    gets = _walk(nodes=(*LIVE, DEAD), pending=())
+    gets[PVC_PATH] = [(503, "etcdserver: request timed out"), gets[PVC_PATH]]
+    kube = _Kube(gets)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    first = seed_tick(_REPLACE_MEMBER_2)
+    second = seed_tick(_SETTLED)
+
+    assert len(_said(first, "redis_storage_reclaim_failed")) == 1
+    assert kube.deleted == [f"/api/v1/nodes/{DEAD}"]
+    assert not _said(second, "redis_storage_reclaimed")
+    assert heartbeat._redis_stranded_pending == set()  # back, so owed no more
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["ready", "not-ready"])
+def test_an_owed_name_the_node_list_has_again_is_left_alone(monkeypatch, ready) -> None:
+    # Listed again is not gone, Ready or not, as on the sweep.
+    kube = _Kube(_walk(nodes=(*LIVE, _node(DEAD, ready=ready)), pending=()))
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage(owed_nodes=[DEAD])
+
+    assert tuple(out) == ([], None)
+    assert kube.deleted == []
+
+
+def test_an_owed_name_still_missing_from_the_node_list_is_reclaimed(monkeypatch) -> None:
+    # Still gone: freed at once on one Node read, without waiting for its pod
+    # to show Pending, and matched as delete_node sends it (#1757).
+    kube = _Kube(_walk(pending=()))
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage(owed_nodes=["DDIPG-Member-2."])
+
+    assert tuple(out) == ([R2], None)
+    assert kube.deleted == FREED
+    assert kube.reads.count(NODES_PATH) == 1 and PENDING_PATH not in kube.reads
+
+
+def test_an_owed_name_is_not_reclaimed_on_a_node_list_that_fails(monkeypatch) -> None:
+    # An unreadable Node list says nothing about the owed node: it stays owed.
+    gets = _walk(pending=())
+    gets[NODES_PATH] = (500, "boom")
+    kube = _Kube(gets)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage(owed_nodes=[DEAD])
+
+    assert out.reclaimed == []
+    assert out.error is not None and "500" in out.error
+    assert kube.deleted == []
+
+
+def test_this_ticks_eviction_stays_authoritative_beside_an_owed_name(monkeypatch) -> None:
+    # member-2 was evicted this tick and is still listed (its DELETE is
+    # milliseconds old); member-4, owed from an earlier tick, is back with
+    # redis-3 on it. The Node read the owed name costs decides member-4 only.
+    claims = (*_WALK_CLAIMS, _redis_claim(3, "pv-r3", selected=MEMBER_4))
+    kube = _Kube(
+        _walk(
+            nodes=(*LIVE, DEAD, MEMBER_4),
+            pending=(),
+            claims=claims,
+            pvs={**_WALK_PVS, "pv-r3": MEMBER_4},
+        )
+    )
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage({DEAD}, owed_nodes=[MEMBER_4])
+
+    assert tuple(out) == ([R2], None)
+    assert kube.deleted == FREED
+
+
+# ---------------------------------------------------------------------------
+# Review of #2433, point 2: a failure is logged once per kind until a sweep
+# comes back clean, and the kind was the whole error text, the answer's body
+# with it. A body that changes from tick to tick (a request id, a timing) then
+# logged on every tick, and the kinds kept grew until the next clean sweep.
+# ---------------------------------------------------------------------------
+
+# Where a sweep can be refused with a body: (names evicted, path, status).
+_REFUSALS = {
+    "pending-pods": ((), PENDING_PATH, 503),
+    "nodes": ((), NODES_PATH, 503),
+    "claims": (DEAD, PVC_PATH, 503),
+    "volume": (DEAD, "/api/v1/persistentvolumes/pv-r2", 503),
+    "claim-delete": (DEAD, f"{PVC_PATH}/{R2}", 500),
+    "pod-delete": (DEAD, f"{POD_PATH}/{REDIS}-2", 500),
+}
+
+
+def _refused_at(monkeypatch, where: str, body: str):
+    evicted, path, status = _REFUSALS[where]
+    gets: dict = _walk()
+    deletes: dict = {}
+    if where.endswith("-delete"):
+        deletes[path] = (status, body)
+    else:
+        gets[path] = (status, body)
+    monkeypatch.setattr(k8s_api, "_request", _Kube(gets, deletes))
+    return k8s_api.reclaim_stranded_redis_storage(evicted)
+
+
+@pytest.mark.parametrize("where", list(_REFUSALS))
+def test_a_refusal_is_one_kind_whatever_its_body(monkeypatch, where) -> None:
+    first = _refused_at(monkeypatch, where, "etcdserver: request timed out (id a1)")
+    again = _refused_at(monkeypatch, where, "etcdserver: leader changed (id b2)")
+
+    # The error still quotes the body, for the one line that is logged ...
+    assert first.error is not None and "a1" in first.error
+    assert again.error is not None and "b2" in again.error
+    # ... and the kind it is logged once on is the same, and quotes none.
+    assert first.error_kind and first.error_kind == again.error_kind
+    assert "etcdserver" not in first.error_kind
+
+
+def test_each_kind_of_refusal_names_its_request(monkeypatch) -> None:
+    kinds = {where: _refused_at(monkeypatch, where, "boom").error_kind for where in _REFUSALS}
+    assert len(set(kinds.values())) == len(_REFUSALS), kinds
+
+
+def test_a_failure_whose_body_changes_every_tick_is_logged_once(seed_tick, monkeypatch) -> None:
+    # The claim list answers 503 four ticks running, each time with another
+    # body, then answers. One line, and one kind kept while it lasts.
+    gets = _walk(pending=())
+    ok = gets[PVC_PATH]
+    gets[PVC_PATH] = [(503, f"etcdserver: request timed out (id {n})") for n in range(4)] + [ok]
+    kube = _Kube(gets)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    logs: list[dict] = []
+    for _ in range(4):
+        logs += seed_tick(_REPLACE_MEMBER_2)
+        assert len(heartbeat._redis_failures_logged) == 1
+    logs += seed_tick(_REPLACE_MEMBER_2)
+
+    failed = _said(logs, "redis_storage_reclaim_failed")
+    assert [e["kind"] for e in failed] == ["list claims: status 503"]
+    assert "(id 0)" in failed[0]["error"]  # the first body, as it came
+    assert [e["pvcs"] for e in _said(logs, "redis_storage_reclaimed")] == [[R2]]
+    assert heartbeat._redis_failures_logged == set()
+
+
+def test_the_kinds_kept_between_clean_sweeps_are_bounded(seed_tick, monkeypatch) -> None:
+    # Twenty ticks with no clean sweep between, each refused with another
+    # status: each is a new kind and is logged, and at most eight are kept.
+    statuses = range(500, 520)
+    gets = _walk(pending=())
+    gets[PVC_PATH] = [(status, "boom") for status in statuses]
+    kube = _Kube(gets)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    logs: list[dict] = []
+    for _ in statuses:
+        logs += seed_tick(_REPLACE_MEMBER_2)
+        assert len(heartbeat._redis_failures_logged) <= 8
+
+    assert len(_said(logs, "redis_storage_reclaim_failed")) == len(statuses)

@@ -1,7 +1,7 @@
 """Periodic Cisco Meraki read-only reconcile (#606).
 
 Mirrors ``panos_sync`` — 30 s beat tick, per-org interval gating, platform-wide
-kill switch via ``PlatformSettings.integration_meraki_enabled``. Plus a
+kill switch via the ``integrations.meraki`` feature module (#2196). Plus a
 ``sync_org_now`` task for the UI's "Sync Now" button.
 """
 
@@ -19,12 +19,11 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
 from app.models.meraki import MerakiOrg
-from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
 from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
-
-_PLATFORM_SINGLETON_ID = 1
 
 
 async def _run_sweep() -> dict[str, Any]:
@@ -36,8 +35,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_meraki_enabled:
+            if not await is_module_enabled(db, "integrations.meraki"):
                 return {"status": "disabled"}
 
             rows = (
@@ -152,6 +150,7 @@ async def _run_one(org_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.meraki_sync.sweep_meraki_orgs", bind=True)
+@module_gated("integrations.meraki")
 def sweep_meraki_orgs(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

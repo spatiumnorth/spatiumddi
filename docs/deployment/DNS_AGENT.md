@@ -233,7 +233,18 @@ while it runs and releases only while it still holds it: a render the OOM
 killer takes mid-flight frees the slot within one lease instead of holding
 every server's render for the render ceiling. A render waiting for the slot
 keeps its server's lock, so the duplicates the sweep and further marks
-enqueue meanwhile coalesce into it.
+enqueue meanwhile coalesce into it. A render killed mid-flight records
+nothing, and the broker redelivers its task, so each render raises a
+per-server count in Redis before it runs and clears it when it returns or
+raises (#2227): once two renders of a server have died without finishing,
+the next records why on the server row (`bundle_render_status = failed`,
+the `agent_bundle_render_failed` alert) and holds that server for five
+minutes before letting one more through. Up to `dns_agent_bundle_render_slots` (2) renders run at
+once, and a server that changed again while it rendered hands its slot to a
+waiting render rather than rendering again in place. The render reads the
+group's records a batch of zones at a time and never holds them whole; for what it
+needs per zone and per record see "Control-plane memory for large groups"
+in [`DNS.md`](../features/DNS.md).
 
 *Every process that writes DNS rows must carry the listener.* It is
 installed by importing `bundle_dirty`: `app.main` does so for the api,
@@ -467,7 +478,9 @@ broke it.
 
 **A bundle the daemon dies on is not re-applied blindly either (#2019).**
 The quarantine only hears of failures the agent survives. A bundle too big
-for the container's memory limit (a large RPZ blocklist set) applies cleanly
+for the container's memory limit (a large RPZ blocklist set; on the appliance
+that limit is sized from node RAM, see `APPLIANCE.md` "Memory sizing for
+named") applies cleanly
 and then named is OOM-killed while it loads the zones; nothing is caught, and
 the agent used to re-apply that same cached bundle at every start, before
 its sync thread existed, so the server crash-looped even after the operator
