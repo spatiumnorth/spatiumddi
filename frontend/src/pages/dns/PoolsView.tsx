@@ -20,6 +20,7 @@ import {
   type DNSServerGroup,
   type DNSZone,
   type SiteRead,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import {
@@ -552,8 +553,7 @@ export function PoolModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const e = err as { response?: { data?: { detail?: string } } };
-      setError(e?.response?.data?.detail ?? "Failed to save pool");
+      setError(formatApiError(err, "Failed to save pool"));
     },
   });
 
