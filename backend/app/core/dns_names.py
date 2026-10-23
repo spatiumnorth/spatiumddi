@@ -37,6 +37,10 @@ from __future__ import annotations
 import re
 import unicodedata
 
+import dns.name
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import idna
 
 # RFC 1035 §2.3.4 / RFC 2181 §11 — a label is ≤ 63 octets; a name is ≤ 255
@@ -622,3 +626,52 @@ def sanitize_mirrored_hostname(raw: str | None) -> str:
     folded = unicodedata.normalize("NFKD", name.translate(_TRANSLITERATE))
     folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
     return sanitize_hostname(_APOSTROPHES_RE.sub("", folded))
+
+
+# Types whose value is not zone-file rdata dnspython can read: TXT / SPF are
+# quoted at render, ALIAS / LUA are PowerDNS-only syntax.
+_RDATA_UNCHECKED_TYPES = frozenset({"TXT", "SPF", "ALIAS", "LUA"})
+
+
+def structured_rdata_error(
+    record_type: str,
+    value: str,
+    *,
+    priority: int | None = None,
+    weight: int | None = None,
+    port: int | None = None,
+    origin: str | None = None,
+) -> str | None:
+    """Why dnspython cannot read this record's rdata, or None if it can (#2502).
+
+    The BIND9 agent writes ``value`` into the zone file verbatim, after
+    prefixing the MX priority / SRV priority+weight+port exactly as composed
+    here, and ``named-checkzone`` then refuses the whole zone. A / AAAA and the
+    bare-name targets are checked elsewhere; a type dnspython does not know is
+    not judged.
+    """
+    rtype = record_type.upper()
+    if rtype in _RDATA_UNCHECKED_TYPES:
+        return None
+    try:
+        rdtype = dns.rdatatype.from_text(rtype)
+    except dns.rdatatype.UnknownRdatatype:
+        return None
+    wire = value
+    if rtype == "MX" and priority is not None:
+        if not wire.lstrip().split(" ", 1)[0].isdigit():
+            wire = f"{priority} {wire}"
+    elif (
+        rtype == "SRV"
+        and priority is not None
+        and weight is not None
+        and port is not None
+        and len(wire.split()) < 4
+    ):
+        wire = f"{priority} {weight} {port} {wire}"
+    try:
+        org = dns.name.from_text(origin) if origin else None
+        dns.rdata.from_text(dns.rdataclass.IN, rdtype, wire, origin=org)
+    except Exception as exc:  # noqa: BLE001 — from_text raises a different type per rdata class
+        return f"{rtype} record value {value!r} is not valid {rtype} rdata: {exc}"
+    return None
