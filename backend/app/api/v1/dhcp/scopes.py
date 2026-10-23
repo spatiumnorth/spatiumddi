@@ -47,7 +47,6 @@ from app.services.tags import apply_tag_filter
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
-VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
 # Fields on ScopeUpdate an explicit ``null`` may CLEAR (#475). Every other
 # nullable column keeps its ``exclude_none`` behaviour — a stray null is dropped
@@ -121,22 +120,34 @@ def _normalize_sync_mode(v: str | None) -> str:
     value, which the old ``<select>`` couldn't render, so edits snapped back
     (#475). The UI now speaks the canonical vocabulary directly; these legacy
     values are still mapped in for backward-compatible API clients. Empty /
-    missing defaults to ``on_static_only`` (the model default).
+    missing defaults to ``on_lease`` (the model default).
     """
     if not v:  # None or ""
-        return "on_static_only"
+        return "on_lease"
     legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
     return legacy.get(v, v)
 
 
+_SCOPE_DDNS_MOVED = (
+    "DDNS is configured per subnet, not per scope: set it under IPAM -> the "
+    "subnet's DDNS settings (inherited from its block or IP space). A scope's "
+    "DDNS fields have no effect on Kea or on DNS (#2270)."
+)
+
+
 def _check_hostname_policy(v: str | None) -> str:
-    """The one vocabulary for a scope's DDNS hostname policy, on create and on
-    update (#1308). Blank means the model default, ``client``."""
-    if v in (None, ""):
+    """A scope's DDNS hostname policy is inert (#2270), so the only value
+    accepted is the model default, ``client`` (blank means the same). Any other
+    value is refused naming the field, rather than stored and ignored."""
+    if v in (None, "", "client"):
         return "client"
-    if v not in VALID_HOSTNAME_POLICIES:
-        raise ValueError(f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}")
-    return v
+    raise ValueError(f"ddns_hostname_policy has no effect on a scope. {_SCOPE_DDNS_MOVED}")
+
+
+def _check_scope_ddns_enabled(v: bool | None) -> bool:
+    if v:
+        raise ValueError(f"ddns_enabled has no effect on a scope. {_SCOPE_DDNS_MOVED}")
+    return False
 
 
 # Fields the scope write models accept under two names, as
@@ -301,7 +312,7 @@ class ScopeCreate(BaseModel):
     options: Any = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str | None = "client"
-    hostname_to_ipam_sync: str = "on_static_only"
+    hostname_to_ipam_sync: str = "on_lease"
     hostname_sync_mode: str | None = None
     # When False, this scope's dynamic-pool lease mirrors are excluded from the
     # IPAM↔DNS drift check (ephemeral leases don't read as "out of sync").
@@ -350,6 +361,11 @@ class ScopeCreate(BaseModel):
     def _h(cls, v: str | None) -> str | None:
         return _check_hostname_policy(v)
 
+    @field_validator("ddns_enabled")
+    @classmethod
+    def _ddns(cls, v: bool) -> bool:
+        return _check_scope_ddns_enabled(v)
+
     @field_validator("ra_interface")
     @classmethod
     def _ra_iface(cls, v: str) -> str:
@@ -369,6 +385,10 @@ class ScopeCreate(BaseModel):
 class ScopeUpdate(BaseModel):
     model_config = {"extra": "ignore"}
 
+    # #2479 — a scope does not move between groups here. Accepted so a body
+    # that names a DIFFERENT group is refused (422) instead of ignored (the
+    # old ``extra: ignore`` answered 200 and kept the stored group).
+    group_id: uuid.UUID | None = None
     name: str | None = None
     description: str | None = None
     # See ScopeCreate: ``enabled`` is the public name, ``is_active`` the
@@ -858,6 +878,12 @@ async def update_scope(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    if body.group_id is not None and body.group_id != scope.group_id:
+        raise HTTPException(
+            status_code=422,
+            detail="A scope cannot be moved to another DHCP server group; "
+            "delete it and create it in the target group",
+        )
     # ``exclude_unset`` (not ``exclude_none``) so an explicit null can clear a
     # nullable column (e.g. resetting min_lease_time / max_lease_time to empty),
     # while a field the client didn't send stays untouched (#475). But keep a
@@ -877,6 +903,7 @@ async def update_scope(
     # ``is_active`` with the stale ``enabled`` a GET supplied (#774).
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
+    changes.pop("group_id", None)  # #2479 — equal to the stored group (checked above)
     # #2499 — judge the MERGED lease triple (stored row under the patch), so a
     # PUT that only sets max_lease_time cannot break an existing scope.
     if {"lease_time", "min_lease_time", "max_lease_time"} & changes.keys():
@@ -900,21 +927,22 @@ async def update_scope(
             status_code=422,
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
-    # #1308 — the same vocabulary as create: the scope dialog offered
-    # ``ipam`` / ``generate``, which create refused with a 422 and this path
-    # stored. Only a CHANGED policy is checked, the way options are (#597,
-    # #1228): the dialog sends the stored policy back with every save, so one
-    # written before this check must not block an unrelated edit.
-    if (
-        "ddns_hostname_policy" in changes
-        and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
-    ):
-        try:
+    # #2270 — a scope's DDNS fields are inert (DDNS is subnet-level), so a
+    # CHANGE to either is refused with a 422 naming it. Only a change: the
+    # dialog of an older client sends the stored values back on every save, and
+    # a scope created before this check may hold ``ddns_enabled=true``.
+    try:
+        if "ddns_enabled" in changes and changes["ddns_enabled"] != scope.ddns_enabled:
+            _check_scope_ddns_enabled(changes["ddns_enabled"])
+        if (
+            "ddns_hostname_policy" in changes
+            and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
+        ):
             changes["ddns_hostname_policy"] = _check_hostname_policy(
                 changes["ddns_hostname_policy"]
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
         normalized = normalize_options(
             changes["options"], raw_codes=await group_raw_codes(db, scope.group_id)

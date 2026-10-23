@@ -81,6 +81,7 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     RetentionLockedError,
+    describe_exc,
     safe_filename,
 )
 
@@ -320,7 +321,7 @@ class S3Destination(BackupDestination):
                     **_lock_headers(config),
                 )
             except (ClientError, BotoCoreError) as exc:
-                raise BackupDestinationError(f"S3 put_object failed: {exc}") from exc
+                raise BackupDestinationError(f"S3 put_object failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 
@@ -357,7 +358,9 @@ class S3Destination(BackupDestination):
                             )
                         )
             except (ClientError, BotoCoreError) as exc:
-                raise BackupDestinationError(f"S3 list_objects_v2 failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"S3 list_objects_v2 failed: {describe_exc(exc)}"
+                ) from exc
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
@@ -377,7 +380,7 @@ class S3Destination(BackupDestination):
                 resp = client.get_object(Bucket=config["bucket"], Key=key)
                 return resp["Body"].read()
             except (ClientError, BotoCoreError) as exc:
-                raise BackupDestinationError(f"S3 get_object failed: {exc}") from exc
+                raise BackupDestinationError(f"S3 get_object failed: {describe_exc(exc)}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -422,7 +425,9 @@ class S3Destination(BackupDestination):
             try:
                 client.delete_object(Bucket=config["bucket"], Key=key)
             except (ClientError, BotoCoreError) as exc:
-                raise BackupDestinationError(f"S3 delete_object failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"S3 delete_object failed: {describe_exc(exc)}"
+                ) from exc
 
         await asyncio.to_thread(_do)
 
