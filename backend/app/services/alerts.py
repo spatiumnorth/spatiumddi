@@ -92,6 +92,10 @@ from app.services.upgrades.alerts import (
 )
 from app.services.wol_scheduler.verify import seen_since
 
+# Stamped into ``AlertEvent.last_observed_value["resolved_by"]`` by the
+# resolve endpoint (#2498); ``evaluate_all`` honours it.
+MANUAL_RESOLVED_BY = "manual"
+
 logger = structlog.get_logger(__name__)
 
 
@@ -3401,8 +3405,10 @@ async def _tailscale_token_subjects(
     from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
     from app.services.tailscale.client import is_auth_rejected  # noqa: PLC0415
 
-    ps = await db.get(PlatformSettings, 1)
-    if ps is None or not ps.integration_tailscale_enabled:
+    # The module is the integration's switch (#2196), not the derived
+    # ``PlatformSettings`` column — which a module turned on before the
+    # settings row existed never received.
+    if not await feature_modules.is_module_enabled(db, "integrations.tailscale"):
         return []
 
     cutoff = now + timedelta(days=threshold_days)
@@ -7538,9 +7544,41 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             match_ids = {sid for sid, _, _, _ in matches}
 
+            # #2498 — a manually resolved event for a subject that still
+            # matches stays resolved, like the conformity engine's. The
+            # suppression ends when the subject next stops matching (marked
+            # here), so a later re-match opens a fresh event.
+            manually_resolved = list(
+                (
+                    await db.execute(
+                        select(AlertEvent).where(
+                            AlertEvent.rule_id == rule.id,
+                            AlertEvent.resolved_at.is_not(None),
+                            AlertEvent.last_observed_value["resolved_by"].astext
+                            == MANUAL_RESOLVED_BY,
+                            AlertEvent.last_observed_value["manual_cleared"].astext.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            suppressed_ids: set[str] = set()
+            for mev in manually_resolved:
+                if mev.subject_id in match_ids:
+                    suppressed_ids.add(mev.subject_id)
+                else:
+                    # Reassign, not mutate: JSONB isn't change-tracked in place.
+                    mev.last_observed_value = {
+                        **(mev.last_observed_value or {}),
+                        "manual_cleared": True,
+                    }
+
             # Open new events for unseen matches; escalate existing ones.
             for subject_id, display, message, severity_override in matches:
                 existing = open_by_subject.get(subject_id)
+                if existing is None and subject_id in suppressed_ids:
+                    continue
                 if existing is not None:
                     # Subject is already open. For the *_expiring rule
                     # family the matcher recomputes a per-row severity

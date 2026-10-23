@@ -233,7 +233,7 @@ Editor roles grant the writes they always claimed to:
 | Surface | Gate |
 |---|---|
 | DNS zones (create, from template, edit, delete) | `write` / `delete` on `dns_zone` |
-| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`) |
+| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`; the import preview and commit, which answer with the zone's existing records, also take `read` on `dns_group`, `dns_zone` or `dns_record`, as the export does) |
 | DNS views and named ACLs | `write` / `delete` on `dns_group` |
 | Blocklist entries and exceptions | `write` / `delete` on `dns_blocklist` |
 | DHCP scopes, phone profiles, PXE profiles | `write` / `delete` on `dhcp_scope` |
