@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
+
 # Columns copied verbatim: split children take the parent's value; merge
 # takes the target's (and reports sources that disagree).
 CARRIED_COLUMNS: tuple[str, ...] = (
@@ -53,17 +55,7 @@ HARD_MERGE_COLUMNS: tuple[str, ...] = ("kind", "customer_id", "site_id")
 
 # Columns that identify a subnet as mirrored by an integration or imported.
 NOT_CARRIED_PROVENANCE: tuple[str, ...] = (
-    "kubernetes_cluster_id",
-    "docker_host_id",
-    "proxmox_node_id",
-    "tailscale_tenant_id",
-    "unifi_controller_id",
-    "cloud_endpoint_id",
-    "opnsense_router_id",
-    "netbird_instance_id",
-    "panos_firewall_id",
-    "fortinet_firewall_id",
-    "meraki_org_id",
+    *sorted(INTEGRATION_OWNERSHIP_FKS),
     "import_source",
 )
 

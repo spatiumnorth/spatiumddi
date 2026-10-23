@@ -266,6 +266,26 @@ describe("#1338 the DNS page", () => {
     expect(button(/^Zone$/).disabled).toBe(true);
   });
 
+  it("the n shortcut opens no Add Record for a Viewer (#2529)", async () => {
+    signInAs(VIEWER);
+    await openDns("zones");
+    await openZone();
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "n" }));
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("the n shortcut still opens Add Record for a record writer (#2529)", async () => {
+    signInAs([...VIEWER, ["write", "dns_record"]]);
+    await openDns("zones");
+    await openZone();
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "n" }));
+    });
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+  });
+
   it("offers a record writer the records, and still not the zone", async () => {
     signInAs([...VIEWER, ["write", "dns_record"]]);
     await openDns("zones");

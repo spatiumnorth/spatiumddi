@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 import structlog
 
 try:
+    import dns.name
     import dns.query
     import dns.rdata
     import dns.rdataclass
@@ -872,16 +873,22 @@ def _format_master(entry: str) -> str:
     return entry
 
 
-def _parses_as_rdata(rtype: str, wire: str) -> bool:
+def _parses_as_rdata(rtype: str, wire: str, origin: str | None = None) -> bool:
     """Whether dnspython can read ``wire`` as rdata of ``rtype``.
 
     Used to keep one unreadable sibling from failing a whole-RRset write. Any
     exception counts as "no" — ``from_text`` raises a different type per rdata
     class (SyntaxError, ValueError, dns.exception.*), and the only thing worth
-    knowing here is whether the value is usable.
+    knowing here is whether the value is usable. ``origin`` is the zone a
+    zone-file line is read in: relative names in the rdata are legal there.
     """
     try:
-        dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.from_text(rtype), wire)
+        dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.from_text(rtype),
+            wire,
+            origin=dns.name.from_text(origin) if origin else None,
+        )
     except Exception:  # noqa: BLE001 — see docstring: any failure means unusable
         return False
     return True
@@ -1982,10 +1989,22 @@ def _render_trust_anchors(anchors: Any) -> str:
 
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
+    #: Records the current render left out because their rdata does not parse
+    #: (#2510), one ``"<zone>: …"`` line each; surfaced via ``refused_zones``.
+    _skipped_records: set[str] | None = None
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
     def render(self, bundle: dict[str, Any]) -> None:
+        self._skipped_records = set()
+        try:
+            self._render(bundle)
+        finally:
+            # Reported as a partial apply by the sync loop (#2510); sorted so
+            # the report is the same whatever order views rendered in.
+            self._refused_zones = tuple(sorted(self._skipped_records or ()))
+
+    def _render(self, bundle: dict[str, Any]) -> None:
         new_dir = self.state_dir / "rendered.new"
         if new_dir.exists():
             shutil.rmtree(new_dir)
@@ -2586,6 +2605,28 @@ class Bind9Driver(DriverBase):
                 and len(value.split()) < 4
             ):
                 value = f"{rec['priority']} {rec['weight']} {rec['port']} {value}"
+            # One row dnspython cannot read makes named-checkzone refuse the
+            # whole zone, and #882 then quarantines the whole bundle (#2510).
+            # Leave that row out, name it in ``_skipped_records`` for the sync
+            # loop to report, and render the rest. Deterministic: the verdict
+            # depends only on the row, so the file (and ETag) cannot flap.
+            if not _parses_as_rdata(rtype, value, zone.get("name") or None):
+                owner = name_field
+                zname = (zone.get("name") or "").rstrip(".")
+                log.warning(
+                    "zone_record_unparseable_skipped",
+                    zone=zname,
+                    name=owner,
+                    type=rtype,
+                    value=value,
+                )
+                if self._skipped_records is None:
+                    self._skipped_records = set()
+                self._skipped_records.add(
+                    f"{zname}: record {owner} {rtype} {value!r} skipped, "
+                    "its rdata does not parse"
+                )
+                continue
             lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
         path.write_text("\n".join(lines) + "\n")
         return apex.notes + timer_notes
