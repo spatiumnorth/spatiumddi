@@ -24,6 +24,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
+from app.core.agent_wake import collect_wake
 from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
@@ -34,12 +35,14 @@ from app.core.dns_names import (
     validate_record_owner,
 )
 from app.core.permissions import (
+    effective_grants,
     is_effective_superadmin,
     require_any_resource_or_scoped,
     token_scope_allows,
     token_scoped_resource_ids,
     user_has_permission,
 )
+from app.models.address_set import AddressSet
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
@@ -67,6 +70,7 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.agent_wake_targets import dhcp_group_channels_for_subnets
 from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
@@ -92,6 +96,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
+from app.services.ipam.utilization import counts_toward_utilization
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -345,7 +350,7 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -985,6 +990,49 @@ async def _load_writable_set_ranges(
     """Resolve the caller's address-set-delegated writable ranges on this subnet
     (alias for :func:`app.services.ipam.address_set_gate.load_writable_set_ranges`)."""
     return await load_writable_set_ranges(db, user, subnet_id)
+
+
+async def _writable_subnet_ids(db: AsyncSession, user: Any) -> set[uuid.UUID] | None:
+    """Subnets on which the caller can write at least one address, or ``None``
+    when they hold type-level subnet write (every subnet).
+
+    Used by filter-driven bulk actions to narrow their row selection before a
+    cap is applied, so a caller whose write grants cover a few subnets or
+    address sets gets the rows they may change rather than a capped page of
+    rows the per-row check then skips. The per-row check
+    (``_user_can_write_ip``) still runs on every row; this only narrows.
+    """
+    if user_has_permission(user, "write", "subnet"):
+        return None
+    out: set[uuid.UUID] = set()
+    set_ids: set[uuid.UUID] = set()
+    any_set = False
+    for grant in effective_grants(user):
+        rtype = grant.get("resource_type")
+        rid = grant.get("resource_id")
+        if rtype in ("subnet", "*") and rid is not None:
+            try:
+                sid = uuid.UUID(str(rid))
+            except (ValueError, TypeError):
+                continue
+            if user_has_permission(user, "write", "subnet", sid):
+                out.add(sid)
+        if rtype in ("address_set", "*"):
+            if rid is None:
+                any_set = True
+            else:
+                try:
+                    set_ids.add(uuid.UUID(str(rid)))
+                except (ValueError, TypeError):
+                    continue
+    if any_set or set_ids:
+        stmt = select(AddressSet.id, AddressSet.subnet_id)
+        if not any_set:
+            stmt = stmt.where(AddressSet.id.in_(set_ids))
+        for set_id, sid in (await db.execute(stmt)).all():
+            if user_has_permission(user, "write", "address_set", set_id):
+                out.add(sid)
+    return out
 
 
 def _eui64_from_mac(net: ipaddress.IPv6Network, mac: str) -> ipaddress.IPv6Address | None:
@@ -1938,6 +1986,7 @@ async def _sync_dns_record(
     backfill_reverse_zone: bool = True,
     strict: bool = False,
     skip_own_alias: bool = False,
+    skip_create: frozenset[tuple[str, uuid.UUID]] = frozenset(),
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1971,6 +2020,10 @@ async def _sync_dns_record(
     the alias already serves the name, so refusing there would block the rest
     of the address's sync (a missing PTR) on every apply. A CNAME alias at
     the name is still refused.
+
+    ``skip_create`` holds ``(record_type, zone_id)`` keys whose record is NOT
+    to be newly written, however missing: the Sync DNS rows the operator
+    unticked (#2471). Records that already exist are still updated.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -2262,6 +2315,8 @@ async def _sync_dns_record(
                         ip.forward_zone_id = effective_zone_id
                     forward_published = True
                     continue
+                if (forward_rtype, desired_zone_id) in skip_create:
+                    continue  # #2471 — the operator unticked this record
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
                     name=ip.hostname,
@@ -2573,6 +2628,8 @@ async def _sync_dns_record(
             # #1867 — the operator wrote this PTR: adopt it, write no twin.
             ip.reverse_zone_id = rev_zone.id
             return True
+        if ("PTR", rev_zone.id) in skip_create:
+            return True  # #2471 — the operator unticked this record
         ptr_rec = DNSRecord(
             zone_id=rev_zone.id,
             name=ptr_name,
@@ -3606,7 +3663,9 @@ class IPAddressCreate(BaseModel):
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
-    dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    dns_zone_id: str | None = (
+        None  # explicit zone override; null falls back to subnet's effective DNS; "" = no DNS record
+    )
     # Issue #25 — split-horizon publishing. Additional zone UUIDs to
     # publish A/AAAA records into beyond the singular primary. Each
     # entry is a UUID stored as string (Pydantic accepts UUIDs as
@@ -3841,7 +3900,9 @@ class NextIPRequest(BaseModel):
     description: str = ""
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
-    dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    dns_zone_id: str | None = (
+        None  # explicit zone override; null falls back to subnet's effective DNS; "" = no DNS record
+    )
     # Issue #25 — split-horizon publishing. Additional zone UUIDs to publish
     # A/AAAA records into beyond the singular primary. Mirrors
     # ``IPAddressCreate.extra_zone_ids`` so next-IP allocation reaches parity
@@ -5418,6 +5479,9 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
 
     if auto_created:
         await _update_utilization(db, subnet.id)
+        # The block rollup sums subnet.allocated_ips in SQL: flush the new
+        # count first or it reads the row as inserted (0) (#2532).
+        await db.flush()
 
     await _update_block_utilization(db, subnet.block_id)
 
@@ -6080,6 +6144,9 @@ async def deprecate_stale_ips(
     even if an id slips through a stale client-side selection. Each row's
     status flips to ``deprecated`` and ``user_modified_at`` is stamped so a
     later discovery / integration sweep won't silently un-deprecate it.
+    Each row is also held to the caller's write grants (subnet-wide write
+    or a covering address set); rows outside them are returned in
+    ``skipped``.
     """
     from app.services.ipam.stale_ips import MAX_BULK_DEPRECATE, select_stale_ip_ids
 
@@ -6090,6 +6157,25 @@ async def deprecate_stale_ips(
     # A subnet-bound token deprecates rows in its own subnets only: the
     # filter is narrowed, and a hand-picked id outside them is skipped.
     scoped_subnets = _token_subnet_scope_uuids(current_user)
+    # Every row is held to the caller's write grants (subnet-wide, or an
+    # address set covering it). For the filter-driven path the selection is
+    # narrowed to subnets the caller can write in before the cap applies.
+    writable_subnets = await _writable_subnet_ids(db, current_user)
+    select_subnets: set[uuid.UUID] | None = scoped_subnets
+    if writable_subnets is not None:
+        select_subnets = (
+            writable_subnets if scoped_subnets is None else scoped_subnets & writable_subnets
+        )
+    set_gate_cache: dict[uuid.UUID, tuple[bool, WritableSetRanges]] = {}
+
+    async def _gate_for(sid: uuid.UUID) -> tuple[bool, WritableSetRanges]:
+        if sid not in set_gate_cache:
+            set_gate_cache[sid] = (
+                user_has_permission(current_user, "write", "subnet", sid),
+                await _load_writable_set_ranges(db, current_user, sid),
+            )
+        return set_gate_cache[sid]
+
     capped = False
     if body.all_matching:
         # Fetch one past the cap so "exactly at cap, no remainder" doesn't
@@ -6101,7 +6187,7 @@ async def deprecate_stale_ips(
             space_id=body.space_id,
             block_id=body.block_id,
             subnet_id=body.subnet_id,
-            subnet_ids=scoped_subnets,
+            subnet_ids=select_subnets,
             cap=MAX_BULK_DEPRECATE + 1,
         )
         capped = len(ids) > MAX_BULK_DEPRECATE
@@ -6123,6 +6209,12 @@ async def deprecate_stale_ips(
             skipped.append(ip.id)
             continue
         if scoped_subnets is not None and ip.subnet_id not in scoped_subnets:
+            skipped.append(ip.id)
+            continue
+        subnet_writable, set_ranges = await _gate_for(ip.subnet_id)
+        if not _user_can_write_ip(
+            current_user, int(ipaddress.ip_address(str(ip.address))), subnet_writable, set_ranges
+        ):
             skipped.append(ip.id)
             continue
         # Re-check staleness against the request's window so a row that came
@@ -6532,6 +6624,12 @@ async def update_subnet(
     if old_block_id != subnet.block_id:
         await _update_block_utilization(db, old_block_id)
         await _update_block_utilization(db, subnet.block_id)
+
+    # #2040 — the DHCP bundle reads this row (DNS servers + domain name for
+    # RA and the DHCPv6 domain search, VLAN + site for the E911 options), so
+    # wake every group serving a scope here. Stashed now, published by the
+    # router's ``wake_publishing`` after the commit below.
+    collect_wake(*await dhcp_group_channels_for_subnets(db, [subnet.id]))
 
     await db.commit()
     await db.refresh(subnet)
@@ -7497,6 +7595,12 @@ class DnsSyncPreviewResponse(BaseModel):
     stale: list[_DnsSyncStaleResp]
 
 
+class DnsSyncRecordKey(BaseModel):
+    ip_id: uuid.UUID
+    record_type: str
+    zone_id: uuid.UUID
+
+
 class DnsSyncCommitRequest(BaseModel):
     """Lists of IP IDs and DNS record IDs the user wants to act on.
     Anything omitted is left alone — we never auto-fix the whole report."""
@@ -7504,6 +7608,11 @@ class DnsSyncCommitRequest(BaseModel):
     create_for_ip_ids: list[uuid.UUID] = []
     update_record_ids: list[uuid.UUID] = []
     delete_stale_record_ids: list[uuid.UUID] = []
+    # #2471 — missing rows the operator unticked. An address is re-synced
+    # whole, so without this its A, extra-zone A and PTR were all written
+    # when any one of its rows was ticked. A listed record is not written;
+    # everything else behaves as before.
+    skip_records: list[DnsSyncRecordKey] = []
 
 
 class DnsSyncCommitResponse(BaseModel):
@@ -7599,6 +7708,9 @@ async def _apply_dns_sync(
     errors: list[str] = []
 
     ip_ids_to_sync: set[uuid.UUID] = set(body.create_for_ip_ids)
+    skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
+    for key in body.skip_records:
+        skip_by_ip.setdefault(key.ip_id, set()).add((key.record_type, key.zone_id))
     if body.update_record_ids:
         rec_res = await db.execute(
             select(DNSRecord.id, DNSRecord.ip_address_id).where(
@@ -7653,6 +7765,7 @@ async def _apply_dns_sync(
                         action="create",
                         strict=True,
                         skip_own_alias=True,
+                        skip_create=frozenset(skip_by_ip.get(ip.id, ())),
                     )
                     if collector is not None and len(collector) == ops_before:
                         continue
@@ -8440,8 +8553,14 @@ async def create_address(
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
-    if body.hostname:
+    # ``dns_zone_id: ""`` is the dialog's "None (no DNS record)" (#2466): the
+    # address is allocated with no forward zone, no A and no PTR. Absent / null
+    # still means "use the subnet's effective zone".
+    no_dns = body.dns_zone_id == ""
+    effective_zone = (
+        None if no_dns else (explicit_zone or await _resolve_effective_zone(db, subnet))
+    )
+    if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
@@ -8486,6 +8605,8 @@ async def create_address(
         created_by_user_id=current_user.id,
         **body.model_dump(exclude={"dns_zone_id", "force", "aliases"}),
     )
+    if no_dns:
+        ip.extra_zone_ids = []
     db.add(ip)
     await db.flush()
 
@@ -8495,9 +8616,10 @@ async def create_address(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
+    if not no_dns:
+        await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
-    if body.aliases:
+    if body.aliases and not no_dns:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     # #1628 — a ``static_dhcp`` row must own a real DHCPStaticAssignment or
@@ -8979,6 +9101,18 @@ async def update_address(
             await _clear_ip_dns_zone(db, ip, subnet)
         else:
             await _sync_dns_record(db, ip, subnet, action="delete")
+    elif (
+        subnet
+        and not dns_zone_explicit
+        and not extras_changed
+        and ip.forward_zone_id is None
+        and not (old["hostname"] != ip.hostname)
+    ):
+        # An address with no forward zone and an unchanged hostname has no DNS
+        # presence to keep in step — an untouched Save must not resolve the
+        # subnet's zone and publish the A / PTR an operator removed with "None"
+        # (#2466). A *changed* hostname still falls through to the sync below.
+        pass
     elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
@@ -10229,8 +10363,14 @@ async def allocate_next_ip(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
     )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
-    if body.hostname:
+    # ``dns_zone_id: ""`` is the dialog's "None (no DNS record)" (#2466): the
+    # address is allocated with no forward zone, no A and no PTR. Absent / null
+    # still means "use the subnet's effective zone".
+    no_dns = body.dns_zone_id == ""
+    effective_zone = (
+        None if no_dns else (explicit_zone or await _resolve_effective_zone(db, subnet))
+    )
+    if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
@@ -10308,7 +10448,7 @@ async def allocate_next_ip(
         tags=body.tags,
         role=body.role,
         reserved_until=body.reserved_until,
-        extra_zone_ids=body.extra_zone_ids,
+        extra_zone_ids=[] if no_dns else body.extra_zone_ids,
         decom_date=body.decom_date,
         created_by_user_id=current_user.id,
     )
@@ -10319,9 +10459,10 @@ async def allocate_next_ip(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
+    if not no_dns:
+        await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
-    if body.aliases:
+    if body.aliases and not no_dns:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     # #1628 — same server-side reservation sync as create_address.

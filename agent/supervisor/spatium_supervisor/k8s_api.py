@@ -24,6 +24,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 from collections.abc import Callable, Iterable
@@ -1774,6 +1775,108 @@ def sizing_memory_mib(state_dir: Path | None = None) -> int | None:
     except OSError as exc:
         log.warning("supervisor.sizing_memory_unpersisted", error=str(exc))
     return current
+
+
+# #2223 — the dns-bind9 memory limit, sized from node RAM. named holds every
+# zone and RPZ in memory, so a fixed limit that fits a lab is OOM-killed at
+# scale: ddi-pg's lab hit the old fixed 2Gi at about 2M records. A quarter of
+# the node, floor 2Gi (the old fixed value, so no node gets less than it did),
+# cap 8Gi (the rest of the node is the control plane's and the kernel's). The
+# request keeps the chart's old ratio, an eighth of the limit (256Mi at 2Gi).
+# Rounded to whole GiB so the value moves only when the node really changes
+# size: a MiB-resolution limit would change with every few MiB of MemTotal,
+# and every change is a rollout of named on every DNS node.
+_DNS_BIND9_MEM_SHARE = 0.25
+_DNS_BIND9_MEM_MIN_GIB = 2
+_DNS_BIND9_MEM_MAX_GIB = 8
+_DNS_BIND9_REQUEST_DIVISOR = 8
+
+
+def dns_bind9_memory(mem_total_mib: int | None) -> dict[str, str]:
+    """PURE: the ``dnsBind9.memory`` values (``limit`` / ``request``) for a
+    node with ``mem_total_mib`` of RAM; ``{}`` when the size is unknown, so
+    the chart's own default (2Gi / 256Mi) stands.
+
+    The chart applies these only where ``dnsBind9.resources`` does not set
+    the memory limit or request itself, so an operator's explicit override
+    always wins (``templates/dns-bind9.yaml``)."""
+    if not mem_total_mib or mem_total_mib <= 0:
+        return {}
+    quarter_gib = int(mem_total_mib * _DNS_BIND9_MEM_SHARE / 1024 + 0.5)
+    limit_gib = min(max(quarter_gib, _DNS_BIND9_MEM_MIN_GIB), _DNS_BIND9_MEM_MAX_GIB)
+    return {
+        "limit": f"{limit_gib}Gi",
+        "request": f"{limit_gib * 1024 // _DNS_BIND9_REQUEST_DIVISOR}Mi",
+    }
+
+
+_QUANTITY_UNITS = {
+    "": 1, "k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12,
+    "Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40,
+}  # fmt: skip
+
+
+def quantity_mib(value: Any) -> int | None:
+    """PURE: a Kubernetes memory quantity (``"16374512Ki"``) in MiB; ``None``
+    when it does not parse."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]*)", str(value or "").strip())
+    if not m or m.group(2) not in _QUANTITY_UNITS:
+        return None
+    return int(float(m.group(1)) * _QUANTITY_UNITS[m.group(2)]) >> 20
+
+
+_DNS_BIND9_ROLE_LABEL = "spatium.io/role-dns-bind9"
+
+
+def dns_sizing_memory_of(nodes_doc: Any) -> int | None:
+    """PURE — #2223: the RAM (MiB) to size dns-bind9 from, out of a
+    ``/api/v1/nodes`` list: the SMALLEST ``status.capacity.memory`` among the
+    nodes labelled for dns-bind9, or among every node when none is yet.
+
+    One value for the cluster, not this node's own: the role chart is ONE
+    HelmChart every member applies whole, and a value two nodes render
+    differently restarts named on every DNS node each time the other applies
+    (#1137). The DaemonSet also takes one limit for all its pods, so the
+    smallest node it runs on decides — a limit sized for a bigger node would
+    let named take a small one down. The kubelet reads the capacity once at
+    start, so a virtio balloon does not move it (#1585). ``None`` when no node
+    reports a capacity."""
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    labelled: list[int] = []
+    every: list[int] = []
+    for node in items or []:
+        node = node or {}
+        mib = quantity_mib(((node.get("status") or {}).get("capacity") or {}).get("memory"))
+        if mib is None or mib <= 0:
+            continue
+        every.append(mib)
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        if labels.get(_DNS_BIND9_ROLE_LABEL) == "true":
+            labelled.append(mib)
+    pool = labelled or every
+    return min(pool) if pool else None
+
+
+def dns_sizing_memory_mib(timeout: float = 5.0) -> tuple[int | None, str | None]:
+    """``(mib, error)``: :func:`dns_sizing_memory_of` over ``GET /api/v1/nodes``.
+
+    ``None`` with an error means unknown, never "unsized": the role apply then
+    writes nothing rather than dropping the sizing, which would put every DNS
+    node back on the chart's 2Gi default and restart named cluster-wide."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    mib = dns_sizing_memory_of(doc)
+    if mib is None:
+        return None, "no node reports a memory capacity"
+    return mib, None
 
 
 def apply_control_plane_overrides(
