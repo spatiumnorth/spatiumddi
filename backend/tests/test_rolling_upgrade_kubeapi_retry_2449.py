@@ -19,14 +19,19 @@ idempotent writes again, within a budget, for a transient kubeapi answer only.
   server's own error, as before.
 * A permission refusal, a sub-500 status, a non-kubeapi error, and a transient
   answer at a step that is not an idempotent write are not retried.
+* The helpers behind those writes keep the API server's whole answer in the
+  error (up to a bound only a pathological body reaches), so a failed run says
+  why: #2449's run lost the webhook's own reason to a 200-byte cut.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.services.appliance import k8s
 from app.services.upgrades import per_node
 
 # The shape spatiumddi#2449's node saw (truncated as the k8s helper truncates).
@@ -175,3 +180,67 @@ def test_kubeapi_transient_classification(error: str | None, transient: bool) ->
 def test_the_retry_steps_are_the_idempotent_writes() -> None:
     # The write steps that hold or release the node; never a read or a wait.
     assert per_node.KUBEAPI_RETRY_STEPS == frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})
+
+
+# ── idea 2: the helpers behind the retried writes keep the whole answer ─────
+#
+# #2449's run ended with the API server's answer cut at 200 bytes, just before
+# the admission webhook's own reason. The three helpers behind the retried
+# steps now keep the whole answer, up to a bound only a pathological body
+# reaches.
+
+_WEBHOOK_REASON = (
+    'failed calling webhook "mcluster.cnpg.io": failed to call webhook: Post '
+    '"https://cnpg-webhook-service.spatium.svc:443/mutate-postgresql-cnpg-io-v1-cluster'
+    '?timeout=10s": no endpoints available for service "cnpg-webhook-service"'
+)
+# A Status as the API server returns it for a failed admission call: compact
+# JSON, the message repeated under details.causes.
+WEBHOOK_STATUS_BODY = json.dumps(
+    {
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Failure",
+        "message": f"Internal error occurred: {_WEBHOOK_REASON}",
+        "reason": "InternalError",
+        "details": {"causes": [{"message": _WEBHOOK_REASON}]},
+        "code": 500,
+    },
+    separators=(",", ":"),
+).encode()
+
+_HELPERS = {
+    "cnpg_window": lambda: k8s.patch_cnpg_maintenance_window(
+        "spatium-control-spatiumddi-postgresql", in_progress=True, namespace="spatium"
+    ),
+    "cordon": lambda: k8s.cordon_node("ddipg-member-3"),
+    "uncordon": lambda: k8s.uncordon_node("ddipg-member-3"),
+}
+
+
+def _kubeapi_answers(monkeypatch: pytest.MonkeyPatch, status: int, body: bytes) -> None:
+    monkeypatch.setattr(k8s, "get_config", MagicMock)
+    monkeypatch.setattr(k8s, "_request", lambda *a, **k: (status, body))
+
+
+@pytest.mark.parametrize("helper", sorted(_HELPERS))
+def test_the_helper_keeps_the_api_servers_whole_answer(
+    helper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert len(WEBHOOK_STATUS_BODY) > 200  # the reason sits past the old cut
+    _kubeapi_answers(monkeypatch, 500, WEBHOOK_STATUS_BODY)
+    ok, err = _HELPERS[helper]()
+    assert ok is False
+    assert err == f"kubeapi status 500: {WEBHOOK_STATUS_BODY!r}"
+    assert err is not None and "no endpoints available for service" in err
+    assert per_node._kubeapi_transient(err) is True  # the retry still classifies it
+
+
+@pytest.mark.parametrize("helper", sorted(_HELPERS))
+def test_a_pathological_body_is_still_bounded(helper: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _kubeapi_answers(monkeypatch, 502, b"x" * 100_000)
+    ok, err = _HELPERS[helper]()
+    assert ok is False
+    assert err is not None
+    assert err.count("x") == k8s.KUBEAPI_ERROR_BODY_MAX

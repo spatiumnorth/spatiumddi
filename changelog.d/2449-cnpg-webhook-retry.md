@@ -17,4 +17,7 @@
   and uncordon, and only a kubeapi helper's own answer: a permission
   refusal, a sub-500 status, and a non-kubeapi error still fail at
   once, and an answer that never clears fails the step with the
-  server's own error once the budget is spent.
+  server's own error once the budget is spent. That error is no
+  longer cut at 200 bytes: the helpers behind those three writes keep
+  the API server's whole answer (up to 4 KiB), so a run that still
+  fails names the webhook's own reason.
