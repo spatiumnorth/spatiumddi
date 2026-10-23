@@ -6,10 +6,16 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from app.drivers.dns._txt import quote_txt
 from app.models.dns import DNSRecord
 from app.services.dns.cname_conflict import NameRow, refused_by_cname_rule
 from app.services.dns_io.parser import ParsedRecord
 from app.services.dns_io.spreadsheet import managed_reason
+from app.services.technitium.rdata import svcb_canonical
+
+# Types whose whole value ends in a domain name (SRV / MX: the priority,
+# weight and port live in their own columns, so the value is the target).
+_NAME_VALUED_TYPES = frozenset({"CNAME", "DNAME", "NS", "PTR", "MX", "SRV"})
 
 
 @dataclass
@@ -41,8 +47,41 @@ class ZoneDiff:
     skipped: list[str] = field(default_factory=list)
 
 
-def _record_key(name: str, rtype: str, value: str) -> tuple[str, str, str]:
-    return (name.lower(), rtype.upper(), value)
+def _abs_name(v: str, zone: str) -> str:
+    """``v`` as a lower-case absolute name. A zone file reads a name without
+    a trailing dot relative to the zone origin, and ``@`` is the origin."""
+    v = v.strip().lower()
+    if v in ("", "@"):
+        return zone
+    return v if v.endswith(".") else f"{v}.{zone}"
+
+
+def _canonical_value(rtype: str, value: str, zone: str | None) -> str:
+    """The one comparison form of a record value (#2187).
+
+    The export writes a stored value as it is, and the parser reads the file
+    back with every name absolute, so ``mail`` (relative, as the record API
+    stores it), ``mail.example.com.`` and ``MAIL.example.com`` are one name;
+    a TXT value is the same record bare or quoted. With no ``zone`` the value
+    compares as written.
+    """
+    if zone is None:
+        return value
+    if rtype == "TXT":
+        return quote_txt(value or "")
+    if rtype in _NAME_VALUED_TYPES:
+        return _abs_name(value, zone)
+    if rtype == "NAPTR":
+        head, sep, replacement = (value or "").strip().rpartition(" ")
+        return f"{head.lower()} {_abs_name(replacement, zone)}" if sep else value
+    if rtype in ("SVCB", "HTTPS"):
+        return svcb_canonical((value or "").strip(), zone)
+    return value
+
+
+def _record_key(name: str, rtype: str, value: str, zone: str | None = None) -> tuple[str, str, str]:
+    rtype = rtype.upper()
+    return (name.lower(), rtype, _canonical_value(rtype, value, zone))
 
 
 def _label(name: str, rtype: str, value: str) -> str:
@@ -63,10 +102,15 @@ def diff_records(
     view_id: uuid.UUID | None = None,
     view_names: dict[uuid.UUID, str] | None = None,
     replace: bool = False,
+    zone_name: str | None = None,
 ) -> ZoneDiff:
     """Compare ``parsed`` records against ``existing`` DB rows.
 
     Identity is (name, record_type, value) within the import's view scope.
+    With ``zone_name`` the value is compared in its canonical form (#2187):
+    names absolute against the zone, case folded, TXT quoted - so a
+    relative target the record API stored matches the absolute one the
+    parser reads back from our own export.
     When that key matches but TTL or priority/weight/port differ, the change
     becomes an ``update``.
 
@@ -108,6 +152,7 @@ def diff_records(
     explicit higher one, to a value the file never stated for it.
     """
     names = view_names or {}
+    zone = zone_name.lower().rstrip(".") + "." if zone_name else None
     existing_list = list(existing)
     parsed_list = list(parsed)
     # Every row per key: legacy twins (#1230) share a key, and a dict keeping
@@ -117,7 +162,7 @@ def diff_records(
     in_views: dict[tuple[str, str, str], list[DNSRecord]] = {}
     out_of_scope: list[DNSRecord] = []
     for r in existing_list:
-        key = _record_key(r.name, r.record_type, r.value)
+        key = _record_key(r.name, r.record_type, r.value, zone)
         if r.view_id == view_id:
             in_scope.setdefault(key, []).append(r)
             continue
@@ -137,7 +182,7 @@ def diff_records(
     # shared row serves the view too, so it counts towards a view's RRset.
     rrset_min: dict[tuple[str, str], int] = {}
     for p in parsed_list:
-        key = _record_key(p.name, p.record_type, p.value)
+        key = _record_key(p.name, p.record_type, p.value, zone)
         for row in in_scope.get(key) or shared.get(key) or []:
             eff = _effective(row)
             if eff is None:
@@ -173,7 +218,7 @@ def diff_records(
     seen_keys: set[tuple[str, str, str]] = set()
 
     for p in parsed_list:
-        key = _record_key(p.name, p.record_type, p.value)
+        key = _record_key(p.name, p.record_type, p.value, zone)
         if key in seen_keys:
             continue
         seen_keys.add(key)

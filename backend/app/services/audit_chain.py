@@ -269,14 +269,19 @@ class ChainVerifyResult:
     ok: bool
     rows_checked: int
     breaks: list[ChainBreak]
-    # How far the walk got (#2286, #2297): the highest ``seq`` examined and
-    # its ``row_hash`` (None when no row was read), and whether the walk
-    # reached the end of the table. ``ok`` with ``complete=False`` means
-    # "clean as far as ``last_seq``" and nothing more, which is how a
-    # ``max_rows``-capped check has to read.
+    # How far the walk got (#2286, #2297): the range actually walked
+    # (``first_seq`` None when no row was read), the highest ``seq`` examined
+    # and its ``row_hash``, and whether rows outside that range exist.
+    # ``ok`` with ``partial=True`` means "clean within the walked range"
+    # and nothing more, so a caller never reads a window as the whole log.
+    first_seq: int | None = None
     last_seq: int | None = None
     last_hash: str | None = None
-    complete: bool = True
+    partial: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not self.partial
 
 
 #: Rows fetched per keyset page. Memory is O(chunk), not O(table).
@@ -319,6 +324,7 @@ async def verify_chain(
     start_after: tuple[int, str] | None = None,
     chunk_size: int = VERIFY_CHUNK_SIZE,
     on_chunk: ChunkCallback | None = None,
+    newest: bool = False,
 ) -> ChainVerifyResult:
     """Walk the audit_log in seq order and check each row's hash.
 
@@ -342,8 +348,36 @@ async def verify_chain(
     ``on_chunk`` runs after each page so a caller can checkpoint progress.
     Any database error propagates; a walk that did not finish is never
     returned as a result.
+
+    ``max_rows`` caps the walk. By default it covers the OLDEST rows; with
+    ``newest=True`` it covers the NEWEST ``max_rows`` rows, anchored on the
+    ``row_hash`` of the row just before the window (#2297) so the window's
+    first ``prev_hash`` is still checked. Recent rows are where tampering
+    matters, so the Audit page badge uses the newest window.
     """
     chunk_size = max(1, chunk_size)
+    window_anchored = False
+    if newest and max_rows is not None and start_after is None:
+        # First row of the newest ``max_rows`` window, then the row before
+        # it as the anchor; the rest is an ordinary keyset walk from there.
+        first_in_window = (
+            await db.execute(
+                select(AuditLog.seq).order_by(AuditLog.seq.desc()).offset(max_rows - 1).limit(1)
+            )
+        ).scalar()
+        if first_in_window is not None:
+            pred = (
+                await db.execute(
+                    select(AuditLog.seq, AuditLog.row_hash)
+                    .where(AuditLog.seq < first_in_window)
+                    .order_by(AuditLog.seq.desc())
+                    .limit(1)
+                )
+            ).first()
+            if pred is not None:
+                start_after = (pred.seq, pred.row_hash)
+                window_anchored = True
+        max_rows = None
     breaks: list[ChainBreak] = []
     expected_prev: str | None = None
     last_seq = 0
@@ -352,6 +386,7 @@ async def verify_chain(
     rows_checked = 0
     last_hash: str | None = expected_prev if start_after is not None else None
     seen_seq: int | None = start_after[0] if start_after is not None else None
+    first_seq: int | None = None
     complete = False
 
     while True:
@@ -371,6 +406,8 @@ async def verify_chain(
         ).all()
         for row in page:
             rows_checked += 1
+            if first_seq is None:
+                first_seq = row.seq
             if row.prev_hash != expected_prev:
                 breaks.append(
                     ChainBreak(
@@ -418,9 +455,10 @@ async def verify_chain(
         ok=not breaks,
         rows_checked=rows_checked,
         breaks=breaks,
+        first_seq=first_seq,
         last_seq=seen_seq,
         last_hash=last_hash,
-        complete=complete,
+        partial=window_anchored or not complete,
     )
 
 

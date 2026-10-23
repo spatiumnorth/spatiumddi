@@ -49,6 +49,8 @@ from app.services.integration_ownership import (
     owning_integration,
     subnet_has_surviving_addresses,
 )
+from app.services.ipam.utilization import counts_toward_utilization
+from app.services.router_naming import pick_unique_router_name
 from app.services.unifi.client import (
     UnifiClient,
     UnifiClientConfig,
@@ -128,6 +130,9 @@ class ReconcileSummary:
     vlans_updated: int = 0
     vlans_deleted: int = 0
     routers_created: int = 0
+    # The controller's Router name — differs from the controller name when
+    # an operator Router already held that name (#2140).
+    router_name: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -258,7 +263,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -420,8 +425,26 @@ async def _apply_router_and_vlans(
         f" ({controller.controller_version})" if controller.controller_version else ""
     )
     if router is None:
+        # Ownership is ``unifi_controller_id`` only: never adopt an
+        # operator Router that merely shares the name — the VLAN pass below
+        # renames and deletes VLANs on the Router it owns (#2140).
+        #
+        # Check-then-insert can still race a concurrent pass that picks the
+        # same free name. That is left to fail on ``uq_router_name``, not
+        # retried under a new name: ``unifi_controller_id`` is not unique,
+        # so when the racer is a second pass for THIS controller (beat sweep
+        # vs Sync Now) a retry would give one controller two Routers. The
+        # task records the crash and the next pass finds or names the Router.
+        router_name = await pick_unique_router_name(db, desired_router_name, tag="UniFi")
+        if router_name != desired_router_name:
+            logger.info(
+                "unifi_router_name_disambiguated",
+                controller=str(controller.id),
+                wanted=desired_router_name,
+                chosen=router_name,
+            )
         router = Router(
-            name=_pick_unique_router_name(db, desired_router_name),
+            name=router_name,
             description=desired_description,
             vendor="Ubiquiti",
             model="UniFi Network Controller",
@@ -433,7 +456,9 @@ async def _apply_router_and_vlans(
         summary.routers_created += 1
     else:
         # Refresh the pieces that can drift across syncs. Leave
-        # ``location`` / ``notes`` alone — those are operator fields
+        # ``name`` alone — it is chosen once at create (possibly
+        # disambiguated, #2140) and an operator may have renamed it — and
+        # ``location`` / ``notes`` — those are operator fields
         # the integration shouldn't clobber.
         if router.description != desired_description:
             router.description = desired_description
@@ -443,6 +468,7 @@ async def _apply_router_and_vlans(
             router.model = "UniFi Network Controller"
         if router.management_ip != desired_management_ip:
             router.management_ip = desired_management_ip
+    summary.router_name = router.name
 
     # Compute the desired VLAN set. Tag → friendly name, picking the
     # last-seen name when two networks share a tag (rare; unique
@@ -494,22 +520,6 @@ async def _apply_router_and_vlans(
                 summary.vlans_updated += 1
 
     return by_tag
-
-
-def _pick_unique_router_name(db: AsyncSession, base: str) -> str:
-    """Router.name has a ``unique`` constraint. If the controller's
-    name collides with an existing operator-managed Router, fall back
-    to a suffixed form so the integration never 500s on an idempotent
-    sync. Synchronous lookup is fine — the caller is already inside
-    an async session and we only hit this once per pass.
-
-    ``db`` is the async session; we use ``run_sync`` only as a marker
-    here — actually we just return ``base`` since the caller catches
-    the unique violation on flush. Keep it simple: prefer the base
-    name and let Postgres yell if there's a real collision (operator
-    is then expected to rename one or the other).
-    """
-    return base
 
 
 def _unique_vlan_name(
@@ -1127,6 +1137,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     "deleted": summary.vlans_deleted,
                 },
                 "routers_created": summary.routers_created,
+                "router_name": summary.router_name,
                 "sites_skipped": summary.sites_skipped,
             },
         )
