@@ -2542,7 +2542,7 @@ async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
     from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
-    from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
     if not name:
@@ -2588,17 +2588,11 @@ async def _preview_create_dns_zone(
         if refusal is not None:
             return PreviewResult(ok=False, detail=refusal)
 
-    existing = (
-        await db.execute(
-            select(DNSZone).where(
-                DNSZone.group_id == grp.id,
-                DNSZone.view_id.is_(None),
-                DNSZone.name == name,
-                DNSZone.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
             detail=f"A zone named {name!r} already exists in group {grp.name!r}.",
@@ -2632,6 +2626,7 @@ async def _apply_create_dns_zone(
     from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_zone", ...) write gate.
@@ -2663,6 +2658,15 @@ async def _apply_create_dns_zone(
         refusal = await sign_refusal(db, grp.id)
         if refusal is not None:
             raise ValueError(refusal)
+
+    # #2652 — the REST create's checks, re-run at apply. The unique
+    # constraint cannot catch a twin when view_id is NULL.
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            raise ValueError(f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
+        raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
 
     zone = DNSZone(
         group_id=grp.id,
