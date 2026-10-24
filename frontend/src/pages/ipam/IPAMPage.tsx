@@ -91,7 +91,11 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -4301,9 +4305,13 @@ function SyncMenu({
   hasDhcp,
   hasDns,
   dnsGate,
+  dhcpGate,
 }: {
   // #2571 — props spread onto the DNS item when the caller may not sync it.
   dnsGate?: { disabled?: boolean; title?: string };
+  // #2699 — DHCP and All run `POST /dhcp/servers/{id}/sync-leases`, a
+  // superadmin route whatever the caller's grants.
+  dhcpGate?: { disabled?: boolean; title?: string };
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
@@ -4334,6 +4342,7 @@ function SyncMenu({
                 label: "DHCP",
                 icon: Server,
                 onSelect: onSyncDhcp,
+                ...dhcpGate,
               },
               // "All" is DHCP + the DNS drift: with DNS off it is just DHCP.
               ...(hasDns
@@ -4344,6 +4353,7 @@ function SyncMenu({
                       icon: RefreshCw,
                       separatorBefore: true,
                       onSelect: onSyncAll,
+                      ...dhcpGate,
                     },
                   ]
                 : []),
@@ -5048,6 +5058,8 @@ export function SubnetDetail({
   const canDnsSync =
     IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
   const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
+  // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
+  const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
   // Bulk delete and Clean Orphans are deletes: the router gate wants
   // ``delete``, the handler write on the row's subnet or address set.
   const canDeleteIpam = canDeleteInIpam(
@@ -5726,6 +5738,7 @@ export function SubnetDetail({
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
               hasDns={dnsOn}
               dnsGate={dnsSyncGate}
+              dhcpGate={dhcpSyncGate}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -8926,7 +8939,9 @@ function useDhcpSync(subnetId: string, enabled: boolean) {
             const next = new Map(prev);
             next.set(serverId, {
               status: "error",
-              error: err?.message ?? String(err),
+              // The server's reason ("Superadmin required"), never the
+              // transport's "Request failed with status code 403" (#2699).
+              error: formatApiError(err, err?.message ?? String(err)),
             });
             return next;
           });
@@ -9069,7 +9084,7 @@ function CounterRow({
   );
 }
 
-function DhcpSyncModal({
+export function DhcpSyncModal({
   subnetId,
   onClose,
 }: {
