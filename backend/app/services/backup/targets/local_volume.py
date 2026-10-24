@@ -56,6 +56,8 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
+    read_capped,
     safe_filename,
 )
 
@@ -227,7 +229,9 @@ class LocalVolumeDestination(BackupDestination):
                 f"could not list archives at {config['path']}: {exc}"
             ) from exc
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
 
         def _do() -> bytes:
@@ -243,7 +247,13 @@ class LocalVolumeDestination(BackupDestination):
                 # multi-node appliance (#1838, services.backup.node_local);
                 # the driver has no database to tell one node from three.
                 raise ArchiveNotFoundError(f"archive {safe!r} not found at {root}")
-            return target.read_bytes()
+            # The size is known before a byte is read, so an archive past
+            # the cap is refused without reading it.
+            check_size(safe, target.stat().st_size, max_bytes)
+            with target.open("rb") as fh:
+                # Capped read as well: the file can grow between the stat
+                # and the read.
+                return read_capped(fh.read, filename=safe, max_bytes=max_bytes)
 
         try:
             return await asyncio.to_thread(_do)

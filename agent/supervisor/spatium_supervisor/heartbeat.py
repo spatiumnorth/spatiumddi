@@ -1375,6 +1375,11 @@ def heartbeat_once(
         # sized from this node's RAM (k8s_api.control_plane_resources) — the
         # chart's BYO-cluster defaults gave way before the VM did on the
         # appliance, and a kubectl patch never survived a k3s restart.
+        # #2240 — and the api / Postgres CPU limits, sized from this node's
+        # CPU count (none when it is unknown: the chart's stand). An
+        # appliance upgrading into a new sizing takes one CNPG rolling
+        # restart (and an api / worker rollout) on the first heartbeat that
+        # writes it; the #1005 guard keeps every later heartbeat quiet.
         #
         # #1313 — CNPG's instance count is the one the patch above left on
         # the Cluster, not cp_size. While #1059's hold keeps the Cluster at
@@ -1404,6 +1409,7 @@ def heartbeat_once(
                 str(ml_vip),
                 web_ui_allowed_cidrs=list(web_ui_cidrs),
                 mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir),
+                cpu_count=k8s_api.node_cpu_count(),
                 cnpg_instances=cnpg_instances,
             )
             if cp_changed:

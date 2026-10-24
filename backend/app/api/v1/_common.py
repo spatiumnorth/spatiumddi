@@ -86,3 +86,35 @@ def add_trigger_audit(
             new_value=new_value,
         )
     )
+
+
+class WinRMSettings(BaseModel):
+    """The non-secret WinRM connection settings stored for a Windows DNS or
+    Windows DHCP server, as the next WinRM call will use them.
+
+    Returned so an edit dialog can show — and an untouched save keep — what is
+    stored. The username and password are never returned.
+    """
+
+    winrm_port: int
+    transport: str = Field(description="ntlm | credssp | basic")
+    use_tls: bool
+    verify_tls: bool
+
+
+def winrm_settings_from_blob(credentials_encrypted: bytes | None) -> WinRMSettings | None:
+    """Echo the stored WinRM settings, or None when nothing readable is stored.
+
+    Best-effort: an undecryptable blob (key rotation, a restore without
+    rewrap) yields None rather than failing the listing that carries it.
+    """
+    if not credentials_encrypted:
+        return None
+    from app.core.crypto import decrypt_dict  # noqa: PLC0415
+    from app.drivers._winrm import effective_winrm_settings  # noqa: PLC0415
+
+    try:
+        creds = decrypt_dict(credentials_encrypted)
+    except Exception:  # noqa: BLE001 — never break the listing on a bad blob
+        return None
+    return WinRMSettings(**effective_winrm_settings(creds))

@@ -5,7 +5,17 @@ Two complements to the per-account lockout (#71):
 * ``login_rate_limited`` — a per-source-IP attempt budget on
   ``/auth/login`` + ``/auth/login/mfa`` (#4). Account lockout needs a
   *valid username* to engage, so an attacker spraying usernames gets one
-  free guess each before lockout triggers; an IP budget caps that.
+  free guess each before lockout triggers; an IP budget caps that. The
+  budget is keyed by ``login_throttle_key``: an IPv4 address as itself, an
+  IPv4-mapped IPv6 address as its IPv4 address, and any other IPv6 address
+  as its /64, since one host is routinely handed a whole /64 and could
+  otherwise take a fresh budget from every address in it.
+* ``claim_login_attempt`` / ``refund_login_attempt`` — failed-password
+  ceilings on ``/auth/login`` that no choice of source address escapes: one
+  per submitted username (lower-cased, counted whether or not the account
+  exists, so a refusal says nothing about which names are real), and one
+  across the whole install. Modelled on the pairing claim: spent before the
+  credential is checked, refunded on a right one.
 * ``mfa_challenge_consume`` — single-use consumption of an MFA challenge
   ``jti`` so a captured (challenge + TOTP) pair can't be replayed inside
   the 5-minute token TTL (#7).
@@ -52,6 +62,9 @@ protection; behind it sits an endpoint with no authentication at all.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -86,6 +99,12 @@ _STEPUP_FAIL_WINDOW_SECONDS = 15 * 60
 # for the legitimate caller and tight for anything enumerating a VLAN.
 _E911_SELF_RL_MAX = 10
 _E911_SELF_RL_WINDOW_SECONDS = 300
+
+# Failed-password ceilings on /auth/login: per submitted username and across
+# the install, over one fixed window. The counts themselves are settings
+# (``login_fail_max_per_username`` / ``login_fail_max_global``).
+LOGIN_FAIL_WINDOW_SECONDS = 15 * 60
+_LOGIN_FAIL_GLOBAL_KEY = "login_fail:global"
 
 # Supervisor registration (#1356). The endpoint is unauthenticated by design:
 # a new appliance proves itself with an 8-digit pairing code (~26.6 bits),
@@ -162,13 +181,32 @@ async def incr_with_window(r: Any, key: str, window_seconds: int) -> int:
     return int(await r.eval(_INCR_WINDOW_LUA, 1, key, window_seconds))
 
 
+def login_throttle_key(ip: str) -> str:
+    """The unit the per-source login budget counts against.
+
+    IPv4: the address. IPv4-mapped IPv6 (``::ffff:a.b.c.d``): the IPv4
+    address, so a dual-stack listener does not give one client two budgets.
+    Other IPv6: the /64 it sits in — SLAAC and privacy addressing hand a
+    single host a whole /64, so per-/128 keying gave it ~2^64 budgets. A
+    value that is not an address is used as-is."""
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.IPv6Network((addr, 64), strict=False))
+    return str(addr)
+
+
 async def login_rate_limited(ip: str | None) -> bool:
-    """Increment the per-IP login counter and return True once it exceeds
-    the window budget. Fails open (False) when ``ip`` is unknown or Redis
-    is unavailable."""
+    """Increment the per-source login counter and return True once it
+    exceeds the window budget. The source is ``login_throttle_key(ip)``.
+    Fails open (False) when ``ip`` is unknown or Redis is unavailable."""
     if not ip:
         return False
-    key = f"login_rl:{ip}"
+    key = f"login_rl:{login_throttle_key(ip)}"
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
@@ -179,6 +217,136 @@ async def login_rate_limited(ip: str | None) -> bool:
     except Exception as exc:  # noqa: BLE001 — throttle must never break login
         logger.warning("login_rate_limit_redis_unavailable", error=str(exc))
         return False
+
+
+# Spend one sign-in attempt from the username and install-wide budgets, in
+# one script (see ``_CLAIM_LUA`` for the shape). KEYS = {username, global};
+# ARGV = {window, username max, global max}, where a max of 0 or less turns
+# that ceiling off and its key is never touched. A username already over its
+# own budget is not charged to the install-wide one, so hammering one name
+# cannot spend everyone's budget on its own; a request the install-wide
+# budget refuses gives the username its attempt back.
+# Returns {allowed, username_charged, global_charged, retry_after}.
+_LOGIN_CLAIM_LUA = """
+local function bump(key)
+  local n = redis.call('INCR', key)
+  if redis.call('TTL', key) < 0 then
+    redis.call('EXPIRE', key, ARGV[1])
+  end
+  return n
+end
+local mu = tonumber(ARGV[2])
+local mg = tonumber(ARGV[3])
+local uc = 0
+if mu > 0 then
+  if bump(KEYS[1]) > mu then
+    return {0, 0, 0, redis.call('TTL', KEYS[1])}
+  end
+  uc = 1
+end
+if mg > 0 then
+  if bump(KEYS[2]) > mg then
+    if uc == 1 then
+      redis.call('DECR', KEYS[1])
+    end
+    return {0, 0, 0, redis.call('TTL', KEYS[2])}
+  end
+  return {1, uc, 1, 0}
+end
+return {1, uc, 0, 0}
+"""
+
+
+@dataclass(frozen=True)
+class LoginClaim:
+    """The outcome of ``claim_login_attempt``. ``allowed`` False carries the
+    seconds until the refusing window ends; the ``*_charged`` flags say what
+    ``refund_login_attempt`` has to give back."""
+
+    allowed: bool
+    retry_after: int = 0
+    username_charged: bool = False
+    global_charged: bool = False
+
+
+_LOGIN_CLAIM_OPEN = LoginClaim(allowed=True)
+
+
+def _login_fail_keys(username: str) -> tuple[str, str]:
+    # Lower-cased so ``Admin`` and ``admin`` share a budget, and hashed so the
+    # key length is bounded whatever was submitted.
+    digest = hashlib.sha256(username.lower().encode("utf-8")).hexdigest()[:32]
+    return f"login_fail:user:{digest}", _LOGIN_FAIL_GLOBAL_KEY
+
+
+async def claim_login_attempt(username: str) -> LoginClaim:
+    """Spend one ``/auth/login`` attempt from the per-username and the
+    install-wide failure budgets, before the credential is checked, so
+    concurrent guesses cannot all read an under-budget count. The caller
+    gives it back with ``refund_login_attempt`` when the password was right,
+    so only failures stay counted.
+
+    The username budget is keyed by the name as submitted (lower-cased),
+    existing or not: a refusal is the same for a real account and an
+    invented one.
+
+    Fails OPEN, like the per-source budget: with Redis unreachable every
+    attempt is allowed and nothing is charged, leaving account lockout and
+    the second factor as the bounds."""
+    max_user = settings.login_fail_max_per_username
+    max_global = settings.login_fail_max_global
+    if max_user <= 0 and max_global <= 0:
+        return _LOGIN_CLAIM_OPEN
+    user_key, global_key = _login_fail_keys(username)
+    try:
+        r: Any = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            allowed, user_charged, global_charged, ttl = await r.eval(
+                _LOGIN_CLAIM_LUA,
+                2,
+                user_key,
+                global_key,
+                LOGIN_FAIL_WINDOW_SECONDS,
+                max_user,
+                max_global,
+            )
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — throttle must never break login
+        logger.warning("login_fail_ceiling_redis_unavailable", error=str(exc))
+        return _LOGIN_CLAIM_OPEN
+    if int(allowed):
+        return LoginClaim(
+            allowed=True,
+            username_charged=bool(int(user_charged)),
+            global_charged=bool(int(global_charged)),
+        )
+    ttl = int(ttl)
+    # Too long a Retry-After only delays a retry; too short sends the client
+    # back while it is still refused.
+    return LoginClaim(allowed=False, retry_after=ttl if ttl > 0 else LOGIN_FAIL_WINDOW_SECONDS)
+
+
+async def refund_login_attempt(username: str, claim: LoginClaim) -> None:
+    """Give back what ``claim_login_attempt`` charged for an attempt whose
+    password was right. Best-effort: a lost refund costs one attempt."""
+    user_key, global_key = _login_fail_keys(username)
+    keys = [
+        k
+        for k, charged in ((user_key, claim.username_charged), (global_key, claim.global_charged))
+        if charged
+    ]
+    if not keys:
+        return
+    try:
+        r: Any = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            for key in keys:
+                await r.eval(_REFUND_LUA, 1, key)
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — a lost refund only costs one attempt
+        logger.warning("login_fail_ceiling_redis_unavailable", error=str(exc))
 
 
 async def e911_self_query_rate_limited(ip: str | None) -> bool:

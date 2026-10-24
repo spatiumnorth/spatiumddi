@@ -660,6 +660,7 @@ backend/alembic/versions/e4a7c1f08b9d_firewall_policy_schema.py:drop_table:144
 backend/alembic/versions/e4a7f10b2c39_agent_last_seen_ip.py:drop_column:41
 backend/alembic/versions/e4a7f10b2c39_agent_last_seen_ip.py:drop_column:42
 backend/alembic/versions/e4b8073af215_wol_run_target_verify_evidence.py:drop_column:53
+backend/alembic/versions/e4b8c27d91f3_dns_server_zone_resync_seq.py:drop_column:32
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:321
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:346
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:453
@@ -724,6 +725,7 @@ backend/alembic/versions/e7a3c0d519f4_rogue_dhcp_detection.py:drop_table:121
 backend/alembic/versions/e7a3c0d519f4_rogue_dhcp_detection.py:drop_table:124
 backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:82
 backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:84
+backend/alembic/versions/e7b2d4c81f06_audit_chain_checkpoint.py:drop_table:41
 backend/alembic/versions/e7b3f29a1d6c_proxmox_last_discovery.py:drop_column:38
 backend/alembic/versions/e7b8c4f96a12_dns_zone_domain_fk.py:drop_column:48
 backend/alembic/versions/e7b8c4f96a12_dns_zone_domain_fk.py:drop_constraint_fk:46
