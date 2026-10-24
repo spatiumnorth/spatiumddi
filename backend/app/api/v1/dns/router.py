@@ -5553,6 +5553,14 @@ class ServerZoneStateEntry(BaseModel):
     # #2042 — ops for this zone the server has not acknowledged yet (pending
     # or in flight). Non-zero means not in sync whatever the serial says.
     pending_ops: int = 0
+    # #2316 — how the server's report is weighed. ``ok``: the server is
+    # active, so its serial counts. ``unreachable``: it is not active (down,
+    # errored, disabled), so a serial it reported earlier is not evidence it
+    # serves the zone now and it is never counted as in sync. ``paused``:
+    # the operator put it in maintenance — excluded from the count and shown
+    # separately. ``counted`` is True only for ``ok``.
+    freshness: Literal["ok", "unreachable", "paused"] = "ok"
+    counted: bool = True
 
 
 class ServerZoneStateResponse(BaseModel):
@@ -5630,6 +5638,13 @@ async def get_zone_server_state(
         current = int(st.current_serial) if st else None
         reported = st.reported_at if st else None
         pending = queued.get((srv.id, zone.name), 0)
+        freshness: Literal["ok", "unreachable", "paused"]
+        if srv.maintenance_mode:
+            freshness = "paused"
+        elif srv.status != "active":
+            freshness = "unreachable"
+        else:
+            freshness = "ok"
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -5638,8 +5653,15 @@ async def get_zone_server_state(
                 current_serial=current,
                 reported_at=reported,
                 pending_ops=pending,
+                freshness=freshness,
+                counted=freshness == "ok",
             )
         )
+        if freshness == "paused":
+            continue
+        if freshness == "unreachable":
+            all_in_sync = False
+            continue
         if current is None:
             all_in_sync = False
         else:
