@@ -313,7 +313,7 @@ export function TrashPage() {
     () => ({
       type: filterType === "all" ? undefined : filterType,
       since: filterSince ? new Date(filterSince).toISOString() : undefined,
-      q: filterQ || undefined,
+      q: filterQ.trim() || undefined,
       limit: PAGE_SIZE,
       offset: page * PAGE_SIZE,
       sort,
