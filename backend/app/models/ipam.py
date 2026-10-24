@@ -76,6 +76,12 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
     }
 )
 IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED
+# The statuses a NEW address may be created with by hand — over REST and over
+# the operation layer (requests portal, Copilot) alike: the operator-settable
+# set plus ``dhcp`` for the static-reservation conversion path. Integration
+# statuses (proxmox-vm, kubernetes-node, …) belong to their reconcilers; a
+# brand-new row carrying one would be "owned" by no integration.
+IP_STATUSES_CREATE_SETTABLE: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
 
 # Valid IPAddress.role values. Orthogonal to ``status`` — the role
 # describes what the IP *is* (a host vs. a VRRP virtual address),
