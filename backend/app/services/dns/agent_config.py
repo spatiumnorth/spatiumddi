@@ -1589,6 +1589,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
         # no such setting and the API refuses a non-default value for them.
         options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
+    # #2263 — the group ``blackhole`` list. Accepted and validated since
+    # #1244 and never shipped, so no agent could render it. Shipped only when
+    # set: an absent key reads as empty on the agent, so a group that does not
+    # use it keeps the bundle (and the structural etag) it had before, and an
+    # upgrade does not reload every agent for a byte-identical config. The
+    # BIND9 agent renders it; PowerDNS / Technitium groups refuse it at the
+    # API, since neither daemon can drop a client by address.
+    blackhole = list(getattr(opts, "blackhole", []) or []) if opts else []
+    if blackhole:
+        options_block["blackhole"] = blackhole
     if server.driver in ("technitium", "bind9"):
         # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
         # renders ``allow-recursion`` from it, literally, #1817), so

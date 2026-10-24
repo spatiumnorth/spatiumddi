@@ -5109,6 +5109,10 @@ export interface ZoneMovePreview {
    *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
    *  means the commit refuses — not waivable by acknowledgement. */
   forward_transport_refusal?: string | null;
+  /** #2263 — the zone's own allow_query / allow_transfer cannot be applied
+   *  by a Technitium server in the target. Non-null means the commit
+   *  refuses — not waivable by acknowledgement. */
+  technitium_acl_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */

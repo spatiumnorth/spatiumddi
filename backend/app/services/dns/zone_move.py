@@ -38,6 +38,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.acme import ACMEAccount
@@ -63,6 +64,7 @@ from app.services.dns.record_ops import (
     count_queued_zone_ops,
     sweep_zone_ops,
 )
+from app.services.dns.technitium_options import allow_query_problem, allow_transfer_problem
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 from app.services.dns.tsig_algorithms import key_refusal
 from app.services.dns.view_collisions import ExtraZone, zone_render_collisions
@@ -210,6 +212,13 @@ class ZoneMovePlan:
     #: same check zone create / update run, so the preview reports exactly the
     #: refusal the commit raises. Refused, never waived.
     forward_transport_refusal: str | None = None
+    #: #2263 — the zone's own ``allow_query`` / ``allow_transfer`` holds an
+    #: element the agent-managed Technitium driver in the target cannot
+    #: express. The zone create / update gate refuses the same list; a move
+    #: is another way into the group, and on a zone Technitium creates fresh
+    #: "left as the daemon has it" means open to every client. Refused,
+    #: never waived.
+    technitium_acl_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -522,6 +531,24 @@ async def assemble_move_plan(
         except HTTPException as exc:
             plan.technitium_api_refusal = str(exc.detail)
 
+    # ── Agent-managed Technitium target (#2263, a refusal) ────────────
+    # The agent applies a primary / secondary / stub zone's own allow_query,
+    # and a primary's allow_transfer, through the address-match translation;
+    # an inexpressible list is left unapplied, which on a zone the move makes
+    # Technitium create means open. Same checks as zone create / update.
+    if "technitium" in plan.target_drivers:
+        defs = await _acl_definitions(db, target_group.id)
+        problem = None
+        if zone.zone_type in ("primary", "secondary", "stub") and zone.allow_query:
+            problem = allow_query_problem(list(zone.allow_query), defs)
+        if problem is None and zone.zone_type == "primary" and zone.allow_transfer:
+            problem = allow_transfer_problem(list(zone.allow_transfer), defs)
+        if problem:
+            plan.technitium_acl_refusal = (
+                f"Group {target_group.name!r} has a Technitium server, which cannot apply "
+                f"this zone's {problem}. Change the zone's list first, or pick another group."
+            )
+
     # ── The forward zone's own upstream transport (#2121, a refusal) ──
     if zone.zone_type == "forward":
         msg = zone_forward_transport_refusal(
@@ -536,6 +563,28 @@ async def assemble_move_plan(
 
     _fill_warnings(plan)
     return plan
+
+
+async def _acl_definitions(
+    db: AsyncSession, group_id: uuid.UUID
+) -> dict[str, list[tuple[str, bool]]]:
+    """The group's named ACLs as ``name -> [(value, negate)]``, for the
+    Technitium address-match translation (#1765, #2263)."""
+    rows = (
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id)
+                .options(selectinload(DNSAcl.entries))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        a.name: [(e.value, bool(e.negate)) for e in sorted(a.entries, key=lambda x: x.order)]
+        for a in rows
+    }
 
 
 async def _count(db: AsyncSession, model: type, *criteria: Any) -> int:
@@ -777,6 +826,8 @@ async def commit_move(
         raise ZoneMoveError(plan.tsig_algorithm_refusal, status_code=422)
     if plan.forward_transport_refusal:
         raise ZoneMoveError(plan.forward_transport_refusal, status_code=422)
+    if plan.technitium_acl_refusal:
+        raise ZoneMoveError(plan.technitium_acl_refusal, status_code=422)
     if plan.technitium_api_refusal:
         # #1784 — refused, not warned: the zone would read as configured on
         # a server that ignores the config. Derived in the plan so the
