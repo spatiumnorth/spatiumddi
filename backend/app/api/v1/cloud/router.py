@@ -35,6 +35,7 @@ from app.services.cloud.base import (
     get_connector,
     implemented_providers,
 )
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["cloud"],
@@ -367,7 +368,11 @@ async def delete_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     if e is None:
         raise HTTPException(status_code=404, detail="Cloud endpoint not found")
     _audit(db, user=user, action="delete", endpoint_id=e.id, endpoint_name=e.name)
-    # Mirror rows (IPBlock/Subnet/IPAddress) cascade via cloud_endpoint_id FK.
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="cloud_endpoint_id", target_id=e.id, user=user, target_name=e.name
+    )
     await db.delete(e)
     await db.commit()
 

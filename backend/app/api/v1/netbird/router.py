@@ -30,6 +30,7 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.netbird import NetbirdInstance
 from app.services.dns.bundle_dirty import mark_integration_dns_released
+from app.services.integration_ownership import release_integration_rows
 from app.services.netbird.client import (
     NetbirdClient,
     NetbirdClientError,
@@ -365,6 +366,11 @@ async def delete_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     if t is None:
         raise HTTPException(status_code=404, detail="NetBird instance not found")
     _audit(db, user=user, action="delete", instance_id=t.id, instance_name=t.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="netbird_instance_id", target_id=t.id, user=user, target_name=t.name
+    )
     # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
     await mark_integration_dns_released(db, own_fk="netbird_instance_id", target_id=t.id)
     await db.delete(t)

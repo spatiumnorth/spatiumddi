@@ -1680,7 +1680,11 @@ async def agent_mac_sightings(
     existing = (
         (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
     )
-    by_key: dict[tuple[Any, str], IPAddress] = {(r.subnet_id, r.address): r for r in existing}
+    # #2651 — ``IPAddress.address`` decodes to IPv4Address/IPv6Address, the
+    # event carries a string; normalise both sides (same as lease-events).
+    by_key: dict[tuple[Any, str], IPAddress] = {
+        (r.subnet_id, norm_ip(str(r.address))): r for r in existing
+    }
 
     # (ipam_row, mac) pairs to classify after the flush assigns new-row ids.
     to_observe: list[tuple[IPAddress, str]] = []
@@ -1690,7 +1694,7 @@ async def agent_mac_sightings(
         )
         if subnet is None:
             continue
-        row = by_key.get((subnet.id, s.ip_address))
+        row = by_key.get((subnet.id, norm_ip(s.ip_address)))
         if row is None:
             # #564 — a concurrent lease-event / Sync-DHCP writer may have
             # already committed this (subnet_id, address). Insert inside a
@@ -1708,7 +1712,7 @@ async def agent_mac_sightings(
                     last_seen_method="l2_sniff",
                 ),
             )
-            by_key[(subnet.id, s.ip_address)] = row
+            by_key[(subnet.id, norm_ip(s.ip_address))] = row
             if not created:
                 # Lost the race — just bump the sighting timestamp on the
                 # incumbent (don't clobber its status/mac; the observation
@@ -2034,7 +2038,9 @@ async def agent_dhcp_fingerprints(
             from app.tasks.dhcp_fingerprint import lookup_fingerprint_task
 
             for mac in enqueue_macs:
-                await dispatch(lookup_fingerprint_task, mac)
+                # Carry the reporting server so the IP stamp stays in the
+                # spaces it serves (#2577).
+                await dispatch(lookup_fingerprint_task, mac, str(server.id))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",

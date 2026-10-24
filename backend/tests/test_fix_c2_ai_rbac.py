@@ -138,6 +138,12 @@ def test_core_write_ops_declare_a_gate() -> None:
         "approve_appliance": ("admin", "appliance"),
         "assign_appliance_role": ("admin", "appliance"),
         "toggle_firewall_policy": ("admin", "appliance"),
+        "create_conformity_policy": ("admin", "conformity"),
+        "update_conformity_policy": ("admin", "conformity"),
+        "evaluate_conformity_policy": ("admin", "conformity"),
+        "create_multicast_domain": ("write", "multicast"),
+        "update_multicast_domain": ("write", "multicast"),
+        "delete_multicast_domain": ("delete", "multicast"),
     }
     for name, gate in expected.items():
         op = get_operation(name)

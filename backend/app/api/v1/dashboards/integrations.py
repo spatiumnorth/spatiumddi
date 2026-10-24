@@ -14,6 +14,12 @@ sweep loop is genuinely behind, not just mid-cycle.
 Recent reconciler errors come from the audit log (every
 integration writes an audit row on failed sync) filtered to the
 matching ``resource_type`` set. Capped at 20 rows.
+
+Recent reconciler warnings (#2577) are the audit rows a sync writes when it
+releases what its target owned outside the target's IP space — after the
+target's ``ipam_space_id`` was changed. A release happens once, on the first
+sync after the change, so it is listed here and also shown as the target
+row's sync warning for ``_RELEASE_WARNING_WINDOW`` after it happened.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ from app.services.integration_credentials import (
     CredentialStatus,
     credential_status,
 )
+from app.services.integration_ownership import RELEASE_AUDIT_ACTION
 from app.services.tailscale.client import is_auth_rejected
 
 router = APIRouter()
@@ -67,6 +74,9 @@ class IntegrationTargetRow(BaseModel):
     # ``None`` for integrations that don't compute warnings.
     last_sync_warning: str | None
     is_stale: bool  # last_synced_at older than 2× sync_interval, or never
+    # #2221 — a disabled target is switched off, so its old ``last_sync_error``
+    # is history: still returned, but never a live problem or a red count.
+    enabled: bool = True
     # #2138 — the target's credential: ok | expiring | expired | rejected |
     # unknown, from app/services/integration_credentials.py. ``None`` for
     # integrations that don't record a credential expiry (yet).
@@ -84,6 +94,9 @@ class IntegrationPanel(BaseModel):
     stale_count: int
     error_count: int
     warning_count: int
+    # #2221 — targets switched off. Counted here instead of in the
+    # healthy / stale / error / warning buckets, which describe live syncs.
+    disabled_count: int = 0
     # #2192 — counted over EVERY target, not the capped ``targets`` list, so
     # the card's counts stay right when the row list is trimmed. A "problem"
     # is a credential that is rejected / expired / expiring, or a sync error;
@@ -107,6 +120,9 @@ class IntegrationsDashboardSummary(BaseModel):
     generated_at: datetime
     panels: list[IntegrationPanel]
     recent_errors: list[IntegrationErrorRow]
+    # #2577 — releases of rows a target owned outside its IP space. Same
+    # shape as an error row; ``error_detail`` carries what was released.
+    recent_warnings: list[IntegrationErrorRow] = []
 
 
 _TARGET_LIMIT = 20
@@ -115,6 +131,11 @@ _TARGET_LIMIT = 20
 # card says "+N more with problems" from ``problem_count``.
 _PROBLEM_TARGET_LIMIT = 50
 _RECENT_ERROR_LIMIT = 20
+_RECENT_WARNING_LIMIT = 20
+# #2577 — how long a release stays on its target row as a sync warning. A
+# release is a one-off (the next sync has nothing outside the space left to
+# release), so the row would otherwise show it for one sync interval at most.
+_RELEASE_WARNING_WINDOW = timedelta(hours=24)
 
 # Resource_type values audit-logged by each integration's reconciler.
 # Mirrors the strings emitted in ``services/{kubernetes,docker,
@@ -146,6 +167,10 @@ def _is_stale(last: datetime | None, interval_seconds: int, now: datetime) -> bo
 
 
 def _has_problem(r: IntegrationTargetRow) -> bool:
+    if not r.enabled:
+        # #2221 — a disabled target's leftover error is history, not a
+        # problem to act on (``credential_state`` already reads "disabled").
+        return False
     return r.credential_state in CREDENTIAL_PROBLEM_STATES or bool(r.last_sync_error)
 
 
@@ -171,6 +196,7 @@ def _build_panel(
     display_attr: str,
     now: datetime,
     credential: Callable[[Any], CredentialStatus] | None = None,
+    release_warnings: dict[str, str] | None = None,
 ) -> IntegrationPanel:
     """Aggregate one integration's targets into the dashboard panel."""
     rows: list[IntegrationTargetRow] = []
@@ -178,6 +204,7 @@ def _build_panel(
     stale = 0
     errors = 0
     warnings = 0
+    disabled = 0
     for t in targets:
         last = getattr(t, "last_synced_at", None)
         interval = int(getattr(t, "sync_interval_seconds", 60) or 60)
@@ -185,8 +212,15 @@ def _build_panel(
         # getattr default — only integrations that compute non-fatal
         # findings carry the column; the rest report None.
         last_warn = getattr(t, "last_sync_warning", None)
+        # #2577 — a recent release of rows outside the target's IP space.
+        released = (release_warnings or {}).get(str(t.id))
+        if released and released not in (last_warn or ""):
+            last_warn = f"{last_warn}\n{released}" if last_warn else released
         is_stale = _is_stale(last, interval, now)
-        if last_err:
+        target_enabled = bool(getattr(t, "enabled", True))
+        if not target_enabled:
+            disabled += 1
+        elif last_err:
             errors += 1
         elif is_stale:
             stale += 1
@@ -209,6 +243,7 @@ def _build_panel(
                 last_sync_error=last_err,
                 last_sync_warning=last_warn,
                 is_stale=is_stale,
+                enabled=target_enabled,
                 credential_state=cred.state if cred else None,
                 credential_expires_at=cred.expires_at if cred else None,
                 credential_days_left=cred.days_left if cred else None,
@@ -223,9 +258,14 @@ def _build_panel(
         stale_count=stale,
         error_count=errors,
         warning_count=warnings,
+        disabled_count=disabled,
         problem_count=sum(1 for r in rows if _has_problem(r)),
-        credential_dead_count=sum(1 for r in rows if r.credential_state in ("rejected", "expired")),
-        credential_expiring_count=sum(1 for r in rows if r.credential_state == "expiring"),
+        credential_dead_count=sum(
+            1 for r in rows if r.enabled and r.credential_state in ("rejected", "expired")
+        ),
+        credential_expiring_count=sum(
+            1 for r in rows if r.enabled and r.credential_state == "expiring"
+        ),
         targets=_cap_rows(rows),
     )
 
@@ -318,8 +358,45 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
     enabled_modules = await get_enabled_modules(db)
 
     readable = [row for row in _PANELS if user_has_permission(current_user, "read", row[4])]
+    readable_types = [row[4] for row in readable]
+
+    # #2577 — releases outside a target's IP space: the recent ones as the
+    # target row's warning, and the latest ones as their own list.
+    warn_rows = list(
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.action == RELEASE_AUDIT_ACTION)
+                .where(AuditLog.resource_type.in_(readable_types))
+                .order_by(desc(AuditLog.timestamp))
+                .limit(_RECENT_WARNING_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    window_rows = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.action == RELEASE_AUDIT_ACTION)
+                .where(AuditLog.resource_type.in_(readable_types))
+                .where(AuditLog.timestamp >= now - _RELEASE_WARNING_WINDOW)
+                .order_by(desc(AuditLog.timestamp))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    release_warnings: dict[str, dict[str, str]] = {}
+    for r in window_rows:
+        # newest first, so the first row per target wins
+        release_warnings.setdefault(r.resource_type, {}).setdefault(
+            r.resource_id, _release_message(r)
+        )
+
     panels = []
-    for kind, label, module_id, model, _rtype in readable:
+    for kind, label, module_id, model, rtype in readable:
         targets = list((await db.execute(select(model))).scalars().all())
         panels.append(
             _build_panel(
@@ -330,9 +407,9 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
                 display_attr="name",
                 now=now,
                 credential=_tailscale_credential(now) if kind == "tailscale" else None,
+                release_warnings=release_warnings.get(rtype),
             )
         )
-    readable_types = [row[4] for row in readable]
 
     # Recent reconciler errors — one filtered audit query covers all
     # integrations at once.
@@ -361,8 +438,28 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
         for r in err_rows
     ]
 
+    recent_warnings = [
+        IntegrationErrorRow(
+            id=str(r.id),
+            integration=r.resource_type,
+            target_id=r.resource_id,
+            target_display=r.resource_display or "",
+            error_detail=_release_message(r),
+            timestamp=r.timestamp,
+        )
+        for r in warn_rows
+    ]
+
     return IntegrationsDashboardSummary(
         generated_at=now,
         panels=panels,
         recent_errors=recent_errors,
+        recent_warnings=recent_warnings,
     )
+
+
+def _release_message(row: AuditLog) -> str:
+    """The text of a release audit row (#2577)."""
+    value = row.new_value or {}
+    message = value.get("message") if isinstance(value, dict) else None
+    return str(message) if message else "released rows outside this target's IP space"

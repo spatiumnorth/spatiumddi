@@ -30,6 +30,7 @@ from app.models.fortinet import FortinetFirewall
 from app.models.ipam import IPSpace, Subnet
 from app.models.panos import FirewallObject
 from app.services.fortinet.client import FortinetClient, FortinetClientError
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["fortinet"],
@@ -348,6 +349,11 @@ async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     if f is None:
         raise HTTPException(status_code=404, detail="Fortinet firewall not found")
     _audit(db, user=user, action="delete", firewall_id=f.id, firewall_name=f.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="fortinet_firewall_id", target_id=f.id, user=user, target_name=f.name
+    )
     await db.delete(f)
     await db.commit()
 

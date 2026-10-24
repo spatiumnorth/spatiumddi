@@ -28,6 +28,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.proxmox import ProxmoxNode
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["proxmox"],
@@ -448,6 +449,11 @@ async def delete_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if n is None:
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
     _audit(db, user=user, action="delete", node_id=n.id, node_name=n.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="proxmox_node_id", target_id=n.id, user=user, target_name=n.name
+    )
     await db.delete(n)
     await db.commit()
 

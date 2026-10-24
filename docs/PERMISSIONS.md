@@ -49,6 +49,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
+| `server`          | Server logs on the **Logs** page (Windows event log, DHCP audit, DNS queries, DHCP activity) and DNS threat analytics. For the agent-log reads (DNS Queries, DHCP Activity) the grant may be scoped: a `resource_id` of a server id reads that server, a DNS or DHCP server-group id reads every server in that group, and group / "all" reads are narrowed to those servers (#2120). Unlike most types, the `resource_id` may name a server group as well as a server: `server` is a surface, not a table, and a group grant is how one delegate reads a load-balanced group. The Windows event-log and DHCP-audit reads, DNS threat analytics and the Copilot log tools still need it unscoped (the tools do narrow a resource-bound API token the same way) |
 | `dns_blocklist`   | Response Policy Zones / blocking lists                |
 | `dhcp_server`     | Kea + Windows DHCP server objects and server groups   |
 | `dhcp_scope`      | DHCP scopes / shared networks                         |

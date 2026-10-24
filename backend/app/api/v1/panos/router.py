@@ -30,6 +30,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
 from app.models.panos import FirewallObject, PANOSFirewall
+from app.services.integration_ownership import release_integration_rows
 from app.services.panos.client import PANOSClient, PANOSClientError
 
 router = APIRouter(
@@ -419,6 +420,11 @@ async def delete_firewall(
         )
     )
     _audit(db, user=user, action="delete", firewall_id=f.id, firewall_name=f.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="panos_firewall_id", target_id=f.id, user=user, target_name=f.name
+    )
     await db.delete(f)
     await db.commit()
 

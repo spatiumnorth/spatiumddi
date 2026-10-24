@@ -53,6 +53,7 @@ from app.models.ipam import (
     IP_STATUSES_INTEGRATION_OWNED,
     IP_STATUSES_OPERATOR_SETTABLE,
     IPAddress,
+    IPSpace,
     Subnet,
 )
 from app.models.nmap import NmapScan
@@ -77,6 +78,43 @@ router = APIRouter(tags=["nmap"])
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
+
+
+async def _scan_ip_row_space(db: AsyncSession, scan: NmapScan) -> tuple[uuid.UUID, str] | None:
+    """The (id, name) of the IP space of the IPAM row a scan was launched
+    from, or None for a scan not pinned to a row (#2577). It is the space
+    ``stamp-discovered`` writes into when the caller names none."""
+    if scan.ip_address_id is None:
+        return None
+    row = (
+        await db.execute(
+            select(IPSpace.id, IPSpace.name)
+            .join(Subnet, Subnet.space_id == IPSpace.id)
+            .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+            .where(IPAddress.id == scan.ip_address_id)
+        )
+    ).first()
+    return (row[0], row[1]) if row is not None else None
+
+
+async def _scan_ip_row_spaces(
+    db: AsyncSession, scans: list[NmapScan]
+) -> dict[uuid.UUID, tuple[uuid.UUID, str]]:
+    """``_scan_ip_row_space`` for a page of scans in one query, keyed by the
+    pinned IP row's id (#2577). The list must carry the space: the History
+    panel opens a scan with the list's copy as its initial data."""
+    ids = {s.ip_address_id for s in scans if s.ip_address_id is not None}
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(IPAddress.id, IPSpace.id, IPSpace.name)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .join(IPSpace, Subnet.space_id == IPSpace.id)
+            .where(IPAddress.id.in_(ids))
+        )
+    ).all()
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 def _to_read(row: NmapScan, *, include_raw: bool = False) -> NmapScanRead:
@@ -244,7 +282,14 @@ async def list_scans(
 
     stmt = base.order_by(NmapScan.created_at.desc()).limit(page_size).offset((page - 1) * page_size)
     rows = list((await db.execute(stmt)).scalars().all())
-    items = [_to_read(r) for r in rows]
+    spaces = await _scan_ip_row_spaces(db, rows)
+    items = []
+    for r in rows:
+        item = _to_read(r)
+        pinned = spaces.get(r.ip_address_id) if r.ip_address_id is not None else None
+        if pinned is not None:
+            item.ip_space_id, item.ip_space_name = pinned
+        items.append(item)
     return NmapScanListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
@@ -259,7 +304,11 @@ async def get_scan(
     row = await db.get(NmapScan, scan_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Scan not found")
-    return _to_read(row, include_raw=True)
+    out = _to_read(row, include_raw=True)
+    pinned = await _scan_ip_row_space(db, row)
+    if pinned is not None:
+        out.ip_space_id, out.ip_space_name = pinned
+    return out
 
 
 @router.delete(
@@ -363,6 +412,17 @@ async def stamp_discovered(
     scan_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
+    space_id: uuid.UUID | None = Query(
+        None,
+        description=(
+            "IP space to stamp into. Overlapping spaces are independent "
+            "(#2577), so an address that falls inside subnets of more "
+            "than one space is ambiguous: without this (and without a "
+            "scan pinned to an IPAM row) such hosts are skipped and "
+            "listed in ``skipped_ambiguous`` rather than written into "
+            "whichever space's subnet happened to match first."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Stamp every alive host from a multi-host scan into IPAM.
 
@@ -373,6 +433,12 @@ async def stamp_discovered(
     only get the ``last_seen`` stamp (status is left alone). New rows
     land as ``discovered``. IPs that don't fall inside any known
     subnet are skipped — there's no obvious place to put them.
+
+    Space context (#2577): the target space is ``space_id`` when
+    given, else the space of the IPAM row the scan was launched from
+    (``scan.ip_address_id``). With neither, a host whose address sits
+    in subnets of two or more spaces is skipped as ambiguous — the
+    scan alone cannot say which network it swept.
 
     Permission gate: the user must be able to write IPAM
     (``ip_address`` write). This is intentionally a different gate
@@ -395,7 +461,8 @@ async def stamp_discovered(
         raise HTTPException(status_code=404, detail="Scan not found")
     summary = scan.summary_json or {}
     hosts: list[dict[str, Any]] = summary.get("hosts") or []
-    if not hosts:
+    # ``[]`` is a sweep that found nothing: stamps nothing, not an error.
+    if summary.get("hosts") is None:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -404,12 +471,27 @@ async def stamp_discovered(
             ),
         )
 
+    space_used: dict[str, Any] | None = None
+    if space_id is not None:
+        chosen = await db.get(IPSpace, space_id)
+        if chosen is None:
+            raise HTTPException(status_code=422, detail="space_id not found")
+        space_used = {"id": str(chosen.id), "name": chosen.name, "source": "requested"}
+    else:
+        pinned = await _scan_ip_row_space(db, scan)
+        if pinned is not None:
+            space_used = {"id": str(pinned[0]), "name": pinned[1], "source": "scan_ip_row"}
+    context_space_id: uuid.UUID | None = (
+        uuid.UUID(space_used["id"]) if space_used is not None else None
+    )
+
     now = datetime.now(UTC)
     created = 0
     bumped = 0  # status flipped to discovered
     refreshed = 0  # last_seen stamped, status preserved
     skipped_no_subnet = 0
     skipped_address: list[str] = []
+    skipped_ambiguous: list[str] = []
 
     for host in hosts:
         if host.get("host_state") != "up":
@@ -428,13 +510,22 @@ async def stamp_discovered(
             skipped_address.append(str(addr))
             continue
 
-        subnet_res = await db.execute(
-            select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(addr)))
+        # Never take the first containing subnet across spaces (#2577):
+        # overlapping spaces are independent, so that would write the
+        # host into an arbitrary network's IPAM.
+        subnet_q = select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(addr)))
+        if context_space_id is not None:
+            subnet_q = subnet_q.where(Subnet.space_id == context_space_id)
+        candidates = list(
+            (await db.execute(subnet_q.order_by(sa_func.masklen(Subnet.network).desc()))).scalars()
         )
-        subnet = subnet_res.scalars().first()
-        if subnet is None:
+        if not candidates:
             skipped_no_subnet += 1
             continue
+        if len({c.space_id for c in candidates}) > 1:
+            skipped_ambiguous.append(str(addr))
+            continue
+        subnet = candidates[0]
 
         ipam_res = await db.execute(
             select(IPAddress).where(
@@ -492,6 +583,9 @@ async def stamp_discovered(
             "refreshed": refreshed,
             "skipped_no_subnet": skipped_no_subnet,
             "skipped_addresses": skipped_address[:50],
+            "skipped_ambiguous": skipped_ambiguous[:50],
+            "space_id": str(context_space_id) if context_space_id else None,
+            "space_source": space_used["source"] if space_used else None,
         },
     )
     await db.commit()
@@ -501,6 +595,12 @@ async def stamp_discovered(
         "refreshed": refreshed,
         "skipped_no_subnet": skipped_no_subnet,
         "skipped_addresses": skipped_address,
+        "skipped_ambiguous": skipped_ambiguous,
+        # Which space the hosts were stamped into, and why: ``requested``
+        # (``space_id``), ``scan_ip_row`` (the space of the IPAM row the scan
+        # was launched from), or ``None`` — no single space, so a host found
+        # in subnets of more than one space was skipped (#2577).
+        "space_used": space_used,
     }
 
 
