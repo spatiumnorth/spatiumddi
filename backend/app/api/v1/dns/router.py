@@ -2178,6 +2178,58 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             ),
         )
 
+    # The zones left are the ones in Trash (the live ones were refused above).
+    # They go with the group by FK cascade, which runs no Python, so write the
+    # per-item row a Trash purge writes (#1957): name, view and record count.
+    trashed_zones = (
+        (
+            await db.execute(
+                select(DNSZone)
+                .where(DNSZone.group_id == group_id)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    view_names: dict[uuid.UUID, str] = {}
+    view_ids = {z.view_id for z in trashed_zones if z.view_id is not None}
+    if view_ids:
+        view_names = {
+            v.id: v.name
+            for v in (await db.execute(select(DNSView).where(DNSView.id.in_(view_ids))))
+            .scalars()
+            .all()
+        }
+    for z in trashed_zones:
+        record_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == z.id)
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one()
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_zone",
+                resource_id=str(z.id),
+                resource_display=z.name,
+                old_value={
+                    "name": z.name,
+                    "view": view_names.get(z.view_id) if z.view_id else None,
+                    "record_count": record_count,
+                    "purged_with": "dns_server_group",
+                    "group": group.name,
+                },
+                result="success",
+            )
+        )
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2187,6 +2239,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             resource_type="dns_server_group",
             resource_id=str(group.id),
             resource_display=group.name,
+            old_value={"trashed_zones_deleted": len(trashed_zones)},
             result="success",
         )
     )
@@ -5553,6 +5606,14 @@ class ServerZoneStateEntry(BaseModel):
     # #2042 — ops for this zone the server has not acknowledged yet (pending
     # or in flight). Non-zero means not in sync whatever the serial says.
     pending_ops: int = 0
+    # #2316 — how the server's report is weighed. ``ok``: the server is
+    # active, so its serial counts. ``unreachable``: it is not active (down,
+    # errored, disabled), so a serial it reported earlier is not evidence it
+    # serves the zone now and it is never counted as in sync. ``paused``:
+    # the operator put it in maintenance — excluded from the count and shown
+    # separately. ``counted`` is True only for ``ok``.
+    freshness: Literal["ok", "unreachable", "paused"] = "ok"
+    counted: bool = True
 
 
 class ServerZoneStateResponse(BaseModel):
@@ -5630,6 +5691,13 @@ async def get_zone_server_state(
         current = int(st.current_serial) if st else None
         reported = st.reported_at if st else None
         pending = queued.get((srv.id, zone.name), 0)
+        freshness: Literal["ok", "unreachable", "paused"]
+        if srv.maintenance_mode:
+            freshness = "paused"
+        elif srv.status != "active":
+            freshness = "unreachable"
+        else:
+            freshness = "ok"
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -5638,8 +5706,15 @@ async def get_zone_server_state(
                 current_serial=current,
                 reported_at=reported,
                 pending_ops=pending,
+                freshness=freshness,
+                counted=freshness == "ok",
             )
         )
+        if freshness == "paused":
+            continue
+        if freshness == "unreachable":
+            all_in_sync = False
+            continue
         if current is None:
             all_in_sync = False
         else:
