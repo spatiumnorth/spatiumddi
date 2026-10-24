@@ -5810,6 +5810,10 @@ export interface ZoneServerStateEntry {
   reported_at: string | null;
   // #2042 — ops for this zone the server has not acknowledged yet.
   pending_ops: number;
+  // #2316 — `ok` counts; `unreachable` (server not active) never counts as in
+  // sync; `paused` (maintenance) is excluded from the count.
+  freshness: "ok" | "unreachable" | "paused";
+  counted: boolean;
 }
 
 export interface ZoneServerState {
@@ -11089,6 +11093,8 @@ export interface IntegrationsDashboardTargetRow {
   // #797 — non-fatal findings; null for integrations that don't compute them.
   last_sync_warning: string | null;
   is_stale: boolean;
+  // #2221 — false: switched off, so last_sync_error is history, not a problem.
+  enabled?: boolean;
   // #2138 — credential health; null for integrations that record no expiry.
   credential_state: CredentialState | null;
   credential_expires_at: string | null;
@@ -11103,6 +11109,8 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2221 — switched-off targets, counted outside the live buckets above.
+  disabled_count?: number;
   // #2192 — over every target, not the capped `targets` list.
   problem_count?: number;
   credential_dead_count?: number;
