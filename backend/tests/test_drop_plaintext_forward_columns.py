@@ -90,10 +90,13 @@ async def test_the_migration_encrypts_what_is_left_and_drops_the_columns(
         name=f"e-{uuid.uuid4().hex[:6]}",
         kind="webhook",
         url_encrypted=encrypt_str(_NEW_URL),
+        auth_header_encrypted=encrypt_str("Bearer already-encrypted"),
     )
     blanked = AuditForwardTarget(
         name=f"b-{uuid.uuid4().hex[:6]}", kind="webhook", url_encrypted=b""
     )
+    for row in (plaintext_only, already, blanked):
+        row.enabled = True
     db_session.add_all([plaintext_only, already, blanked])
     if await db_session.get(PlatformSettings, 1) is None:
         db_session.add(PlatformSettings(id=1))
@@ -113,7 +116,8 @@ async def test_the_migration_encrypts_what_is_left_and_drops_the_columns(
         text(
             "UPDATE platform_settings SET audit_forward_webhook_url = :u, "
             "audit_forward_webhook_auth_header = NULL, "
-            "audit_forward_webhook_url_encrypted = NULL WHERE id = 1"
+            "audit_forward_webhook_url_encrypted = NULL, "
+            "audit_forward_webhook_enabled = true WHERE id = 1"
         ),
         {"u": _GENERIC},
     )
@@ -166,8 +170,36 @@ async def test_the_migration_encrypts_what_is_left_and_drops_the_columns(
     ).one()
     assert decrypt_str(bytes(ps[0])) == _GENERIC and ps[1] is None
 
+    # A target the fold wrote into is left disabled; one that already had a
+    # ciphertext is untouched and stays enabled.
+    async def _enabled(row_id: uuid.UUID) -> bool:
+        return bool(
+            (
+                await db_session.execute(
+                    text("SELECT enabled FROM audit_forward_target WHERE id = :id"),
+                    {"id": row_id},
+                )
+            ).scalar_one()
+        )
+
+    assert await _enabled(plaintext_only.id) is False
+    assert await _enabled(blanked.id) is False
+    assert await _enabled(already.id) is True
+    assert (
+        await db_session.execute(
+            text("SELECT audit_forward_webhook_enabled FROM platform_settings WHERE id = 1")
+        )
+    ).scalar_one() is False
+
     # A second run is a no-op, not an error.
     await conn.run_sync(_run("upgrade"))
+    # ...so a target re-enabled after the first run stays enabled.
+    await db_session.execute(
+        text("UPDATE audit_forward_target SET enabled = true WHERE id = :id"),
+        {"id": plaintext_only.id},
+    )
+    await conn.run_sync(_run("upgrade"))
+    assert await _enabled(plaintext_only.id) is True
 
     await conn.run_sync(_run("downgrade"))
     for table, plain, _enc in module._PAIRS:  # noqa: SLF001

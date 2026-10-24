@@ -19,6 +19,17 @@ measure the row records. Importing ``app.core.crypto`` is deliberate, as in
 ``e51ab0dede3e``: the ciphertext must be exactly what the application reads
 back, under the install's own key.
 
+A value the fold writes back is restored from a column the application has
+not read since ``e51ab0dede3e``, so it may be one an admin has since cleared:
+on a build that blanked nothing on a clear, a cleared value left the old
+plaintext in place beside a NULL ciphertext, which is the same state as one
+never rewritten. So every target the fold writes into is left DISABLED
+(``audit_forward_target.enabled``; for the legacy single webhook,
+``platform_settings.audit_forward_webhook_enabled``), and its id and name are
+logged, so an admin turns it back on knowingly instead of audit events
+starting to flow to an endpoint that may have been removed. A row the fold does
+not write into is left exactly as it is.
+
 Each column is dropped only if present, so a schema built from the models (a
 test database, a fresh install that never ran ``e51ab0dede3e``'s expand) and
 a database a selective restore has already folded
@@ -36,9 +47,14 @@ Create Date: 2026-10-23
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import sqlalchemy as sa
 
 from alembic import op
+
+logger = logging.getLogger("alembic.runtime.migration")
 
 revision = "c2b203844c95"
 down_revision = "e7b3d19a4c26"
@@ -66,10 +82,19 @@ def _columns(conn: sa.engine.Connection, table: str) -> set[str]:
     return {c["name"] for c in sa.inspect(conn).get_columns(table)}
 
 
+# table -> (enabled column, label column or None). The legacy webhook is one
+# row (id 1) with no name of its own.
+_ENABLED: dict[str, tuple[str, str | None]] = {
+    "audit_forward_target": ("enabled", "name"),
+    "platform_settings": ("audit_forward_webhook_enabled", None),
+}
+
+
 def upgrade() -> None:
     from app.core.crypto import encrypt_str
 
     conn = op.get_bind()
+    rearmed: dict[tuple[str, Any], None] = {}
     for table, plain, encrypted in _PAIRS:
         if plain not in _columns(conn, table):
             continue
@@ -85,7 +110,28 @@ def upgrade() -> None:
                 sa.text(f"UPDATE {table} SET {encrypted} = :value WHERE id = :id"),  # noqa: S608
                 {"value": encrypt_str(value), "id": row_id},
             )
+            rearmed[(table, row_id)] = None
         op.drop_column(table, plain)
+
+    for table, row_id in rearmed:
+        flag, label = _ENABLED[table]
+        name = ""
+        if label is not None:
+            name = conn.execute(
+                sa.text(f"SELECT {label} FROM {table} WHERE id = :id"),  # noqa: S608
+                {"id": row_id},
+            ).scalar_one_or_none()
+        conn.execute(
+            sa.text(f"UPDATE {table} SET {flag} = false WHERE id = :id"),  # noqa: S608
+            {"id": row_id},
+        )
+        logger.warning(
+            "c2b203844c95: restored a plaintext webhook value into %s id=%s%s and "
+            "left it disabled; re-enable it once the endpoint is confirmed",
+            table,
+            row_id,
+            f" name={name!r}" if name else "",
+        )
 
 
 def downgrade() -> None:

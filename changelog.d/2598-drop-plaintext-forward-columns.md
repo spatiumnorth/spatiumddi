@@ -7,7 +7,10 @@
   columns one release ago and kept, unread, so a rolling upgrade's old
   pods kept working. The migration encrypts any value still left in one
   into its encrypted column when that column is empty, then drops it.
-  An encrypted value already present is left as it is. Archives taken
+  An encrypted value already present is left as it is. A target the
+  migration writes a value into is left disabled (the Settings webhook
+  likewise) and logged, since that value may be one an admin cleared;
+  re-enable it once the endpoint is confirmed. Archives taken
   before the drop still restore: a full restore migrates them, and a
   selective restore loads the old columns, encrypts what they hold, and
   drops them again. The code that blanked the plaintext copy on every write is gone with them.
