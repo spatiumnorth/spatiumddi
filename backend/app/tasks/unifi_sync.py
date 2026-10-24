@@ -154,6 +154,8 @@ async def _run_one(controller_id: str) -> dict[str, Any]:
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "controller_version": summary.controller_version,
                 "site_count": summary.site_count,
                 "network_count": summary.network_count,

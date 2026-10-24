@@ -2005,6 +2005,7 @@ async def _preview_create_dns_record(
         find_cname_conflict,
         is_apex,
     )
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2032,6 +2033,10 @@ async def _preview_create_dns_record(
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} not found.")
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
+    # #2653 — the REST create's refusal; the reconciler would revert the row.
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        return PreviewResult(ok=False, detail=synth_err)
 
     name = args.name.strip()
     if not name:
@@ -2111,6 +2116,7 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2127,6 +2133,13 @@ async def _apply_create_dns_record(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         raise ValueError(f"Zone {args.zone_id} not found.")
+    # #2653 — a zone trashed (or taken over by an integration) between
+    # propose and apply must not receive records.
+    if getattr(zone, "deleted_at", None) is not None:
+        raise ValueError(f"Zone {args.zone_id} is deleted.")
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        raise ValueError(synth_err)
 
     name = args.name.strip()
     fqdn = (
@@ -2549,7 +2562,7 @@ async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
     from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
-    from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
     if not name:
@@ -2595,17 +2608,11 @@ async def _preview_create_dns_zone(
         if refusal is not None:
             return PreviewResult(ok=False, detail=refusal)
 
-    existing = (
-        await db.execute(
-            select(DNSZone).where(
-                DNSZone.group_id == grp.id,
-                DNSZone.view_id.is_(None),
-                DNSZone.name == name,
-                DNSZone.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
             detail=f"A zone named {name!r} already exists in group {grp.name!r}.",
@@ -2639,6 +2646,7 @@ async def _apply_create_dns_zone(
     from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_zone", ...) write gate.
@@ -2670,6 +2678,15 @@ async def _apply_create_dns_zone(
         refusal = await sign_refusal(db, grp.id)
         if refusal is not None:
             raise ValueError(refusal)
+
+    # #2652 — the REST create's checks, re-run at apply. The unique
+    # constraint cannot catch a twin when view_id is NULL.
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            raise ValueError(f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
+        raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
 
     zone = DNSZone(
         group_id=grp.id,

@@ -391,8 +391,13 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
             # rides this 60 s sweep rather than a beat entry of its own.
             from app.services.dns.record_ops import heal_primaryless_groups
 
-            healed = await heal_primaryless_groups(db)
+            healed_groups: list = []
+            healed = await heal_primaryless_groups(db, healed_groups)
             await db.commit()
+            if healed_groups:
+                from app.core.agent_wake import dns_group_channel, publish_wake
+
+                await publish_wake(*(dns_group_channel(g) for g in healed_groups))
             if changed:
                 logger.info("dns_agent_stale_sweep", marked_unreachable=changed)
             return {"marked_unreachable": changed, "primaries_healed": healed}
