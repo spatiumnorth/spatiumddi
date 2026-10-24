@@ -1023,11 +1023,17 @@ function VrfSummaryCard() {
 // ── Domains Summary card ──────────────────────────────────────────────────────
 
 function DomainsSummaryCard() {
+  const { enabled, ready } = useFeatureModules();
+  // Wait for the real module state: ``enabled`` is optimistically true while
+  // loading, which would fire one 404 on a hard load with the module off.
+  const moduleOn = ready && enabled("network.domains");
   const { data, isLoading, isError } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
+    enabled: moduleOn,
   });
+  if (!moduleOn) return null;
 
   const inner = (() => {
     if (isLoading) {
@@ -4923,6 +4929,32 @@ function IntegrationsDashboardTabPanel() {
         ))}
       </DashboardListCard>
 
+      <DashboardListCard
+        title="Recent reconciler warnings"
+        emptyHint="No reconciler warnings in recent history."
+      >
+        {(data.recent_warnings ?? []).map((w) => (
+          <div key={w.id} className="px-4 py-2 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="min-w-0 truncate font-medium">
+                {w.integration} · {w.target_display || w.target_id}
+              </span>
+              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                {humanTime(w.timestamp)}
+              </span>
+            </div>
+            {w.error_detail && (
+              <p
+                className="mt-0.5 break-words font-mono text-[10px] text-amber-600 dark:text-amber-400"
+                title={w.error_detail}
+              >
+                {w.error_detail}
+              </p>
+            )}
+          </div>
+        ))}
+      </DashboardListCard>
+
       <p className="text-[11px] text-muted-foreground">
         Refreshes every 30 s. A target is flagged stale when its last sync is
         older than 2× its configured
@@ -5044,11 +5076,13 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               <span
                 className={cn(
                   "shrink-0 tabular-nums",
-                  t.last_sync_error
-                    ? "text-red-600 dark:text-red-400"
-                    : t.is_stale || t.last_sync_warning
-                      ? "text-amber-600 dark:text-amber-400"
-                      : "text-muted-foreground",
+                  t.enabled === false
+                    ? "text-muted-foreground"
+                    : t.last_sync_error
+                      ? "text-red-600 dark:text-red-400"
+                      : t.is_stale || t.last_sync_warning
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-muted-foreground",
                 )}
                 title={t.last_sync_error ?? t.last_sync_warning ?? undefined}
               >

@@ -385,8 +385,10 @@ export function CloudPage() {
               Remove the cloud account{" "}
               <span className="font-semibold">{del.name}</span>? This only
               affects SpatiumDDI — nothing on the {PROVIDER_LABEL[del.provider]}{" "}
-              side changes. All IPAM rows mirrored from this account (subnets +
-              addresses) will be removed via the FK cascade.
+              side changes. Only rows that were purely mirrored are removed.
+              Anything you added yourself (addresses, DHCP scopes, reservations,
+              edited rows, custom fields) is kept and detached from this
+              integration.
             </>
           ) : (
             ""

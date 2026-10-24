@@ -40,6 +40,7 @@ from typing import Any
 import structlog
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.services.appliance import k8s
 from app.services.appliance.containers import (
     DockerUnavailableError,
@@ -341,7 +342,7 @@ def generate_diagnostic_bundle() -> bytes:
             "appliance_mode": settings.appliance_mode,
             "appliance_version": settings.appliance_version,
             "appliance_hostname": settings.appliance_hostname,
-            "version": settings.version,
+            "version": canonical_version(settings.version, settings.app_version),
         }
         _put(
             zf,

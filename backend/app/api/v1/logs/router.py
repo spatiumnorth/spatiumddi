@@ -28,29 +28,33 @@ from typing import Any, Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
 
-from app.api.deps import DB
-from app.core.permissions import require_permission
+from app.api.deps import DB, CurrentUser
+from app.api.token_binding import honours_token_binding
+from app.core.permissions import require_permission, require_permission_or_scoped
 from app.drivers.dhcp import AGENTLESS_DRIVERS as DHCP_AGENTLESS
 from app.drivers.dhcp import get_driver as get_dhcp_driver
 from app.drivers.dns import AGENTLESS_DRIVERS as DNS_AGENTLESS
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
-from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.services.feature_modules import get_enabled_modules, require_module
-
-# Drivers backed by an in-container agent (BIND9, Kea). Distinct from
-# ``AGENTLESS_DRIVERS`` (Windows over WinRM) because the log-pull
-# transport is different — agent-driven sources push log lines to the
-# control plane on a tail thread, agentless drivers pull on demand.
-DNS_AGENT_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns"})
-DHCP_AGENT_DRIVERS: frozenset[str] = frozenset({"kea"})
+from app.services.logs.agent_logs import (
+    LogScopeError,
+    dns_query_analytics,
+    resolve_dhcp_log_servers,
+    resolve_dns_log_servers,
+    search_dhcp_activity,
+    search_dns_queries,
+)
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(dependencies=[Depends(require_permission("read", "server"))])
+# No router-level gate: the WinRM routes take ``read`` on ``server``
+# unscoped, while the agent-log routes below also admit a scoped grant and
+# narrow their own rows (#2120). Each route declares its own.
+router = APIRouter()
+_WINRM_READ = Depends(require_permission("read", "server"))
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -152,7 +156,7 @@ class DhcpAuditResponse(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 
-@router.get("/sources", response_model=list[LogSource])
+@router.get("/sources", response_model=list[LogSource], dependencies=[_WINRM_READ])
 async def list_sources(db: DB) -> list[LogSource]:
     """List every server we can pull logs from.
 
@@ -292,7 +296,7 @@ async def _resolve_server(db: DB, server_kind: str, server_id: uuid.UUID) -> tup
     return server, server.driver
 
 
-@router.post("/query", response_model=LogQueryResponse)
+@router.post("/query", response_model=LogQueryResponse, dependencies=[_WINRM_READ])
 async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     """Run a filtered ``Get-WinEvent`` against the named server and return
     matching rows.
@@ -355,7 +359,7 @@ async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
 @router.post(
     "/dhcp-audit",
     response_model=DhcpAuditResponse,
-    dependencies=[Depends(require_module("core.dhcp"))],
+    dependencies=[_WINRM_READ, Depends(require_module("core.dhcp"))],
 )
 async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
     """Read + parse a Windows DHCP server's audit log for the given day.
@@ -433,6 +437,19 @@ async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
 
 
 # ── Agent-shipped query / activity logs (BIND9 + Kea) ────────────────
+#
+# These reads cover one server, one server group, or every server, and
+# return only what the caller may read (#2120). The gate admits a ``read``
+# grant on ``server`` scoped to particular servers or groups;
+# ``app.services.logs.agent_logs`` resolves the selected set and intersects
+# it with the caller's grants, so the request's filter is never trusted on
+# its own.
+
+_AGENT_READ = Depends(require_permission_or_scoped("read", "server"))
+
+
+def _scope_http_error(exc: LogScopeError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 class AgentLogSource(BaseModel):
@@ -440,7 +457,9 @@ class AgentLogSource(BaseModel):
 
     Different shape from ``LogSource`` — there's no log-name picker
     (each agent ships one stream), and we don't pre-fetch driver
-    capability lists since the parser is universal.
+    capability lists since the parser is universal. ``group_id`` /
+    ``group_name`` drive the grouped picker (#2120); a DHCP server with no
+    group carries ``None`` for both.
     """
 
     server_id: uuid.UUID
@@ -448,11 +467,18 @@ class AgentLogSource(BaseModel):
     server_kind: Literal["dns", "dhcp"]
     driver: str
     host: str
+    group_id: uuid.UUID | None = None
+    group_name: str | None = None
 
 
-@router.get("/agent-sources", response_model=list[AgentLogSource])
-async def list_agent_sources(db: DB) -> list[AgentLogSource]:
-    """List every DNS / DHCP server backed by an agent driver.
+@router.get(
+    "/agent-sources",
+    response_model=list[AgentLogSource],
+    dependencies=[_AGENT_READ],
+)
+async def list_agent_sources(db: DB, current_user: CurrentUser) -> list[AgentLogSource]:
+    """List every DNS / DHCP server backed by an agent driver that the
+    caller may read.
 
     Drives the server-picker on the "DNS Queries" / "DHCP Activity"
     tabs. Servers whose agent has never reported in still appear —
@@ -462,42 +488,32 @@ async def list_agent_sources(db: DB) -> list[AgentLogSource]:
     """
     out: list[AgentLogSource] = []
     kinds = await _enabled_kinds(db)
-
-    dns_rows = (
-        (await db.execute(select(DNSServer).where(DNSServer.driver.in_(DNS_AGENT_DRIVERS))))
-        .scalars()
-        .all()
-        if "dns" in kinds
-        else []
-    )
-    for s in dns_rows:
-        out.append(
-            AgentLogSource(
-                server_id=s.id,
-                server_name=s.name,
-                server_kind="dns",
-                driver=s.driver,
-                host=s.host,
+    if "dns" in kinds:
+        for s in await resolve_dns_log_servers(db, current_user):
+            out.append(
+                AgentLogSource(
+                    server_id=s.id,
+                    server_name=s.name,
+                    server_kind="dns",
+                    driver=s.driver,
+                    host=s.host,
+                    group_id=s.group_id,
+                    group_name=s.group_name,
+                )
             )
-        )
-
-    dhcp_rows = (
-        (await db.execute(select(DHCPServer).where(DHCPServer.driver.in_(DHCP_AGENT_DRIVERS))))
-        .scalars()
-        .all()
-        if "dhcp" in kinds
-        else []
-    )
-    for s in dhcp_rows:
-        out.append(
-            AgentLogSource(
-                server_id=s.id,
-                server_name=s.name,
-                server_kind="dhcp",
-                driver=s.driver,
-                host=s.host,
+    if "dhcp" in kinds:
+        for s in await resolve_dhcp_log_servers(db, current_user):
+            out.append(
+                AgentLogSource(
+                    server_id=s.id,
+                    server_name=s.name,
+                    server_kind="dhcp",
+                    driver=s.driver,
+                    host=s.host,
+                    group_id=s.group_id,
+                    group_name=s.group_name,
+                )
             )
-        )
 
     out.sort(key=lambda s: (s.server_kind, s.server_name.lower()))
     return out
@@ -506,6 +522,9 @@ async def list_agent_sources(db: DB) -> list[AgentLogSource]:
 class DNSQueryLogRow(BaseModel):
     id: int
     ts: datetime
+    # Which server logged it (#2120) — a group or "all" read merges several.
+    server_id: uuid.UUID
+    server_name: str
     client_ip: str | None
     client_port: int | None
     qname: str | None
@@ -523,7 +542,11 @@ class DNSQueryLogRow(BaseModel):
 
 
 class DNSQueryLogRequest(BaseModel):
-    server_id: uuid.UUID
+    # Scope (#2120): ``server_id`` → that server; ``group_id`` → every
+    # agent server in the group; neither → every agent server the caller
+    # may read. Both set → the server, which must be in the group.
+    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
     since: datetime | None = None
     until: datetime | None = None
     q: str | None = None
@@ -541,7 +564,11 @@ class DNSQueryLogRequest(BaseModel):
 
 
 class DNSQueryLogResponse(BaseModel):
-    server_id: uuid.UUID
+    # The requested server, when one was; ``None`` for a group / all read.
+    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
+    # Every server the read covered — after the caller's grants narrowed it.
+    server_ids: list[uuid.UUID]
     events: list[DNSQueryLogRow]
     truncated: bool
 
@@ -549,60 +576,45 @@ class DNSQueryLogResponse(BaseModel):
 @router.post(
     "/dns-queries",
     response_model=DNSQueryLogResponse,
-    dependencies=[Depends(require_module("core.dns"))],
+    dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
-async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResponse:
-    """Read parsed BIND9 query log entries for a server.
+@honours_token_binding
+async def query_dns_queries(
+    body: DNSQueryLogRequest, db: DB, current_user: CurrentUser
+) -> DNSQueryLogResponse:
+    """Read parsed BIND9 / PowerDNS query log entries for one server, one
+    server group, or every server the caller may read.
 
     All filters are server-side so the firehose stays manageable —
     the typical caller asks for the most recent 200 entries with an
     optional substring on ``qname`` (e.g. operator typed "github.com"
-    to debug a resolution problem). Newest first.
+    to debug a resolution problem). Newest first, merged across servers.
     """
-    server = await db.get(DNSServer, body.server_id)
-    if server is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS server not found")
-    if server.driver not in DNS_AGENT_DRIVERS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Driver {server.driver!r} doesn't ship query logs from an "
-                f"agent. Use /logs/query for Windows DNS event log."
-            ),
+    try:
+        servers = await resolve_dns_log_servers(
+            db, current_user, server_id=body.server_id, group_id=body.group_id
         )
-
-    stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.server_id == server.id)
-    if body.since is not None:
-        stmt = stmt.where(DNSQueryLogEntry.ts >= body.since)
-    if body.until is not None:
-        stmt = stmt.where(DNSQueryLogEntry.ts <= body.until)
-    if body.qtype:
-        stmt = stmt.where(DNSQueryLogEntry.qtype == body.qtype.upper())
-    if body.client_ip:
-        stmt = stmt.where(DNSQueryLogEntry.client_ip == body.client_ip)
-    if body.view:
-        stmt = stmt.where(DNSQueryLogEntry.view == body.view)
-    if body.rcode:
-        wanted = body.rcode.strip().upper()
-        if wanted == _RCODE_UNKNOWN:
-            stmt = stmt.where(DNSQueryLogEntry.rcode.is_(None))
-        else:
-            stmt = stmt.where(DNSQueryLogEntry.rcode == wanted)
-    if body.q:
-        like = f"%{body.q.lower()}%"
-        # ILIKE on qname (most common search) and a fallback on raw —
-        # operators sometimes paste a fragment they remember from the
-        # daemon stdout that didn't survive parsing.
-        stmt = stmt.where((DNSQueryLogEntry.qname.ilike(like)) | (DNSQueryLogEntry.raw.ilike(like)))
-    stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(
-        body.max_events
+    except LogScopeError as exc:
+        raise _scope_http_error(exc) from exc
+    names = {s.id: s.name for s in servers}
+    rows = await search_dns_queries(
+        db,
+        list(names),
+        since=body.since,
+        until=body.until,
+        q=body.q,
+        qtype=body.qtype,
+        client_ip=body.client_ip,
+        view=body.view,
+        rcode=body.rcode,
+        limit=body.max_events,
     )
-
-    rows = (await db.execute(stmt)).scalars().all()
     events = [
         DNSQueryLogRow(
             id=r.id,
             ts=r.ts,
+            server_id=r.server_id,
+            server_name=names.get(r.server_id, str(r.server_id)),
             client_ip=str(r.client_ip) if r.client_ip is not None else None,
             client_port=r.client_port,
             qname=r.qname,
@@ -617,17 +629,12 @@ async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResp
         for r in rows
     ]
     return DNSQueryLogResponse(
-        server_id=server.id,
+        server_id=body.server_id,
+        group_id=body.group_id,
+        server_ids=list(names),
         events=events,
         truncated=len(events) >= body.max_events,
     )
-
-
-#: Sentinel used on the wire for "the outcome was never recorded". Not a
-#: real DNS RCODE, and deliberately not spelled like one — an operator
-#: reading ``UNKNOWN`` in the filter or the distribution should not
-#: mistake it for something the resolver returned.
-_RCODE_UNKNOWN = "UNKNOWN"
 
 
 # ── DNS query analytics ─────────────────────────────────────────────────────
@@ -639,7 +646,9 @@ class DNSQueryAnalyticsRow(BaseModel):
 
 
 class DNSQueryAnalyticsRequest(BaseModel):
-    server_id: uuid.UUID
+    # Same scope rules as ``DNSQueryLogRequest`` (#2120).
+    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
     # Defaults to "last hour" — the query log table is pruned at 24h, so
     # asking past that returns nothing useful anyway.
     since: datetime | None = None
@@ -648,7 +657,9 @@ class DNSQueryAnalyticsRequest(BaseModel):
 
 
 class DNSQueryAnalyticsResponse(BaseModel):
-    server_id: uuid.UUID
+    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
+    server_ids: list[uuid.UUID]
     since: datetime | None
     until: datetime | None
     total_queries: int
@@ -665,95 +676,57 @@ class DNSQueryAnalyticsResponse(BaseModel):
     rcode_distribution: list[DNSQueryAnalyticsRow]
 
 
+def _rows(pairs: list[tuple[str, int]]) -> list[DNSQueryAnalyticsRow]:
+    return [DNSQueryAnalyticsRow(key=k, count=n) for k, n in pairs]
+
+
 @router.post(
     "/dns-queries/analytics",
     response_model=DNSQueryAnalyticsResponse,
-    dependencies=[Depends(require_module("core.dns"))],
+    dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
-async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQueryAnalyticsResponse:
-    """Top-N rollups over the parsed BIND9 query log.
+async def query_dns_analytics(
+    body: DNSQueryAnalyticsRequest, db: DB, current_user: CurrentUser
+) -> DNSQueryAnalyticsResponse:
+    """Top-N rollups over the parsed query log, across every server the
+    scope selects.
 
     Computed on-demand against ``dns_query_log_entry`` (24 h retention).
-    Three dimensions in one round trip — operators land on the analytics
+    Every dimension in one round trip — operators land on the analytics
     panel and see all of them at once. Longer history belongs in Loki;
     this endpoint deliberately mirrors the query log's retention window.
     """
-    server = await db.get(DNSServer, body.server_id)
-    if server is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS server not found")
-    if server.driver not in DNS_AGENT_DRIVERS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Driver {server.driver!r} doesn't ship query logs — "
-                f"analytics only works for agent-based BIND9 servers."
-            ),
+    try:
+        servers = await resolve_dns_log_servers(
+            db, current_user, server_id=body.server_id, group_id=body.group_id
         )
-
-    base_filter = [DNSQueryLogEntry.server_id == server.id]
-    if body.since is not None:
-        base_filter.append(DNSQueryLogEntry.ts >= body.since)
-    if body.until is not None:
-        base_filter.append(DNSQueryLogEntry.ts <= body.until)
-
-    total_q = select(func.count()).select_from(DNSQueryLogEntry).where(*base_filter)
-    total_queries = (await db.execute(total_q)).scalar_one() or 0
-
-    async def _topn(column: Any, limit: int) -> list[DNSQueryAnalyticsRow]:
-        # Aliased to ``n`` (not ``count``) because ``Row.count`` is a method
-        # on SQLAlchemy's Row API — naming the column ``count`` would shadow
-        # it on attribute access and mypy flags the resulting confusion.
-        stmt = (
-            select(column.label("key"), func.count().label("n"))
-            .where(*base_filter, column.is_not(None))
-            .group_by(column)
-            .order_by(func.count().desc())
-            .limit(limit)
-        )
-        rows = (await db.execute(stmt)).all()
-        return [DNSQueryAnalyticsRow(key=str(r.key), count=int(r.n)) for r in rows]
-
-    top_qnames = await _topn(DNSQueryLogEntry.qname, body.limit)
-    top_clients = await _topn(DNSQueryLogEntry.client_ip, body.limit)
-    # Distribution returns *every* qtype seen, not just top-N — operators
-    # want a complete pie of A vs AAAA vs CNAME etc.
-    qtype_distribution = await _topn(DNSQueryLogEntry.qtype, 25)
-    # Per-view split (issue #371) — every view seen (small cardinality).
-    top_views = await _topn(DNSQueryLogEntry.view, 25)
-    # Outcome split (#914). ``_topn`` skips NULLs by design — that is
-    # right for a "top talkers" list and wrong here, where the NULLs are
-    # the answer to "is response logging on at all". Counted separately
-    # and prepended under an explicit key.
-    rcode_distribution = await _topn(DNSQueryLogEntry.rcode, 25)
-    unknown_rcodes = (
-        await db.execute(
-            select(func.count())
-            .select_from(DNSQueryLogEntry)
-            .where(*base_filter, DNSQueryLogEntry.rcode.is_(None))
-        )
-    ).scalar_one() or 0
-    if unknown_rcodes:
-        rcode_distribution.append(
-            DNSQueryAnalyticsRow(key=_RCODE_UNKNOWN, count=int(unknown_rcodes))
-        )
-        rcode_distribution.sort(key=lambda r: r.count, reverse=True)
-
+    except LogScopeError as exc:
+        raise _scope_http_error(exc) from exc
+    server_ids = [s.id for s in servers]
+    a = await dns_query_analytics(
+        db, server_ids, since=body.since, until=body.until, limit=body.limit
+    )
     return DNSQueryAnalyticsResponse(
-        server_id=server.id,
+        server_id=body.server_id,
+        group_id=body.group_id,
+        server_ids=server_ids,
         since=body.since,
         until=body.until,
-        total_queries=int(total_queries),
-        top_qnames=top_qnames,
-        top_clients=top_clients,
-        qtype_distribution=qtype_distribution,
-        top_views=top_views,
-        rcode_distribution=rcode_distribution,
+        total_queries=a.total_queries,
+        top_qnames=_rows(a.top_qnames),
+        top_clients=_rows(a.top_clients),
+        qtype_distribution=_rows(a.qtype_distribution),
+        top_views=_rows(a.top_views),
+        rcode_distribution=_rows(a.rcode_distribution),
     )
 
 
 class DHCPActivityLogRow(BaseModel):
     id: int
     ts: datetime
+    # Which server logged it (#2120).
+    server_id: uuid.UUID
+    server_name: str
     severity: str | None
     code: str | None
     mac_address: str | None
@@ -763,7 +736,11 @@ class DHCPActivityLogRow(BaseModel):
 
 
 class DHCPActivityLogRequest(BaseModel):
-    server_id: uuid.UUID
+    # Scope (#2120): ``server_id`` → that server; ``group_id`` → every Kea
+    # server in that DHCP server group; neither → every Kea server the
+    # caller may read.
+    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
     since: datetime | None = None
     until: datetime | None = None
     q: str | None = None
@@ -775,7 +752,9 @@ class DHCPActivityLogRequest(BaseModel):
 
 
 class DHCPActivityLogResponse(BaseModel):
-    server_id: uuid.UUID
+    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
+    server_ids: list[uuid.UUID]
     events: list[DHCPActivityLogRow]
     truncated: bool
 
@@ -783,48 +762,42 @@ class DHCPActivityLogResponse(BaseModel):
 @router.post(
     "/dhcp-activity",
     response_model=DHCPActivityLogResponse,
-    dependencies=[Depends(require_module("core.dhcp"))],
+    dependencies=[_AGENT_READ, Depends(require_module("core.dhcp"))],
 )
-async def query_dhcp_activity(body: DHCPActivityLogRequest, db: DB) -> DHCPActivityLogResponse:
-    """Read parsed Kea DHCPv4 log entries for a server. Newest first."""
-    server = await db.get(DHCPServer, body.server_id)
-    if server is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DHCP server not found")
-    if server.driver not in DHCP_AGENT_DRIVERS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Driver {server.driver!r} doesn't ship activity logs from an "
-                f"agent. Use /logs/dhcp-audit for Windows DHCP audit log."
-            ),
+@honours_token_binding
+async def query_dhcp_activity(
+    body: DHCPActivityLogRequest, db: DB, current_user: CurrentUser
+) -> DHCPActivityLogResponse:
+    """Read parsed Kea log entries for one server, one DHCP server group,
+    or every server the caller may read. Newest first, merged."""
+    try:
+        servers = await resolve_dhcp_log_servers(
+            db, current_user, server_id=body.server_id, group_id=body.group_id
         )
-
-    stmt = select(DHCPLogEntry).where(DHCPLogEntry.server_id == server.id)
-    if body.since is not None:
-        stmt = stmt.where(DHCPLogEntry.ts >= body.since)
-    if body.until is not None:
-        stmt = stmt.where(DHCPLogEntry.ts <= body.until)
-    if body.severity:
-        stmt = stmt.where(DHCPLogEntry.severity == body.severity.upper())
-    if body.code:
-        stmt = stmt.where(DHCPLogEntry.code == body.code.upper())
-    if body.mac_address:
-        stmt = stmt.where(DHCPLogEntry.mac_address == body.mac_address.lower())
-    if body.ip_address:
-        stmt = stmt.where(DHCPLogEntry.ip_address == body.ip_address)
-    if body.q:
-        like = f"%{body.q.lower()}%"
-        stmt = stmt.where(DHCPLogEntry.raw.ilike(like))
-    stmt = stmt.order_by(DHCPLogEntry.ts.desc(), DHCPLogEntry.id.desc()).limit(body.max_events)
-
-    rows = (await db.execute(stmt)).scalars().all()
+    except LogScopeError as exc:
+        raise _scope_http_error(exc) from exc
+    names = {s.id: s.name for s in servers}
+    rows = await search_dhcp_activity(
+        db,
+        list(names),
+        since=body.since,
+        until=body.until,
+        q=body.q,
+        severity=body.severity,
+        code=body.code,
+        mac_address=body.mac_address,
+        ip_address=body.ip_address,
+        limit=body.max_events,
+    )
     events = [
         DHCPActivityLogRow(
             id=r.id,
             ts=r.ts,
+            server_id=r.server_id,
+            server_name=names.get(r.server_id, str(r.server_id)),
             severity=r.severity,
             code=r.code,
-            mac_address=r.mac_address,
+            mac_address=str(r.mac_address) if r.mac_address is not None else None,
             ip_address=str(r.ip_address) if r.ip_address is not None else None,
             transaction_id=r.transaction_id,
             raw=r.raw,
@@ -832,7 +805,9 @@ async def query_dhcp_activity(body: DHCPActivityLogRequest, db: DB) -> DHCPActiv
         for r in rows
     ]
     return DHCPActivityLogResponse(
-        server_id=server.id,
+        server_id=body.server_id,
+        group_id=body.group_id,
+        server_ids=list(names),
         events=events,
         truncated=len(events) >= body.max_events,
     )

@@ -708,6 +708,9 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
                 "subnet_id": str(ip.subnet_id),
                 "subnet_network": str(sub.network) if sub else None,
                 "subnet_name": sub.name if sub else None,
+                # The same address can live in several IP spaces (#2577);
+                # every match is returned, labelled with its space.
+                "space_id": str(sub.space_id) if sub else None,
                 "status": ip.status,
                 "role": ip.role,
                 "hostname": ip.hostname,
