@@ -1673,6 +1673,9 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Moves on a SUCCESSFUL refresh only (#2313). ``last_synced_at`` is stamped
+    # on failure too, so it cannot say how long a feed has been failing.
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Rules the last adblock-format refresh could not enforce, by category
     # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count.

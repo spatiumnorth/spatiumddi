@@ -6952,6 +6952,10 @@ export interface DNSBlockList {
   last_synced_at: string | null;
   last_sync_status: string | null;
   last_sync_error: string | null;
+  /** Last refresh that SUCCEEDED (#2313); null = never. */
+  last_success_at?: string | null;
+  /** ok | error | stale | never; null for a list with no feed (#2313). */
+  feed_sync_state?: "ok" | "error" | "stale" | "never" | null;
   entry_count: number;
   /** Rules the last adblock refresh could not enforce, by category (#2123).
    *  null = not recorded (no adblock refresh yet, or another feed format). */
