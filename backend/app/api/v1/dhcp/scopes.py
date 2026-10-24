@@ -776,6 +776,7 @@ async def create_scope(
         ra_prefix_autonomous=body.ra_prefix_autonomous,
         ra_interface=body.ra_interface,
         relay_addresses=body.relay_addresses,
+        tags=body.tags,
     )
     db.add(scope)
     # The pre-check above can't see a soft-deleted scope, and even for
