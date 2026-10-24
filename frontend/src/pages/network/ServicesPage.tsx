@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1343,9 +1344,30 @@ export function ServicesPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    {byResourceActive
-                      ? `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
-                      : 'No services yet — click "New service" to add one.'}
+                    {byResourceActive ? (
+                      `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
+                    ) : (
+                      <ListEmpty
+                        error={query.error}
+                        what="services"
+                        filtered={
+                          search !== "" ||
+                          statusFilter !== "" ||
+                          kindFilter !== "" ||
+                          customerFilter !== "" ||
+                          tagFilters.length > 0
+                        }
+                        onClearFilters={() => {
+                          setSearch("");
+                          setStatusFilter("");
+                          setKindFilter("");
+                          setCustomerFilter("");
+                          setTagFilters([]);
+                        }}
+                      >
+                        No services yet — click "New service" to add one.
+                      </ListEmpty>
+                    )}
                   </td>
                 </tr>
               )}
