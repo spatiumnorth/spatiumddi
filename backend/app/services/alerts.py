@@ -406,6 +406,18 @@ _APPLIANCE_HEARTBEAT_STALE_AFTER = timedelta(minutes=5)
 _APPLIANCE_HEARTBEAT_CRITICAL_AFTER = timedelta(minutes=30)
 _APPLIANCE_HEARTBEAT_RULE_NAME = "Appliance heartbeat lost"
 
+# Issue #2400 — an appliance's /var is running out. Subject = the appliance.
+# A 1.5 GiB upgrade image on a 15 GB /var pushed a single-node appliance past
+# the kubelet's 5 % eviction threshold; the kubelet then evicted the api,
+# worker and supervisor until 15 % was free again (evictionMinimumReclaim),
+# and nothing in the product had said a word. Fires on the kubelet's
+# DiskPressure condition (critical: it is evicting now), on /var under the
+# 15 % eviction headroom (critical), and under ``threshold_percent`` free
+# (warning, default 20). Judged by ``services/appliance/var_disk``, which
+# the Fleet row and the slot-upgrade pre-flight also use.
+RULE_TYPE_APPLIANCE_DISK_LOW = "appliance_disk_low"
+_APPLIANCE_DISK_RULE_NAME = "Appliance /var low on space"
+
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
@@ -686,6 +698,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
+        RULE_TYPE_APPLIANCE_DISK_LOW,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -4205,6 +4218,111 @@ async def _matching_agent_bundle_render_failed_subjects(
     return matches
 
 
+async def _matching_appliance_disk_low_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for approved
+    appliances whose ``/var`` is low or whose node reports DiskPressure
+    (#2400).
+
+    Two inputs, each optional: the supervisor's ``/var`` reading from
+    ``cluster_health`` (judged only while fresh) and the kubelet's
+    ``DiskPressure`` condition from the live cluster snapshot, matched to
+    the appliance by k8s node name. A cluster that cannot be read just
+    leaves the condition unknown; the /var reading still decides.
+
+    **A reading that goes away does not resolve an open event.** The pods
+    eviction takes down include the supervisor, so a node in DiskPressure
+    is precisely the node whose heartbeat stops — and ``evaluate_all``
+    resolves every open event whose subject is absent from a pass.
+    Without the hold, the alarm would announce a recovery at the moment
+    the outage was worst. Same treatment as ``appliance_storage_degraded``.
+    """
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+    from app.services.appliance.ownership import k8s_node_name  # noqa: PLC0415
+    from app.services.appliance.var_disk import (  # noqa: PLC0415
+        LOW_FREE_PCT,
+        evaluate_var_disk,
+        reading_is_fresh,
+        var_disk_reading,
+    )
+
+    threshold = float(
+        rule.threshold_percent if rule.threshold_percent is not None else LOW_FREE_PCT
+    )
+
+    pressure_by_node: dict[str, bool] = {}
+    try:
+        snap = await _cluster_health_snapshot()
+    except AlertDataUnavailable:
+        snap = None
+    for node in (snap or {}).get("nodes") or []:
+        name = node.get("name")
+        dp = node.get("disk_pressure")
+        if name and isinstance(dp, bool):
+            pressure_by_node[str(name).lower()] = dp
+
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.revoked_at.is_(None),
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    open_severity_by_subject: dict[str, str] = {
+        ev.subject_id: ev.severity
+        for ev in (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+
+    out: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        subject_id = str(a.id)
+        fresh = reading_is_fresh(a.last_seen_at, now)
+        reading = var_disk_reading(a.cluster_health) if fresh else None
+        pressure = pressure_by_node.get(k8s_node_name(a.hostname))
+        finding = evaluate_var_disk(reading, disk_pressure=pressure, low_free_pct=threshold)
+        if finding is not None:
+            out.append(
+                (subject_id, a.hostname, f"{a.hostname}: {finding.detail}", finding.severity)
+            )
+            continue
+        if reading is None and pressure is None:
+            held = open_severity_by_subject.get(subject_id)
+            if held is not None:
+                out.append(
+                    (
+                        subject_id,
+                        a.hostname,
+                        f"{a.hostname}: /var can no longer be read — the supervisor "
+                        "has stopped reporting (kubelet eviction takes it down too). "
+                        "The last known state is left standing because unknown is "
+                        "not recovered.",
+                        held,
+                    )
+                )
+    return out
+
+
 async def _matching_appliance_heartbeat_stale_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -5366,6 +5484,45 @@ async def seed_appliance_storage_alert_rule() -> None:
                     "state. Auto-resolves when redundancy is restored."
                 ),
                 rule_type=RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+                severity="warning",
+                enabled=True,
+            )
+        )
+        await session.commit()
+
+
+async def seed_appliance_disk_alert_rule() -> None:
+    """Seed the #2400 rule, ENABLED by default with a 20 % threshold.
+
+    Cannot fire on an install with no appliances (Compose / plain k8s have
+    none), nor on a supervisor too old to report /var. Keyed on ``name``; an
+    operator who disables, retunes or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+    from app.services.appliance.var_disk import LOW_FREE_PCT  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _APPLIANCE_DISK_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_APPLIANCE_DISK_RULE_NAME,
+                description=(
+                    "Fires when an appliance's /var is running out of space. The "
+                    "kubelet evicts pods at 5% free and, once it has started, keeps "
+                    "evicting until 15% is free; on a single-node appliance the "
+                    "evicted pods are the api, worker and supervisor. Critical when "
+                    "the node reports DiskPressure or /var is under 15% free; "
+                    "warning under the threshold (default 20%). Free space by "
+                    "deleting unused upgrade images in Fleet. Silent on supervisors "
+                    "too old to report /var. Auto-resolves once space is back."
+                ),
+                rule_type=RULE_TYPE_APPLIANCE_DISK_LOW,
+                threshold_percent=LOW_FREE_PCT,
                 severity="warning",
                 enabled=True,
             )
@@ -7405,6 +7562,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in storage_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_DISK_LOW:
+                low_disk = await _matching_appliance_disk_low_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in low_disk]
                 subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_APPLIANCE_HEARTBEAT_STALE:
                 silent_nodes = await _matching_appliance_heartbeat_stale_subjects(db, rule, now)

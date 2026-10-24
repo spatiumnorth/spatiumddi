@@ -63,6 +63,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1.appliance.cluster import VarDiskFinding
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WAKE_TICK_SECONDS,
@@ -99,6 +100,7 @@ from app.models.appliance import (
     DESIRED_CLUSTER_ROLE_MEMBER,
     DESIRED_CLUSTER_ROLE_NONE,
     Appliance,
+    ApplianceUpgradeImage,
     PairingClaim,
     PairingCode,
 )
@@ -166,6 +168,12 @@ from app.services.appliance.storage_health import (
 )
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
+from app.services.appliance.var_disk import (
+    reading_is_fresh,
+    staging_shortfall,
+    var_disk_fields,
+    var_disk_reading,
+)
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
 from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
@@ -2174,6 +2182,14 @@ async def supervisor_heartbeat(
         # blanking it back to UNKNOWN, which would silently disarm the
         # upgrade-architecture gate on every node during a rollout.
         row.architecture = body.architecture
+    # #2400 — what the node had written before this heartbeat; a change is
+    # the moment a stored upgrade image may have become reclaimable.
+    slot_state_before = (
+        row.installed_appliance_version,
+        row.slot_a_version,
+        row.slot_b_version,
+        row.desired_slot_image_url,
+    )
     if body.installed_appliance_version is not None:
         row.installed_appliance_version = body.installed_appliance_version
     if body.current_slot is not None:
@@ -2838,6 +2854,19 @@ async def supervisor_heartbeat(
 
     await db.commit()
 
+    # #2400 — a node just reported a new slot / installed version, or its
+    # schedule was cleared: a stored upgrade image every node has now
+    # written is gigabytes on the control plane's /var doing nothing.
+    # Best-effort and after the telemetry commit, so a failure here can
+    # never cost the heartbeat.
+    if slot_state_before != (
+        row.installed_appliance_version,
+        row.slot_a_version,
+        row.slot_b_version,
+        row.desired_slot_image_url,
+    ):
+        await _reclaim_written_upgrade_images()
+
     # #358 Phase 1b — heartbeat long-poll. When the supervisor opts in
     # (wait_seconds > 0) and there's no concrete pending host command,
     # hold the response open until a per-appliance wake fires (upgrade /
@@ -3496,6 +3525,10 @@ class ApplianceRow(BaseModel):
     storage_findings: list[dict[str, str]] = []
     storage_worst_severity: str | None = None
     storage_reported: bool = False
+    # #2400 — /var headroom against kubelet eviction, judged by the function
+    # behind the ``appliance_disk_low`` alert. ``None`` = fine or unknown.
+    # The raw numbers are in ``cluster_health.host_disk_partitions``.
+    var_disk_finding: VarDiskFinding | None = None
     # #1017 — the interface MTU spatium-etc-render actually APPLIED at
     # this node's last boot, not what STATE asked for: the renderer drops
     # a value that is out of range, that would break a pinned IPv6
@@ -3584,6 +3617,15 @@ def _storage_findings(row: Appliance) -> list[StorageFinding]:
 
 def _storage_worst_severity(row: Appliance) -> str | None:
     return worst_severity(_storage_findings(row))
+
+
+def _var_disk_finding(row: Appliance) -> dict[str, Any] | None:
+    """#2400 — the /var finding for one appliance row (``None`` = fine or
+    unknown). A stale reading is not judged: it says nothing about now."""
+    finding: dict[str, Any] | None = var_disk_fields(row.cluster_health, row.last_seen_at)[
+        "var_disk_finding"
+    ]
+    return finding
 
 
 def mtu_fields(cluster_health: Any) -> dict[str, Any]:
@@ -3696,6 +3738,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ],
         storage_worst_severity=_storage_worst_severity(row),
         storage_reported=has_storage_report(row.cluster_health),
+        var_disk_finding=_var_disk_finding(row),
         **mtu_fields(row.cluster_health),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
@@ -6618,6 +6661,46 @@ class ApplianceUpgradeRequest(BaseModel):
     acknowledge_schema_rollback: bool = False
 
 
+async def _reclaim_written_upgrade_images() -> None:
+    """Run the #2400 reclaim in its own session; log any failure.
+
+    Its own session so a failure rolls back only the reclaim: rolling back
+    the heartbeat's session would expire ``row``, which the long-poll below
+    still reads."""
+    from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
+        reclaim_committed_upgrade_images,
+    )
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    try:
+        async with AsyncSessionLocal() as session:
+            if await reclaim_committed_upgrade_images(session):
+                await session.commit()
+    except Exception as exc:  # noqa: BLE001 — never fail a heartbeat over cleanup
+        logger.warning("appliance_upgrade_image_reclaim_failed", error=str(exc))
+
+
+async def _require_node_staging_headroom(
+    db: AsyncSession, row: Appliance, slot_image_id: uuid.UUID | None
+) -> None:
+    """422 when staging the image on ``row``'s /var would leave it under the
+    kubelet's eviction headroom (#2400). Silent when the node's reading is
+    absent or stale — unknown is not a refusal."""
+    if not reading_is_fresh(row.last_seen_at):
+        return
+    reading = var_disk_reading(row.cluster_health)
+    if reading is None:
+        return
+    image_bytes = 0
+    if slot_image_id is not None:
+        image = await db.get(ApplianceUpgradeImage, slot_image_id)
+        if image is not None:
+            image_bytes = int(image.size_bytes or 0)
+    message = staging_shortfall(reading, image_bytes, row.hostname)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
 @router.post(
     "/appliances/{appliance_id}/upgrade",
     response_model=ApplianceRow,
@@ -6674,6 +6757,16 @@ async def schedule_appliance_upgrade(
                 "for docker / k8s deployments."
             ),
         )
+
+    # #2400 — the node downloads the image onto its own /var before writing
+    # the slot. If that leaves under the kubelet's eviction headroom, the
+    # kubelet evicts the control plane mid-upgrade. The host runner refuses
+    # too (rc 7), but only after the operator has been told "scheduled";
+    # refuse here, with the numbers, while the request is still open. The
+    # size is the stored image's for an uploaded/imported one; an external
+    # URL's is unknown, so only the margin itself is checked. A missing or
+    # stale reading is UNKNOWN and does not refuse (the host check remains).
+    await _require_node_staging_headroom(db, row, body.slot_image_id)
 
     # #1227 — an "upgrade" to an older image on a control-plane node is a
     # downgrade of the release that runs on THE database, which that release

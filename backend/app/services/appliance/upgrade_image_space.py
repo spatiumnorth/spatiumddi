@@ -28,10 +28,12 @@ import structlog
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 
+# evictionHard 5 % + evictionMinimumReclaim 10 %: one definition, shared with
+# the /var alert and the slot-upgrade scheduling pre-flight.
+from app.services.appliance.var_disk import EVICTION_HEADROOM_PCT
+
 logger = structlog.get_logger(__name__)
 
-# evictionHard 5 % + evictionMinimumReclaim 10 %.
-EVICTION_HEADROOM_PCT = 15
 
 _MIB = 1024 * 1024
 

@@ -13131,6 +13131,9 @@ export interface ApplianceRow {
   // False = the supervisor never looked (too old to collect it), which is
   // UNKNOWN — distinct from "looked and found no arrays".
   storage_reported: boolean;
+  // #2400 — /var low or under the kubelet eviction headroom. Null = fine
+  // or unknown (no reading, or a stale one).
+  var_disk_finding?: VarDiskFinding | null;
   // #1017 — the interface MTU spatium-etc-render actually APPLIED at this
   // node's last boot, which is not what STATE asked for: the renderer
   // drops a value that is out of range, that would break a pinned IPv6
@@ -13706,6 +13709,20 @@ export interface HostPartition {
   label: string;
   total_bytes: number;
   used_bytes: number;
+  // #2400 — statvfs f_bavail (the kubelet's eviction measure). Absent from
+  // a supervisor too old to send it.
+  available_bytes?: number | null;
+}
+
+/**
+ * #2400 — /var against kubelet eviction, judged server-side by the same
+ * function behind the `appliance_disk_low` alert. Absent / null = fine or
+ * unknown.
+ */
+export interface VarDiskFinding {
+  severity: "warning" | "critical" | string;
+  free_pct: number | null;
+  detail: string;
 }
 
 /** One member of a software-RAID array (#999 Part A). */
@@ -13935,6 +13952,7 @@ export interface ClusterNodeVitals {
    * real "no arrays here" reading.
    */
   host_storage: NodeStorage | null;
+  var_disk_finding?: VarDiskFinding | null;
 }
 
 /** One /proc/pressure line's rolling averages, as % of wall time. */

@@ -39,6 +39,7 @@ from app.services.appliance import k8s
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
 from app.services.appliance.ownership import k8s_node_name
 from app.services.appliance.storage_health import evaluate_storage, worst_severity
+from app.services.appliance.var_disk import evaluate_var_disk, var_disk_reading
 
 logger = structlog.get_logger(__name__)
 
@@ -55,6 +56,19 @@ class HostPartition(BaseModel):
     label: str
     total_bytes: int
     used_bytes: int
+    # #2400 — statvfs f_bavail, what the kubelet's eviction signal measures
+    # (``total - used`` also counts ext4's 5 % root reserve). None from a
+    # supervisor too old to send it.
+    available_bytes: int | None = None
+
+
+class VarDiskFinding(BaseModel):
+    """#2400 — /var against kubelet eviction, from ``services/appliance/
+    var_disk`` (the ``appliance_disk_low`` alert's own evaluator)."""
+
+    severity: str
+    free_pct: float | None = None
+    detail: str
 
 
 # ── #999 Part A — storage redundancy, as reported by the supervisor ──
@@ -256,6 +270,8 @@ class NodeVitals(BaseModel):
     # old to collect it), which is UNKNOWN and must never render as a
     # green tick. An empty snapshot is a real "nothing here" reading.
     host_storage: NodeStorage | None = None
+    # #2400 — set when /var is low or the node reports DiskPressure.
+    var_disk_finding: VarDiskFinding | None = None
 
 
 class PodSummary(BaseModel):
@@ -395,6 +411,16 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
         key = k8s_node_name(node["name"])
         if key in pmap:
             node["host_disk_partitions"] = pmap[key]
+        finding = evaluate_var_disk(
+            var_disk_reading({"host_disk_partitions": pmap.get(key)}),
+            disk_pressure=node.get("disk_pressure"),
+        )
+        if finding is not None:
+            node["var_disk_finding"] = {
+                "severity": finding.severity,
+                "free_pct": finding.free_pct,
+                "detail": finding.detail,
+            }
         if key in smap:
             storage = dict(smap[key])
             findings = evaluate_storage(storage)

@@ -607,6 +607,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_disk_alert_rule,
             seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
@@ -620,6 +621,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_appliance_storage_alert_rule()
         # Silent supervisor (#2259) — cannot fire with no appliances.
         await seed_appliance_heartbeat_alert_rule()
+        # /var headroom (#2400) — cannot fire with no appliances.
+        await seed_appliance_disk_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue

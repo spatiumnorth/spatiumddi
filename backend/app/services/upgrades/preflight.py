@@ -70,6 +70,7 @@ from app.models.appliance import (
 )
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer
+from app.services.appliance import var_disk
 from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
 from app.services.upgrades import mutex
 
@@ -334,26 +335,13 @@ def _node_var_free_bytes(cluster_health: Any) -> int | None:
     """Free bytes on a node's ``/var`` from its reported partitions.
 
     ``None`` = no usable reading (key absent, entry absent, malformed) —
-    UNKNOWN, never zero and never "plenty".
+    UNKNOWN, never zero and never "plenty". Read through
+    :func:`var_disk.var_disk_reading`, which prefers the kubelet's own
+    measure (``available_bytes``, statvfs f_bavail) over ``total - used``,
+    which counts ext4's root reserve as free (#2400).
     """
-    if not isinstance(cluster_health, dict):
-        return None
-    parts = cluster_health.get("host_disk_partitions")
-    if not isinstance(parts, list):
-        return None
-    for p in parts:
-        if not isinstance(p, dict) or p.get("mount") != "/var":
-            continue
-        total, used = p.get("total_bytes"), p.get("used_bytes")
-        if (
-            isinstance(total, int)
-            and isinstance(used, int)
-            and not isinstance(total, bool)
-            and not isinstance(used, bool)
-            and total > 0
-        ):
-            return max(total - used, 0)
-    return None
+    reading = var_disk.var_disk_reading(cluster_health)
+    return reading.free_bytes if reading is not None else None
 
 
 def judge_node_disk_headroom(

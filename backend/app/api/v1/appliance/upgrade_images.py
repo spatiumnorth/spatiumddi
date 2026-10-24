@@ -56,7 +56,7 @@ import os
 import shutil
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -75,7 +75,8 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, SuperAdmin
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
@@ -1297,6 +1298,124 @@ async def download_upgrade_image(
     )
 
 
+async def _delete_image_bytes(image_id: uuid.UUID) -> None:
+    """Remove an image's bytes from the mirror (when on) and local FS."""
+    if settings.slot_image_mirror_url:
+        # #296 Phase B — delete from the mirror Deployment. Best-effort:
+        # the DB row delete is the authoritative signal; stale bytes on
+        # the mirror get reaped by the future prune task.
+        await _delete_from_mirror(image_id)
+    # #787 — always sweep local FS too, not just on the no-mirror branch.
+    # The appliance keeps the slot-images hostPath mounted even with the
+    # mirror on (so a pre-promote image is still readable), which means a
+    # local copy can exist in mirror mode. Skipping it here would strand
+    # 1-4 GiB per deleted image on the seed's /var forever — the "future
+    # prune task" the mirror branch defers to does not exist, and would
+    # not cover local FS anyway. It also removes the stale-bytes hazard
+    # the download fallback would otherwise inherit: without this, a
+    # deleted image could still be served from a node's local copy.
+    try:
+        _image_path(image_id).unlink(missing_ok=True)
+    except OSError as exc:
+        # Disk-side cleanup is best-effort — the row delete is the
+        # authoritative "this image is gone" signal. Logged rather than
+        # swallowed so a permission / read-only-mount problem is visible
+        # instead of quietly accumulating gigabytes.
+        logger.warning(
+            "upgrade_image_local_unlink_failed",
+            image_id=str(image_id),
+            error=str(exc),
+        )
+
+
+# #2400 — an image younger than this is never reclaimed: an operator who has
+# just uploaded or imported one (say, to re-apply a version every node already
+# runs) has not had the chance to schedule it yet.
+_RECLAIM_MIN_AGE = timedelta(hours=1)
+
+
+async def reclaim_committed_upgrade_images(db: AsyncSession) -> list[str]:
+    """Delete stored upgrade images every node has already written (#2400).
+
+    A 1.5 GiB ``.raw.xz`` stayed in the store on the control plane's /var
+    after it had been written to the slots, until somebody deleted it by
+    hand — on a 15 GB /var, the difference between headroom and kubelet
+    eviction. An image is reclaimed only when ALL of these hold:
+
+    * every approved appliance-OS node it applies to (same architecture,
+      or either side unlabelled) reports its version in a slot or as
+      installed. The slot version is stamped by ``spatium-upgrade-slot``
+      AFTER the write and its verification, so this is never before the
+      write is known good — and a node whose write failed still lacks it;
+    * no node is scheduled to fetch it and no active rolling run names it
+      (the delete endpoint's own in-use rule, #2410);
+    * it is older than :data:`_RECLAIM_MIN_AGE`.
+
+    Returns the reclaimed images' ``"<filename> (<version>)"``. The caller
+    commits. Best-effort per image: bytes that cannot be removed are
+    logged by :func:`_delete_image_bytes`, and the row still goes.
+    """
+    from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance  # noqa: PLC0415
+    from app.services.appliance.architecture import normalize  # noqa: PLC0415
+
+    images = list((await db.execute(select(ApplianceUpgradeImage))).scalars().all())
+    if not images:
+        return []
+    nodes = (
+        await db.execute(
+            select(Appliance.hostname, Appliance.architecture).where(
+                Appliance.state == APPLIANCE_STATE_APPROVED,
+                Appliance.revoked_at.is_(None),
+                or_(Appliance.deployment_kind.is_(None), Appliance.deployment_kind == "appliance"),
+            )
+        )
+    ).all()
+    usage = await catalog.image_usage(db, images)
+    cutoff = datetime.now(UTC) - _RECLAIM_MIN_AGE
+    reclaimed: list[str] = []
+    for img in images:
+        u = usage[img.id]
+        if u.scheduled_for or u.run_id is not None:
+            continue
+        uploaded = img.uploaded_at
+        if uploaded is not None and uploaded.tzinfo is None:
+            uploaded = uploaded.replace(tzinfo=UTC)
+        if uploaded is None or uploaded > cutoff:
+            continue
+        img_arch = normalize(img.architecture)
+        wanted = {
+            host
+            for host, arch in nodes
+            if not (img_arch and normalize(arch) and normalize(arch) != img_arch)
+        }
+        if not wanted or not wanted <= set(u.installed_on):
+            continue
+        await _delete_image_bytes(img.id)
+        label = f"{img.filename} ({img.appliance_version})"
+        await db.delete(img)
+        db.add(
+            AuditLog(
+                user_id=None,
+                user_display_name="system",
+                auth_source="system",
+                action="appliance.upgrade_image_reclaimed",
+                resource_type="appliance_upgrade_image",
+                resource_id=str(img.id),
+                resource_display=label,
+                new_value={"written_on": sorted(wanted), "size_bytes": img.size_bytes},
+                result="success",
+            )
+        )
+        logger.info(
+            "appliance_upgrade_image_reclaimed",
+            image_id=str(img.id),
+            version=img.appliance_version,
+            written_on=sorted(wanted),
+        )
+        reclaimed.append(label)
+    return reclaimed
+
+
 @router.delete(
     "/upgrade-images/{image_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -1335,32 +1454,7 @@ async def delete_upgrade_image(
             + "; ".join(forced_over)
             + ". Cancel the upgrade first, or retry with force=true.",
         )
-    if settings.slot_image_mirror_url:
-        # #296 Phase B — delete from the mirror Deployment. Best-effort:
-        # the DB row delete below is the authoritative signal; stale
-        # bytes on the mirror get reaped by the future prune task.
-        await _delete_from_mirror(row.id)
-    # #787 — always sweep local FS too, not just on the no-mirror branch.
-    # The appliance keeps the slot-images hostPath mounted even with the
-    # mirror on (so a pre-promote image is still readable), which means a
-    # local copy can exist in mirror mode. Skipping it here would strand
-    # 1-4 GiB per deleted image on the seed's /var forever — the "future
-    # prune task" the mirror branch defers to does not exist, and would
-    # not cover local FS anyway. It also removes the stale-bytes hazard
-    # the download fallback would otherwise inherit: without this, a
-    # deleted image could still be served from a node's local copy.
-    try:
-        _image_path(row.id).unlink(missing_ok=True)
-    except OSError as exc:
-        # Disk-side cleanup is best-effort — the row delete below is the
-        # authoritative "this image is gone" signal. Logged rather than
-        # swallowed so a permission / read-only-mount problem is visible
-        # instead of quietly accumulating gigabytes.
-        logger.warning(
-            "upgrade_image_local_unlink_failed",
-            image_id=str(row.id),
-            error=str(exc),
-        )
+    await _delete_image_bytes(row.id)
     filename = row.filename
     version = row.appliance_version
     await db.delete(row)

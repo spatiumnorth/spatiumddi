@@ -70,6 +70,7 @@ import {
   type HistPoint,
 } from "./clusterShared";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import { VarDiskWarning } from "./VarDiskWarning";
 
 /**
  * Cluster → Overview (#402 / #416) — one cohesive, near-real-time dashboard
@@ -848,6 +849,11 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
             with neither, so a single-disk appliance is unchanged.
           */}
           <StorageRow storage={node.host_storage ?? null} />
+          {/*
+            #2400 — /var low or under the kubelet's eviction headroom, judged
+            by the evaluator behind the appliance_disk_low alert.
+          */}
+          <VarDiskWarning finding={node.var_disk_finding} compact />
         </div>
       </div>
     </div>
