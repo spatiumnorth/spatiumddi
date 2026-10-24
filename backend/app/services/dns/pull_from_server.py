@@ -35,7 +35,11 @@ from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
-from app.services.dns.record_ops import resolve_primary_server, rrset_from_payload
+from app.services.dns.record_ops import (
+    QUEUED_OP_STATES,
+    resolve_primary_server,
+    rrset_from_payload,
+)
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.tsig import (
@@ -668,7 +672,7 @@ async def _queue_for_agent(
                 select(DNSRecordOp).where(
                     DNSRecordOp.server_id == server.id,
                     DNSRecordOp.zone_id == zone.id,
-                    DNSRecordOp.state.in_(("pending", "in_flight")),
+                    DNSRecordOp.state.in_(QUEUED_OP_STATES),
                     DNSRecordOp.op == "create",
                 )
             )
