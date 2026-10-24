@@ -342,6 +342,12 @@ Multiple syslog targets can be configured simultaneously (e.g., local Loki + rem
 
 ### 2.7 Audit Log and Data Retention
 
+- Retention period (default: 365 days)
+- Export audit log: date range → CSV or JSON download
+- Archive to S3-compatible storage (optional)
+- Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
+- Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
+- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which runs at least once every 7 days, and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to a week between an edit to an old row and its alert. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
 **Audit log.** The audit log is append-only: nothing deletes from it,
 not even a superadmin, and no task prunes it, so it has no retention
 setting. Every mutation records the user, timestamp, source IP, action,
@@ -751,7 +757,7 @@ The proxy-download endpoint streams `driver.download(filename)` straight back to
 Same code path is hit whether the archive comes from an upload or a destination download.
 
 1. **Pre-flight.** Validates archive shape, manifest `format_version` (1 or 2 currently), passphrase. The passphrase verify happens **before** any destructive step so a wrong passphrase is rejected up front.
-2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump.
+2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump. Only the newest three safety dumps are kept in that directory; older ones are deleted when a new one is written, because each carries the install's `SECRET_KEY` under that public passphrase.
 3. **Connection pool teardown.** SQLAlchemy's engine is disposed and `pg_terminate_backend` kicks every other connection so the replay's drops don't deadlock against the worker / beat / agents.
 4. **Data replay.**
    - Full restore: the schema is **cleared, then the archive replayed, in one transaction** (#1363). `psql --single-transaction --set=ON_ERROR_STOP=1` reads one script on stdin: first a block that drops every table, view, sequence, standalone type and routine in `public` (extension members excepted), then the archive's SQL. For a Phase 2+ archive (`dump_format: custom`) that SQL is `pg_restore --no-owner --no-acl --file=-`'s output, streamed rather than staged on disk. For a Phase 1 archive (plain SQL) it is the dump itself. If `pg_restore` fails part way, psql is killed before it reaches end of input, so it never commits. A replay counts as complete only when psql acknowledges the end of the script: a per-run token is `\echo`-ed after the archive's last statement, so a psql that left early with exit 0 is reported as a partial restore, not a success. Any failure before psql is given end of input (a bad statement, a `pg_restore` error, a timeout) rolls back and leaves the database exactly as it was. The one exception is a timeout after end of input, while psql may be committing. It is reported as an unknown outcome, not as a rollback, so check the database (or restore the pre-restore safety dump) before relying on it.
@@ -849,7 +855,7 @@ A backup you have never restored is a hypothesis. The **Restore Drills** tab tur
 | `dump_replays_cleanly` | `pg_restore` / `psql` aborted — the dump is truncated or corrupt. |
 | `alembic_version_present` | No single schema revision, or one this build has never heard of (the archive came from a newer SpatiumDDI). An archive *behind* the bundled head passes: a real restore migrates it forward. |
 | `core_tables_populated` | The archive restored but came back with no users — an install restored from it would have no way in. |
-| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. Capped at 250k rows — a break inside that window is plenty to prove damage, and the nightly `audit_chain_verify` task walks the live table exhaustively. |
+| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. Capped at 250k rows — a break inside that window is plenty to prove damage, and the `audit_chain_verify` task walks the whole live table at least weekly (see §2.7). |
 
 #### Requirements and costs
 

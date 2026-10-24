@@ -429,7 +429,7 @@ Available at `/admin/audit`:
 - Same filtering and live-tail as the log viewer
 - Additional filters: `action`, `resource_type`, `result`
 - Diff view for updates: shows old vs. new value side-by-side
-- Non-deletable — no delete button, enforced at DB level (trigger prevents DELETE)
+- Non-deletable and non-editable — no delete button, and DB triggers refuse DELETE and UPDATE. Tamper-evident, not tamper-proof: the database owner can drop the triggers, which the `audit_log_immutable` conformity check reports
 
 ### 5.1 External forwarding
 

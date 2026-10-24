@@ -79,6 +79,46 @@ def validate_transport(value: str | None) -> str | None:
     return value
 
 
+# The non-secret connection settings of a stored WinRM credential blob. The
+# server responses echo these (never ``username`` / ``password``) so an edit
+# dialog can show what is stored instead of a hard-coded default.
+WINRM_SETTING_KEYS: tuple[str, ...] = ("winrm_port", "transport", "use_tls", "verify_tls")
+
+
+def effective_winrm_settings(creds: dict[str, Any]) -> dict[str, Any]:
+    """The connection settings ``run_ps`` will actually use for ``creds``.
+
+    One reading for the session builder and the API echo, so what an edit
+    dialog shows is what the next WinRM call does — including for a blob
+    stored without one of the keys.
+    """
+    use_tls = bool(creds.get("use_tls", False))
+    return {
+        "winrm_port": int(creds.get("winrm_port") or (5986 if use_tls else 5985)),
+        "transport": creds.get("transport") or "ntlm",
+        "use_tls": use_tls,
+        "verify_tls": bool(creds.get("verify_tls", False)),
+    }
+
+
+def winrm_settings_diff(
+    before: dict[str, Any] | None, after: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """``{key: {"old": …, "new": …}}`` for each effective setting that moved.
+
+    For the audit row: a credential update records the old and new value of
+    every non-secret setting it changed, not just the key names it carried.
+    ``before`` is None when nothing was stored.
+    """
+    new = effective_winrm_settings(after)
+    old = effective_winrm_settings(before) if before is not None else None
+    return {
+        k: {"old": old[k] if old is not None else None, "new": new[k]}
+        for k in WINRM_SETTING_KEYS
+        if old is None or old[k] != new[k]
+    }
+
+
 def _warn_insecure_transport(host: str, transport: str, use_tls: bool, verify_tls: bool) -> None:
     """Emit a one-time-ish WARNING when the WinRM transport is insecure,
     matching the #289 hardening on the proxmox / unifi / opnsense / ftp
@@ -131,14 +171,15 @@ def run_ps(
     # that only run agent-based drivers don't need the pywinrm wheel.
     import winrm  # noqa: PLC0415
 
-    transport = creds.get("transport") or "ntlm"
+    settings = effective_winrm_settings(creds)
+    transport = settings["transport"]
     if transport == "kerberos":
         # A server saved with Kerberos before #1128 — say why, instead of
         # letting pywinrm fail on the missing library.
         raise RuntimeError(KERBEROS_UNSUPPORTED + " Edit the server and pick another transport.")
-    use_tls = bool(creds.get("use_tls", False))
-    verify_tls = bool(creds.get("verify_tls", False))
-    port = int(creds.get("winrm_port") or (5986 if use_tls else 5985))
+    use_tls = settings["use_tls"]
+    verify_tls = settings["verify_tls"]
+    port = settings["winrm_port"]
     scheme = "https" if use_tls else "http"
     endpoint = f"{scheme}://{host}:{port}/wsman"
 

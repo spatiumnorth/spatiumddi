@@ -13,6 +13,7 @@ synchronous round-trip.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 import structlog
@@ -31,8 +32,14 @@ logger = structlog.get_logger(__name__)
     max_retries=3,
     default_retry_delay=60,
 )
-def lookup_fingerprint_task(self: Any, mac_address: str) -> dict[str, str]:
+def lookup_fingerprint_task(
+    self: Any, mac_address: str, server_id: str | None = None
+) -> dict[str, str]:
     """Drive one fingerbank lookup + IP-stamp pass.
+
+    ``server_id`` is the reporting DHCP server; it scopes the IP stamp to
+    the spaces that server serves (#2577). Optional so a message queued
+    by an older api still runs.
 
     The fingerbank service swallows network errors internally, so a
     failure here typically means a DB issue (connection drop, schema
@@ -41,7 +48,7 @@ def lookup_fingerprint_task(self: Any, mac_address: str) -> dict[str, str]:
     """
     logger.info("dhcp_fingerprint_task_started", mac=mac_address)
     try:
-        asyncio.run(_run(mac_address))
+        asyncio.run(_run(mac_address, server_id))
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "dhcp_fingerprint_task_error",
@@ -53,10 +60,14 @@ def lookup_fingerprint_task(self: Any, mac_address: str) -> dict[str, str]:
     return {"mac": mac_address}
 
 
-async def _run(mac_address: str) -> None:
+async def _run(mac_address: str, server_id: str | None = None) -> None:
     async with task_session() as db:
         # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
         # do no work (and open no driver connections) when it is.
         if not await is_module_enabled(db, "core.dhcp"):
             return
-        await run_lookup_and_stamp(db, mac_address=mac_address)
+        await run_lookup_and_stamp(
+            db,
+            mac_address=mac_address,
+            server_id=uuid.UUID(server_id) if server_id else None,
+        )

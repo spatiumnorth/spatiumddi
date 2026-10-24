@@ -422,7 +422,8 @@ export function BulkAllocateModal({
               previewData &&
               previewData.conflicts_in_use +
                 previewData.conflicts_in_pool +
-                previewData.conflicts_fqdn >
+                previewData.conflicts_fqdn +
+                (previewData.conflicts_no_perm ?? 0) >
                 0)
           }
           onClick={() => commitMut.mutate()}
@@ -642,7 +643,10 @@ function PreviewResults({
   onCollision: "skip" | "abort";
 }) {
   const totalConflicts =
-    data.conflicts_in_use + data.conflicts_in_pool + data.conflicts_fqdn;
+    data.conflicts_in_use +
+    data.conflicts_in_pool +
+    data.conflicts_fqdn +
+    (data.conflicts_no_perm ?? 0);
   const blockedByAbort = onCollision === "abort" && totalConflicts > 0;
 
   return (
@@ -688,6 +692,12 @@ function PreviewResults({
               <li>
                 {data.conflicts_fqdn} IP(s) collide on hostname+zone with
                 existing rows
+              </li>
+            )}
+            {(data.conflicts_no_perm ?? 0) > 0 && (
+              <li>
+                {data.conflicts_no_perm} IP(s) outside the address sets you can
+                edit
               </li>
             )}
           </ul>

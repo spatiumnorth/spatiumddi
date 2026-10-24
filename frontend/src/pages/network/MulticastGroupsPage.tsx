@@ -1387,7 +1387,20 @@ function GroupsTabBody({
                   colSpan={8}
                   className="px-3 py-10 text-center text-sm text-muted-foreground"
                 >
-                  <ListEmpty error={query.error} what="multicast groups">
+                  <ListEmpty
+                    error={query.error}
+                    what="multicast groups"
+                    filtered={
+                      search !== "" ||
+                      spaceFilter !== "" ||
+                      customerFilter !== ""
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setSpaceFilter("");
+                      setCustomerFilter("");
+                    }}
+                  >
                     No multicast groups yet. Click <strong>New group</strong> to
                     add the first.
                   </ListEmpty>

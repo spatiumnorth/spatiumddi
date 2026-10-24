@@ -164,6 +164,16 @@ class Settings(BaseSettings):
     # proxy's address. Validated at boot: a bad entry fails it.
     trusted_proxy_cidrs: str = DEFAULT_TRUSTED_PROXY_CIDRS
 
+    # Password sign-in failure ceilings on ``POST /auth/login``, per 15-minute
+    # window, kept in Redis (``app.core.auth_throttle``). One per submitted
+    # username (lower-cased, counted whether or not the account exists) and
+    # one across the whole install. Reaching the install-wide one refuses
+    # every password sign-in until its window ends: a bounded denial of
+    # service, traded for a bound on guessing spread over many addresses and
+    # names (docs/features/AUTH.md). 0 or less turns a ceiling off.
+    login_fail_max_per_username: int = 20
+    login_fail_max_global: int = 500
+
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
     # encrypted with the Fernet helper in app.core.crypto using

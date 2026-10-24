@@ -1513,11 +1513,13 @@ class SettingsUpdate(BaseModel):
     @classmethod
     def validate_password_min_length(cls, v: int | None) -> int | None:
         # Floor at 6 even when operators relax the policy — anything
-        # shorter is a configuration mistake. Cap at 128 because bcrypt
-        # truncates inputs above 72 bytes; values past that are dead
-        # length the operator might assume is being checked.
-        if v is not None and not (6 <= v <= 128):
-            raise ValueError("Min password length must be between 6 and 128")
+        # shorter is a configuration mistake. Cap at 72: every path that
+        # sets a password refuses one over 72 bytes (bcrypt's limit, see
+        # password_policy.MAX_PASSWORD_BYTES), so a minimum above 72 would
+        # be a policy nobody can meet and would lock every password change
+        # out (#2619).
+        if v is not None and not (6 <= v <= 72):
+            raise ValueError("Min password length must be between 6 and 72")
         return v
 
     @field_validator("password_history_count")
