@@ -13,12 +13,19 @@
 #
 # Apply flow when enabled:
 #   1. Extract body, write to /tmp staging
-#   2. ``snmpd -t -C -c <tmp>`` (config syntax check); abort on fail
+#   2. Foreground-start snmpd against a copy of the staged file on a
+#      throwaway port + AgentX socket (net-snmp has no config-test flag,
+#      #550); abort on a parse failure
 #   3. systemctl stop snmpd (if running)
 #   4. rm /var/lib/snmp/snmpd.conf so createUser lines re-run fresh
 #   5. Atomically swap /etc/snmp/snmpd.conf
 #   6. systemctl enable --now snmpd
 #   7. Verify it's up; write the hash sidecar + status sidecar
+#
+# lldpd (when its "Expose via SNMP" toggle is on) is an AgentX subagent
+# of this snmpd. It is NOT restarted here: lldpd's AgentX ping notices
+# the master went away and re-registers LLDP-MIB on its own within
+# ~15 s of snmpd coming back (verified, #2154).
 #
 # Apply flow when disabled:
 #   1. systemctl disable --now snmpd (idempotent)
@@ -133,7 +140,22 @@ case "$MARKER" in
         # A config parse/read error makes snmpd exit before it settles;
         # a clean parse keeps it alive until we kill it.
         SNMP_VALIDATE_LOG=/tmp/spatium-snmpd-validate.log
-        snmpd -f -C -c "$TMP_BODY" -Lf "$SNMP_VALIDATE_LOG" \
+        # The rendered config makes snmpd an AgentX master on
+        # /run/agentx/master (#2154). The probe must not take that path:
+        # on start a master unlinks + rebinds its socket, so a probe
+        # sharing it would steal the live snmpd's socket (and with it
+        # lldpd's LLDP-MIB registration) and, being killed, leave the
+        # path dangling. Probe a copy whose agentXSocket points at a
+        # throwaway path instead — the directive is still parsed, which
+        # is what the probe is for.
+        PROBE_DIR=$(mktemp -d /tmp/spatium-snmpd-probe.XXXXXX)
+        # Armed before anything can fail under ``set -e``, so the copy
+        # (it carries the community / USM secrets) never outlives us.
+        trap 'rm -f "$TMP_BODY"; rm -rf "$PROBE_DIR"' EXIT
+        PROBE_BODY="$PROBE_DIR/snmpd.conf"
+        sed "s|^agentXSocket .*|agentXSocket $PROBE_DIR/agentx-master|" \
+            "$TMP_BODY" > "$PROBE_BODY"
+        snmpd -f -C -c "$PROBE_BODY" -Lf "$SNMP_VALIDATE_LOG" \
             udp:127.0.0.1:16199 >"$SNMP_VALIDATE_LOG" 2>&1 &
         probe_pid=$!
         sleep 1
