@@ -4087,6 +4087,7 @@ async def _matching_dns_pool_health_stale_subjects(
     from app.models.dns import DNSPool  # noqa: PLC0415
     from app.services.dns.pool_health_staleness import (  # noqa: PLC0415
         STALE_AFTER_INTERVALS,
+        format_age,
         is_member_check_stale,
         member_check_age_seconds,
     )
@@ -4102,7 +4103,7 @@ async def _matching_dns_pool_health_stale_subjects(
         stale = [m for m in pool.members if is_member_check_stale(pool, m, now)]
         if not stale:
             continue
-        oldest_h = max((member_check_age_seconds(m, now) or 0) for m in stale) // 3600
+        oldest = format_age(max((member_check_age_seconds(m, now) or 0) for m in stale))
         serving = [m for m in stale if m.last_check_state == "healthy"]
         consequence = (
             f" {len(serving)} of them last checked healthy and are still being served "
@@ -4116,7 +4117,7 @@ async def _matching_dns_pool_health_stale_subjects(
                 pool.name,
                 f"DNS pool '{pool.name}': {len(stale)} of {len(pool.members)} member(s) have "
                 f"not been health-checked for over {STALE_AFTER_INTERVALS} intervals "
-                f"({pool.hc_interval_seconds} s each; oldest {oldest_h} h ago). The pool "
+                f"({pool.hc_interval_seconds} s each; oldest {oldest} ago). The pool "
                 f"health-check task is not running.{consequence}",
                 "warning",
             )

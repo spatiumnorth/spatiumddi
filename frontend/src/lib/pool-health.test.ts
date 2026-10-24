@@ -17,6 +17,17 @@ describe("memberCheckCell", () => {
     expect(c.text).toBe("stale \u00b7 4h ago");
     expect(c.title).toContain("still being served");
   });
+  it("words the age as s/m under an hour, then h, then d", () => {
+    const at = (iso: string) =>
+      memberCheckCell(
+        { last_check_state: "healthy", last_check_at: iso, check_stale: true },
+        NOW,
+      ).text;
+    expect(at("2026-10-23T11:59:15Z")).toBe("stale \u00b7 45s ago");
+    expect(at("2026-10-23T11:50:00Z")).toBe("stale \u00b7 10m ago");
+    expect(at("2026-10-23T10:59:00Z")).toBe("stale \u00b7 1h ago");
+    expect(at("2026-10-21T11:00:00Z")).toBe("stale \u00b7 2d ago");
+  });
   it("does not claim the member is served when it was unhealthy", () => {
     const c = memberCheckCell(
       {

@@ -34,6 +34,13 @@ def member_check_age_seconds(member: DNSPoolMember, now: datetime | None = None)
     return max(0, int((now - member.last_check_at).total_seconds()))
 
 
+def format_age(seconds: int) -> str:
+    """Operator wording for an age: minutes under an hour, hours above."""
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)} min"
+    return f"{seconds // 3600} h"
+
+
 def is_member_check_stale(
     pool: DNSPool, member: DNSPoolMember, now: datetime | None = None
 ) -> bool:

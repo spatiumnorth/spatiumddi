@@ -104,6 +104,21 @@ async def test_alert_fires_past_three_intervals_only(db_session: AsyncSession) -
 
 
 @pytest.mark.asyncio
+async def test_alert_age_is_minutes_under_an_hour_and_hours_above(
+    db_session: AsyncSession,
+) -> None:
+    grp, zone = await _zone(db_session)
+    await _pool(db_session, grp, zone, "mins", members=[("192.0.2.1", 420, "healthy", True)])
+    await _pool(
+        db_session, grp, zone, "hours", members=[("192.0.2.2", 3 * 3600 + 120, "healthy", True)]
+    )
+    fired = await _fired(db_session)
+    assert "oldest 7 min ago" in fired["mins"]
+    assert "0 h" not in fired["mins"]
+    assert "oldest 3 h ago" in fired["hours"]
+
+
+@pytest.mark.asyncio
 async def test_interval_floor_is_the_tasks_own_30_seconds(db_session: AsyncSession) -> None:
     grp, zone = await _zone(db_session)
     # A 10 s interval is still checked every 30 s: 80 s old is fine, 100 s is stale.

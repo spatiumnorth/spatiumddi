@@ -2046,7 +2046,7 @@ added is visibility: a verdict older than 3 x the pool's check interval
 `check_age_seconds` per member, and the default-on `dns_pool_health_stale`
 alert (warning, one event per pool) fires and resolves when the pool is
 checked again. Disabled pools and members are not checked on purpose and
-never count as stale.
+never count as stale. Every alert rule is evaluated by the Celery worker, so a stopped worker stops the health checks AND this alert; a stopped worker is reported by the platform health components `celery-workers` / `celery-beat` instead.
 
 ### 17.1 Serving scope — steering one name to the nearest datacenter
 
