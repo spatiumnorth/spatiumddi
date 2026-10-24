@@ -808,6 +808,11 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     # #430 — capture the group before delete; removing a member can drop a
     # group out of HA, re-rendering the survivors' failover block. Wake it.
     gid = s.server_group_id
+    # #2290 — leases cascade with the server, so tear their IPAM mirrors and
+    # DDNS down first (sparing any an HA peer still holds).
+    from app.services.dhcp.lease_cleanup import delete_leases_for_server  # noqa: PLC0415
+
+    await delete_leases_for_server(db, s.id)
     await db.delete(s)
     if gid is not None:
         collect_wake(dhcp_group_channel(gid))
