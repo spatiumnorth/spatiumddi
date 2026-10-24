@@ -37,6 +37,7 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["unifi"],
@@ -801,6 +802,11 @@ async def delete_controller(
         )
     )
     _audit(db, user=user, action="delete", controller_id=c.id, controller_name=c.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="unifi_controller_id", target_id=c.id, user=user, target_name=c.name
+    )
     await db.delete(c)
     await db.commit()
 

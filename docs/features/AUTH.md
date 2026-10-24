@@ -570,12 +570,18 @@ rejected with `422` rather than silently locking the operator out:
 
 - `read` — restricts the token to safe-method requests
   (`GET` / `HEAD` / `OPTIONS`); any mutation `401`s.
-- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans*`,
-  `/vrfs*`, `/network-devices*`.
-- `dns:write` — allows mutations under `/api/v1/dns/*`, `/dns-pools*`.
+- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
+  `/vrfs/*`, `/network-devices/*`.
+- `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,
+  groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
+  (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
+  that writes there needs an empty scope set, with RBAC as the gate.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
 - `agent` — allows only the agent push surface
   (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+Prefixes match on a whole path segment, so `/api/v1/dns` covers
+`/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
 
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still

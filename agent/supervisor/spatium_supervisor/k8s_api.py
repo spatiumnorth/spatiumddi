@@ -529,13 +529,19 @@ class RedisReclaim:
     they are not counted again); ``nodes``: the hostnames the reclaimed
     claims were pinned to; ``sources``: per reclaimed claim, whether the
     bound PV's node affinity (``pv``) or the scheduler's selected-node
-    annotation (``annotation``) decided it was stranded."""
+    annotation (``annotation``) decided it was stranded; ``error``: why the
+    sweep stopped, quoting the start of the answer's body when it was
+    refused; ``error_kind``: the same without the body (the request, and
+    its status when the sweep has it), set wherever ``error`` can quote
+    one. The heartbeat logs a failure once per kind, and an apiserver can
+    answer every tick with another body (review of #2433)."""
 
     reclaimed: list[str] = field(default_factory=list)
     error: str | None = None
     terminating: list[str] = field(default_factory=list)
     nodes: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
+    error_kind: str = ""
 
     def __iter__(self):
         # ``reclaimed, err = ...``, the shape #590's callers unpack.
@@ -559,8 +565,18 @@ def _waits_on_redis_claim(pod: dict) -> bool:
     return False
 
 
+def _k3s_node_names(names: str | Iterable[str]) -> set[str]:
+    """PURE: the names as k3s registers its Nodes, lowercased with no trailing
+    dot (#1757), as delete_node sends them. A bare string is one name."""
+    given = [names] if isinstance(names, str) else names
+    return {str(n).strip().rstrip(".").lower() for n in given if n} - {""}
+
+
 def reclaim_stranded_redis_storage(
-    evicted_nodes: str | Iterable[str] = (), namespace: str = "spatium"
+    evicted_nodes: str | Iterable[str] = (),
+    namespace: str = "spatium",
+    *,
+    owed_nodes: str | Iterable[str] = (),
 ) -> RedisReclaim:
     """Delete Redis PVCs (and their Pending consumer pods) stranded on a
     node that no longer exists. Returns a :class:`RedisReclaim`, which
@@ -599,11 +615,17 @@ def reclaim_stranded_redis_storage(
     three-node cluster, Redis still ran two of three 37 minutes after a
     replace). The seed calls it on every tick now:
 
-    * ``evicted_nodes``: the names the caller deleted this tick, and any a
-      failed sweep left owed (a bare name is one node). They are
-      authoritative, as for Postgres: their claims go at once, with no
-      Node read (the DELETE is milliseconds old and the Node can still be
-      listed).
+    * ``evicted_nodes``: the names the caller deleted this tick (a bare
+      name is one node). They are authoritative, as for Postgres: their
+      claims go at once, with no Node read (the DELETE is milliseconds old
+      and the Node can still be listed).
+    * ``owed_nodes``: the names a failed sweep left owed. They were evicted
+      on an earlier tick, and a run of failed sweeps can keep them owed
+      while the node rejoins under the same hostname, its replica running
+      on the claim again (review of #2433). So one Node read decides: a
+      name the list no longer has goes as if evicted now, and one it lists
+      again keeps its claim and pod. A Node list that cannot be read is an
+      error, and nothing is freed.
     * otherwise one read, the namespace's Pending pods. Only while a pod
       that mounts a ``-redis-`` claim is Pending does the sweep read the
       Node list, and it reclaims each claim whose every pinned hostname
@@ -617,10 +639,15 @@ def reclaim_stranded_redis_storage(
     fails is an error, never a guess. A claim an earlier sweep deleted is
     reported ``terminating``, not reclaimed again, and its pod DELETE is
     retried."""
-    names = [evicted_nodes] if isinstance(evicted_nodes, str) else list(evicted_nodes)
-    # #1757: k3s registers the host's name lowercased, as delete_node sends it.
-    forced = {str(n).strip().rstrip(".").lower() for n in names if n} - {""}
+    forced = _k3s_node_names(evicted_nodes)
+    owed = _k3s_node_names(owed_nodes) - forced
     base = f"/api/v1/namespaces/{quote(namespace)}"
+    if owed:
+        # Owed, not evicted this tick: only while the Node list lacks the name.
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
+        forced |= owed - set(listed)
     live: set[str] | None = None
     if not forced:
         try:
@@ -628,7 +655,10 @@ def reclaim_stranded_redis_storage(
         except (RuntimeError, OSError) as exc:
             return RedisReclaim(error=str(exc))
         if status != 200:
-            return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+            return RedisReclaim(
+                error=f"kubeapi status {status}: {resp[:200]!r}",
+                error_kind=f"list Pending pods: status {status}",
+            )
         try:
             pending = json.loads(resp).get("items") or []
         except (ValueError, AttributeError):
@@ -637,7 +667,7 @@ def reclaim_stranded_redis_storage(
             return RedisReclaim()
         listed, nodes_err = cluster_node_names()
         if listed is None:
-            return RedisReclaim(error=nodes_err)
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
         live = set(listed)
 
     try:
@@ -645,7 +675,10 @@ def reclaim_stranded_redis_storage(
     except (RuntimeError, OSError) as exc:
         return RedisReclaim(error=str(exc))
     if status != 200:
-        return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+        return RedisReclaim(
+            error=f"kubeapi status {status}: {resp[:200]!r}",
+            error_kind=f"list claims: status {status}",
+        )
     try:
         items = json.loads(resp).get("items", [])
     except (ValueError, AttributeError):
@@ -659,7 +692,7 @@ def reclaim_stranded_redis_storage(
             continue
         pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
         if pin_err:
-            out.error = f"{name}: {pin_err}"
+            out.error, out.error_kind = f"{name}: {pin_err}", f"read the volume of {name}"
             break
         # Stranded: every hostname the volume is pinned to is gone, i.e. one
         # the caller evicted, or (on a sweep) one the Node list no longer has.
@@ -679,6 +712,7 @@ def reclaim_stranded_redis_storage(
                 break
             if status not in (200, 202, 404):
                 out.error = f"kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete claim {name}: status {status}"
                 break
             if status != 404:  # 404: gone between the list and the delete
                 out.reclaimed.append(name)
@@ -698,6 +732,7 @@ def reclaim_stranded_redis_storage(
                 break
             if status not in (200, 202, 404):
                 out.error = f"pod {pod}: kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete pod {pod}: status {status}"
                 break
     out.nodes = sorted(gone)
     return out
@@ -1925,7 +1960,11 @@ def apply_control_plane_overrides(
     # and evict them from a dead node in seconds rather than the k8s default
     # 300 s. ``replicas`` here IS the node count, so hard
     # (requiredDuringScheduling) anti-affinity is exactly right, and the
-    # chart no-ops it below 2 replicas.
+    # chart no-ops it below 2 replicas, except the frontend's on the host
+    # network, which it renders at one replica too (#2450). The first promote
+    # then changes the frontend's replicas and nothing in its pod template, so
+    # the seed's frontend pod is scaled beside, never rolled off ports 80 and
+    # 443 (test_frontend_promotion_overrides.py pins this side of it).
     #
     # Written on every promote/demote rather than relying on the
     # firstboot-rendered HelmChart values, because firstboot only runs on a

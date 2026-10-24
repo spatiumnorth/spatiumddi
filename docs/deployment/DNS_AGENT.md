@@ -233,7 +233,18 @@ while it runs and releases only while it still holds it: a render the OOM
 killer takes mid-flight frees the slot within one lease instead of holding
 every server's render for the render ceiling. A render waiting for the slot
 keeps its server's lock, so the duplicates the sweep and further marks
-enqueue meanwhile coalesce into it.
+enqueue meanwhile coalesce into it. A render killed mid-flight records
+nothing, and the broker redelivers its task, so each render raises a
+per-server count in Redis before it runs and clears it when it returns or
+raises (#2227): once two renders of a server have died without finishing,
+the next records why on the server row (`bundle_render_status = failed`,
+the `agent_bundle_render_failed` alert) and holds that server for five
+minutes before letting one more through. Up to `dns_agent_bundle_render_slots` (2) renders run at
+once, and a server that changed again while it rendered hands its slot to a
+waiting render rather than rendering again in place. The render reads the
+group's records a batch of zones at a time and never holds them whole; for what it
+needs per zone and per record see "Control-plane memory for large groups"
+in [`DNS.md`](../features/DNS.md).
 
 *Every process that writes DNS rows must carry the listener.* It is
 installed by importing `bundle_dirty`: `app.main` does so for the api,

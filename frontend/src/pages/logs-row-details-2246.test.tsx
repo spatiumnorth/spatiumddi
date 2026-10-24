@@ -38,6 +38,8 @@ const LONG_RAW =
 const dnsRow = (over: Partial<DNSQueryLogRow> = {}): DNSQueryLogRow => ({
   id: 1,
   ts: "2026-10-20T09:12:33.123Z",
+  server_id: "11111111-1111-1111-1111-111111111111",
+  server_name: "ns1",
   client_ip: "192.0.2.5",
   client_port: 53123,
   qname: LONG_QNAME,
@@ -56,6 +58,8 @@ const dhcpRow = (
 ): DHCPActivityLogRow => ({
   id: 7,
   ts: "2026-10-20T09:12:33.123Z",
+  server_id: "22222222-2222-2222-2222-222222222222",
+  server_name: "kea1",
   severity: "INFO",
   code: "DHCP4_LEASE_ALLOC",
   mac_address: "aa:bb:cc:dd:ee:ff",

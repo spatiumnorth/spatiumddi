@@ -576,7 +576,24 @@ export function OverlaysPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    <ListEmpty error={query.error} what="overlays">
+                    <ListEmpty
+                      error={query.error}
+                      what="overlays"
+                      filtered={
+                        search !== "" ||
+                        statusFilter !== "" ||
+                        kindFilter !== "" ||
+                        customerFilter !== "" ||
+                        tagFilters.length > 0
+                      }
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                        setKindFilter("");
+                        setCustomerFilter("");
+                        setTagFilters([]);
+                      }}
+                    >
                       No overlays yet — click "New overlay" to add one.
                     </ListEmpty>
                   </td>
