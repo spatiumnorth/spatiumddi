@@ -227,6 +227,7 @@ from app.services.dns.zone_move import (
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
+from app.services.dns.zone_synthesis import synthesised_zone_error
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -10582,28 +10583,9 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
     Tailscale tenant (or rebind it to a different DNS group), then
     the operator can manage the zone manually.
     """
-    if zone.tailscale_tenant_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Zone {zone.name!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. The reconciler "
-                f"will overwrite any changes on the next sync. Unbind the "
-                f"DNS group on the Tailscale tenant or delete the tenant "
-                f"to release the zone."
-            ),
-        )
-    if zone.netbird_instance_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Zone {zone.name!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. The reconciler "
-                f"will overwrite any changes on the next sync. Unbind the "
-                f"DNS group on the NetBird instance or delete the instance "
-                f"to release the zone."
-            ),
-        )
+    msg = synthesised_zone_error(zone, op)
+    if msg is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:

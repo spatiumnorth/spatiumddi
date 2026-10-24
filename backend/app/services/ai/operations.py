@@ -1985,6 +1985,7 @@ async def _preview_create_dns_record(
         find_cname_conflict,
         is_apex,
     )
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2012,6 +2013,10 @@ async def _preview_create_dns_record(
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} not found.")
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
+    # #2653 — the REST create's refusal; the reconciler would revert the row.
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        return PreviewResult(ok=False, detail=synth_err)
 
     name = args.name.strip()
     if not name:
@@ -2091,6 +2096,7 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2107,6 +2113,13 @@ async def _apply_create_dns_record(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         raise ValueError(f"Zone {args.zone_id} not found.")
+    # #2653 — a zone trashed (or taken over by an integration) between
+    # propose and apply must not receive records.
+    if getattr(zone, "deleted_at", None) is not None:
+        raise ValueError(f"Zone {args.zone_id} is deleted.")
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        raise ValueError(synth_err)
 
     name = args.name.strip()
     fqdn = (
