@@ -659,7 +659,7 @@ function GroupDetailView({
 // Rogue-DHCP observed responders (#370). Lists DHCP servers the active probe
 // saw answering on this group's segments + lets the operator acknowledge a
 // known-but-external one (allowlists it so the rogue alert auto-resolves).
-function RespondersTab({ groupId }: { groupId: string }) {
+export function RespondersTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Acknowledging allowlists the source: a POST the router gates as
   // write on dhcp_server (no SuperAdmin on the handler).
@@ -687,9 +687,9 @@ function RespondersTab({ groupId }: { groupId: string }) {
       <p className="text-xs text-muted-foreground">
         DHCP servers seen answering on this group's segments by the active probe
         (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
-        responders classify <span className="text-rose-600">rogue</span> and
-        fire the Rogue DHCP alert — acknowledge a known-but-external one to
-        allowlist it.
+        responders classify <span className="text-rose-600">rogue</span>, and
+        fire the Rogue DHCP alert once that rule is enabled (Alerts → Rules; it
+        ships disabled) — acknowledge a known-but-external one to allowlist it.
       </p>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">
