@@ -990,12 +990,26 @@ env_banner_fg: str (default "#ffffff")      -- 6-digit hex, validated
 env_banner_position: str (default "top")    -- top | bottom | both
 ```
 
-Branding writes (`app_title`, either banner) are **superadmin-only**, a
-stronger gate than the `write:settings` the rest of the PUT takes: these
-fields render to anonymous visitors on the login page, so a delegated
-settings editor must not be able to put arbitrary text in front of
-everyone. Every branding change writes an audit row
+Branding writes (`app_title`, either banner) are **superadmin-only**:
+these fields render to anonymous visitors on the login page, so a
+delegated settings editor must not be able to put arbitrary text in front
+of everyone. Every branding change writes an audit row
 (`resource_type="platform_settings"`, `resource_id="branding"`).
+
+The same holds for **most of `PUT /settings`**. A delegate holding
+`write` on `settings` may change only the fields in
+`SETTINGS_DELEGATE_WRITABLE` (`backend/app/api/v1/settings/router.py`):
+IPAM / DNS / DHCP working preferences such as utilization thresholds,
+DNS defaults, the DNS auto-sync and pull schedules, and DHCP lease and
+domain defaults. Every other field is superadmin-only, including
+`app_base_url` (it builds the URLs handed to identity providers),
+session and password policy, appliance host configuration (SSH, APT,
+syslog, SNMP, NTP, LLDP, resolver, timezone), and anything that makes an
+outbound connection. A new field is superadmin-only until it is added to
+that set. A delegate's request naming any superadmin-only field is
+refused whole with `403` and an audited denial, so nothing is written.
+`PUT /settings/resolver` is superadmin-only for the same reason. The
+Settings page offers every field to superadmins only.
 
 ### 6.1 Public branding endpoint
 

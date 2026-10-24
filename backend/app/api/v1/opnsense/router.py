@@ -26,6 +26,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.opnsense import OPNsenseRouter
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["opnsense"],
@@ -429,6 +430,11 @@ async def delete_router(
         )
     )
     _audit(db, user=user, action="delete", router_id=r.id, router_name=r.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="opnsense_router_id", target_id=r.id, user=user, target_name=r.name
+    )
     await db.delete(r)
     await db.commit()
 
