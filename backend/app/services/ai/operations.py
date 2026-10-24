@@ -31,14 +31,24 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import bind_check_names_error, primary_ns_error, structured_rdata_error
+from app.core.dns_names import (
+    HOSTNAME_TARGET_RECORD_TYPES,
+    bind_check_names_error,
+    contains_control_chars,
+    primary_ns_error,
+    record_value_error,
+    validate_fqdn,
+    validate_optional_hostname,
+    validate_record_owner,
+)
+from app.core.mac import canonicalize_mac
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
@@ -225,6 +235,38 @@ class CreateIPAddressArgs(BaseModel):
     )
     mac_address: str | None = Field(default=None, description="MAC address in any standard format")
     description: str = Field(default="", description="Free-form description")
+
+    # The same field rules as the REST create (``IPAddressCreate``): the
+    # requests portal validates a submission against this model, and an
+    # approved request provisions it, so a value REST refuses must be refused
+    # here too, at submit, where the requester can still correct it.
+    @field_validator("status")
+    @classmethod
+    def _status(cls, v: str) -> str:
+        if v not in IP_STATUSES_CREATE_SETTABLE:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(IP_STATUSES_CREATE_SETTABLE))}"
+            )
+        return v
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return validate_optional_hostname(v) or None
+
+    @field_validator("fqdn")
+    @classmethod
+    def _fqdn(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return validate_fqdn(v, field="fqdn", allow_underscore=False)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return canonicalize_mac(v)
 
 
 async def _preview_create_ip_address(
@@ -1994,6 +2036,26 @@ class CreateDNSRecordArgs(BaseModel):
         le=65_535,
     )
 
+    # The REST record create's rules (``RecordCreate`` +
+    # ``_validate_address_record_value``), applied when the payload is parsed
+    # so a requests-portal submission is refused at submit. The checks that
+    # need the zone (relative rdata names) run again in preview / apply.
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        return validate_record_owner(v, field="record name")
+
+    @model_validator(mode="after")
+    def _value(self) -> CreateDNSRecordArgs:
+        rtype = self.record_type.strip().upper()
+        if contains_control_chars(self.value) or rtype in (
+            {"A", "AAAA"} | HOSTNAME_TARGET_RECORD_TYPES
+        ):
+            err = record_value_error(rtype, self.value)
+            if err is not None:
+                raise ValueError(err)
+        return self
+
 
 async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
@@ -2048,8 +2110,8 @@ async def _preview_create_dns_record(
     names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
     if names_err is not None:
         return PreviewResult(ok=False, detail=names_err)
-    # #2502 — nor rdata dnspython cannot read.
-    rdata_err = structured_rdata_error(
+    # #2502 — nor rdata dnspython cannot read, nor a value REST refuses.
+    rdata_err = record_value_error(
         rtype,
         args.value,
         priority=args.priority,
@@ -2152,8 +2214,8 @@ async def _apply_create_dns_record(
     names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
     if names_err is not None:
         raise ValueError(names_err)
-    # #2502 — the same unreadable-rdata refusal as the REST create path.
-    rdata_err = structured_rdata_error(
+    # #2502 — the same record-value refusal as the REST create path.
+    rdata_err = record_value_error(
         rtype,
         args.value,
         priority=args.priority,
@@ -2792,6 +2854,18 @@ class CreateDHCPStaticArgs(BaseModel):
     mac_address: str = Field(description="MAC address (any standard format).")
     hostname: str | None = Field(default=None, description="Optional hostname.")
     description: str = Field(default="", description="Free-form description.")
+
+    # The REST reservation create's rules (``StaticCreate``): a blank hostname
+    # is no hostname, anything else a legal host name; the MAC is canonical.
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return validate_optional_hostname(v)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str) -> str:
+        return canonicalize_mac(v)
 
 
 async def _preview_create_dhcp_static(
