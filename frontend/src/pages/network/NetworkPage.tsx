@@ -485,7 +485,22 @@ export function NetworkPage() {
             <div className="flex flex-col items-center gap-2 p-10 text-center">
               <NetworkIcon className="h-8 w-8 text-muted-foreground" />
               <p className="text-sm text-muted-foreground">
-                <ListEmpty error={listError} what="network devices">
+                <ListEmpty
+                  error={listError}
+                  what="network devices"
+                  filtered={
+                    typeFilter !== "all" ||
+                    statusFilter !== "all" ||
+                    activeFilter !== "all" ||
+                    tagFilters.length > 0
+                  }
+                  onClearFilters={() => {
+                    setTypeFilter("all");
+                    setStatusFilter("all");
+                    setActiveFilter("all");
+                    setTagFilters([]);
+                  }}
+                >
                   No network devices yet — add a router or switch to start
                   discovering IPs.
                 </ListEmpty>
