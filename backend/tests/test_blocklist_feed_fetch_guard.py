@@ -34,6 +34,7 @@ from app.core.safe_fetch import (
     REDIRECT_LIMIT_MESSAGE,
     SCHEME_REFUSED_MESSAGE,
     TARGET_REFUSED_MESSAGE,
+    FetchFailedError,
     FetchRefusedError,
     GuardedTransport,
     safe_get_text,
@@ -379,7 +380,7 @@ async def test_refresh_http_error_stores_status_only(
     _wire_task(monkeypatch, db_session, None)
     bl = await _list(db_session, url)
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(FetchFailedError):
         await dns_tasks._refresh_blocklist_feed_async(str(bl.id))
 
     assert len(rec.seen) == 1
@@ -398,7 +399,7 @@ async def test_refresh_transport_error_stores_no_exception_text(
     _wire_task(monkeypatch, db_session, None)
     bl = await _list(db_session, f"http://u:pw@{PUBLIC_IP}/list.txt")
 
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(FetchFailedError):
         await dns_tasks._refresh_blocklist_feed_async(str(bl.id))
 
     await db_session.refresh(bl)

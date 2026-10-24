@@ -12,3 +12,14 @@
   the kind of failure on the list, never the error text or the URL, and the
   worker log names the feed by scheme and host only. The fetch no longer
   uses `HTTP_PROXY` / `HTTPS_PROXY` from the worker's environment.
+- **Credentials in a DNS blocklist feed URL are used for the fetch only.** A
+  feed URL with a password or a `?token=` in it was returned in full by the
+  blocklist API and the `list_dns_blocklists` copilot tool, and a failed
+  fetch (a 404, say) wrote the full URL into the worker log through Celery's
+  retry and failure lines and its stored task result. The API, the UI and
+  the copilot now show the URL with those values replaced by `***`, and a
+  failed fetch raises an error naming only the HTTP status or the kind of
+  failure. Saving a list with the masked URL unchanged keeps the stored
+  one; a URL that still contains `***` in a credential position is refused,
+  so the mask is never stored as the credential. The WoL calendar feed,
+  which shares the fetch, gets the same error message.

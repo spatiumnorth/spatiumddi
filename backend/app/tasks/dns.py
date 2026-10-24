@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
-from app.core.safe_fetch import FetchRefusedError, safe_get_text
+from app.core.safe_fetch import FetchRefusedError, describe_fetch_error, safe_get_text
 from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
 from app.services.dns_blocklist import parse_feed_detailed
@@ -37,19 +37,6 @@ logger = structlog.get_logger(__name__)
 # one statement holds in memory; 5000 domains in an ``IN (...)`` stays well
 # under asyncpg's 32767 bind-parameter limit.
 _FEED_WRITE_BATCH = 5000
-
-
-def _describe_fetch_error(exc: BaseException) -> str:
-    """A reader-safe description of a failed feed fetch: the HTTP status, or
-    the kind of failure — never the exception text."""
-
-    if isinstance(exc, httpx.HTTPStatusError):
-        return f"HTTP {exc.response.status_code}"
-    if isinstance(exc, httpx.TimeoutException):
-        return "timed out"
-    if isinstance(exc, (httpx.ConnectError, socket.gaierror)):
-        return "could not connect"
-    return "transport error"
 
 
 def _batched(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
@@ -100,7 +87,10 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             # failure — never the exception text, which can carry the
             # resolved address, a response body, or the URL itself with its
             # credentials. The detail goes to the server log, with the URL
-            # reduced to scheme + host.
+            # reduced to scheme + host. The transient error re-raised below
+            # for Celery's retry is safe_fetch's FetchFailedError, whose
+            # message carries no URL: Celery writes it into its own retry /
+            # failure log lines and the result backend.
             shown_url = url_display(bl.feed_url)
             try:
                 with secret_url_in_flight(bl.feed_url):
@@ -125,7 +115,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 # broad ``except`` swallowed every exception and the
                 # task's ``max_retries=3`` was decorative.
                 bl.last_sync_status = "error"
-                bl.last_sync_error = f"Fetch failed: {_describe_fetch_error(e)}"
+                bl.last_sync_error = f"Fetch failed: {describe_fetch_error(e)}"
                 bl.last_synced_at = datetime.now(UTC)
                 await db.commit()
                 logger.warning(

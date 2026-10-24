@@ -1405,6 +1405,15 @@ worker log, with the feed URL reduced to its scheme and host. The fetch goes
 direct: `HTTP_PROXY` / `HTTPS_PROXY` in the worker's environment are not
 used.
 
+A feed URL can carry credentials (`https://user:pass@host/list.txt`, or a
+query parameter such as `?token=…`). They are used for the fetch and shown
+nowhere else: the API, the UI and the copilot return the URL with the
+password and any credential-looking query value replaced by `***`, and no
+failure message, worker log line or Celery retry record includes the URL.
+Editing a list sends the masked URL back unchanged, which keeps the stored
+one; to change the URL, type it in full with its credentials — a URL that
+still contains `***` in a credential position is refused (422).
+
 #### Do feed entries block subdomains?
 
 Yes by default, and it is a **per-list** setting — *Block subdomains of
