@@ -389,10 +389,10 @@ async def _require_store_headroom(image_bytes: int | None) -> None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
 
 
-async def _delete_from_mirror(image_id: uuid.UUID) -> None:
+async def _delete_from_mirror(image_id: uuid.UUID, *, timeout: httpx.Timeout | None = None) -> None:
     """Issue DELETE against the mirror; tolerate 404 (already gone)."""
     headers = {"X-Mirror-Auth": mirror_auth_token("delete", image_id)}
-    async with httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=timeout or _MIRROR_HTTP_TIMEOUT) as client:
         try:
             resp = await client.delete(_mirror_url(image_id), headers=headers)
         except httpx.HTTPError as exc:
@@ -1298,13 +1298,19 @@ async def download_upgrade_image(
     )
 
 
-async def _delete_image_bytes(image_id: uuid.UUID) -> None:
-    """Remove an image's bytes from the mirror (when on) and local FS."""
+async def _delete_image_bytes(
+    image_id: uuid.UUID, *, mirror_timeout: httpx.Timeout | None = None
+) -> None:
+    """Remove an image's bytes from the mirror (when on) and local FS.
+
+    Callers delete the DB row and COMMIT first: a leftover file is
+    recoverable (it is just disk), a schedule pointing at a row whose bytes
+    are gone is not."""
     if settings.slot_image_mirror_url:
         # #296 Phase B — delete from the mirror Deployment. Best-effort:
         # the DB row delete is the authoritative signal; stale bytes on
         # the mirror get reaped by the future prune task.
-        await _delete_from_mirror(image_id)
+        await _delete_from_mirror(image_id, timeout=mirror_timeout)
     # #787 — always sweep local FS too, not just on the no-mirror branch.
     # The appliance keeps the slot-images hostPath mounted even with the
     # mirror on (so a pre-promote image is still readable), which means a
@@ -1328,70 +1334,157 @@ async def _delete_image_bytes(image_id: uuid.UUID) -> None:
         )
 
 
-# #2400 — an image younger than this is never reclaimed: an operator who has
-# just uploaded or imported one (say, to re-apply a version every node already
-# runs) has not had the chance to schedule it yet.
-_RECLAIM_MIN_AGE = timedelta(hours=1)
+# #2400 — how long a stored image must have existed before it is reclaimed.
+# An image something has scheduled (a per-box upgrade or a rolling run) is
+# fair game an hour after upload. One NOTHING ever scheduled — every node
+# already runs that version — was most likely uploaded ahead for a node
+# that is not paired yet, or as a repair copy; that waits a week.
+_RECLAIM_MIN_AGE_SCHEDULED = timedelta(hours=1)
+_RECLAIM_MIN_AGE_NEVER_SCHEDULED = timedelta(days=7)
+# The mirror DELETE on the reclaim path: a slow mirror delays one cleanup,
+# never a whole sweep (the upload/download timeout is 30 minutes).
+_RECLAIM_MIRROR_TIMEOUT = httpx.Timeout(15.0)
+
+
+def _node_has_committed(
+    installed: str | None,
+    current_slot: str | None,
+    durable_default: str | None,
+    is_trial_boot: bool | None,
+    version: str,
+) -> bool:
+    """The node RUNS ``version`` and has made it durable (#2400 review).
+
+    A version only in the inactive slot can still be rolled back or be an
+    operator-cancelled write; one installed but on a trial boot can still
+    fall back to the other slot. Either needs the image again."""
+    return (
+        installed == version
+        and current_slot is not None
+        and durable_default == current_slot
+        and not is_trial_boot
+    )
+
+
+async def _ever_scheduled(db: AsyncSession, image_id: uuid.UUID) -> bool:
+    """Has a per-box schedule or a rolling run (any state) named this image?"""
+    from app.models.system_upgrade import SystemUpgradeRun  # noqa: PLC0415
+
+    sid = str(image_id)
+    hit = await db.scalar(
+        select(AuditLog.id)
+        .where(
+            AuditLog.action == "appliance.upgrade_scheduled",
+            AuditLog.new_value["slot_image_id"].astext == sid,
+        )
+        .limit(1)
+    )
+    if hit is not None:
+        return True
+    run = await db.scalar(
+        select(SystemUpgradeRun.id)
+        .where(SystemUpgradeRun.plan["slot_image_id"].astext == sid)
+        .limit(1)
+    )
+    return run is not None
 
 
 async def reclaim_committed_upgrade_images(db: AsyncSession) -> list[str]:
-    """Delete stored upgrade images every node has already written (#2400).
+    """Delete stored upgrade images every node has committed to (#2400).
 
     A 1.5 GiB ``.raw.xz`` stayed in the store on the control plane's /var
-    after it had been written to the slots, until somebody deleted it by
-    hand — on a 15 GB /var, the difference between headroom and kubelet
-    eviction. An image is reclaimed only when ALL of these hold:
+    after every node ran it, until somebody deleted it by hand. An image is
+    reclaimed only when ALL of these hold:
 
-    * every approved appliance-OS node it applies to (same architecture,
-      or either side unlabelled) reports its version in a slot or as
-      installed. The slot version is stamped by ``spatium-upgrade-slot``
-      AFTER the write and its verification, so this is never before the
-      write is known good — and a node whose write failed still lacks it;
+    * every appliance-OS node it applies to (same architecture, or either
+      side unlabelled), approved OR still pending approval, RUNS its
+      version durably: installed, on a committed (non-trial) boot. A
+      version that is only in a slot does not count;
     * no node is scheduled to fetch it and no active rolling run names it
-      (the delete endpoint's own in-use rule, #2410);
-    * it is older than :data:`_RECLAIM_MIN_AGE`.
+      (the delete endpoint's in-use rule, #2410);
+    * it is older than :data:`_RECLAIM_MIN_AGE_SCHEDULED`, or
+      :data:`_RECLAIM_MIN_AGE_NEVER_SCHEDULED` when nothing ever scheduled it.
 
-    Returns the reclaimed images' ``"<filename> (<version>)"``. The caller
-    commits. Best-effort per image: bytes that cannot be removed are
-    logged by :func:`_delete_image_bytes`, and the row still goes.
+    Concurrency: runs under the catalogue lock held EXCLUSIVELY
+    (``try`` — another replica or a scheduling request holding it means
+    this pass does nothing and the next beat tick retries), which the
+    scheduling paths hold SHARED from resolving the image until their
+    commit. So a schedule cannot land between the usage check and the
+    delete. The rows are deleted and COMMITTED before any bytes are
+    touched; byte removal is best-effort afterwards.
+
+    Commits. Returns the reclaimed images' ``"<filename> (<version>)"``.
     """
-    from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance  # noqa: PLC0415
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        APPLIANCE_STATE_PENDING_APPROVAL,
+        Appliance,
+    )
     from app.services.appliance.architecture import normalize  # noqa: PLC0415
 
+    if not await catalog.try_lock_catalog_exclusive(db):
+        await db.rollback()
+        return []
     images = list((await db.execute(select(ApplianceUpgradeImage))).scalars().all())
     if not images:
+        await db.rollback()
         return []
     nodes = (
         await db.execute(
-            select(Appliance.hostname, Appliance.architecture).where(
-                Appliance.state == APPLIANCE_STATE_APPROVED,
+            select(
+                Appliance.hostname,
+                Appliance.architecture,
+                Appliance.installed_appliance_version,
+                Appliance.current_slot,
+                Appliance.durable_default,
+                Appliance.is_trial_boot,
+            ).where(
+                Appliance.state.in_((APPLIANCE_STATE_APPROVED, APPLIANCE_STATE_PENDING_APPROVAL)),
                 Appliance.revoked_at.is_(None),
                 or_(Appliance.deployment_kind.is_(None), Appliance.deployment_kind == "appliance"),
             )
         )
     ).all()
     usage = await catalog.image_usage(db, images)
-    cutoff = datetime.now(UTC) - _RECLAIM_MIN_AGE
-    reclaimed: list[str] = []
+    now = datetime.now(UTC)
+    gone: list[tuple[uuid.UUID, str]] = []
     for img in images:
         u = usage[img.id]
         if u.scheduled_for or u.run_id is not None:
             continue
         uploaded = img.uploaded_at
-        if uploaded is not None and uploaded.tzinfo is None:
+        if uploaded is None:
+            continue
+        if uploaded.tzinfo is None:
             uploaded = uploaded.replace(tzinfo=UTC)
-        if uploaded is None or uploaded > cutoff:
-            continue
         img_arch = normalize(img.architecture)
-        wanted = {
-            host
-            for host, arch in nodes
-            if not (img_arch and normalize(arch) and normalize(arch) != img_arch)
-        }
-        if not wanted or not wanted <= set(u.installed_on):
+        wanted = [
+            n
+            for n in nodes
+            if not (
+                img_arch and normalize(n.architecture) and normalize(n.architecture) != img_arch
+            )
+        ]
+        if not wanted or not all(
+            _node_has_committed(
+                n.installed_appliance_version,
+                n.current_slot,
+                n.durable_default,
+                n.is_trial_boot,
+                img.appliance_version,
+            )
+            for n in wanted
+        ):
             continue
-        await _delete_image_bytes(img.id)
+        min_age = (
+            _RECLAIM_MIN_AGE_SCHEDULED
+            if await _ever_scheduled(db, img.id)
+            else _RECLAIM_MIN_AGE_NEVER_SCHEDULED
+        )
+        if uploaded > now - min_age:
+            continue
         label = f"{img.filename} ({img.appliance_version})"
+        hosts = sorted(n.hostname for n in wanted)
         await db.delete(img)
         db.add(
             AuditLog(
@@ -1402,18 +1495,17 @@ async def reclaim_committed_upgrade_images(db: AsyncSession) -> list[str]:
                 resource_type="appliance_upgrade_image",
                 resource_id=str(img.id),
                 resource_display=label,
-                new_value={"written_on": sorted(wanted), "size_bytes": img.size_bytes},
+                new_value={"running_on": hosts, "size_bytes": img.size_bytes},
                 result="success",
             )
         )
-        logger.info(
-            "appliance_upgrade_image_reclaimed",
-            image_id=str(img.id),
-            version=img.appliance_version,
-            written_on=sorted(wanted),
-        )
-        reclaimed.append(label)
-    return reclaimed
+        gone.append((img.id, label))
+    # Commit (and release the lock) BEFORE touching bytes.
+    await db.commit()
+    for image_id, label in gone:
+        await _delete_image_bytes(image_id, mirror_timeout=_RECLAIM_MIRROR_TIMEOUT)
+        logger.info("appliance_upgrade_image_reclaimed", image_id=str(image_id), image=label)
+    return [label for _, label in gone]
 
 
 @router.delete(
@@ -1435,6 +1527,10 @@ async def delete_upgrade_image(
         ),
     ),
 ) -> None:
+    # #2400 — exclusive against the scheduling paths, which hold the lock
+    # shared from resolving an image until they commit, so a schedule cannot
+    # land between the in-use check below and the delete.
+    await catalog.lock_catalog_exclusive(db)
     row = await db.get(ApplianceUpgradeImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade image not found.")
@@ -1454,7 +1550,6 @@ async def delete_upgrade_image(
             + "; ".join(forced_over)
             + ". Cancel the upgrade first, or retry with force=true.",
         )
-    await _delete_image_bytes(row.id)
     filename = row.filename
     version = row.appliance_version
     await db.delete(row)
@@ -1472,6 +1567,9 @@ async def delete_upgrade_image(
         )
     )
     await db.commit()
+    # Bytes only after the row is gone for good (#2400): a leftover file is
+    # recoverable, a row whose bytes vanished under a schedule is not.
+    await _delete_image_bytes(image_id)
     logger.info(
         "appliance_upgrade_image_deleted",
         image_id=str(image_id),

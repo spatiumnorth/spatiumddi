@@ -11,9 +11,10 @@
   the kubelet measures it, without ext4's 5% root reserve.
 - **Upgrade images no longer pile up on /var (#2400).** The node's staged
   copy is removed as soon as the slot write ends, on failure as well as
-  success. A stored upgrade image is deleted automatically, and audited,
-  once every node it applies to has it written to a slot and nothing is
-  scheduled to fetch it.
+  success. A periodic task deletes a stored upgrade image, and audits it,
+  once every node it applies to (including nodes awaiting approval) runs
+  that version on a committed boot and nothing is scheduled to fetch it;
+  an image nothing ever scheduled is kept for 7 days.
 - **The appliance no longer creates a swapfile it never uses (#2400).**
   Its fstab entry went into the /etc overlay, which systemd never reads at
   boot, so the 2 GiB file was swap only until the first reboot. Firstboot

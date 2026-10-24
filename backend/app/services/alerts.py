@@ -417,6 +417,9 @@ _APPLIANCE_HEARTBEAT_RULE_NAME = "Appliance heartbeat lost"
 # the Fleet row and the slot-upgrade pre-flight also use.
 RULE_TYPE_APPLIANCE_DISK_LOW = "appliance_disk_low"
 _APPLIANCE_DISK_RULE_NAME = "Appliance /var low on space"
+# Hysteresis: an open event resolves (or steps down from critical) only once
+# /var is this many percentage points above the boundary it crossed.
+_APPLIANCE_DISK_RESOLVE_MARGIN_PCT = 2
 
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
@@ -4247,6 +4250,7 @@ async def _matching_appliance_disk_low_subjects(
     )
     from app.services.appliance.ownership import k8s_node_name  # noqa: PLC0415
     from app.services.appliance.var_disk import (  # noqa: PLC0415
+        EVICTION_HEADROOM_PCT,
         LOW_FREE_PCT,
         evaluate_var_disk,
         reading_is_fresh,
@@ -4295,31 +4299,58 @@ async def _matching_appliance_disk_low_subjects(
     }
 
     out: list[tuple[str, str, str, str]] = []
+    margin = _APPLIANCE_DISK_RESOLVE_MARGIN_PCT
     for a in rows:
         subject_id = str(a.id)
+        held = open_severity_by_subject.get(subject_id)
         fresh = reading_is_fresh(a.last_seen_at, now)
         reading = var_disk_reading(a.cluster_health) if fresh else None
         pressure = pressure_by_node.get(k8s_node_name(a.hostname))
         finding = evaluate_var_disk(reading, disk_pressure=pressure, low_free_pct=threshold)
         if finding is not None:
+            severity = finding.severity
+            # Hysteresis, critical side: a node hovering at 15% must not
+            # flip critical <-> warning on every pass.
+            if (
+                held == "critical"
+                and severity == "warning"
+                and reading is not None
+                and reading.free_pct < EVICTION_HEADROOM_PCT + margin
+            ):
+                severity = "critical"
+            out.append((subject_id, a.hostname, f"{a.hostname}: {finding.detail}", severity))
+            continue
+        if held is None:
+            continue
+        if reading is None:
+            # No /var reading. A DiskPressure=False condition alone is not a
+            # recovery: the kubelet clears it as soon as it has evicted its
+            # way back over 5%, which is exactly when the supervisor is gone.
             out.append(
-                (subject_id, a.hostname, f"{a.hostname}: {finding.detail}", finding.severity)
+                (
+                    subject_id,
+                    a.hostname,
+                    f"{a.hostname}: /var can no longer be read — the supervisor "
+                    "has stopped reporting (kubelet eviction takes it down too). "
+                    "The last known state is left standing because unknown is "
+                    "not recovered.",
+                    held,
+                )
             )
             continue
-        if reading is None and pressure is None:
-            held = open_severity_by_subject.get(subject_id)
-            if held is not None:
-                out.append(
-                    (
-                        subject_id,
-                        a.hostname,
-                        f"{a.hostname}: /var can no longer be read — the supervisor "
-                        "has stopped reporting (kubelet eviction takes it down too). "
-                        "The last known state is left standing because unknown is "
-                        "not recovered.",
-                        held,
-                    )
+        if reading.free_pct < threshold + margin:
+            # Hysteresis, warning side: resolve only once /var is clearly
+            # back, not the moment it crosses the threshold by a byte.
+            out.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"{a.hostname}: {reading.free_pct:.0f}% of /var free — just over "
+                    f"the {threshold:.0f}% threshold; resolves above "
+                    f"{threshold + margin:.0f}%.",
+                    held,
                 )
+            )
     return out
 
 
@@ -5519,7 +5550,8 @@ async def seed_appliance_disk_alert_rule() -> None:
                     "the node reports DiskPressure or /var is under 15% free; "
                     "warning under the threshold (default 20%). Free space by "
                     "deleting unused upgrade images in Fleet. Silent on supervisors "
-                    "too old to report /var. Auto-resolves once space is back."
+                    "too old to report /var. Auto-resolves once /var is 2 points "
+                    "above the threshold."
                 ),
                 rule_type=RULE_TYPE_APPLIANCE_DISK_LOW,
                 threshold_percent=LOW_FREE_PCT,

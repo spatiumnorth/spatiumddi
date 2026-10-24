@@ -3175,20 +3175,35 @@ appliance when the kubelet reports `DiskPressure` or `/var` is under 15%
 free (critical), or under 20% free (warning; the threshold is the rule's
 `threshold_percent`). The Fleet drilldown (**Disk space**) and the Cluster
 → Overview node card show the same finding, from the same evaluator. An
-open event is held rather than resolved when the reading disappears,
-because the eviction it warns about takes the supervisor down with it.
+open event is held rather than resolved when the reading disappears
+(a `DiskPressure=False` condition alone does not resolve it), because the
+eviction it warns about takes the supervisor down with it. To avoid
+flapping, an open event resolves only once `/var` is 2 percentage points
+above the threshold, and steps down from critical only 2 points above
+15%.
 
 **Cached images are cleaned up.** `spatium-upgrade-slot` removes its
 staged copy in `/var/lib/spatiumddi/slot-staging/` as soon as the slot
 write is over, success or failure (a failed run's copy was never reused:
 the next apply discards it before fetching). On the control plane, a
-stored upgrade image is deleted automatically, and audited as
-`appliance.upgrade_image_reclaimed`, once every approved appliance it
-applies to (same architecture, or either side unlabelled) reports its
-version in a slot or as installed, no node is scheduled to fetch it, no
-active rolling run names it, and it was uploaded more than an hour ago.
-The slot version is only recorded after the write and its verification,
-so an image is never reclaimed before it is on disk. Re-import it from
+periodic task (every 10 minutes, on the worker) deletes a stored upgrade
+image, audited as `appliance.upgrade_image_reclaimed`, once:
+
+- every appliance it applies to (same architecture, or either side
+  unlabelled), approved **or still pending approval**, *runs* its
+  version durably: installed, on a committed boot (durable default slot
+  = current slot, not a trial boot). A version that is only written to
+  the inactive slot does not count, because the node can still roll back
+  or the write was cancelled;
+- no node is scheduled to fetch it and no active rolling run names it;
+- it was uploaded more than an hour ago, or more than **7 days** ago when
+  nothing (no per-node schedule, no rolling run) ever named it, since such
+  an image was most likely uploaded ahead for a node not paired yet.
+
+The sweep takes the upgrade-image catalogue lock exclusively, the same lock
+scheduling takes shared from resolving the image until it commits, so an
+image cannot be deleted under a schedule that is being written. The row is
+deleted and committed before the bytes are removed. Re-import it from
 GitHub (or upload it again) to re-apply.
 
 **No swapfile.** Releases before #2400 created a 2 GiB

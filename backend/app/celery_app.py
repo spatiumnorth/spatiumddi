@@ -156,6 +156,7 @@ celery_app = Celery(
         "app.tasks.prune_pairing_codes",
         "app.tasks.firewall_lint_scan",
         "app.tasks.prune_revoked_appliances",
+        "app.tasks.upgrade_image_reclaim",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.ipam_discovery",
@@ -281,6 +282,7 @@ celery_app.conf.update(
         "app.tasks.looking_glass.*": {"queue": "default"},
         "app.tasks.conformity.*": {"queue": "default"},
         "app.tasks.prune_revoked_appliances.*": {"queue": "default"},
+        "app.tasks.upgrade_image_reclaim.*": {"queue": "default"},
         "app.tasks.upgrade_orchestrator.*": {"queue": "default"},
         "app.tasks.dnsbl_sweep.*": {"queue": "default"},
         # #1111 — DNS agent bundle renders. Their own queue so a 30–60 s
@@ -787,6 +789,13 @@ celery_app.conf.update(
         "appliances-prune-revoked": {
             "task": "app.tasks.prune_revoked_appliances.prune_revoked_appliances",
             "schedule": schedule(run_every=3600.0),
+        },
+        # #2400 — delete stored upgrade images every node has committed to.
+        # Every 10 min: the gate inside is an hour (a week for an image
+        # nothing ever scheduled), so finer would only add idle passes.
+        "appliances-reclaim-upgrade-images": {
+            "task": "app.tasks.upgrade_image_reclaim.reclaim_upgrade_images",
+            "schedule": schedule(run_every=600.0),
         },
         # Every 60 s, fire any backup target whose ``next_run_at``
         # is now in the past (issue #117 Phase 1b). The sweep + the

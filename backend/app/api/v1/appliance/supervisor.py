@@ -2182,14 +2182,6 @@ async def supervisor_heartbeat(
         # blanking it back to UNKNOWN, which would silently disarm the
         # upgrade-architecture gate on every node during a rollout.
         row.architecture = body.architecture
-    # #2400 — what the node had written before this heartbeat; a change is
-    # the moment a stored upgrade image may have become reclaimable.
-    slot_state_before = (
-        row.installed_appliance_version,
-        row.slot_a_version,
-        row.slot_b_version,
-        row.desired_slot_image_url,
-    )
     if body.installed_appliance_version is not None:
         row.installed_appliance_version = body.installed_appliance_version
     if body.current_slot is not None:
@@ -2853,19 +2845,6 @@ async def supervisor_heartbeat(
             row.clear_upgrade_requested_at = None
 
     await db.commit()
-
-    # #2400 — a node just reported a new slot / installed version, or its
-    # schedule was cleared: a stored upgrade image every node has now
-    # written is gigabytes on the control plane's /var doing nothing.
-    # Best-effort and after the telemetry commit, so a failure here can
-    # never cost the heartbeat.
-    if slot_state_before != (
-        row.installed_appliance_version,
-        row.slot_a_version,
-        row.slot_b_version,
-        row.desired_slot_image_url,
-    ):
-        await _reclaim_written_upgrade_images()
 
     # #358 Phase 1b — heartbeat long-poll. When the supervisor opts in
     # (wait_seconds > 0) and there's no concrete pending host command,
@@ -6659,25 +6638,6 @@ class ApplianceUpgradeRequest(BaseModel):
     # #1227 — proceed with a control-plane node going to a release that
     # cannot run on the database as it is now (an older image).
     acknowledge_schema_rollback: bool = False
-
-
-async def _reclaim_written_upgrade_images() -> None:
-    """Run the #2400 reclaim in its own session; log any failure.
-
-    Its own session so a failure rolls back only the reclaim: rolling back
-    the heartbeat's session would expire ``row``, which the long-poll below
-    still reads."""
-    from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
-        reclaim_committed_upgrade_images,
-    )
-    from app.db import AsyncSessionLocal  # noqa: PLC0415
-
-    try:
-        async with AsyncSessionLocal() as session:
-            if await reclaim_committed_upgrade_images(session):
-                await session.commit()
-    except Exception as exc:  # noqa: BLE001 — never fail a heartbeat over cleanup
-        logger.warning("appliance_upgrade_image_reclaim_failed", error=str(exc))
 
 
 async def _require_node_staging_headroom(

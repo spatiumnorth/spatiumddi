@@ -358,7 +358,7 @@ async def test_fleet_row_carries_the_finding(db_session: AsyncSession) -> None:
     assert _var_disk_finding(stale) is None
 
 
-# ── reclaiming a stored image every node has written ───────────────
+# ── reclaiming a stored image every node has committed to ─────────
 
 
 @pytest.fixture()
@@ -380,25 +380,51 @@ def _bytes(store: Path, image: ApplianceUpgradeImage) -> Path:
 
 
 _OLD = datetime.now(UTC) - timedelta(days=1)
+_ANCIENT = datetime.now(UTC) - timedelta(days=8)
+V = "2026.10.20-1"
+
+
+def _committed(node: Appliance, version: str = V) -> Appliance:
+    """Running ``version`` on a committed (durable, non-trial) boot."""
+    node.installed_appliance_version = version
+    node.current_slot = "slot_b"
+    node.durable_default = "slot_b"
+    node.is_trial_boot = False
+    node.slot_b_version = version
+    return node
+
+
+def _scheduled_once(db: AsyncSession, image: ApplianceUpgradeImage) -> None:
+    db.add(
+        AuditLog(
+            user_display_name="t",
+            auth_source="local",
+            action="appliance.upgrade_scheduled",
+            resource_type="appliance",
+            resource_id=str(uuid.uuid4()),
+            resource_display="n",
+            new_value={"slot_image_id": str(image.id)},
+            result="success",
+        )
+    )
+
+
+async def _reclaim(db: AsyncSession) -> list[str]:
+    from app.api.v1.appliance.upgrade_images import reclaim_committed_upgrade_images
+
+    return await reclaim_committed_upgrade_images(db)
 
 
 @pytest.mark.asyncio
-async def test_an_image_every_node_has_written_is_reclaimed(
-    db_session: AsyncSession, store: Path
-) -> None:
-    from app.api.v1.appliance.upgrade_images import reclaim_committed_upgrade_images
-
+async def test_an_image_every_node_runs_is_reclaimed(db_session: AsyncSession, store: Path) -> None:
     image = await _image(db_session, uploaded_at=_OLD)
-    a = await _node(db_session, free=TOTAL // 2)
-    b = await _node(db_session, free=TOTAL // 2, installed="2026.10.20-1")
-    a.slot_b_version = "2026.10.20-1"  # written to the inactive slot
+    _scheduled_once(db_session, image)
+    a = _committed(await _node(db_session, free=TOTAL // 2))
+    b = _committed(await _node(db_session, free=TOTAL // 2))
     path = _bytes(store, image)
     await db_session.flush()
 
-    assert await reclaim_committed_upgrade_images(db_session) == [
-        f"{image.filename} ({image.appliance_version})"
-    ]
-    await db_session.commit()
+    assert await _reclaim(db_session) == [f"{image.filename} ({image.appliance_version})"]
     assert not path.exists()
     assert await db_session.get(ApplianceUpgradeImage, image.id) is None
     audit = (
@@ -406,22 +432,50 @@ async def test_an_image_every_node_has_written_is_reclaimed(
             select(AuditLog).where(AuditLog.action == "appliance.upgrade_image_reclaimed")
         )
     ).scalar_one()
-    assert sorted(audit.new_value["written_on"]) == sorted([a.hostname, b.hostname])
+    assert audit.new_value["running_on"] == sorted([a.hostname, b.hostname])
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["one_node_lacks_it", "scheduled", "too_new", "no_node_has_it"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "one_node_lacks_it",
+        "scheduled",
+        "too_new",
+        "no_node_has_it",
+        # review finding 3 — written but not committed
+        "only_in_inactive_slot",
+        "trial_boot",
+        # review finding 4 — a node awaiting approval on another version
+        "pending_node_on_old_version",
+        "never_scheduled_and_a_day_old",
+    ],
+)
 async def test_an_image_still_needed_is_kept(
     db_session: AsyncSession, store: Path, case: str
 ) -> None:
-    from app.api.v1.appliance.upgrade_images import reclaim_committed_upgrade_images
-
     image = await _image(db_session, uploaded_at=datetime.now(UTC) if case == "too_new" else _OLD)
+    if case != "never_scheduled_and_a_day_old":
+        _scheduled_once(db_session, image)
     a = await _node(db_session, free=TOTAL // 2)
-    if case != "no_node_has_it":
-        a.slot_b_version = "2026.10.20-1"
+    if case not in ("no_node_has_it", "only_in_inactive_slot", "trial_boot"):
+        _committed(a)
+    if case == "only_in_inactive_slot":
+        # The write happened; the node still runs the old version (it rolled
+        # back, or the operator never rebooted into it).
+        a.installed_appliance_version = "2026.10.01-1"
+        a.current_slot = a.durable_default = "slot_a"
+        a.slot_b_version = V
+    if case == "trial_boot":
+        a.installed_appliance_version = V
+        a.current_slot = "slot_b"
+        a.durable_default = "slot_a"
+        a.is_trial_boot = True
     if case == "one_node_lacks_it":
         await _node(db_session, free=TOTAL // 2, installed="2026.10.01-1")
+    if case == "pending_node_on_old_version":
+        p = await _node(db_session, free=TOTAL // 2, installed="2026.10.01-1")
+        p.state = "pending_approval"
     if case == "scheduled":
         a.desired_slot_image_url = (
             f"https://cp/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t=x"
@@ -429,23 +483,200 @@ async def test_an_image_still_needed_is_kept(
     path = _bytes(store, image)
     await db_session.flush()
 
-    assert await reclaim_committed_upgrade_images(db_session) == []
+    assert await _reclaim(db_session) == []
     assert path.exists()
     assert await db_session.get(ApplianceUpgradeImage, image.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_never_scheduled_image_is_reclaimed_after_a_week(
+    db_session: AsyncSession, store: Path
+) -> None:
+    image = await _image(db_session, uploaded_at=_ANCIENT)
+    _committed(await _node(db_session, free=TOTAL // 2))
+    _bytes(store, image)
+    await db_session.flush()
+    assert len(await _reclaim(db_session)) == 1
 
 
 @pytest.mark.asyncio
 async def test_a_node_of_another_architecture_does_not_hold_an_image(
     db_session: AsyncSession, store: Path
 ) -> None:
-    from app.api.v1.appliance.upgrade_images import reclaim_committed_upgrade_images
-
     image = await _image(db_session, uploaded_at=_OLD, architecture="amd64")
-    await _node(db_session, free=TOTAL // 2, installed="2026.10.20-1")
+    _scheduled_once(db_session, image)
+    _committed(await _node(db_session, free=TOTAL // 2))
     await _node(db_session, free=TOTAL // 2, architecture="arm64")  # never takes amd64
     _bytes(store, image)
     await db_session.flush()
-    assert len(await reclaim_committed_upgrade_images(db_session)) == 1
+    assert len(await _reclaim(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rolling_run_holds_the_image_until_it_finishes(
+    db_session: AsyncSession, store: Path
+) -> None:
+    """Review finding 1: the run turns ``succeeded`` after the last node's
+    state changed; the periodic sweep must still reclaim afterwards."""
+    from app.models.system_upgrade import RUN_KINDS, SystemUpgradeRun
+
+    image = await _image(db_session, uploaded_at=_OLD)
+    _committed(await _node(db_session, free=TOTAL // 2))
+    run = SystemUpgradeRun(
+        kind=RUN_KINDS[0],
+        target_version=V,
+        state="running",
+        plan={"slot_image_id": str(image.id)},
+    )
+    db_session.add(run)
+    path = _bytes(store, image)
+    await db_session.flush()
+    assert await _reclaim(db_session) == []
+    assert path.exists()
+
+    run = await db_session.get(SystemUpgradeRun, run.id)
+    run.state = "succeeded"
+    await db_session.commit()
+    assert len(await _reclaim(db_session)) == 1
+    assert not path.exists()
+
+
+def test_the_sweep_is_a_beat_task_not_a_heartbeat_hook() -> None:
+    """Review findings 1 + 2."""
+    import inspect
+
+    from app.api.v1.appliance import supervisor
+    from app.celery_app import celery_app
+
+    assert "reclaim" not in inspect.getsource(supervisor.supervisor_heartbeat)
+    entry = celery_app.conf.beat_schedule["appliances-reclaim-upgrade-images"]
+    assert entry["task"] == "app.tasks.upgrade_image_reclaim.reclaim_upgrade_images"
+    import app.tasks.upgrade_image_reclaim as task_mod
+
+    assert task_mod.reclaim_upgrade_images.name == entry["task"]
+
+
+@pytest.mark.asyncio
+async def test_reclaim_mirror_delete_uses_a_short_timeout(
+    db_session: AsyncSession, store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 2: not the 1800 s upload/download timeout."""
+    from app.api.v1.appliance import upgrade_images
+
+    seen: list = []
+
+    async def fake_delete(image_id, *, timeout=None):
+        seen.append(timeout)
+
+    monkeypatch.setattr(upgrade_images.settings, "slot_image_mirror_url", "http://mirror")
+    monkeypatch.setattr(upgrade_images, "_delete_from_mirror", fake_delete)
+    image = await _image(db_session, uploaded_at=_OLD)
+    _scheduled_once(db_session, image)
+    _committed(await _node(db_session, free=TOTAL // 2))
+    await db_session.flush()
+    assert len(await _reclaim(db_session)) == 1
+    assert len(seen) == 1 and seen[0] is not None and seen[0].read <= 30
+
+
+@pytest.mark.asyncio
+async def test_bytes_go_only_after_the_row_delete_is_committed(
+    db_session: AsyncSession, store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 5: a leftover file is recoverable, a schedule pointing
+    at an image whose bytes vanished is not."""
+    from app.api.v1.appliance import upgrade_images
+    from app.db import AsyncSessionLocal
+
+    image = await _image(db_session, uploaded_at=_OLD)
+    _scheduled_once(db_session, image)
+    _committed(await _node(db_session, free=TOTAL // 2))
+    _bytes(store, image)
+    await db_session.commit()
+    row_visible_elsewhere: list[bool] = []
+    real = upgrade_images._delete_image_bytes
+
+    async def spy(image_id, **kw):
+        async with AsyncSessionLocal() as other:
+            row_visible_elsewhere.append(
+                await other.get(ApplianceUpgradeImage, image_id) is not None
+            )
+        await real(image_id, **kw)
+
+    monkeypatch.setattr(upgrade_images, "_delete_image_bytes", spy)
+    assert len(await _reclaim(db_session)) == 1
+    assert row_visible_elsewhere == [False]
+
+
+@pytest.mark.asyncio
+async def test_reclaim_yields_to_an_in_flight_schedule(
+    db_session: AsyncSession, store: Path
+) -> None:
+    """Review finding 5: a scheduling transaction (holding the catalogue lock
+    shared since it resolved the image) or a second replica's sweep makes
+    this pass a no-op rather than deleting under it."""
+    from app.db import AsyncSessionLocal
+    from app.services.appliance.slot_image_target import resolve_slot_image_target
+
+    image = await _image(db_session, uploaded_at=_OLD)
+    _scheduled_once(db_session, image)
+    _committed(await _node(db_session, free=TOTAL // 2))
+    path = _bytes(store, image)
+    await db_session.commit()
+
+    async with AsyncSessionLocal() as scheduler:
+        await resolve_slot_image_target(scheduler, base_url="https://cp", slot_image_id=image.id)
+        # The schedule has not committed yet.
+        assert await _reclaim(db_session) == []
+        assert path.exists()
+        await scheduler.rollback()
+    assert len(await _reclaim(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_alert_hysteresis(db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review finding 6: no flapping at the 20 % / 15 % boundaries, and a
+    DiskPressure=False reading alone does not resolve an unreadable node."""
+    monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
+    pressure: dict[str, bool] = {}
+
+    async def snapshot():
+        return {"nodes": [{"name": k, "disk_pressure": v} for k, v in pressure.items()]}
+
+    monkeypatch.setattr(alerts_svc, "_cluster_health_snapshot", snapshot)
+    rule = AlertRule(
+        name="Appliance /var low (hysteresis)",
+        rule_type="appliance_disk_low",
+        threshold_percent=20,
+        severity="warning",
+        enabled=True,
+    )
+    db_session.add(rule)
+    n = await _node(db_session, free=TOTAL * 18 // 100, hostname="hy1")
+    await db_session.commit()
+
+    async def state() -> list[str]:
+        await evaluate_all(db_session)
+        return [e.severity for e in await _open(db_session, rule)]
+
+    assert await state() == ["warning"]
+    n.cluster_health = _health(free=TOTAL * 21 // 100)  # just over 20 %
+    await db_session.commit()
+    assert await state() == ["warning"]
+    n.cluster_health = _health(free=TOTAL * 14 // 100)
+    await db_session.commit()
+    assert await state() == ["critical"]
+    n.cluster_health = _health(free=TOTAL * 16 // 100)  # just over 15 %
+    await db_session.commit()
+    assert await state() == ["critical"]
+    # Supervisor gone, kubelet says no DiskPressure: still not a recovery.
+    n.last_seen_at = datetime.now(UTC) - timedelta(hours=1)
+    pressure["hy1"] = False
+    await db_session.commit()
+    assert await state() == ["critical"]
+    n.last_seen_at = datetime.now(UTC)
+    n.cluster_health = _health(free=TOTAL * 23 // 100)
+    await db_session.commit()
+    assert await state() == []
 
 
 @pytest.mark.asyncio
@@ -489,3 +720,21 @@ async def test_copilot_fleet_row_carries_var(db_session: AsyncSession) -> None:
     assert d["var_disk_finding"]["severity"] == "critical"
     d = _row_to_dict(unknown)
     assert d["var_free_bytes"] is None and d["var_disk_finding"] is None
+
+
+@pytest.mark.asyncio
+async def test_cluster_node_card_does_not_judge_a_stale_reading(db_session: AsyncSession) -> None:
+    """Review finding 7: same freshness rule as Fleet and the alert."""
+    from app.api.v1.appliance.cluster import _merge_supervisor_host_state
+
+    await _node(
+        db_session,
+        free=TOTAL // 100,
+        hostname="old1",
+        last_seen=datetime.now(UTC) - timedelta(hours=1),
+    )
+    await db_session.flush()
+    snap = {"available": True, "nodes": [{"name": "old1", "disk_pressure": False}]}
+    await _merge_supervisor_host_state(db_session, snap)
+    assert snap["nodes"][0].get("var_disk_finding") is None
+    assert snap["nodes"][0]["host_disk_partitions"]  # the bars still show

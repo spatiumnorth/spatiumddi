@@ -155,6 +155,11 @@ spec:
             # shared hostPath (firstboot chowns it 1000:1000).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # #2400 — upgrade-image store. The reclaim beat task deletes an
+            # image every node has committed to; the api writes the same
+            # hostPath (firstboot chowns it 1000:1000).
+            - name: slot-images
+              mountPath: /var/lib/spatiumddi/slot-images
             # #1160 — local-volume backup archives. The worker WRITES every
             # scheduled run here; the api lists / downloads / restores from
             # the same hostPath (firstboot chowns it 1000:1000).
@@ -185,6 +190,11 @@ spec:
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+        # #2400 — upgrade-image store (shared with the api).
+        - name: slot-images
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.slotImagesDir }}
             type: DirectoryOrCreate
         # #1160 — local-volume backup archives (shared with the api).
         - name: backups

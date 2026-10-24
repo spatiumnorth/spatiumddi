@@ -39,7 +39,7 @@ from app.services.appliance import k8s
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
 from app.services.appliance.ownership import k8s_node_name
 from app.services.appliance.storage_health import evaluate_storage, worst_severity
-from app.services.appliance.var_disk import evaluate_var_disk, var_disk_reading
+from app.services.appliance.var_disk import evaluate_var_disk, reading_is_fresh, var_disk_reading
 
 logger = structlog.get_logger(__name__)
 
@@ -391,19 +391,25 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
         return
     rows = (
         await db.execute(
-            select(Appliance.hostname, Appliance.cluster_health).where(
+            select(Appliance.hostname, Appliance.cluster_health, Appliance.last_seen_at).where(
                 Appliance.state == APPLIANCE_STATE_APPROVED
             )
         )
     ).all()
     pmap: dict[str, list[dict[str, Any]]] = {}
     smap: dict[str, dict[str, Any]] = {}
-    for hostname, ch in rows:
+    # #2400 — whose partition reading is fresh enough to JUDGE. The bars still
+    # show the last report; the /var finding follows the same freshness rule
+    # as the Fleet row and the appliance_disk_low alert.
+    fresh: set[str] = set()
+    for hostname, ch, last_seen_at in rows:
         if not hostname or not isinstance(ch, dict):
             continue
         parts = ch.get("host_disk_partitions")
         if isinstance(parts, list) and parts:
             pmap[k8s_node_name(hostname)] = parts
+            if reading_is_fresh(last_seen_at):
+                fresh.add(k8s_node_name(hostname))
         storage = ch.get("storage")
         if isinstance(storage, dict):
             smap[k8s_node_name(hostname)] = storage
@@ -412,7 +418,7 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
         if key in pmap:
             node["host_disk_partitions"] = pmap[key]
         finding = evaluate_var_disk(
-            var_disk_reading({"host_disk_partitions": pmap.get(key)}),
+            var_disk_reading({"host_disk_partitions": pmap.get(key)}) if key in fresh else None,
             disk_pressure=node.get("disk_pressure"),
         )
         if finding is not None:
