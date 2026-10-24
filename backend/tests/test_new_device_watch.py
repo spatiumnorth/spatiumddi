@@ -18,7 +18,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from app.api.v1.dhcp.agents import _auth_agent
+from app.api.v1.dhcp.agents import _auth_agent, insert_ipam_mirror_row
 from app.core.security import create_access_token, hash_password
 from app.main import app
 from app.models.alerts import AlertRule
@@ -767,7 +767,6 @@ async def test_mac_sightings_existing_row_matches_without_insert(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#2651 — a known IP updates its row in place; no failing INSERT/savepoint."""
-    import app.api.v1.dhcp.agents as agents_mod
 
     server, subnet = await _seed_dhcp(db_session)
     await _enable_watch(db_session)
@@ -779,13 +778,13 @@ async def test_mac_sightings_existing_row_matches_without_insert(
     db_session.expire(row)
 
     calls: list[object] = []
-    real = agents_mod.insert_ipam_mirror_row
+    real = insert_ipam_mirror_row
 
     async def spy(db, candidate):  # type: ignore[no-untyped-def]
         calls.append(candidate)
         return await real(db, candidate)
 
-    monkeypatch.setattr(agents_mod, "insert_ipam_mirror_row", spy)
+    monkeypatch.setattr("app.api.v1.dhcp.agents.insert_ipam_mirror_row", spy)
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
         resp = await client.post(
