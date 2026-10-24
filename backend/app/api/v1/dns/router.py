@@ -46,6 +46,7 @@ from app.api.pagination import (
     Page,
     paginate,
 )
+from app.api.v1._common import WinRMSettings, winrm_settings_from_blob
 from app.config import settings
 from app.core.agent_wake import (
     appliance_channel,
@@ -76,7 +77,7 @@ from app.core.permissions import (
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
 from app.core.update_nulls import changed_keys, resolve_update_changes
-from app.drivers._winrm import validate_transport
+from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
     CREDENTIALED_DNS_DRIVERS,
@@ -186,6 +187,7 @@ from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
+    ServerMoveResult,
     catalog_unsupported_message,
     elect_primary,
     ensure_group_catalog_compatible,
@@ -524,8 +526,9 @@ class WindowsCredentialsInput(BaseModel):
     """Windows DNS admin credentials (for driver='windows_dns' Path B).
 
     Stored Fernet-encrypted on ``DNSServer.credentials_encrypted``.
-    Server never returns the password back — responses only expose
-    ``has_credentials``.
+    The username and password are never returned — responses expose
+    ``has_credentials`` and the non-secret ``winrm_settings`` (port,
+    transport, TLS, certificate validation) only.
 
     Mirrors the DHCP-side shape. All fields are optional to support
     **partial updates**: sending ``{"transport": "credssp"}`` on an
@@ -662,6 +665,10 @@ class ServerResponse(BaseModel):
     # button, Sync Zones from Server action) without hardcoding driver
     # names client-side.
     has_credentials: bool
+    # The stored non-secret WinRM settings (windows_dns with credentials;
+    # null otherwise). Lets the edit dialog show what is stored, so an
+    # untouched save sends nothing and keeps it. Never carries the secrets.
+    winrm_settings: WinRMSettings | None = None
     is_agentless: bool
     # Agent-state fields used by the Server Detail modal — surfacing
     # these lets operators answer "what's this server doing right now"
@@ -759,6 +766,11 @@ class ServerResponse(BaseModel):
             last_health_check_at=s.last_health_check_at,
             notes=s.notes,
             has_credentials=bool(s.credentials_encrypted),
+            winrm_settings=(
+                winrm_settings_from_blob(s.credentials_encrypted)
+                if s.driver == "windows_dns"
+                else None
+            ),
             is_agentless=is_agentless(s.driver),
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
@@ -2446,6 +2458,19 @@ async def _refuse_second_signer(
         raise HTTPException(status_code=422, detail=refusal)
 
 
+def _server_update_audit_value(
+    move_result: ServerMoveResult | None, winrm_diff: dict[str, dict[str, Any]]
+) -> dict[str, object] | None:
+    """The server-update audit row's ``new_value``: the group move (if any)
+    and the old → new value of each WinRM setting the update changed."""
+    value: dict[str, object] = {}
+    if move_result is not None:
+        value.update(move_result.as_audit_value())
+    if winrm_diff:
+        value["winrm_settings_changed"] = winrm_diff
+    return value or None
+
+
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
     group_id: uuid.UUID,
@@ -2537,16 +2562,22 @@ async def update_server(
 
     # Credentials contract matches DHCP:
     #   None → leave alone, {} → clear, partial dict → decrypt-merge-reencrypt
+    winrm_diff: dict[str, dict[str, Any]] = {}
     if body.windows_credentials is not None:
         if isinstance(body.windows_credentials, WindowsCredentialsInput):
             patch = body.windows_credentials.model_dump(exclude_none=True)
             if not patch:
                 pass  # empty WindowsCredentialsInput — no-op
             elif server.credentials_encrypted:
+                # Merge: a key the request does not carry keeps its stored
+                # value, so an edit that omits the TLS settings never resets
+                # them to the create defaults.
                 existing = decrypt_dict(server.credentials_encrypted)
+                before_creds = dict(existing)
                 existing.update(patch)
                 server.credentials_encrypted = encrypt_dict(existing)
                 changes["windows_credentials_updated"] = sorted(patch.keys())
+                winrm_diff = winrm_settings_diff(before_creds, existing)
             else:
                 if not patch.get("username") or not patch.get("password"):
                     raise HTTPException(
@@ -2563,6 +2594,7 @@ async def update_server(
                 patch.setdefault("winrm_port", 5986 if patch.get("use_tls") else 5985)
                 server.credentials_encrypted = encrypt_dict(patch)
                 changes["windows_credentials_set"] = True
+                winrm_diff = winrm_settings_diff(None, patch)
         elif body.windows_credentials == {}:
             server.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
@@ -2676,7 +2708,7 @@ async def update_server(
             resource_id=str(server.id),
             resource_display=server.name,
             changed_fields=changed_keys(before, changes),
-            new_value=move_result.as_audit_value() if move_result else None,
+            new_value=_server_update_audit_value(move_result, winrm_diff),
             result="success",
         )
     )
