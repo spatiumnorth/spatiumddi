@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -333,7 +334,13 @@ export function DomainsPage() {
     page_size: 200,
   };
 
-  const { data, isLoading, refetch, isFetching } = useQuery({
+  const {
+    data,
+    isLoading,
+    refetch,
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["domains", listParams],
     queryFn: () => domainsApi.list(listParams),
     // #278 — a freshly-created domain's RDAP data lands a few seconds
@@ -563,7 +570,22 @@ export function DomainsPage() {
                     colSpan={9}
                     className="px-4 py-8 text-center text-xs text-muted-foreground"
                   >
-                    No domains yet — click "New domain" to add the first one.
+                    <ListEmpty
+                      error={listError}
+                      what="domains"
+                      filtered={
+                        stateFilter !== "" ||
+                        search.trim() !== "" ||
+                        tagFilters.length > 0
+                      }
+                      onClearFilters={() => {
+                        setStateFilter("");
+                        setSearch("");
+                        setTagFilters([]);
+                      }}
+                    >
+                      No domains yet — click "New domain" to add the first one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}

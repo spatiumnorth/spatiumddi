@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -399,7 +400,17 @@ export function CustomersPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={6}
                   >
-                    No customers yet — click "New customer" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="customers"
+                      filtered={search !== "" || statusFilter !== ""}
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                      }}
+                    >
+                      No customers yet — click "New customer" to add one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
