@@ -662,6 +662,15 @@ best-effort by design (failures are logged, not raised): a `502` from an
 unreachable Windows box would roll the DB restore back and make the row
 *unrestorable*, which is the opposite of what a recovery action should do.
 
+### Deleting a server releases its lease mirrors (#2290)
+
+Deleting a DHCP server purges its leases through the same teardown the expiry
+sweep uses: each lease's `auto_from_lease` IPAM mirror is freed and its DDNS
+A/PTR retracted, unless an HA / failover partner (or another client on the
+server) still holds an active lease on the address, in which case the shared
+mirror and DNS stay. The hourly mirror sweep also frees any `status="dhcp"`
+mirror that no lease row backs, healing servers deleted before this fix.
+
 ### The IPAM mirror is released on wholesale deletes (#618)
 
 A reservation owns an `ip_address` row at `status="static_dhcp"`, back-linked via

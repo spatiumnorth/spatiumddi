@@ -46,6 +46,7 @@ from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMembe
 from app.models.audit import AuditLog
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
 from app.models.ipam import IPAddress
+from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
@@ -589,7 +590,9 @@ async def resolve_primary_server(db: AsyncSession, zone: DNSZone) -> DNSServer |
     return candidate
 
 
-async def heal_primaryless_groups(db: AsyncSession) -> int:
+async def heal_primaryless_groups(
+    db: AsyncSession, healed_groups: list[uuid.UUID] | None = None
+) -> int:
     """Mark a primary in every group that has servers and no primary (#2276).
 
     Self-heal for installs left without one — by deleting the primary on a
@@ -605,7 +608,13 @@ async def heal_primaryless_groups(db: AsyncSession) -> int:
     lookup caps at one row, so that state mis-picks rather than 500s (#934),
     and only a group already without a primary is ever touched, which after
     this fix means one left over from an older build. Returns the number of
-    groups healed.
+    groups healed; when ``healed_groups`` is given, their ids are appended so
+    the caller can wake the group channels after its commit.
+
+    ``is_primary`` is a bundle input and the UPDATE is Core, which the
+    bundle-dirty listener never sees, so each healed group is marked dirty
+    here (#2655) — otherwise the stored bundle stays "current" and, e.g., a
+    catalog-zone group keeps serving a bundle with no producer.
     """
     primaried = select(DNSServer.group_id).where(DNSServer.is_primary.is_(True))
     group_ids = (
@@ -636,15 +645,19 @@ async def heal_primaryless_groups(db: AsyncSession) -> int:
         )
         if res.rowcount:
             healed += 1
+            if healed_groups is not None:
+                healed_groups.append(group_id)
+            await mark_bundles_dirty(db, group_ids=[group_id])
+            collect_wake(dns_group_channel(group_id))
             logger.warning(
                 "dns_group_primary_healed",
                 group_id=str(group_id),
                 server_id=str(candidate.id),
                 server=candidate.name,
             )
-    # No wake: the agents' bundles pick the flag up on the 12 s safety tick,
-    # and record writes already reach the stand-in through
-    # ``resolve_primary_server`` in the meantime.
+    # The marks above shift the stored bundle; the 12 s tick alone would NOT
+    # pick the flag up (it only re-checks ``is_current``). Record writes reach
+    # the stand-in through ``resolve_primary_server`` in the meantime.
     return healed
 
 

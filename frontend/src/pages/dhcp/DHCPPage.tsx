@@ -83,6 +83,7 @@ import {
   servingByScopeId,
   useGroupFailover,
 } from "./windowsFailover";
+import { deleteServerDescription } from "./serverDeleteCopy";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
@@ -659,7 +660,7 @@ function GroupDetailView({
 // Rogue-DHCP observed responders (#370). Lists DHCP servers the active probe
 // saw answering on this group's segments + lets the operator acknowledge a
 // known-but-external one (allowlists it so the rogue alert auto-resolves).
-function RespondersTab({ groupId }: { groupId: string }) {
+export function RespondersTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Acknowledging allowlists the source: a POST the router gates as
   // write on dhcp_server (no SuperAdmin on the handler).
@@ -687,9 +688,9 @@ function RespondersTab({ groupId }: { groupId: string }) {
       <p className="text-xs text-muted-foreground">
         DHCP servers seen answering on this group's segments by the active probe
         (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
-        responders classify <span className="text-rose-600">rogue</span> and
-        fire the Rogue DHCP alert — acknowledge a known-but-external one to
-        allowlist it.
+        responders classify <span className="text-rose-600">rogue</span>, and
+        fire the Rogue DHCP alert once that rule is enabled (Alerts → Rules; it
+        ships disabled) — acknowledge a known-but-external one to allowlist it.
       </p>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">
@@ -3217,6 +3218,26 @@ function ServerDetailView({
   );
 }
 
+/** The confirm sentence of Delete Server Group (#2607). `count: null` is a list
+ *  that did not load: the kind is named without a number. */
+function deleteGroupDescription(
+  name: string,
+  kinds: { one: string; many: string; count: number | null }[],
+): string {
+  const held = kinds
+    .filter((k) => k.count === null || k.count > 0)
+    .map((k) =>
+      k.count === null
+        ? `its ${k.many}`
+        : `${k.count} ${k.count === 1 ? k.one : k.many}`,
+    );
+  const config =
+    held.length > 0
+      ? ` The group's own configuration is deleted with it, none of it into Trash: ${held.join(", ")}.`
+      : "";
+  return `Permanently delete group "${name}"? Scopes of this group already in Trash are deleted with it, with their pools and reservations, and can no longer be restored.${config} Its rogue-DHCP responder and router-advertisement records and allowlists go too. None of this can be restored.`;
+}
+
 /** Delete Server Group (#1399). The server refuses a group that still holds
  *  servers or live scopes (409), so the dialog reads both first and, when the
  *  group holds either, says what it holds and offers no Delete: the console
@@ -3224,7 +3245,7 @@ function ServerDetailView({
  *  the backstop (a list read before another tab added a scope, the API, the
  *  approval queue) and its reason shows in the dialog. What a delete still
  *  takes is the group's scopes already in Trash, for good. */
-function DeleteServerGroupModal({
+export function DeleteServerGroupModal({
   group,
   onConfirm,
   onClose,
@@ -3247,6 +3268,59 @@ function DeleteServerGroupModal({
     queryKey: ["dhcp-scopes-group", group.id],
     queryFn: () => dhcpApi.listScopesByGroup(group.id),
   });
+  // What else a delete destroys (#2607): the group's own configuration goes with
+  // it by FK cascade and none of it goes to Trash. Counted from the lists the
+  // group's tabs already read; one that fails to load is named without a number.
+  const configQs = [
+    {
+      one: "MAC block",
+      many: "MAC blocks",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "mac-blocks", group.id],
+        queryFn: () => dhcpApi.listMacBlocks(group.id),
+      }),
+    },
+    {
+      one: "client class",
+      many: "client classes",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "client-classes", group.id],
+        queryFn: () => dhcpApi.listClientClasses(group.id),
+      }),
+    },
+    {
+      one: "option template",
+      many: "option templates",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "option-templates", group.id],
+        queryFn: () => dhcpApi.listOptionTemplates(group.id),
+      }),
+    },
+    {
+      one: "PXE profile",
+      many: "PXE profiles",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "pxe-profiles", group.id],
+        queryFn: () => dhcpApi.listPxeProfiles(group.id),
+      }),
+    },
+    {
+      one: "device policy",
+      many: "device policies",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "device-policies", group.id],
+        queryFn: () => dhcpApi.listDevicePolicies(group.id),
+      }),
+    },
+    {
+      one: "phone profile",
+      many: "phone profiles",
+      q: useQuery({
+        queryKey: ["dhcp-group-delete-count", "phone-profiles", group.id],
+        queryFn: () => dhcpApi.listPhoneProfiles(group.id),
+      }),
+    },
+  ];
   const title = "Delete Server Group";
 
   if (serversQ.isPending || scopesQ.isPending) {
@@ -3295,10 +3369,28 @@ function DeleteServerGroupModal({
       </Modal>
     );
   }
+  // Only the delete path needs the configuration counts; a refused group
+  // (above) never waits for them.
+  if (configQs.some(({ q }) => q.isPending)) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" holds…
+        </p>
+      </Modal>
+    );
+  }
   return (
     <DeleteConfirmModal
       title={title}
-      description={`Permanently delete group "${group.name}"? Scopes of this group already in Trash are deleted with it, with their pools and reservations, and can no longer be restored.`}
+      description={deleteGroupDescription(
+        group.name,
+        configQs.map(({ one, many, q }) => ({
+          one,
+          many,
+          count: q.data ? q.data.length : null,
+        })),
+      )}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
@@ -3528,7 +3620,7 @@ export function DHCPPage() {
       {delServer && (
         <DeleteConfirmModal
           title="Delete DHCP Server"
-          description={`Remove server "${delServer.name}"? Its scopes remain but will be unassigned.`}
+          description={deleteServerDescription(delServer.name)}
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => {
             setDelServer(null);
