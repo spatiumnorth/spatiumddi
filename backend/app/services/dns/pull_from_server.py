@@ -23,7 +23,8 @@ a TSIG-signed AXFR (#734), the rest over their own authenticated API.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -35,8 +36,10 @@ from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
+from app.services.dns.ingest import learned_record_op, server_ops_touching
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
+    enqueue_agent_record_ops,
     resolve_primary_server,
     rrset_from_payload,
 )
@@ -68,6 +71,15 @@ class PullResult:
     imported: int  # count of rows we created
     imported_records: list[dict[str, Any]]  # user-visible list for UI
     skipped_unsupported: int  # count filtered because record_type not imported
+    # The rows an ``apply=True`` import added (#2654), so the caller can send
+    # them to the group's other agent servers. Empty in preview.
+    created_rows: list[DNSRecord] = field(default_factory=list, repr=False)
+    # Record ops queued to those other servers (#2654).
+    peer_ops: int = 0
+    # On-wire records not imported because an op for their name and type is
+    # still queued to the server read (#2654): mid-change, so neither side
+    # is the truth yet. The next sync looks again.
+    skipped_in_flight: int = 0
 
 
 @dataclass
@@ -511,18 +523,26 @@ def _additive_import(
     relative_targets: bool,
     importable_types: frozenset[str] | None = None,
     not_importable: set[RecordKey] | None = None,
+    in_flight: Callable[[str, str], bool] | None = None,
 ) -> PullResult:
     """Create DNSRecord rows for on-wire entries that are missing from DB.
 
     ``not_importable`` names on-wire records that are a DB row served wrong
     (``_legacy_technitium_txt_keys``): neither existing nor new, so they are
     skipped and left for the push to replace.
+
+    ``in_flight(name, type)`` true means an op for that RRset is still queued
+    to the server read (#2654). Such a record is not imported: a record whose
+    delete has not reached the server yet would otherwise come straight back
+    as a new row and be re-sent to the servers that already dropped it.
     """
     if importable_types is None:
         importable_types = frozenset(_IMPORTABLE_TYPES)
     zone_name = zone.name
     zone_name_no_dot = zone.name.rstrip(".")
     imported_records: list[dict[str, Any]] = []
+    created_rows: list[DNSRecord] = []
+    skipped_in_flight = 0
     skipped_unsupported = 0
     existing = 0
     imported = 0
@@ -537,6 +557,9 @@ def _additive_import(
             existing += 1
             continue
         if not_importable and key in not_importable:
+            continue
+        if in_flight is not None and in_flight(rec.name, rtype):
+            skipped_in_flight += 1
             continue
 
         fqdn = zone_name_no_dot if rec.name == "@" else f"{rec.name}.{zone_name_no_dot}"
@@ -555,6 +578,7 @@ def _additive_import(
         )
         if apply:
             db.add(row)
+            created_rows.append(row)
         imported += 1
         imported_records.append(
             {
@@ -572,6 +596,35 @@ def _additive_import(
         imported=imported,
         imported_records=imported_records,
         skipped_unsupported=skipped_unsupported,
+        created_rows=created_rows,
+        skipped_in_flight=skipped_in_flight,
+    )
+
+
+async def _send_imports_to_peers(
+    db: AsyncSession, zone: DNSZone, read_from: Any, result: PullResult
+) -> None:
+    """Queue every row the import just created to the group's OTHER agent
+    servers (#2654).
+
+    The rows describe what ``read_from`` serves, so it is left out. In a
+    no-views group an agent only ever receives a record as a record op, so
+    without this the other servers of a multi-agent group never served what
+    the import found. The ops are per value (``rrset_action="add"``), like
+    the import itself: additive, so a value a peer holds that the database
+    does not know about is left alone. The push phase cannot cover it: on an
+    agent-managed BIND9 server the control plane has no RFC 2136 path of its
+    own and the push reports an error per record instead. Agentless groups
+    are left to the push phase, which is how they have always been written to.
+    """
+    if not result.created_rows or is_agentless(getattr(read_from, "driver", "")):
+        return
+    serial = bump_zone_serial(zone)
+    ops = [
+        {**learned_record_op("create", row), "target_serial": serial} for row in result.created_rows
+    ]
+    result.peer_ops = await enqueue_agent_record_ops(
+        db, zone, ops, exclude_server_ids={read_from.id}
     )
 
 
@@ -623,9 +676,11 @@ async def pull_zone_from_server(
         relative_targets=rel,
         importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
         not_importable=_not_importable(primary, db_rows, zone.name),
+        in_flight=(await server_ops_touching(db, zone, primary, None)).queued_at,
     )
     if apply and result.imported:
         await db.flush()
+        await _send_imports_to_peers(db, zone, primary, result)
 
     logger.info(
         "dns.pull_from_server",
@@ -1002,9 +1057,11 @@ async def sync_zone_with_server(
         relative_targets=rel,
         importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
         not_importable=_not_importable(primary, db_rows, zone.name),
+        in_flight=(await server_ops_touching(db, zone, primary, None)).queued_at,
     )
     if apply and pull_result.imported:
         await db.flush()
+        await _send_imports_to_peers(db, zone, primary, pull_result)
 
     push_result = await _additive_push(
         db,

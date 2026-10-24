@@ -43,6 +43,7 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.acme import ACMEAccount
 from app.models.dns import (
     DNSAcl,
+    DNSIngestSnapshot,
     DNSKey,
     DNSPool,
     DNSRecord,
@@ -888,6 +889,8 @@ async def commit_move(
 
     # ── Purge state belonging to the old group ────────────────────────
     await db.execute(sa_delete(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id))
+    # #2654 — the old group's servers' DDNS ingest reports for this zone.
+    await db.execute(sa_delete(DNSIngestSnapshot).where(DNSIngestSnapshot.zone_id == zone.id))
     await sweep_zone_ops(db, zone, old_group_id)
     # DNSSEC key state is a read-only mirror of what the OLD group's agents
     # reported. The target signs from scratch, so leaving it would show the

@@ -29,6 +29,7 @@ from app.api.deps import DB
 from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    collecting_wakes,
     dns_wake_channels,
     wake_subscription,
 )
@@ -1495,13 +1496,13 @@ async def agent_ingested_records(
     journal; the agent AXFRs them and posts them here so they become
     UI/IPAM-visible + survive a full re-render. Gated on the zone actually
     having ``dynamic_update_enabled`` (defense-in-depth against a
-    misbehaving agent) and scoped to the posting server's group.
+    misbehaving agent) and scoped to the posting server's group. In a group
+    with several agent servers a learned record is also queued to the
+    other servers, and the report is read as a change since that server's
+    previous one rather than as the zone's whole truth (#2654; see
+    ``app.services.dns.ingest``).
     """
-    from app.services.dns.ingest import (  # noqa: PLC0415
-        IncomingRecord,
-        reconcile_external_records,
-        to_summary,
-    )
+    from app.services.dns.ingest import IncomingRecord  # noqa: PLC0415
 
     server, _ = auth
     zone_name = body.zone_name.rstrip(".")
@@ -1545,8 +1546,32 @@ async def agent_ingested_records(
         )
         for r in body.records
     ]
-    result = await reconcile_external_records(db, zone, incoming)
-    summary = to_summary(result)
+    # #2654 — in a group with several agent servers the reconcile also queues
+    # record ops to the reporter's peers (or to the reporter, when it is
+    # behind). The agent router has no ``wake_publishing`` dependency, so open
+    # a collector here: the wake goes out after the commit below, and the
+    # peers apply the op on their next poll instead of the 12 s safety tick.
+    async with collecting_wakes():
+        summary = await _reconcile_and_audit(db, server, zone, zone_name, incoming)
+    return {"zone": zone_name, **summary}
+
+
+async def _reconcile_and_audit(
+    db: AsyncSession,
+    server: DNSServer,
+    zone: DNSZone,
+    zone_name: str,
+    incoming: list[Any],
+) -> dict[str, Any]:
+    from app.services.dns.ingest import (  # noqa: PLC0415
+        reconcile_external_records,
+        to_summary,
+    )
+
+    result = await reconcile_external_records(db, zone, incoming, server=server)
+    summary: dict[str, Any] = dict(to_summary(result))
+    if result.mode == "disabled_reporter":
+        summary["skipped"] = "server_disabled"
     if summary["added"] or summary["removed"]:
         # One summarising row per batch (not per record): an external writer
         # churning records would otherwise flood audit_log. Names are capped.
@@ -1565,6 +1590,7 @@ async def agent_ingested_records(
                 new_value={
                     "server_id": str(server.id),
                     "server": server.name,
+                    "mode": result.mode,
                     **summary,
                     "added_records": result.added_records[:cap],
                     "truncated": max(result.added, result.removed) > cap,
@@ -1579,7 +1605,7 @@ async def agent_ingested_records(
             **summary,
         )
     await db.commit()
-    return {"zone": zone_name, **summary}
+    return summary
 
 
 @router.post("/dnssec-state")

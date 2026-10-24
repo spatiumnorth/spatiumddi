@@ -1680,8 +1680,15 @@ async def _fanout_agent_ops(
     zone: DNSZone,
     primary: DNSServer,
     ops: list[dict[str, Any]],
+    *,
+    exclude_server_ids: Collection[uuid.UUID] = (),
+    only_server_ids: Collection[uuid.UUID] | None = None,
 ) -> list[DNSRecordOp | None]:
     """Queue ``ops`` for every ENABLED agent-based server in the zone's group.
+
+    ``exclude_server_ids`` / ``only_server_ids`` narrow that set for
+    :func:`enqueue_agent_record_ops` (#2654); every other caller passes
+    neither and gets the whole group.
 
     The one fan-out both batch entry points share. Resolves the server set
     ONCE, stamps the RRsets ONCE (#773), inserts every row in one ``add_all``
@@ -1713,8 +1720,18 @@ async def _fanout_agent_ops(
         .scalars()
         .all()
     )
-    agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
+    agent_servers = [
+        s
+        for s in agent_rows
+        if not is_agentless(s.driver)
+        and s.id not in exclude_server_ids
+        and (only_server_ids is None or s.id in only_server_ids)
+    ]
     if not agent_servers:
+        if exclude_server_ids or only_server_ids is not None:
+            # A narrowed fan-out with nobody left to send to is the normal
+            # outcome for a one-server group, not a dropped write.
+            return [None] * len(ops)
         logger.warning(
             "record_op_batch_dropped_no_enabled_agent",
             zone=zone.name,
@@ -1750,6 +1767,48 @@ async def _fanout_agent_ops(
     # commit by the request's ``wake_publishing`` dependency.
     collect_wake(dns_group_channel(zone.group_id))
     return result
+
+
+async def enqueue_agent_record_ops(
+    db: AsyncSession,
+    zone: DNSZone,
+    ops: list[dict[str, Any]],
+    *,
+    exclude_server_ids: Collection[uuid.UUID] = (),
+    only_server_ids: Collection[uuid.UUID] | None = None,
+) -> int:
+    """Queue ``ops`` for a SUBSET of the group's enabled agent servers (#2654).
+
+    For records the control plane LEARNED from one server rather than ones an
+    operator wrote: the DDNS ingest-back mirror and Sync with Server(s)
+    imports. The server the record came from already holds it, so it is
+    excluded; the rest of the group gets it the only way an agent ever
+    receives a record in a no-views group, as a record op. Same row shape,
+    RRset stamping (#773), PTR re-assert and wake as
+    :func:`enqueue_record_ops_batch`.
+
+    Agent-based groups only. An agentless primary is the single writer for
+    its group and the agents in such a (mixed) group are not fed by record
+    ops at all, so nothing is queued there. Returns how many of ``ops`` were
+    queued (each to every targeted server); 0 when no server was targeted.
+    """
+    if not ops:
+        return 0
+    primary = await resolve_primary_server(db, zone)
+    if primary is None or is_agentless(primary.driver):
+        return 0
+    rows = await _fanout_agent_ops(
+        db,
+        zone,
+        primary,
+        ops,
+        exclude_server_ids=exclude_server_ids,
+        only_server_ids=only_server_ids,
+    )
+    queued = sum(1 for r in rows if r is not None)
+    if queued:
+        await reassert_ptrs_after_a_deletes(db, zone, primary, ops)
+    return queued
 
 
 async def enqueue_record_ops_batch(
