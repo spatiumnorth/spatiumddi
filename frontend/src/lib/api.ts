@@ -19029,6 +19029,12 @@ export interface L3VPNSummary {
   edge_circuits: L3VPNCircuitSummary[];
   edge_subnets: L3VPNSubnetSummary[];
   warnings: string[];
+  /** Section -> number of attached rows left out because the caller has no
+   *  read grant on them. Absent on an older server; a missing section was
+   *  shown in full. */
+  withheld?: Partial<
+    Record<"vrf" | "edge_sites" | "edge_circuits" | "edge_subnets", number>
+  >;
 }
 
 export interface CustomGroupedSummary {
