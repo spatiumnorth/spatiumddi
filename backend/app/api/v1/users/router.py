@@ -157,7 +157,7 @@ class CreateUserRequest(BaseModel):
         # whose detail is an error ARRAY, a shape the change-password screen
         # did not parse, so a 7-character password was reported as "check
         # your current password". A floor of 1 cannot collide with a policy
-        # minimum (settings clamp it to 6..128), so the two can never
+        # minimum (settings clamp it to 6..72), so the two can never
         # disagree again.
         if v is not None and not v:
             raise ValueError("Password cannot be empty")
@@ -233,7 +233,7 @@ class ResetPasswordRequest(BaseModel):
         # whose detail is an error ARRAY, a shape the change-password screen
         # did not parse, so a 7-character password was reported as "check
         # your current password". A floor of 1 cannot collide with a policy
-        # minimum (settings clamp it to 6..128), so the two can never
+        # minimum (settings clamp it to 6..72), so the two can never
         # disagree again.
         if not v:
             raise ValueError("Password cannot be empty")

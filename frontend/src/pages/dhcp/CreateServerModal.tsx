@@ -7,6 +7,11 @@ import {
   type FortiGateCredentials,
   formatApiError,
 } from "@/lib/api";
+import {
+  WINRM_FORM_DEFAULTS,
+  winrmFormFrom,
+  winrmSettingsPayload,
+} from "@/lib/winrm";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
 export function CreateServerModal({
@@ -32,15 +37,25 @@ export function CreateServerModal({
   const [error, setError] = useState("");
 
   // Windows-only fields. When editing a server that already has creds set,
-  // we leave the fields blank and only submit them if the user types a new
-  // password — matches the "None → leave alone, {} → clear" server contract.
+  // the username/password stay blank and are only submitted if the user
+  // types one — matches the "None → leave alone, {} → clear" server
+  // contract. The connection settings are seeded from what is stored, and
+  // only the ones the operator changes are sent, so an untouched save keeps
+  // them.
+  const [winSeed] = useState(() =>
+    server?.driver === "windows_dhcp" && server.has_credentials
+      ? winrmFormFrom(server.winrm_settings)
+      : undefined,
+  );
+  const winInitial = winSeed ?? WINRM_FORM_DEFAULTS;
   const [winUsername, setWinUsername] = useState("");
   const [winPassword, setWinPassword] = useState("");
-  const [winPort, setWinPort] = useState("5985");
-  const [winTransport, setWinTransport] =
-    useState<WindowsDHCPCredentials["transport"]>("ntlm");
-  const [winUseTLS, setWinUseTLS] = useState(false);
-  const [winVerifyTLS, setWinVerifyTLS] = useState(false);
+  const [winPort, setWinPort] = useState(winInitial.port);
+  const [winTransport, setWinTransport] = useState<
+    WindowsDHCPCredentials["transport"]
+  >(winInitial.transport);
+  const [winUseTLS, setWinUseTLS] = useState(winInitial.useTls);
+  const [winVerifyTLS, setWinVerifyTLS] = useState(winInitial.verifyTls);
   const [winClearCreds, setWinClearCreds] = useState(false);
 
   // FortiGate-only fields. Same "blank = keep stored" contract on edit.
@@ -159,16 +174,21 @@ export function CreateServerModal({
         if (winClearCreds) {
           data.windows_credentials = {};
         } else {
-          // Always send the creds block on windows_dhcp so transport / port /
-          // TLS toggles reach the backend even when username+password are
-          // blank (edit case — backend merges with stored blob). The backend
-          // requires username+password only on first-time set.
-          const creds: Partial<WindowsDHCPCredentials> = {
-            winrm_port: parseInt(winPort, 10) || 5985,
-            transport: winTransport,
-            use_tls: winUseTLS,
-            verify_tls: winVerifyTLS,
-          };
+          // With stored credentials, send only what the operator changed —
+          // the backend merges a partial block over the stored one, so an
+          // untouched setting keeps its stored value and an untouched dialog
+          // sends no block at all. Otherwise (new server, or nothing stored)
+          // send every setting; the backend requires username+password on
+          // first-time set.
+          const creds: Partial<WindowsDHCPCredentials> = winrmSettingsPayload(
+            {
+              port: winPort,
+              transport: winTransport ?? "ntlm",
+              useTls: winUseTLS,
+              verifyTls: winVerifyTLS,
+            },
+            winSeed,
+          );
           if (winUsername) creds.username = winUsername;
           if (winPassword) creds.password = winPassword;
           if (!editing && (!winUsername || !winPassword)) {
@@ -176,7 +196,9 @@ export function CreateServerModal({
               "Windows DHCP requires a username + password to connect over WinRM.",
             );
           }
-          data.windows_credentials = creds as WindowsDHCPCredentials;
+          if (Object.keys(creds).length > 0) {
+            data.windows_credentials = creds as WindowsDHCPCredentials;
+          }
         }
       }
 

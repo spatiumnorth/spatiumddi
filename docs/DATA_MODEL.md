@@ -476,8 +476,18 @@ Files: [`audit.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend
 ### Audit log (append-only + hash chain)
 
 `AuditLog` (table `audit_log`) is the append-only record of every
-mutation. It is **never** deleted application-side, and a DB-level
-trigger blocks `DELETE` as a second guard (issue #73).
+mutation. It is **never** updated or deleted application-side, and
+DB-level row triggers refuse both as a second guard: `audit_log_no_delete`
+(`BEFORE DELETE`, issue #73) and `audit_log_no_update` (`BEFORE UPDATE`,
+issue #2315). `TRUNCATE` is not guarded, since the selective restore of
+the `audit` section truncates the table before reloading it.
+
+This makes the table **tamper-evident, not tamper-proof**: the database
+owner can disable or drop a trigger. The built-in conformity policy
+"Audit log is reachable and append-only" (check `audit_log_immutable`)
+reads `pg_trigger` and fails, naming the trigger, when either guard is
+missing, disabled, or altered. A migration that ever has to rewrite rows
+must disable `audit_log_no_update` for its duration.
 
 Tamper-evidence is a hash chain: each row carries a monotonic
 `BigInteger seq` (assigned from `audit_log_seq_seq`), a `row_hash`, and a
@@ -486,7 +496,10 @@ Tamper-evidence is a hash chain: each row carries a monotonic
 a SQLAlchemy `before_flush` listener that takes a Postgres advisory lock
 to serialize "look up previous row → hash → append", so concurrent
 inserts can't interleave and break the chain. `prev_hash` is NULL only on
-the first row. A nightly `verify_chain` task re-walks and validates it.
+the first row. A nightly task validates it with `verify_chain`, a keyset
+walk in pages, resuming from the singleton `audit_chain_checkpoint` row
+(last verified `seq` + hash) and re-walking the whole chain at least weekly
+(#2286).
 
 Each row records *who* (`user_id`, `user_display_name`, `auth_source`,
 `source_ip`, `user_agent`), *what* (`action`, `resource_type`,

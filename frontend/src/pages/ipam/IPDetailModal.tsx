@@ -51,6 +51,7 @@ import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -666,10 +667,13 @@ export function ReputationSection({ address }: { address: string }) {
   const bareIp = (address || "").split("/")[0];
   const isIPv4 = bareIp.includes(".") && !bareIp.includes(":");
 
+  // GET /dnsbl/listings/by-ip takes read on 'dnsbl'; a user without it is
+  // not asked, and told so rather than "No blocklists are enabled" (#2704).
+  const canReadDnsbl = usePermissions().can("read", "dnsbl");
   const q = useQuery({
     queryKey: ["dnsbl", "by-ip", bareIp],
     queryFn: () => dnsblApi.byIp(bareIp),
-    enabled: dnsblEnabled && isIPv4,
+    enabled: dnsblEnabled && isIPv4 && canReadDnsbl,
     staleTime: 30_000,
   });
 
@@ -713,7 +717,15 @@ export function ReputationSection({ address }: { address: string }) {
         </button>
       </div>
 
-      {entries.length === 0 ? (
+      {q.error || !canReadDnsbl ? (
+        <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
+          {q.error ? (
+            <ListReadError error={q.error} what="this IP's blocklist status" />
+          ) : (
+            "You don't have permission to see this IP's blocklist status."
+          )}
+        </div>
+      ) : entries.length === 0 ? (
         <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
           No blocklists are enabled. Enable lists in Administration → DNS
           Blocklists to check this IP.
@@ -780,7 +792,9 @@ export function ReputationSection({ address }: { address: string }) {
 
 function CertsSection({ addressId }: { addressId: string }) {
   const { enabled } = useFeatureModules();
-  const certsEnabled = enabled("security.tls_certs");
+  // Read on 'tls_cert' (#2704): a user without it is not asked.
+  const canRead = usePermissions().can("read", "tls_cert");
+  const certsEnabled = enabled("security.tls_certs") && canRead;
 
   const q = useQuery({
     queryKey: ["tls-certs", "by-ip", addressId],
@@ -806,7 +820,8 @@ function CertsSection({ addressId }: { addressId: string }) {
 
 function MulticastMembershipsSection({ addressId }: { addressId: string }) {
   const { enabled } = useFeatureModules();
-  const multicastEnabled = enabled("network.multicast");
+  const canRead = usePermissions().can("read", "multicast");
+  const multicastEnabled = enabled("network.multicast") && canRead;
 
   const q = useQuery({
     queryKey: ["multicast-memberships-by-ip", addressId],
@@ -862,7 +877,8 @@ function BACnetDeviceSection({ addressId }: { addressId: string }) {
   // module list is still loading, so without it a hard page load fires
   // one request that 404s when the module is off.
   const { enabled, ready } = useFeatureModules();
-  const bacnetEnabled = ready && enabled("network.bacnet");
+  const canRead = usePermissions().can("read", "bacnet_device");
+  const bacnetEnabled = ready && enabled("network.bacnet") && canRead;
 
   const q = useQuery({
     queryKey: ["bacnet-device-by-ip", addressId],
@@ -934,7 +950,8 @@ function BACnetDeviceSection({ addressId }: { addressId: string }) {
 
 function DICOMAESection({ addressId }: { addressId: string }) {
   const { enabled, ready } = useFeatureModules();
-  const dicomEnabled = ready && enabled("network.dicom");
+  const canRead = usePermissions().can("read", "dicom_ae");
+  const dicomEnabled = ready && enabled("network.dicom") && canRead;
 
   const q = useQuery({
     queryKey: ["dicom-ae-by-ip", addressId],
@@ -998,7 +1015,8 @@ function DICOMAESection({ addressId }: { addressId: string }) {
 
 function OTDeviceSection({ addressId }: { addressId: string }) {
   const { enabled, ready } = useFeatureModules();
-  const otEnabled = ready && enabled("network.ot");
+  const canRead = usePermissions().can("read", "ot_device");
+  const otEnabled = ready && enabled("network.ot") && canRead;
 
   const q = useQuery({
     queryKey: ["ot-device-by-ip", addressId],
@@ -1066,7 +1084,8 @@ function OTDeviceSection({ addressId }: { addressId: string }) {
  *  module is off or nothing in the active RIB covers the address. */
 function BgpRouteLookupSection({ address }: { address: string }) {
   const { enabled } = useFeatureModules();
-  const lgEnabled = enabled("network.looking_glass");
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
+  const lgEnabled = enabled("network.looking_glass") && canRead;
 
   const q = useQuery({
     queryKey: ["bgp-lg-route-for-ip", address],

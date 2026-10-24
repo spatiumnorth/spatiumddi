@@ -60,6 +60,13 @@
 #                      dedicated pass asserting the appliance's api / worker /
 #                      frontend retire first at one replica too, where the
 #                      blocking term rides on the OUTGOING pods (#1541).
+#   template-stable  — dedicated pass over the appliance renders at one replica
+#                      and at three: the frontend's pod template must be the
+#                      same in both (#2450). The first promotion only raises
+#                      its replicas, and on the appliance a template change
+#                      rolls the seed's one frontend pod, which holds the
+#                      node's ports 80 and 443, before its replacement can
+#                      start: the seed refuses connections mid-promotion.
 #   shared-env       — dedicated umbrella render: api, worker and beat all carry
 #                      every variable in ``sharedEnv``, and APPLIANCE_VERSION
 #                      from ``applianceVersion`` (#2176); api and worker carry
@@ -316,6 +323,44 @@ neg1805() { # label manifest [chart-api-node-local.py flags...]
 neg1805 "the default render read as the appliance's" "$OUT/umbrella-defaults.yaml" --require
 neg1805 "an appliance render read as the default" "$OUT/umbrella-appliance-cp-3.yaml" \
     --require --absent
+# #2450 — the first promotion takes the appliance's frontend from one replica
+# to the node count, and the supervisor's overrides change nothing else in its
+# values. Its pods bind hostPorts 80 and 443 and the old pod retires first, so
+# a pod template that differs between one replica and three rolls the seed's
+# only frontend pod mid-promotion, and the seed refuses connections on both
+# ports until the replacement binds them. Rendered under the appliance's own
+# release name (the renders above are named apart, which their labels carry);
+# the values are the cp renders' and already validated there.
+for n in 1 3; do
+    helm template spatium-control "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        "${APPLIANCE_CP_HARD[@]}" \
+        --set api.replicas=$n --set worker.replicas=$n --set frontend.replicas=$n \
+        > "$OUT/umbrella-appliance-promote-$n.yaml" || failures=$((failures + 1))
+done
+echo "── frontend pod template at 1 and 3 replicas (umbrella, #2450)"
+python3 "$ROOT/.github/scripts/chart-template-stable.py" --component frontend \
+    "$OUT/umbrella-appliance-promote-1.yaml" "$OUT/umbrella-appliance-promote-3.yaml" \
+    || failures=$((failures + 1))
+# Negative control: a three-replica frontend whose template gained a field must
+# be refused, or the guard above could be passing on renders it cannot read.
+echo "── negative control: a frontend template that differs must fail"
+if python3 "$ROOT/.github/scripts/chart-template-stable.py" --component frontend \
+    "$OUT/umbrella-appliance-promote-1.yaml" \
+    <(python3 - "$OUT/umbrella-appliance-promote-3.yaml" <<'PYEOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["labels"].get("app.kubernetes.io/component") == "frontend":
+        meta = d["spec"]["template"]["metadata"]
+        meta.setdefault("annotations", {})["example.com/changed"] = "1"
+print(yaml.safe_dump_all(docs))
+PYEOF
+) >/dev/null 2>&1; then
+    echo "   FAIL: chart-template-stable.py passed a frontend template that differs" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: a frontend template that differs refused"
+fi
 # #1826 — the appliance's shared env, as firstboot writes it. Rendered with
 # the mirror on so its URL / secret are in the set too.
 render umbrella-shared-env "$UMBRELLA" \

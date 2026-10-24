@@ -148,8 +148,14 @@ export const dnsSectionNav: NavEntry[] = [
   // Domains is deliberately NOT gated on core.dns (#1068): a Domain is the
   // registrar / expiry / RDAP record for a name, which exists whether or not
   // SpatiumDDI serves a zone for it — an operator tracking renewals on names
-  // hosted elsewhere still wants this with DNS off.
-  { label: "Domains", icon: Earth, to: "/admin/domains" },
+  // hosted elsewhere still wants this with DNS off. It has its own module
+  // (#2325) because it is the one that makes off-prem RDAP lookups.
+  {
+    label: "Domains",
+    icon: Earth,
+    to: "/admin/domains",
+    module: "network.domains",
+  },
 ];
 
 // Operations — cross-cutting live telemetry.

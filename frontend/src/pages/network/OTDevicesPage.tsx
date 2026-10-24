@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Factory, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -141,8 +142,17 @@ export function OTDevicesPage() {
               <Factory className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">OT / industrial devices</h1>
               <span className="text-xs text-muted-foreground">
-                {total} device{total === 1 ? "" : "s"} · {zones.length} zone
-                {zones.length === 1 ? "" : "s"}
+                {devicesQ.error ? (
+                  <ListReadError error={devicesQ.error} what="OT devices" />
+                ) : (
+                  `${total} device${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {zonesQ.error ? (
+                  <ListReadError error={zonesQ.error} what="Purdue zones" />
+                ) : (
+                  `${zones.length} zone${zones.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -272,9 +282,14 @@ export function OTDevicesPage() {
           <div className="rounded-lg border">
             {devices.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {devicesQ.isLoading
-                  ? "Loading devices…"
-                  : "No OT descriptors recorded. Attach one to an existing IPAM address to start documenting the plant."}
+                {devicesQ.isLoading ? (
+                  "Loading devices…"
+                ) : (
+                  <ListEmpty error={devicesQ.error} what="OT devices">
+                    No OT descriptors recorded. Attach one to an existing IPAM
+                    address to start documenting the plant.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -413,9 +428,13 @@ export function OTDevicesPage() {
           <div className="rounded-lg border">
             {zones.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {zonesQ.isLoading
-                  ? "Loading zones…"
-                  : "No subnet has been classified yet."}
+                {zonesQ.isLoading ? (
+                  "Loading zones…"
+                ) : (
+                  <ListEmpty error={zonesQ.error} what="Purdue zones">
+                    No subnet has been classified yet.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
