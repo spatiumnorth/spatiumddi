@@ -18,6 +18,7 @@ import {
   type DNSBLSettings,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { Toggle } from "@/components/ui/toggle";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 
@@ -41,19 +42,23 @@ export function DNSBLPage() {
   );
   const canWrite = !writeGate.disabled;
 
-  const { data: lists = [], isLoading: listsLoading } = useQuery({
+  const {
+    data: lists = [],
+    isLoading: listsLoading,
+    error: listsError,
+  } = useQuery({
     queryKey: ["dnsbl-lists"],
     queryFn: dnsblApi.listLists,
   });
-  const { data: pinned = [] } = useQuery({
+  const { data: pinned = [], error: pinnedError } = useQuery({
     queryKey: ["dnsbl-pinned"],
     queryFn: dnsblApi.listPinned,
   });
-  const { data: settings } = useQuery({
+  const { data: settings, error: settingsError } = useQuery({
     queryKey: ["dnsbl-settings"],
     queryFn: dnsblApi.getSettings,
   });
-  const { data: listings } = useQuery({
+  const { data: listings, error: listingsError } = useQuery({
     queryKey: ["dnsbl-listings"],
     queryFn: () => dnsblApi.listListings({ listed_only: true, limit: 100 }),
   });
@@ -163,18 +168,34 @@ export function DNSBLPage() {
           <div className="flex items-center justify-between gap-4">
             <div className="text-sm font-medium">Last sweep</div>
             <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
-              {settings?.dnsbl_sweep_last_run_at
-                ? new Date(settings.dnsbl_sweep_last_run_at).toLocaleString()
-                : "never"}
+              {settingsError
+                ? "not shown"
+                : settings?.dnsbl_sweep_last_run_at
+                  ? new Date(settings.dnsbl_sweep_last_run_at).toLocaleString()
+                  : "never"}
             </span>
           </div>
           <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
-            <span>{enabledCount} list(s) enabled</span>
-            <span
-              className={cn(listedCount > 0 && "font-medium text-rose-600")}
-            >
-              {listedCount} IP-listing(s) currently active
-            </span>
+            {settingsError && (
+              <ListReadError error={settingsError} what="the sweep settings" />
+            )}
+            {listsError ? (
+              <ListReadError error={listsError} what="the blocklist catalog" />
+            ) : (
+              <span>{enabledCount} list(s) enabled</span>
+            )}
+            {listingsError ? (
+              <ListReadError
+                error={listingsError}
+                what="the current IP listings"
+              />
+            ) : (
+              <span
+                className={cn(listedCount > 0 && "font-medium text-rose-600")}
+              >
+                {listedCount} IP-listing(s) currently active
+              </span>
+            )}
           </div>
         </div>
       </section>
@@ -259,7 +280,9 @@ export function DNSBLPage() {
         <ul className="divide-y rounded border text-sm">
           {pinned.length === 0 && (
             <li className="px-2 py-2 text-xs text-muted-foreground">
-              No pinned IPs.
+              <ListEmpty error={pinnedError} what="the pinned IPs">
+                No pinned IPs.
+              </ListEmpty>
             </li>
           )}
           {pinned.map((p) => (
@@ -294,6 +317,10 @@ export function DNSBLPage() {
         <h2 className="mb-3 text-sm font-semibold">Blocklist catalog</h2>
         {listsLoading ? (
           <div className="text-sm text-muted-foreground">Loading…</div>
+        ) : listsError ? (
+          <div className="text-sm">
+            <ListReadError error={listsError} what="the blocklist catalog" />
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[720px] text-sm">
