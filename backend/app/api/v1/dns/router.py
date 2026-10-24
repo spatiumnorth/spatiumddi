@@ -191,6 +191,7 @@ from app.services.dns.server_move import (
     lock_server_row,
     move_server_to_group,
 )
+from app.services.dns.server_resync import force_zone_resync
 from app.services.dns.technitium_options import (
     allow_transfer_problem as technitium_transfer_problem,
 )
@@ -2519,9 +2520,14 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
         setattr(server, k, v)
+    if reenabled:
+        # #2281 — it got no record ops while disabled; make its agent
+        # re-render every zone from the current records.
+        changes["zone_resync_ops_retired"] = await force_zone_resync(db, server)
 
     # Credentials contract matches DHCP:
     #   None → leave alone, {} → clear, partial dict → decrypt-merge-reencrypt

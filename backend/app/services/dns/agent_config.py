@@ -2107,6 +2107,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # be structural (issue #50).
         "tls_cert": tls_cert_block,
     }
+    if server.zone_resync_seq:
+        # #2281 — this server was re-enabled. While it was disabled it got no
+        # record ops, so its daemon still serves the records it had then; the
+        # bundle body carries the current ones, but without views records do
+        # not move the structural etag and the agent would never render them.
+        # A new value here makes it re-render every zone from the body. Left
+        # out at zero so a server never re-enabled keeps its etag.
+        structural["zone_resync_seq"] = server.zone_resync_seq
     if server.driver == "technitium":
         # #1513 — say how a dot-less SVCB / HTTPS target in this bundle is
         # meant: relative to the zone, as in a zone file. Before #1513 the
