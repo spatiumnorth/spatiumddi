@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, Sequence, String, Text, func
+from sqlalchemy import (
+    DDL,
+    BigInteger,
+    DateTime,
+    Index,
+    Integer,
+    Sequence,
+    String,
+    Text,
+    event,
+    func,
+)
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -13,8 +24,11 @@ class AuditLog(Base):
     """
     Append-only audit trail of all data mutations.
     Stored in PostgreSQL (not the log store) for queryability and compliance.
-    No application-layer deletes are ever performed on this table.
-    A DB-level trigger prevents DELETE as an extra guard (issue #73).
+    No application-layer deletes or updates are ever performed on this
+    table. DB-level triggers refuse DELETE (issue #73) and UPDATE (issue
+    #2315) as an extra guard; see ``AUDIT_LOG_GUARD_TRIGGERS``. They make
+    the table tamper-evident, not tamper-proof: the table owner can drop
+    them, which the ``audit_log_immutable`` conformity check reports.
 
     ``seq`` + ``row_hash`` + ``prev_hash`` form a tamper-evident chain
     (issue #73). The hash is computed in
@@ -93,6 +107,45 @@ class AuditLog(Base):
     # ``prev_hash`` is NULL only on the very first row.
     row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+# The row triggers that make ``audit_log`` append-only: trigger name ->
+# (the event it refuses, the function it runs). Production creates them in
+# the Alembic migrations ``d92f4a18c763`` (DELETE, #73) and ``8ef2ed5e45c8``
+# (UPDATE, #2315); the ``after_create`` hooks below create the same objects
+# under ``Base.metadata.create_all``, which is what the test suite uses, so
+# tests run against the guarded table. The ``audit_log_immutable``
+# conformity check reads this mapping to know what must be present.
+# TRUNCATE is deliberately not guarded: the test suite and the selective
+# restore of the ``audit`` section both truncate the table.
+AUDIT_LOG_GUARD_TRIGGERS: dict[str, tuple[str, str]] = {
+    "audit_log_no_delete": ("DELETE", "audit_log_block_delete"),
+    "audit_log_no_update": ("UPDATE", "audit_log_block_update"),
+}
+
+_GUARD_MESSAGES = {
+    "audit_log_block_delete": "audit_log is append-only (issue #73)",
+    "audit_log_block_update": "audit_log is append-only: UPDATE refused (issue #2315)",
+}
+
+for _trigger, (_event, _function) in AUDIT_LOG_GUARD_TRIGGERS.items():
+    event.listen(
+        AuditLog.__table__,
+        "after_create",
+        DDL(
+            f"CREATE OR REPLACE FUNCTION {_function}() RETURNS TRIGGER AS $$ "
+            f"BEGIN RAISE EXCEPTION '{_GUARD_MESSAGES[_function]}'; END; "
+            "$$ LANGUAGE plpgsql"
+        ),
+    )
+    event.listen(
+        AuditLog.__table__,
+        "after_create",
+        DDL(
+            f"CREATE TRIGGER {_trigger} BEFORE {_event} ON audit_log "
+            f"FOR EACH ROW EXECUTE FUNCTION {_function}()"
+        ),
+    )
 
 
 class AuditChainCheckpoint(Base):

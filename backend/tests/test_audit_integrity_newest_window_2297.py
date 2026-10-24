@@ -32,10 +32,14 @@ async def _seed(n: int) -> list[uuid.UUID]:
 
 
 async def _tamper(row_id: uuid.UUID) -> None:
+    # audit_log refuses UPDATE (#2315); tampering takes the table owner
+    # switching the guard off first, which is what this models.
     async with AsyncSessionLocal() as s:
+        await s.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update"))
         await s.execute(
             text("UPDATE audit_log SET resource_display='edited' WHERE id=:i"), {"i": row_id}
         )
+        await s.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update"))
         await s.commit()
 
 
@@ -67,9 +71,11 @@ async def test_window_start_is_anchored_on_the_preceding_row() -> None:
     ids = await _seed(6)
     # Rewrite the prev_hash of the first row in the window.
     async with AsyncSessionLocal() as s:
+        await s.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update"))
         await s.execute(
             text("UPDATE audit_log SET prev_hash='deadbeef' WHERE id=:i"), {"i": ids[-3]}
         )
+        await s.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update"))
         await s.commit()
     res = await _badge(3, True)
     assert not res.ok
