@@ -31,6 +31,8 @@ import ipaddress
 import json
 from typing import Any
 
+from app.services.dhcp.class_refs import reserved_name_reason
+
 from .canonical import (
     ImportedClientClass,
     ImportedPool,
@@ -289,13 +291,17 @@ def _parse_client_classes(
         name = str(entry["name"])
         if name == "DROP":
             continue
+        # Any other reserved name (``drop``, ``HA_*``, a name SpatiumDDI
+        # generates) is shown in the preview but not created.
+        reserved = reserved_name_reason(name)
         out.append(
             ImportedClientClass(
                 name=name,
                 match_expression=str(entry.get("test") or ""),
                 address_family=address_family,
                 options=_parse_option_data(entry.get("option-data"), address_family=address_family),
-                supported=True,
+                supported=reserved is None,
+                warning=f"Not imported: {reserved}." if reserved else None,
             )
         )
     return out

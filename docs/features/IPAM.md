@@ -1008,7 +1008,10 @@ hand-picked set, or `all_matching=true` with the report filter to
 deprecate every matching row in one shot (capped at `MAX_BULK_DEPRECATE`
 = 5000; the response `capped` flag tells the operator to re-run for the
 remainder). System placeholders and DHCP mirrors are skipped even if an
-id slips through. The page lives at **Stale IPs** in the sidebar.
+id slips through. **Deprecating does not free the address (#2421):** a
+`deprecated` row is a retained record, so it still counts as allocated on
+its subnet and Next available never offers it. Delete the row to give the
+address back. The page lives at **Stale IPs** in the sidebar.
 
 **Hygiene alert.** A `stale_ip_count` alert rule fires when any subnet
 holds at least `threshold_percent` (re-used as a raw count) allocated
@@ -1933,7 +1936,11 @@ confirmation gates and pg advisory locks held through commit:
   subnet into 2^k aligned children at a longer prefix. Preview
   reports the prospective children + any IP-address conflicts
   (rows that wouldn't fit cleanly into one child or the other);
-  commit refuses if the typed CIDR doesn't match. Children inherit
+  commit refuses if the typed CIDR doesn't match. A host sitting on
+  a child's network or broadcast address (e.g. .127 / .128 of a /24
+  split into /25s) is a `host_on_child_boundary` conflict naming the
+  address, and the commit refuses it; the preview also warns that
+  every client needs the new netmask. Children inherit
   the parent's compliance and discovery settings (PCI / HIPAA scope,
   internet-facing, role, do-not-probe, kind, customer, site, discovery
   and split-horizon); integration ownership and import provenance are

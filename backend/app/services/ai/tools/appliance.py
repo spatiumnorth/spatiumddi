@@ -1027,7 +1027,11 @@ class FindUpgradeImagesArgs(BaseModel):
         "operator uploaded (air-gap) or imported from a GitHub release — "
         "the pool a fleet / per-box OS upgrade can point at. Each row "
         "carries filename / appliance_version / architecture / size / a "
-        "short SHA-256 / upload time / notes. ``architecture`` is null for "
+        "short SHA-256 / upload time / notes, plus channel (nightly / "
+        "prerelease / stable), the fleet-architecture verdict, which "
+        "appliances have that version installed, which are scheduled to "
+        "fetch it, and any active rolling run naming it (an image with "
+        "scheduled_for or rolling_run_id set is in use). ``architecture`` is null for "
         "an image nobody labelled — that means UNKNOWN, never amd64 "
         "(#1026). Use to answer 'which upgrade images do we "
         "have staged?' or 'is 1.0.0 already uploaded?'. Read-only "
@@ -1042,6 +1046,9 @@ async def find_upgrade_images(
 ) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
         return err
+    from app.services.appliance import releases as releases_service  # noqa: PLC0415
+    from app.services.appliance import upgrade_image_catalog as catalog  # noqa: PLC0415
+
     rows = list(
         (
             await db.execute(
@@ -1053,6 +1060,11 @@ async def find_upgrade_images(
         .scalars()
         .all()
     )
+    # #2410 — the same derivations GET /upgrade-images uses, so the copilot
+    # and the table cannot disagree about an image.
+    fleet = await catalog.fleet_architectures(db)
+    usage = await catalog.image_usage(db, rows)
+    cached = releases_service.peek_upgrade_image_releases()
     return {
         "images": [
             {
@@ -1067,6 +1079,15 @@ async def find_upgrade_images(
                 "sha256_short": (r.sha256[:12] + "…" + r.sha256[-6:]) if r.sha256 else None,
                 "uploaded_at": r.uploaded_at.isoformat(),
                 "notes": r.notes,
+                # #2410 — channel from the tag; fleet verdict is #2399's
+                # (matches / no_node / unknown); installed_on is NOT in use
+                # (bytes are on a slot), scheduled_for / rolling_run_id are
+                # (a delete is refused while either is set).
+                "channel": catalog.staged_channel(r, catalog.release_for_staged(r, cached)),
+                "fleet_architecture": catalog.fleet_verdict(fleet, r.architecture)[0],
+                "installed_on": usage[r.id].installed_on,
+                "scheduled_for": usage[r.id].scheduled_for,
+                "rolling_run_id": str(usage[r.id].run_id) if usage[r.id].run_id else None,
             }
             for r in rows
         ],
@@ -1087,7 +1108,9 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
     description=(
         "List GitHub releases that carry an importable appliance upgrade "
         "image (superadmin only, #199). Returns each release tag + name + "
-        "architecture + prerelease/installed flags + the image size, plus "
+        "architecture + channel + prerelease flag + the image size + the "
+        "fleet-architecture verdict + the staged image id when already "
+        "imported (``is_installed`` means the CONTROL PLANE runs this tag), plus "
         "whether GitHub was reachable at all. A release that publishes "
         "both architectures appears ONCE PER ARCHITECTURE, so the same tag "
         "can be listed twice (#1026). Use to answer 'what upgrade images can I "
@@ -1105,12 +1128,21 @@ async def find_available_upgrade_images(
     if (err := _superadmin_gate(user)) is not None:
         return err
     from app.services.appliance import releases as releases_service  # noqa: PLC0415
+    from app.services.appliance import upgrade_image_catalog as catalog  # noqa: PLC0415
 
     reachable, rows = await releases_service.list_available_upgrade_images()
+    fleet = await catalog.fleet_architectures(db)
+    staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
+    staged_ids = catalog.staged_assignment(staged, rows)
     return {
         "github_reachable": reachable,
         "available": [
             {
+                "channel": releases_service.release_channel(r.tag, r.is_prerelease),
+                "fleet_architecture": catalog.fleet_verdict(fleet, r.architecture)[0],
+                "staged_image_id": (
+                    str(sid) if (sid := staged_ids.get((r.tag, r.architecture))) else None
+                ),
                 "tag": r.tag,
                 "name": r.name,
                 "is_prerelease": r.is_prerelease,

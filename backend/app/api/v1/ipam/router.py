@@ -75,6 +75,11 @@ from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
+from app.services.dns.ddns import (
+    EffectiveDDNS,
+    resolve_effective_ddns,
+    resolve_effective_ddns_for_block,
+)
 from app.services.dns.sync_check import (
     address_own_forward_zone_id,
     forward_zone_ids_in_order,
@@ -549,6 +554,7 @@ async def _check_ip_collisions(
     role: str | None = None,
     subnet: Subnet | None = None,
     address: str | None = None,
+    space_id: uuid.UUID | None = None,
 ) -> list[dict[str, Any]]:
     """Return FQDN + MAC + PTR collision warnings for a pending IP assignment.
 
@@ -573,6 +579,11 @@ async def _check_ip_collisions(
       name from a *different* IP row (a manual PTR, or pre-existing
       cross-space data from before the #844 space guards), warn rather than
       silently stacking a second value onto the RRset.
+    - The MAC check is confined to the pending row's IP space (#2577):
+      spaces are independent networks, so the same MAC in another space is
+      not a collision. The space comes from ``space_id``, else ``subnet``,
+      else the row being updated (``exclude_ip_id``); with none of those
+      the check stays platform-wide.
     """
     warnings: list[dict[str, Any]] = []
 
@@ -601,11 +612,24 @@ async def _check_ip_collisions(
     mac_norm = _normalize_mac(mac_address)
     skip_mac_check = role in IP_ROLES_SHARED
     if mac_norm and mac_address is not None and not skip_mac_check:
+        mac_space_id = space_id
+        if mac_space_id is None and subnet is not None:
+            mac_space_id = subnet.space_id
+        if mac_space_id is None and exclude_ip_id is not None:
+            mac_space_id = (
+                await db.execute(
+                    select(Subnet.space_id)
+                    .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+                    .where(IPAddress.id == exclude_ip_id)
+                )
+            ).scalar_one_or_none()
         q = (
             select(IPAddress, Subnet.network)
             .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(IPAddress.mac_address == mac_address)
         )
+        if mac_space_id is not None:
+            q = q.where(Subnet.space_id == mac_space_id)
         if exclude_ip_id is not None:
             q = q.where(IPAddress.id != exclude_ip_id)
         for ip, subnet_network in (await db.execute(q)).all():
@@ -3711,6 +3735,41 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class EffectiveDdnsResponse(BaseModel):
+    """What a subnet's DDNS resolves to, and where it comes from (#2475).
+
+    ``source`` is ``subnet`` (its own settings), ``block`` / ``space`` (the
+    ancestor it inherits from, named by ``source_id`` / ``source_name``) or
+    ``none``.
+    """
+
+    enabled: bool
+    hostname_policy: str
+    domain_override: str | None
+    ttl: int | None
+    source: str
+    source_id: str | None = None
+    source_name: str | None = None
+
+
+async def _effective_ddns_response(db: AsyncSession, eff: EffectiveDDNS) -> EffectiveDdnsResponse:
+    kind, _, ident = eff.source.partition(":")
+    name: str | None = None
+    if ident:
+        row = await db.get(IPBlock if kind == "block" else IPSpace, uuid.UUID(ident))
+        if row is not None:
+            name = (row.name or str(getattr(row, "network", ""))) if kind == "block" else row.name
+    return EffectiveDdnsResponse(
+        enabled=eff.enabled,
+        hostname_policy=eff.hostname_policy,
+        domain_override=eff.domain_override,
+        ttl=eff.ttl,
+        source=kind,
+        source_id=ident or None,
+        source_name=name,
+    )
+
+
 class EffectiveDhcpResponse(BaseModel):
     """Effective DHCP server-group resolution for a space/block/subnet.
 
@@ -5363,6 +5422,17 @@ async def get_effective_block_dns(
     )
 
 
+@router.get("/blocks/{block_id}/effective-ddns", response_model=EffectiveDdnsResponse)
+async def get_effective_block_ddns(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDdnsResponse:
+    """DDNS a subnet created in this block would inherit (#2475)."""
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+    return await _effective_ddns_response(db, await resolve_effective_ddns_for_block(db, block))
+
+
 @router.get(
     "/blocks/{block_id}/effective-dhcp",
     response_model=EffectiveDhcpResponse,
@@ -5884,7 +5954,10 @@ async def allocate_subnet(
     # through create_subnet's commit, which releases it).
     create_body = SubnetCreate(
         **{
-            **body.model_dump(exclude={"prefix_len"}),
+            # exclude_unset: the rebuilt body's ``model_fields_set`` must hold
+            # only what the caller sent, or the template pre-fill reads every
+            # default as an explicit value and fills nothing (#2566).
+            **body.model_dump(exclude={"prefix_len"}, exclude_unset=True),
             "network": str(chosen),
             "space_id": block.space_id,
             "block_id": block_id,
@@ -6568,6 +6641,17 @@ async def get_effective_subnet_dns(
     )
 
 
+@router.get("/subnets/{subnet_id}/effective-ddns", response_model=EffectiveDdnsResponse)
+async def get_effective_subnet_ddns(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDdnsResponse:
+    """Resolve effective DDNS for a subnet: its own, or its block chain / space (#2475)."""
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    return await _effective_ddns_response(db, await resolve_effective_ddns(db, subnet))
+
+
 @router.get(
     "/subnets/{subnet_id}/effective-dhcp",
     response_model=EffectiveDhcpResponse,
@@ -6694,8 +6778,13 @@ async def update_subnet(
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:
         if body.vlan_ref_id is None:
-            # Clearing the FK — leave vlan_id alone unless caller also sent it
-            pass
+            # Clearing the FK (#2474). The integer tag was derived from the
+            # referenced VLAN, so it goes with it — unless the caller also
+            # sent a vlan_id of its own, or the subnet had no reference (a
+            # hand-typed legacy tag must survive an untouched save).
+            if subnet.vlan_ref_id is not None and "vlan_id" not in body.model_fields_set:
+                body.vlan_id = None
+                body.model_fields_set.add("vlan_id")
         else:
             vlan_obj = await db.get(VLAN, body.vlan_ref_id)
             if vlan_obj is None:
@@ -6759,6 +6848,11 @@ async def update_subnet(
         "ddns_domain_override",
         "ddns_ttl",
         "show_free_ranges",  # #2137 — null restores the default
+        # #2474 — the Edit dialog's "clear" for these three sends null.
+        "vxlan_id",
+        "subnet_role",
+        "vlan_ref_id",
+        "vlan_id",
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -6809,6 +6903,10 @@ async def update_subnet(
         "ddns_domain_override",
         "ddns_ttl",
         "show_free_ranges",
+        "vxlan_id",
+        "subnet_role",
+        "vlan_ref_id",
+        "vlan_id",
     ):
         if _field in body.model_fields_set:
             _val = getattr(body, _field)
@@ -7880,6 +7978,11 @@ class DnsSyncCommitResponse(BaseModel):
     updated: int
     deleted: int
     errors: list[str]
+    # #2577 — stale record IDs the request asked to delete that the scope's
+    # own drift report does not list (another subnet's or space's orphan, a
+    # record that is no longer stale, or one that does not exist). They are
+    # ignored, never deleted, and listed here so a client can tell.
+    skipped_stale_record_ids: list[uuid.UUID] = []
 
 
 class DnsSyncSummaryResponse(BaseModel):
@@ -7952,20 +8055,49 @@ async def dns_sync_preview(
     )
 
 
+def _stale_ids(report: Any) -> frozenset[uuid.UUID]:
+    """The record IDs a drift report lists as stale (#2577)."""
+    return frozenset(s.record_id for s in report.stale)
+
+
 async def _apply_dns_sync(
     db: AsyncSession,
     body: DnsSyncCommitRequest,
     *,
+    allowed_stale_ids: Iterable[uuid.UUID] = (),
     restrict_subnet_id: uuid.UUID | None = None,
+    skipped_stale_out: list[uuid.UUID] | None = None,
 ) -> tuple[int, int, int, list[str]]:
     """Apply create/update/delete actions, looking up each IP's owning subnet
     on the fly. ``restrict_subnet_id`` scopes the create/update set to a
     single subnet (used by the per-subnet endpoint); aggregate endpoints
-    leave it None."""
+    leave it None.
+
+    ``allowed_stale_ids`` is the stale set of the scope being synced, from
+    its own drift report computed server-side: a stale ID the client sends
+    is deleted only when that set also lists it (#2577). It defaults to
+    empty, so a caller that does not pass one deletes nothing (fail closed).
+    The client's list used to be trusted outright, so a commit could delete
+    any auto-generated record in the install — another subnet's, another
+    space's — by naming it. The rest are ignored rather than refused, so one
+    record that stopped being stale between preview and commit does not
+    fail the whole sync; they are appended to ``skipped_stale_out``."""
     created = 0
     updated = 0
     deleted = 0
     errors: list[str] = []
+
+    allowed = frozenset(allowed_stale_ids)
+    delete_ids = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid in allowed]
+    skipped = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid not in allowed]
+    if skipped:
+        logger.warning(
+            "dns_sync_stale_ids_outside_scope",
+            skipped=len(skipped),
+            restrict_subnet_id=str(restrict_subnet_id) if restrict_subnet_id else None,
+        )
+        if skipped_stale_out is not None:
+            skipped_stale_out.extend(skipped)
 
     ip_ids_to_sync: set[uuid.UUID] = set(body.create_for_ip_ids)
     skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
@@ -8063,7 +8195,7 @@ async def _apply_dns_sync(
             elif fip.id in ip_ids_to_sync:
                 updated = max(0, updated - 1)
 
-    if body.delete_stale_record_ids:
+    if delete_ids:
         from app.services.dns.record_ops import (  # noqa: PLC0415
             enqueue_record_ops_batch,
         )
@@ -8071,7 +8203,7 @@ async def _apply_dns_sync(
         stale_res = await db.execute(
             select(DNSRecord)
             .where(
-                DNSRecord.id.in_(body.delete_stale_record_ids),
+                DNSRecord.id.in_(delete_ids),
                 DNSRecord.auto_generated.is_(True),
             )
             .options(selectinload(DNSRecord.zone))
@@ -8216,10 +8348,20 @@ async def dns_sync_commit(
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
 
+    from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
+
+    # #2577 — the subnet's own stale set, recomputed here: only a record it
+    # lists may be deleted, whatever IDs the request names.
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(await compute_subnet_dns_drift(db, subnet_id))
+    skipped: list[uuid.UUID] = []
     created, updated, deleted, errors = await _apply_dns_sync(
         db,
         body,
+        allowed_stale_ids=allowed,
         restrict_subnet_id=subnet_id,
+        skipped_stale_out=skipped,
     )
 
     if created or updated or deleted:
@@ -8235,11 +8377,18 @@ async def dns_sync_commit(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 @router.get(
@@ -8283,7 +8432,21 @@ async def dns_sync_commit_block(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=404, detail="Block not found")
-    created, updated, deleted, errors = await _apply_dns_sync(db, body)
+    from app.services.dns.sync_check import compute_block_dns_drift  # noqa: PLC0415
+
+    # #2577 — deletable only what the block's own report lists (the same
+    # subnet scope the preview applied to this caller).
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(
+            await compute_block_dns_drift(
+                db, block_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+            )
+        )
+    skipped: list[uuid.UUID] = []
+    created, updated, deleted, errors = await _apply_dns_sync(
+        db, body, allowed_stale_ids=allowed, skipped_stale_out=skipped
+    )
     if created or updated or deleted:
         db.add(
             _audit(
@@ -8297,11 +8460,18 @@ async def dns_sync_commit_block(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 @router.get(
@@ -8344,7 +8514,20 @@ async def dns_sync_commit_space(
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
-    created, updated, deleted, errors = await _apply_dns_sync(db, body)
+    from app.services.dns.sync_check import compute_space_dns_drift  # noqa: PLC0415
+
+    # #2577 — deletable only what the space's own report lists.
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(
+            await compute_space_dns_drift(
+                db, space_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+            )
+        )
+    skipped: list[uuid.UUID] = []
+    created, updated, deleted, errors = await _apply_dns_sync(
+        db, body, allowed_stale_ids=allowed, skipped_stale_out=skipped
+    )
     if created or updated or deleted:
         db.add(
             _audit(
@@ -8358,11 +8541,18 @@ async def dns_sync_commit_space(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 # ── Reverse-zone backfill ──────────────────────────────────────────────────────
@@ -9059,6 +9249,10 @@ async def get_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) 
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
+    # #2625 — the schema promises alias_count / nat_mapping_count / vendor on
+    # get as well as list; without this the single GET answered 0 for an
+    # address the subnet list counted an alias on.
+    await _enrich_addresses(db, [ip])
     return ip
 
 
@@ -10296,6 +10490,9 @@ async def bulk_allocate_preview(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    # The preview reports name collisions in the zone the body names, so it
+    # is held to the same zone rule as the commit.
+    await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
 
     items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
     in_use = sum(1 for i in items if i.in_use)
@@ -10648,6 +10845,7 @@ async def allocate_next_ip(
             forward_zone_id=effective_zone,
             mac_address=body.mac_address,
             role=body.role,
+            space_id=subnet.space_id,
         )
         if warnings:
             raise _collision_http_exc(warnings)
@@ -10850,6 +11048,24 @@ async def add_subnet_domain(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
 
+    # A token bound to specific zones may only bind one of them. The subnet's
+    # current effective zone does not whitelist a new one (``subnet=None``):
+    # once bound as primary, every address write in the subnet publishes into
+    # it. Zones the subnet is already bound to pass, so a re-bind is not
+    # refused here (it answers 409 below).
+    current_zone_ids = (
+        await db.execute(
+            select(SubnetDomain.dns_zone_id).where(SubnetDomain.subnet_id == subnet_id)
+        )
+    ).scalars()
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        None,
+        [body.dns_zone_id],
+        already=[*current_zone_ids, subnet.dns_zone_id],
+    )
+
     zone = await db.get(DNSZone, body.dns_zone_id)
     if zone is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS zone not found")
@@ -11002,6 +11218,12 @@ async def bulk_edit_subnets(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="subnet_ids must not be empty",
         )
+
+    # The subnets are named in the body, which the router-level token check
+    # does not read: a token bound to specific subnets edits only those, and
+    # the whole batch is refused before anything changes.
+    for sid in body.subnet_ids:
+        _enforce_subnet_token_scope(current_user, sid)
 
     batch_id = uuid.uuid4()
     updated = 0

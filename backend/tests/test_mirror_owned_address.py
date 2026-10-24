@@ -166,8 +166,10 @@ async def test_kubernetes_row_not_moved_onto_other_integrations_row(
     db_session: AsyncSession,
 ) -> None:
     """Our node row sits in a subnet of another space; the cluster's own
-    space has a UniFi row at that address. Moving it would collide, so
-    the row stays put and the rest of the sync commits."""
+    space has a UniFi row at that address. Since #2577 a row in another
+    space is never moved: as a pure mirror row of the cluster's it is
+    released (deleted), the sync reports it, the UniFi row is left alone,
+    and the rest of the sync commits."""
     _space, lan, cluster, unifi_row = await _k8s_setup(db_session)
     other_space = await _make_space(db_session)
     other_block = IPBlock(space_id=other_space.id, network="10.0.0.0/24", name="old")
@@ -191,14 +193,15 @@ async def test_kubernetes_row_not_moved_onto_other_integrations_row(
     )
     db_session.add(own_row)
     await db_session.commit()
+    own_row_id, old_sub_id = own_row.id, old_sub.id
 
     with _k8s_client(("node-a", "10.0.0.5"), ("node-b", "10.0.0.6")):
         summary = await reconcile_cluster(db_session, cluster)
 
     assert summary.ok, summary.error
-    assert any("10.0.0.5" in w and "not moving" in w for w in summary.warnings)
-    await db_session.refresh(own_row)
-    assert own_row.subnet_id == old_sub.id
+    assert any("released what this target owned outside" in w for w in summary.warnings)
+    assert await db_session.get(IPAddress, own_row_id, populate_existing=True) is None
+    assert (await _rows_in(db_session, old_sub_id)) == {}
     await _assert_left_alone(db_session, unifi_row)
     rows = await _rows_in(db_session, lan.id)
     assert rows["10.0.0.6"].kubernetes_cluster_id == cluster.id

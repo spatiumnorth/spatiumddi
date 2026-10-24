@@ -4069,6 +4069,7 @@ _save_install_logs() {
     # Say what happened. An unconditional success line is the last thing
     # written to the log that is then (not) copied, so on a full or
     # read-only /var it ends with a claim the three WARNs above disprove.
+    _INSTALL_LOGS_SAVED=$saved
     if [ "$saved" -gt 0 ]; then
         log "Installer logs preserved under /var/log/spatiumddi/install/ ($saved file(s), $failed failed)"
     else
@@ -6639,11 +6640,28 @@ on_failure() {
     # are exactly the ones that leave none, and the operator's natural
     # next move re-runs the installer, whose startup TRUNCATES both logs.
     # The target is still mounted here: the unmount block is at 95%.
-    if [ -d "$MOUNT/var/log" ]; then
+    #
+    # #2405 — "$MOUNT/var/log exists" was the wrong gate: a root copy that
+    # fails early (rsync exit 11 in /usr/lib/modules) stops before /var is
+    # populated, so /var/log is absent and nothing was saved OR said. The
+    # question is whether the target is MOUNTED; _save_install_logs
+    # creates the directory itself. Before anything is mounted (the
+    # wizard prompts) there is no target to write to, and creating
+    # $MOUNT/... would only litter the live tmpfs, so that case skips.
+    # The gate is /var, not the root: /var is its own partition, so a
+    # failure between mounting the root and mounting /var would write the
+    # logs into the root's /var directory, hidden under the real /var
+    # mount on every boot after.
+    local _logs_kept=0
+    if mountpoint -q "$MOUNT/var" 2>/dev/null \
+        || [ -d "$MOUNT/var/log" ]; then
+        _INSTALL_LOGS_SAVED=0
         _save_install_logs || true
+        if [ "${_INSTALL_LOGS_SAVED:-0}" -gt 0 ]; then
+            _logs_kept=1
+        fi
     fi
     clear
-    echo
     echo "Installer exited with status $exit_code"
     echo
     echo "-- Last 20 lines of $INSTALL_LOG --"
@@ -6669,6 +6687,18 @@ on_failure() {
     echo "Also useful from the shell:"
     echo "  journalctl -u spatium-install.service --no-pager"
     echo "  systemctl cat spatium-install.service"
+    echo
+    # #2405 — the verdict on the logs goes LAST, just above the prompt: the
+    # tails above run to ~90 rows, so printed first it scrolled off a
+    # 50-row console before anyone could read it.
+    if [ "${_logs_kept:-0}" -eq 1 ]; then
+        echo "Installer logs were saved to the target: /var/log/spatiumddi/install/"
+    else
+        echo "WARN: the installer logs could NOT be saved to the target."
+        echo "      They remain on the live system only: $INSTALL_LOG, $TRACE_LOG,"
+        echo "      /var/log/spatium-install-launch.log. Copy them off before rebooting"
+        echo "      or re-running the installer (a re-run starts them afresh)."
+    fi
     echo
     echo "Press Enter to drop to a root shell."
     echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"

@@ -41,6 +41,12 @@ export function ListReadError({
  * error it renders `children` untouched, so a list that really is empty
  * still says so.
  *
+ * `filtered` (#2616) is for a list that holds rows but hides them all under
+ * a search, filter, chip or tag: "No VRFs yet." over a list the filter
+ * emptied is false, so it says the filter matches nothing instead, and
+ * offers `onClearFilters` when given. The "yet" copy stays for a list that
+ * is really empty.
+ *
  * Wrap only the empty branch: the caller has already decided there are no
  * rows to show.
  */
@@ -49,14 +55,38 @@ export function ListEmpty({
   what,
   children,
   className,
+  filtered = false,
+  onClearFilters,
 }: {
   error: unknown;
   what: string;
   children: ReactNode;
   className?: string;
+  /** A search, filter, chip or tag is active, so an empty result is not an empty list. */
+  filtered?: boolean;
+  onClearFilters?: () => void;
 }) {
   if (error) {
     return <ListReadError error={error} what={what} className={className} />;
+  }
+  if (filtered) {
+    return (
+      <span className={className}>
+        No {what} match the current search or filter.
+        {onClearFilters && (
+          <>
+            {" "}
+            <button
+              type="button"
+              onClick={onClearFilters}
+              className="text-primary underline hover:no-underline"
+            >
+              Clear filters
+            </button>
+          </>
+        )}
+      </span>
+    );
   }
   return <>{children}</>;
 }

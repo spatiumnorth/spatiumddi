@@ -1,3 +1,4 @@
+import { poolDeleteSummary } from "@/lib/pool-delete-copy";
 import { useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useNavigate } from "react-router-dom";
@@ -413,7 +414,7 @@ function PickGroupZoneModal({
   );
 }
 
-function ConfirmDeleteModal({
+export function ConfirmDeleteModal({
   pool,
   onConfirm,
   onClose,
@@ -431,13 +432,14 @@ function ConfirmDeleteModal({
   return (
     <Modal title={`Delete pool: ${pool.name}`} onClose={onClose}>
       <p className="text-sm text-muted-foreground">
-        Delete pool <span className="font-medium">{pool.name}</span> and remove
-        the {pool.member_count} member
-        {pool.member_count === 1 ? "" : "s"} currently published as{" "}
-        <span className="font-mono">
-          {fqdn} {pool.record_type}
-        </span>
-        ?
+        {poolDeleteSummary({
+          name: pool.name,
+          fqdn,
+          recordType: pool.record_type,
+          poolEnabled: pool.enabled,
+          memberCount: pool.member_count,
+          publishedCount: pool.enabled ? pool.live_count : 0,
+        })}
       </p>
       <div className="mt-4 flex justify-end gap-2">
         <button
