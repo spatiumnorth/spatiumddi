@@ -8814,4 +8814,8 @@ async def k8s_get_pod_logs(
             status.HTTP_502_BAD_GATEWAY,
             f"kubeapi returned {status_code}: {body[:200]!r}",
         )
-    return PlainTextResponse(body.decode("utf-8", errors="replace"))
+    # Pod output can carry whatever the process printed; the same secret
+    # redaction as the appliance's own log views applies.
+    from app.services.support_bundle.scrub import redact_secrets  # noqa: PLC0415
+
+    return PlainTextResponse(redact_secrets(body.decode("utf-8", errors="replace"))[0])

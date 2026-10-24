@@ -10,14 +10,18 @@ Mounted at ``/api/v1/appliance/containers``:
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from datetime import datetime
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api import stream_auth
 from app.api.deps import DB, CurrentUser
 from app.api.stream_auth import StreamAuthGuard
 from app.core.permissions import require_permission
@@ -32,7 +36,7 @@ from app.services.appliance.containers import (
 from app.services.appliance.containers import (
     list_containers as svc_list_containers,
 )
-from app.services.support_bundle.scrub import redact_secrets
+from app.services.support_bundle.scrub import LogStreamRedactor, redact_secrets
 
 logger = structlog.get_logger(__name__)
 
@@ -130,30 +134,76 @@ async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
     return {"name": name, "tail": redact_secrets(text)[0]}
 
 
-def _sse_log_response(gen, request: Request) -> StreamingResponse:
+_END = object()
+
+# Log sources still being closed after their stream ended. A pod-log source
+# reads in a worker thread that only notices cancellation once its next line
+# arrives, so the response does not wait for it; this keeps the task
+# referenced until it finishes.
+_closing_sources: set[asyncio.Task[None]] = set()
+
+
+def _sse_log_response(gen: AsyncIterator[str], request: Request) -> StreamingResponse:
     """Wrap a log-chunk generator as an SSE response.
 
     Chunks are JSON-encoded ``{"line": "..."}`` so embedded newlines /
     quotes round-trip cleanly through the SSE wire format.
     ``X-Accel-Buffering: no`` disables nginx response buffering so each
     line reaches the browser ASAP (same pattern as the AI-chat stream).
-    The caller is re-validated on a bounded cadence before each chunk is
-    sent (``StreamAuthGuard``, against ``_LOG_PERMISSION``); the stream
-    ends once that fails. Each chunk is passed through ``redact_secrets``.
+
+    The caller is re-validated (``StreamAuthGuard``, against
+    ``_LOG_PERMISSION``) before each chunk is sent AND whenever the source
+    has been quiet for a re-check interval, so a stream that prints nothing
+    still ends once the caller loses access. Lines pass through a
+    ``LogStreamRedactor``, which keeps state between chunks: a private key
+    arrives one line per chunk, and redacting each chunk on its own would
+    let every line but the BEGIN through.
     """
     guard = StreamAuthGuard(request, permission=_LOG_PERMISSION)
 
-    async def event_source():
+    async def event_source() -> AsyncIterator[str]:
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
+
+        async def pump() -> None:
+            try:
+                async for chunk in gen:
+                    await queue.put(chunk)
+            except Exception as exc:  # noqa: BLE001 — re-raised by the reader
+                await queue.put(exc)
+                return
+            await queue.put(_END)
+
+        reader = asyncio.create_task(pump())
+        redactor = LogStreamRedactor()
         try:
-            async for chunk in gen:
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=stream_auth.STREAM_AUTH_RECHECK_SECONDS
+                    )
+                except TimeoutError:
+                    if not await guard.still_authorized():
+                        return
+                    continue
                 if not await guard.still_authorized():
                     return
-                # Redact the whole chunk before splitting, so a multi-line
-                # secret (a PEM block) is matched as one unit.
-                for line in redact_secrets(chunk)[0].splitlines():
+                if item is _END:
+                    lines = redactor.flush()
+                elif isinstance(item, Exception):
+                    raise item
+                else:
+                    lines = redactor.feed(item)
+                for line in lines:
                     yield f"data: {json.dumps({'line': line})}\n\n"
+                if item is _END:
+                    return
         finally:
-            await gen.aclose()
+            if reader.done():
+                await gen.aclose()
+            else:
+                reader.cancel()
+                _closing_sources.add(reader)
+                reader.add_done_callback(_closing_sources.discard)
 
     return StreamingResponse(
         event_source(),

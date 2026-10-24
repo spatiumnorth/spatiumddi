@@ -416,6 +416,55 @@ async def test_log_stream_ends_when_admin_is_reduced_to_read(db_session: AsyncSe
 
 
 @pytest.mark.usefixtures("stream_env")
+async def test_a_quiet_log_stream_ends_when_admin_is_reduced_to_read(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pod that prints one line and then nothing: the re-check runs on a
+    timer as well as per line, so the stream still ends after the cut."""
+
+    async def _quiet_logs(
+        _name: str, tail: int = 100, container: str | None = None
+    ) -> AsyncIterator[str]:
+        yield "log line"
+        await asyncio.Event().wait()
+        yield "never"
+
+    monkeypatch.setattr(containers_module, "stream_container_logs", _quiet_logs)
+    _user, role, _session, token = await _viewer(db_session, appliance_action="admin")
+    stream = await _open(LOGS, token)
+    try:
+        await db_session.execute(
+            update(Role)
+            .where(Role.id == role.id)
+            .values(permissions=[{"action": "read", "resource_type": "appliance"}])
+        )
+        await db_session.commit()
+        assert await stream.ended_within(ENDS_WITHIN)
+    finally:
+        await stream.close()
+
+
+@pytest.mark.usefixtures("stream_env")
+async def test_a_quiet_log_stream_stays_open_for_a_valid_caller(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _quiet_logs(
+        _name: str, tail: int = 100, container: str | None = None
+    ) -> AsyncIterator[str]:
+        yield "log line"
+        await asyncio.Event().wait()
+        yield "never"
+
+    monkeypatch.setattr(containers_module, "stream_container_logs", _quiet_logs)
+    _user, _role, _session, token = await _viewer(db_session, appliance_action="admin")
+    stream = await _open(LOGS, token)
+    try:
+        assert not await stream.ended_within(RECHECK * 4)
+    finally:
+        await stream.close()
+
+
+@pytest.mark.usefixtures("stream_env")
 async def test_log_stream_is_refused_to_a_read_only_role(db_session: AsyncSession) -> None:
     _user, _role, _session, token = await _viewer(db_session)
     stream = _Stream(LOGS, {"Authorization": f"Bearer {token}"})
