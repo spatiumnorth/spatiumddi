@@ -28,15 +28,21 @@ from app.services.appliance.diagnostics import (
     run_self_test,
     self_test_report_to_dict,
 )
+from app.services.support_bundle.scrub import redact_secrets
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
 
+# Raw host log text can carry whatever a daemon printed — connection
+# strings, keys, tokens — so reading it takes ``admin`` on ``appliance``,
+# the same permission as the diagnostic bundle that packages these files,
+# and the text is passed through the bundle's secret redaction on the way
+# out. A read-only role sees the appliance's state but not its log lines.
 @router.get(
     "/logs",
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List host log files visible to the appliance",
 )
 async def list_logs() -> dict[str, list[str]]:
@@ -45,7 +51,7 @@ async def list_logs() -> dict[str, list[str]]:
 
 @router.get(
     "/logs/{name}",
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Tail a specific log file",
 )
 async def get_log(name: str, lines: int = 500) -> dict[str, str | int]:
@@ -63,7 +69,7 @@ async def get_log(name: str, lines: int = 500) -> dict[str, str | int]:
             status.HTTP_404_NOT_FOUND,
             f"log '{name}' not found or empty",
         )
-    return {"name": name, "lines": lines, "tail": text}
+    return {"name": name, "lines": lines, "tail": redact_secrets(text)[0]}
 
 
 @router.post(

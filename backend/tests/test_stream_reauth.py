@@ -192,9 +192,12 @@ class _Stream:
             self.task.cancel()
 
 
-async def _viewer(db: AsyncSession) -> tuple[User, Role, UserSession, str]:
-    """A non-superadmin with read on appliance + the nmap permission, a live
-    session, and an access token bound to it."""
+async def _viewer(
+    db: AsyncSession, *, appliance_action: str = "read"
+) -> tuple[User, Role, UserSession, str]:
+    """A non-superadmin with ``appliance_action`` on appliance + the nmap
+    permission, a live session, and an access token bound to it. The pod-log
+    streams take ``admin`` on appliance; the cluster stream takes ``read``."""
     user = User(
         username=f"s-{uuid.uuid4().hex[:8]}",
         email=f"{uuid.uuid4().hex[:8]}@example.com",
@@ -212,7 +215,7 @@ async def _viewer(db: AsyncSession) -> tuple[User, Role, UserSession, str]:
         name=f"r-{uuid.uuid4().hex[:6]}",
         description="",
         permissions=[
-            {"action": "read", "resource_type": "appliance"},
+            {"action": appliance_action, "resource_type": "appliance"},
             {"action": "read", "resource_type": "manage_nmap_scans"},
         ],
     )
@@ -370,7 +373,7 @@ async def test_cluster_stream_ends_when_the_api_token_expires(db_session: AsyncS
 
 @pytest.mark.usefixtures("stream_env")
 async def test_log_stream_ends_when_the_session_is_revoked(db_session: AsyncSession) -> None:
-    _user, _role, session, token = await _viewer(db_session)
+    _user, _role, session, token = await _viewer(db_session, appliance_action="admin")
     stream = await _open(LOGS, token)
     try:
         await db_session.execute(
@@ -384,12 +387,40 @@ async def test_log_stream_ends_when_the_session_is_revoked(db_session: AsyncSess
 
 @pytest.mark.usefixtures("stream_env")
 async def test_log_stream_ends_when_the_permission_is_removed(db_session: AsyncSession) -> None:
-    _user, role, _session, token = await _viewer(db_session)
+    _user, role, _session, token = await _viewer(db_session, appliance_action="admin")
     stream = await _open(LOGS, token)
     try:
         await db_session.execute(update(Role).where(Role.id == role.id).values(permissions=[]))
         await db_session.commit()
         assert await stream.ended_within(ENDS_WITHIN)
+    finally:
+        await stream.close()
+
+
+@pytest.mark.usefixtures("stream_env")
+async def test_log_stream_ends_when_admin_is_reduced_to_read(db_session: AsyncSession) -> None:
+    """The stream re-checks the same permission its route requires, so a
+    role cut from ``admin`` to ``read`` on appliance stops receiving lines."""
+    _user, role, _session, token = await _viewer(db_session, appliance_action="admin")
+    stream = await _open(LOGS, token)
+    try:
+        await db_session.execute(
+            update(Role)
+            .where(Role.id == role.id)
+            .values(permissions=[{"action": "read", "resource_type": "appliance"}])
+        )
+        await db_session.commit()
+        assert await stream.ended_within(ENDS_WITHIN)
+    finally:
+        await stream.close()
+
+
+@pytest.mark.usefixtures("stream_env")
+async def test_log_stream_is_refused_to_a_read_only_role(db_session: AsyncSession) -> None:
+    _user, _role, _session, token = await _viewer(db_session)
+    stream = _Stream(LOGS, {"Authorization": f"Bearer {token}"})
+    try:
+        assert await stream.status() == 403
     finally:
         await stream.close()
 
