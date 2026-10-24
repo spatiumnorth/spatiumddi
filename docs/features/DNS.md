@@ -2692,8 +2692,9 @@ only coherent resulting state, and the alternative would leave no single
 call that disables query logging at all.
 
 It roughly **doubles query-log volume**: named writes a second line per
-query. That volume is why the query log is capped at a 24 h window in
-the first place, so treat this as a troubleshooting switch rather than a
+query. That volume is why the query log keeps a short window in the
+first place (24 h by default, at most a week — `log_retention_hours`,
+Settings → Data Retention), so treat this as a troubleshooting switch rather than a
 permanent setting on a busy resolver.
 
 > **`rndc reconfig` applies neither `querylog` nor `responselog`.**
