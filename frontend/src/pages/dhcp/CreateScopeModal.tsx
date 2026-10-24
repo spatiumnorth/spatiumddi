@@ -545,9 +545,10 @@ export function CreateScopeModal({
         {!editing && (
           <p className="rounded border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
             A DHCP scope binds an <strong>IPAM subnet</strong> to a{" "}
-            <strong>DHCP server</strong> so that server hands out leases from
-            the subnet&apos;s address range. The subnet must exist in IPAM first
-            — create it under IPAM → Subnets if it doesn&apos;t.
+            <strong>DHCP server group</strong> so every server in the group
+            hands out leases from the subnet&apos;s address range. The subnet
+            must exist in IPAM first — create it on the IPAM page if it
+            doesn&apos;t.
           </p>
         )}
 
