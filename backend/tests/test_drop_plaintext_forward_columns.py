@@ -43,7 +43,7 @@ _MIGRATION = (
     / "versions"
     / "c2b203844c95_drop_plaintext_forward_webhook_columns.py"
 )
-_PREVIOUS_HEAD = "e7b3d19a4c26"
+_PREVIOUS_HEAD = "a3c7e91f2d58"
 _HEAD = "c2b203844c95"
 
 # Fixtures only; nothing here is ever contacted.
