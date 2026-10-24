@@ -139,6 +139,8 @@ async def _run_one(instance_id: str) -> dict[str, Any]:
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "dns_domain": summary.dns_domain,
                 "peer_count": summary.peer_count,
                 "blocks_created": summary.blocks_created,

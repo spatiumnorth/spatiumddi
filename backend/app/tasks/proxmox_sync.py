@@ -145,6 +145,8 @@ async def _run_one(node_id: str) -> dict[str, Any]:
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "pve_version": summary.pve_version,
                 "cluster_name": summary.cluster_name,
                 "node_count": summary.node_count,
