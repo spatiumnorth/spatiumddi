@@ -2356,45 +2356,59 @@ on every sweep. Now each server's previous report is kept
 
 | What the report shows, compared with that server's previous one | What happens |
 |---|---|
-| A record **appeared** and has no mirror | A writer added it. Mirror it, and queue a `create` record op to every **other** enabled agent server in the group. |
-| A record **vanished** and has a mirror | A writer deleted it. Drop the mirror and queue a `delete` op to every other server. |
-| A mirrored record is **missing** and the server never reported it | The server is behind (it was disabled when the op went out, joined later, or predates the fix). Queue a `create` op to that server alone, unless one is already queued for it. Never a delete. |
-| The server still holds a record whose mirror is **gone** | Behind the other way. Queue a `delete` op to that server alone, unless one is already queued for it. |
-| A change at a name and type for which one of **our** ops is still queued for this server, or was applied since its previous report | Not acted on this sweep. It is most likely our own write landing, not the writer's, and reading it as the writer's would push a deletion back to the server the writer just re-added the record on. It is looked at again on the next report. |
-| A managed record now owns the mirror's name and type | The mirror is dropped and every server, including the reporter, is sent the managed RRset (managed names win). |
+| A record **appeared** and has no mirror | A writer added it. Mirror it, and queue an op adding that value to every **other** enabled agent server in the group. |
+| A record **vanished** and has a mirror | A writer deleted it. Drop the mirror and queue an op removing that value from every other server. |
+| A mirrored record is **missing** and the server never reported it | The server is behind (it joined later, or predates the fix). Queue an add of that value to that server alone, unless one is already queued for it or failed in the last 6 hours. Never a delete. |
+| The server still holds a record whose mirror is **gone** | Behind the other way. Queue a removal of that value from that server alone, on the same conditions. |
+| A change to a value for which one of **our** ops is still queued for this server, or was applied in the minute before its previous report or since | Not acted on this sweep. It is most likely our own write landing, not the writer's, and reading it as the writer's would push a deletion back to the server the writer just re-added the record on. It is looked at again on the next report. |
+| A managed record now owns the mirror's name and type | The mirror row is dropped and **no op is sent**, exactly as in the one-server path. The managed row is often an import of the very record the servers serve (Sync with servers, the scheduled pull), so a wire delete would remove a live record everywhere. |
 
 So removal on one server deletes the record everywhere only when that
 server **had** it and then lost it. A server that simply never received a
 record is corrected, not believed. The server a record was learned from is
-never sent an op for it: it already holds it, and an RRset write there could
-overwrite a newer change the writer made after the report.
+never sent an op for it: it already holds it.
 
-The ops go through the same `DNSRecordOp` queue every record edit uses, so
-they carry the complete RRset (#773) and wake the agents. A record arriving on two servers in the same sweep is mirrored
-once (reports for one zone are serialised on the zone row).
+**Every op is per value, never a whole-RRset replace.** An operator's edit
+ships the complete RRset the database holds at that name (#773); these do
+not. The database only knows the values that have been reported, so a
+replace would wipe any other value the target server holds at that name: a
+writer's value not reported yet, or one whose report was deferred. The ops
+carry `rrset_action` `add` / `delete_value`, which BIND9 applies as
+`update add` / `update delete <rdata>`, PowerDNS as a splice into the live
+RRset, and Technitium as `overwrite=false` / a delete of that value. They go
+through the same `DNSRecordOp` queue every record edit uses and wake the
+agents. A record arriving on two servers in the same sweep is mirrored once
+(reports for one zone are serialised on the zone row).
 
-* **Disabled server.** Its report is recorded and otherwise ignored while
-  the group has another enabled agent server: it is sent no ops, so what it
-  holds says nothing about what the others should serve. When it is enabled
-  again, its next reports correct it to the database.
+* **Paused server.** Its reports are ignored while the group has another
+  enabled agent server: it is sent no ops, so what it holds says nothing
+  about what the others should serve. Its stored report is **kept as it was
+  when it was paused**, so when it is enabled again a record a writer added
+  or deleted on it during the pause reads as a change and is propagated,
+  instead of being corrected away. A server whose agent was simply offline
+  is handled the same way. The stored report is never aged out: however
+  long a server was away, what it held when it left is the right baseline.
 * **Agentless member** (Windows DNS, `technitium_api`, cloud). It does not
   run the ingest loop and is not sent these ops. A group whose only agent is
   a single BIND9 or PowerDNS server behaves as a one-server group.
-* **Stale history.** A previous report older than 24 hours, or from before a
-  server or zone changed group, is not compared against: the next report is
-  treated as the first, which only ever adds mirrors and corrects that server.
-* **Known limit.** Ops write whole RRsets. If a writer changes the same name
-  and type on two servers inside one 180 s sweep, the RRset the control
-  plane sends can replace the newer of the two changes on the server it
-  lands on.
+* **Moves.** A server's or zone's stored reports are dropped when it changes
+  group; the next report is treated as the first, which only ever adds
+  mirrors and corrects that server.
+* **A correction that keeps failing** (the op reaches `failed` after its
+  retry budget) is queued again after 6 hours, not on every 180 s report.
 
 **Sync with server(s) imports reach the other servers too (#2654).** A
 record that *Sync with server* / *Sync with servers* or the scheduled pull
-imports from one agent server is queued as a `create` op to the group's
-other enabled agent servers, the same way. The push phase of that sync could
-not cover it: on an agent-managed BIND9 server the control plane has no RFC
-2136 path of its own, so the push reports an error per record instead (a
-separate, unchanged gap). Agentless groups are unchanged: they are written through their
+imports from one agent server is queued to the group's other enabled agent
+servers as a per-value add, so the sync stays additive on every server. A
+record whose name and type has an op still queued to the server being read
+is **not imported** that run (`skipped_in_flight`): a record whose delete has
+not reached that server yet would otherwise come straight back as a row and
+be re-sent to the servers that already dropped it. The next sync looks
+again. The push phase of the sync could not cover the other servers: on an
+agent-managed BIND9 server the control plane has no RFC 2136 path of its
+own, so the push reports an error per record instead (a separate, unchanged
+gap). Agentless groups are unchanged: they are written through their
 primary, as before.
 
 ---

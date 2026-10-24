@@ -42,19 +42,24 @@ each server's previous report (``DNSIngestSnapshot``):
   others. A record missing from a server that never had it is not a delete;
 * a server that lacks a mirrored record it never reported, or still holds
   one whose mirror is gone, is behind (it was disabled when the op went out,
-  joined the group later, or predates this fix): it alone is sent an op that
-  brings that RRset back in line with the database, unless one is already
-  queued for it;
-* a change on a server that one of OUR ops explains (an op for that RRset
+  joined the group later, or predates this fix): it alone is sent an op for
+  that value, unless one is already queued for it or failed recently;
+* a change on a server that one of OUR ops explains (an op for that value
   still queued for it, or applied since its last report) is not acted on
   this cycle, because it is most likely our own write landing rather than
-  the writer's, and is looked at again on the next report.
+  the writer's, and is looked at again on the next report;
+* a mirror whose (name, type) a managed record now owns is dropped, with no
+  wire op, as in the one-server path.
+
+Every op this sends is PER VALUE (``rrset_action`` add / delete_value), not
+the whole-RRset replace an operator's edit sends: the database only knows the
+values that have been reported, and a replace would wipe any other value the
+target server holds at that name.
 
 The server a record came from is never sent an op for it: it already holds
-the record, and an RRset write there could overwrite a newer write the
-writer made since the report. A disabled server's report updates its
-snapshot and nothing else: it receives no ops, so it does not get to drive
-the mirror while its peers keep serving.
+the record. A disabled server's report is ignored and its snapshot is kept
+as it was when it was paused, so on re-enable the changes a writer made on it
+meanwhile read as changes.
 """
 
 from __future__ import annotations
@@ -75,17 +80,18 @@ logger = structlog.get_logger(__name__)
 # Provenance marker for a record the agent read back off the live zone.
 EXTERNAL_IMPORT_SOURCE = "ddns_external"
 
-# A snapshot older than this is not compared against (#2654): a server back
-# after a long absence is treated as reporting for the first time, which
-# only ever adds mirrors and corrects that server, never deletes from peers.
-# The sweep runs every 180 s, so a day is several hundred missed reports.
-SNAPSHOT_MAX_AGE = timedelta(hours=24)
+# A correction that failed permanently (``MAX_OP_ATTEMPTS``) is not queued
+# again for this long, so a value one server will not accept is retried a few
+# times a day rather than on every 180 s report.
+FAILED_OP_BACKOFF = timedelta(hours=6)
 
 # An op applied this long before a server's previous report still counts as
 # an explanation for a change in its next one. The agent reads the zone a few
 # seconds before it posts, so an op applied in that gap shows up in the NEXT
-# report even though it was applied before the previous one was stored.
-OP_ATTRIBUTION_SLACK = timedelta(minutes=5)
+# report even though it was applied before the previous one was stored. The
+# gap is bounded by the agent's 20 s transfer and 20 s POST timeouts; kept
+# well under the 180 s sweep so one landed op defers at most one report.
+OP_ATTRIBUTION_SLACK = timedelta(seconds=60)
 
 # RR types the daemon manages itself — never ingested as "external writer"
 # data even though they show up in an AXFR.
@@ -232,10 +238,13 @@ async def reconcile_external_records(
 
     if not server.is_enabled:
         # A paused server is sent no ops, so what it holds says nothing about
-        # what its peers should serve. Record it, so that when it is enabled
-        # again it is compared against what it held, not against stale data.
+        # what its peers should serve: it does not drive the mirror. Its
+        # snapshot is deliberately NOT updated. When it is enabled again its
+        # first report is compared against what it held when it was paused,
+        # so a writer's add or delete made on it during the pause reads as a
+        # change (and is mirrored and fanned out) instead of as drift to
+        # correct away.
         result.mode = "disabled_reporter"
-        await _save_snapshot(db, server, zone, set(desired))
         return result
 
     result.mode = "multi"
@@ -268,6 +277,34 @@ async def _full_reconcile(
             await _drop_mirror(db, row, result)
 
 
+def learned_record_op(op: str, rec: IncomingRecord | DNSRecord) -> dict[str, Any]:
+    """A PER-VALUE record op for a learned record (#2654 review).
+
+    ``rrset_action`` makes the agent add or remove exactly this value
+    (BIND9 ``update add`` / ``update delete <rdata>``, PowerDNS splice,
+    Technitium ``overwrite=false`` / value delete), and keeps
+    ``stamp_rrsets_for_ops`` from turning the op into a whole-RRset replace.
+    A replace would carry only what the DATABASE holds at that name, and wipe
+    every value the target server holds that is not mirrored yet: a writer's
+    value on that server that has not been reported, or one whose report was
+    deferred.
+    """
+    rtype = rec.record_type.upper()
+    record: dict[str, Any] = {
+        "name": rec.name,
+        "type": rtype,
+        "value": rec.value,
+        "ttl": rec.ttl,
+        "priority": rec.priority,
+        "weight": rec.weight,
+        "port": rec.port,
+        "rrset_action": "add" if op == "create" else "delete_value",
+    }
+    if isinstance(rec, DNSRecord) and rec.id is not None:
+        record["record_id"] = str(rec.id)
+    return {"op": op, "record": record}
+
+
 async def _transition_reconcile(
     db: AsyncSession,
     zone: DNSZone,
@@ -280,31 +317,28 @@ async def _transition_reconcile(
     """Several agent servers: act on what changed on ``server`` (#2654)."""
     from app.services.dns.record_ops import (  # noqa: PLC0415 — record_ops imports models heavily
         enqueue_agent_record_ops,
-        record_op_payload,
     )
     from app.services.dns.serial import bump_zone_serial  # noqa: PLC0415
 
     snap = await db.get(DNSIngestSnapshot, (server.id, zone.id))
-    now = datetime.now(UTC)
     previous: set[tuple[str, str, str]] = set()
     since: datetime | None = None
-    if snap is not None and now - snap.reported_at <= SNAPSHOT_MAX_AGE:
+    if snap is not None:
         previous = {(str(a), str(b), str(c)) for a, b, c in snap.record_keys}
         since = snap.reported_at - OP_ATTRIBUTION_SLACK
-    queued_nt, explained_nt = await _rrsets_touched_by_ops(db, zone, server, since)
+    ops = await server_ops_touching(db, zone, server, since)
 
     current = set(desired)
     carried = set(current)  # becomes the stored snapshot
     added_rows: list[DNSRecord] = []
     peer_ops: list[dict[str, Any]] = []
-    all_ops: list[dict[str, Any]] = []  # for mirrors a managed record now shadows
     self_ops: list[dict[str, Any]] = []
 
     # Appeared on this server since its last report.
     for k in current - previous:
         if k in external_by_key:
             continue
-        if _nt(k) in explained_nt:
+        if ops.explains(k):
             carried.discard(k)  # look again next report
             result.deferred += 1
             continue
@@ -313,65 +347,49 @@ async def _transition_reconcile(
     # Vanished from this server since its last report.
     for k in previous - current:
         row = external_by_key.get(k)
-        if row is None:
-            continue
-        if _nt(k) in managed_nt:
-            continue  # handled with the shadowed mirrors below
-        if _nt(k) in explained_nt:
+        if row is None or _nt(k) in managed_nt:
+            continue  # shadowed mirrors are dropped below
+        if ops.explains(k):
             carried.add(k)  # still "held" until the next report decides
             result.deferred += 1
             continue
-        peer_ops.append({"op": "delete", "record": record_op_payload(row)})
+        peer_ops.append(learned_record_op("delete", row))
         await _drop_mirror(db, row, result)
         del external_by_key[k]
 
     # A managed record now owns a mirror's (name, type): the operator's
-    # declared state wins, as in the single-server path. Every server has the
-    # mirror in that RRset, so the op goes to all of them.
+    # declared state wins, exactly as in the single-server path. Drop the row
+    # and send nothing: the managed (name, type) is often an import of what
+    # the servers really serve (Sync with servers, the scheduled pull), so a
+    # wire delete here would remove a writer's live record everywhere.
     for k, row in list(external_by_key.items()):
         if _nt(k) in managed_nt:
-            all_ops.append({"op": "delete", "record": record_op_payload(row)})
             await _drop_mirror(db, row, result)
             del external_by_key[k]
 
-    # This server is behind: corrections to it alone, unless one is queued.
+    # This server is behind: corrections to it alone, unless one is queued
+    # or recently failed for that value.
     for k, row in external_by_key.items():
-        if k not in current and k not in previous and _nt(k) not in queued_nt:
-            self_ops.append({"op": "create", "record": record_op_payload(row)})
+        if k not in current and k not in previous and not ops.blocks_correction(k):
+            self_ops.append(learned_record_op("create", row))
     for k in (current & previous) - set(external_by_key):
-        if _nt(k) in queued_nt or _nt(k) in managed_nt:
+        if ops.blocks_correction(k):
             continue
-        rec = desired[k]
-        self_ops.append(
-            {
-                "op": "delete",
-                "record": {
-                    "name": rec.name,
-                    "type": rec.record_type.upper(),
-                    "value": rec.value,
-                    "ttl": rec.ttl,
-                    "priority": rec.priority,
-                    "weight": rec.weight,
-                    "port": rec.port,
-                },
-            }
-        )
+        self_ops.append(learned_record_op("delete", desired[k]))
 
     if added_rows:
-        await db.flush()  # ids for record_op_payload
-        peer_ops.extend({"op": "create", "record": record_op_payload(r)} for r in added_rows)
+        await db.flush()  # ids for the op payloads
+        peer_ops.extend(learned_record_op("create", r) for r in added_rows)
     await db.flush()
 
-    if peer_ops or self_ops or all_ops:
+    if peer_ops or self_ops:
         serial = bump_zone_serial(zone)
-        for o in (*peer_ops, *self_ops, *all_ops):
+        for o in (*peer_ops, *self_ops):
             o["target_serial"] = serial
     if peer_ops:
         result.peer_ops = await enqueue_agent_record_ops(
             db, zone, peer_ops, exclude_server_ids={server.id}
         )
-    if all_ops:
-        result.peer_ops += await enqueue_agent_record_ops(db, zone, all_ops)
     if self_ops:
         result.corrections = await enqueue_agent_record_ops(
             db, zone, self_ops, only_server_ids={server.id}
@@ -443,13 +461,45 @@ async def _enabled_agent_peers(
     return [s for s in rows if not is_agentless(s.driver)]
 
 
-async def _rrsets_touched_by_ops(
-    db: AsyncSession, zone: DNSZone, server: DNSServer, since: datetime | None
-) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-    """``(queued, explained)`` RRsets, as ``(name_lower, TYPE)``, for ``server``.
+@dataclass
+class ServerOps:
+    """What record ops say about one server's RRsets in one zone.
 
-    ``queued``: an op for it is still pending or in flight. ``explained``: that,
-    or one was applied since ``since`` (the previous report, less the slack).
+    Keys are ``(name_lower, TYPE)`` for a whole-RRset op (it rewrites every
+    value at that name) and ``(name_lower, TYPE, value)`` for a per-value op.
+    """
+
+    explained_nt: set[tuple[str, str]] = field(default_factory=set)
+    explained_v: set[tuple[str, str, str]] = field(default_factory=set)
+    blocked_nt: set[tuple[str, str]] = field(default_factory=set)
+    blocked_v: set[tuple[str, str, str]] = field(default_factory=set)
+    queued_nt: set[tuple[str, str]] = field(default_factory=set)
+
+    def explains(self, k: tuple[str, str, str]) -> bool:
+        """An op queued, or applied since the server's last report, could be
+        what changed ``k`` on it."""
+        return _nt(k) in self.explained_nt or (_nt(k) + (k[2],)) in self.explained_v
+
+    def blocks_correction(self, k: tuple[str, str, str]) -> bool:
+        """An op for ``k`` is queued, or failed recently, so do not queue
+        another correction for it."""
+        return _nt(k) in self.blocked_nt or (_nt(k) + (k[2],)) in self.blocked_v
+
+    def queued_at(self, name: str, rtype: str) -> bool:
+        """Any op (whole-RRset or per-value) for this name and type is still
+        pending or in flight to the server."""
+        return ((name or "@").lower(), rtype.upper()) in self.queued_nt
+
+
+async def server_ops_touching(
+    db: AsyncSession, zone: DNSZone, server: Any, since: datetime | None
+) -> ServerOps:
+    """Classify ``server``'s record ops for ``zone`` (#2654).
+
+    ``explains``: the op is still queued, or was applied after ``since`` (the
+    previous report, less the slack). ``blocks_correction``: still queued, or
+    failed within ``FAILED_OP_BACKOFF``, so a correction that keeps failing is
+    not re-queued on every report.
     """
     from app.services.dns.record_ops import (  # noqa: PLC0415
         QUEUED_OP_STATES,
@@ -457,26 +507,45 @@ async def _rrsets_touched_by_ops(
         _op_type_sql,
     )
 
-    cond = DNSRecordOp.state.in_(QUEUED_OP_STATES)
+    now = datetime.now(UTC)
+    conds = [
+        DNSRecordOp.state.in_(QUEUED_OP_STATES),
+        (DNSRecordOp.state == "failed") & (DNSRecordOp.updated_at >= now - FAILED_OP_BACKOFF),
+    ]
     if since is not None:
-        cond = or_(cond, (DNSRecordOp.state == "applied") & (DNSRecordOp.applied_at >= since))
+        conds.append((DNSRecordOp.state == "applied") & (DNSRecordOp.applied_at >= since))
     rows = (
         await db.execute(
-            select(_op_name_sql(), _op_type_sql(), DNSRecordOp.state).where(
+            select(
+                _op_name_sql(),
+                _op_type_sql(),
+                DNSRecordOp.record["value"].astext,
+                DNSRecordOp.record.has_key("rrset"),
+                DNSRecordOp.state,
+            ).where(
                 DNSRecordOp.server_id == server.id,
                 DNSRecordOp.zone_id == zone.id,
-                cond,
+                or_(*conds),
             )
         )
     ).all()
-    queued: set[tuple[str, str]] = set()
-    explained: set[tuple[str, str]] = set()
-    for name, rtype, state in rows:
+    out = ServerOps()
+    for name, rtype, value, whole_rrset, state in rows:
         nt = (str(name or "@"), str(rtype or ""))
-        explained.add(nt)
+        vk = (*nt, str(value or "").strip())
+        if state != "failed":
+            if whole_rrset:
+                out.explained_nt.add(nt)
+            else:
+                out.explained_v.add(vk)
         if state in QUEUED_OP_STATES:
-            queued.add(nt)
-    return queued, explained
+            out.queued_nt.add(nt)
+        if state != "applied":
+            if whole_rrset:
+                out.blocked_nt.add(nt)
+            else:
+                out.blocked_v.add(vk)
+    return out
 
 
 async def _save_snapshot(
@@ -515,8 +584,11 @@ def to_summary(result: IngestResult) -> dict[str, int]:
 
 __all__ = [
     "EXTERNAL_IMPORT_SOURCE",
+    "FAILED_OP_BACKOFF",
     "OP_ATTRIBUTION_SLACK",
-    "SNAPSHOT_MAX_AGE",
+    "ServerOps",
+    "learned_record_op",
+    "server_ops_touching",
     "IncomingRecord",
     "IngestResult",
     "reconcile_external_records",

@@ -10,7 +10,7 @@ ingest endpoint as two agents.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -137,7 +137,9 @@ async def test_record_learned_on_one_server_is_queued_to_the_other_and_does_not_
     # second sweep did not queue a duplicate while the first is still pending.
     assert _for(ops, ns1) == []
     assert _for(ops, ns2) == [("create", "dc01")]
-    assert ops[0].record["rrset"]["members"][0]["value"] == "10.0.0.5"
+    # Per value: an add of exactly this RR, not a replace of the RRset.
+    assert ops[0].record["rrset_action"] == "add" and "rrset" not in ops[0].record
+    assert ops[0].record["value"] == "10.0.0.5"
 
     # ns2 applies it and reports it: nothing more happens.
     await _apply_all(db_session, zone)
@@ -173,7 +175,8 @@ async def test_writer_delete_on_one_server_reaches_the_others(
     ops = await _ops(db_session, zone)
     assert _for(ops, ns1) == []
     assert _for(ops, ns2)[-1] == ("delete", "dc01")
-    assert ops[-1].record["rrset"]["members"] == []
+    assert ops[-1].record["rrset_action"] == "delete_value"
+    assert ops[-1].record["value"] == "10.0.0.5"
 
     # ns2 reports before applying it: still holds dc01, a delete is queued.
     # No second delete, and no resurrection.
@@ -211,7 +214,7 @@ async def test_our_own_op_landing_is_not_read_as_a_writer_delete(
     assert (r["added"], r["removed"], r["peer_ops"], r["corrections"]) == (0, 0, 0, 0)
 
 
-async def test_value_change_ships_the_final_rrset(
+async def test_value_change_ships_both_values_per_value(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9")
@@ -222,8 +225,11 @@ async def test_value_change_ships_the_final_rrset(
     assert await _mirrors(db_session, zone) == [("dc01", "10.0.0.6")]
     pending = [o for o in await _ops(db_session, zone) if o.state == "pending"]
     assert {o.server_id for o in pending} == {ns2.id}
-    for o in pending:  # whatever order ns2 drains them in, it ends on .6
-        assert [m["value"] for m in o.record["rrset"]["members"]] == ["10.0.0.6"]
+    # Per-value ops commute: whatever order ns2 drains them in, it ends on .6.
+    assert sorted((o.op, o.record["rrset_action"], o.record["value"]) for o in pending) == [
+        ("create", "add", "10.0.0.6"),
+        ("delete", "delete_value", "10.0.0.5"),
+    ]
 
 
 async def test_record_arriving_on_both_servers_is_mirrored_once(
@@ -289,7 +295,12 @@ async def test_server_still_holding_a_withdrawn_record_is_corrected(
     r = await _post(client, ns2, [DC01])
     assert r["added"] == 0 and r["corrections"] == 1
     op = (await _ops(db_session, zone))[-1]
-    assert (op.server_id, op.op, op.record["rrset"]["members"]) == (ns2.id, "delete", [])
+    assert (op.server_id, op.op, op.record["rrset_action"], op.record["value"]) == (
+        ns2.id,
+        "delete",
+        "delete_value",
+        "10.0.0.5",
+    )
 
 
 async def test_disabled_reporter_does_not_drive_the_mirror(
@@ -369,3 +380,202 @@ async def test_sync_import_is_queued_to_the_other_agent_servers(
         assert _for(ops, servers[1]) == [("create", "printer")]
     else:
         assert result.pull.peer_ops == 0 and ops == []
+
+
+# ── Review of PR #2666 ───────────────────────────────────────────────────────
+
+
+async def _set_enabled(db: AsyncSession, server: DNSServer, enabled: bool) -> None:
+    await db.execute(update(DNSServer).where(DNSServer.id == server.id).values(is_enabled=enabled))
+    await db.commit()
+    await db.refresh(server)
+
+
+async def test_writer_add_on_a_paused_server_survives_re_enable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Finding 1. A writer registers W on ns2 while ns2 is paused. On re-enable
+    W is a change since ns2's pre-pause report: mirrored and fanned out, not
+    deleted from ns2 as drift."""
+    zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9")
+    await _post(client, ns1, [])
+    await _post(client, ns2, [])
+    await _set_enabled(db_session, ns2, False)
+    w = {**DC01, "name": "laptop7", "value": "10.0.0.77"}
+    r = await _post(client, ns2, [w])  # paused: ignored
+    assert r["skipped"] == "server_disabled"
+    await _set_enabled(db_session, ns2, True)
+
+    r = await _post(client, ns2, [w])
+    assert r["added"] == 1 and r["corrections"] == 0
+    assert await _mirrors(db_session, zone) == [("laptop7", "10.0.0.77")]
+    ops = await _ops(db_session, zone)
+    assert _for(ops, ns2) == []  # nothing deletes it from ns2
+    assert _for(ops, ns1) == [("create", "laptop7")]
+
+
+async def test_writer_delete_on_a_paused_server_reaches_the_others_on_re_enable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Finding 1, the other direction: a mirrored record the writer deleted on
+    ns2 during the pause is deleted everywhere, not re-created on ns2."""
+    zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9")
+    await _post(client, ns1, [DC01])
+    await _apply_all(db_session, zone)
+    await _post(client, ns2, [DC01])
+    await _set_enabled(db_session, ns2, False)
+    await _post(client, ns2, [])  # writer deleted it on ns2 while paused
+    await _set_enabled(db_session, ns2, True)
+    # The pause lasted longer than the op-attribution slack: our .5 add to ns2
+    # no longer explains a change on it.
+    await db_session.execute(
+        update(DNSRecordOp)
+        .where(DNSRecordOp.zone_id == zone.id)
+        .values(applied_at=datetime.now(UTC) - timedelta(hours=1))
+    )
+    await db_session.commit()
+
+    r = await _post(client, ns2, [])
+    assert r["removed"] == 1 and r["corrections"] == 0
+    assert await _mirrors(db_session, zone) == []
+    pending = [o for o in await _ops(db_session, zone) if o.state == "pending"]
+    assert [(o.server_id, o.op) for o in pending] == [(ns1.id, "delete")]
+
+
+async def test_peer_ops_never_wipe_values_the_peer_holds(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Finding 2. ns2 holds a writer value (.6) at a name we also push to.
+    The op we send ns2 for ns1's new value (.7) must add .7, not replace the
+    RRset with what the database holds; and .6 is mirrored, not deferred,
+    because our op for .5 does not explain a change to .6."""
+    zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9")
+    await _post(client, ns2, [])
+    await _post(client, ns1, [DC01])  # .5 -> add to ns2
+    await _apply_all(db_session, zone)
+    v6 = {**DC01, "value": "10.0.0.6"}
+    v7 = {**DC01, "value": "10.0.0.7"}
+    r = await _post(client, ns2, [DC01, v6])  # right after our .5 landed
+    assert r["deferred"] == 0 and r["added"] == 1
+    await _post(client, ns1, [DC01, v7])
+
+    pending = [o for o in await _ops(db_session, zone) if o.state == "pending"]
+    assert all("rrset" not in o.record for o in pending)
+    to_ns2 = sorted(
+        (o.op, o.record["rrset_action"], o.record["value"])
+        for o in pending
+        if o.server_id == ns2.id
+    )
+    assert to_ns2 == [("create", "add", "10.0.0.7")]
+    to_ns1 = sorted((o.op, o.record["value"]) for o in pending if o.server_id == ns1.id)
+    assert to_ns1 == [("create", "10.0.0.6")]  # ns2's .6, once (no duplicate correction)
+
+    await _apply_all(db_session, zone)
+    r = await _post(client, ns2, [DC01, v6, v7])
+    assert (r["added"], r["removed"]) == (0, 0)
+    assert await _mirrors(db_session, zone) == [
+        ("dc01", "10.0.0.5"),
+        ("dc01", "10.0.0.6"),
+        ("dc01", "10.0.0.7"),
+    ]
+
+
+async def test_managed_record_taking_over_a_name_sends_no_wire_delete(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Finding 3. Like the one-server path: the mirror row goes, nothing is
+    deleted on any server (the managed row is often an import of the very
+    record the servers serve)."""
+    zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9")
+    await _post(client, ns1, [DC01])
+    await _apply_all(db_session, zone)
+    await _post(client, ns2, [DC01])
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id, name="dc01", fqdn=f"dc01.{ZONE}", record_type="A", value="10.0.0.5"
+        )
+    )
+    await db_session.commit()
+    before = len(await _ops(db_session, zone))
+
+    r = await _post(client, ns1, [DC01])
+    assert r["removed"] == 1 and r["peer_ops"] == 0
+    assert await _mirrors(db_session, zone) == []
+    assert len(await _ops(db_session, zone)) == before
+
+
+async def test_sync_does_not_import_a_record_whose_op_is_still_queued(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 4. ns1 still serves `printer` because its delete op has not
+    landed yet; the sync must not bring the row back and re-send it to ns2,
+    which already applied the delete."""
+    zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9", dynamic=False)
+    db_session.add(
+        DNSRecordOp(
+            server_id=ns1.id,
+            zone_id=zone.id,
+            zone_name=zone.name,
+            op="delete",
+            record={"name": "printer", "type": "A", "value": "10.0.0.9"},
+            state="pending",
+        )
+    )
+    await db_session.commit()
+    fake = _FakeDriver()
+
+    async def _resolve(db: Any, z: Any, server: Any = None) -> Any:
+        return server or ns1, fake, [None], None
+
+    async def _pull(driver: Any, server: Any, zone_name: str, keys: Any, **kw: Any) -> Any:
+        return [RecordData(name="printer", record_type="A", value="10.0.0.9", ttl=300)], None
+
+    monkeypatch.setattr(pfs, "_resolve_primary_and_driver", _resolve)
+    monkeypatch.setattr(pfs, "pull_zone_records_signed", _pull)
+
+    result = await pfs.sync_zone_with_server(db_session, zone, apply=True, server=ns1)
+    assert (result.pull.imported, result.pull.skipped_in_flight, result.pull.peer_ops) == (0, 1, 0)
+    assert _for(await _ops(db_session, zone), ns2) == []
+
+
+async def test_a_correction_that_failed_is_not_requeued_every_report(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Finding 5. A correction ns2 cannot apply goes ``failed`` after
+    MAX_OP_ATTEMPTS. It is retried after FAILED_OP_BACKOFF, not on every
+    180 s report."""
+    from app.services.dns.ingest import FAILED_OP_BACKOFF
+
+    zone, (ns1, ns2) = await _group(db_session, "bind9", "bind9")
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="dc01",
+            fqdn=f"dc01.{ZONE}",
+            record_type="A",
+            value="10.0.0.5",
+            import_source="ddns_external",
+        )
+    )
+    await db_session.commit()
+    r = await _post(client, ns2, [])
+    assert r["corrections"] == 1
+    await db_session.execute(
+        update(DNSRecordOp)
+        .where(DNSRecordOp.zone_id == zone.id)
+        .values(state="failed", attempts=8, updated_at=datetime.now(UTC))
+    )
+    await db_session.commit()
+
+    r = await _post(client, ns2, [])
+    assert r["corrections"] == 0
+    assert len(await _ops(db_session, zone)) == 1
+
+    await db_session.execute(
+        update(DNSRecordOp)
+        .where(DNSRecordOp.zone_id == zone.id)
+        .values(updated_at=datetime.now(UTC) - FAILED_OP_BACKOFF - timedelta(minutes=1))
+    )
+    await db_session.commit()
+    r = await _post(client, ns2, [])
+    assert r["corrections"] == 1

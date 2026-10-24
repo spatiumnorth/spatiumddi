@@ -97,10 +97,11 @@ class DNSIngestSnapshot(Base):
     ``(name, type, value)`` keys the server held, after the managed-name and
     daemon-owned filters. See ``app.services.dns.ingest``.
 
-    One row per ``(server, zone)``, replaced on every report. Purged with the
-    other per-server zone state when a server or zone changes group, and
-    ignored once older than ``ingest.SNAPSHOT_MAX_AGE`` so a server returning
-    after a long absence is not compared against what it held back then.
+    One row per ``(server, zone)``, replaced on every report from an enabled
+    server (a paused one keeps its pre-pause row). Purged with the other
+    per-server zone state when a server or zone changes group. Never aged
+    out: however long a server was away, what it held when it left is the
+    right baseline for what changed on it since.
     """
 
     __tablename__ = "dns_ingest_snapshot"
