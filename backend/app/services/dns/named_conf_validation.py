@@ -595,6 +595,30 @@ def _validate_also_notify(
     return cleaned
 
 
+def _refuse_mixed_none(elements: list[str], *, field: str) -> None:
+    """Refuse an ``allow_transfer`` list that puts ``none`` beside other entries.
+
+    BIND reads ``none`` as ``!any``: wherever it sits, it denies everyone
+    from that point on, so ``["none", "10.0.0.0/8"]`` admits nobody while
+    reading like "10/8 only", and ``["10.0.0.0/8", "none"]`` is just
+    ``["10.0.0.0/8"]``. One list, two plausible readings — so neither is
+    accepted. ``["none"]`` alone, or the entries without it, say one thing.
+    """
+    if len(elements) < 2:
+        return
+    for element in elements:
+        body = element[1:].strip() if element.startswith("!") else element
+        if body.lower() == "none":
+            raise ViewValidationError(
+                "'none' cannot be combined with other entries: BIND reads it as "
+                "'deny everyone from here on'. Use ['none'] on its own to allow "
+                "transfers to no one but the group's TSIG keys, or list only the "
+                "addresses, prefixes, ACLs or keys that may transfer.",
+                field=field,
+                value=element,
+            )
+
+
 def validate_server_option(
     field: str,
     value: Any,
@@ -614,12 +638,15 @@ def validate_server_option(
     if value is None:
         return None
     if field in ADDRESS_MATCH_LIST_OPTIONS:
-        return validate_address_match_list(
+        cleaned = validate_address_match_list(
             list(value),
             field=field,
             known_acls=known_acls,
             known_keys=known_keys,
         )
+        if field == "allow_transfer":
+            _refuse_mixed_none(cleaned, field=field)
+        return cleaned
     if field == "forwarders":
         return _validate_forwarders(list(value), field=field)
     if field == "also_notify":

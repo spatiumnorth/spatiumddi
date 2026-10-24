@@ -67,4 +67,19 @@ describe("AuditPage details", () => {
     expect(screen.getByText(/\[redacted\]/)).toBeTruthy();
     expect(get).toHaveBeenCalledWith("e1");
   });
+
+  it("filters DNS server groups by the type their audit rows carry (#2623)", async () => {
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AuditPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("button", { name: /show details/i });
+    const values = Array.from(container.querySelectorAll("option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    // The API writes `dns_server_group`; `dns_group` matches no row.
+    expect(values).toContain("dns_server_group");
+    expect(values).not.toContain("dns_group");
+  });
 });

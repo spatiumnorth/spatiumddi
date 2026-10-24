@@ -183,7 +183,7 @@ describe("IPAM delete confirmations", () => {
       ["Permanently Delete", "the orphan purge's title"],
       ["? This cannot be undone.", "after an address purge's question"],
       [
-        "Auto-generated records IPAM no longer wants (the reason is shown under each one). Selecting will permanently delete them and push the delete to BIND.",
+        "Auto-generated records IPAM no longer wants (the reason is shown under each one). None are selected by default: selecting one will permanently delete it and push the delete to the DNS server.",
         "stale DNS records are deleted from the database and the server",
       ],
       ["permanently removed", "Clean Orphans deletes orphan address rows"],

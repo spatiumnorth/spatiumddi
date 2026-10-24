@@ -372,6 +372,157 @@ made in SQL bypass the audit log.
 
 ---
 
+## An integration took IP addresses from another IP space
+
+**Symptom** — Hand-allocated addresses disappeared from one IP space after
+an integration (UniFi, Docker, Kubernetes, Proxmox, Tailscale, NetBird or
+Cloud) was pointed at a *different* space covering the same range. Trying
+to allocate a missing address again says it is already allocated, and the
+address shows up in the integration's space instead. A Sync DNS on the
+original subnet may also offer to delete many DNS records.
+
+**What happened** — Before #2577 those seven reconcilers looked existing
+addresses up across **every** IP space instead of only their own. When an
+integration saw an address that an operator had allocated in another space,
+it adopted that row: it set the integration's ownership column, stamped
+`user_modified_at`, and moved the row into the integration's own space.
+The row's DNS records moved with it. Later passes could delete the row
+outright (a duplicate in the target subnet, or the host leaving the
+integration's view), and deleting the integration's target or its space
+deleted every row it had taken. A deleted row leaves its auto-generated DNS
+records behind with no address, which is what Sync DNS then offers to
+delete.
+
+Upgrading stops it: every reconciler now only reads, adopts, moves, dedupes
+and deletes rows inside its target's own space. Nothing already moved is put
+back automatically, because the row's original subnet was never recorded,
+and a wrong guess would move it a second time.
+
+One kind of damage does repair itself. An operator row the old build
+claimed but never managed to move still sits in its home space carrying the
+integration's column. On the first sync after the upgrade the integration
+**releases** everything it owns outside its own space: it clears its column
+on such a row and leaves the row where it is, `user_modified_at` included.
+It only ever deletes a row it can show is a pure mirror row of its own
+(created after the integration, never edited or audited by a person, no
+DHCP reservation, no other owner); when in doubt it un-claims. The same
+release is what happens when you change an integration's IP space on
+purpose. The sync warnings say what was released.
+
+**Before anything else** — Upgrade first, so the integration stops moving
+rows while you repair them. If the integration is still pointed at an
+overlapping space, leave it running: it no longer touches the other space.
+Do **not** commit DNS deletions from Sync DNS on an affected subnet until
+the rows are back; those records are what you will be restoring.
+
+### Find the rows it moved
+
+As a superadmin, call the read-only report:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://<spatiumddi>/api/v1/ipam/integration-space-audit" | jq .
+```
+
+or ask the Operator Copilot to run `find_cross_space_integration_adoptions`.
+Each row lists the address, the integration and target that own it now, the
+subnet and space it sits in now, and:
+
+- `evidence` — why it is suspected. `operator_create_audit` means someone
+  created it through IPAM (`created_by` names them).
+  `created_before_target` means the row is older than the integration
+  target, which an integration-created row can't be.
+  `outside_target_space` means it carries the integration's column but sits
+  outside the integration's space; the integration's next sync releases it
+  (see above), so these only show up until then.
+  `dhcp_reservation_in_other_space` means a DHCP reservation linked to the
+  row belongs to a scope in another space: it was made there.
+  `predates_its_space_subnets` means the row is older than every subnet of
+  its current space that contains it, while a subnet in another space that
+  contains it is older than the row. A row can't be created before its
+  subnet, so it was moved in. (A subnet split in its own space can produce
+  this too, so it is evidence, not proof.)
+- `likely_cross_space` — the row has operator-origin evidence AND one of
+  the last two pieces of evidence that it lived in another space. These are
+  the rows to repair.
+- `needs_review` — the row has operator-origin evidence and some subnet in
+  another space contains its address, but nothing shows it ever lived
+  there. That is exactly what an ordinary adoption in the integration's
+  **own** space looks like whenever the range also exists in another space,
+  so do not move these on the report's word: confirm with whoever owns the
+  address first. A row the old build stole after the integration was set
+  up, and without a DHCP reservation, also lands here — which is why they
+  are listed at all.
+- `home_candidates` — the subnets in other spaces that contain the address,
+  and `address_free`, whether nothing holds that address there now. The
+  one with `address_free: true` in the space the address went missing from
+  is almost always where the row came from.
+
+`?include_same_space=true` also lists operator rows an integration adopted
+inside its own space whose address exists in no other space. That is
+normal, documented adoption, not this bug. `truncated: true` means more
+rows matched than `limit` returned; raise `limit` (up to 5000).
+
+### Put a row back
+
+For each `likely_cross_space` row — and each `needs_review` row its owner
+confirms came from another space — confirm the home subnet with whoever
+owns the address, then move it back and release the integration's claim.
+Use the column for the integration the report names (`unifi_controller_id`,
+`docker_host_id`, `kubernetes_cluster_id`, `proxmox_node_id`,
+`tailscale_tenant_id`, `netbird_instance_id`, `cloud_endpoint_id`):
+
+```sql
+BEGIN;
+UPDATE ip_address
+SET subnet_id = '<home_candidates[].subnet_id>',
+    unifi_controller_id = NULL
+WHERE id = '<ip_address_id>';
+COMMIT;
+```
+
+Keep `user_modified_at` as it is: the row holds an operator's hostname,
+description and MAC, and clearing it would let some later integration
+overwrite them. If the `UPDATE` fails on `uq_ip_address_subnet_address`,
+something now holds the address in the home subnet; decide which of the two
+to keep before going further. Subnet and block utilization counters correct
+themselves within the hour (the `recount_ipam_utilization` sweep). Edits
+made in SQL bypass the audit log, so note what you changed.
+
+Once the row is back, the integration creates its own row for the address
+in its own space on its next sync. Then run **Sync DNS** on the home subnet
+and confirm the address's records are reported in sync.
+
+### Rows that were already deleted
+
+The report can only find rows that still exist. A row the integration
+deleted, or that went with a deleted integration target or space, is gone,
+but its IPAM create audit row is not. This lists addresses created through
+IPAM that no longer exist and were not deleted through IPAM:
+
+```sql
+SELECT c.timestamp, c.user_display_name, c.resource_display AS address,
+       c.new_value
+FROM audit_log c
+WHERE c.resource_type = 'ip_address' AND c.action = 'create'
+  AND c.resource_display NOT LIKE 'profile\_scan %'
+  AND NOT EXISTS (SELECT 1 FROM ip_address a WHERE a.id::text = c.resource_id)
+  AND NOT EXISTS (SELECT 1 FROM audit_log d
+                  WHERE d.resource_type = 'ip_address' AND d.action = 'delete'
+                    AND d.resource_id = c.resource_id)
+ORDER BY c.timestamp;
+```
+
+This also lists rows removed by deleting their subnet, block or space,
+which writes no per-address audit row, so read it next to what you know was
+deleted on purpose. `new_value` carries what was typed at creation
+(hostname, description, status, MAC); later edits are in `update` rows for
+the same `resource_id`. Re-create the ones you want through IPAM. Their
+orphaned DNS records stay where they are until Sync DNS on the subnet
+reports them, so re-create the address before committing any deletions.
+
+---
+
 ## `/health/platform` says `celery-beat` is unhealthy
 
 **Read the component name as a symptom, not a diagnosis.** Beat only

@@ -186,10 +186,10 @@ async def test_a_render_never_releases_a_slot_it_no_longer_holds(
     entered = {s1.id: asyncio.Event(), s2.id: asyncio.Event()}
     gate = {s1.id: asyncio.Event(), s2.id: asyncio.Event()}
 
-    async def _gated(server_id):  # noqa: ANN001
+    async def _gated(server_id, *rest):  # noqa: ANN001
         entered[server_id].set()
         await gate[server_id].wait()
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _gated)
     r1 = asyncio.create_task(agent_bundles._run(str(s1.id)))
@@ -225,13 +225,13 @@ async def test_a_render_never_releases_a_server_lock_it_no_longer_holds(
     calls: list[asyncio.Event] = []
     gates: list[asyncio.Event] = []
 
-    async def _gated(server_id):  # noqa: ANN001
+    async def _gated(server_id, *rest):  # noqa: ANN001
         entered, gate = asyncio.Event(), asyncio.Event()
         calls.append(entered)
         gates.append(gate)
         entered.set()
         await gate.wait()
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _gated)
     r1 = asyncio.create_task(agent_bundles._run(str(server.id)))
@@ -265,7 +265,7 @@ _KILLED_HOLDER = r"""
 import asyncio, os, sys
 from app.tasks import agent_bundles
 
-async def _hang(server_id):
+async def _hang(server_id, *rest):
     await asyncio.sleep(300)
 
 agent_bundles._render_once = _hang
@@ -353,10 +353,10 @@ async def test_a_render_longer_than_its_lease_keeps_the_slot(
     await db_session.commit()
     real = agent_bundles._render_once
 
-    async def _slow(server_id):  # noqa: ANN001
+    async def _slow(server_id, *rest):  # noqa: ANN001
         if server_id == slow.id:
             await asyncio.sleep(3.5 * lease)
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _slow)
     task = asyncio.create_task(agent_bundles._run(str(slow.id)))
@@ -385,11 +385,11 @@ async def test_two_slots_let_two_servers_render_at_once(
     real = agent_bundles._render_once
     gate, entered = asyncio.Event(), asyncio.Event()
 
-    async def _held(server_id):  # noqa: ANN001
+    async def _held(server_id, *rest):  # noqa: ANN001
         if server_id == slow.id:
             entered.set()
             await gate.wait()
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _held)
     task = asyncio.create_task(agent_bundles._run(str(slow.id)))
@@ -423,14 +423,14 @@ async def test_a_holder_with_more_to_render_hands_its_slot_to_a_waiting_server(
     entered, gate = asyncio.Event(), asyncio.Event()
     renders: list[uuid.UUID] = []
 
-    async def _storm(server_id):  # noqa: ANN001
+    async def _storm(server_id, *rest):  # noqa: ANN001
         renders.append(server_id)
         if server_id == busy.id:
             entered.set()
             await gate.wait()
             # A change landed while it rendered.
             await client.set(keys["dirty"] + str(busy.id), "1", ex=60)
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _storm)
     task = asyncio.create_task(agent_bundles._run(str(busy.id)))
@@ -466,7 +466,7 @@ def test_a_handed_on_render_comes_back_after_the_waiters_next_try(
     ``SLOT_RETRY_SECONDS``) came round, so nothing was handed to anyone."""
     sid = str(uuid.uuid4())
 
-    async def _handed(server_id, lock_token=None):  # noqa: ANN001
+    async def _handed(server_id, lock_token=None, soft_limit=None):  # noqa: ANN001
         return {"status": "handed_on", "lock_token": "tok", "renders": 1}
 
     requeued: list[dict] = []
@@ -482,6 +482,9 @@ def test_a_handed_on_render_comes_back_after_the_waiters_next_try(
             "countdown": agent_bundles.HANDED_ON_RETRY_SECONDS,
             "retry": False,
             "queue": "bundles",
+            # The message's own limits go with it (#2240): here the floor.
+            "soft_time_limit": 900,
+            "time_limit": 960,
         }
     ], requeued
     assert agent_bundles.HANDED_ON_RETRY_SECONDS > agent_bundles.SLOT_RETRY_SECONDS
@@ -499,12 +502,12 @@ async def test_with_nobody_waiting_a_holder_renders_again(
     real = agent_bundles._render_once
     calls = 0
 
-    async def _dirty_once(server_id):  # noqa: ANN001
+    async def _dirty_once(server_id, *rest):  # noqa: ANN001
         nonlocal calls
         calls += 1
         if calls == 1:
             await client.set(keys["dirty"] + str(server.id), "1", ex=60)
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _dirty_once)
     result = await agent_bundles._run(str(server.id))
