@@ -84,6 +84,47 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class DNSIngestSnapshot(Base):
+    """What one agent last reported for one dynamic zone's external records (#2654).
+
+    The ingest-back loop (#641) mirrors records an RFC 2136 writer injected
+    into a live daemon. In a group with several agent servers each one is an
+    independent primary and the writer usually talks to only one of them, so
+    "absent from this server's report" cannot mean "the writer withdrew it":
+    the other servers may simply not have it yet. The reconcile therefore
+    works on CHANGE (what appeared on or vanished from a server since its
+    previous report), and this row is that previous report: the external
+    ``(name, type, value)`` keys the server held, after the managed-name and
+    daemon-owned filters. See ``app.services.dns.ingest``.
+
+    One row per ``(server, zone)``, replaced on every report. Purged with the
+    other per-server zone state when a server or zone changes group, and
+    ignored once older than ``ingest.SNAPSHOT_MAX_AGE`` so a server returning
+    after a long absence is not compared against what it held back then.
+    """
+
+    __tablename__ = "dns_ingest_snapshot"
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    # ``[[name_lower, TYPE, value], ...]``: the ingest ``_key`` of each record.
+    record_keys: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'[]'::jsonb")
+    )
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class DNSServerRuntimeState(Base):
     """Latest agent-pushed runtime snapshot for a single DNS server.
 

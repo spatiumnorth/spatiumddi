@@ -23,18 +23,23 @@ a TSIG-signed AXFR (#734), the rest over their own authenticated API.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver
+from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
-from app.services.dns.record_ops import resolve_primary_server, rrset_from_payload
+from app.services.dns.record_ops import (
+    enqueue_agent_record_ops,
+    record_op_payload,
+    resolve_primary_server,
+    rrset_from_payload,
+)
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.tsig import (
@@ -63,6 +68,11 @@ class PullResult:
     imported: int  # count of rows we created
     imported_records: list[dict[str, Any]]  # user-visible list for UI
     skipped_unsupported: int  # count filtered because record_type not imported
+    # The rows an ``apply=True`` import added (#2654), so the caller can send
+    # them to the group's other agent servers. Empty in preview.
+    created_rows: list[DNSRecord] = field(default_factory=list, repr=False)
+    # Record ops queued to those other servers (#2654).
+    peer_ops: int = 0
 
 
 @dataclass
@@ -515,6 +525,7 @@ def _additive_import(
     zone_name = zone.name
     zone_name_no_dot = zone.name.rstrip(".")
     imported_records: list[dict[str, Any]] = []
+    created_rows: list[DNSRecord] = []
     skipped_unsupported = 0
     existing = 0
     imported = 0
@@ -547,6 +558,7 @@ def _additive_import(
         )
         if apply:
             db.add(row)
+            created_rows.append(row)
         imported += 1
         imported_records.append(
             {
@@ -564,6 +576,33 @@ def _additive_import(
         imported=imported,
         imported_records=imported_records,
         skipped_unsupported=skipped_unsupported,
+        created_rows=created_rows,
+    )
+
+
+async def _send_imports_to_peers(
+    db: AsyncSession, zone: DNSZone, read_from: Any, result: PullResult
+) -> None:
+    """Queue every row the import just created to the group's OTHER agent
+    servers (#2654).
+
+    The rows describe what ``read_from`` serves, so it is left out. In a
+    no-views group an agent only ever receives a record as a record op, so
+    without this the other servers of a multi-agent group never served what
+    the import found. The push phase cannot cover it: on an agent-managed
+    BIND9 server the control plane has no RFC 2136 path of its own and the
+    push reports an error per record instead. Agentless groups are left to
+    the push phase, which is how they have always been written to.
+    """
+    if not result.created_rows or is_agentless(getattr(read_from, "driver", "")):
+        return
+    serial = bump_zone_serial(zone)
+    ops = [
+        {"op": "create", "record": record_op_payload(row), "target_serial": serial}
+        for row in result.created_rows
+    ]
+    result.peer_ops = await enqueue_agent_record_ops(
+        db, zone, ops, exclude_server_ids={read_from.id}
     )
 
 
@@ -618,6 +657,7 @@ async def pull_zone_from_server(
     )
     if apply and result.imported:
         await db.flush()
+        await _send_imports_to_peers(db, zone, primary, result)
 
     logger.info(
         "dns.pull_from_server",
@@ -917,6 +957,7 @@ async def sync_zone_with_server(
     )
     if apply and pull_result.imported:
         await db.flush()
+        await _send_imports_to_peers(db, zone, primary, pull_result)
 
     push_result = await _additive_push(
         db,

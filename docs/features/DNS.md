@@ -2342,11 +2342,60 @@ would be wrong; the audit row is the history. The agent never ships an
 empty set after a failed AXFR, so an empty report is a real withdrawal and
 is applied (and audited), not floor-guarded.
 
-**P1 limitation:** live multi-server propagation of an ingested record
-across every server in a group happens on the next full re-render, not
-instantly (ingested rows aren't re-shipped as per-server record ops). The
-record is durable + visible immediately; other servers converge on their
-next structural reload.
+**One agent server in the group: the report is the whole truth.** Records
+in it that are not mirrored are added, mirrors missing from it are removed.
+
+**Two or more enabled agent servers: the report is read as a change (issue
+#2654).** Every agent server renders the zone as an independent primary
+with its own journal, and an RFC 2136 writer normally updates only one of
+them (the SOA MNAME). Before #2654 the mirror row was written with no record
+op, so the other servers never served the record (half the lookups answered
+NXDOMAIN), and their own reports, which lacked it, deleted the mirror again
+on every sweep. Now each server's previous report is kept
+(`dns_ingest_snapshot`, one row per server and zone), and:
+
+| What the report shows, compared with that server's previous one | What happens |
+|---|---|
+| A record **appeared** and has no mirror | A writer added it. Mirror it, and queue a `create` record op to every **other** enabled agent server in the group. |
+| A record **vanished** and has a mirror | A writer deleted it. Drop the mirror and queue a `delete` op to every other server. |
+| A mirrored record is **missing** and the server never reported it | The server is behind (it was disabled when the op went out, joined later, or predates the fix). Queue a `create` op to that server alone, unless one is already queued for it. Never a delete. |
+| The server still holds a record whose mirror is **gone** | Behind the other way. Queue a `delete` op to that server alone, unless one is already queued for it. |
+| A change at a name and type for which one of **our** ops is still queued for this server, or was applied since its previous report | Not acted on this sweep. It is most likely our own write landing, not the writer's, and reading it as the writer's would push a deletion back to the server the writer just re-added the record on. It is looked at again on the next report. |
+| A managed record now owns the mirror's name and type | The mirror is dropped and every server, including the reporter, is sent the managed RRset (managed names win). |
+
+So removal on one server deletes the record everywhere only when that
+server **had** it and then lost it. A server that simply never received a
+record is corrected, not believed. The server a record was learned from is
+never sent an op for it: it already holds it, and an RRset write there could
+overwrite a newer change the writer made after the report.
+
+The ops go through the same `DNSRecordOp` queue every record edit uses, so
+they carry the complete RRset (#773) and wake the agents. A record arriving on two servers in the same sweep is mirrored
+once (reports for one zone are serialised on the zone row).
+
+* **Disabled server.** Its report is recorded and otherwise ignored while
+  the group has another enabled agent server: it is sent no ops, so what it
+  holds says nothing about what the others should serve. When it is enabled
+  again, its next reports correct it to the database.
+* **Agentless member** (Windows DNS, `technitium_api`, cloud). It does not
+  run the ingest loop and is not sent these ops. A group whose only agent is
+  a single BIND9 or PowerDNS server behaves as a one-server group.
+* **Stale history.** A previous report older than 24 hours, or from before a
+  server or zone changed group, is not compared against: the next report is
+  treated as the first, which only ever adds mirrors and corrects that server.
+* **Known limit.** Ops write whole RRsets. If a writer changes the same name
+  and type on two servers inside one 180 s sweep, the RRset the control
+  plane sends can replace the newer of the two changes on the server it
+  lands on.
+
+**Sync with server(s) imports reach the other servers too (#2654).** A
+record that *Sync with server* / *Sync with servers* or the scheduled pull
+imports from one agent server is queued as a `create` op to the group's
+other enabled agent servers, the same way. The push phase of that sync could
+not cover it: on an agent-managed BIND9 server the control plane has no RFC
+2136 path of its own, so the push reports an error per record instead (a
+separate, unchanged gap). Agentless groups are unchanged: they are written through their
+primary, as before.
 
 ---
 
