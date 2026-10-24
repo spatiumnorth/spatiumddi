@@ -86,7 +86,8 @@ async def test_a_recent_failure_alone_does_not_fire_but_a_long_one_does(
     await db_session.flush()
     fired = await _fired(db_session)
     assert set(fired) == {"long-failing"}
-    assert "Fetch failed: 404" in fired["long-failing"][0]
+    assert "Fetch failed" not in fired["long-failing"][0]
+    assert "last refresh attempt failed" in fired["long-failing"][0]
 
 
 @pytest.mark.asyncio
@@ -111,6 +112,7 @@ def test_state_classification() -> None:
         base = dict(
             feed_url=URL,
             update_interval_hours=24,
+            enabled=True,
             last_sync_status="success",
             last_success_at=datetime.now(UTC),
             created_at=datetime.now(UTC),
@@ -125,6 +127,12 @@ def test_state_classification() -> None:
     old = datetime.now(UTC) - timedelta(days=4)
     assert feed_sync_state(bl(last_success_at=old)) == "stale"  # type: ignore[arg-type]
     assert feed_sync_state(bl(last_success_at=old, update_interval_hours=0)) == "ok"  # type: ignore[arg-type]
+    # Manual-only and disabled lists make no schedule promise: no never/stale.
+    for kw in ({"update_interval_hours": 0}, {"enabled": False}):
+        assert feed_sync_state(bl(last_success_at=None, last_sync_status=None, **kw)) == "ok"  # type: ignore[arg-type]
+        assert feed_sync_state(bl(last_success_at=old, **kw)) == "ok"  # type: ignore[arg-type]
+        # ...but a failed last attempt is still reported.
+        assert feed_sync_state(bl(last_sync_status="error", **kw)) == "error"  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -277,3 +285,16 @@ async def test_rule_is_seeded_enabled_and_registered(db_session: AsyncSession) -
         .all()
     )
     assert len(rows) == 1 and rows[0].enabled is True
+
+
+@pytest.mark.asyncio
+async def test_alert_message_never_carries_the_stored_fetch_error(
+    db_session: AsyncSession,
+) -> None:
+    bl = await _list(db_session, "credentialed", success_hours_ago=200, status="error")
+    bl.last_sync_error = "Fetch failed: GET http://u:secretpw@host/x?key=secretkey"
+    await db_session.flush()
+    message, _sev = (await _fired(db_session))["credentialed"]
+    for leak in ("secretpw", "secretkey", "u:", "http", "host/x"):
+        assert leak not in message
+    assert "last refresh attempt failed" in message

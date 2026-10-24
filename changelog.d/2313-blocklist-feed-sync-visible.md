@@ -4,7 +4,10 @@
   refreshing (#2313).** Feed-sourced blocklist rows now carry a sync
   chip (red on a failed refresh, amber past 3 update intervals without
   a success, grey when never synced), and a new default-on
-  `dns_blocklist_feed_stale` alert fires per stale list.
+  `dns_blocklist_feed_stale` alert fires per stale list. Manual-only,
+  disabled and hand-made lists show no `never synced` / `stale` chip and
+  never alert; the alert text carries a fixed reason, not the stored fetch
+  error.
 
 ### Migrations
 

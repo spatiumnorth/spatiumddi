@@ -4114,7 +4114,9 @@ async def _matching_dns_blocklist_feed_stale_subjects(
             if bl.last_success_at
             else f"has never refreshed successfully (created {age_h} h ago)"
         )
-        err = f" Last error: {bl.last_sync_error}" if bl.last_sync_status == "error" else ""
+        # Fixed text only: the stored fetch error can quote the feed URL, which
+        # may carry credentials, and alert events are widely readable/forwarded.
+        err = " The last refresh attempt failed." if bl.last_sync_status == "error" else ""
         matches.append(
             (
                 str(bl.id),

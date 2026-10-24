@@ -27,6 +27,16 @@ describe("feedChip", () => {
   it("is grey when never synced", () => {
     expect(feedChip({ feed_sync_state: "never" }, NOW)?.tone).toBe("grey");
   });
+  it("shows no staleness chip for a list the server reports as ok", () => {
+    // A manual-only or disabled feed list arrives as "ok" (never/stale are
+    // schedule promises); only a failed last attempt still draws a chip.
+    expect(
+      feedChip({ feed_sync_state: "ok", last_success_at: null }, NOW),
+    ).toBeNull();
+    expect(feedChip({ feed_sync_state: "error" }, NOW)?.label).toBe(
+      "sync failed",
+    );
+  });
   it("shows nothing when healthy or when the list has no feed", () => {
     expect(feedChip({ feed_sync_state: "ok" }, NOW)).toBeNull();
     expect(feedChip({ feed_sync_state: null }, NOW)).toBeNull();

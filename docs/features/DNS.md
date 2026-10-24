@@ -1397,8 +1397,12 @@ when no refresh has succeeded for more than 3 update intervals, grey when the
 feed has never synced. The default-on `dns_blocklist_feed_stale` alert (warning,
 one event per list) fires on the same 3-interval test, measured from the last
 *successful* refresh (`last_success_at`) or, for a feed that never succeeded,
-from its creation. Manual-only lists (interval `0`) and disabled lists never
-alert.
+from its creation. Manual-only lists (interval `0`), disabled lists and
+hand-made (non-feed) lists never alert and show no `never synced` / `stale`
+chip; a failed last refresh still shows `sync failed` on any feed list.
+Assignment to a group is not a condition: an unassigned feed that stops
+refreshing alerts too. The alert text says only that the last refresh failed;
+the stored fetch error (which can quote the feed URL) stays in the list detail.
 
 #### Do feed entries block subdomains?
 
