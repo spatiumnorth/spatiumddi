@@ -288,6 +288,15 @@ class SettingsResponse(BaseModel):
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
     ssh_lockdown: bool = False
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Read by the nightly prune tasks; every one is superadmin-only to
+    # change (not in ``SETTINGS_DELEGATE_WRITABLE``).
+    soft_delete_purge_days: int = 30
+    dhcp_lease_history_retention_days: int = 90
+    pcap_retention_days: int = 7
+    appliance_revoked_retention_days: int = 30
+    metric_retention_days: int = 7
+    log_retention_hours: int = 24
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -898,6 +907,19 @@ SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
 )
 
 
+# Data-retention windows (#2273), each read by a nightly prune task. All are
+# superadmin-only (none is in ``SETTINGS_DELEGATE_WRITABLE``): shortening one
+# deletes data on the next sweep.
+RETENTION_FIELDS: tuple[str, ...] = (
+    "soft_delete_purge_days",
+    "dhcp_lease_history_retention_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
+    "metric_retention_days",
+    "log_retention_hours",
+)
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -1062,6 +1084,19 @@ class SettingsUpdate(BaseModel):
     # smaller tick — an operator may have sent that one for another reason.
     ssh_lockdown_force: bool | None = None
     acknowledge_console_only: bool | None = None
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Superadmin-only. 0 turns the trash purge, lease-history prune and
+    # revoked-appliance hard-delete off (keep forever), as each task
+    # already reads it. pcap / metric / log windows have no "off": a
+    # capture holds plaintext credentials, and the other two are
+    # high-volume tables. ``log_retention_hours`` is capped at 168 until
+    # #2185 replaces the single unbatched DELETE with partition drops.
+    soft_delete_purge_days: int | None = Field(default=None, ge=0, le=365)
+    dhcp_lease_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    pcap_retention_days: int | None = Field(default=None, ge=1, le=90)
+    appliance_revoked_retention_days: int | None = Field(default=None, ge=0, le=365)
+    metric_retention_days: int | None = Field(default=None, ge=1, le=365)
+    log_retention_hours: int | None = Field(default=None, ge=1, le=168)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -2371,6 +2406,15 @@ async def update_settings(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
                 ) from exc
 
+    # #2273 — remember the retention windows this request changes, for the
+    # dedicated audit row below (shortening one deletes data on the next
+    # nightly prune, so old and new values are both recorded).
+    _retention_old = {
+        f: getattr(settings, f)
+        for f in RETENTION_FIELDS
+        if f in changes and getattr(settings, f) != changes[f]
+    }
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2486,6 +2530,26 @@ async def update_settings(
                     "dnssec": settings.resolver_dnssec,
                     "dns_over_tls": settings.resolver_dns_over_tls,
                 },
+            )
+        )
+
+    # #2273 — dedicated audit row for a data-retention change (non-negotiable
+    # #4; the ``logger.info`` below is not an ``audit_log`` row). Only real
+    # changes are recorded, so echoing the form back writes nothing.
+    if _retention_old:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="retention",
+                resource_display="Data retention",
+                result="success",
+                changed_fields=sorted(_retention_old),
+                old_value=_retention_old,
+                new_value={f: getattr(settings, f) for f in _retention_old},
             )
         )
 
