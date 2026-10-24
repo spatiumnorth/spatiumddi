@@ -78,7 +78,10 @@ export function credentialChipView(
 export function hasTargetProblem(t: {
   credential_state?: CredentialState | null;
   last_sync_error?: string | null;
+  enabled?: boolean;
 }): boolean {
+  // #2221 — a disabled target's leftover error is history, not a problem.
+  if (t.enabled === false) return false;
   return (
     t.credential_state === "rejected" ||
     t.credential_state === "expired" ||
@@ -104,6 +107,7 @@ export function cardTargets<
   T extends {
     credential_state?: CredentialState | null;
     last_sync_error?: string | null;
+    enabled?: boolean;
   },
 >(
   targets: T[],

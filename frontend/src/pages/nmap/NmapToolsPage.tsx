@@ -170,7 +170,7 @@ function LiveTab({
   );
 }
 
-function ResultTab({
+export function ResultTab({
   scan,
   onClear,
 }: {
@@ -185,6 +185,10 @@ function ResultTab({
     queryKey: ["nmap-scan", scan?.id],
     queryFn: () => nmapApi.getScan(scan!.id),
     initialData: scan ?? undefined,
+    // #2577 — the list's copy is incomplete (no raw output, and on an older
+    // server no IP space), so treat it as stale and fetch the scan at once
+    // rather than trusting it for the default `staleTime`.
+    initialDataUpdatedAt: 0,
   });
   if (!data) {
     return (

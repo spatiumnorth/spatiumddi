@@ -1168,9 +1168,10 @@ function DeleteNodeModal({
         <p className="text-sm text-muted-foreground">
           Remove the Proxmox endpoint{" "}
           <span className="font-semibold">{node.name}</span>? This only affects
-          SpatiumDDI — nothing on the Proxmox side changes. All IPAM rows
-          mirrored from this endpoint (subnets + addresses) will be removed via
-          the FK cascade.
+          SpatiumDDI — nothing on the Proxmox side changes. Only rows that were
+          purely mirrored are removed. Anything you added yourself (addresses,
+          DHCP scopes, reservations, edited rows, custom fields) is kept and
+          detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

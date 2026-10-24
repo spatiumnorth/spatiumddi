@@ -44,11 +44,12 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `ip_address`      | Individual IPs, aliases, bulk address ops             |
 | `vlan`            | VLANs and routers                                     |
 | `vrf`             | VRFs (Virtual Routing and Forwarding) — `manage_vrfs` |
-| `asn`             | Autonomous Systems + RPKI ROAs + BGP peering / communities — `manage_asns` |
-| `domain`          | Domain registration tracking (registrar / expiry / NS drift) — `manage_domains` |
+| `manage_asns`     | Autonomous Systems + RPKI ROAs + BGP peering / communities |
+| `manage_domains`  | Domain registration tracking (registrar / expiry / NS drift) |
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
+| `server`          | Server logs on the **Logs** page (Windows event log, DHCP audit, DNS queries, DHCP activity) and DNS threat analytics. For the agent-log reads (DNS Queries, DHCP Activity) the grant may be scoped: a `resource_id` of a server id reads that server, a DNS or DHCP server-group id reads every server in that group, and group / "all" reads are narrowed to those servers (#2120). Unlike most types, the `resource_id` may name a server group as well as a server: `server` is a surface, not a table, and a group grant is how one delegate reads a load-balanced group. The Windows event-log and DHCP-audit reads, DNS threat analytics and the Copilot log tools still need it unscoped (the tools do narrow a resource-bound API token the same way) |
 | `dns_blocklist`   | Response Policy Zones / blocking lists                |
 | `dhcp_server`     | Kea + Windows DHCP server objects and server groups   |
 | `dhcp_scope`      | DHCP scopes / shared networks                         |
@@ -149,6 +150,17 @@ on inactive.
    resize / split / merge / next-IP / bulk / DNS-sync, and editing or
    deleting an existing address stay refused unless a type-level grant
    covers them.
+   **IPAM address sets (#103).** A `write` / `admin` grant on an address set
+   (the Address Set Editor role, scoped to one set) reaches an allow-list of
+   address routes and nothing else in IPAM: create, next-IP, bulk-allocate
+   (preview and commit), edit and delete an address, add and remove its
+   aliases, bulk-edit and bulk-delete addresses, deprecate stale IPs, and the
+   address import (preview and commit). Each of those checks every address it
+   touches against the set's range, so the holder changes only addresses
+   inside the sets it holds. Every other mutating IPAM route, including one
+   added later, refuses such a holder with 403 until it is listed
+   (`_ADDRESS_SET_ROUTES` in `backend/app/api/v1/ipam/router.py`). Reads
+   still need a normal read grant.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —
@@ -217,7 +229,7 @@ neither on the list nor reviewed as something else.
 | `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62) — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
 | `Requester`        | `write` + `read` on `provisioning_request` (#696) — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. |
-| `Appliance Operator` | `admin` on `appliance` (#134) — full control of the SpatiumDDI OS appliance management surface (TLS cert upload, release manager, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage the appliance lifecycle without full superadmin over the DDI data plane. |
+| `Appliance Operator` | `admin` on `appliance` (#134) — runs the SpatiumDDI OS appliance on a node (TLS cert upload and ACME, the read-only releases catalogue, node-local slot apply and rollback, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage a node's lifecycle without full superadmin over the DDI data plane. **Fleet management still needs a superadmin** (#2620): the upgrade-image store, every Fleet member action (approve, role assignment, OS upgrade, reboot), MetalLB, the kube-api CIDRs and pairing codes. |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
 

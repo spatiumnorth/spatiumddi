@@ -24,7 +24,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
@@ -334,6 +334,9 @@ class ScopeCreate(BaseModel):
     # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
     relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
+    # #2705 — the create dialog offers a PXE profile; before this the field
+    # was dropped (``extra: ignore``) and the scope came back without it.
+    pxe_profile_id: uuid.UUID | None = None
     # #1110 — see ``WindowsPlacementIn``. Only consulted when no Windows
     # member holds the scope yet; an existing one stays where it is held.
     windows_placement: WindowsPlacementIn | None = None
@@ -746,9 +749,18 @@ async def create_scope(
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
     )
+    if body.pxe_profile_id is not None:
+        # Same group rule as update_scope (#2650).
+        _pxe = await db.get(DHCPPXEProfile, body.pxe_profile_id)
+        if _pxe is None or _pxe.group_id != group_id:
+            raise HTTPException(
+                status_code=422,
+                detail="PXE profile does not exist in this scope's server group",
+            )
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
+        pxe_profile_id=body.pxe_profile_id,
         name=(body.name or "").strip(),
         description=(body.description or "").strip(),
         is_active=is_active,
@@ -776,6 +788,7 @@ async def create_scope(
         ra_prefix_autonomous=body.ra_prefix_autonomous,
         ra_interface=body.ra_interface,
         relay_addresses=body.relay_addresses,
+        tags=body.tags,
     )
     db.add(scope)
     # The pre-check above can't see a soft-deleted scope, and even for
@@ -966,6 +979,15 @@ async def update_scope(
     # detaches one profile and binds another) still wins.
     if changes.pop("clear_pxe_profile", False):
         scope.pxe_profile_id = None
+    if changes.get("pxe_profile_id") is not None:
+        # #2650 — profiles are group-scoped; binding one from another group
+        # would render that group's boot server into this group's agents.
+        _pxe = await db.get(DHCPPXEProfile, changes["pxe_profile_id"])
+        if _pxe is None or _pxe.group_id != scope.group_id:
+            raise HTTPException(
+                status_code=422,
+                detail="PXE profile does not exist in this scope's server group",
+            )
     if "relay_addresses" in changes:
         # Family must match the scope's (subnet-derived) address_family;
         # address_family itself is immutable on update (#337).

@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -310,8 +311,13 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
                   colSpan={6}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
-                  No Emergency Response Locations yet. A voice subnet with no
-                  ERL carries no dispatchable location on a 911 call.
+                  <ListEmpty
+                    error={query.error}
+                    what="Emergency Response Locations"
+                  >
+                    No Emergency Response Locations yet. A voice subnet with no
+                    ERL carries no dispatchable location on a 911 call.
+                  </ListEmpty>
                 </td>
               </tr>
             )}
@@ -918,8 +924,10 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
                   colSpan={5}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
-                  No bindings yet — every lookup will answer{" "}
-                  <code>confidence: none</code>.
+                  <ListEmpty error={query.error} what="location bindings">
+                    No bindings yet — every lookup will answer{" "}
+                    <code>confidence: none</code>.
+                  </ListEmpty>
                 </td>
               </tr>
             )}

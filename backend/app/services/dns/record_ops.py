@@ -21,10 +21,28 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, event, func, or_, select, tuple_, update
+from sqlalchemy import (
+    Select,
+    Text,
+    and_,
+    any_,
+    cast,
+    event,
+    func,
+    literal,
+    literal_column,
+    null,
+    or_,
+    select,
+    tuple_,
+    union_all,
+    update,
+)
 from sqlalchemy import delete as sa_delete
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.util import await_only
 
@@ -34,6 +52,7 @@ from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMembe
 from app.models.audit import AuditLog
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
 from app.models.ipam import IPAddress
+from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
@@ -63,8 +82,9 @@ OP_RETRY_MAX_SECONDS = 15 * 60
 # next heartbeat (~30 s) and keeps an unsent ack across failed heartbeats, so
 # five minutes is several missed heartbeats, not a slow one.
 IN_FLIGHT_ACK_TIMEOUT = timedelta(minutes=5)
-# Keys per ``IN`` list when matching RRsets in SQL: three bind parameters a
-# key, well under asyncpg's 32767.
+# Keys per statement when matching RRsets in SQL (``candidates_with_keys``). The
+# keys ride as three array parameters (#2289), so this no longer bounds a
+# bind-parameter count; it only bounds what one statement carries.
 RRSET_KEY_CHUNK = 3000
 
 
@@ -100,11 +120,130 @@ def _op_type_sql() -> Any:
     return func.upper(DNSRecordOp.record["type"].astext)
 
 
+def _keys_in(cols: tuple[Any, Any, Any], keys: Collection[tuple[str, str, str]]) -> Any:
+    """``cols`` is one of ``keys``, with the keys as three array parameters.
+
+    Never a row ``IN`` list (#2289): Postgres cannot turn ``(a, b, c) IN
+    ((..), ..)`` into an array comparison, so a 3,000-key list was a
+    9,000-comparison OR-of-ANDs, costed over ``jit_above_cost`` and
+    JIT-compiled in the backend and every parallel worker — 1.3-1.5 GB and
+    seconds to minutes per process, which OOM-killed the primary under seven
+    polling agents. Unnested, the statement is the same size whatever the key
+    count and the planner joins against the keys. Same rows: no key component
+    is ever NULL (``op_rrset_key``)."""
+    keys = list(keys)
+    wanted = (
+        func.unnest(
+            literal([k[0] for k in keys], ARRAY(Text)),
+            literal([k[1] for k in keys], ARRAY(Text)),
+            literal([k[2] for k in keys], ARRAY(Text)),
+        )
+        .table_valued("zone_name", "name", "type")
+        .render_derived()
+    )
+    return tuple_(*cols).in_(select(wanted.c.zone_name, wanted.c.name, wanted.c.type))
+
+
 def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
     """WHERE clause matching ops whose RRset is one of ``keys``."""
     return and_(
         DNSRecordOp.record.has_key("rrset"),
-        tuple_(DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()).in_(list(keys)),
+        _keys_in((DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()), keys),
+    )
+
+
+def _rrset_candidates(*where: Any) -> Select[Any]:
+    """The ops matching ``where`` as ``(id, zone_name, name, type)`` rows, for
+    ``candidates_with_keys``. Only ops that carry an RRset have a key."""
+    return select(
+        DNSRecordOp.id.label("id"),
+        DNSRecordOp.zone_name.label("zone_name"),
+        _op_name_sql().label("name"),
+        _op_type_sql().label("type"),
+    ).where(*where, DNSRecordOp.record.has_key("rrset"))
+
+
+def candidates_with_keys(candidates: Select[Any], keys: Collection[tuple[str, str, str]]) -> Any:
+    """WHERE clause matching the ops among ``candidates`` (``_rrset_candidates``)
+    whose RRset key is one of ``keys`` — by grouping, never by a join.
+
+    The candidates and the keys go into one ``UNION ALL`` (a key as a row
+    with a NULL ``id``), grouped by RRset key; a group keeps its ids only
+    when a key row is in it. A ``GROUP BY`` is a hash or a sort, linear in
+    the rows either way, so no plan can compare every candidate with every
+    key (#2289). A join could, and did: with statistics taken while the
+    queue was idle, the GENERIC plan a prepared statement switches to after
+    five executions (asyncpg prepares every statement) estimated one
+    candidate and the unnested keys at 10 rows, and ran a nested-loop semi
+    join that rescanned the keys once per candidate — 7.5-10.9 s for 5,000
+    waiting ops and 3,000 keys, against 35 ms for the custom plan.
+
+    The ids come back as ONE array, matched with ``= ANY(..)``: computed
+    once (an InitPlan) and probed through the primary key whatever the
+    estimates, where a semi join on a high estimate could hash the matches
+    and read the whole table to probe them. ``coalesce`` keeps it an array
+    value (bare, ``ANY (SELECT ..)`` is the row-by-row subquery form) and
+    gives an empty array when nothing matches. The keys ride as three array
+    parameters, so the statement is the same size for any key count; no key
+    component is ever NULL (``op_rrset_key``), so the NULL ``id`` cannot be
+    confused with a candidate.
+    """
+    keys = list(keys)
+    wanted = (
+        func.unnest(
+            literal([k[0] for k in keys], ARRAY(Text)),
+            literal([k[1] for k in keys], ARRAY(Text)),
+            literal([k[2] for k in keys], ARRAY(Text)),
+        )
+        .table_valued("zone_name", "name", "type")
+        .render_derived()
+    )
+    c = candidates.subquery("candidates")
+    rows = union_all(
+        select(c.c.id, cast(c.c.zone_name, Text).label("zone_name"), c.c.name, c.c.type),
+        select(
+            cast(null(), PG_UUID(as_uuid=True)).label("id"),
+            wanted.c.zone_name,
+            wanted.c.name,
+            wanted.c.type,
+        ),
+    ).subquery("rrset_rows")
+    matched = (
+        select(func.unnest(func.array_agg(rows.c.id).filter(rows.c.id.is_not(None))).label("id"))
+        .group_by(rows.c.zone_name, rows.c.name, rows.c.type)
+        .having(func.bool_or(rows.c.id.is_(None)))
+        .subquery("matched")
+    )
+    return DNSRecordOp.id == any_(
+        func.coalesce(
+            select(func.array_agg(matched.c.id)).scalar_subquery(),
+            literal_column("'{}'::uuid[]"),
+        )
+    )
+
+
+def backed_off_match_where(
+    server_id: uuid.UUID, now: datetime, keys: Collection[tuple[str, str, str]]
+) -> Any:
+    """WHERE clause matching ``server_id``'s ops still backing off at ``now``
+    (``pending``, ``next_attempt_at`` later) whose RRset is one of ``keys``.
+
+    The candidates are only the ops actually waiting — none, usually — read
+    through the partial ``ix_dns_record_op_server_backoff``, and the keys are
+    matched against that set (``candidates_with_keys``), so the cost follows
+    the page and those ops, never the server's whole backlog or the size of
+    a zone (#2289).
+    """
+    return candidates_with_keys(
+        _rrset_candidates(
+            DNSRecordOp.server_id == server_id,
+            # A literal, not a bind parameter: the partial index's predicate
+            # is ``state = 'pending'``, and a generic plan cannot prove that
+            # from ``state = $1``, so it would read every op of the server.
+            DNSRecordOp.state == literal_column("'pending'"),
+            DNSRecordOp.next_attempt_at > now,
+        ),
+        keys,
     )
 
 
@@ -156,12 +295,16 @@ async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uu
                         DNSRecordOp.created_at,
                         DNSRecordOp.seq,
                     ).where(
-                        DNSRecordOp.server_id == server_id,
-                        # ``>=``: an op of the earliest op's own transaction
-                        # can follow it (#1489).
-                        DNSRecordOp.created_at >= earliest,
-                        DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
-                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                        candidates_with_keys(
+                            _rrset_candidates(
+                                DNSRecordOp.server_id == server_id,
+                                # ``>=``: an op of the earliest op's own
+                                # transaction can follow it (#1489).
+                                DNSRecordOp.created_at >= earliest,
+                                DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
+                            ),
+                            keys[i : i + RRSET_KEY_CHUNK],
+                        )
                     )
                 )
             ).all()
@@ -441,14 +584,145 @@ async def sweep_zone_ops(db: AsyncSession, zone: DNSZone, group_id: uuid.UUID) -
     return int(res.rowcount or 0)
 
 
+async def primary_candidate(
+    db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID | None = None
+) -> DNSServer | None:
+    """The server a group that has no primary should treat as one (#2276).
+
+    Read-only: picks, never writes. The one ordering every election uses —
+    :func:`app.services.dns.server_move.elect_primary` (a move or a delete
+    taking the primary out), the beat self-heal, and the write path below
+    when a group has no primary at all — so all three name the same server.
+
+    Prefers a server that can actually accept writes: enabled, not paused,
+    oldest first so the choice is deterministic. Falls back to any member when
+    every one is disabled or paused, because a paused primary still beats none:
+    a disabled one is visible in the UI, a missing one is not.
+    ``exclude_id`` names a server still in the group in this session that is
+    on its way out (see ``elect_primary``).
+    """
+    conditions = [DNSServer.group_id == group_id]
+    if exclude_id is not None:
+        conditions.append(DNSServer.id != exclude_id)
+    base = select(DNSServer).where(*conditions).order_by(DNSServer.created_at, DNSServer.id)
+    candidate = (
+        await db.execute(
+            base.where(
+                DNSServer.is_enabled.is_(True),
+                DNSServer.maintenance_mode.is_(False),
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if candidate is None:
+        candidate = (await db.execute(base.limit(1))).scalar_one_or_none()
+    return candidate
+
+
 async def resolve_primary_server(db: AsyncSession, zone: DNSZone) -> DNSServer | None:
-    """Find the `is_primary=True` server in the zone's group."""
+    """The server that stands for the zone's group on the write path.
+
+    The ``is_primary=True`` server when the group has one. When it has none —
+    the group's primary was deleted on a build that did not re-elect, or the
+    flag was cleared some other way — the server the election would pick
+    (:func:`primary_candidate`) rather than ``None`` (#2276). ``None`` used to
+    make every record write to the group's zones a logged no-op behind a 200,
+    and it did so BEFORE the agent fan-out, so the surviving agents got
+    nothing either. The beat self-heal stamps the flag on that same server
+    within a minute; until then this keeps writes flowing to it.
+
+    ``None`` now means the group has no servers at all, where nothing is lost:
+    a server added later receives the zone's records in its config bundle.
+    """
     res = await db.execute(
         select(DNSServer)
         .where(DNSServer.group_id == zone.group_id, DNSServer.is_primary.is_(True))
         .limit(1)
     )
-    return res.scalar_one_or_none()
+    primary = res.scalar_one_or_none()
+    if primary is not None:
+        return primary
+    candidate = await primary_candidate(db, zone.group_id)
+    if candidate is not None:
+        logger.warning(
+            "dns_group_has_no_primary",
+            zone=zone.name,
+            group_id=str(zone.group_id),
+            standing_in=str(candidate.id),
+            driver=candidate.driver,
+            hint="Writing through the server the election picks; the beat self-heal marks it.",
+        )
+    return candidate
+
+
+async def heal_primaryless_groups(
+    db: AsyncSession, healed_groups: list[uuid.UUID] | None = None
+) -> int:
+    """Mark a primary in every group that has servers and no primary (#2276).
+
+    Self-heal for installs left without one — by deleting the primary on a
+    build that did not re-elect. Run from the 60 s agent stale sweep.
+    Idempotent: a group that has a primary is untouched. The UPDATE re-checks
+    "no primary in this group" in the same statement, which closes the gap
+    between the scan and the write and makes two concurrent sweeps converge
+    on one server (the pick is deterministic). It does NOT serialise against
+    an operator promotion that is still uncommitted — READ COMMITTED cannot
+    see it, and the promotion takes no group lock — so that narrow window can
+    still leave two primaries, exactly as two concurrent promotions or a
+    promotion racing create-time auto-election always could. Every primary
+    lookup caps at one row, so that state mis-picks rather than 500s (#934),
+    and only a group already without a primary is ever touched, which after
+    this fix means one left over from an older build. Returns the number of
+    groups healed; when ``healed_groups`` is given, their ids are appended so
+    the caller can wake the group channels after its commit.
+
+    ``is_primary`` is a bundle input and the UPDATE is Core, which the
+    bundle-dirty listener never sees, so each healed group is marked dirty
+    here (#2655) — otherwise the stored bundle stays "current" and, e.g., a
+    catalog-zone group keeps serving a bundle with no producer.
+    """
+    primaried = select(DNSServer.group_id).where(DNSServer.is_primary.is_(True))
+    group_ids = (
+        (
+            await db.execute(
+                select(DNSServer.group_id).where(DNSServer.group_id.not_in(primaried)).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    healed = 0
+    for group_id in group_ids:
+        candidate = await primary_candidate(db, group_id)
+        if candidate is None:
+            continue
+        other = aliased(DNSServer)
+        res = await db.execute(
+            update(DNSServer)
+            .where(
+                DNSServer.id == candidate.id,
+                ~select(other.id)
+                .where(other.group_id == group_id, other.is_primary.is_(True))
+                .exists(),
+            )
+            .values(is_primary=True)
+            .execution_options(synchronize_session=False)
+        )
+        if res.rowcount:
+            healed += 1
+            if healed_groups is not None:
+                healed_groups.append(group_id)
+            await mark_bundles_dirty(db, group_ids=[group_id])
+            collect_wake(dns_group_channel(group_id))
+            logger.warning(
+                "dns_group_primary_healed",
+                group_id=str(group_id),
+                server_id=str(candidate.id),
+                server=candidate.name,
+            )
+    # The marks above shift the stored bundle; the 12 s tick alone would NOT
+    # pick the flag up (it only re-checks ``is_current``). Record writes reach
+    # the stand-in through ``resolve_primary_server`` in the meantime.
+    return healed
 
 
 def rrset_from_payload(record: dict[str, Any]) -> RRsetData | None:
@@ -1359,28 +1633,26 @@ async def enqueue_record_op(
       secondaries' on-disk zone files stayed frozen at the bundle
       they received on initial register.
 
-    Returns the op for the primary server (or ``None`` if no primary
-    + agent-based path didn't run either). Callers that need to ack
+    Returns the op for the primary server (or ``None`` when nothing was
+    queued: an empty group, or every eligible server disabled). A group with
+    servers but no ``is_primary`` flag writes through the server the election
+    would pick (#2276), never drops. Callers that need to ack
     every server's apply outcome should query ``DNSRecordOp`` directly
     by ``server_id``; the singular return preserves the prior
     contract for the typed-event audit path.
     """
     primary = await resolve_primary_server(db, zone)
     if primary is None:
-        # Silent drop was a footgun: frontend got a 200, nothing landed. Log
-        # it loudly so the symptom shows up in `docker compose logs -f api`
-        # and in the audit log via the caller.
-        logger.warning(
-            "record_op_dropped_no_primary",
+        # The group has no servers at all (a group with servers but no
+        # primary resolves to the election's stand-in, #2276). Nothing is
+        # lost: a server added later gets the zone's records in its bundle.
+        logger.info(
+            "record_op_skipped_empty_group",
             zone=zone.name,
             group_id=str(zone.group_id),
             op=op,
             name=record.get("name"),
             type=record.get("type"),
-            hint=(
-                "No DNS server in this zone's group has is_primary=True. "
-                "Edit the server in DNS → Server Groups and mark one as primary."
-            ),
         )
         return None
 
@@ -1645,8 +1917,9 @@ async def enqueue_record_ops_batch(
 
     primary = await resolve_primary_server(db, zone)
     if primary is None:
-        logger.warning(
-            "record_op_batch_dropped_no_primary",
+        # Empty group — see enqueue_record_op (#2276).
+        logger.info(
+            "record_op_batch_skipped_empty_group",
             zone=zone.name,
             group_id=str(zone.group_id),
             count=len(ops),
@@ -1696,12 +1969,13 @@ async def enqueue_record_ops_bulk(
 
     primary = await resolve_primary_server(db, zone)
     if primary is None:
-        logger.warning(
+        # Empty group — see enqueue_record_op (#2276).
+        logger.info(
             "record_op_bulk_dropped",
             zone=zone.name,
             group_id=str(zone.group_id),
             count=len(ops),
-            reason="no primary configured for zone",
+            reason="the zone's group has no servers",
         )
         return 0
 

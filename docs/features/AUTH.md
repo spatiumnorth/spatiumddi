@@ -42,6 +42,58 @@ SpatiumDDI's auth stack has three layers:
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
+### Sign-in throttles
+
+`POST /auth/login` checks three budgets, all kept in Redis, before it looks
+at the password. Each refusal is a `429` with the same message, so a refusal
+says nothing about whether the account exists.
+
+| Budget | Limit | Keyed by |
+|---|---|---|
+| Per source | 30 attempts / 60 s (`_LOGIN_RL_MAX` in `app/core/auth_throttle.py`). Shared with `/auth/login/mfa` and the approvals break-glass | The client address: an IPv4 address as itself, an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as its IPv4 address, any other IPv6 address as its **/64**. A single host is routinely handed a whole /64, so counting each /128 separately gave it a fresh budget per address |
+| Per username | 20 failed passwords / 15 min (`LOGIN_FAIL_MAX_PER_USERNAME`) | The submitted name, lower-cased, **whether or not an account has it** |
+| Install-wide | 500 failed passwords / 15 min (`LOGIN_FAIL_MAX_GLOBAL`) | Nothing: one counter for the install |
+
+The per-username and install-wide budgets count failures only. The attempt
+is spent before the password is checked, so concurrent guesses cannot all
+read an under-budget count, and a right password gives it back. A name
+already over its own budget is not charged to the install-wide one, so
+hammering a single name cannot spend everyone's budget on its own. A
+refusal answers `Retry-After` with the seconds left in the window that
+refused it, and writes a `login` / `failure` audit row with reason
+`login_throttled` and no `user_id`. Set either variable to `0` to turn
+that budget off.
+
+These budgets fail **open**: with Redis unreachable every attempt is
+allowed, and account lockout plus the second factor are the bounds that
+remain. Account lockout (`lockout_threshold`, Settings → Account Lockout) is a
+separate, per-account setting kept on the user row, and is off by default.
+
+**The trade-off: these ceilings are a bounded denial of service.** Anyone
+who can reach the sign-in page can spend them on purpose.
+
+- Twenty wrong passwords for a name refuse that name's sign-ins, the right
+  password included, for up to 15 minutes. Nothing else is affected.
+- Spreading 500 wrong passwords over enough names and addresses refuses
+  **every** password sign-in on the install for up to 15 minutes, a
+  superadmin's included.
+
+What it buys is a bound on password guessing that no number of source
+addresses or invented names escapes. Without it, guessing spread across
+many /64s and many names was limited only by how many addresses the
+guesser held. The denial is bounded: it ends when the window does, it
+does not touch existing sessions, API tokens, or OIDC / SAML sign-in, and
+it locks no account. An install that would rather not carry it raises
+`LOGIN_FAIL_MAX_GLOBAL` or sets it to `0`. To end a refusal early, delete
+the counter in Redis: `login_fail:global`, or `login_fail:user:` followed
+by the first 32 hex characters of the SHA-256 of the lower-cased name.
+
+The source address is the one `TrustedProxyMiddleware` resolves (#1221):
+`X-Real-IP` when the TCP peer is in `TRUSTED_PROXY_CIDRS`, otherwise the
+peer itself. Behind your own reverse proxy, set
+`FRONTEND_TRUSTED_PROXY_CIDRS` ([REVERSE_PROXY.md](../deployment/REVERSE_PROXY.md)),
+or every client is counted as the proxy and shares one per-source budget.
+
 ## TOTP MFA (issue #69)
 
 Local-user 2FA stacks on top of the password flow. As of #408, TOTP
@@ -570,12 +622,18 @@ rejected with `422` rather than silently locking the operator out:
 
 - `read` — restricts the token to safe-method requests
   (`GET` / `HEAD` / `OPTIONS`); any mutation `401`s.
-- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans*`,
-  `/vrfs*`, `/network-devices*`.
-- `dns:write` — allows mutations under `/api/v1/dns/*`, `/dns-pools*`.
+- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
+  `/vrfs/*`, `/network-devices/*`.
+- `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,
+  groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
+  (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
+  that writes there needs an empty scope set, with RBAC as the gate.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
 - `agent` — allows only the agent push surface
   (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+Prefixes match on a whole path segment, so `/api/v1/dns` covers
+`/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
 
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still
@@ -735,6 +793,14 @@ invalid JWT to avoid confirming token existence to an attacker.
 - Revoke softly via `PATCH /api/v1/api-tokens/{id}` with
   `{is_active: false}` — the row stays so `last_used_at` is still
   visible for incident forensics.
+- Re-enable an inactive token with `{is_active: true}`: superadmin only,
+  with the operator step-up (`stepup_password` / `stepup_totp_code`). An
+  owner who needs access back creates a new token. A non-superadmin gets
+  `403` and the refusal is audited (`reenable_requires_superadmin`).
+- Change `scopes` with the same `PATCH`. Narrowing (dropping a scope, or
+  restricting an unrestricted token) needs nothing more; widening (adding
+  a scope, or sending `[]` so the token is unrestricted) needs the step-up.
+  Renaming and revoking need neither.
 - Delete hard via `DELETE /api/v1/api-tokens/{id}` — same outward
   behaviour (401 on next use), audit row written on both paths.
 

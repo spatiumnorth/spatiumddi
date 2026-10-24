@@ -18,13 +18,15 @@ from sqlalchemy.orm import selectinload
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
+from app.core.safe_fetch import FetchRefusedError, describe_fetch_error, safe_get_text
 from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
 from app.services.dns_blocklist import parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
+from app.services.forward_secrets import redact, secret_url_in_flight, url_display
 from app.tasks.module_gate import module_gated
 
-# If an agent hasn't heartbeat'd in this long, we fall back to an active probe.
+# If an agent hasn't heartbeat'd in this long, the server is unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
 # Timeout for a SOA probe against the server.
 DNS_PROBE_TIMEOUT = 3.0
@@ -75,11 +77,37 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 await db.commit()
                 return {"status": "error", "added": 0, "removed": 0}
 
+            # The feed URL is operator-typed and fetched by the control
+            # plane, so it goes through the guarded fetch: http/https only,
+            # loopback / link-local / metadata refused before the request
+            # AND at connect time, every redirect hop re-checked.
+            #
+            # What lands in ``last_sync_error`` is readable by every
+            # dns_blocklist reader, so it is a fixed description of the
+            # failure — never the exception text, which can carry the
+            # resolved address, a response body, or the URL itself with its
+            # credentials. The detail goes to the server log, with the URL
+            # reduced to scheme + host. The transient error re-raised below
+            # for Celery's retry is safe_fetch's FetchFailedError, whose
+            # message carries no URL: Celery writes it into its own retry /
+            # failure log lines and the result backend.
+            shown_url = url_display(bl.feed_url)
             try:
-                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                    resp = await client.get(bl.feed_url)
-                    resp.raise_for_status()
-                    text = resp.text
+                with secret_url_in_flight(bl.feed_url):
+                    text = await safe_get_text(bl.feed_url, label="dns_blocklist_feed", timeout=60)
+            except FetchRefusedError as e:
+                # Permanent — the same URL gets the same answer; no retry.
+                bl.last_sync_status = "error"
+                bl.last_sync_error = f"Fetch refused: {e}"
+                bl.last_synced_at = datetime.now(UTC)
+                await db.commit()
+                logger.warning(
+                    "blocklist_feed_fetch_refused",
+                    list_id=list_id,
+                    feed=shown_url,
+                    reason=str(e),
+                )
+                return {"status": "error", "added": 0, "removed": 0}
             except (httpx.HTTPError, socket.gaierror) as e:
                 # Transient — write the per-row error state then re-raise
                 # so Celery's ``autoretry_for`` (configured on the task
@@ -87,23 +115,31 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 # broad ``except`` swallowed every exception and the
                 # task's ``max_retries=3`` was decorative.
                 bl.last_sync_status = "error"
-                bl.last_sync_error = f"Fetch failed: {e}"
+                bl.last_sync_error = f"Fetch failed: {describe_fetch_error(e)}"
                 bl.last_synced_at = datetime.now(UTC)
                 await db.commit()
                 logger.warning(
                     "blocklist_feed_fetch_failed",
                     list_id=list_id,
-                    error=str(e),
+                    feed=shown_url,
+                    error_type=type(e).__name__,
+                    error=redact(str(e), bl.feed_url),
                 )
                 raise
             except Exception as e:  # noqa: BLE001
                 # Permanent (parse error, unexpected shape) — same DB
                 # shape but don't bubble; retrying won't help.
                 bl.last_sync_status = "error"
-                bl.last_sync_error = f"Fetch failed: {e}"
+                bl.last_sync_error = "Fetch failed: unexpected error (see server log)"
                 bl.last_synced_at = datetime.now(UTC)
                 await db.commit()
-                logger.exception("blocklist_feed_fetch_failed", list_id=list_id, error=str(e))
+                logger.warning(
+                    "blocklist_feed_fetch_failed",
+                    list_id=list_id,
+                    feed=shown_url,
+                    error_type=type(e).__name__,
+                    error=redact(str(e), bl.feed_url),
+                )
                 return {"status": "error", "added": 0, "removed": 0}
 
             parsed = parse_feed_detailed(text, bl.feed_format)
@@ -345,7 +381,8 @@ AGENT_STALE_AFTER_SECONDS = 90  # 3× heartbeat interval per DNS_AGENT.md §4
 
 
 async def _dns_agent_stale_sweep_async() -> dict[str, int]:
-    """Mark agents stale when no heartbeat seen for AGENT_STALE_AFTER_SECONDS.
+    """Mark agents stale when no heartbeat seen for AGENT_STALE_AFTER_SECONDS,
+    and re-elect a primary in any group left without one (#2276).
 
     Idempotent — only flips status for servers whose status is currently
     'active' but whose last_seen_at is beyond the threshold.
@@ -367,7 +404,7 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
             if not await is_module_enabled(db, "core.dns"):
                 # Typed dict[str, int] — a "status" string would not type
                 # check, and zero marked is the honest count anyway.
-                return {"marked_unreachable": 0}
+                return {"marked_unreachable": 0, "primaries_healed": 0}
             cutoff = datetime.now(UTC) - timedelta(seconds=AGENT_STALE_AFTER_SECONDS)
             # Issue #182: paused servers are deliberately offline —
             # don't trip the heartbeat-stale state transition for them.
@@ -385,10 +422,21 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
                 .returning(DNSServer.id)
             )
             changed = len(res.all())
+            # #2276 — self-heal a group left with servers and no primary (its
+            # primary deleted on a build that did not re-elect). Idempotent;
+            # rides this 60 s sweep rather than a beat entry of its own.
+            from app.services.dns.record_ops import heal_primaryless_groups
+
+            healed_groups: list = []
+            healed = await heal_primaryless_groups(db, healed_groups)
             await db.commit()
+            if healed_groups:
+                from app.core.agent_wake import dns_group_channel, publish_wake
+
+                await publish_wake(*(dns_group_channel(g) for g in healed_groups))
             if changed:
                 logger.info("dns_agent_stale_sweep", marked_unreachable=changed)
-            return {"marked_unreachable": changed}
+            return {"marked_unreachable": changed, "primaries_healed": healed}
     finally:
         await engine.dispose()
 
@@ -494,6 +542,18 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 await db.commit()
                 return
 
+            # Issue #182 — a paused (maintenance) server is intentionally
+            # offline: leave its status alone, as the DHCP health task does.
+            if server.maintenance_mode:
+                server.last_health_check_at = now
+                await db.commit()
+                logger.info(
+                    "dns_health_skipped_maintenance",
+                    server_id=str(server_id),
+                    host=server.host,
+                )
+                return
+
             new_status: str
             health_detail: str | None = None
 
@@ -521,17 +581,22 @@ async def _check_health(server_id: uuid.UUID) -> None:
                         error=str(exc),
                     )
             else:
-                # Agent-based: trust a fresh heartbeat; otherwise SOA probe.
-                last_seen = server.last_health_check_at
-                if (
-                    last_seen is not None
-                    and (now - last_seen) <= AGENT_STALE_AFTER
-                    and server.status == "active"
-                ):
-                    new_status = "active"
-                else:
+                # Agent-based (#2314): judge freshness by ``last_seen_at``,
+                # which only the agent's heartbeat writes. The task's own
+                # ``last_health_check_at`` stamp must never count as a
+                # heartbeat, or an active server renews its own freshness
+                # forever. A stale agent stays ``unreachable`` even when
+                # named still answers SOA (a wedged agent is not healthy);
+                # the SOA probe is only the fallback for a server whose agent
+                # has never reported in.
+                last_seen = server.last_seen_at
+                if last_seen is None:
                     reachable = await _probe_server_soa(server.host, server.port)
                     new_status = "active" if reachable else "unreachable"
+                elif (now - last_seen) <= AGENT_STALE_AFTER:
+                    new_status = "active"
+                else:
+                    new_status = "unreachable"
 
             server.status = new_status
             server.last_health_check_at = now

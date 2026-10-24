@@ -448,6 +448,21 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=7, server_default=sa_text("7")
     )
 
+    # How many days of per-server DNS / DHCP metric samples the nightly
+    # ``prune_metrics`` sweep keeps (#2273). The InfluxDB push (#889) can
+    # only backfill what is still inside this window.
+    metric_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+
+    # How many hours of agent-shipped DNS query log and DHCP activity log
+    # rows the nightly ``prune_logs`` sweep keeps (#2273). Capped at 168 by
+    # the API: the prune is one unbatched DELETE, so a longer window grows
+    # that single transaction. #2185 lifts the cap with partition drops.
+    log_retention_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=24, server_default=sa_text("24")
+    )
+
     # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of
     # the device profiling feature). Fernet-encrypted at rest; null when the
     # operator hasn't configured a key. When unset, the agent still ships

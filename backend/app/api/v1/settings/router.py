@@ -28,7 +28,11 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
-from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.core.permissions import (
+    is_effective_superadmin,
+    refuse_and_audit,
+    user_has_permission,
+)
 from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
@@ -283,6 +287,15 @@ class SettingsResponse(BaseModel):
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
     ssh_lockdown: bool = False
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Read by the nightly prune tasks; every one is superadmin-only to
+    # change (not in ``SETTINGS_DELEGATE_WRITABLE``).
+    soft_delete_purge_days: int = 30
+    dhcp_lease_history_retention_days: int = 90
+    pcap_retention_days: int = 7
+    appliance_revoked_retention_days: int = 30
+    metric_retention_days: int = 7
+    log_retention_hours: int = 24
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -854,6 +867,58 @@ def _merge_apt_auth(
     return out
 
 
+# Fields a delegated ``write:settings`` holder may change through
+# ``PUT /settings``. Every other field is SUPERADMIN-ONLY, which is the
+# default: a field added to ``SettingsUpdate`` is superadmin-only until it is
+# listed here on purpose. These are IPAM / DNS / DHCP working preferences:
+# none changes authentication, what the login page shows, a URL the
+# platform hands to an identity provider, host configuration pushed to
+# appliances, or a connection the platform makes to anything off-prem. The
+# rest is either one of those or points clients and appliances at servers
+# (DHCP default DNS / NTP servers, resolvers), so it stays with superadmins,
+# matching the Settings page, which offers every field to superadmins only.
+# Integration switches are handled separately (only a real flip is gated),
+# and the two acknowledgement flags are not fields.
+SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
+    {
+        "ip_allocation_strategy",
+        "utilization_warn_threshold",
+        "utilization_critical_threshold",
+        "utilization_max_prefix_ipv4",
+        "utilization_max_prefix_ipv6",
+        "subnet_tree_default_expanded_depth",
+        "dns_default_ttl",
+        "dns_default_zone_type",
+        "dns_default_dnssec_validation",
+        "dns_recursive_by_default",
+        "dns_auto_sync_enabled",
+        "dns_auto_sync_interval_minutes",
+        "dns_auto_sync_delete_stale",
+        "dns_pull_from_server_enabled",
+        "dns_pull_from_server_interval_minutes",
+        "dhcp_pull_leases_enabled",
+        "dhcp_pull_leases_interval_seconds",
+        "dhcp_default_lease_time",
+        "dhcp_default_domain_name",
+        "dhcp_default_domain_search",
+        "vrf_strict_rd_validation",
+    }
+)
+
+
+# Data-retention windows (#2273), each read by a nightly prune task. All are
+# superadmin-only (none is in ``SETTINGS_DELEGATE_WRITABLE``): shortening one
+# deletes data on the next sweep.
+RETENTION_FIELDS: tuple[str, ...] = (
+    "soft_delete_purge_days",
+    "dhcp_lease_history_retention_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
+    "metric_retention_days",
+    "log_retention_hours",
+)
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -1018,6 +1083,19 @@ class SettingsUpdate(BaseModel):
     # smaller tick — an operator may have sent that one for another reason.
     ssh_lockdown_force: bool | None = None
     acknowledge_console_only: bool | None = None
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Superadmin-only. 0 turns the trash purge, lease-history prune and
+    # revoked-appliance hard-delete off (keep forever), as each task
+    # already reads it. pcap / metric / log windows have no "off": a
+    # capture holds plaintext credentials, and the other two are
+    # high-volume tables. ``log_retention_hours`` is capped at 168 until
+    # #2185 replaces the single unbatched DELETE with partition drops.
+    soft_delete_purge_days: int | None = Field(default=None, ge=0, le=365)
+    dhcp_lease_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    pcap_retention_days: int | None = Field(default=None, ge=1, le=90)
+    appliance_revoked_retention_days: int | None = Field(default=None, ge=0, le=365)
+    metric_retention_days: int | None = Field(default=None, ge=1, le=365)
+    log_retention_hours: int | None = Field(default=None, ge=1, le=168)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -1434,11 +1512,13 @@ class SettingsUpdate(BaseModel):
     @classmethod
     def validate_password_min_length(cls, v: int | None) -> int | None:
         # Floor at 6 even when operators relax the policy — anything
-        # shorter is a configuration mistake. Cap at 128 because bcrypt
-        # truncates inputs above 72 bytes; values past that are dead
-        # length the operator might assume is being checked.
-        if v is not None and not (6 <= v <= 128):
-            raise ValueError("Min password length must be between 6 and 128")
+        # shorter is a configuration mistake. Cap at 72: every path that
+        # sets a password refuses one over 72 bytes (bcrypt's limit, see
+        # password_policy.MAX_PASSWORD_BYTES), so a minimum above 72 would
+        # be a policy nobody can meet and would lock every password change
+        # out (#2619).
+        if v is not None and not (6 <= v <= 72):
+            raise ValueError("Min password length must be between 6 and 72")
         return v
 
     @field_validator("password_history_count")
@@ -1871,26 +1951,6 @@ async def update_settings(
     changes.pop("ssh_lockdown_force", None)
     changes.pop("acknowledge_console_only", None)
 
-    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
-    # model_validator already rejects override + explicitly-empty servers in
-    # the same request; this also catches the case it can't see — override
-    # selected (or already on) while the RESULTING server list is empty (e.g.
-    # servers omitted and the stored list is empty too). Override routes all
-    # host DNS to the global ``DNS=`` list, so an empty list means zero working
-    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
-    if "resolver_mode" in changes or "resolver_servers" in changes:
-        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
-        _resolver_resulting_servers = (
-            changes["resolver_servers"]
-            if "resolver_servers" in changes
-            else list(settings.resolver_servers or [])
-        )
-        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="resolver override mode requires at least one DNS server",
-            )
-
     # Branding is SUPERADMIN-ONLY (issues #885 / #887). These fields render
     # on the unauthenticated login page, so a delegated ``write:settings``
     # editor could otherwise put arbitrary text in front of every visitor —
@@ -1953,6 +2013,47 @@ async def update_settings(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Integrations can only be switched on or off by a superadmin",
+            )
+
+    # Everything else outside SETTINGS_DELEGATE_WRITABLE is superadmin-only
+    # too. The checks above keep their own wording; this one covers the rest
+    # (app_base_url, authentication and password policy, appliance host
+    # configuration, outbound connections, ...). Runs before anything is
+    # written, so a refused request changes nothing.
+    _superadmin_only = sorted(f for f in changes if f not in SETTINGS_DELEGATE_WRITABLE)
+    if _superadmin_only and not is_effective_superadmin(current_user):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="update",
+            resource_type="platform_settings",
+            resource_id="1",
+            resource_display="Platform Settings",
+            reason="superadmin_only_settings: " + ", ".join(_superadmin_only),
+            detail=(
+                "These settings can only be changed by a superadmin: " + ", ".join(_superadmin_only)
+            ),
+        )
+
+    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
+    # model_validator already rejects override + explicitly-empty servers in
+    # the same request; this also catches the case it can't see — override
+    # selected (or already on) while the RESULTING server list is empty (e.g.
+    # servers omitted and the stored list is empty too). Override routes all
+    # host DNS to the global ``DNS=`` list, so an empty list means zero working
+    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
+    if "resolver_mode" in changes or "resolver_servers" in changes:
+        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+        _resolver_resulting_servers = (
+            changes["resolver_servers"]
+            if "resolver_servers" in changes
+            else list(settings.resolver_servers or [])
+        )
+        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="resolver override mode requires at least one DNS server",
             )
 
     # Maintenance mode (issue #57). Capture the prior enabled state before
@@ -2298,6 +2399,15 @@ async def update_settings(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
                 ) from exc
 
+    # #2273 — remember the retention windows this request changes, for the
+    # dedicated audit row below (shortening one deletes data on the next
+    # nightly prune, so old and new values are both recorded).
+    _retention_old = {
+        f: getattr(settings, f)
+        for f in RETENTION_FIELDS
+        if f in changes and getattr(settings, f) != changes[f]
+    }
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2413,6 +2523,26 @@ async def update_settings(
                     "dnssec": settings.resolver_dnssec,
                     "dns_over_tls": settings.resolver_dns_over_tls,
                 },
+            )
+        )
+
+    # #2273 — dedicated audit row for a data-retention change (non-negotiable
+    # #4; the ``logger.info`` below is not an ``audit_log`` row). Only real
+    # changes are recorded, so echoing the form back writes nothing.
+    if _retention_old:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="retention",
+                resource_display="Data retention",
+                result="success",
+                changed_fields=sorted(_retention_old),
+                old_value=_retention_old,
+                new_value={f: getattr(settings, f) for f in _retention_old},
             )
         )
 
@@ -2637,8 +2767,9 @@ async def update_resolver_settings(
 ) -> ResolverSettingsResponse:
     """Scoped write of just the appliance DNS-resolver config (issue #158).
 
-    Same guardrails as the combined PUT: demo-mode block, ``write`` on
-    ``settings`` permission gate, a dedicated audit row (``resource_id=
+    Same guardrails as the combined PUT: demo-mode block, superadmin only
+    (the resolver_* fields are superadmin-only there too — they set the
+    appliance hosts' own DNS), a dedicated audit row (``resource_id=
     'resolver'``), and a HOSTCONFIG_ALL wake so parked supervisor / DHCP-agent
     long-polls pick the change up. Only the resolver_* columns are touched.
     """
@@ -2647,6 +2778,11 @@ async def update_resolver_settings(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'write' on 'settings'",
+        )
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The appliance DNS resolver can only be changed by a superadmin",
         )
 
     settings = await _get_or_create(db)

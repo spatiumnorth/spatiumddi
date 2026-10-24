@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -167,8 +168,20 @@ export function DICOMPage() {
                 DICOM application entities
               </h1>
               <span className="text-xs text-muted-foreground">
-                {total} AE{total === 1 ? "" : "s"} · {peers.length} association
-                {peers.length === 1 ? "" : "s"}
+                {aesQ.error ? (
+                  <ListReadError
+                    error={aesQ.error}
+                    what="DICOM application entities"
+                  />
+                ) : (
+                  `${total} AE${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {peersQ.error ? (
+                  <ListReadError error={peersQ.error} what="associations" />
+                ) : (
+                  `${peers.length} association${peers.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -288,9 +301,16 @@ export function DICOMPage() {
           <div className="rounded-lg border">
             {aes.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {aesQ.isLoading
-                  ? "Loading application entities…"
-                  : "No DICOM application entities recorded."}
+                {aesQ.isLoading ? (
+                  "Loading application entities…"
+                ) : (
+                  <ListEmpty
+                    error={aesQ.error}
+                    what="DICOM application entities"
+                  >
+                    No DICOM application entities recorded.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">

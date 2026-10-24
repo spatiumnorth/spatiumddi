@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 from sqlalchemy import String, asc, desc, func, or_, select, text
 from sqlalchemy import cast as sa_cast
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -75,6 +76,11 @@ from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
+from app.services.dns.ddns import (
+    EffectiveDDNS,
+    resolve_effective_ddns,
+    resolve_effective_ddns_for_block,
+)
 from app.services.dns.sync_check import (
     address_own_forward_zone_id,
     forward_zone_ids_in_order,
@@ -128,11 +134,11 @@ DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_do
 # `/subnets/{id}/orphans/purge`) → `delete` too. Endpoints under /ipam manipulate IPAM resources, so we
 # accept any of the IPAM resource types (an "IPAM Editor" role grants all
 # four; a scoped Subnet-writer role would be matched here for subnet routes
-# and fail for space routes — which is intended). ``address_set`` is included
-# so the "Address Set Editor" role (admin on address_set only, #103) clears
-# this coarse gate and reaches the per-IP delegation gate
-# (``_user_can_write_ip``), which enforces the real per-row boundary. Per-row
-# scoping happens inline in the handlers via `user_has_permission`.
+# and fail for space routes — which is intended). ``address_set`` is admitted
+# separately, on ``_ADDRESS_SET_ROUTES`` only, so the "Address Set Editor" role
+# (admin on address_set only, #103) reaches the per-IP delegation gate
+# (``_user_can_write_ip``) and nothing else. Per-row scoping happens inline in
+# the handlers via `user_has_permission`.
 _IPAM_GATE_TYPES = (
     "ip_space",
     "ip_block",
@@ -165,31 +171,52 @@ _SUBNET_INSTANCE_ROUTES = (
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
 )
 
-router = APIRouter(
-    dependencies=[
-        Depends(
-            require_any_resource_or_scoped(
-                # Unscoped types: a normal (type-level / wildcard) grant on any
-                # of these admits the request.
-                _IPAM_GATE_TYPES,
-                # Scoped-admit types (write/delete only): a delegate holding only
-                # an instance-scoped ``{write, address_set, <id>}`` grant clears
-                # this coarse gate and reaches the per-IP gate
-                # (``_user_can_write_ip``), which enforces the real range boundary
-                # (#103). require_any_resource_permission's unscoped check would
-                # 403 such a delegate before delegation ever runs.
-                ("address_set",),
-                # A grant scoped to ONE subnet (#2438) reaches that subnet's own
-                # routes, named here one by one: a route added later stays
-                # closed to it until it is listed. Left off on purpose: the DNS
-                # drift report (lists orphan records of other subnets sharing
-                # the zone), NAT by-subnet (a separate resource type), and
-                # every structural / bulk / DNS-sync / delete write.
-                instance_routes={"subnet_id": _SUBNET_INSTANCE_ROUTES},
-            )
-        )
-    ]
+# The mutating routes an address-set delegate may reach (#103). Each handler
+# here resolves the caller's writable set ranges (``_load_writable_set_ranges``)
+# and checks every address it touches with ``_user_can_write_ip``, which is the
+# real boundary of the delegation; the coarse gate ignores the grant's
+# ``resource_id``. Every other mutating IPAM route refuses such a delegate at
+# the gate, including routes added later, until they are listed here.
+# ``tests/test_ipam_address_set_route_allowlist.py`` fails when a listed route
+# stops doing the per-row check.
+_ADDRESS_SET_ROUTES = frozenset(
+    {
+        "POST /subnets/{subnet_id}/addresses",
+        "POST /subnets/{subnet_id}/next",
+        "POST /subnets/{subnet_id}/bulk-allocate/preview",
+        "POST /subnets/{subnet_id}/bulk-allocate",
+        "PUT /addresses/{address_id}",
+        "DELETE /addresses/{address_id}",
+        "POST /addresses/{address_id}/aliases",
+        "DELETE /addresses/{address_id}/aliases/{record_id}",
+        "POST /addresses/bulk-edit",
+        "POST /addresses/bulk-delete",
+        "POST /reports/stale-ips/deprecate",
+        "POST /import/addresses/preview",
+        "POST /import/addresses/commit",
+    }
 )
+
+_IPAM_GATE = require_any_resource_or_scoped(
+    # Unscoped types: a normal (type-level / wildcard) grant on any of these
+    # admits the request.
+    _IPAM_GATE_TYPES,
+    # Scoped admit (write/delete only): a delegate holding only an
+    # instance-scoped ``{write, address_set, <id>}`` grant clears this coarse
+    # gate on the routes listed in ``_ADDRESS_SET_ROUTES`` and reaches their
+    # per-IP gate (``_user_can_write_ip``), which enforces the real range
+    # boundary (#103). require_any_resource_permission's unscoped check would
+    # 403 such a delegate before delegation ever runs.
+    {"address_set": _ADDRESS_SET_ROUTES},
+    # A grant scoped to ONE subnet (#2438) reaches that subnet's own routes,
+    # named here one by one: a route added later stays closed to it until it
+    # is listed. Left off on purpose: the DNS drift report (lists orphan
+    # records of other subnets sharing the zone), NAT by-subnet (a separate
+    # resource type), and every structural / bulk / DNS-sync / delete write.
+    instance_routes={"subnet_id": _SUBNET_INSTANCE_ROUTES},
+)
+
+router = APIRouter(dependencies=[Depends(_IPAM_GATE)])
 
 
 def _require_type_write(
@@ -201,10 +228,10 @@ def _require_type_write(
     """Per-type inline gate for the structural IPAM handlers (space/block/subnet
     create, update, resize, split, merge, move, purge, DNS sync, delete). The
     router-level gate admits an any-of grant over the whole IPAM surface —
-    including peripheral types like ``nat_mapping`` and ``custom_field`` — and,
-    for mutating methods, ANY ``address_set`` grant with its ``resource_id``
-    ignored, so without this a ``write:nat_mapping`` grant or a set-scoped
-    delegate could mutate core structure it holds no permission on (#508).
+    including peripheral types like ``nat_mapping`` and ``custom_field`` — so
+    without this a ``write:nat_mapping`` grant could mutate core structure it
+    holds no permission on (#508). (An ``address_set`` grant no longer reaches
+    these routes at all: the gate admits it on ``_ADDRESS_SET_ROUTES`` only.)
     ``action`` is ``write`` (the default) or ``delete`` for the delete routes.
     Superadmin and wildcard grants pass via ``user_has_permission``."""
     if not user_has_permission(current_user, action, resource_type, resource_id):
@@ -549,6 +576,7 @@ async def _check_ip_collisions(
     role: str | None = None,
     subnet: Subnet | None = None,
     address: str | None = None,
+    space_id: uuid.UUID | None = None,
 ) -> list[dict[str, Any]]:
     """Return FQDN + MAC + PTR collision warnings for a pending IP assignment.
 
@@ -573,6 +601,11 @@ async def _check_ip_collisions(
       name from a *different* IP row (a manual PTR, or pre-existing
       cross-space data from before the #844 space guards), warn rather than
       silently stacking a second value onto the RRset.
+    - The MAC check is confined to the pending row's IP space (#2577):
+      spaces are independent networks, so the same MAC in another space is
+      not a collision. The space comes from ``space_id``, else ``subnet``,
+      else the row being updated (``exclude_ip_id``); with none of those
+      the check stays platform-wide.
     """
     warnings: list[dict[str, Any]] = []
 
@@ -601,11 +634,24 @@ async def _check_ip_collisions(
     mac_norm = _normalize_mac(mac_address)
     skip_mac_check = role in IP_ROLES_SHARED
     if mac_norm and mac_address is not None and not skip_mac_check:
+        mac_space_id = space_id
+        if mac_space_id is None and subnet is not None:
+            mac_space_id = subnet.space_id
+        if mac_space_id is None and exclude_ip_id is not None:
+            mac_space_id = (
+                await db.execute(
+                    select(Subnet.space_id)
+                    .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+                    .where(IPAddress.id == exclude_ip_id)
+                )
+            ).scalar_one_or_none()
         q = (
             select(IPAddress, Subnet.network)
             .join(Subnet, Subnet.id == IPAddress.subnet_id)
             .where(IPAddress.mac_address == mac_address)
         )
+        if mac_space_id is not None:
+            q = q.where(Subnet.space_id == mac_space_id)
         if exclude_ip_id is not None:
             q = q.where(IPAddress.id != exclude_ip_id)
         for ip, subnet_network in (await db.execute(q)).all():
@@ -1124,6 +1170,19 @@ async def _load_writable_set_ranges(
     """Resolve the caller's address-set-delegated writable ranges on this subnet
     (alias for :func:`app.services.ipam.address_set_gate.load_writable_set_ranges`)."""
     return await load_writable_set_ranges(db, user, subnet_id)
+
+
+async def _require_ip_writable(db: AsyncSession, user: Any, ip: IPAddress) -> None:
+    """403 unless ``user`` may write this one address: subnet-wide ``write``,
+    or an address set on its subnet whose range covers it (#103)."""
+    subnet_writable = user_has_permission(user, "write", "subnet", ip.subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, user, ip.subnet_id)
+    ip_int = int(ipaddress.ip_address(str(ip.address)))
+    if not _user_can_write_ip(user, ip_int, subnet_writable, set_ranges):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"No write permission on subnet or any address set covering {ip.address}",
+        )
 
 
 async def _writable_subnet_ids(db: AsyncSession, user: Any) -> set[uuid.UUID] | None:
@@ -1825,6 +1884,186 @@ async def _create_alias_records(
         db.add(rec)
         await db.flush()
         await _enqueue_dns_op(db, zone, "create", name, rtype, value, None)
+
+
+# #2604 — the namespace of the deletion batch an orphaned address's aliases
+# are withdrawn under. One batch id per address, derived rather than stored,
+# so the restore finds exactly the aliases the orphan withdrew (and not one
+# the operator trashed by hand) with no column to carry it.
+_ORPHAN_ALIAS_BATCH_NS = uuid.UUID("5b0f3c2e-8a41-4d6e-9f27-2604a11a5e00")
+
+
+def orphan_alias_batch_id(ip_id: uuid.UUID) -> uuid.UUID:
+    """The ``deletion_batch_id`` Mark as Orphan stamps on the address's aliases."""
+    return uuid.uuid5(_ORPHAN_ALIAS_BATCH_NS, str(ip_id))
+
+
+async def _withdraw_aliases_for_orphan(db: AsyncSession, user: Any, ip: IPAddress) -> int:
+    """Take the address's aliases out of DNS without losing them (#2604).
+
+    Mark as Orphan is reversible, so the aliases are soft-deleted under the
+    address's orphan batch (:func:`orphan_alias_batch_id`) instead of being
+    deleted with its host record: the served zone loses them now, and the
+    row's Restore brings them back (:func:`_aliases_to_restore`).
+    Must run BEFORE ``_sync_dns_record(action="delete")``, which would
+    otherwise delete them for good. Returns how many were withdrawn.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(
+                    DNSRecord.ip_address_id == ip.id,
+                    DNSRecord.auto_generated.is_(True),
+                    DNSRecord.ip_alias.is_(True),
+                )
+                .options(selectinload(DNSRecord.zone))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+    now = datetime.now(UTC)
+    batch_id = orphan_alias_batch_id(ip.id)
+    for rec in rows:
+        zone = rec.zone
+        if zone is not None and ipam_authors_zone(zone):
+            await _enqueue_dns_op(
+                db,
+                zone,
+                "delete",
+                rec.name,
+                rec.record_type,
+                rec.value,
+                rec.ttl,
+                record_id=rec.id,
+            )
+        rec.deleted_at = now
+        rec.deleted_by_user_id = user.id
+        rec.deletion_batch_id = batch_id
+        db.add(
+            _audit(
+                user,
+                "soft_delete",
+                "dns_record",
+                str(rec.id),
+                rec.fqdn,
+                old_value={"deletion_batch_id": str(batch_id), "alias_of": str(ip.id)},
+            )
+        )
+    await db.flush()
+    return len(rows)
+
+
+async def _aliases_to_restore(
+    db: AsyncSession, ip: IPAddress, subnet: Subnet
+) -> list[tuple[DNSZone, list[DNSRecord]]]:
+    """The aliases Mark as Orphan withdrew that a restore brings back (#2604).
+
+    Checked here, before anything is written, as a new alias would be
+    (``_assert_alias_cname_rules``): a record that took an alias's name
+    while the address was an orphan is a 409 naming it, not an alias
+    silently left behind. With no hostname there is nothing for a CNAME to
+    name, and an alias whose zone is gone (or no longer IPAM-authored) has
+    nowhere to go; those stay in the trash.
+    """
+    if not ip.hostname:
+        return []
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(
+                    DNSRecord.ip_address_id == ip.id,
+                    DNSRecord.ip_alias.is_(True),
+                    DNSRecord.deleted_at.is_not(None),
+                    DNSRecord.deletion_batch_id == orphan_alias_batch_id(ip.id),
+                )
+                .order_by(DNSRecord.created_at)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+    for rec in rows:
+        by_zone.setdefault(rec.zone_id, []).append(rec)
+    out: list[tuple[DNSZone, list[DNSRecord]]] = []
+    for zone_id, recs in by_zone.items():
+        zone = await db.get(DNSZone, zone_id)
+        if zone is None or zone.deleted_at is not None or not ipam_authors_zone(zone):
+            continue
+        await _assert_alias_cname_rules(
+            db,
+            subnet,
+            recs,
+            hostname=ip.hostname,
+            address=ip.address,
+            zone_id=zone_id,
+            own_ip_id=ip.id,
+        )
+        out.append((zone, recs))
+    return out
+
+
+async def _restore_aliases_after_orphan(
+    db: AsyncSession,
+    user: Any,
+    ip: IPAddress,
+    restore: list[tuple[DNSZone, list[DNSRecord]]],
+) -> None:
+    """Publish again the aliases :func:`_aliases_to_restore` cleared (#2604).
+
+    A CNAME is re-pointed at the address's current name, so a restore that
+    also renames the address does not publish a CNAME to the old one.
+    """
+    for zone, recs in restore:
+        zone_domain = zone.name.rstrip(".")
+        for rec in recs:
+            if rec.record_type == "CNAME":
+                rec.value = f"{ip.hostname}.{zone_domain}."
+            else:
+                rec.value = str(ip.address)
+            rec.deleted_at = None
+            rec.deleted_by_user_id = None
+            rec.deletion_batch_id = None
+            await db.flush()
+            await _enqueue_dns_op(db, zone, "create", rec.name, rec.record_type, rec.value, rec.ttl)
+            db.add(
+                _audit(
+                    user,
+                    "restore",
+                    "dns_record",
+                    str(rec.id),
+                    rec.fqdn,
+                    new_value={"value": rec.value, "alias_of": str(ip.id)},
+                )
+            )
+
+
+async def _purge_withdrawn_aliases(db: AsyncSession, ip_ids: list[uuid.UUID]) -> None:
+    """Delete for good the aliases these orphans withdrew (#2604).
+
+    Called where an address is deleted permanently: the aliases left DNS when
+    it became an orphan, and without the address there is nothing to restore
+    them to. Without this they would sit in the trash until its retention
+    purge, restorable as aliases of nothing.
+    """
+    if not ip_ids:
+        return
+    await db.execute(
+        sa_delete(DNSRecord)
+        .where(
+            DNSRecord.ip_address_id.in_(ip_ids),
+            DNSRecord.ip_alias.is_(True),
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.in_([orphan_alias_batch_id(i) for i in ip_ids]),
+        )
+        .execution_options(include_deleted=True, synchronize_session=False)
+    )
 
 
 def _invalidate_ip_dns_cache(rec: DNSRecord, ip: IPAddress | None) -> None:
@@ -3711,6 +3950,41 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class EffectiveDdnsResponse(BaseModel):
+    """What a subnet's DDNS resolves to, and where it comes from (#2475).
+
+    ``source`` is ``subnet`` (its own settings), ``block`` / ``space`` (the
+    ancestor it inherits from, named by ``source_id`` / ``source_name``) or
+    ``none``.
+    """
+
+    enabled: bool
+    hostname_policy: str
+    domain_override: str | None
+    ttl: int | None
+    source: str
+    source_id: str | None = None
+    source_name: str | None = None
+
+
+async def _effective_ddns_response(db: AsyncSession, eff: EffectiveDDNS) -> EffectiveDdnsResponse:
+    kind, _, ident = eff.source.partition(":")
+    name: str | None = None
+    if ident:
+        row = await db.get(IPBlock if kind == "block" else IPSpace, uuid.UUID(ident))
+        if row is not None:
+            name = (row.name or str(getattr(row, "network", ""))) if kind == "block" else row.name
+    return EffectiveDdnsResponse(
+        enabled=eff.enabled,
+        hostname_policy=eff.hostname_policy,
+        domain_override=eff.domain_override,
+        ttl=eff.ttl,
+        source=kind,
+        source_id=ident or None,
+        source_name=name,
+    )
+
+
 class EffectiveDhcpResponse(BaseModel):
     """Effective DHCP server-group resolution for a space/block/subnet.
 
@@ -5363,6 +5637,17 @@ async def get_effective_block_dns(
     )
 
 
+@router.get("/blocks/{block_id}/effective-ddns", response_model=EffectiveDdnsResponse)
+async def get_effective_block_ddns(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDdnsResponse:
+    """DDNS a subnet created in this block would inherit (#2475)."""
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+    return await _effective_ddns_response(db, await resolve_effective_ddns_for_block(db, block))
+
+
 @router.get(
     "/blocks/{block_id}/effective-dhcp",
     response_model=EffectiveDhcpResponse,
@@ -6569,6 +6854,17 @@ async def get_effective_subnet_dns(
     return EffectiveDnsResponse(
         dns_group_ids=[], dns_zone_id=None, dns_additional_zone_ids=[], inherited_from_block_id=None
     )
+
+
+@router.get("/subnets/{subnet_id}/effective-ddns", response_model=EffectiveDdnsResponse)
+async def get_effective_subnet_ddns(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDdnsResponse:
+    """Resolve effective DDNS for a subnet: its own, or its block chain / space (#2475)."""
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    return await _effective_ddns_response(db, await resolve_effective_ddns(db, subnet))
 
 
 @router.get(
@@ -7897,6 +8193,11 @@ class DnsSyncCommitResponse(BaseModel):
     updated: int
     deleted: int
     errors: list[str]
+    # #2577 — stale record IDs the request asked to delete that the scope's
+    # own drift report does not list (another subnet's or space's orphan, a
+    # record that is no longer stale, or one that does not exist). They are
+    # ignored, never deleted, and listed here so a client can tell.
+    skipped_stale_record_ids: list[uuid.UUID] = []
 
 
 class DnsSyncSummaryResponse(BaseModel):
@@ -7969,20 +8270,49 @@ async def dns_sync_preview(
     )
 
 
+def _stale_ids(report: Any) -> frozenset[uuid.UUID]:
+    """The record IDs a drift report lists as stale (#2577)."""
+    return frozenset(s.record_id for s in report.stale)
+
+
 async def _apply_dns_sync(
     db: AsyncSession,
     body: DnsSyncCommitRequest,
     *,
+    allowed_stale_ids: Iterable[uuid.UUID] = (),
     restrict_subnet_id: uuid.UUID | None = None,
+    skipped_stale_out: list[uuid.UUID] | None = None,
 ) -> tuple[int, int, int, list[str]]:
     """Apply create/update/delete actions, looking up each IP's owning subnet
     on the fly. ``restrict_subnet_id`` scopes the create/update set to a
     single subnet (used by the per-subnet endpoint); aggregate endpoints
-    leave it None."""
+    leave it None.
+
+    ``allowed_stale_ids`` is the stale set of the scope being synced, from
+    its own drift report computed server-side: a stale ID the client sends
+    is deleted only when that set also lists it (#2577). It defaults to
+    empty, so a caller that does not pass one deletes nothing (fail closed).
+    The client's list used to be trusted outright, so a commit could delete
+    any auto-generated record in the install — another subnet's, another
+    space's — by naming it. The rest are ignored rather than refused, so one
+    record that stopped being stale between preview and commit does not
+    fail the whole sync; they are appended to ``skipped_stale_out``."""
     created = 0
     updated = 0
     deleted = 0
     errors: list[str] = []
+
+    allowed = frozenset(allowed_stale_ids)
+    delete_ids = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid in allowed]
+    skipped = [rid for rid in dict.fromkeys(body.delete_stale_record_ids) if rid not in allowed]
+    if skipped:
+        logger.warning(
+            "dns_sync_stale_ids_outside_scope",
+            skipped=len(skipped),
+            restrict_subnet_id=str(restrict_subnet_id) if restrict_subnet_id else None,
+        )
+        if skipped_stale_out is not None:
+            skipped_stale_out.extend(skipped)
 
     ip_ids_to_sync: set[uuid.UUID] = set(body.create_for_ip_ids)
     skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
@@ -8080,7 +8410,7 @@ async def _apply_dns_sync(
             elif fip.id in ip_ids_to_sync:
                 updated = max(0, updated - 1)
 
-    if body.delete_stale_record_ids:
+    if delete_ids:
         from app.services.dns.record_ops import (  # noqa: PLC0415
             enqueue_record_ops_batch,
         )
@@ -8088,7 +8418,7 @@ async def _apply_dns_sync(
         stale_res = await db.execute(
             select(DNSRecord)
             .where(
-                DNSRecord.id.in_(body.delete_stale_record_ids),
+                DNSRecord.id.in_(delete_ids),
                 DNSRecord.auto_generated.is_(True),
             )
             .options(selectinload(DNSRecord.zone))
@@ -8233,10 +8563,20 @@ async def dns_sync_commit(
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
 
+    from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
+
+    # #2577 — the subnet's own stale set, recomputed here: only a record it
+    # lists may be deleted, whatever IDs the request names.
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(await compute_subnet_dns_drift(db, subnet_id))
+    skipped: list[uuid.UUID] = []
     created, updated, deleted, errors = await _apply_dns_sync(
         db,
         body,
+        allowed_stale_ids=allowed,
         restrict_subnet_id=subnet_id,
+        skipped_stale_out=skipped,
     )
 
     if created or updated or deleted:
@@ -8252,11 +8592,18 @@ async def dns_sync_commit(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 @router.get(
@@ -8300,7 +8647,21 @@ async def dns_sync_commit_block(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=404, detail="Block not found")
-    created, updated, deleted, errors = await _apply_dns_sync(db, body)
+    from app.services.dns.sync_check import compute_block_dns_drift  # noqa: PLC0415
+
+    # #2577 — deletable only what the block's own report lists (the same
+    # subnet scope the preview applied to this caller).
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(
+            await compute_block_dns_drift(
+                db, block_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+            )
+        )
+    skipped: list[uuid.UUID] = []
+    created, updated, deleted, errors = await _apply_dns_sync(
+        db, body, allowed_stale_ids=allowed, skipped_stale_out=skipped
+    )
     if created or updated or deleted:
         db.add(
             _audit(
@@ -8314,11 +8675,18 @@ async def dns_sync_commit_block(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 @router.get(
@@ -8361,7 +8729,20 @@ async def dns_sync_commit_space(
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
-    created, updated, deleted, errors = await _apply_dns_sync(db, body)
+    from app.services.dns.sync_check import compute_space_dns_drift  # noqa: PLC0415
+
+    # #2577 — deletable only what the space's own report lists.
+    allowed: frozenset[uuid.UUID] = frozenset()
+    if body.delete_stale_record_ids:
+        allowed = _stale_ids(
+            await compute_space_dns_drift(
+                db, space_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+            )
+        )
+    skipped: list[uuid.UUID] = []
+    created, updated, deleted, errors = await _apply_dns_sync(
+        db, body, allowed_stale_ids=allowed, skipped_stale_out=skipped
+    )
     if created or updated or deleted:
         db.add(
             _audit(
@@ -8375,11 +8756,18 @@ async def dns_sync_commit_space(
                     "updated": updated,
                     "deleted": deleted,
                     "errors": errors,
+                    "skipped_stale": len(skipped),
                 },
             )
         )
     await db.commit()
-    return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+    return DnsSyncCommitResponse(
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        errors=errors,
+        skipped_stale_record_ids=skipped,
+    )
 
 
 # ── Reverse-zone backfill ──────────────────────────────────────────────────────
@@ -9076,6 +9464,10 @@ async def get_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) 
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
+    # #2625 — the schema promises alias_count / nat_mapping_count / vendor on
+    # get as well as list; without this the single GET answered 0 for an
+    # address the subnet list counted an alias on.
+    await _enrich_addresses(db, [ip])
     return ip
 
 
@@ -9354,6 +9746,12 @@ async def update_address(
         and ip.hostname
         and ip.forward_zone_id is not None
     )
+    # #2604 — the aliases Mark as Orphan withdrew come back with the row.
+    # Checked before any record is written, so a name taken meanwhile is a
+    # 409 and nothing is half-restored.
+    aliases_back: list[tuple[DNSZone, list[DNSRecord]]] = []
+    if subnet and old_status == "orphan" and ip.status != "orphan":
+        aliases_back = await _aliases_to_restore(db, ip, subnet)
     # Issue #25 — re-sync when ``extra_zone_ids`` changes too. The
     # sync helper handles fanout + cleanup-on-shrink in one call so a
     # pure extras edit (no hostname / zone change) still triggers the
@@ -9408,6 +9806,8 @@ async def update_address(
         await _sync_dns_record(
             db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
         )
+    if aliases_back:
+        await _restore_aliases_after_orphan(db, current_user, ip, aliases_back)
 
     # #1628 — keep the DHCP reservation in step with the row: a MAC /
     # hostname change lands on the linked DHCPStaticAssignment, flipping
@@ -9495,6 +9895,9 @@ async def add_alias(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
+    # An alias is a DNS record on this address: the same per-address write
+    # check as editing the address itself (#103).
+    await _require_ip_writable(db, current_user, ip)
     subnet = await db.get(Subnet, ip.subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -9585,6 +9988,7 @@ async def delete_alias(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
+    await _require_ip_writable(db, current_user, ip)
     rec = await db.get(DNSRecord, record_id)
     if rec is None or rec.ip_address_id != ip.id:
         raise HTTPException(status_code=404, detail="Alias not found")
@@ -9842,6 +10246,7 @@ async def delete_address(
         # but we want a clean delete and fqdn cleared)
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
+        await _purge_withdrawn_aliases(db, [ip.id])
         db.add(
             _audit(
                 current_user,
@@ -9858,7 +10263,10 @@ async def delete_address(
         if subnet:
             await _update_block_utilization(db, subnet.block_id)
     else:
-        # Soft-delete: mark as orphan; remove DNS record since the name is being released
+        # Soft-delete: mark as orphan; remove DNS record since the name is being
+        # released. The aliases are withdrawn, not deleted, so the row's
+        # Restore brings them back (#2604).
+        await _withdraw_aliases_for_orphan(db, current_user, ip)
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
         old_status = ip.status
@@ -9932,6 +10340,8 @@ async def purge_orphans(
     _require_static_delete(current_user, lingering_statics, "This purge")
     await _remove_linked_statics(db, current_user, lingering_statics)
 
+    # The aliases these orphans withdrew go with them (#2604).
+    await _purge_withdrawn_aliases(db, [ip.id for ip in rows])
     for ip in rows:
         # Best-effort DNS teardown (the FK would null it, but be explicit).
         try:
@@ -10139,6 +10549,9 @@ class BulkAllocatePreviewResponse(BaseModel):
     conflicts_in_use: int
     conflicts_in_pool: int
     conflicts_fqdn: int
+    # Addresses the caller may not write (outside every address set it holds
+    # on this subnet, #103); the commit skips these as ``skipped_no_perm``.
+    conflicts_no_perm: int = 0
     sample: list[BulkAllocateItem]
     warnings: list[str]
 
@@ -10313,12 +10726,39 @@ async def bulk_allocate_preview(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    # The preview reports name collisions in the zone the body names, so it
+    # is held to the same zone rule as the commit.
+    await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
+
+    # Address-set write delegation (#103): the same per-address test the
+    # commit applies. A caller who can write nothing on this subnet is refused
+    # rather than shown its occupancy.
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+    if not subnet_writable and not set_ranges:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No write permission on subnet or any address set on it.",
+        )
+
+    def _no_perm(addr: str) -> bool:
+        try:
+            return not _user_can_write_ip(
+                current_user, int(ipaddress.ip_address(addr)), subnet_writable, set_ranges
+            )
+        except ValueError:
+            return True
 
     items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
     in_use = sum(1 for i in items if i.in_use)
     in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
     fqdn_coll = sum(1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision)
-    will_create = len(items) - in_use - in_pool - fqdn_coll
+    no_perm = sum(
+        1
+        for i in items
+        if not i.in_use and not i.in_dynamic_pool and not i.fqdn_collision and _no_perm(i.address)
+    )
+    will_create = len(items) - in_use - in_pool - fqdn_coll - no_perm
 
     sample = items if len(items) <= 7 else items[:5] + items[-2:]
 
@@ -10328,6 +10768,7 @@ async def bulk_allocate_preview(
         conflicts_in_use=in_use,
         conflicts_in_pool=in_pool,
         conflicts_fqdn=fqdn_coll,
+        conflicts_no_perm=no_perm,
         sample=sample,
         warnings=warnings,
     )
@@ -10665,6 +11106,7 @@ async def allocate_next_ip(
             forward_zone_id=effective_zone,
             mac_address=body.mac_address,
             role=body.role,
+            space_id=subnet.space_id,
         )
         if warnings:
             raise _collision_http_exc(warnings)
@@ -10867,6 +11309,24 @@ async def add_subnet_domain(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
 
+    # A token bound to specific zones may only bind one of them. The subnet's
+    # current effective zone does not whitelist a new one (``subnet=None``):
+    # once bound as primary, every address write in the subnet publishes into
+    # it. Zones the subnet is already bound to pass, so a re-bind is not
+    # refused here (it answers 409 below).
+    current_zone_ids = (
+        await db.execute(
+            select(SubnetDomain.dns_zone_id).where(SubnetDomain.subnet_id == subnet_id)
+        )
+    ).scalars()
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        None,
+        [body.dns_zone_id],
+        already=[*current_zone_ids, subnet.dns_zone_id],
+    )
+
     zone = await db.get(DNSZone, body.dns_zone_id)
     if zone is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS zone not found")
@@ -11019,6 +11479,12 @@ async def bulk_edit_subnets(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="subnet_ids must not be empty",
         )
+
+    # The subnets are named in the body, which the router-level token check
+    # does not read: a token bound to specific subnets edits only those, and
+    # the whole batch is refused before anything changes.
+    for sid in body.subnet_ids:
+        _enforce_subnet_token_scope(current_user, sid)
 
     batch_id = uuid.uuid4()
     updated = 0
@@ -11373,7 +11839,13 @@ async def bulk_delete_addresses(
     await _remove_linked_statics(db, current_user, list(removed_statics.values()))
 
     # Pass 2: tear down DNS and delete / orphan the rows.
+    if body.permanent:
+        # Aliases an orphan among them withdrew go with it (#2604).
+        await _purge_withdrawn_aliases(db, [ip.id for ip in to_delete])
     for ip in to_delete:
+        if not body.permanent:
+            # Withdrawn, not deleted, so the row's Restore brings them back (#2604).
+            await _withdraw_aliases_for_orphan(db, current_user, ip)
         subnet = await db.get(Subnet, ip.subnet_id)
         if subnet is not None:
             try:

@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from typing import Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.content_disposition import content_disposition
-from app.core.permissions import user_has_permission
+from app.core.permissions import (
+    token_scope_allows,
+    token_scoped_resource_ids,
+    user_has_permission,
+)
 from app.core.responses import PdfResponse
+from app.models.auth import User
 from app.services.ipam.address_set_gate import (
     load_writable_set_ranges,
     user_can_write_ip,
@@ -33,6 +40,42 @@ router = APIRouter()
 
 # Upload size guard: 25 MB is plenty for IPAM imports.
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _enforce_subnet_token_binding(user: Any, subnet_id: uuid.UUID) -> None:
+    """403 when an API token bound to specific subnets (#374) is not bound to
+    ``subnet_id``.
+
+    The router-level gate (``app.api.token_path_scope``) reads ids from the
+    path and the query string only. The address import names its subnet in a
+    form field, so the check has to be made here. Sessions and tokens without
+    resource grants pass.
+    """
+    if not token_scope_allows(user, "subnet", subnet_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this subnet",
+        )
+
+
+def _refuse_bound_token(user: Any, what: str) -> None:
+    """403 for an API token bound to specific subnets on a route whose answer
+    covers a whole space or block.
+
+    A whole-tree import diff, or an export of a block or space, describes every
+    subnet in it. A token bound to subnets has no grant on the container
+    (``ip_block`` / ``ip_space`` are not grantable), so it is refused rather
+    than handed the other subnets' rows; it exports its own subnets by
+    ``subnet_id``. Sessions, unbound tokens and wildcard ``subnet`` grants
+    pass.
+    """
+    if token_scoped_resource_ids(user, "subnet") is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"API token is bound to specific subnets; {what} needs a " "credential that is not"
+            ),
+        )
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -55,6 +98,7 @@ async def import_preview(
     strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
 ) -> dict:
     """Dry-run an import and return the would-create / would-update / conflict diff."""
+    _refuse_bound_token(current_user, "a whole-space import")
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_import(
@@ -86,6 +130,7 @@ async def import_commit(
     strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
 ) -> dict:
     """Commit the import in a single transaction. Writes audit entries per mutation."""
+    _refuse_bound_token(current_user, "a whole-space import")
     # The import creates / updates blocks and subnets, so the coarse router
     # gate (which also admits any address_set grant) is not enough.
     for rtype in ("ip_block", "subnet"):
@@ -128,6 +173,7 @@ async def import_preview_json(
     """
     from app.services.ipam_io.parser import ParsedPayload
 
+    _refuse_bound_token(current_user, "a whole-space import")
     raw = body.get("payload")
     if not isinstance(raw, dict):
         raise HTTPException(status_code=422, detail="Missing 'payload' object")
@@ -148,6 +194,37 @@ async def import_preview_json(
     return preview.as_dict()
 
 
+async def _address_import_write_gate(
+    db: AsyncSession, current_user: User, subnet_id: uuid.UUID
+) -> Callable[[str], bool] | None:
+    """Address-set write delegation (#103) for the address import.
+
+    Refuses the whole import if the caller holds neither subnet-wide write nor
+    any address set on this subnet. Returns ``None`` for a subnet-wide writer
+    (no per-row test needed), otherwise a per-IP closure so rows outside the
+    writable ranges are skipped and reported. The gate helpers are imported at
+    module level from the shared module (#12).
+    """
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await load_writable_set_ranges(db, current_user, subnet_id)
+    if not subnet_writable and not set_ranges:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No write permission on subnet or any address set on it.",
+        )
+    if subnet_writable:
+        return None
+
+    def _can_write(addr: str) -> bool:
+        try:
+            ip_int = int(ipaddress.ip_address(addr))
+        except ValueError:
+            return False
+        return user_can_write_ip(current_user, ip_int, subnet_writable, set_ranges)
+
+    return _can_write
+
+
 @router.post("/import/addresses/preview")
 async def import_addresses_preview(
     current_user: CurrentUser,
@@ -164,6 +241,11 @@ async def import_addresses_preview(
     ``custom_fields`` entries so migrations from other DDI tools don't
     need column renaming.
     """
+    _enforce_subnet_token_binding(current_user, subnet_id)
+    # The same write test as the commit (#103), so the preview neither runs
+    # against a subnet the caller cannot write nor shows existing rows outside
+    # the address sets it holds.
+    can_write = await _address_import_write_gate(db, current_user, subnet_id)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_address_import(
@@ -172,6 +254,7 @@ async def import_addresses_preview(
         subnet_id=subnet_id,
         strategy=strategy,
         current_user=current_user,
+        can_write_ip=can_write,
     )
     logger.info(
         "ipam_address_import_preview",
@@ -197,28 +280,10 @@ async def import_addresses_commit(
     audit trail it writes — a DNS-sync failure on a single row surfaces
     as a non-fatal error in the response, not a rolled-back import.
     """
+    _enforce_subnet_token_binding(current_user, subnet_id)
+    can_write = await _address_import_write_gate(db, current_user, subnet_id)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
-
-    # Address-set write delegation (#103): resolve the caller's writable
-    # ranges once and refuse the whole import if they hold neither subnet-wide
-    # write nor any address set on this subnet. Otherwise pass a per-IP gate
-    # closure so rows outside the writable ranges are skipped + reported. The
-    # gate helpers are imported at module level from the shared module (#12).
-    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
-    set_ranges = await load_writable_set_ranges(db, current_user, subnet_id)
-    if not subnet_writable and not set_ranges:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No write permission on subnet or any address set on it.",
-        )
-
-    def _can_write(addr: str) -> bool:
-        try:
-            ip_int = int(ipaddress.ip_address(addr))
-        except ValueError:
-            return False
-        return user_can_write_ip(current_user, ip_int, subnet_writable, set_ranges)
 
     result = await commit_address_import(
         db,
@@ -226,7 +291,7 @@ async def import_addresses_commit(
         current_user=current_user,
         subnet_id=subnet_id,
         strategy=strategy,
-        can_write_ip=None if subnet_writable else _can_write,
+        can_write_ip=can_write,
     )
     await db.commit()
     return result.as_dict()
@@ -265,6 +330,8 @@ async def export_pdf_endpoint(
     """
     from app.services.ipam_io.pdf import generate_ipam_pdf  # noqa: PLC0415
 
+    if space_id is not None or block_id is not None:
+        _refuse_bound_token(current_user, "a block or space report")
     data, filename = await generate_ipam_pdf(
         db,
         space_id=space_id,
@@ -297,7 +364,13 @@ async def export_endpoint(
     format: Literal["csv", "json", "xlsx"] = Query(default="csv"),
     include_addresses: bool = Query(default=False),
 ) -> Response:
-    """Export a subtree. Exactly one of space_id/block_id/subnet_id must be set."""
+    """Export a subtree. Exactly one of space_id/block_id/subnet_id must be set.
+
+    A token bound to specific subnets exports by ``subnet_id`` only: a block
+    or space export carries every subnet (and address) in it.
+    """
+    if space_id is not None or block_id is not None:
+        _refuse_bound_token(current_user, "a block or space export")
     data, content_type, filename = await export_subtree(
         db,
         space_id=space_id,

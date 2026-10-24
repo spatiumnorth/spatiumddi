@@ -82,6 +82,7 @@ from app.services.backup.rewrap import (
     RewrapOutcome,
     rewrap_secrets,
 )
+from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -128,6 +129,9 @@ class RestoreOutcome:
     # destination agent and produces *new* DS records the operator
     # must re-publish to the parent registrar.
     warnings: list[str] = field(default_factory=list)
+    # Backup targets whose ``in_progress`` claim came back inside the
+    # archive and was settled (#2097). Empty when none.
+    reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -909,7 +913,44 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    _prune_pre_restore_safety_dumps(keep=out_path)
     return str(out_path)
+
+
+def _prune_pre_restore_safety_dumps(*, keep: Path) -> None:
+    """Keep the newest ``PRE_RESTORE_KEEP_LAST_N`` safety dumps in
+    ``PRE_RESTORE_DIR`` and delete the rest.
+
+    Each dump holds the SECRET_KEY under a passphrase anyone can read in
+    this file, so old copies are not harmless clutter. A target's
+    retention already prunes them when a local-volume target points at
+    this directory; without one they used to accumulate. Runs only after
+    a new dump is written, never removes ``keep`` (the dump just taken),
+    and only touches regular files named like a safety dump. A failure to
+    delete is logged and does not fail the restore.
+    """
+    try:
+        dumps = [
+            p
+            for p in PRE_RESTORE_DIR.iterdir()
+            if p.name.startswith(PRE_RESTORE_PREFIX)
+            and p.name.endswith(".zip")
+            and not p.is_symlink()
+            and p.is_file()
+        ]
+        dumps.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError as exc:
+        logger.warning("pre_restore_safety_prune_failed", path=str(PRE_RESTORE_DIR), error=str(exc))
+        return
+    # The dump just written counts first whatever its mtime says, so a
+    # clock step cannot make the prune delete it.
+    ordered = [keep] + [p for p in dumps if p != keep]
+    for dump in ordered[max(PRE_RESTORE_KEEP_LAST_N, 1) :]:
+        try:
+            dump.unlink()
+            logger.info("pre_restore_safety_dump_pruned", path=str(dump))
+        except OSError as exc:
+            logger.warning("pre_restore_safety_prune_failed", path=str(dump), error=str(exc))
 
 
 async def _collect_post_restore_warnings(db_url: str) -> list[str]:
@@ -990,6 +1031,24 @@ _RESTORE_LOCK_HOLDERS_SQL = (
     f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
     "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
 )
+
+
+async def restore_lock_held(db) -> bool:
+    """True while a restore holds the install-wide restore lock (#2097).
+
+    A read of ``pg_locks``, not a ``pg_try_advisory_lock``: taking the lock,
+    even for an instant, would refuse a restore that started in that instant
+    as "already in progress". Nothing here blocks or changes state.
+
+    The lock is held from before the replay until after the restore has
+    settled the run claims its archive carried, so a caller that sees it
+    free has either run before the replay or after the settle — never in the
+    window between the replay's commit and the settle, where a restored
+    claim reads as two hours old with nothing behind it.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    return bool(await db.scalar(text(f"SELECT EXISTS ({_RESTORE_LOCK_HOLDERS_SQL})")))
 
 
 async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
@@ -1382,6 +1441,45 @@ async def _apply_backup_restore_inner(
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
 
+    # #2097 — the archive holds its own run's ``in_progress`` claim. Settle
+    # it now, or the target refuses Run now and sits off its schedule until
+    # the 2 h reap marks a run that succeeded as failed. Needs the
+    # backup-target table to have been restored.
+    reconciled: list[dict[str, Any]] = []
+    if restored_tables is None or "backup_target" in restored_tables:
+        try:
+            from sqlalchemy.ext.asyncio import (  # noqa: PLC0415
+                async_sessionmaker,
+                create_async_engine,
+            )
+            from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+            from app.db import _json_serializer, task_connect_args  # noqa: PLC0415
+            from app.services.backup.runner import (  # noqa: PLC0415
+                reconcile_restored_run_claims,
+            )
+
+            # The database the restore just wrote (``db_url``), as every
+            # other phase uses — not the app's pooled engine, which Phase 4
+            # disposed and which need not point at the same database.
+            reconcile_engine = create_async_engine(
+                db_url,
+                poolclass=NullPool,
+                json_serializer=_json_serializer,
+                connect_args=task_connect_args(),
+            )
+            try:
+                async with async_sessionmaker(reconcile_engine, expire_on_commit=False)() as rdb:
+                    reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+            finally:
+                await reconcile_engine.dispose()
+        except Exception as exc:  # noqa: BLE001 — the data is in; the 2 h reap still backstops
+            logger.warning("backup_restore_reconcile_failed", error=str(exc))
+            post_warnings.append(
+                "Could not settle backup targets left 'in progress' by the restored "
+                f"archive ({exc}); they free themselves after 2 hours."
+            )
+
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
@@ -1450,4 +1548,5 @@ async def _apply_backup_restore_inner(
         migration=migration_outcome,
         rewrap=rewrap_outcome,
         warnings=post_warnings,
+        reconciled_backup_targets=reconciled,
     )
