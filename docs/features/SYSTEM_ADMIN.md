@@ -344,7 +344,7 @@ Multiple syslog targets can be configured simultaneously (e.g., local Loki + rem
 - Retention period (default: 365 days)
 - Export audit log: date range → CSV or JSON download
 - Archive to S3-compatible storage (optional)
-- Audit log is append-only — no delete capability, even for superadmin
+- Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
 - Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
 
 ### 2.8 Statistics / Reporting
