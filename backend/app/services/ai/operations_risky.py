@@ -1200,6 +1200,26 @@ async def _apply_delete_group(
         released += await remove_ipam_for_scope_statics(db, sc.id)
         await delete_leases_for_scope(db, sc.id)
 
+    # One row per scope the group takes with it (#1957's convention, as the
+    # Trash purge writes for a subnet's scopes): the scope rows go by FK
+    # CASCADE, which runs no Python.
+    for sc in group_scopes:
+        write_audit(
+            db,
+            user=user,
+            action="delete",
+            resource_type="dhcp_scope",
+            resource_id=str(sc.id),
+            resource_display=sc.name,
+            old_value={
+                "name": sc.name,
+                "address_family": sc.address_family,
+                "subnet_id": str(sc.subnet_id),
+                "purged_with": "dhcp_server_group",
+                "group": g.name,
+            },
+        )
+
     write_audit(
         db,
         user=user,

@@ -3450,7 +3450,8 @@ function RecordModal({
 // ── Zone Detail View (records panel) ─────────────────────────────────────────
 
 /**
- * Per-server serial-drift pill. Three display states:
+ * Per-server serial-drift pill (#2316: a non-active server is never counted
+ * as in sync, a paused one is excluded and listed as "paused"). Display states:
  *  - All servers on the target serial → emerald "N/N synced · serial X"
  *  - Some servers behind / ahead      → amber "1/3 drift · target X"
  *  - No server has reported yet       → muted "— not reported"
@@ -3459,29 +3460,42 @@ function RecordModal({
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
 function ZoneSyncPill({ state }: { state: ZoneServerState }) {
-  const total = state.servers.length;
-  if (total === 0) return null;
-  const reported = state.servers.filter((s) => s.current_serial !== null);
+  if (state.servers.length === 0) return null;
+  // #2316 — a paused (maintenance) server is shown separately and left out
+  // of the count; a server that is not active is counted, but never as in
+  // sync, whatever serial it reported before it went away.
+  const paused = state.servers.filter((s) => s.freshness === "paused");
+  const down = state.servers.filter((s) => s.freshness === "unreachable");
+  const counted = state.servers.filter((s) => s.freshness !== "paused");
+  const total = counted.length;
+  const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
   // even when the serial it reported matches.
-  const inSync = state.servers.filter(
-    (s) => s.current_serial === state.target_serial && !s.pending_ops,
+  const inSync = counted.filter(
+    (s) =>
+      s.counted && s.current_serial === state.target_serial && !s.pending_ops,
   );
   const tooltip = state.servers
     .map((s) =>
-      s.current_serial === null
-        ? `${s.server_name}: not reported`
-        : `${s.server_name}: serial ${s.current_serial}` +
-          (s.current_serial !== state.target_serial ? " (drift)" : "") +
-          (s.pending_ops
-            ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
-            : ""),
+      s.freshness === "paused"
+        ? `${s.server_name}: paused (maintenance), not counted`
+        : s.freshness === "unreachable"
+          ? `${s.server_name}: ${s.server_status}, not counted as in sync`
+          : s.current_serial === null
+            ? `${s.server_name}: not reported`
+            : `${s.server_name}: serial ${s.current_serial}` +
+              (s.current_serial !== state.target_serial ? " (drift)" : "") +
+              (s.pending_ops
+                ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+                : ""),
     )
     .join("\n");
 
   let cls = "bg-muted/40 text-muted-foreground";
   let label = "not reported";
-  if (reported.length === 0) {
+  if (total === 0) {
+    label = `${paused.length} paused`;
+  } else if (reported.length === 0 && down.length === 0) {
     // noop — keep muted
   } else if (state.in_sync) {
     cls =
@@ -3491,7 +3505,9 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
     cls =
       "bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400";
     label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
+    if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
+  if (total > 0 && paused.length > 0) label += ` · ${paused.length} paused`;
   return (
     <span
       className={cn(
@@ -11118,6 +11134,13 @@ function GroupDetailView({
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const [syncing, setSyncing] = useState(false);
+  // Shares the cache the Servers tab fills; only the enabled count is read,
+  // for the in-flight line of the sync modal (#2426).
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dns-servers", group.id],
+    queryFn: () => dnsApi.listServers(group.id),
+  });
+  const enabledServerCount = groupServers.filter((s) => s.is_enabled).length;
   const [groupSyncResult, setGroupSyncResult] = useState<{
     result: DNSGroupSyncResult | null;
     error: string | null;
@@ -11307,6 +11330,8 @@ function GroupDetailView({
           group={group}
           result={groupSyncResult.result}
           error={groupSyncResult.error}
+          syncing={syncing}
+          serverCount={enabledServerCount}
           onClose={() => setGroupSyncResult(null)}
         />
       )}
@@ -11314,20 +11339,43 @@ function GroupDetailView({
   );
 }
 
-function SyncWithServersResultModal({
+export function SyncWithServersResultModal({
   group,
   result,
   error,
+  syncing = false,
+  serverCount = 0,
   onClose,
 }: {
   group: DNSServerGroup;
   result: DNSGroupSyncResult | null;
   error: string | null;
+  syncing?: boolean;
+  serverCount?: number;
   onClose: () => void;
 }) {
   return (
     <Modal title={`Sync result — ${group.name}`} onClose={onClose} wide>
       <div className="space-y-3 text-sm">
+        {!result && !error && syncing && (
+          <div
+            role="status"
+            className="flex items-start gap-2 text-sm text-muted-foreground"
+          >
+            <RefreshCw className="mt-0.5 h-4 w-4 flex-shrink-0 animate-spin" />
+            <div>
+              <p>
+                Syncing with {serverCount}{" "}
+                {serverCount === 1 ? "server" : "servers"}… a Windows server can
+                take a minute.
+              </p>
+              <p className="text-xs">
+                You can close this window; the sync keeps running and the result
+                reopens here when it finishes.
+              </p>
+            </div>
+          </div>
+        )}
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
