@@ -24,7 +24,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
@@ -967,6 +967,15 @@ async def update_scope(
     # detaches one profile and binds another) still wins.
     if changes.pop("clear_pxe_profile", False):
         scope.pxe_profile_id = None
+    if changes.get("pxe_profile_id") is not None:
+        # #2650 — profiles are group-scoped; binding one from another group
+        # would render that group's boot server into this group's agents.
+        _pxe = await db.get(DHCPPXEProfile, changes["pxe_profile_id"])
+        if _pxe is None or _pxe.group_id != scope.group_id:
+            raise HTTPException(
+                status_code=422,
+                detail="PXE profile does not exist in this scope's server group",
+            )
     if "relay_addresses" in changes:
         # Family must match the scope's (subnet-derived) address_family;
         # address_family itself is immutable on update (#337).
