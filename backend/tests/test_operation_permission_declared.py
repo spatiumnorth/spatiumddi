@@ -16,6 +16,7 @@ declare none.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import uuid
 
@@ -24,10 +25,6 @@ from fastapi import HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.main  # noqa: F401 — registers every operation module the app loads
-import app.services.ai.operations_control  # noqa: F401
-import app.services.ai.operations_risky  # noqa: F401
-import app.services.ai.operations_writes  # noqa: F401
 from app.api.v1.ai.proposals import apply_proposal
 from app.core.security import hash_password
 from app.models.ai import AIOperationProposal
@@ -36,6 +33,15 @@ from app.models.conformity import ConformityPolicy
 from app.models.multicast import MulticastDomain
 from app.services.ai import operations
 from app.services.ai.operations import all_operations, get_operation
+
+# Registers every operation module the app loads, so the registry is complete.
+for _module in (
+    "app.main",
+    "app.services.ai.operations_control",
+    "app.services.ai.operations_risky",
+    "app.services.ai.operations_writes",
+):
+    importlib.import_module(_module)
 
 # Operations that declare no gate on purpose. Each one must check
 # authorization inside its own apply; the reason says how.
