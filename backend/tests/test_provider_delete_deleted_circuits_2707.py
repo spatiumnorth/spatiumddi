@@ -35,7 +35,8 @@ async def test_deleted_circuit_no_longer_blocks(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     h, pid, cid = await _setup(client, db_session)
-    assert (await client.delete(f"/api/v1/circuits/{cid}", headers=h)).status_code == 204
+    gone = await client.delete(f"/api/v1/circuits/{cid}", headers=h)
+    assert gone.status_code == 204, gone.text
     r = await client.delete(f"/api/v1/providers/{pid}", headers=h)
     assert r.status_code == 204, r.text
 
