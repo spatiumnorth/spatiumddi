@@ -531,6 +531,9 @@ export interface DnsSyncCommitResult {
   updated: number;
   deleted: number;
   errors: string[];
+  // #2577 — stale record IDs sent for deletion that the scope's own drift
+  // report no longer lists. The server ignored them; none were deleted.
+  skipped_stale_record_ids?: string[];
 }
 
 export interface DnsSyncSummary {
@@ -1319,6 +1322,9 @@ export interface BulkAllocatePreviewResponse {
   conflicts_in_use: number;
   conflicts_in_pool: number;
   conflicts_fqdn: number;
+  // Addresses outside every address set the caller holds on this subnet;
+  // the commit skips them (or, with on_collision="abort", refuses).
+  conflicts_no_perm?: number;
   sample: BulkAllocateItem[];
   warnings: string[];
 }
@@ -5106,6 +5112,10 @@ export interface ZoneMovePreview {
    *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
    *  means the commit refuses — not waivable by acknowledgement. */
   forward_transport_refusal?: string | null;
+  /** #2263 — the zone's own allow_query / allow_transfer cannot be applied
+   *  by a Technitium server in the target. Non-null means the commit
+   *  refuses — not waivable by acknowledgement. */
+  technitium_acl_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5149,6 +5159,16 @@ export interface DNSServerGroup {
   scope_warnings?: string[];
   created_at: string;
   modified_at: string;
+}
+
+/** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
+ * the server echoes them (never the username or password). Seeds the edit
+ * dialog so an untouched save keeps what is stored. */
+export interface WinRMSettings {
+  winrm_port: number;
+  transport: string;
+  use_tls: boolean;
+  verify_tls: boolean;
 }
 
 export interface WindowsDNSCredentials {
@@ -5508,6 +5528,8 @@ export interface DNSServer {
    * the UI to show "Credentials set" / "Clear" and gate the Path B
    * affordances without exposing the password. */
   has_credentials: boolean;
+  /** Stored WinRM settings (windows_dns with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   /** True when the driver runs from the control plane (no agent). Used
    * by the UI to hide approval / agent-registration affordances. */
   is_agentless: boolean;
@@ -6413,8 +6435,18 @@ export const dnsApi = {
     api
       .put<DNSView>(`/dns/groups/${groupId}/views/${viewId}`, data)
       .then((r) => r.data),
-  deleteView: (groupId: string, viewId: string) =>
-    api.delete(`/dns/groups/${groupId}/views/${viewId}`),
+  // #2275 — refused (409) while the view still scopes zones or records;
+  // blocking lists scoped to it need the explicit acknowledgement.
+  deleteView: (
+    groupId: string,
+    viewId: string,
+    opts: { acknowledgeBlocklistDetach?: boolean } = {},
+  ) =>
+    api.delete(`/dns/groups/${groupId}/views/${viewId}`, {
+      params: opts.acknowledgeBlocklistDetach
+        ? { acknowledge_blocklist_detach: true }
+        : undefined,
+    }),
 
   // TLD registry (#986) — the IANA root-zone list behind zone name_scope.
   // Read by anyone who can read DNS; refresh is superadmin-only and is the
@@ -6787,6 +6819,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_errors: string[];
+        queued_for_agent?: boolean;
       }>(`/dns/groups/${groupId}/zones/${zoneId}/sync-with-server`, { apply })
       .then((r) => r.data),
   exportAllZones: (groupId: string, viewId?: string | null) =>
@@ -8503,6 +8536,8 @@ export interface DHCPServer {
   // seeds the checkbox from the stored value instead of resetting it (which
   // would silently re-disable verification). Null for non-cloud drivers.
   verify_tls?: boolean | null;
+  /** Stored WinRM settings (windows_dhcp with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   // Per-server maintenance mode (issue #182). When true the control
   // plane skips shipping pending DHCPConfigOp rows + suppresses the
   // heartbeat-stale alert; the UI renders an amber Maintenance chip.
@@ -10662,6 +10697,10 @@ export interface ApiTokenUpdate {
   description?: string;
   is_active?: boolean;
   scopes?: ApiTokenScope[];
+  /** Needed to re-enable an inactive token (superadmin only) or to widen
+   *  its scopes. Renaming, narrowing and revoking need neither. */
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 /**
@@ -11129,6 +11168,9 @@ export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
   recent_errors: IntegrationsDashboardErrorRow[];
+  // #2577 — rows a sync released outside its target's IP space; same shape,
+  // `error_detail` carries what was released. Absent from older servers.
+  recent_warnings?: IntegrationsDashboardErrorRow[];
 }
 
 // Security dashboard tab (#109)
@@ -16595,6 +16637,11 @@ export interface NmapScanRead {
   id: string;
   target_ip: string;
   ip_address_id: string | null;
+  /** IP space of the IPAM row the scan was launched from (#2577) — where
+   *  stamp-discovered writes when no space is named. Single-scan GET and the
+   *  scan list both carry it. */
+  ip_space_id?: string | null;
+  ip_space_name?: string | null;
   preset: NmapPreset;
   port_spec: string | null;
   extra_args: string | null;
@@ -16659,8 +16706,11 @@ export const nmapApi = {
    *  Existing rows in ``available`` / ``discovered`` get bumped to
    *  ``discovered``; integration / operator-owned rows get a
    *  ``last_seen`` stamp only. New rows land as ``discovered``.
+   *  ``spaceId`` picks the IP space; without it the scan's own IPAM row
+   *  space is used, and with neither, hosts that fall in subnets of more
+   *  than one space are skipped as ambiguous.
    *  Returns counters for the UI to render. */
-  stampDiscovered: (scanId: string) =>
+  stampDiscovered: (scanId: string, spaceId?: string) =>
     api
       .post<{
         created: number;
@@ -16668,7 +16718,19 @@ export const nmapApi = {
         refreshed: number;
         skipped_no_subnet: number;
         skipped_addresses: string[];
-      }>(`/nmap/scans/${scanId}/stamp-discovered`)
+        /** Hosts inside subnets of several IP spaces, skipped because no
+         *  space was chosen (#2577). */
+        skipped_ambiguous: string[];
+        /** The space hosts were stamped into and why (``requested`` /
+         *  ``scan_ip_row``); null when no single space applied (#2577). */
+        space_used: {
+          id: string;
+          name: string;
+          source: "requested" | "scan_ip_row";
+        } | null;
+      }>(`/nmap/scans/${scanId}/stamp-discovered`, null, {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
       .then((r) => r.data),
   // SECURITY (#400, M8): the SSE stream is consumed via `streamScan`
   // (fetch + ReadableStream) so the access token rides the

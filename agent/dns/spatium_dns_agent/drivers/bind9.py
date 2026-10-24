@@ -8,6 +8,8 @@ TSIG key carried in the config bundle.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import math
@@ -58,7 +60,7 @@ NAMED_CONF_SKELETON = """\
 {encrypted_listeners}    recursion {recursion};
 {allow_recursion}    allow-query {{ {allow_query}; }};
 {allow_query_cache}    {allow_transfer}
-    dnssec-validation {dnssec};
+{blackhole}    dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
 {max_cache_size}{query_log}{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
@@ -252,6 +254,55 @@ def _dedupe_key_names(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+#: A TSIG key secret as BIND reads it: one base64 string. Anything else in
+#: the quoted ``secret "…";`` — a quote, a brace, a semicolon, whitespace — is
+#: either a config BIND will not load or text outside the key statement.
+_TSIG_SECRET_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+#: Key names: the operator grammar (``[a-z0-9.-]``), the group key
+#: (``spatium-<label>``) and the per-view keys (``spatium_xfr_<view>``).
+_TSIG_NAME_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_TSIG_ALGO_SAFE_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+def _tsig_key_problem(k: dict[str, Any]) -> str | None:
+    """Why ``k`` cannot be written as a ``key {}`` stanza, or None.
+
+    The control plane validates secrets on write; a row stored before that
+    still reaches the bundle, and the key file is interpolated verbatim, so
+    the check is repeated here rather than trusted.
+    """
+    name = str(k.get("name") or "")
+    if not _TSIG_NAME_SAFE_RE.match(name):
+        return "name"
+    if not _TSIG_ALGO_SAFE_RE.match(str(k.get("algorithm") or "hmac-sha256")):
+        return "algorithm"
+    secret = str(k.get("secret") or "")
+    if len(secret) % 4 or not _TSIG_SECRET_RE.match(secret):
+        return "secret"
+    try:
+        if not base64.b64decode(secret, validate=True):
+            return "secret"
+    except (binascii.Error, ValueError):
+        return "secret"
+    return None
+
+
+def _renderable_tsig_keys(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The keys that can be written to a key file; the rest skipped and logged.
+
+    Filtered once, before any grant, include or ``allow-update`` names them,
+    so a skipped key is never referenced by the config either.
+    """
+    out: list[dict[str, Any]] = []
+    for k in keys:
+        problem = _tsig_key_problem(k)
+        if problem is not None:
+            log.warning("tsig_key_unrenderable_skipped", key=k.get("name"), field=problem)
+            continue
+        out.append(k)
+    return out
+
+
 def _transfer_key_grants(tsig_keys: list[dict[str, Any]]) -> list[str]:
     """``key "name";`` items for every TSIG key in the bundle (issue #734).
 
@@ -349,6 +400,23 @@ def _safe_conf_entries(entries: Any) -> list[str]:
     return out
 
 
+def _render_blackhole(opts: dict[str, Any]) -> str:
+    """The options-level ``blackhole { … };`` statement (#2263).
+
+    Accepted and validated as an address-match list since #1244, and never
+    shipped or rendered, so an operator blackholing an abusive client range
+    got a 200 and a server that kept answering it. BIND drops a matching
+    request before any other ACL is consulted and sends nothing back.
+
+    Empty (the default, and absent from the bundle) renders nothing, so a
+    group that does not use it keeps a byte-identical ``named.conf``.
+    """
+    entries = _safe_conf_entries(opts.get("blackhole"))
+    if not entries:
+        return ""
+    return f"    blackhole {{ {'; '.join(entries)}; }};\n"
+
+
 def _render_notify_block(opts: dict[str, Any]) -> str:
     """Server-level NOTIFY statements for the options block (#1523).
 
@@ -407,19 +475,29 @@ def _render_allow_transfer(
     settable in the UI and persisted, but nothing ever rendered them — the
     operator got a 200 and silence.
 
-    The key grants are unioned in unconditionally, INCLUDING when the ACL
-    says ``none``. That is deliberate: ``none`` is the default, so honouring
-    it literally would lock the control plane out of every zone on a stock
-    install and re-break drift the moment this shipped. ``none`` is dropped
-    from the rendered list when anything else is present — as an address
-    match it never matches, so it is pure noise.
+    The key grants come first and are unioned in unconditionally, INCLUDING
+    when the ACL says ``none``. That is deliberate: ``none`` is the default,
+    so honouring it literally would lock the control plane out of every zone
+    on a stock install and re-break drift the moment this shipped.
+
+    After the key grants the operator's entries are rendered in their own
+    order, ``none`` included. BIND compiles ``none`` as ``!any`` — an
+    element that matches every request and DENIES it, ending the list — so
+    ``["none", "10.0.0.0/8"]`` admits nobody but the key holders. Dropping
+    ``none`` from such a list would turn it into "admit 10/8", the opposite
+    of what it says, and disagree with the Technitium translation of the
+    same list. The control plane refuses a ``none`` mixed with other
+    entries on write; this keeps rows stored before that meaning what BIND
+    reads them as. A list that is nothing but ``none`` renders as the key
+    grants alone, which is the same answer.
+
+    Entries that could break out of the statement (``;``, braces, newlines)
+    are dropped, as for the other address-match lists.
     """
     items = list(key_grants)
-    for entry in acl or []:
-        token = str(entry).strip()
-        if not token or token.lower() == "none":
-            continue
-        items.append(f"{token};")
+    tokens = _safe_conf_entries(acl)
+    if any(t.lower() != "none" for t in tokens):
+        items += [f"{t};" for t in tokens]
     if not items:
         return "allow-transfer { none; }; "
     return f'allow-transfer {{ {" ".join(items)} }}; '
@@ -2060,7 +2138,7 @@ class Bind9Driver(DriverBase):
             if str(opts.get("forward_policy", "first")).lower() == "only":
                 fwd_block += "    forward only;\n"
 
-        tsig_keys = _dedupe_key_names(bundle.get("tsig_keys") or [])
+        tsig_keys = _dedupe_key_names(_renderable_tsig_keys(bundle.get("tsig_keys") or []))
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
         # Derived from ``state_dir``, not hardcoded (#920). AGENT_STATE_DIR is
         # an honoured override and every other path the config points at —
@@ -2087,7 +2165,15 @@ class Bind9Driver(DriverBase):
         # it: ddns.key's FIRST key is the loopback identity the record-op path
         # and the ingest worker sign with, and nothing here may ever displace
         # it. Defined at global scope, above every view that names them.
-        view_keys = _view_transfer_keys(views) if has_views else {}
+        view_keys = (
+            {
+                vname: k
+                for vname, k in _view_transfer_keys(views).items()
+                if _renderable_tsig_keys([k])
+            }
+            if has_views
+            else {}
+        )
         if view_keys:
             tsig_include += (
                 f'include "{self.state_dir / "tsig" / "view-transfer.key"}";\n'
@@ -2131,6 +2217,7 @@ class Bind9Driver(DriverBase):
             allow_query=allow_query,
             allow_query_cache=_render_allow_query_cache(opts, bundle.get("acls")),
             allow_transfer=allow_transfer_opt.rstrip(),
+            blackhole=_render_blackhole(opts),
             dnssec=dnssec,
             forwarders=fwd_block,
             notify_block=_render_notify_block(opts),
@@ -2455,10 +2542,12 @@ class Bind9Driver(DriverBase):
         tsig_dir.mkdir(parents=True, exist_ok=True)
         path = tsig_dir / filename
         tmp = path.with_name(path.name + ".new")
+        # Re-checked here so no caller can write an unvalidated stanza: a key
+        # that fails is left out of the file rather than written malformed.
         payload = "".join(
             f'key "{k["name"]}" {{ algorithm {k.get("algorithm", "hmac-sha256")}; '
             f'secret "{k["secret"]}"; }};\n'
-            for k in keys
+            for k in _renderable_tsig_keys(keys)
         )
         fd = os.open(
             str(tmp),

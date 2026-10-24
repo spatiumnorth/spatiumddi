@@ -74,6 +74,8 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
 | `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
 | `FRONTEND_TRUSTED_PROXY_CIDRS` | unset (trust no proxy) | Your own reverse proxy in front of the frontend: the frontend nginx keeps its `X-Forwarded-Proto` and takes the client address from its `X-Forwarded-For`. List only the proxy. See [`REVERSE_PROXY.md`](REVERSE_PROXY.md) |
+| `LOGIN_FAIL_MAX_PER_USERNAME` | `20` | Failed passwords per submitted username per 15 minutes before `/auth/login` answers `429` for that name. `0` turns it off. See [Sign-in throttles](../features/AUTH.md#sign-in-throttles) |
+| `LOGIN_FAIL_MAX_GLOBAL` | `500` | Failed passwords across the whole install per 15 minutes before every password sign-in answers `429` until the window ends. `0` turns it off. See [Sign-in throttles](../features/AUTH.md#sign-in-throttles) |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |

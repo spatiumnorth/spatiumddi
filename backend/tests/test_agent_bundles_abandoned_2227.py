@@ -109,7 +109,7 @@ _DOOMED_RENDER = r"""
 import asyncio, os, sys
 from app.tasks import agent_bundles
 
-async def _hang(server_id):
+async def _hang(server_id, *rest):
     await asyncio.sleep(300)
 
 agent_bundles._render_once = _hang
@@ -183,9 +183,9 @@ async def test_renders_killed_mid_flight_are_surfaced_held_and_retried_once(
     rendered: list[uuid.UUID] = []
     real = agent_bundles._render_once
 
-    async def _spy(server_id):  # noqa: ANN001
+    async def _spy(server_id, *rest):  # noqa: ANN001
         rendered.append(server_id)
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _spy)
 
