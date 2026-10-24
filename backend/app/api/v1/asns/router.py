@@ -22,7 +22,7 @@ from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import String, func, or_, select
 
 from app.api.deps import DB, CurrentUser
@@ -772,23 +772,26 @@ class BGPCommunityCreate(BaseModel):
     outbound_action: str = ""
     tags: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("value")
-    @classmethod
-    def _v_value(cls, v: str, info: Any) -> str:  # type: ignore[override]
-        v = v.strip()
+    # A model validator, not a ``value`` field validator: ``value`` is
+    # declared before ``kind``, so a field validator sees ``info.data``
+    # without the kind and judges every value as a regular community
+    # (#2624).
+    @model_validator(mode="after")
+    def _v_value(self) -> BGPCommunityCreate:
+        v = self.value.strip()
         if not v:
             raise ValueError("value is required")
-        kind = info.data.get("kind", "regular")
-        if kind == "standard":
+        if self.kind == "standard":
             if v not in _STANDARD_NAMES:
                 raise ValueError(f"standard community must be one of: {sorted(_STANDARD_NAMES)}")
-        elif kind == "regular":
+        elif self.kind == "regular":
             if not _REGULAR_COMMUNITY_RE.match(v):
                 raise ValueError("regular community must be ASN:N (e.g. 65000:100)")
-        elif kind == "large":
+        elif self.kind == "large":
             if not _LARGE_COMMUNITY_RE.match(v):
                 raise ValueError("large community must be ASN:N:M (e.g. 65000:100:200)")
-        return v
+        self.value = v
+        return self
 
 
 class BGPCommunityUpdate(BaseModel):
