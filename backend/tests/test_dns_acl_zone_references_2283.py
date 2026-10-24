@@ -115,3 +115,40 @@ async def test_bundle_keeps_a_defined_zone_acl(db_session):
     bundle = await build_config_bundle(db_session, loaded)
     (z,) = [z for z in bundle["zones"] if z["name"] == "example.test."]
     assert z["allow_query"] == ["partners"]
+
+
+@pytest.mark.asyncio
+async def test_stored_bundle_drops_dangling_zone_acl_too(db_session):
+    """The worker's streamed render (#2227) builds its zones apart from
+    ``zone_payload``, so the drop must reach them there as well: the stored
+    bytes must equal the whole render's, dangling citation and all."""
+    import gzip
+    import json
+
+    from app.models.settings import PlatformSettings
+    from app.services.dns import agent_bundle_store as store
+    from app.services.dns.agent_bundle_render import render_and_store
+    from app.services.dns.agent_config import render_bundle_body
+
+    db_session.add(PlatformSettings(id=1))
+    group, _ = await _setup(
+        db_session,
+        allow_query=["gone-acl"],
+        allow_transfer=["gone-acl", "192.0.2.0/24"],
+    )
+    server = DNSServer(group_id=group.id, name="s1", driver="bind9", host="127.0.0.1", port=53)
+    db_session.add(server)
+    await db_session.commit()
+
+    reference = await render_bundle_body(db_session, server)
+    outcome = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert outcome.bundle is not None
+    stored = await store.load_body(db_session, outcome.bundle)
+    assert stored is not None
+    body = gzip.decompress(stored)
+    assert body == store.encode_body(reference.body)
+    assert (outcome.etag, outcome.structural_etag) == (reference.etag, reference.structural_etag)
+    (z,) = [z for z in json.loads(body)["zones"] if z["name"] == "example.test."]
+    assert z["allow_query"] == ["none"]
+    assert z["allow_transfer"] == ["192.0.2.0/24"]

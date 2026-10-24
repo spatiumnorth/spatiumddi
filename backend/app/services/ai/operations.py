@@ -92,6 +92,15 @@ class Operation:
     # (e.g. archiving your own chat session) that gate on ownership
     # inside their own apply rather than on a coarse RBAC permission.
     required_permission: tuple[str, str] | None = None
+    # The gate for operations whose REST equivalent is superadmin-only
+    # (webhooks, DNSSEC sign/unsign, zone update ACL, SNMP/NTP/syslog
+    # settings, the importers, alert rules, temporary access, service
+    # restart). There is no RBAC permission to name for those, so instead of
+    # ``required_permission`` they set this, and ``enforce_operation_permission``
+    # refuses a non-superadmin at apply time. Their ``_apply_*`` still checks
+    # inline too. ``tests/test_operation_permission_declared.py`` fails for any
+    # operation that sets neither.
+    requires_superadmin: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,8 +158,8 @@ class OperationPermissionError(PermissionError):
     alert rows the equivalent REST route would 403.
     """
 
-    def __init__(self, action: str, resource_type: str) -> None:
-        super().__init__(f"Permission denied: need '{action}' on '{resource_type}'")
+    def __init__(self, action: str, resource_type: str, message: str | None = None) -> None:
+        super().__init__(message or f"Permission denied: need '{action}' on '{resource_type}'")
         self.action = action
         self.resource_type = resource_type
 
@@ -160,11 +169,22 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
 
     Called both by ``apply_proposal`` (the authoritative gate) and by
     each ``_apply_*`` (defense in depth, so the gate holds even if the
-    op is ever dispatched outside the apply endpoint). No-op when the
-    operation declares ``required_permission=None`` (self-scoped ops).
+    op is ever dispatched outside the apply endpoint). Refuses a
+    non-superadmin for ``requires_superadmin`` operations. No-op when the
+    operation declares neither gate (self-scoped ops such as
+    ``archive_session``, which check ownership inside their own apply).
     """
-    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        is_effective_superadmin,
+        user_has_permission,
+    )
 
+    if op.requires_superadmin and not is_effective_superadmin(user):
+        raise OperationPermissionError(
+            "superadmin",
+            op.name,
+            f"Permission denied: operation '{op.name}' is restricted to superadmin users",
+        )
     if op.required_permission is None:
         return
     action, resource_type = op.required_permission
@@ -1985,6 +2005,7 @@ async def _preview_create_dns_record(
         find_cname_conflict,
         is_apex,
     )
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2012,6 +2033,10 @@ async def _preview_create_dns_record(
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} not found.")
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
+    # #2653 — the REST create's refusal; the reconciler would revert the row.
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        return PreviewResult(ok=False, detail=synth_err)
 
     name = args.name.strip()
     if not name:
@@ -2091,6 +2116,7 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2107,6 +2133,13 @@ async def _apply_create_dns_record(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         raise ValueError(f"Zone {args.zone_id} not found.")
+    # #2653 — a zone trashed (or taken over by an integration) between
+    # propose and apply must not receive records.
+    if getattr(zone, "deleted_at", None) is not None:
+        raise ValueError(f"Zone {args.zone_id} is deleted.")
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        raise ValueError(synth_err)
 
     name = args.name.strip()
     fqdn = (
@@ -2529,7 +2562,7 @@ async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
     from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
-    from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
     if not name:
@@ -2575,17 +2608,11 @@ async def _preview_create_dns_zone(
         if refusal is not None:
             return PreviewResult(ok=False, detail=refusal)
 
-    existing = (
-        await db.execute(
-            select(DNSZone).where(
-                DNSZone.group_id == grp.id,
-                DNSZone.view_id.is_(None),
-                DNSZone.name == name,
-                DNSZone.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
             detail=f"A zone named {name!r} already exists in group {grp.name!r}.",
@@ -2619,6 +2646,7 @@ async def _apply_create_dns_zone(
     from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_zone", ...) write gate.
@@ -2651,11 +2679,21 @@ async def _apply_create_dns_zone(
         if refusal is not None:
             raise ValueError(refusal)
 
+    # #2652 — the REST create's checks, re-run at apply. The unique
+    # constraint cannot catch a twin when view_id is NULL.
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            raise ValueError(f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
+        raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
+
     from app.services.dns.view_collisions import RenderGuard  # noqa: PLC0415
 
     # #2275 — a zone with no view renders into every view of the group, so it
     # must not land beside a same-name zone pinned to one of them.
     render_guard = await RenderGuard.capture(db, grp.id, [name])
+
     zone = DNSZone(
         group_id=grp.id,
         name=name,
@@ -3014,6 +3052,7 @@ register(
         preview=_preview_create_alert_rule,
         apply=_apply_create_alert_rule,
         category="ops",
+        requires_superadmin=True,
     )
 )
 
@@ -4467,6 +4506,7 @@ register(
         preview=_preview_grant_temporary_access,
         apply=_apply_grant_temporary_access,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -5454,5 +5494,6 @@ register(
         preview=_preview_restart_service,
         apply=_apply_restart_service,
         category="admin",
+        requires_superadmin=True,
     )
 )

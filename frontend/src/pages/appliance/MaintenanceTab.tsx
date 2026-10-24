@@ -16,8 +16,8 @@ import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
  * Phase 4f — Maintenance tab.
  *
  * Two operator actions:
- *  1. Toggle maintenance-mode flag (file-backed; future tasks will
- *     read it to drain DNS/DHCP).
+ *  1. Toggle maintenance-mode flag (file-backed; recorded and shown,
+ *     nothing reads it yet — #2618).
  *  2. Schedule a host reboot (writes a trigger file; host-side
  *     systemd Path unit waits 10 s + runs ``systemctl reboot``).
  *
@@ -61,9 +61,9 @@ export function MaintenanceTab() {
           Maintenance
         </h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          Maintenance mode is a soft flag (future tasks read it to drain
-          DNS/DHCP traffic). Reboot is a real reboot — the api schedules it via
-          a host-side service with a 10-second grace.
+          Maintenance mode is a soft flag: it is recorded and shown, and nothing
+          drains DNS/DHCP traffic from it yet. Reboot is a real reboot — the api
+          schedules it via a host-side service with a 10-second grace.
         </p>
       </div>
 
@@ -106,9 +106,10 @@ export function MaintenanceTab() {
               Maintenance mode
             </h3>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              When enabled, scheduled tasks check this flag and refuse to issue
-              / renew DNS records or DHCP leases until you flip it back off.
-              Existing leases keep being served.
+              Records that this appliance is under maintenance and shows it
+              here. No scheduled task, agent or service reads the flag yet, so
+              turning it on does not stop DNS records or DHCP leases being
+              issued or renewed, and existing leases keep being served.
             </p>
           </div>
           <button

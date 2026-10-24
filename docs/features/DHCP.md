@@ -662,6 +662,15 @@ best-effort by design (failures are logged, not raised): a `502` from an
 unreachable Windows box would roll the DB restore back and make the row
 *unrestorable*, which is the opposite of what a recovery action should do.
 
+### Deleting a server releases its lease mirrors (#2290)
+
+Deleting a DHCP server purges its leases through the same teardown the expiry
+sweep uses: each lease's `auto_from_lease` IPAM mirror is freed and its DDNS
+A/PTR retracted, unless an HA / failover partner (or another client on the
+server) still holds an active lease on the address, in which case the shared
+mirror and DNS stay. The hourly mirror sweep also frees any `status="dhcp"`
+mirror that no lease row backs, healing servers deleted before this fix.
+
 ### The IPAM mirror is released on wholesale deletes (#618)
 
 A reservation owns an `ip_address` row at `status="static_dhcp"`, back-linked via
@@ -1130,6 +1139,14 @@ How the kill is seen depends on the deployment:
   1.32+) restores the single-process kill and the agent's own record.
 
 ---
+
+> **Logs → DHCP Activity across a group (#2120).** The Kea activity log
+> reads one server, one DHCP server group, or every server:
+> `POST /logs/dhcp-activity` takes an optional `server_id` and an optional
+> `group_id`, each row carries the `server_name` that logged it, and the
+> selection is narrowed to the servers the caller may read — so an HA pair's
+> two halves read as one time-ordered stream. See
+> [`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
 
 ## 5. DHCP Lease Tracking
 

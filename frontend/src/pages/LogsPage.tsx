@@ -18,7 +18,6 @@ import {
   Search,
   ScrollText,
   ShieldAlert,
-  Server,
   XCircle,
 } from "lucide-react";
 import {
@@ -32,6 +31,14 @@ import {
   type LogSource,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { AgentLogScopePicker } from "@/components/AgentLogScopePicker";
+import {
+  type AgentLogSelection,
+  defaultSelection,
+  selectionHost,
+  selectionIsValid,
+  selectionToScope,
+} from "@/lib/agent-log-scope";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
@@ -874,7 +881,7 @@ function QueryingIndicator({ host }: { host: string | undefined }) {
     <div className="flex h-full items-center justify-center">
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <RefreshCw className="h-4 w-4 animate-spin" />
-        Querying {host}…
+        Querying {host ?? "servers"}…
       </div>
     </div>
   );
@@ -1082,36 +1089,6 @@ function formatTime(iso: string): string {
 
 // ── Agent server picker ───────────────────────────────────────────
 
-function AgentServerPicker({
-  sources,
-  value,
-  onChange,
-}: {
-  sources: AgentLogSource[];
-  value: string | null;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="flex items-center gap-1.5 text-xs">
-      <span className="inline-flex items-center gap-1 text-muted-foreground">
-        <Server className="h-3 w-3" />
-        Server
-      </span>
-      <select
-        value={value ?? ""}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded-md border bg-background px-2 py-1 text-sm"
-      >
-        {sources.map((s) => (
-          <option key={s.server_id} value={s.server_id}>
-            {s.server_name} ({s.host})
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
 function EmptyAgentTab({
   kind,
   drivers,
@@ -1134,9 +1111,32 @@ function EmptyAgentTab({
 
 // ── DNS Queries tab (BIND9 query log) ────────────────────────────
 
+// Grid templates as whole literals so Tailwind sees them. The `_server`
+// variant adds a Server column after Time, shown whenever the read covers
+// more than one server (a group or "All servers", #2120).
+const DNS_COLS = "grid-cols-[20px_160px_140px_60px_70px_120px_95px_80px_1fr]";
+const DNS_COLS_SERVER =
+  "grid-cols-[20px_160px_130px_140px_60px_70px_120px_95px_80px_1fr]";
+const DHCP_COLS = "grid-cols-[20px_160px_70px_180px_140px_120px_1fr]";
+const DHCP_COLS_SERVER =
+  "grid-cols-[20px_160px_130px_70px_180px_140px_120px_1fr]";
+
+/** Whether a response merged more than one server. */
+function coversManyServers(data: { server_ids?: string[] } | undefined) {
+  return (data?.server_ids?.length ?? 0) > 1;
+}
+
+function ServerCell({ name }: { name: string }) {
+  return (
+    <span className="truncate font-mono text-[11px]" title={name}>
+      {name}
+    </span>
+  );
+}
+
 function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
-  const [serverId, setServerId] = useState<string | null>(
-    sources[0]?.server_id ?? null,
+  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
+    defaultSelection(sources),
   );
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
@@ -1148,21 +1148,22 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
   useEffect(() => {
     if (sources.length === 0) {
-      setServerId(null);
+      setSelection(null);
       return;
     }
-    if (!serverId || !sources.some((s) => s.server_id === serverId)) {
-      setServerId(sources[0].server_id);
+    if (!selectionIsValid(selection, sources)) {
+      setSelection(defaultSelection(sources));
     }
-  }, [sources, serverId]);
+  }, [sources, selection]);
+  const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!serverId;
+  const enabled = !!selection;
 
   const dnsQueriesQuery = useQuery({
     queryKey: [
       "logs-dns-queries",
-      serverId,
+      selection,
       maxEvents,
       sinceIso,
       q,
@@ -1173,7 +1174,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     ],
     queryFn: () =>
       logsApi.dnsQueries({
-        server_id: serverId!,
+        ...scope,
         max_events: maxEvents,
         since: sinceIso,
         q: q.trim() || null,
@@ -1191,10 +1192,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   // Analytics rollups — keyed off (server_id, since) only so per-keystroke
   // filter changes (qtype / client_ip / q) don't refetch the entire summary.
   const analyticsQuery = useQuery({
-    queryKey: ["logs-dns-queries-analytics", serverId, sinceIso],
+    queryKey: ["logs-dns-queries-analytics", selection, sinceIso],
     queryFn: () =>
       logsApi.dnsQueryAnalytics({
-        server_id: serverId!,
+        ...scope,
         since: sinceIso,
         limit: 10,
       }),
@@ -1205,9 +1206,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   });
 
   const events = dnsQueriesQuery.data?.events ?? [];
-  const selected = useMemo(
-    () => sources.find((s) => s.server_id === serverId),
-    [serverId, sources],
+  const showServer = coversManyServers(dnsQueriesQuery.data);
+  const selectedHost = useMemo(
+    () => selectionHost(selection, sources),
+    [selection, sources],
   );
 
   if (sources.length === 0) {
@@ -1218,10 +1220,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     <>
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-3 border-b bg-muted/20 px-6 py-3">
-        <AgentServerPicker
+        <AgentLogScopePicker
           sources={sources}
-          value={serverId}
-          onChange={setServerId}
+          value={selection}
+          onChange={setSelection}
         />
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">QType</span>
@@ -1322,7 +1324,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
       {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
       {dnsQueriesQuery.isFetching && events.length === 0 && (
-        <QueryingIndicator host={selected?.host} />
+        <QueryingIndicator host={selectedHost} />
       )}
       {!dnsQueriesQuery.isError &&
         !dnsQueriesQuery.isFetching &&
@@ -1330,9 +1332,15 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
       {events.length > 0 && (
         <div className="flex-1 overflow-auto">
-          <div className="grid grid-cols-[20px_160px_140px_60px_70px_120px_95px_80px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div
+            className={cn(
+              "grid gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground",
+              showServer ? DNS_COLS_SERVER : DNS_COLS,
+            )}
+          >
             <span className="sr-only">Details</span>
             <span>Time</span>
+            {showServer && <span>Server</span>}
             <span>Client</span>
             <span>QType</span>
             <span>QClass</span>
@@ -1346,6 +1354,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
               <DNSQueryRow
                 key={row.id}
                 row={row}
+                showServer={showServer}
                 onFilterClient={(ip) => setClientIp(ip)}
                 onFilterQname={(name) => setQ(name)}
               />
@@ -1559,16 +1568,24 @@ function RcodeCell({
 
 export function DNSQueryRow({
   row,
+  showServer = false,
   onFilterClient,
   onFilterQname,
 }: {
   row: DNSQueryLogRow;
+  /** Render the Server column (#2120) — the read merged several servers. */
+  showServer?: boolean;
   onFilterClient?: (ip: string) => void;
   onFilterQname?: (qname: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="grid grid-cols-[20px_160px_140px_60px_70px_120px_95px_80px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+    <div
+      className={cn(
+        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
+        showServer ? DNS_COLS_SERVER : DNS_COLS,
+      )}
+    >
       <RowDetailsButton onClick={() => setOpen(true)} />
       {open && (
         <DNSQueryDetailModal
@@ -1584,6 +1601,7 @@ export function DNSQueryRow({
       >
         {formatTime(row.ts)}
       </span>
+      {showServer && <ServerCell name={row.server_name} />}
       <span
         className="truncate font-mono text-[11px]"
         title={
@@ -1620,8 +1638,8 @@ export function DNSQueryRow({
 // ── DHCP Activity tab (Kea log) ───────────────────────────────────
 
 function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
-  const [serverId, setServerId] = useState<string | null>(
-    sources[0]?.server_id ?? null,
+  const [selection, setSelection] = useState<AgentLogSelection | null>(() =>
+    defaultSelection(sources),
   );
   const [maxEvents, setMaxEvents] = useState(200);
   const [since, setSince] = useState<string>("");
@@ -1633,21 +1651,22 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
   useEffect(() => {
     if (sources.length === 0) {
-      setServerId(null);
+      setSelection(null);
       return;
     }
-    if (!serverId || !sources.some((s) => s.server_id === serverId)) {
-      setServerId(sources[0].server_id);
+    if (!selectionIsValid(selection, sources)) {
+      setSelection(defaultSelection(sources));
     }
-  }, [sources, serverId]);
+  }, [sources, selection]);
+  const scope = selection ? selectionToScope(selection) : {};
 
   const sinceIso = since ? new Date(since).toISOString() : null;
-  const enabled = !!serverId;
+  const enabled = !!selection;
 
   const activityQuery = useQuery({
     queryKey: [
       "logs-dhcp-activity",
-      serverId,
+      selection,
       maxEvents,
       sinceIso,
       q,
@@ -1658,7 +1677,7 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
     ],
     queryFn: () =>
       logsApi.dhcpActivity({
-        server_id: serverId!,
+        ...scope,
         max_events: maxEvents,
         since: sinceIso,
         q: q.trim() || null,
@@ -1674,9 +1693,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   });
 
   const events = activityQuery.data?.events ?? [];
-  const selected = useMemo(
-    () => sources.find((s) => s.server_id === serverId),
-    [serverId, sources],
+  const showServer = coversManyServers(activityQuery.data);
+  const selectedHost = useMemo(
+    () => selectionHost(selection, sources),
+    [selection, sources],
   );
 
   if (sources.length === 0) {
@@ -1686,10 +1706,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   return (
     <>
       <div className="flex flex-wrap items-center gap-3 border-b bg-muted/20 px-6 py-3">
-        <AgentServerPicker
+        <AgentLogScopePicker
           sources={sources}
-          value={serverId}
-          onChange={setServerId}
+          value={selection}
+          onChange={setSelection}
         />
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">Severity</span>
@@ -1764,7 +1784,7 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
       {activityQuery.isError && <QueryErrorBanner query={activityQuery} />}
       {activityQuery.isFetching && events.length === 0 && (
-        <QueryingIndicator host={selected?.host} />
+        <QueryingIndicator host={selectedHost} />
       )}
       {!activityQuery.isError &&
         !activityQuery.isFetching &&
@@ -1772,9 +1792,15 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
       {events.length > 0 && (
         <div className="flex-1 overflow-auto">
-          <div className="grid grid-cols-[20px_160px_70px_180px_140px_120px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div
+            className={cn(
+              "grid gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground",
+              showServer ? DHCP_COLS_SERVER : DHCP_COLS,
+            )}
+          >
             <span className="sr-only">Details</span>
             <span>Time</span>
+            {showServer && <span>Server</span>}
             <span>Severity</span>
             <span>Code</span>
             <span>MAC</span>
@@ -1783,7 +1809,7 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
           </div>
           <div className="divide-y text-xs">
             {events.map((row) => (
-              <DHCPActivityRow key={row.id} row={row} />
+              <DHCPActivityRow key={row.id} row={row} showServer={showServer} />
             ))}
           </div>
           {activityQuery.data?.truncated && (
@@ -1798,7 +1824,14 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
   );
 }
 
-export function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
+export function DHCPActivityRow({
+  row,
+  showServer = false,
+}: {
+  row: DHCPActivityLogRow;
+  /** Render the Server column (#2120) — the read merged several servers. */
+  showServer?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const sevCls =
     row.severity === "ERROR" || row.severity === "FATAL"
@@ -1809,7 +1842,12 @@ export function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
           ? "text-muted-foreground/60"
           : "text-foreground";
   return (
-    <div className="grid grid-cols-[20px_160px_70px_180px_140px_120px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+    <div
+      className={cn(
+        "grid items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40",
+        showServer ? DHCP_COLS_SERVER : DHCP_COLS,
+      )}
+    >
       <RowDetailsButton onClick={() => setOpen(true)} />
       {open && (
         <DHCPActivityDetailModal row={row} onClose={() => setOpen(false)} />
@@ -1820,6 +1858,7 @@ export function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
       >
         {formatTime(row.ts)}
       </span>
+      {showServer && <ServerCell name={row.server_name} />}
       <span className={cn("font-mono text-[11px]", sevCls)}>
         {row.severity ?? <span className="text-muted-foreground/40">—</span>}
       </span>
@@ -1978,6 +2017,9 @@ function DNSQueryDetailModal({
         <DetailField label="Timestamp" mono>
           {formatFullTimestamp(row.ts)}
         </DetailField>
+        <DetailField label="Server" mono>
+          {row.server_name || <Missing />}
+        </DetailField>
         <DetailField label="Client" mono>
           {client ?? <Missing />}
         </DetailField>
@@ -2062,6 +2104,9 @@ function DHCPActivityDetailModal({
       <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-2">
         <DetailField label="Timestamp" mono>
           {formatFullTimestamp(row.ts)}
+        </DetailField>
+        <DetailField label="Server" mono>
+          {row.server_name || <Missing />}
         </DetailField>
         <DetailField label="Severity" mono>
           {row.severity ?? <Missing />}

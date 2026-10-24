@@ -936,7 +936,20 @@ export function CertificatesPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={8}
                   >
-                    <ListEmpty error={query.error} what="certificate targets">
+                    <ListEmpty
+                      error={query.error}
+                      what="certificate targets"
+                      filtered={
+                        search !== "" ||
+                        stateFilter !== "" ||
+                        sourceFilter !== ""
+                      }
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStateFilter("");
+                        setSourceFilter("");
+                      }}
+                    >
                       No targets yet — click "New target" to add one.
                     </ListEmpty>
                   </td>
