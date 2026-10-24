@@ -249,8 +249,15 @@ async def _run_auto_sync() -> dict[str, Any]:
                     ),
                 )
                 try:
+                    # #2577 — the report is this subnet's own, so its stale set
+                    # is both what is requested and what may be deleted: an
+                    # orphan in a zone the subnet shares is in it only when its
+                    # address lies inside the subnet.
                     created, updated, deleted, subnet_errors = await _apply_dns_sync(
-                        db, body, restrict_subnet_id=subnet_id
+                        db,
+                        body,
+                        allowed_stale_ids=[s.record_id for s in report.stale],
+                        restrict_subnet_id=subnet_id,
                     )
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"apply({subnet_id}): {exc}")

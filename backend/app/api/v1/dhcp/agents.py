@@ -2033,7 +2033,9 @@ async def agent_dhcp_fingerprints(
             from app.tasks.dhcp_fingerprint import lookup_fingerprint_task
 
             for mac in enqueue_macs:
-                lookup_fingerprint_task.delay(mac)
+                # Carry the reporting server so the IP stamp stays in the
+                # spaces it serves (#2577).
+                lookup_fingerprint_task.delay(mac, str(server.id))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",
