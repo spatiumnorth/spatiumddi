@@ -436,6 +436,22 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     ),
     (a.RULE_TYPE_CLUSTER_DNS_DEGRADED, "Cluster DNS (CoreDNS) degraded", "Infrastructure", []),
     (a.RULE_TYPE_APPLIANCE_STORAGE_DEGRADED, "Appliance storage degraded", "Infrastructure", []),
+    (
+        a.RULE_TYPE_APPLIANCE_DISK_USAGE,
+        "Appliance data partition (/var) filling",
+        "Infrastructure",
+        [
+            _pct(
+                "Warning threshold (%)",
+                80,
+                "Warns when a node's /var data partition is at least this full. "
+                "Separate from the fixed 90% critical level, where the kubelet "
+                "starts evicting pods (ext4 keeps 5% of /var for root, so 90% used "
+                "leaves the kubelet its last 5%). Silent on nodes whose supervisor "
+                "does not report /var.",
+            )
+        ],
+    ),
     (a.RULE_TYPE_APPLIANCE_HEARTBEAT_STALE, "Appliance heartbeat lost", "Infrastructure", []),
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
