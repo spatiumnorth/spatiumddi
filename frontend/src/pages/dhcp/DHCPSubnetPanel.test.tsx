@@ -224,7 +224,9 @@ describe("DHCPSubnetPanel delete scope (#2446)", () => {
     expect(screen.getByText("1 pool")).toBeTruthy();
     expect(screen.getByText("2 reservations")).toBeTruthy();
     expect(
-      screen.getByText(/restorable as a set from Administration/),
+      screen.getByText(
+        /A superadmin can restore them as a set from Administration/,
+      ),
     ).toBeTruthy();
     expect(screen.queryByText(/cannot be undone/)).toBeNull();
   });

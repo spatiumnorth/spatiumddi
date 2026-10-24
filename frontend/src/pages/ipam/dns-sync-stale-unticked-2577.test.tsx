@@ -115,6 +115,11 @@ async function open(commit: Answer) {
     </QueryClientProvider>,
   );
   await screen.findByText("ghost → 10.1.0.9");
+  // The default selection is seeded after the preview loads; on a slow
+  // runner a click can land before it settles (#2725). Wait for it.
+  await vi.waitFor(() =>
+    expect(checkboxFor("web → 10.1.0.5").checked).toBe(true),
+  );
 }
 
 describe("Sync DNS modal selection (#2577)", () => {
