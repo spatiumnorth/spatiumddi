@@ -30,6 +30,8 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.dhcp.class_refs import reserved_name_reason
+
 from .canonical import (
     ImportedClientClass,
     ImportedPool,
@@ -375,13 +377,19 @@ def _build_class(st: _Stmt) -> ImportedClientClass:
         if sub.keyword in ("match", "spawn"):
             match_expr = " ".join(p.value for p in sub.parts)
             break
+    name = name or "unnamed-class"
+    reserved = reserved_name_reason(name)
     return ImportedClientClass(
-        name=name or "unnamed-class",
+        name=name,
         match_expression=match_expr,
         description="Imported from ISC dhcpd.conf — review the match expression before enabling.",
         supported=False,
-        warning="ISC classifier DSL doesn't map to SpatiumDDI's client-class model; "
-        "left for manual review.",
+        warning=(
+            f"Not imported: {reserved}."
+            if reserved
+            else "ISC classifier DSL doesn't map to SpatiumDDI's client-class model; "
+            "left for manual review."
+        ),
     )
 
 

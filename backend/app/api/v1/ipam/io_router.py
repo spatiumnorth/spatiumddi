@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status
@@ -12,7 +12,11 @@ from fastapi.responses import Response
 
 from app.api.deps import DB, CurrentUser
 from app.core.content_disposition import content_disposition
-from app.core.permissions import user_has_permission
+from app.core.permissions import (
+    token_scope_allows,
+    token_scoped_resource_ids,
+    user_has_permission,
+)
 from app.core.responses import PdfResponse
 from app.services.ipam.address_set_gate import (
     load_writable_set_ranges,
@@ -35,6 +39,42 @@ router = APIRouter()
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
+def _enforce_subnet_token_binding(user: Any, subnet_id: uuid.UUID) -> None:
+    """403 when an API token bound to specific subnets (#374) is not bound to
+    ``subnet_id``.
+
+    The router-level gate (``app.api.token_path_scope``) reads ids from the
+    path and the query string only. The address import names its subnet in a
+    form field, so the check has to be made here. Sessions and tokens without
+    resource grants pass.
+    """
+    if not token_scope_allows(user, "subnet", subnet_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this subnet",
+        )
+
+
+def _refuse_bound_token(user: Any, what: str) -> None:
+    """403 for an API token bound to specific subnets on a route whose answer
+    covers a whole space or block.
+
+    A whole-tree import diff, or an export of a block or space, describes every
+    subnet in it. A token bound to subnets has no grant on the container
+    (``ip_block`` / ``ip_space`` are not grantable), so it is refused rather
+    than handed the other subnets' rows; it exports its own subnets by
+    ``subnet_id``. Sessions, unbound tokens and wildcard ``subnet`` grants
+    pass.
+    """
+    if token_scoped_resource_ids(user, "subnet") is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"API token is bound to specific subnets; {what} needs a " "credential that is not"
+            ),
+        )
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     data = await file.read()
     if len(data) > _MAX_UPLOAD_BYTES:
@@ -55,6 +95,7 @@ async def import_preview(
     strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
 ) -> dict:
     """Dry-run an import and return the would-create / would-update / conflict diff."""
+    _refuse_bound_token(current_user, "a whole-space import")
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_import(
@@ -86,6 +127,7 @@ async def import_commit(
     strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
 ) -> dict:
     """Commit the import in a single transaction. Writes audit entries per mutation."""
+    _refuse_bound_token(current_user, "a whole-space import")
     # The import creates / updates blocks and subnets, so the coarse router
     # gate (which also admits any address_set grant) is not enough.
     for rtype in ("ip_block", "subnet"):
@@ -128,6 +170,7 @@ async def import_preview_json(
     """
     from app.services.ipam_io.parser import ParsedPayload
 
+    _refuse_bound_token(current_user, "a whole-space import")
     raw = body.get("payload")
     if not isinstance(raw, dict):
         raise HTTPException(status_code=422, detail="Missing 'payload' object")
@@ -164,6 +207,7 @@ async def import_addresses_preview(
     ``custom_fields`` entries so migrations from other DDI tools don't
     need column renaming.
     """
+    _enforce_subnet_token_binding(current_user, subnet_id)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_address_import(
@@ -197,6 +241,7 @@ async def import_addresses_commit(
     audit trail it writes — a DNS-sync failure on a single row surfaces
     as a non-fatal error in the response, not a rolled-back import.
     """
+    _enforce_subnet_token_binding(current_user, subnet_id)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
 
@@ -265,6 +310,8 @@ async def export_pdf_endpoint(
     """
     from app.services.ipam_io.pdf import generate_ipam_pdf  # noqa: PLC0415
 
+    if space_id is not None or block_id is not None:
+        _refuse_bound_token(current_user, "a block or space report")
     data, filename = await generate_ipam_pdf(
         db,
         space_id=space_id,
@@ -297,7 +344,13 @@ async def export_endpoint(
     format: Literal["csv", "json", "xlsx"] = Query(default="csv"),
     include_addresses: bool = Query(default=False),
 ) -> Response:
-    """Export a subtree. Exactly one of space_id/block_id/subnet_id must be set."""
+    """Export a subtree. Exactly one of space_id/block_id/subnet_id must be set.
+
+    A token bound to specific subnets exports by ``subnet_id`` only: a block
+    or space export carries every subnet (and address) in it.
+    """
+    if space_id is not None or block_id is not None:
+        _refuse_bound_token(current_user, "a block or space export")
     data, content_type, filename = await export_subtree(
         db,
         space_id=space_id,

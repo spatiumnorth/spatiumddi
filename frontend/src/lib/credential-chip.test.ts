@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { cardTargets, credentialChipView } from "./credential-chip";
+import {
+  cardTargets,
+  credentialChipView,
+  hasTargetProblem,
+} from "./credential-chip";
 
 describe("credentialChipView (#2138)", () => {
   it("is red for a rejected or expired token", () => {
@@ -38,6 +42,28 @@ describe("credentialChipView (#2138)", () => {
   it("renders nothing for an integration without credential tracking", () => {
     expect(credentialChipView(null, null, null)).toBeNull();
     expect(credentialChipView(undefined, null, null)).toBeNull();
+  });
+});
+
+describe("hasTargetProblem (#2221)", () => {
+  it("does not treat a disabled target's old error as a problem", () => {
+    expect(hasTargetProblem({ last_sync_error: "boom", enabled: false })).toBe(
+      false,
+    );
+    expect(hasTargetProblem({ last_sync_error: "boom", enabled: true })).toBe(
+      true,
+    );
+    expect(hasTargetProblem({ last_sync_error: "boom" })).toBe(true);
+  });
+
+  it("sorts a disabled errored target after the live problems", () => {
+    const rows = [
+      { id: "off", last_sync_error: "boom", enabled: false },
+      { id: "live", last_sync_error: "boom", enabled: true },
+    ];
+    const { shown, hiddenProblems } = cardTargets(rows, 3, { problemTotal: 1 });
+    expect(shown.map((r) => r.id)).toEqual(["live", "off"]);
+    expect(hiddenProblems).toBe(0);
   });
 });
 
