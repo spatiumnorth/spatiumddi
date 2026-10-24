@@ -363,6 +363,11 @@ class _LocalWriteError(RuntimeError):
     help, so this is never treated as a transfer problem."""
 
 
+# Where ``apply`` stages the downloaded .raw.xz on /var (a module constant so
+# the tests can point it somewhere writable).
+_STAGING_DIR = Path("/var/lib/spatiumddi/slot-staging")
+
+
 class InsufficientSpace(_LocalWriteError):
     """Staging the image would leave /var below the kubelet's eviction
     margin (#2400); ``_fetch_image`` returns 7. Never retried."""
@@ -698,7 +703,7 @@ def cmd_apply(args) -> int:
         )
         return 2
 
-    workdir = Path("/var/lib/spatiumddi/slot-staging")
+    workdir = _STAGING_DIR
     workdir.mkdir(parents=True, exist_ok=True)
     staged = workdir / "slot.raw.xz"
 
@@ -708,70 +713,80 @@ def cmd_apply(args) -> int:
     if rc:
         return rc
 
-    # Verify SHA256 against an expected literal (#386 — passed by the
-    # control plane for self-served images, no second fetch) or a sidecar
-    # checksum file (legacy / external URLs).
-    if expected_sha256 or args.checksum:
-        _write_progress("verifying", None, "verifying sha256")
-        if not expected_sha256:
-            sha_path = workdir / "slot.sha256"
-            fetch_to(args.checksum, sha_path, insecure=insecure)
-            expected_sha256 = sha_path.read_text().strip().split()[0].lower()
-        actual = sha256_file(staged)
-        if expected_sha256 != actual.lower():
-            print(
-                f"ERROR: checksum mismatch (expected {expected_sha256}, got {actual})",
-                file=sys.stderr,
-            )
-            return 3
-        print(f"  checksum OK: {actual}")
-
-    # Decompress + dd directly into the inactive partition. xz can
-    # stream-decompress so we don't need disk space for an intermediate
-    # uncompressed file.
-    #
-    # #1804 — the write bypasses the page cache. The node is still serving
-    # while it stages (#1743), and a buffered dd queued hundreds of MB of
-    # the 8 GiB image ahead of every other write on the disk: etcd's WAL
-    # fdatasync waited behind it for seconds, and on the node holding the
-    # cluster's leases the controller-manager missed its renewal and k3s
-    # exited mid-write. With O_DIRECT dd writes one 4 MiB block at a time,
-    # so etcd waits behind one block at most. iflag=fullblock is what keeps
-    # it direct: the input is xz's pipe, whose reads come back short, and dd
-    # turns O_DIRECT off at the first write shorter than bs. The runner feeds
-    # dd itself, through _paced_copy, so the write also keeps to
-    # _WRITE_RATE_BYTES_PER_SECOND.
-    _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
-    print(f"  writing → {target_dev} (paced to "
-          f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
-    xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
-                          stdout=subprocess.PIPE)
-    dd = subprocess.Popen(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
-                           "oflag=direct", "conv=fsync", "status=progress"],
-                          stdin=subprocess.PIPE)
+    # #2400 — the staged .raw.xz is ~1.5 GiB on /var. It is removed once the
+    # write below has finished, whichever way it finished: on success it has
+    # been decompressed into the slot, and on a checksum, xz or dd failure it
+    # is useless, because the next apply discards it before fetching anyway
+    # (fetch_to never resumes across runs). Left behind, it sat on a nearly
+    # full /var until the next upgrade — the headroom the kubelet evicts on.
+    # Never removed BEFORE the write: the finally only runs once it is over.
     try:
-        _paced_copy(xz.stdout, dd.stdin)
-    except BrokenPipeError:
-        pass  # dd stopped reading; its exit status below says why
-    finally:
+        # Verify SHA256 against an expected literal (#386 — passed by the
+        # control plane for self-served images, no second fetch) or a sidecar
+        # checksum file (legacy / external URLs).
+        if expected_sha256 or args.checksum:
+            _write_progress("verifying", None, "verifying sha256")
+            if not expected_sha256:
+                sha_path = workdir / "slot.sha256"
+                fetch_to(args.checksum, sha_path, insecure=insecure)
+                expected_sha256 = sha_path.read_text().strip().split()[0].lower()
+            actual = sha256_file(staged)
+            if expected_sha256 != actual.lower():
+                print(
+                    f"ERROR: checksum mismatch (expected {expected_sha256}, got {actual})",
+                    file=sys.stderr,
+                )
+                return 3
+            print(f"  checksum OK: {actual}")
+
+        # Decompress + dd directly into the inactive partition. xz can
+        # stream-decompress so we don't need disk space for an intermediate
+        # uncompressed file.
+        #
+        # #1804 — the write bypasses the page cache. The node is still serving
+        # while it stages (#1743), and a buffered dd queued hundreds of MB of
+        # the 8 GiB image ahead of every other write on the disk: etcd's WAL
+        # fdatasync waited behind it for seconds, and on the node holding the
+        # cluster's leases the controller-manager missed its renewal and k3s
+        # exited mid-write. With O_DIRECT dd writes one 4 MiB block at a time,
+        # so etcd waits behind one block at most. iflag=fullblock is what keeps
+        # it direct: the input is xz's pipe, whose reads come back short, and dd
+        # turns O_DIRECT off at the first write shorter than bs. The runner feeds
+        # dd itself, through _paced_copy, so the write also keeps to
+        # _WRITE_RATE_BYTES_PER_SECOND.
+        _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
+        print(f"  writing → {target_dev} (paced to "
+              f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
+        xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
+                              stdout=subprocess.PIPE)
+        dd = subprocess.Popen(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
+                               "oflag=direct", "conv=fsync", "status=progress"],
+                              stdin=subprocess.PIPE)
         try:
-            dd.stdin.close()
+            _paced_copy(xz.stdout, dd.stdin)
         except BrokenPipeError:
-            pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
-    if dd.wait() != 0:
-        xz.kill()
+            pass  # dd stopped reading; its exit status below says why
+        finally:
+            try:
+                dd.stdin.close()
+            except BrokenPipeError:
+                pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
+        if dd.wait() != 0:
+            xz.kill()
+            xz.wait()
+            raise subprocess.CalledProcessError(dd.returncode, "dd")
         xz.wait()
-        raise subprocess.CalledProcessError(dd.returncode, "dd")
-    xz.wait()
-    if xz.returncode != 0:
-        print("ERROR: xz exited non-zero", file=sys.stderr)
-        return 4
+        if xz.returncode != 0:
+            print("ERROR: xz exited non-zero", file=sys.stderr)
+            return 4
+    finally:
+        staged.unlink(missing_ok=True)
+        (workdir / "slot.sha256").unlink(missing_ok=True)
 
     _write_progress("bootloader", None, "updating bootloader + slot versions")
     print("  flushing kernel buffers + re-reading filesystem metadata…")
     subprocess.run(["partprobe", _parent_disk(target_dev)], check=False)
     subprocess.run(["udevadm", "settle"], check=False)
-    staged.unlink(missing_ok=True)
 
     # The dd overwrote the partition with the slot image's ext4
     # filesystem. That filesystem's UUID was baked at slot-image build

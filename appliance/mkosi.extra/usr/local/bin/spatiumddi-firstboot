@@ -107,6 +107,48 @@ SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 K3S_JOIN_DROPIN="${SPATIUM_K3S_JOIN_DROPIN:-/etc/rancher/k3s/config.yaml.d/spatium-cluster.yaml}"
 node_is_cluster_member() { [ -f "$K3S_JOIN_DROPIN" ]; }
 
+# ── #2400 — the swapfile this script used to create ─────────────────────────
+# Until #2400, every boot that found no active swap created a 2 GiB
+# /var/lib/spatiumddi/swapfile, swapon'd it and appended it to /etc/fstab.
+# It was active only until the first reboot, and never again:
+#
+#   * /etc is an overlay (etc.mount, lower /usr/lib/etc.image, upper
+#     /var/persist/etc) that mounts AFTER PID1 has run its generators over the
+#     underlying rootfs /etc. So systemd-fstab-generator never saw the swap
+#     line — it lives only in the overlay upper — and no swap unit existed on
+#     any later boot. A slot upgrade lands a new rootfs that never had it.
+#   * the creation guard also required the file NOT to exist, so a reboot (no
+#     active swap, file present) skipped it entirely.
+#
+# The result was 2 GiB of /var — 13 % of a 15 GB disk — holding nothing, on
+# the volume the kubelet evicts the control plane on. The #1124 memory
+# eviction thresholds and the #1115 sizing were measured and calibrated on
+# appliances that in practice had NO swap, so it is retired rather than
+# switched on: enabling it now would change the memory behaviour of every
+# appliance in the field on an upgrade. An operator who wants swap adds it
+# themselves.
+#
+# Only an INACTIVE file is removed: swapping off a live one under memory
+# pressure could OOM the node, so an active one (the first boot of an older
+# image) is left until it is inactive on a later boot.
+SWAPFILE="${SPATIUM_SWAPFILE:-/var/lib/spatiumddi/swapfile}"
+SWAP_FSTAB="${SPATIUM_SWAP_FSTAB:-/etc/fstab}"
+retire_inactive_swapfile() {
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qxF "$SWAPFILE"; then
+        echo "swapfile $SWAPFILE is active; leaving it until a later boot"
+        return 0
+    fi
+    if [ -e "$SWAPFILE" ]; then
+        rm -f "$SWAPFILE" && echo "Removed unused swapfile $SWAPFILE (#2400)"
+    fi
+    if [ -f "$SWAP_FSTAB" ] && grep -q "^$SWAPFILE " "$SWAP_FSTAB"; then
+        _fstab_tmp="$SWAP_FSTAB.spatium.$$"
+        grep -v "^$SWAPFILE " "$SWAP_FSTAB" > "$_fstab_tmp" || true
+        cat "$_fstab_tmp" > "$SWAP_FSTAB" && rm -f "$_fstab_tmp"
+    fi
+    return 0
+}
+
 # Sourced by the unit tests to reach the helpers above without running any of
 # the boot-time side effects below. Mirrors spatium-cluster-join's guard.
 if [ "${SPATIUM_FIRSTBOOT_LIB:-}" = "1" ]; then
@@ -117,25 +159,9 @@ mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP")"
 exec >>"$LOG" 2>&1
 echo "=== spatiumddi-firstboot $(date -Iseconds) ==="
 
-# ── Swap (created once, idempotent) ──────────────────────────────────────────
-# 2 GiB swapfile if the system has no active swap. Protects k3s
-# control-plane components (etcd-like kine, kubeapi, helm-controller)
-# from OOM under memory pressure. Sized small — operators with bigger
-# workloads grow it.
-SWAPFILE=/var/lib/spatiumddi/swapfile
-if [ "$(swapon --show=NAME --noheadings | wc -l)" = "0" ] && [ ! -f "$SWAPFILE" ]; then
-    echo "Creating 2 GiB swapfile at $SWAPFILE"
-    if fallocate -l 2G "$SWAPFILE" 2>/dev/null || \
-       dd if=/dev/zero of="$SWAPFILE" bs=1M count=2048 status=none; then
-        chmod 0600 "$SWAPFILE"
-        mkswap "$SWAPFILE" && swapon "$SWAPFILE"
-        if ! grep -q "^$SWAPFILE " /etc/fstab 2>/dev/null; then
-            echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
-        fi
-    else
-        echo "WARN: couldn't create swapfile — continuing without swap"
-    fi
-fi
+# ── Swap: retired (#2400) ────────────────────────────────────────────────────
+# See retire_inactive_swapfile above for why the swapfile is no longer created.
+retire_inactive_swapfile || echo "WARN: could not retire the old swapfile — continuing"
 
 gen_hex()    { openssl rand -hex "${1:-32}"; }
 gen_fernet() { openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_'; }

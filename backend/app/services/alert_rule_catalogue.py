@@ -437,6 +437,21 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     (a.RULE_TYPE_CLUSTER_DNS_DEGRADED, "Cluster DNS (CoreDNS) degraded", "Infrastructure", []),
     (a.RULE_TYPE_APPLIANCE_STORAGE_DEGRADED, "Appliance storage degraded", "Infrastructure", []),
     (a.RULE_TYPE_APPLIANCE_HEARTBEAT_STALE, "Appliance heartbeat lost", "Infrastructure", []),
+    (
+        a.RULE_TYPE_APPLIANCE_DISK_LOW,
+        "Appliance /var low on space",
+        "Infrastructure",
+        [
+            _pct(
+                "Warn below free (%)",
+                20,
+                "Warns when an appliance's /var has less than this much free. "
+                "Always critical under 15% (the kubelet's 5% eviction threshold "
+                "plus its 10% minimum reclaim) and when the node reports "
+                "DiskPressure, whatever this is set to.",
+            )
+        ],
+    ),
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_SPOOL_TRIMMED, "Agent spool trimmed", "Infrastructure", []),
