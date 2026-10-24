@@ -15,6 +15,7 @@ const BUILTIN_ROLE_TYPES = [
   "dnsbl",
   "e911_location",
   "manage_asns",
+  "manage_domains",
   "manage_block_sync",
   "manage_dns_pools",
   "manage_network_devices",
@@ -48,6 +49,13 @@ describe("GRANT_RESOURCE_TYPES", () => {
     expect(
       documented.filter((t) => t !== "resource_type" && !offered.has(t)),
     ).toEqual([]);
+  });
+
+  it("offers no type that no route checks (#2621)", () => {
+    // The ASN and Domains routes check manage_asns / manage_domains by exact
+    // match, so a grant on `asn` or `domain` reads nothing.
+    expect(offered.has("asn")).toBe(false);
+    expect(offered.has("domain")).toBe(false);
   });
 
   it("has no duplicates", () => {
