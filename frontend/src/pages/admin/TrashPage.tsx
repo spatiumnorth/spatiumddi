@@ -211,22 +211,18 @@ function ConfirmRestoreModal({
 }
 
 // What a permanent delete takes with the row, beyond the row itself. These are
-// the rows its foreign keys cascade to, most of which the Trash does not list;
-// the batch count is every row deleted with this one that the Trash holds, so
-// it can be lower than what goes (a DNS pool is not soft-deleted).
+// the rows its foreign keys cascade to, most of which the Trash does not list.
+// It names no count of "other rows deleted with it": the purge takes this
+// row's own subtree, never the rest of its deletion batch (its parent block,
+// its siblings), so a batch count named rows that stay (#2736).
 function purgeScope(entry: TrashEntry): string {
-  const others = entry.batch_size - 1;
-  const count =
-    others > 0
-      ? ` ${others} other row${others === 1 ? "" : "s"} deleted with it ${others === 1 ? "is" : "are"} removed too.`
-      : "";
   switch (entry.type) {
     case "subnet":
-      return ` Its DHCP scopes (with their pools and static assignments), its addresses and the DNS records published for them are removed with it.${count}`;
+      return ` Its DHCP scopes (with their pools and static assignments), its addresses and the DNS records published for them are removed with it.`;
     case "dns_zone":
-      return ` All of its DNS records and its DNS pools are removed with it.${count}`;
+      return ` All of its DNS records and its DNS pools are removed with it.`;
     case "dhcp_scope":
-      return ` Its pools and static assignments are removed with it.${count}`;
+      return ` Its pools and static assignments are removed with it.`;
     default:
       return "";
   }
@@ -262,7 +258,7 @@ function ConfirmPermanentDeleteModal({
           <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
           {TYPE_LABELS[entry.type]}).
           {entry.type === "ip_block" || entry.type === "ip_space"
-            ? " The subnets and blocks in the Trash under it are removed with it."
+            ? " The subnets and blocks in the Trash under it, with their addresses, DHCP scopes and DNS records, are removed with it."
             : ""}
           {purgeScope(entry)} It cannot be restored.
         </p>

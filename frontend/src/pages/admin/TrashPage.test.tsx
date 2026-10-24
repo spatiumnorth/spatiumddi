@@ -298,17 +298,17 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
     return (await screen.findByText(/This permanently removes/)).textContent;
   }
 
-  it("names a subnet's scopes, addresses and records, and counts the batch", async () => {
+  it("names a subnet's scopes, addresses and records, and does not count the batch", async () => {
     const t = await openDelete("subnet", 4);
     expect(t).toMatch(/DHCP scopes \(with their pools and static/);
     expect(t).toMatch(/addresses and the DNS records published for them/);
-    expect(t).toMatch(/3 other rows deleted with it are removed too/);
+    expect(t).not.toMatch(/other row/);
   });
 
   it("names a zone's records and pools", async () => {
     const t = await openDelete("dns_zone", 3);
     expect(t).toMatch(/All of its DNS records and its DNS pools/);
-    expect(t).toMatch(/2 other rows/);
+    expect(t).not.toMatch(/other row/);
   });
 
   it("adds no count for a row deleted alone", async () => {
