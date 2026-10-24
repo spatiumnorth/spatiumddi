@@ -47,7 +47,7 @@ from app.services.dns.pool_geo import (
     GEO_DEFAULT_VIEW,
     build_geo_steering,
     build_view_descriptors,
-    view_renders_zone,
+    views_rendering_zone,
 )
 
 logger = structlog.get_logger(__name__)
@@ -118,7 +118,56 @@ async def resolve_group_transfer_key(db: AsyncSession, group_id: uuid.UUID) -> T
                 key=k.name,
             )
             continue
+        if tsig_secret_shape_problem(secret) is not None:
+            # Left out of the bundle for the same reason, so never granted.
+            continue
         return TsigKey(name=k.name, algorithm=k.algorithm, secret=secret)
+    return None
+
+
+#: Decoded length bounds for an operator-supplied secret. 16 bytes is the
+#: floor RFC 8945 §6 sets for a usable HMAC key; 512 is far beyond any
+#: algorithm's block size and only stops a pasted blob, not a real key.
+TSIG_SECRET_MIN_BYTES = 16
+TSIG_SECRET_MAX_BYTES = 512
+
+_TSIG_SECRET_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def tsig_secret_shape_problem(secret: str | None) -> str | None:
+    """Why ``secret`` is not one base64 string, or None.
+
+    The structural half only — what decides whether the value can sit inside
+    ``secret "…";`` in a key file at all. The bundle builder applies it to
+    stored rows, where refusing a short-but-working key would break a group
+    that converges today.
+    """
+    value = secret or ""
+    if not value or len(value) % 4 or not _TSIG_SECRET_RE.match(value):
+        return "must be base64 (A-Z, a-z, 0-9, '+', '/', with '=' padding only at the end)"
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return "is not valid base64"
+    if not decoded:
+        return "decodes to an empty key"
+    return None
+
+
+def tsig_secret_problem(secret: str | None) -> str | None:
+    """Why ``secret`` cannot be stored as a TSIG key secret, or None.
+
+    The API's check on create: the shape check above plus a decoded length
+    between :data:`TSIG_SECRET_MIN_BYTES` and :data:`TSIG_SECRET_MAX_BYTES`.
+    """
+    if problem := tsig_secret_shape_problem(secret):
+        return problem
+    n = len(base64.b64decode(secret or "", validate=True))
+    if not TSIG_SECRET_MIN_BYTES <= n <= TSIG_SECRET_MAX_BYTES:
+        return (
+            f"decodes to {n} bytes; a key must be between {TSIG_SECRET_MIN_BYTES} "
+            f"and {TSIG_SECRET_MAX_BYTES} bytes"
+        )
     return None
 
 
@@ -262,7 +311,7 @@ async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
     the zone's group renders no views.
 
     Only views that hold a copy are candidates — the same rule the bundle
-    expands zones by (:func:`~app.services.dns.pool_geo.view_renders_zone`).
+    expands zones by (:func:`~app.services.dns.pool_geo.views_rendering_zone`).
     Among them: the zone's own pinned view; else the first operator view in
     precedence order (it serves every shared record, plus its own scoped
     ones); else the geo catch-all, which serves the default pool members;
@@ -286,8 +335,7 @@ async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
         .scalars()
         .all()
     )
-    targets = scoped | ({zone.view_id} if zone.view_id is not None else set())
-    holding = [vd for vd in descs if view_renders_zone(vd, targets)]
+    holding = views_rendering_zone(descs, zone.view_id, scoped)
     for pick in (
         lambda vd: vd["kind"] == "operator" and vd["id"] == zone.view_id,
         lambda vd: vd["kind"] == "operator",

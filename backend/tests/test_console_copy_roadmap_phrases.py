@@ -49,3 +49,18 @@ def test_copilot_tool_descriptions_describe_what_ships() -> None:
         tool.name: _hits(tool.description) for tool in REGISTRY.all() if _hits(tool.description)
     }
     assert not hits, f"Copilot tool descriptions carry roadmap language: {hits}"
+
+
+def test_appliance_operator_does_not_claim_full_control() -> None:
+    """#2620 — the role reaches a node, not the Fleet surface.
+
+    The upgrade-image store, Fleet member actions, MetalLB, the kube-api CIDRs
+    and pairing take a superadmin, so "Full control" of the appliance
+    management surface was false; the description names what still needs one.
+    """
+    desc, perms = _BUILTIN_ROLES["Appliance Operator"]
+    assert "full control" not in desc.lower()
+    assert "superadmin" in desc.lower()
+    assert "upgrade-image store" in desc
+    # The description was the only thing that changed: the grant is untouched.
+    assert perms == [{"action": "admin", "resource_type": "appliance"}]

@@ -44,6 +44,10 @@ UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
         "Technitium has no allow-notify setting (a secondary zone accepts NOTIFY "
         "only from its own primary name servers)",
     ),
+    # #2263: BIND's ``blackhole`` drops a client's queries unanswered. Technitium
+    # has no server setting that refuses a client by address (its access
+    # controls are per zone, and answer REFUSED rather than nothing).
+    "blackhole": ([], "Technitium has no setting to drop queries from a client address"),
     "forward_tls_verify": (
         True,
         "Technitium always validates an encrypted upstream's certificate and has no "

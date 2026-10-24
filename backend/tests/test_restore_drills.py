@@ -212,11 +212,19 @@ class _FakeDriver:
     def __init__(self, *, archives: list[Any] | None = None, payload: bytes = b"zip") -> None:
         self._archives = archives if archives is not None else [_listing("newest.zip")]
         self._payload = payload
+        self.max_bytes_seen: list[int | None] = []
 
     async def list_archives(self, *, config: dict[str, Any]) -> list[Any]:
         return self._archives
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
+        from app.services.backup.targets.base import ArchiveTooLargeError
+
+        self.max_bytes_seen.append(max_bytes)
+        if max_bytes is not None and len(self._payload) > max_bytes:
+            raise ArchiveTooLargeError(filename, max_bytes)
         return self._payload
 
 
@@ -371,6 +379,42 @@ async def test_newest_archive_is_the_one_drilled(monkeypatch) -> None:
     target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
     outcome = await _execute(target, live_db_url="postgresql+asyncpg://u:p@h:5432/live")
     assert outcome.filename == "newest.zip"
+
+
+@pytest.mark.asyncio
+async def test_drill_download_passes_the_archive_cap(monkeypatch) -> None:
+    """The drill asks the driver to stop at the archive cap, so an archive
+    whose listing understates its size is not read into memory whole."""
+    from app.services.backup.archive import MAX_ARCHIVE_BYTES
+    from app.services.backup.drill import _execute
+
+    driver = _FakeDriver()
+    _wire_drill(
+        monkeypatch, assertions=[Assertion("core_tables_populated", PASS, "ok")], driver=driver
+    )
+    target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
+    outcome = await _execute(target, live_db_url="postgresql+asyncpg://u:p@h:5432/live")
+    assert outcome.state == "passed"
+    assert driver.max_bytes_seen == [MAX_ARCHIVE_BYTES]
+
+
+@pytest.mark.asyncio
+async def test_drill_reports_an_archive_past_the_cap_as_error(monkeypatch) -> None:
+    """A listing that declares a small size for an archive the driver then
+    finds past the cap ends the drill as an error naming the cap, not as a
+    failed backup."""
+    from app.services.backup import drill as drill_mod
+    from app.services.backup.drill import _execute
+    from app.services.backup.targets.base import ArchiveListing
+
+    monkeypatch.setattr(drill_mod, "MAX_ARCHIVE_BYTES", 2)
+    understated = ArchiveListing(filename="newest.zip", size_bytes=1, created_at=datetime.now(UTC))
+    driver = _FakeDriver(archives=[understated], payload=b"zip")
+    _wire_drill(monkeypatch, assertions=[], driver=driver)
+    target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
+    outcome = await _execute(target, live_db_url="postgresql+asyncpg://u:p@h:5432/live")
+    assert outcome.state == "error"
+    assert outcome.error is not None and "cap" in outcome.error
 
 
 def test_assertion_serialises_for_jsonb() -> None:

@@ -96,7 +96,7 @@ SECTIONS: tuple[Section, ...] = (
             "audit also restores the tamper-evidence chain "
             "(seq + row_hash + prev_hash) from the source install."
         ),
-        tables=("audit_log", "audit_forward_target"),
+        tables=("audit_log", "audit_forward_target", "audit_chain_checkpoint"),
     ),
     Section(
         key="settings",
