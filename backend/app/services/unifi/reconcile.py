@@ -45,8 +45,14 @@ from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
+    SpaceRelease,
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
     owned_by_other_integration,
+    owned_subnets_in_space,
     owning_integration,
+    refuse_sync_into_trashed_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -134,6 +140,9 @@ class ReconcileSummary:
     # an operator Router already held that name (#2140).
     router_name: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -577,8 +586,18 @@ async def _apply_blocks_and_subnets(
         existing_networks[supernet] = parent
         summary.blocks_created += 1
 
-    res = await db.execute(select(Subnet).where(Subnet.unifi_controller_id == controller.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # #2577 — only subnets in the controller's own space; anything it owns
+    # in another (its old space, after a space change) is released first.
+    current_subnets = {
+        str(s.network): s
+        for s in await owned_subnets_in_space(
+            db,
+            "unifi_controller_id",
+            controller.id,
+            controller.ipam_space_id,
+            summary=summary,
+        )
+    }
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
@@ -699,6 +718,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -716,10 +736,15 @@ async def _apply_addresses(
     #     hits the (subnet_id, address) unique violation.
     # Keep the most-recently-modified row, soft-delete the rest. Done
     # before adoption so the adopted set is already deduped.
-    pre_owned = (
-        (await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id)))
-        .scalars()
-        .all()
+    # #2577 — only rows inside the controller's space; a unifi-owned row in
+    # another space is released (never moved or deduped across spaces) by
+    # ``owned_addresses_in_space`` before this sees anything.
+    pre_owned = await owned_addresses_in_space(
+        db,
+        "unifi_controller_id",
+        controller.id,
+        controller.ipam_space_id,
+        summary=summary,
     )
     pre_groups: dict[str, list[IPAddress]] = {}
     for row in pre_owned:
@@ -737,11 +762,9 @@ async def _apply_addresses(
 
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from the controller's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, controller.ipam_space_id, desired_addrs)
         # Group by address so we can detect "multiple operator-owned
         # rows at this address" before adopting any of them. Adopting
         # both would re-create the duplicate we just cleaned up.
@@ -781,8 +804,16 @@ async def _apply_addresses(
                 winner.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db,
+            "unifi_controller_id",
+            controller.id,
+            controller.ipam_space_id,
+            summary=summary,
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.unifi_controller_id == controller.id}
 
@@ -805,6 +836,13 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 # Before moving the row, check whether the target
                 # (subnet_id, address) tuple is already occupied by a
                 # different row — typically one written by SNMP
@@ -989,6 +1027,10 @@ def _decrypt_or_empty(blob: bytes) -> str:
 
 async def reconcile_controller(db: AsyncSession, controller: UnifiController) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, controller, summary):
+        return summary
 
     try:
         api_key = _decrypt_or_empty(controller.api_key_encrypted)
@@ -1116,6 +1158,8 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
             resource_id=str(controller.id),
             resource_display=controller.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -1146,6 +1190,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
     summary.ok = True
     logger.info(
         "unifi_reconcile_ok",
+        **summary.released.log_fields(),
         controller=str(controller.id),
         version=summary.controller_version,
         sites=summary.site_count,

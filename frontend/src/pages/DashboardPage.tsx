@@ -4929,6 +4929,32 @@ function IntegrationsDashboardTabPanel() {
         ))}
       </DashboardListCard>
 
+      <DashboardListCard
+        title="Recent reconciler warnings"
+        emptyHint="No reconciler warnings in recent history."
+      >
+        {(data.recent_warnings ?? []).map((w) => (
+          <div key={w.id} className="px-4 py-2 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="min-w-0 truncate font-medium">
+                {w.integration} · {w.target_display || w.target_id}
+              </span>
+              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                {humanTime(w.timestamp)}
+              </span>
+            </div>
+            {w.error_detail && (
+              <p
+                className="mt-0.5 break-words font-mono text-[10px] text-amber-600 dark:text-amber-400"
+                title={w.error_detail}
+              >
+                {w.error_detail}
+              </p>
+            )}
+          </div>
+        ))}
+      </DashboardListCard>
+
       <p className="text-[11px] text-muted-foreground">
         Refreshes every 30 s. A target is flagged stale when its last sync is
         older than 2× its configured
