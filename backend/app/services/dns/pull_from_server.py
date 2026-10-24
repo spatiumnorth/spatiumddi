@@ -30,10 +30,11 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver
+from app.core.agent_wake import collect_wake, dns_server_channel
+from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
 from app.services.dns.record_ops import resolve_primary_server, rrset_from_payload
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
@@ -73,6 +74,9 @@ class PushResult:
     pushed: int  # successfully applied on the wire
     pushed_records: list[dict[str, Any]]  # user-visible list for UI
     push_errors: list[str]  # one entry per failed push (first ~10)
+    # #2667 — agent-managed server: the missing rows were queued as record
+    # ops for the agent to apply, not applied on the wire by us.
+    queued_for_agent: bool = False
 
 
 @dataclass
@@ -642,6 +646,83 @@ async def pull_zone_from_server(
 _PUSHABLE_TYPES = frozenset({"A", "AAAA", "CNAME", "MX", "TXT", "PTR", "SRV", "NS", "TLSA"})
 
 
+async def _queue_for_agent(
+    db: AsyncSession,
+    server: Any,
+    zone: DNSZone,
+    rows: list[DNSRecord],
+    payloads: list[dict[str, Any]],
+    target_serial: int,
+) -> PushResult:
+    """Agent-managed server: hand the missing rows to its record-op queue (#2667).
+
+    The control plane has no RFC 2136 / driver path to an agent-managed
+    server (the agent applies ops against loopback ``named``), so calling
+    ``apply_record_changes`` failed every record. Ops are queued for THIS
+    server only — Sync with Servers is per-server. A row whose identical
+    create is already pending / in flight is not queued twice.
+    """
+    queued = (
+        (
+            await db.execute(
+                select(DNSRecordOp).where(
+                    DNSRecordOp.server_id == server.id,
+                    DNSRecordOp.zone_id == zone.id,
+                    DNSRecordOp.state.in_(("pending", "in_flight")),
+                    DNSRecordOp.op == "create",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    already = {
+        (
+            str((o.record or {}).get("name", "")),
+            str((o.record or {}).get("type", "")).upper(),
+            str((o.record or {}).get("value", "")),
+        )
+        for o in queued
+    }
+    new_ops: list[DNSRecordOp] = []
+    pushed_records: list[dict[str, Any]] = []
+    for row, payload in zip(rows, payloads, strict=True):
+        rec = payload["record"]
+        pushed_records.append(
+            {
+                "name": row.name,
+                "fqdn": row.fqdn,
+                "record_type": row.record_type.upper(),
+                "value": row.value,
+                "ttl": row.ttl,
+            }
+        )
+        if (rec["name"], rec["type"], rec["value"]) in already:
+            continue
+        new_ops.append(
+            DNSRecordOp(
+                server_id=server.id,
+                zone_id=zone.id,
+                zone_name=zone.name,
+                op="create",
+                record=payload["record"],
+                target_serial=target_serial,
+                state="pending",
+            )
+        )
+    if new_ops:
+        db.add_all(new_ops)
+        await db.flush()
+        collect_wake(dns_server_channel(server.id))
+    return PushResult(
+        candidates=len(rows),
+        pushed=len(pushed_records),
+        pushed_records=pushed_records,
+        push_errors=[],
+        queued_for_agent=True,
+    )
+
+
 async def _additive_push(
     db: AsyncSession,
     primary: Any,
@@ -755,6 +836,9 @@ async def _additive_push(
         return PushResult(
             candidates=0, pushed=0, pushed_records=pushed_records, push_errors=push_errors
         )
+
+    if not is_agentless(primary.driver):
+        return await _queue_for_agent(db, primary, zone, candidate_rows, payloads, target_serial)
 
     try:
         results = await driver.apply_record_changes(primary, changes)

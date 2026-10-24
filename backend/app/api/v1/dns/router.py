@@ -3047,6 +3047,7 @@ class ZoneSyncItem(BaseModel):
     pushed: int
     server_records: int
     push_errors: list[str]
+    queued_for_agent: bool = False
     error: str | None = None
 
 
@@ -3308,6 +3309,7 @@ async def _sync_single_server(
                     pushed=result.push.pushed,
                     server_records=result.pull.server_records,
                     push_errors=result.push.push_errors,
+                    queued_for_agent=result.push.queued_for_agent,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — per-zone isolation
@@ -9656,6 +9658,8 @@ class SyncWithServerResponse(BaseModel):
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
+    # #2667 — agent-managed server: pushed rows were queued for the agent.
+    queued_for_agent: bool = False
 
 
 @router.post(
@@ -9734,6 +9738,7 @@ async def sync_zone_with_server_endpoint(
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
+        queued_for_agent=result.push.queued_for_agent,
     )
 
 
