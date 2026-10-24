@@ -131,9 +131,8 @@ async def test_restore_that_renames_repoints_the_cname(
 ) -> None:
     headers, sid, zone = await _setup(client, db_session)
     ip_id = await _aliased(client, headers, sid, "10.98.5.22")
-    assert (
-        await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
-    ).status_code == 204
+    resp = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
     p = await client.put(
         f"/api/v1/ipam/addresses/{ip_id}",
         headers=headers,
@@ -151,9 +150,8 @@ async def test_a_name_taken_meanwhile_refuses_the_restore(
     headers, sid, zone = await _setup(client, db_session)
     zone_id = zone.id
     ip_id = await _aliased(client, headers, sid, "10.98.5.23")
-    assert (
-        await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
-    ).status_code == 204
+    resp = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
     # Another address now holds the CNAME alias's name.
     r = await _alloc(client, headers, sid, "10.98.5.24", "www")
     assert r.status_code == 201, r.text
@@ -179,9 +177,8 @@ async def test_purging_the_orphan_deletes_its_aliases(
 ) -> None:
     headers, sid, _zone = await _setup(client, db_session)
     ip_id = await _aliased(client, headers, sid, "10.98.5.25")
-    assert (
-        await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
-    ).status_code == 204
+    resp = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
     r = await client.post(
         f"/api/v1/ipam/subnets/{sid}/orphans/purge", headers=headers, json={"ip_ids": [ip_id]}
     )
@@ -196,9 +193,8 @@ async def test_permanent_delete_of_an_orphan_deletes_its_aliases(
 ) -> None:
     headers, sid, _zone = await _setup(client, db_session)
     ip_id = await _aliased(client, headers, sid, "10.98.5.26")
-    assert (
-        await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
-    ).status_code == 204
+    resp = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
     d = await client.delete(f"/api/v1/ipam/addresses/{ip_id}?permanent=true", headers=headers)
     assert d.status_code == 204, d.text
     assert await _all_alias_rows(db_session, ip_id) == []
@@ -231,9 +227,8 @@ async def test_retention_purge_keeps_an_orphans_aliases(
 ) -> None:
     headers, sid, _zone = await _setup(client, db_session)
     ip_id = await _aliased(client, headers, sid, "10.98.5.28")
-    assert (
-        await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
-    ).status_code == 204
+    resp = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
     # A cutoff past every stamp: anything not held back would go.
     await _purge_dns_records(db_session, datetime.now(UTC) + timedelta(days=1), set())
     await db_session.commit()
