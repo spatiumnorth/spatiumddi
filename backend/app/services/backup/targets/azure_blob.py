@@ -46,10 +46,12 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
     describe_exc,
     safe_filename,
 )
@@ -206,7 +208,9 @@ class AzureBlobDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         blob_name = self._blob_name(config, filename)
 
         def _do() -> bytes:
@@ -218,7 +222,18 @@ class AzureBlobDestination(BackupDestination):
             client = self._container_client(config)
             try:
                 stream = client.get_blob_client(blob_name).download_blob()
-                return stream.readall()
+                # ``size`` is the blob's length from the response headers;
+                # refuse before reading when it is already past the cap,
+                # and count the chunks in case it is absent or wrong.
+                size = getattr(stream, "size", None)
+                if isinstance(size, int):
+                    check_size(filename, size, max_bytes)
+                out = bytearray()
+                for chunk in stream.chunks():
+                    out += chunk
+                    if max_bytes is not None and len(out) > max_bytes:
+                        raise ArchiveTooLargeError(filename, max_bytes)
+                return bytes(out)
             except ResourceNotFoundError as exc:
                 raise BackupDestinationError(
                     f"archive {filename!r} not found in container " f"{config['container']!r}"

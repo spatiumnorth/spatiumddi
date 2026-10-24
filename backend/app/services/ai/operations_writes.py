@@ -41,7 +41,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
-from app.services.ai.operations import Operation, PreviewResult, register
+from app.services.ai.operations import (
+    Operation,
+    PreviewResult,
+    enforce_operation_permission,
+    get_operation,
+    register,
+)
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
 # Re-declared here (tiny) rather than imported from the routers, so this
@@ -53,6 +59,16 @@ _CONFORMITY_TARGET_KINDS = frozenset(
 _CONFORMITY_BUILTIN_MUTABLE = frozenset(
     {"enabled", "eval_interval_hours", "severity", "fail_alert_rule_id", "description"}
 )
+
+
+def _enforce_declared_gate(user: User, name: str) -> None:
+    """Defense in depth: re-check the operation's declared gate inside its
+    own apply, so it holds even if the operation is dispatched outside the
+    apply endpoint (which enforces the same gate first)."""
+    op = get_operation(name)
+    if op is None:  # pragma: no cover — every caller names a registered op
+        raise ValueError(f"Operation {name!r} is not registered")
+    enforce_operation_permission(user, op)
 
 
 def _clip(text: str, n: int = 80) -> str:
@@ -128,6 +144,7 @@ async def _preview_create_conformity_policy(
 async def _apply_create_conformity_policy(
     db: AsyncSession, user: User, args: CreateConformityPolicyArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "create_conformity_policy")
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
 
     err = _validate_conformity_common(args)
@@ -226,6 +243,7 @@ async def _preview_update_conformity_policy(
 async def _apply_update_conformity_policy(
     db: AsyncSession, user: User, args: UpdateConformityPolicyArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "update_conformity_policy")
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
 
     p = await db.get(ConformityPolicy, args.policy_id)
@@ -301,6 +319,7 @@ async def _preview_evaluate_conformity_policy(
 async def _apply_evaluate_conformity_policy(
     db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "evaluate_conformity_policy")
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
     from app.services import alerts as alert_service  # noqa: PLC0415
     from app.services.conformity import evaluate_policy  # noqa: PLC0415
@@ -333,6 +352,7 @@ register(
         preview=_preview_create_conformity_policy,
         apply=_apply_create_conformity_policy,
         category="compliance",
+        required_permission=("admin", "conformity"),
     )
 )
 register(
@@ -343,6 +363,7 @@ register(
         preview=_preview_update_conformity_policy,
         apply=_apply_update_conformity_policy,
         category="compliance",
+        required_permission=("admin", "conformity"),
     )
 )
 register(
@@ -353,6 +374,7 @@ register(
         preview=_preview_evaluate_conformity_policy,
         apply=_apply_evaluate_conformity_policy,
         category="compliance",
+        required_permission=("admin", "conformity"),
     )
 )
 
@@ -637,6 +659,7 @@ register(
         preview=_preview_create_webhook,
         apply=_apply_create_webhook,
         category="webhooks",
+        requires_superadmin=True,
     )
 )
 register(
@@ -647,6 +670,7 @@ register(
         preview=_preview_update_webhook,
         apply=_apply_update_webhook,
         category="webhooks",
+        requires_superadmin=True,
     )
 )
 register(
@@ -657,6 +681,7 @@ register(
         preview=_preview_test_webhook,
         apply=_apply_test_webhook,
         category="webhooks",
+        requires_superadmin=True,
     )
 )
 
@@ -727,6 +752,7 @@ async def _preview_create_multicast_domain(
 async def _apply_create_multicast_domain(
     db: AsyncSession, user: User, args: CreateMulticastDomainArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "create_multicast_domain")
     from app.api.v1.multicast.router import (  # noqa: PLC0415
         _check_device,
         _check_vrf,
@@ -828,6 +854,7 @@ async def _preview_update_multicast_domain(
 async def _apply_update_multicast_domain(
     db: AsyncSession, user: User, args: UpdateMulticastDomainArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "update_multicast_domain")
     from app.models.multicast import MulticastDomain  # noqa: PLC0415
 
     row = await db.get(MulticastDomain, args.domain_id)
@@ -904,6 +931,7 @@ async def _preview_delete_multicast_domain(
 async def _apply_delete_multicast_domain(
     db: AsyncSession, user: User, args: DeleteMulticastDomainArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "delete_multicast_domain")
     from app.models.multicast import MulticastDomain  # noqa: PLC0415
 
     row = await db.get(MulticastDomain, args.domain_id)
@@ -932,6 +960,7 @@ register(
         preview=_preview_create_multicast_domain,
         apply=_apply_create_multicast_domain,
         category="multicast",
+        required_permission=("write", "multicast"),
     )
 )
 register(
@@ -942,6 +971,7 @@ register(
         preview=_preview_update_multicast_domain,
         apply=_apply_update_multicast_domain,
         category="multicast",
+        required_permission=("write", "multicast"),
     )
 )
 register(
@@ -952,6 +982,7 @@ register(
         preview=_preview_delete_multicast_domain,
         apply=_apply_delete_multicast_domain,
         category="multicast",
+        required_permission=("delete", "multicast"),
     )
 )
 
@@ -1106,6 +1137,7 @@ register(
         preview=_preview_sign_zone_dnssec,
         apply=_apply_sign_zone_dnssec,
         category="dns",
+        requires_superadmin=True,
     )
 )
 register(
@@ -1116,6 +1148,7 @@ register(
         preview=_preview_unsign_zone_dnssec,
         apply=_apply_unsign_zone_dnssec,
         category="dns",
+        requires_superadmin=True,
     )
 )
 
@@ -1297,6 +1330,7 @@ register(
         preview=_preview_set_zone_update_acl,
         apply=_apply_set_zone_update_acl,
         category="dns",
+        requires_superadmin=True,
     )
 )
 
@@ -1449,6 +1483,7 @@ register(
         preview=_preview_update_snmp_settings,
         apply=_apply_update_snmp_settings,
         category="admin",
+        requires_superadmin=True,
     )
 )
 register(
@@ -1459,6 +1494,7 @@ register(
         preview=_preview_update_ntp_settings,
         apply=_apply_update_ntp_settings,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -1612,6 +1648,7 @@ register(
         preview=_preview_update_syslog_settings,
         apply=_apply_update_syslog_settings,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -1882,6 +1919,7 @@ register(
         preview=_preview_commit_dns_import,
         apply=_apply_commit_dns_import,
         category="dns",
+        requires_superadmin=True,
     )
 )
 register(
@@ -1892,6 +1930,7 @@ register(
         preview=_preview_commit_dhcp_import,
         apply=_apply_commit_dhcp_import,
         category="dhcp",
+        requires_superadmin=True,
     )
 )
 
@@ -2027,6 +2066,7 @@ register(
         preview=_preview_commit_netbox_import,
         apply=_apply_commit_netbox_import,
         category="ipam",
+        requires_superadmin=True,
     )
 )
 

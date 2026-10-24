@@ -1313,6 +1313,20 @@ class PowerDNSDriver(DriverBase):
                 ),
             )
 
+        # Group blackhole (#2263): BIND9-only. The API refuses to set it on a
+        # group with a PowerDNS server; a value stored before that (or a
+        # server joining a group that holds one) is said out loud here.
+        blackhole = [str(a).strip() for a in (opts.get("blackhole") or []) if str(a).strip()]
+        if blackhole:
+            log.warning(
+                "powerdns_blackhole_unsupported",
+                blackhole=blackhole,
+                hint=(
+                    "PowerDNS authoritative cannot drop queries by client "
+                    "address; the group blackhole is not applied on this group."
+                ),
+            )
+
         # Issue #247 — blocklists. The BIND9 driver renders these as
         # RPZ zones + a `response-policy` directive in named.conf;
         # PowerDNS auth doesn't have an equivalent inline RPZ surface

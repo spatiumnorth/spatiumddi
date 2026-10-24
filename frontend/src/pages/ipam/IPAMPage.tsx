@@ -76,10 +76,12 @@ import {
   type CustomField,
   type IPAMTemplate,
   type DNSZone,
+  type EffectiveDdns,
   type FreeCidrRange,
   type Router as NetworkRouter,
   type VLAN,
   type DHCPLeaseSyncResult,
+  type DnsSyncCommitResult,
   type MacHistoryEntry,
   type NATMapping,
   type NetworkContextEntry,
@@ -1995,6 +1997,9 @@ export function DdnsSettingsSection({
   domainOverride,
   ttlText,
   subnetNetwork,
+  inherit,
+  effective,
+  onInheritChange,
   onEnabledChange,
   onPolicyChange,
   onDomainOverrideChange,
@@ -2005,6 +2010,11 @@ export function DdnsSettingsSection({
   domainOverride: string | null;
   ttlText: string;
   subnetNetwork?: string;
+  /** #2475 — a subnet inherits its DDNS unless it opts out. Without
+   *  `onInheritChange` the section is the old subnet-only form. */
+  inherit?: boolean;
+  effective?: EffectiveDdns | null;
+  onInheritChange?: (v: boolean) => void;
   onEnabledChange: (v: boolean) => void;
   onPolicyChange: (v: DdnsPolicy) => void;
   onDomainOverrideChange: (v: string | null) => void;
@@ -2031,7 +2041,30 @@ export function DdnsSettingsSection({
     return `dhcp-${octets[2]}-${octets[3]}`;
   })();
 
-  const disabled = !enabled;
+  // While inheriting, the controls show what the subnet resolves to (the
+  // parent's settings), read-only — never the subnet's own stored values,
+  // which are not the ones in force (#2475).
+  const inheriting = inherit === true && !!onInheritChange;
+  const shown = inheriting && effective ? effective : null;
+  const shownEnabled = inheriting ? (effective?.enabled ?? false) : enabled;
+  const shownPolicy = (shown?.hostname_policy as DdnsPolicy) ?? policy;
+  const shownOverride = inheriting
+    ? (shown?.domain_override ?? null)
+    : domainOverride;
+  const shownTtl = inheriting
+    ? shown?.ttl == null
+      ? ""
+      : String(shown.ttl)
+    : ttlText;
+  const sourceText = !effective
+    ? "the parent block or space"
+    : effective.source === "block"
+      ? `block ${effective.source_name ?? ""}`.trim()
+      : effective.source === "space"
+        ? `space ${effective.source_name ?? ""}`.trim()
+        : "the parent block or space";
+
+  const disabled = inheriting || !shownEnabled;
 
   return (
     <div className="space-y-2">
@@ -2040,30 +2073,51 @@ export function DdnsSettingsSection({
           <Network className="h-3.5 w-3.5 text-muted-foreground" />
           <span className="text-xs font-medium">Dynamic DNS (from DHCP)</span>
         </div>
-        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => onEnabledChange(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          Enabled
-        </label>
+        <div className="flex items-center gap-3">
+          {onInheritChange && (
+            <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={inherit === true}
+                onChange={(e) => onInheritChange(e.target.checked)}
+                className="h-3.5 w-3.5"
+              />
+              Inherit from parent
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={shownEnabled}
+              disabled={inheriting}
+              onChange={(e) => onEnabledChange(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            Enabled
+          </label>
+        </div>
       </div>
-      {!enabled && (
+      {inheriting && (
+        <p className="text-xs text-muted-foreground italic">
+          {effective
+            ? `Inheriting from ${sourceText}: DDNS is ${effective.enabled ? "enabled" : "disabled"}.`
+            : "Inheriting from the parent block or space."}
+        </p>
+      )}
+      {!shownEnabled && !inheriting && (
         <p className="text-xs text-muted-foreground italic">
           When enabled, DHCP leases in this subnet will publish A/AAAA + PTR
           records into the subnet's forward / reverse zones.
         </p>
       )}
-      {enabled && (
+      {shownEnabled && (
         <div className="space-y-2 pl-5 border-l-2 border-muted">
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Hostname policy
             </span>
             <select
-              value={policy}
+              value={shownPolicy}
               onChange={(e) => onPolicyChange(e.target.value as DdnsPolicy)}
               disabled={disabled}
               className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
@@ -2080,19 +2134,21 @@ export function DdnsSettingsSection({
               <option value="disabled">disabled — no DDNS records</option>
             </select>
           </label>
-          {preview && policy !== "client_provided" && policy !== "disabled" && (
-            <p className="text-[11px] text-muted-foreground">
-              Generated names look like{" "}
-              <code className="rounded bg-muted px-1">{preview}</code>.
-            </p>
-          )}
+          {preview &&
+            shownPolicy !== "client_provided" &&
+            shownPolicy !== "disabled" && (
+              <p className="text-[11px] text-muted-foreground">
+                Generated names look like{" "}
+                <code className="rounded bg-muted px-1">{preview}</code>.
+              </p>
+            )}
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Domain override (optional)
             </span>
             <input
               type="text"
-              value={domainOverride ?? ""}
+              value={shownOverride ?? ""}
               onChange={(e) =>
                 onDomainOverrideChange(e.target.value.trim() || null)
               }
@@ -2112,7 +2168,7 @@ export function DdnsSettingsSection({
             <input
               type="text"
               inputMode="numeric"
-              value={ttlText}
+              value={shownTtl}
               onChange={(e) => onTtlTextChange(e.target.value)}
               placeholder="300"
               disabled={disabled}
@@ -2570,7 +2626,14 @@ export function CreateSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
-  // DDNS state — subnet-only, no inheritance for MVP
+  // DDNS state — a new subnet inherits unless the operator opts out (#2475)
+  const [ddnsInherit, setDdnsInherit] = useState(true);
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-block", blockId],
+    queryFn: () => ipamApi.getEffectiveBlockDdns(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     "client_or_generated",
@@ -2637,6 +2700,8 @@ export function CreateSubnetModal({
       setCustomFields((prev) => ({ ...prev, ...v.customFields }));
     }
     if (v.ddns) {
+      // A template's DDNS is this subnet's own, as its DNS group is (#1304).
+      setDdnsInherit(false);
       setDdnsEnabled(v.ddns.enabled);
       setDdnsPolicy(v.ddns.policy);
       setDdnsDomainOverride(v.ddns.domainOverride);
@@ -2756,10 +2821,18 @@ export function CreateSubnetModal({
             }),
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -3070,6 +3143,9 @@ export function CreateSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -7341,7 +7417,7 @@ type DnsSyncScope =
   | { kind: "block"; id: string; label: string }
   | { kind: "space"; id: string; label: string };
 
-function DnsSyncModal({
+export function DnsSyncModal({
   scope,
   onClose,
 }: {
@@ -7405,21 +7481,18 @@ function DnsSyncModal({
   const [selMissing, setSelMissing] = useState<Set<string>>(new Set());
   const [selMismatched, setSelMismatched] = useState<Set<string>>(new Set());
   const [selStale, setSelStale] = useState<Set<string>>(new Set());
-  const [result, setResult] = useState<{
-    created: number;
-    updated: number;
-    deleted: number;
-    errors: string[];
-  } | null>(null);
+  const [result, setResult] = useState<DnsSyncCommitResult | null>(null);
 
-  // Default-select everything when the report first arrives so the common
-  // case (user wants to fix all drift) is one click. They can untick
-  // individual rows to skip suspected manual edits.
+  // Missing and mismatched rows start selected, so the common case (publish
+  // what IPAM expects) is one click; the operator can untick a row to skip a
+  // suspected manual edit. Stale rows start UNselected (#2577): each one is a
+  // permanent delete pushed to the DNS server, and a delete must be the
+  // operator's explicit choice, never the default a single Apply carries.
   useEffect(() => {
     if (!data) return;
     setSelMissing(new Set(data.missing.map((m) => missingKey(m))));
     setSelMismatched(new Set(data.mismatched.map((m) => m.record_id)));
-    setSelStale(new Set(data.stale.map((s) => s.record_id)));
+    setSelStale(new Set());
   }, [data]);
 
   const commitMut = useMutation({
@@ -7605,6 +7678,16 @@ function DnsSyncModal({
                 <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs">
                   Applied: {result.created} created · {result.updated} updated ·{" "}
                   {result.deleted} deleted
+                  {(result.skipped_stale_record_ids?.length ?? 0) > 0 && (
+                    <div className="mt-1 text-amber-700 dark:text-amber-400">
+                      {result.skipped_stale_record_ids!.length} stale record
+                      {result.skipped_stale_record_ids!.length === 1
+                        ? " was"
+                        : "s were"}{" "}
+                      not deleted: no longer stale in this scope. Re-check to
+                      see the current report.
+                    </div>
+                  )}
                   {result.errors.length > 0 && (
                     <div className="mt-1 text-destructive">
                       {result.errors.length} error
@@ -7701,7 +7784,7 @@ function DnsSyncModal({
               {data.stale.length > 0 && (
                 <DriftSection
                   title="Stale records"
-                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). Selecting will permanently delete them and push the delete to BIND."
+                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). None are selected by default: selecting one will permanently delete it and push the delete to the DNS server."
                   count={data.stale.length}
                   selected={selStale.size}
                   onToggleAll={() =>
@@ -8060,7 +8143,15 @@ export function EditSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     subnet.dhcp_server_group_id ?? null,
   );
-  // DDNS state — initialised from subnet
+  // DDNS state — initialised from subnet (#2475: inheritance is shown and kept)
+  const [ddnsInherit, setDdnsInherit] = useState(
+    subnet.ddns_inherit_settings ?? true,
+  );
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-subnet", subnet.id],
+    queryFn: () => ipamApi.getEffectiveSubnetDdns(subnet.id),
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(subnet.ddns_enabled ?? false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     subnet.ddns_hostname_policy ?? "client_or_generated",
@@ -8235,10 +8326,18 @@ export function EditSubnetModal({
         dns_split_horizon: dnsSplitHorizon,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -8340,7 +8439,8 @@ export function EditSubnetModal({
             <span>
               Any DHCP-leased addresses in this subnet and their auto-published
               DNS (DDNS) records will be revoked and removed. Manually-allocated
-              addresses are unaffected.
+              addresses go to Trash with the subnet, and the DNS records
+              published for them stop resolving until a superadmin restores it.
             </span>
           </div>
           {deleteError && (
@@ -8606,6 +8706,9 @@ export function EditSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -13915,7 +14018,7 @@ export function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {hasBlockFilter || hasTagFilter
+                  {hasBlockFilter || hasTagFilter || hasRoleFilter
                     ? "No results match the active filters."
                     : "This block has no child blocks or subnets yet."}
                 </p>

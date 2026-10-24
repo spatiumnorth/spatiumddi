@@ -331,6 +331,9 @@ describe("Saving with DNS off keeps the stored DNS linkage", () => {
       dns_zone_id: "z1",
       dns_additional_zone_ids: ["z2"],
       dns_split_horizon: true,
+      // #2475 — a subnet carrying its own DDNS has opted out of inheriting;
+      // while inheriting the dialog sends only the flag.
+      ddns_inherit_settings: false,
       ddns_enabled: true,
       ddns_hostname_policy: "client_provided",
       ddns_domain_override: "dyn.example.",

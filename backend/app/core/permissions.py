@@ -668,6 +668,46 @@ def require_any_permission(*pairs: tuple[str, str]) -> Callable[..., Awaitable[U
     return _dep
 
 
+def require_permission_or_scoped(
+    action: str,
+    resource_type: str,
+) -> Callable[..., Awaitable[User]]:
+    """Like :func:`require_permission`, but also admits a caller whose only
+    grant on ``resource_type`` is scoped to particular instances.
+
+    For routes whose handler narrows its own result to the instances the
+    caller may read (the agent-log reads, #2120). The unscoped check in
+    :func:`require_permission` refuses a grant scoped to one instance —
+    ``_resource_id_matches`` cannot match a scoped grant against an unscoped
+    question — so without this such a caller could never reach the handler
+    that would have served them their own instances. The handler is the
+    authoritative per-row gate; a route using this MUST narrow every row it
+    returns.
+
+    A resource-scoped API token (#374) must also carry a grant on the type.
+    """
+
+    async def _dep(
+        request: Request,
+        current_user: CurrentUser,
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        if user_has_permission(current_user, action, resource_type):
+            return current_user
+        if has_any_grant_for(current_user, action, resource_type):
+            token_grants = _token_grants_for(current_user)
+            if not token_grants or _token_grants_allow(token_grants, action, resource_type, None):
+                return current_user
+        await _record_denial(db, current_user, request, action, resource_type, None)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: need '{action}' on '{resource_type}'",
+        )
+
+    _dep.spatium_requires = ("exact", [(action, resource_type)])  # type: ignore[attr-defined]
+    return _dep
+
+
 # ── Router-level method → action mapper ────────────────────────────────────────
 #
 # Many routers have dozens of endpoints where the HTTP method already tells us
@@ -945,6 +985,7 @@ __all__ = [
     "require_any_permission",
     "require_any_resource_permission",
     "require_permission",
+    "require_permission_or_scoped",
     "require_resource_permission",
     "token_scope_allows",
     "token_scoped_resource_ids",

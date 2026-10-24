@@ -348,3 +348,20 @@ async def test_drift_does_not_report_an_a_alias_as_a_mismatched_host(
     report = await compute_subnet_dns_drift(db_session, uuid.UUID(sid))
     assert [m.current_name for m in report.mismatched] == []
     assert [s.name for s in report.stale] == []
+
+
+@pytest.mark.asyncio
+async def test_single_get_counts_aliases_like_the_list_2625(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2625 — GET /addresses/{id} answered alias_count 0 where the list said 1."""
+    headers, sid, _zone = await _setup(client, db_session)
+    r = await _alloc(
+        client, headers, sid, "10.98.5.14", "h1", aliases=[{"name": "www", "record_type": "A"}]
+    )
+    ip_id = r.json()["id"]
+    ips = await client.get(f"/api/v1/ipam/subnets/{sid}/addresses", headers=headers)
+    assert [a["alias_count"] for a in ips.json() if a["id"] == ip_id] == [1]
+    one = await client.get(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert one.status_code == 200, one.text
+    assert one.json()["alias_count"] == 1

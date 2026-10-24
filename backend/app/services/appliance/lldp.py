@@ -94,8 +94,8 @@ def render_lldpd_conf(settings: PlatformSettings) -> str:
 
     # Advertise the management address + capabilities (router/bridge/…) so the
     # appliance shows up usefully in upstream LLDP/NMS tables.
-    lines.append("configure lldp management-addresses-advertisements enable")
-    lines.append("configure lldp capabilities-advertisements enable")
+    lines.append("configure lldp management-addresses-advertisements")
+    lines.append("configure lldp capabilities-advertisements")
 
     # LLDP-MED ELIN location (issue #348) — Emergency Location Identification
     # Number, advertised to MED-capable endpoints (IP phones) for E911 routing.

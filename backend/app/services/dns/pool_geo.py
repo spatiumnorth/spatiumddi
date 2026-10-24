@@ -86,6 +86,7 @@ it later crosses into a different geo scope. Keep the pool TTL short.
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -334,6 +335,26 @@ def view_renders_zone(view_desc: dict[str, Any], operator_target_ids: set[Any]) 
         and bool(operator_target_ids)
         and view_desc["id"] not in operator_target_ids
     )
+
+
+def views_rendering_zone(
+    view_descs: list[dict[str, Any]],
+    zone_view_id: Any,
+    record_view_ids: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """The views (in render order) that carry a copy of one zone.
+
+    ``zone_view_id`` is the zone's own pinned view (or None) and
+    ``record_view_ids`` the views its view-scoped records name. The bundle
+    builder renders a zone stanza into exactly these views, and the #2275
+    collision guard counts placements from the same call, so the two cannot
+    disagree about where a zone lands. A group with no views (``view_descs``
+    empty) renders zones flat and is the caller's case to handle.
+    """
+    targets = {v for v in record_view_ids if v is not None}
+    if zone_view_id is not None:
+        targets.add(zone_view_id)
+    return [vd for vd in view_descs if view_renders_zone(vd, targets)]
 
 
 def records_for_view(
