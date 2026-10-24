@@ -8796,7 +8796,15 @@ async def k8s_get_pod_logs(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid identifier")
     tail = max(1, min(10_000, tail_lines))
 
-    path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log?tailLines={tail}"
+    # Context before the window, so a key the window starts inside is caught
+    # by its BEGIN line; trimmed to ``tail`` after redacting.
+    from app.services.support_bundle.scrub import (  # noqa: PLC0415
+        LOG_CONTEXT_LINES,
+        redact_log_tail,
+    )
+
+    requested = tail + LOG_CONTEXT_LINES
+    path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log?tailLines={requested}"
     if container:
         path += f"&container={container}"
 
@@ -8816,6 +8824,5 @@ async def k8s_get_pod_logs(
         )
     # Pod output can carry whatever the process printed; the same secret
     # redaction as the appliance's own log views applies.
-    from app.services.support_bundle.scrub import redact_secrets  # noqa: PLC0415
-
-    return PlainTextResponse(redact_secrets(body.decode("utf-8", errors="replace"))[0])
+    text = body.decode("utf-8", errors="replace")
+    return PlainTextResponse(redact_log_tail(text, tail, requested=requested))

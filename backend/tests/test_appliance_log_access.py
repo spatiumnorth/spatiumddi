@@ -282,3 +282,127 @@ def test_the_diagnostic_bundle_redacts_a_key_split_by_the_tail(
     for line in KEY_BODY:
         assert line not in pod_log
     assert "bundlepw" not in pod_log
+
+
+# ── One-shot windows that fall inside a key ─────────────────────────────
+#
+# A log that ends inside a private key (the process printed the BEGIN line
+# and part of the body, no END yet). A short window then holds body lines
+# and neither marker, so the one-shot views read back past the window.
+
+OPEN_KEY_BODY = tuple(
+    f"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAt{n:07d}" for n in range(10)
+)
+OPEN_KEY_LOG = "\n".join(
+    (
+        "starting",
+        "listening on 8080",
+        "worker ready",
+        "before",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        *OPEN_KEY_BODY,
+    )
+)
+ONE_SHOT = (
+    ("/api/v1/appliance/diagnostics/logs/syslog", "lines"),
+    ("/api/v1/appliance/containers/api-0/logs", "tail"),
+)
+
+
+def _stub_tail(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    """Sources that honour the requested line count, like the real ones."""
+    log_lines = text.split("\n")
+
+    def _last(n: int) -> str:
+        return "\n".join(log_lines[-n:])
+
+    monkeypatch.setattr(diagnostics_route, "read_log_tail", lambda _n, lines=500: _last(lines))
+    monkeypatch.setattr(
+        containers_route, "get_container_logs", lambda _n, tail=200: _last(tail) + "\n"
+    )
+
+
+@pytest.mark.parametrize("window", [5, 11, 14])
+@pytest.mark.parametrize(("path", "param"), ONE_SHOT)
+async def test_a_window_inside_an_unterminated_key_is_redacted(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    param: str,
+    window: int,
+) -> None:
+    _stub_tail(monkeypatch, OPEN_KEY_LOG)
+    headers = await _headers(db_session, "admin")
+    r = await client.get(path, params={param: window}, headers=headers)
+    assert r.status_code == 200, r.text
+    for line in OPEN_KEY_BODY:
+        assert line not in r.text, f"key body reached {path} with a {window}-line window"
+    assert "[REDACTED]:pem" in r.text
+    tail = r.json()["tail"]
+    assert len(tail.splitlines()) <= window
+
+
+@pytest.mark.parametrize(("path", "param"), ONE_SHOT)
+async def test_base64_lines_that_are_not_a_key_are_still_shown(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    param: str,
+) -> None:
+    ordinary = (
+        "image digest sha256 0123456789abcdef0123456789abcdef",
+        "QWxhZGRpbjpvcGVuIHNlc2FtZQ0123456789abcdef",
+        "token cache refreshed",
+        "ZGlzdHJpYnV0ZWQgY29uZmlnIGJsb2I0123456789",
+        "c2Vzc2lvbiByZXN1bWVkIGNsZWFubHk0123456789",
+    )
+    _stub_tail(monkeypatch, "\n".join(("boot", *ordinary)))
+    headers = await _headers(db_session, "admin")
+    r = await client.get(path, params={param: 5}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["tail"].splitlines() == list(ordinary)
+
+
+def test_a_tail_whose_key_began_before_the_context_is_dropped() -> None:
+    """When even the context starts inside a key, its leading body run goes."""
+    from app.services.support_bundle.scrub import redact_log_tail
+
+    text = "\n".join((*OPEN_KEY_BODY, "after the key"))
+    assert redact_log_tail(text, 3, requested=len(OPEN_KEY_BODY) + 1) == "after the key"
+    # The same text read whole (fewer lines than requested) is the start of
+    # the log, so nothing is dropped on that ground.
+    assert OPEN_KEY_BODY[-1] in redact_log_tail(text, 3, requested=100)
+
+
+def test_the_bundle_pod_log_is_read_with_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bundle's 500-line pod tail is read with context and trimmed after
+    redacting, like the one-shot views."""
+    import io
+    import zipfile
+    from types import SimpleNamespace
+
+    from app.services.appliance import diagnostics as diag_svc
+
+    # A log that ends inside a key, longer than the 500-line window.
+    log_lines = [f"line {n}" for n in range(1000)] + OPEN_KEY_LOG.split("\n")
+    requested: list[int] = []
+
+    def _logs(_n: str, tail: int = 500) -> str:
+        requested.append(tail)
+        return "\n".join(log_lines[-tail:])
+
+    monkeypatch.setattr(diag_svc, "list_log_sources", lambda: [])
+    monkeypatch.setattr(
+        diag_svc, "list_containers", lambda: [SimpleNamespace(name="api-0", is_spatium=True)]
+    )
+    monkeypatch.setattr(diag_svc, "get_container_logs", _logs)
+    monkeypatch.setattr(diag_svc, "run_self_test", lambda: None)
+    monkeypatch.setattr(diag_svc, "_format_self_test_report", lambda _r: "ok")
+    blob = diag_svc.generate_diagnostic_bundle()
+    pod_log = zipfile.ZipFile(io.BytesIO(blob)).read("pods/api-0.log").decode()
+    assert requested and requested[0] > 500
+    assert len(pod_log.splitlines()) <= 500
+    for line in OPEN_KEY_BODY:
+        assert line not in pod_log

@@ -540,6 +540,38 @@ def _redact_pem_fragments(text: str) -> tuple[str, int]:
     return "\n".join(out), hits
 
 
+# Extra lines a one-shot log view reads before its window. A window that
+# falls inside a private key holds body lines and neither marker, so it
+# cannot be recognised on its own; reading back far enough to reach the
+# BEGIN (a key spans at most ``_PEM_MAX_LINES``) lets the fragment pass see it.
+LOG_CONTEXT_LINES = _PEM_MAX_LINES
+
+
+def redact_log_tail(text: str, lines: int, *, requested: int) -> str:
+    """Redact a log tail read with :data:`LOG_CONTEXT_LINES` of context,
+    then trim it to its last ``lines`` lines.
+
+    ``text`` is the last ``requested`` lines of the log (``lines`` plus the
+    context). When it holds fewer, it is the whole log; otherwise it starts
+    mid-log, and a leading run of key-body lines is dropped too, since its
+    BEGIN lies even further back.
+    """
+    trailing = text.endswith("\n")
+    out = redact_secrets(text)[0].split("\n")
+    if trailing and out and out[-1] == "":
+        out.pop()
+    if len(text.splitlines()) >= requested:
+        skip = 0
+        while skip < len(out) and skip < _PEM_MAX_LINES and out[skip].strip():
+            if _PEM_REDACTED in out[skip] or not _pem_body_like(out[skip]):
+                break
+            skip += 1
+        out = out[skip:]
+    if lines > 0:
+        out = out[-lines:]
+    return "\n".join(out) + ("\n" if trailing and out else "")
+
+
 class LogStreamRedactor:
     """:func:`redact_secrets` for text that arrives one line at a time.
 

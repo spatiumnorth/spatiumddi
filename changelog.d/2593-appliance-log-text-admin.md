@@ -23,7 +23,11 @@
   ADO-style `Pwd=…;`, `PGPASSWORD=…`, a JSON or YAML `password` field),
   and an OpenPGP private key block. A private key whose text holds only
   its BEGIN or only its END line (a log tail that starts or stops inside
-  the key) loses the body lines next to that marker. The pod log streams
+  the key) loses the body lines next to that marker. The one-shot views
+  (the host log viewer, a pod's log fetch, the Fleet pod-log view and the
+  diagnostic bundle's pod tails) read back up to 256 lines before their
+  window and trim after redacting, so a window that falls wholly inside a
+  key, with neither marker in it, is still recognised and redacted. The pod log streams
   keep the redaction state between lines, since a key arrives one line at
   a time and was previously sent with only its BEGIN line replaced. The
   Fleet pod-log view (superadmin) is redacted the same way, and the

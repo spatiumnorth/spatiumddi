@@ -46,7 +46,13 @@ from app.services.appliance.containers import (
     get_container_logs,
     list_containers,
 )
-from app.services.support_bundle.scrub import redact_secrets, render_env, render_env_file
+from app.services.support_bundle.scrub import (
+    LOG_CONTEXT_LINES,
+    redact_log_tail,
+    redact_secrets,
+    render_env,
+    render_env_file,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -373,7 +379,12 @@ def generate_diagnostic_bundle() -> bytes:
                 if not c.is_spatium:
                     continue
                 try:
-                    logs = get_container_logs(c.name, tail=500)
+                    # Context before the 500-line window, so a key the
+                    # window starts inside is caught by its BEGIN line.
+                    requested = 500 + LOG_CONTEXT_LINES
+                    logs = redact_log_tail(
+                        get_container_logs(c.name, tail=requested), 500, requested=requested
+                    )
                 except DockerUnavailableError as exc:
                     logs = f"[unable to fetch logs: {exc}]"
                 _put(zf, f"pods/{c.name}.log", logs)

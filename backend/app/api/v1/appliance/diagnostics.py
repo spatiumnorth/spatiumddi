@@ -28,7 +28,7 @@ from app.services.appliance.diagnostics import (
     run_self_test,
     self_test_report_to_dict,
 )
-from app.services.support_bundle.scrub import redact_secrets
+from app.services.support_bundle.scrub import LOG_CONTEXT_LINES, redact_log_tail
 
 logger = structlog.get_logger(__name__)
 
@@ -58,7 +58,10 @@ async def get_log(name: str, lines: int = 500) -> dict[str, str | int]:
     if lines < 1 or lines > 5000:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "lines must be between 1 and 5000")
     try:
-        text = read_log_tail(name, lines=lines)
+        # Read back past the window so a key that the window starts inside
+        # is recognised by its BEGIN line, then trim after redacting.
+        requested = lines + LOG_CONTEXT_LINES
+        text = read_log_tail(name, lines=requested)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if not text:
@@ -69,7 +72,11 @@ async def get_log(name: str, lines: int = 500) -> dict[str, str | int]:
             status.HTTP_404_NOT_FOUND,
             f"log '{name}' not found or empty",
         )
-    return {"name": name, "lines": lines, "tail": redact_secrets(text)[0]}
+    return {
+        "name": name,
+        "lines": lines,
+        "tail": redact_log_tail(text, lines, requested=requested),
+    }
 
 
 @router.post(

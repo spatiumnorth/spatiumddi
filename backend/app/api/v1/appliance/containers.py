@@ -36,7 +36,11 @@ from app.services.appliance.containers import (
 from app.services.appliance.containers import (
     list_containers as svc_list_containers,
 )
-from app.services.support_bundle.scrub import LogStreamRedactor, redact_secrets
+from app.services.support_bundle.scrub import (
+    LOG_CONTEXT_LINES,
+    LogStreamRedactor,
+    redact_log_tail,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -128,10 +132,13 @@ async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
     if tail < 1 or tail > 5000:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "tail must be between 1 and 5000")
     try:
-        text = get_container_logs(name, tail=tail)
+        # Read back past the window so a key the window starts inside is
+        # recognised by its BEGIN line; trimmed to ``tail`` after redacting.
+        requested = tail + LOG_CONTEXT_LINES
+        text = get_container_logs(name, tail=requested)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
-    return {"name": name, "tail": redact_secrets(text)[0]}
+    return {"name": name, "tail": redact_log_tail(text, tail, requested=requested)}
 
 
 _END = object()
