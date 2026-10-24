@@ -67,6 +67,10 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.legacy_columns import (
+    fold_dropped_plaintext_columns,
+    selective_readd_sql,
+)
 from app.services.backup.migrations import (
     MigrationOutcome,
     maybe_upgrade_after_restore,
@@ -768,6 +772,10 @@ def _selective_prelude(tables: list[str]) -> str:
         + _REFUSE_A_WIDER_CASCADE_SQL.format(tables=array)
         + f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE;\n"
         + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=array)
+        # An archive taken before a contract migration still names the
+        # columns it dropped; put them back so its COPY loads. The restore
+        # folds and drops them again after the migration step.
+        + selective_readd_sql(tables)
     )
 
 
@@ -1366,6 +1374,23 @@ async def _apply_backup_restore_inner(
             error=f"migration step aborted: {exc}",
         )
 
+    # Phase 6b: a selective restore of an archive taken before a contract
+    # migration re-added the plaintext secret columns that migration dropped
+    # (see ``_selective_prelude``). Encrypt whatever they hold into their
+    # empty ``*_encrypted`` columns and drop them again. Before the rewrap:
+    # the values are encrypted under this install's key, which the rewrap
+    # recognises and leaves alone. Non-fatal, like the steps around it.
+    fold_warning: str | None = None
+    try:
+        await fold_dropped_plaintext_columns(db_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("backup_restore_legacy_plaintext_fold_failed", error=str(exc))
+        fold_warning = (
+            "Plaintext columns from an older archive could not be folded into "
+            f"their encrypted columns ({exc}). They are not read by the "
+            "application; re-run the restore once the cause is fixed."
+        )
+
     # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and
     # re-encrypts with the destination install's key. No-op when
@@ -1458,6 +1483,8 @@ async def _apply_backup_restore_inner(
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
+    if fold_warning:
+        post_warnings.append(fold_warning)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
