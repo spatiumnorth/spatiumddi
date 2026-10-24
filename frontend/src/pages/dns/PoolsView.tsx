@@ -1,6 +1,7 @@
 import { poolDeleteSummary } from "@/lib/pool-delete-copy";
 import { useState } from "react";
 import { humanTime } from "../network/_shared";
+import { memberCheckCell } from "@/lib/pool-health";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -325,6 +326,7 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
     ) : (
       <Clock className="h-3.5 w-3.5 text-amber-500" />
     );
+  const staleCell = memberCheckCell(member);
   const scoped =
     (member.serving_cidrs?.length ?? 0) > 0 || member.site_id != null;
   const scopeTitle = scoped
@@ -357,7 +359,18 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
         </div>
       </td>
       <td className="py-1.5 text-muted-foreground">
-        {member.last_check_at ? humanTime(member.last_check_at) : "—"}
+        {staleCell.stale ? (
+          <span
+            className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-600"
+            title={staleCell.title}
+          >
+            {staleCell.text}
+          </span>
+        ) : member.last_check_at ? (
+          humanTime(member.last_check_at)
+        ) : (
+          "—"
+        )}
       </td>
       <td
         className="max-w-md truncate py-1.5 text-muted-foreground"

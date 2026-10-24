@@ -2033,6 +2033,21 @@ holds only PTRs.
 > `ttl` seconds. Keep the TTL short (default 30 s). See the
 > **TTL-race caveat** below.
 
+**Pools fail open on a stopped health checker
+([#2312](https://github.com/spatiumnorth/spatiumddi/issues/2312)).** A
+member renders while it is enabled and its last verdict is `healthy`; the
+verdict has no expiry. If the health-check task stops running (the `dns`
+queue backed up, a worker down), a member that last checked healthy keeps
+being answered even if it has since died, because withdrawing every member
+would be an outage of its own. This is deliberate and unchanged. What is
+added is visibility: a verdict older than 3 x the pool's check interval
+(the task's floor of 30 s applies) is **stale**. The members table shows
+`stale · 4h ago` instead of a bare time, the API reports `check_stale` and
+`check_age_seconds` per member, and the default-on `dns_pool_health_stale`
+alert (warning, one event per pool) fires and resolves when the pool is
+checked again. Disabled pools and members are not checked on purpose and
+never count as stale.
+
 ### 17.1 Serving scope — steering one name to the nearest datacenter
 
 By default every client gets the same healthy rrset. **Geo steering**
