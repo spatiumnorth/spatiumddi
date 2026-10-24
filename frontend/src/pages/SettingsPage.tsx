@@ -88,6 +88,7 @@ function Field({
 
 type SectionId =
   | "branding"
+  | "data-retention"
   | "dns"
   | "dns-auto-sync"
   | "reverse-dns"
@@ -165,6 +166,14 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "env_banner_bg",
     "env_banner_fg",
     "env_banner_position",
+  ],
+  "data-retention": [
+    "log_retention_hours",
+    "metric_retention_days",
+    "dhcp_lease_history_retention_days",
+    "soft_delete_purge_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
   ],
   dns: [
     "dns_default_ttl",
@@ -446,6 +455,125 @@ function OUIRefreshModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+// #2273 — every window a nightly prune task reads. Ranges mirror the
+// server-side limits in ``SettingsUpdate``; the API rejects anything outside
+// them with a 422. ``offAtZero`` rows treat 0 as "never delete".
+type RetentionKey =
+  | "soft_delete_purge_days"
+  | "dhcp_lease_history_retention_days"
+  | "pcap_retention_days"
+  | "appliance_revoked_retention_days"
+  | "metric_retention_days"
+  | "log_retention_hours";
+
+const RETENTION_ROWS: {
+  key: RetentionKey;
+  label: string;
+  description: string;
+  unit: "days" | "hours";
+  min: number;
+  max: number;
+  fallback: number;
+}[] = [
+  {
+    key: "log_retention_hours",
+    label: "DNS query & DHCP activity logs",
+    description:
+      "Agent-shipped query and activity log rows. 1–168 hours. Capped at a week: the nightly prune is one DELETE, and a longer window makes it larger. Ship to Loki or a SIEM for longer history.",
+    unit: "hours",
+    min: 1,
+    max: 168,
+    fallback: 24,
+  },
+  {
+    key: "metric_retention_days",
+    label: "DNS & DHCP metrics",
+    description:
+      "Per-server metric samples behind the dashboard charts. 1–365 days. InfluxDB export can only backfill what is still inside this window.",
+    unit: "days",
+    min: 1,
+    max: 365,
+    fallback: 7,
+  },
+  {
+    key: "dhcp_lease_history_retention_days",
+    label: "DHCP lease history",
+    description:
+      "Expired and released lease records. 0–3650 days; 0 keeps them forever.",
+    unit: "days",
+    min: 0,
+    max: 3650,
+    fallback: 90,
+  },
+  {
+    key: "soft_delete_purge_days",
+    label: "Trash",
+    description:
+      "Deleted IPAM / DNS / DHCP items stay restorable this long, then are purged for good. 0–365 days; 0 turns the purge off.",
+    unit: "days",
+    min: 0,
+    max: 365,
+    fallback: 30,
+  },
+  {
+    key: "pcap_retention_days",
+    label: "Packet captures",
+    description:
+      "Finished captures and their .pcap files. 1–90 days. Captures can hold plaintext credentials, so there is no keep-forever option.",
+    unit: "days",
+    min: 1,
+    max: 90,
+    fallback: 7,
+  },
+  {
+    key: "appliance_revoked_retention_days",
+    label: "Deleted appliances",
+    description:
+      "Fleet rows in the revoked state before they are removed for good. 0–365 days; 0 keeps them until you permanently delete them.",
+    unit: "days",
+    min: 0,
+    max: 365,
+    fallback: 30,
+  },
+];
+
+function DataRetentionSection({
+  values,
+  set,
+  isSuperadmin,
+  inputCls,
+}: {
+  values: PlatformSettings;
+  set: <K extends keyof PlatformSettings>(
+    key: K,
+    value: PlatformSettings[K],
+  ) => void;
+  isSuperadmin: boolean;
+  inputCls: string;
+}) {
+  return (
+    <>
+      {RETENTION_ROWS.map((row) => (
+        <Field key={row.key} label={row.label} description={row.description}>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={row.min}
+              max={row.max}
+              value={values[row.key] ?? row.fallback}
+              onChange={(e) => set(row.key, Number(e.target.value))}
+              disabled={!isSuperadmin}
+              aria-label={row.label}
+              className={cn(inputCls, "w-24")}
+            />
+            <span className="text-xs text-muted-foreground">{row.unit}</span>
+          </div>
+        </Field>
+      ))}
+    </>
+  );
+}
+
 function OUILookupSection({
   values,
   set,
@@ -691,6 +819,29 @@ const SECTIONS: SectionDef[] = [
       "base",
       "saml",
       "oidc",
+    ],
+  },
+  {
+    id: "data-retention",
+    title: "Data Retention",
+    group: "Application",
+    description:
+      "How long SpatiumDDI keeps what it collects: query and activity logs, metrics, lease history, trash, packet captures, and deleted appliances. A nightly sweep deletes anything older. Audit log entries are never pruned.",
+    keywords: [
+      "retention",
+      "retain",
+      "prune",
+      "purge",
+      "keep",
+      "history",
+      "logs",
+      "query log",
+      "metrics",
+      "trash",
+      "pcap",
+      "lease history",
+      "disk",
+      "storage",
     ],
   },
   {
@@ -2419,6 +2570,15 @@ export function SettingsPage() {
                     </Field>
                   )}
               </>
+            )}
+
+            {activeId === "data-retention" && (
+              <DataRetentionSection
+                values={values}
+                set={set}
+                isSuperadmin={isSuperadmin}
+                inputCls={inputCls}
+              />
             )}
 
             {activeId === "session" && (
