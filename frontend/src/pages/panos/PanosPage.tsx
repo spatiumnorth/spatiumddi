@@ -1131,9 +1131,10 @@ function DeleteFirewallModal({
           <span className="font-semibold">{firewall.name}</span>? This only
           affects SpatiumDDI — nothing on the PAN-OS side changes. If active
           block sync is armed, disarm it first (that lifts the pushed blocks
-          from the device); delete is refused while it is armed. All IPAM rows
-          mirrored from this firewall (subnets + addresses) will be removed via
-          the FK cascade.
+          from the device); delete is refused while it is armed. Only rows that
+          were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

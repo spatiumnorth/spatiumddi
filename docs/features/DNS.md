@@ -285,10 +285,20 @@ registrar still points at the old group's, so issuance fails until repointed.
 applied at. It is auto-elected on create and on first agent registration when
 the group has none; send `is_primary: true` on the same PUT to move it, which
 demotes whichever server currently holds it. **Clearing the last primary is
-refused (422)** — it re-creates the footgun the auto-election exists to
-prevent, and the resulting dropped writes are silent (a log line; no error
-reaches whoever made the change). Promote a replacement instead; that demotes
-the incumbent as a side effect.
+refused (422)** — it would not stick, because a group without a primary has
+one re-elected automatically (below). Promote a replacement instead; that
+demotes the incumbent as a side effect.
+
+**Deleting the primary elects a successor (#2276)** in the same transaction:
+the oldest enabled, unpaused survivor, or any survivor if every one is disabled
+or paused. Revoking an appliance that owned the primary does the same. The
+delete's audit row names the server elected. A group that is still left with
+no primary (one that lost it on an older build) keeps receiving record writes:
+agent-based groups fan out to every enabled server regardless, an agentless
+group writes through the server the election would pick, and a 60 s beat
+sweep marks that server primary. Only a group with no servers at all queues
+nothing, and nothing is lost there: a server added later receives the zone's
+records in its bundle.
 
 ### Control-plane memory for large groups (#2227)
 
@@ -840,6 +850,8 @@ On lease expiry, `dhcp_lease_cleanup` sweeps the DHCPLease row past its grace pe
 ### Subnet-level configuration
 
 DDNS is opt-in per subnet. A subnet can also inherit its DDNS settings from its enclosing block / space: `IPSpace` and `IPBlock` carry the same four DDNS fields, and when `ddns_inherit_settings` is true `resolve_effective_ddns` (in `backend/app/services/dns/ddns.py`) walks subnet → block → space to find the effective values.
+
+The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle like the DNS and DHCP tabs. While it is ticked the tab shows what the subnet resolves to and from where (read-only, from `GET /ipam/subnets/{id}/effective-ddns`, or `GET /ipam/blocks/{id}/effective-ddns` for a subnet that does not exist yet), and a Save sends only `ddns_inherit_settings`, so it keeps the inheritance. Unticking it shows the subnet's own settings.
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -2762,6 +2774,18 @@ got through.
 > `allow_transfer` (#734) and `forward_policy` (#899): a setting that is
 > stored, shipped, and rendered nowhere. The lesson from §8.2 applies
 > unchanged — **assert on the rendered config, not the stored row**.
+
+### 21.1 Reading a whole group at once (issue #2120)
+
+A group behind one load-balanced address spreads a client's queries
+across its servers, so "did this client ask for this name?" has no
+single-server answer. Logs → DNS Queries therefore reads one server, one
+server group, or every server: `POST /logs/dns-queries` and
+`/logs/dns-queries/analytics` take an optional `server_id` and an
+optional `group_id`, each row names the server that logged it, and the
+analytics roll up across the selection. The selection is always narrowed
+to the servers the caller may read. See
+[`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
 
 ---
 

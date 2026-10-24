@@ -447,6 +447,17 @@ export interface ProbePolicy {
   inherited: boolean;
 }
 
+/** What a subnet's DDNS resolves to and where from (#2475). */
+export interface EffectiveDdns {
+  enabled: boolean;
+  hostname_policy: DdnsHostnamePolicy;
+  domain_override: string | null;
+  ttl: number | null;
+  source: "subnet" | "block" | "space" | "none";
+  source_id: string | null;
+  source_name: string | null;
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -520,6 +531,9 @@ export interface DnsSyncCommitResult {
   updated: number;
   deleted: number;
   errors: string[];
+  // #2577 — stale record IDs sent for deletion that the scope's own drift
+  // report no longer lists. The server ignored them; none were deleted.
+  skipped_stale_record_ids?: string[];
 }
 
 export interface DnsSyncSummary {
@@ -1554,6 +1568,14 @@ export const ipamApi = {
   getEffectiveSubnetDns: (subnetId: string) =>
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
+      .then((r) => r.data),
+  getEffectiveBlockDdns: (blockId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)
+      .then((r) => r.data),
+  getEffectiveSubnetDdns: (subnetId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/subnets/${subnetId}/effective-ddns`)
       .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
     api
@@ -5791,6 +5813,10 @@ export interface ZoneServerStateEntry {
   reported_at: string | null;
   // #2042 — ops for this zone the server has not acknowledged yet.
   pending_ops: number;
+  // #2316 — `ok` counts; `unreachable` (server not active) never counts as in
+  // sync; `paused` (maintenance) is excluded from the count.
+  freshness: "ok" | "unreachable" | "paused";
+  counted: boolean;
 }
 
 export interface ZoneServerState {
@@ -10167,11 +10193,34 @@ export interface AgentLogSource {
   server_kind: "dns" | "dhcp";
   driver: string;
   host: string;
+  /** Server group (#2120). `null` for a DHCP server in no group. */
+  group_id?: string | null;
+  group_name?: string | null;
+}
+
+/**
+ * Scope of an agent-log read (#2120): `server_id` → that server,
+ * `group_id` → every server in the group, neither → every server the
+ * caller may read. The server always narrows to what the caller may read.
+ */
+export interface AgentLogScope {
+  server_id?: string | null;
+  group_id?: string | null;
+}
+
+/** Echoed scope + the servers a read actually covered (#2120). */
+export interface AgentLogScopeEcho {
+  server_id: string | null;
+  group_id: string | null;
+  server_ids: string[];
 }
 
 export interface DNSQueryLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   client_ip: string | null;
   client_port: number | null;
   qname: string | null;
@@ -10190,8 +10239,7 @@ export interface DNSQueryLogRow {
   raw: string;
 }
 
-export interface DNSQueryLogRequest {
-  server_id: string;
+export interface DNSQueryLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -10204,8 +10252,7 @@ export interface DNSQueryLogRequest {
   max_events?: number;
 }
 
-export interface DNSQueryLogResponse {
-  server_id: string;
+export interface DNSQueryLogResponse extends AgentLogScopeEcho {
   events: DNSQueryLogRow[];
   truncated: boolean;
 }
@@ -10213,6 +10260,9 @@ export interface DNSQueryLogResponse {
 export interface DHCPActivityLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   severity: string | null;
   code: string | null;
   mac_address: string | null;
@@ -10221,8 +10271,7 @@ export interface DHCPActivityLogRow {
   raw: string;
 }
 
-export interface DHCPActivityLogRequest {
-  server_id: string;
+export interface DHCPActivityLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -10233,8 +10282,7 @@ export interface DHCPActivityLogRequest {
   max_events?: number;
 }
 
-export interface DHCPActivityLogResponse {
-  server_id: string;
+export interface DHCPActivityLogResponse extends AgentLogScopeEcho {
   events: DHCPActivityLogRow[];
   truncated: boolean;
 }
@@ -10246,15 +10294,13 @@ export interface DNSQueryAnalyticsRow {
   count: number;
 }
 
-export interface DNSQueryAnalyticsRequest {
-  server_id: string;
+export interface DNSQueryAnalyticsRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   limit?: number;
 }
 
-export interface DNSQueryAnalyticsResponse {
-  server_id: string;
+export interface DNSQueryAnalyticsResponse extends AgentLogScopeEcho {
   since: string | null;
   until: string | null;
   total_queries: number;
@@ -10554,12 +10600,12 @@ export const API_TOKEN_SCOPES: {
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
   },
   {
     value: "dhcp:write",
@@ -11050,6 +11096,8 @@ export interface IntegrationsDashboardTargetRow {
   // #797 — non-fatal findings; null for integrations that don't compute them.
   last_sync_warning: string | null;
   is_stale: boolean;
+  // #2221 — false: switched off, so last_sync_error is history, not a problem.
+  enabled?: boolean;
   // #2138 — credential health; null for integrations that record no expiry.
   credential_state: CredentialState | null;
   credential_expires_at: string | null;
@@ -11064,6 +11112,8 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2221 — switched-off targets, counted outside the live buckets above.
+  disabled_count?: number;
   // #2192 — over every target, not the capped `targets` list.
   problem_count?: number;
   credential_dead_count?: number;
@@ -11082,6 +11132,9 @@ export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
   recent_errors: IntegrationsDashboardErrorRow[];
+  // #2577 — rows a sync released outside its target's IP space; same shape,
+  // `error_detail` carries what was released. Absent from older servers.
+  recent_warnings?: IntegrationsDashboardErrorRow[];
 }
 
 // Security dashboard tab (#109)
@@ -16548,6 +16601,11 @@ export interface NmapScanRead {
   id: string;
   target_ip: string;
   ip_address_id: string | null;
+  /** IP space of the IPAM row the scan was launched from (#2577) — where
+   *  stamp-discovered writes when no space is named. Single-scan GET and the
+   *  scan list both carry it. */
+  ip_space_id?: string | null;
+  ip_space_name?: string | null;
   preset: NmapPreset;
   port_spec: string | null;
   extra_args: string | null;
@@ -16612,8 +16670,11 @@ export const nmapApi = {
    *  Existing rows in ``available`` / ``discovered`` get bumped to
    *  ``discovered``; integration / operator-owned rows get a
    *  ``last_seen`` stamp only. New rows land as ``discovered``.
+   *  ``spaceId`` picks the IP space; without it the scan's own IPAM row
+   *  space is used, and with neither, hosts that fall in subnets of more
+   *  than one space are skipped as ambiguous.
    *  Returns counters for the UI to render. */
-  stampDiscovered: (scanId: string) =>
+  stampDiscovered: (scanId: string, spaceId?: string) =>
     api
       .post<{
         created: number;
@@ -16621,7 +16682,19 @@ export const nmapApi = {
         refreshed: number;
         skipped_no_subnet: number;
         skipped_addresses: string[];
-      }>(`/nmap/scans/${scanId}/stamp-discovered`)
+        /** Hosts inside subnets of several IP spaces, skipped because no
+         *  space was chosen (#2577). */
+        skipped_ambiguous: string[];
+        /** The space hosts were stamped into and why (``requested`` /
+         *  ``scan_ip_row``); null when no single space applied (#2577). */
+        space_used: {
+          id: string;
+          name: string;
+          source: "requested" | "scan_ip_row";
+        } | null;
+      }>(`/nmap/scans/${scanId}/stamp-discovered`, null, {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
       .then((r) => r.data),
   // SECURITY (#400, M8): the SSE stream is consumed via `streamScan`
   // (fetch + ReadableStream) so the access token rides the

@@ -140,6 +140,25 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Autonomous-system records with RDAP holder + RPKI ROA enrichment.",
         default_enabled=False,
     ),
+    # Default-OFF (#1069), with ``default_on_if_rows_in`` (#2325). A Domain row
+    # triggers off-prem RDAP lookups, so a fresh install ships with the module
+    # off and makes no such call. But Domains was ungated before this module
+    # existed, so an upgraded install already tracking registrations has rows
+    # and no ``feature_module`` row (a migration may not seed one). The same
+    # shape as ``ipam.nat`` (#2100) covers that: with no operator override the
+    # module resolves ON iff ``domain`` holds a row, so those pages and the
+    # expiry tracking keep working. Consequence, stated rather than hidden:
+    # an operator who wants zero egress on an upgraded install turns it off
+    # explicitly (a row wins), and on a fresh install enables it to create
+    # the first Domain (docs/PRIVACY.md §3.3).
+    ModuleSpec(
+        id="network.domains",
+        label="Domains",
+        group="Network",
+        description="Domain registration records — registrar, expiry, DNSSEC and nameserver drift. Each row is refreshed from public RDAP registries (an off-prem lookup of the domain name) on creation and every 24 h. Off on a fresh install (nothing is sent), but on by default wherever Domain records already exist; turn this off to stop all of that traffic and hide the Domains pages and API.",
+        default_enabled=False,
+        default_on_if_rows_in="domain",
+    ),
     ModuleSpec(
         id="network.circuit",
         label="Circuits",

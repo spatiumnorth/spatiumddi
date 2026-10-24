@@ -124,7 +124,21 @@ survivable. Only an override that declares its OWN ``podAntiAffinity``
 key wins — that one is an explicit opt-out, and merging the two would
 render a duplicate key.
 
-Nothing is spread below 2 replicas (nothing to spread).
+Nothing is spread below 2 replicas (nothing to spread), unless the pods run
+on the host network (below).
+
+``hostNetwork`` (optional, the frontend's) renders the spread at ONE replica
+too (#2450). A host-network pod binds its ports on the node itself, so a
+second pod of the component can never share its node anyway, and the term
+changes nothing about where a lone replica can run. What it changes is the
+first promotion: the supervisor raises the replicas from 1 to the node count
+and nothing else, and a term that appeared only above one replica changed the
+pod template there, so the frontend rolled, and it retires its old pod first.
+The seed's one frontend pod, holding the node's ports 80 and 443, went before
+its replacement could bind them, and the seed refused connections while the
+browser that drives the promotion was on it. With the term in place at one
+replica the promotion is a scale-up: the seed's pod keeps serving and the new
+pods start on the new nodes. (A demote is the same scale, the other way.)
 
 #590 — api/worker/frontend previously defaulted to no affinity at all,
 so a 3-node cluster could (and did) land 3 of 4 api pods on the seed.
@@ -195,7 +209,8 @@ strategy:
 {{- define "spatiumddi.podAntiAffinity" -}}
 {{- $mode := default "soft" .mode -}}
 {{- $affinity := deepCopy (default (dict) .override) -}}
-{{- if and (gt (int .replicas) 1) (ne $mode "none") (not (hasKey $affinity "podAntiAffinity")) -}}
+{{- $spread := or (gt (int .replicas) 1) (get . "hostNetwork") -}}
+{{- if and $spread (ne $mode "none") (not (hasKey $affinity "podAntiAffinity")) -}}
   {{- $selector := dict "matchLabels" (include "spatiumddi.componentSelectorLabels" . | fromYaml) -}}
   {{- $term := dict "labelSelector" $selector "topologyKey" "kubernetes.io/hostname" -}}
   {{- if eq $mode "hard" -}}
