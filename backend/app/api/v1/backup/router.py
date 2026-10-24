@@ -390,6 +390,7 @@ async def restore_backup(
                     # the widening restored tables outside the selection.
                     "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
+                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
                 },
             )
         )

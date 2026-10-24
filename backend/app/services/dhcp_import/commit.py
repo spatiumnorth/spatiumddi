@@ -41,6 +41,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.services.dhcp.class_refs import reserved_name_reason
 from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import rekey_raw_options
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
@@ -449,13 +450,24 @@ async def _commit_client_classes(
     source: ImportSource,
     now: datetime,
     current_user: User,
+    warnings: list[str],
 ) -> int:
     """Create the supported client classes group-wide, skipping any that
     already exist by name and any flagged unsupported (manual review).
-    Each class commits in its own savepoint."""
+    Each class commits in its own savepoint.
+
+    A class whose name is reserved (``reserved_name_reason``: Kea built-ins
+    such as ``DROP``, Kea's own prefixes, and names SpatiumDDI generates) is
+    never created, and the skip is reported in ``warnings``. The check sits
+    here rather than only in the parsers because the commit takes the
+    preview from the request body.
+    """
     created = 0
     for cc in preview.client_classes:
         if not cc.supported:
+            continue
+        if (reason := reserved_name_reason(cc.name)) is not None:
+            warnings.append(f"Client class '{cc.name}' was not imported: {reason}.")
             continue
         try:
             existing = (
@@ -602,6 +614,7 @@ async def commit_import(
         source=preview.source,
         now=now,
         current_user=current_user,
+        warnings=warnings,
     )
 
     return CommitResult(

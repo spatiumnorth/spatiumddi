@@ -1731,10 +1731,11 @@ async def test_address_owned_by_other_integration_is_not_inserted_again(
 async def test_own_row_is_not_moved_onto_another_integrations_row(
     db_session: AsyncSession,
 ) -> None:
-    """Our row for a VM sits in a subnet that no longer encloses it for
-    this node, and the subnet that does already has a UniFi row at the
-    address. The move would collide; the row stays put and the sweep
-    still commits."""
+    """Our row for a VM sits in a subnet of ANOTHER space, and the node's
+    own space already has a UniFi row at the address. Since #2577 a row in
+    another space is never moved: as a pure mirror row of the node's it is
+    released (deleted) in place, the sync reports it, the UniFi row is not
+    claimed, and the sweep still commits."""
     space = await _make_space(db_session)
     node = await _make_node(db_session, space)
     _sub, unifi_row = await _make_lan_with_unifi_row(db_session, space, "10.0.0.50")
@@ -1759,15 +1760,16 @@ async def test_own_row_is_not_moved_onto_another_integrations_row(
     db_session.add(own_row)
     await db_session.commit()
 
+    own_row_id = own_row.id
+
     fake = _FakeClient(
         networks=_LAN_BRIDGE, qemu={"pve01": [_vm(100, "BC:24:11:E8:4A:3F", "10.0.0.50")]}
     )
     with _patch_client(fake):
         summary = await reconcile_node(db_session, node)
     assert summary.ok, summary.error
-    assert any("not moving" in w for w in summary.warnings)
+    assert any("released what this target owned outside" in w for w in summary.warnings)
 
-    await db_session.refresh(own_row)
+    assert await db_session.get(IPAddress, own_row_id, populate_existing=True) is None
     await db_session.refresh(unifi_row)
-    assert own_row.subnet_id == old_sub.id
     assert unifi_row.proxmox_node_id is None

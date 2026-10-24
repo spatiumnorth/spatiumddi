@@ -47,11 +47,13 @@ from app.core.auth.user_sync import (
     sync_external_user,
 )
 from app.core.auth_throttle import (
+    claim_login_attempt,
     login_rate_limited,
     mfa_challenge_consume,
     mfa_challenge_spent,
     record_mfa_challenge_failure,
     record_stepup_password_failure,
+    refund_login_attempt,
     refund_stepup_attempt,
 )
 from app.core.demo_mode import forbid_in_demo_mode
@@ -578,6 +580,18 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many login attempts. Try again shortly.",
         )
+    # Failed-password ceilings per submitted username and across the install,
+    # which no choice of source address escapes. Spent before the password is
+    # checked and refunded below on a right one. The refusal is the same for
+    # a name with no account behind it, and the audit row carries no user.
+    claim = await claim_login_attempt(body.username)
+    if not claim.allowed:
+        await _audit_login_failure(db, request, body.username, reason="login_throttled")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again shortly.",
+            headers={"Retry-After": str(claim.retry_after)},
+        )
 
     result = await db.execute(select(User).where(User.username == body.username))
     user = result.scalar_one_or_none()
@@ -622,6 +636,9 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
         # write an audit row for the password-success-but-MFA-pending case
         # because a successful login is what crosses the audit boundary;
         # ``/login/mfa`` is what fires the ``login`` action.
+        # The password was right: give back the attempt it spent, whether
+        # the sign-in finishes here or at the MFA step.
+        await refund_login_attempt(body.username, claim)
         if user.totp_enabled and user.totp_secret_encrypted is not None:
             challenge = create_mfa_challenge_token(str(user.id))
             return LoginResponse(mfa_required=True, mfa_token=challenge)
@@ -637,6 +654,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: DB
         db, request, body.username, body.password
     )
     if external_response is not None:
+        await refund_login_attempt(body.username, claim)
         _set_refresh_cookie(response, request, external_response.refresh_token)
         return LoginResponse(
             access_token=external_response.access_token,

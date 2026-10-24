@@ -16,7 +16,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecordOp
+from app.models.dns import DNSRecordOp, DNSServer
 from app.services.dns import agent_bundle_store as store
 from app.services.dns.agent_bundle_render import render_and_store
 from tests.test_dns_agent_bundle_ops_gate import CONFIG_URL, _agent, _op
@@ -111,9 +111,17 @@ async def test_rollover_endpoint_under_views_reaches_the_agent(
 async def test_rollover_endpoint_refuses_when_nothing_was_queued(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """No primary (or no enabled agent-based server): no row is written, so
-    the endpoint must not answer ``queued``."""
-    grp = await _group_with_driver(db_session, "bind9")  # one server, not primary
+    """No enabled agent-based server: no row is written, so the endpoint must
+    not answer ``queued``. (A group with servers but no primary flag now
+    writes through the election's stand-in, #2276, so the server here is
+    disabled rather than merely unflagged.)"""
+    grp = await _group_with_driver(db_session, "bind9")
+    for srv in (
+        (await db_session.execute(select(DNSServer).where(DNSServer.group_id == grp.id)))
+        .scalars()
+        .all()
+    ):
+        srv.is_enabled = False
     zone = await _zone_row(db_session, grp)
     zone.dnssec_enabled = True
     token = await _admin(db_session)

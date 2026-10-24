@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LayoutTemplate, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -787,7 +788,17 @@ export function IPAMTemplatesPage() {
                     colSpan={7}
                     className="px-3 py-8 text-center text-muted-foreground"
                   >
-                    No templates yet.
+                    <ListEmpty
+                      error={tplsQ.error}
+                      what="templates"
+                      filtered={filterApplies !== "" || search !== ""}
+                      onClearFilters={() => {
+                        setFilterApplies("");
+                        setSearch("");
+                      }}
+                    >
+                      No templates yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}

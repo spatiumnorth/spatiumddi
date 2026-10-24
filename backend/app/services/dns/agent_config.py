@@ -77,7 +77,7 @@ from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
     records_for_view,
-    view_renders_zone,
+    views_rendering_zone,
 )
 from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
@@ -1430,12 +1430,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # record filtering is delegated to ``records_for_view``. The rule is
         # shared with the transfer-key resolver (#920), so the view drift and
         # sync ask for is always one that holds the zone.
-        record_view_ids = {r.view_id for r in rec_rows if r.view_id is not None}
-        zone_view_ids = {z.view_id} if z.view_id is not None else set()
-        operator_target_ids = record_view_ids | zone_view_ids
-        for vd in view_descs:
-            if not view_renders_zone(vd, operator_target_ids):
-                continue
+        # #2275 — the collision guard counts placements from the same call.
+        for vd in views_rendering_zone(view_descs, z.view_id, (r.view_id for r in rec_rows)):
             recs = records_for_view(rec_rows, vd, geo)
             copies.append(
                 {
@@ -1601,6 +1597,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
         # no such setting and the API refuses a non-default value for them.
         options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
+    # #2263 — the group ``blackhole`` list. Accepted and validated since
+    # #1244 and never shipped, so no agent could render it. Shipped only when
+    # set: an absent key reads as empty on the agent, so a group that does not
+    # use it keeps the bundle (and the structural etag) it had before, and an
+    # upgrade does not reload every agent for a byte-identical config. The
+    # BIND9 agent renders it; PowerDNS / Technitium groups refuse it at the
+    # API, since neither daemon can drop a client by address.
+    blackhole = list(getattr(opts, "blackhole", []) or []) if opts else []
+    if blackhole:
+        options_block["blackhole"] = blackhole
     if server.driver in ("technitium", "bind9"):
         # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
         # renders ``allow-recursion`` from it, literally, #1817), so
@@ -2115,6 +2121,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # be structural (issue #50).
         "tls_cert": tls_cert_block,
     }
+    if server.zone_resync_seq:
+        # #2281 — this server was re-enabled. While it was disabled it got no
+        # record ops, so its daemon still serves the records it had then; the
+        # bundle body carries the current ones, but without views records do
+        # not move the structural etag and the agent would never render them.
+        # A new value here makes it re-render every zone from the body. Left
+        # out at zero so a server never re-enabled keeps its etag.
+        structural["zone_resync_seq"] = server.zone_resync_seq
     if server.driver == "technitium":
         # #1513 — say how a dot-less SVCB / HTTPS target in this bundle is
         # meant: relative to the zone, as in a zone file. Before #1513 the

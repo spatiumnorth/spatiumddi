@@ -134,6 +134,8 @@ async def _run_one(org_id: str) -> dict[str, Any]:
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "network_count": summary.network_count,
                 "object_count": summary.object_count,
                 "nat_rule_count": summary.nat_rule_count,

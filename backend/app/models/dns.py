@@ -505,6 +505,17 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # that finishes still behind. NULL while current. The stalled-render
     # alert measures from here.
     bundle_dirty_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2281 — bumped when the server is re-enabled. A disabled server gets no
+    # record ops and no renders while its agent keeps serving the old config,
+    # and in a group without views records are left out of the structural
+    # etag, so the next bundle would carry the current records and the agent
+    # would never re-render them. Folded into the structural fingerprint
+    # (``agent_config``) when non-zero, so a bump forces one full re-render
+    # of every zone on that server. Zero adds nothing, so a server that was
+    # never re-enabled keeps the structural etag it had.
+    zone_resync_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:

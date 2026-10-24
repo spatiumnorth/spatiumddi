@@ -47,7 +47,7 @@ from app.services.dns.pool_geo import (
     GEO_DEFAULT_VIEW,
     build_geo_steering,
     build_view_descriptors,
-    view_renders_zone,
+    views_rendering_zone,
 )
 
 logger = structlog.get_logger(__name__)
@@ -311,7 +311,7 @@ async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
     the zone's group renders no views.
 
     Only views that hold a copy are candidates — the same rule the bundle
-    expands zones by (:func:`~app.services.dns.pool_geo.view_renders_zone`).
+    expands zones by (:func:`~app.services.dns.pool_geo.views_rendering_zone`).
     Among them: the zone's own pinned view; else the first operator view in
     precedence order (it serves every shared record, plus its own scoped
     ones); else the geo catch-all, which serves the default pool members;
@@ -335,8 +335,7 @@ async def transfer_view_name(db: AsyncSession, zone: DNSZone) -> str | None:
         .scalars()
         .all()
     )
-    targets = scoped | ({zone.view_id} if zone.view_id is not None else set())
-    holding = [vd for vd in descs if view_renders_zone(vd, targets)]
+    holding = views_rendering_zone(descs, zone.view_id, scoped)
     for pick in (
         lambda vd: vd["kind"] == "operator" and vd["id"] == zone.view_id,
         lambda vd: vd["kind"] == "operator",

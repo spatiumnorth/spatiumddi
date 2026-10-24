@@ -60,7 +60,7 @@ NAMED_CONF_SKELETON = """\
 {encrypted_listeners}    recursion {recursion};
 {allow_recursion}    allow-query {{ {allow_query}; }};
 {allow_query_cache}    {allow_transfer}
-    dnssec-validation {dnssec};
+{blackhole}    dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
 {max_cache_size}{query_log}{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
@@ -398,6 +398,23 @@ def _safe_conf_entries(entries: Any) -> list[str]:
         if token and not _UNSAFE_CONF_CHARS.search(token):
             out.append(token)
     return out
+
+
+def _render_blackhole(opts: dict[str, Any]) -> str:
+    """The options-level ``blackhole { … };`` statement (#2263).
+
+    Accepted and validated as an address-match list since #1244, and never
+    shipped or rendered, so an operator blackholing an abusive client range
+    got a 200 and a server that kept answering it. BIND drops a matching
+    request before any other ACL is consulted and sends nothing back.
+
+    Empty (the default, and absent from the bundle) renders nothing, so a
+    group that does not use it keeps a byte-identical ``named.conf``.
+    """
+    entries = _safe_conf_entries(opts.get("blackhole"))
+    if not entries:
+        return ""
+    return f"    blackhole {{ {'; '.join(entries)}; }};\n"
 
 
 def _render_notify_block(opts: dict[str, Any]) -> str:
@@ -2200,6 +2217,7 @@ class Bind9Driver(DriverBase):
             allow_query=allow_query,
             allow_query_cache=_render_allow_query_cache(opts, bundle.get("acls")),
             allow_transfer=allow_transfer_opt.rstrip(),
+            blackhole=_render_blackhole(opts),
             dnssec=dnssec,
             forwarders=fwd_block,
             notify_block=_render_notify_block(opts),
