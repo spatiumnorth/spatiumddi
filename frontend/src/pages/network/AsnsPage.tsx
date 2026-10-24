@@ -416,9 +416,8 @@ export function AsnsPage() {
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-              The autonomous systems carrying our IP space. Foundation for RDAP
-              refresh, RPKI ROA tracking, and BGP-relationship FKs in follow-up
-              phases.
+              The autonomous systems carrying our IP space, with RDAP refresh,
+              RPKI ROA tracking, and BGP peerings and communities.
             </p>
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
