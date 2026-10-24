@@ -592,11 +592,14 @@ async def list_nat_mappings_for_ip(
 async def list_nat_mappings_for_subnet(
     subnet_id: uuid.UUID, db: DB, _: CurrentUser
 ) -> list[NATMappingResponse]:
-    """Every NAT mapping whose internal IP falls inside this subnet's CIDR.
+    """Every NAT mapping that references an IP inside this subnet's CIDR.
 
     Combines:
       * mappings with ``internal_subnet_id == subnet_id`` (hide-NAT pinned to subnet)
       * mappings whose ``internal_ip`` is contained by the subnet's network
+      * mappings whose ``external_ip`` is contained by the subnet's network
+        (#2617) — the address rows' "NAT n" badge counts both sides, so the
+        tab has to list both or it contradicts the badge.
     """
 
     subnet = await db.get(Subnet, subnet_id)
@@ -614,6 +617,10 @@ async def list_nat_mappings_for_subnet(
                         and_(
                             NATMapping.internal_ip.is_not(None),
                             NATMapping.internal_ip.op("<<=")(cidr_lit),
+                        ),
+                        and_(
+                            NATMapping.external_ip.is_not(None),
+                            NATMapping.external_ip.op("<<=")(cidr_lit),
                         ),
                     )
                 )

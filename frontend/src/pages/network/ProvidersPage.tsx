@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -420,7 +421,17 @@ export function ProvidersPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={7}
                   >
-                    No providers yet — click "New provider" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="providers"
+                      filtered={search !== "" || kindFilter !== ""}
+                      onClearFilters={() => {
+                        setSearch("");
+                        setKindFilter("");
+                      }}
+                    >
+                      No providers yet — click "New provider" to add one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}

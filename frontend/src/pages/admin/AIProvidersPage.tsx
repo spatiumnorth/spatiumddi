@@ -40,6 +40,8 @@ interface ProviderForm {
   // null = leave existing key untouched on update; "" = explicitly clear;
   // any other value = set / replace.
   api_key: string | null;
+  // Whether the stored provider has a key (always false on create).
+  has_api_key: boolean;
   default_model: string;
   is_enabled: boolean;
   priority: string;
@@ -56,6 +58,7 @@ const EMPTY: ProviderForm = {
   kind: "openai_compat",
   base_url: "http://host.docker.internal:11434/v1",
   api_key: "",
+  has_api_key: false,
   default_model: "",
   is_enabled: true,
   priority: "100",
@@ -72,8 +75,9 @@ function formFromProvider(p: AIProvider): ProviderForm {
     base_url: p.base_url,
     // Edit modal starts with api_key=null so an unchanged save leaves
     // the stored ciphertext alone. Operator can paste a new value
-    // (replaces) or click "clear" (sets to "").
+    // (replaces) or tick "Remove the stored key" (sets to "").
     api_key: null,
+    has_api_key: p.has_api_key,
     default_model: p.default_model,
     is_enabled: p.is_enabled,
     priority: String(p.priority),
@@ -277,24 +281,43 @@ function ProviderEditor({
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
                 API key{" "}
                 <span className="text-muted-foreground/60">
-                  (leave blank to keep unchanged
                   {mode === "edit"
-                    ? ` — currently ${initial.api_key === null ? "stored" : "—"}`
-                    : ""}
-                  )
+                    ? initial.has_api_key
+                      ? "(a key is stored — leave blank to keep it)"
+                      : "(no key stored)"
+                    : "(optional)"}
                 </span>
               </label>
               <input
                 type="password"
                 value={form.api_key ?? ""}
-                onChange={(e) => set("api_key", e.target.value)}
+                // Blank = leave the stored key alone; removing it is the
+                // explicit checkbox below, which sends api_key "" (#2622).
+                onChange={(e) =>
+                  set("api_key", e.target.value === "" ? null : e.target.value)
+                }
+                disabled={form.api_key === ""}
                 placeholder={
                   mode === "edit"
-                    ? "Type to replace, or clear to remove"
+                    ? initial.has_api_key
+                      ? "Type to replace the stored key"
+                      : "Type to set a key"
                     : "Optional — local providers (Ollama, LM Studio) don't need one"
                 }
                 className={`${inputCls} font-mono text-xs`}
               />
+              {mode === "edit" && initial.has_api_key && (
+                <label className="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={form.api_key === ""}
+                    onChange={(e) =>
+                      set("api_key", e.target.checked ? "" : null)
+                    }
+                  />
+                  Remove the stored key
+                </label>
+              )}
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">

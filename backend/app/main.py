@@ -319,14 +319,17 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface: "
-        "TLS cert upload, release manager, "
-        "container start/stop/restart + live logs, host network + "
-        "firewall config, maintenance mode, diagnostic bundle download. "
-        "Intended for ops staff who manage the appliance lifecycle "
-        "without needing full superadmin over the DDI data plane. "
-        "Granted ``admin`` on resource_type=appliance; superadmin "
-        "always bypasses anyway.",
+        "Runs the SpatiumDDI OS appliance on this node: TLS cert upload "
+        "and ACME, the read-only releases catalogue, node-local slot "
+        "apply and rollback, container start/stop/restart + live logs, "
+        "host network + firewall config, maintenance mode, diagnostic "
+        "bundle download. Fleet management is NOT included and still "
+        "needs a superadmin: the upgrade-image store, every Fleet member "
+        "action (approve, role assignment, OS upgrade, reboot), "
+        "MetalLB, the kube-api CIDRs and pairing codes. Intended for ops "
+        "staff who manage a node's lifecycle without superadmin over the "
+        "DDI data plane. Granted ``admin`` on resource_type=appliance; "
+        "superadmin always bypasses anyway.",
         [
             {"action": "admin", "resource_type": "appliance"},
         ],

@@ -9449,7 +9449,20 @@ function ZonesTab({
       )}
       {zones.length === 0 && !isFetching && (
         <p className="text-sm text-muted-foreground italic">
-          No zones yet. Click "Add Zone" to create one.
+          {tagFilters.length > 0 ? (
+            <>
+              No zones match the selected tags.{" "}
+              <button
+                type="button"
+                onClick={() => setTagFilters([])}
+                className="not-italic text-primary underline hover:no-underline"
+              >
+                Clear filters
+              </button>
+            </>
+          ) : (
+            'No zones yet. Click "Add Zone" to create one.'
+          )}
         </p>
       )}
       {hasZoneFilter && filteredZones.length === 0 && zones.length > 0 && (
