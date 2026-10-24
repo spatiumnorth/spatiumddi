@@ -6187,7 +6187,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     try:
         from app.tasks.ipam_discovery import run_subnet_discovery
 
-        run_subnet_discovery.delay(str(subnet_id))
+        await dispatch(run_subnet_discovery, str(subnet_id))
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         queued = False
         logger.warning("ipam_discovery_trigger_enqueue_failed", error=str(exc))
@@ -11949,6 +11949,7 @@ async def bulk_edit_addresses(
 # the IPAM page.
 
 from app.api.v1.network.schemas import NetworkContextEntry  # noqa: E402
+from app.core.celery_dispatch import dispatch  # noqa: E402
 from app.models.network import (  # noqa: E402
     NetworkDevice as _NetworkDevice,
 )

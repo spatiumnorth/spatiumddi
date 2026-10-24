@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
 from app.core.responses import PcapResponse
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
@@ -299,7 +300,7 @@ async def create_capture(
         try:
             from app.tasks.pcap import run_capture_task  # noqa: PLC0415
 
-            run_capture_task.delay(str(cap.id))
+            await dispatch(run_capture_task, str(cap.id))
         except Exception as exc:  # noqa: BLE001 — broker down
             logger.warning("pcap_dispatch_failed", capture_id=str(cap.id), error=str(exc))
 

@@ -33,6 +33,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
@@ -1665,7 +1666,7 @@ async def refresh_blocklist(
 
     task_id: str | None = None
     try:
-        result = refresh_blocklist_feed.delay(str(bl.id))
+        result = await dispatch(refresh_blocklist_feed, str(bl.id))
         task_id = result.id
     except Exception as e:  # noqa: BLE001
         logger.warning("blocklist_refresh_enqueue_failed", list_id=str(bl.id), error=str(e))
