@@ -13,6 +13,6 @@
   or its recorded full-pass time lies in the future, so an edit to an
   already-verified row is alerted within a week, not overnight
   (documented in SYSTEM_ADMIN.md §2.7). A run that dies keeps its progress but fails loudly; it is never
-  reported as verified. `GET /audit/integrity` also returns
-  `verified_through_seq` and `complete`, so a capped check says how far
-  it got (#2297). Migration `e7b2d4c81f06`.
+  reported as verified. `GET /audit/integrity` keeps its existing answer: a capped check reports
+  `partial`, `rows_checked` and the `first_seq` / `last_seq` it walked
+  (#2297). Migration `e7b2d4c81f06`.
