@@ -473,6 +473,11 @@ RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 # shows, so the alarm and the panel cannot disagree.
 RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
 
+# Issue #2313 — a blocklist feed whose refresh has not SUCCEEDED within three
+# of its own update intervals. A family filter that stopped refreshing keeps
+# enforcing the list it last had, and nothing else says so.
+RULE_TYPE_DNS_BLOCKLIST_FEED_STALE = "dns_blocklist_feed_stale"
+
 # Issue #1762 — a DNSSEC-signed zone on a group with more than one agent DNS
 # server (BIND9 / PowerDNS / Technitium; disabled servers count — they still
 # serve the bundle). Each server signs with keys it generated, so the zone is
@@ -681,6 +686,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+        RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -4064,6 +4070,65 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
     return matches
 
 
+async def _matching_dns_blocklist_feed_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_blocklist_feed_stale`` — every enabled feed list whose refresh has
+    not succeeded within 3 x its ``update_interval_hours`` (#2313).
+
+    Judged from ``last_success_at`` (``last_synced_at`` moves on failure too).
+    A list that has never succeeded is measured from its creation. Interval 0
+    (manual refresh) never matches. Auto-resolves on the next good refresh.
+    """
+    from app.models.dns import DNSBlockList  # noqa: PLC0415
+    from app.services.dns.blocklist_feed_health import (  # noqa: PLC0415
+        STALE_AFTER_INTERVALS,
+        is_feed_stale,
+        stale_since,
+    )
+
+    now = now or datetime.now(UTC)
+    rows = (
+        (
+            await db.execute(
+                select(DNSBlockList).where(
+                    DNSBlockList.enabled.is_(True),
+                    DNSBlockList.feed_url.is_not(None),
+                    DNSBlockList.update_interval_hours > 0,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for bl in rows:
+        if not is_feed_stale(bl, now):
+            continue
+        since = stale_since(bl)
+        age_h = int((now - since).total_seconds() // 3600) if since else 0
+        how = (
+            f"last refreshed successfully {age_h} h ago"
+            if bl.last_success_at
+            else f"has never refreshed successfully (created {age_h} h ago)"
+        )
+        err = f" Last error: {bl.last_sync_error}" if bl.last_sync_status == "error" else ""
+        matches.append(
+            (
+                str(bl.id),
+                bl.name,
+                f"Blocklist feed '{bl.name}' {how}; it refreshes every "
+                f"{bl.update_interval_hours} h and is now past "
+                f"{STALE_AFTER_INTERVALS} intervals. Servers keep enforcing the entries "
+                f"it last had.{err}",
+                "warning",
+            )
+        )
+    return matches
+
+
 async def _matching_agent_daemon_degraded_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -5588,6 +5653,48 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_BLOCKLIST_FEED_STALE_RULE_NAME = "DNS blocklist feed stale"
+
+
+async def seed_dns_blocklist_feed_stale_alert_rule() -> None:
+    """Seed the #2313 rule, ENABLED by default.
+
+    Silent on an install with no feed-sourced blocklist. A feed that stops
+    refreshing keeps enforcing its last entries, so nothing visibly breaks and
+    nothing else says it has gone stale. The 3-interval threshold is fixed
+    (the issue's "~3x"), so the rule has no parameters. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_BLOCKLIST_FEED_STALE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_BLOCKLIST_FEED_STALE_RULE_NAME,
+                description=(
+                    "Fires for each enabled blocklist feed whose refresh has not "
+                    "succeeded within three of its own update intervals (a feed that "
+                    "never succeeded is measured from its creation). The servers keep "
+                    "enforcing the entries the list last had. Lists set to manual "
+                    "refresh are ignored. Resolves on the next successful refresh."
+                ),
+                rule_type=RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_agent_daemon_degraded_alert_rule() -> None:
     """Seed the #1067 rule, ENABLED by default.
 
@@ -7070,6 +7177,7 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
+    RULE_TYPE_DNS_BLOCKLIST_FEED_STALE: "core.dns",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -7361,6 +7469,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # A scope held on Windows need not have a SpatiumDDI row, so the
                 # subject is "<group id>:<cidr>", not a dhcp_scope id.
                 subject_type = "dhcp_scope"
+            elif rule.rule_type == RULE_TYPE_DNS_BLOCKLIST_FEED_STALE:
+                stale_feeds = await _matching_dns_blocklist_feed_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_feeds]
+                subject_type = "dns_blocklist"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]

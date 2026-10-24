@@ -565,6 +565,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dhcp_scope_uncoordinated_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # Stale blocklist feed alert rule — singleton, ENABLED by default
+    # (issue #2313). Silent unless a feed list stopped refreshing. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_blocklist_feed_stale_alert_rule,
+        )
+
+        await seed_dns_blocklist_feed_stale_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_blocklist_feed_stale_alert_rule_seed_skipped", reason=str(exc))
     # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
     # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
     # deleted. A startup seed would re-create it on every restart.

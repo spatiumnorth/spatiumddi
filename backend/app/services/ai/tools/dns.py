@@ -32,6 +32,7 @@ from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
 from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
+from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 
@@ -866,6 +867,8 @@ async def list_dns_blocklists(
             "feed_parse_skipped": r.feed_parse_skipped,
             "last_synced_at": (r.last_synced_at.isoformat() if r.last_synced_at else None),
             "last_sync_status": r.last_sync_status,
+            "last_success_at": (r.last_success_at.isoformat() if r.last_success_at else None),
+            "feed_sync_state": feed_sync_state(r),
             "last_sync_error": r.last_sync_error,
         }
         for r in rows

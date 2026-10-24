@@ -1391,6 +1391,15 @@ due together are queued a minute apart, at most 55 per sweep so each has run
 before the next sweep looks again; any beyond that go in the next hour,
 longest-overdue first.
 
+The list row shows a sync chip so a bad feed is visible without opening it:
+red when the last refresh failed (with how long ago it last worked), amber
+when no refresh has succeeded for more than 3 update intervals, grey when the
+feed has never synced. The default-on `dns_blocklist_feed_stale` alert (warning,
+one event per list) fires on the same 3-interval test, measured from the last
+*successful* refresh (`last_success_at`) or, for a feed that never succeeded,
+from its creation. Manual-only lists (interval `0`) and disabled lists never
+alert.
+
 #### Do feed entries block subdomains?
 
 Yes by default, and it is a **per-list** setting — *Block subdomains of
