@@ -11134,6 +11134,13 @@ function GroupDetailView({
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const [syncing, setSyncing] = useState(false);
+  // Shares the cache the Servers tab fills; only the enabled count is read,
+  // for the in-flight line of the sync modal (#2426).
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dns-servers", group.id],
+    queryFn: () => dnsApi.listServers(group.id),
+  });
+  const enabledServerCount = groupServers.filter((s) => s.is_enabled).length;
   const [groupSyncResult, setGroupSyncResult] = useState<{
     result: DNSGroupSyncResult | null;
     error: string | null;
@@ -11323,6 +11330,8 @@ function GroupDetailView({
           group={group}
           result={groupSyncResult.result}
           error={groupSyncResult.error}
+          syncing={syncing}
+          serverCount={enabledServerCount}
           onClose={() => setGroupSyncResult(null)}
         />
       )}
@@ -11330,20 +11339,43 @@ function GroupDetailView({
   );
 }
 
-function SyncWithServersResultModal({
+export function SyncWithServersResultModal({
   group,
   result,
   error,
+  syncing = false,
+  serverCount = 0,
   onClose,
 }: {
   group: DNSServerGroup;
   result: DNSGroupSyncResult | null;
   error: string | null;
+  syncing?: boolean;
+  serverCount?: number;
   onClose: () => void;
 }) {
   return (
     <Modal title={`Sync result — ${group.name}`} onClose={onClose} wide>
       <div className="space-y-3 text-sm">
+        {!result && !error && syncing && (
+          <div
+            role="status"
+            className="flex items-start gap-2 text-sm text-muted-foreground"
+          >
+            <RefreshCw className="mt-0.5 h-4 w-4 flex-shrink-0 animate-spin" />
+            <div>
+              <p>
+                Syncing with {serverCount}{" "}
+                {serverCount === 1 ? "server" : "servers"}… a Windows server can
+                take a minute.
+              </p>
+              <p className="text-xs">
+                You can close this window; the sync keeps running and the result
+                reopens here when it finishes.
+              </p>
+            </div>
+          </div>
+        )}
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
