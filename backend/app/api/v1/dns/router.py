@@ -225,6 +225,7 @@ from app.services.dns.tsig import (
     group_key_names,
     normalize_tsig_name,
     rotate_group_tsig_key,
+    tsig_secret_problem,
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.view_collisions import RenderGuard
@@ -4900,12 +4901,35 @@ class TSIGKeyCreate(BaseModel):
             raise ValueError(f"algorithm must be one of {sorted(_TSIG_ALGO_LENGTHS)}")
         return v
 
+    @field_validator("secret")
+    @classmethod
+    def validate_secret(cls, v: str | None) -> str | None:
+        # The secret is written verbatim into ``secret "…";`` in the agent's
+        # key file, so it must be one base64 string of a usable length.
+        # Empty / whitespace-only still means "generate one".
+        if v is None or not v.strip():
+            return None
+        v = v.strip()
+        if problem := tsig_secret_problem(v):
+            raise ValueError(f"secret {problem}")
+        return v
+
 
 class TSIGKeyUpdate(BaseModel):
     name: str | None = None
     algorithm: str | None = None
     purpose: str | None = None
     notes: str | None = None
+    # Accepted only so a request carrying one is refused rather than silently
+    # ignored: the secret changes through /rotate, never through update.
+    secret: str | None = None
+
+    @field_validator("secret")
+    @classmethod
+    def refuse_secret(cls, v: str | None) -> None:
+        if v is not None:
+            raise ValueError("secret cannot be set on update; use the rotate action to replace it")
+        return None
 
     @field_validator("name")
     @classmethod
@@ -5125,6 +5149,7 @@ async def update_tsig_key(
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
     changes = body.model_dump(exclude_unset=True)
+    changes.pop("secret", None)  # never a column write; see TSIGKeyUpdate
     # #1858 — only a CHANGE of algorithm is refused: re-saving a key the group
     # already holds (the form posts every field) must keep working.
     new_algo = changes.get("algorithm")

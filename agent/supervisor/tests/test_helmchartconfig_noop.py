@@ -82,7 +82,9 @@ def _yaml(doc: dict) -> str:
     return yaml.safe_dump(doc, sort_keys=True, default_flow_style=False)
 
 
-def _owned(cp_size: int = 1, mem_total_mib: int | None = None) -> dict:
+def _owned(
+    cp_size: int = 1, mem_total_mib: int | None = None, cpu_count: int | None = None
+) -> dict:
     """What ``apply_control_plane_overrides`` writes on a virgin cluster.
 
     Captured from the real function rather than restated here, so a new
@@ -94,7 +96,11 @@ def _owned(cp_size: int = 1, mem_total_mib: int | None = None) -> dict:
     k8s_api._request = kube  # type: ignore[assignment]
     try:
         ok, err = k8s_api.apply_control_plane_overrides(
-            cp_size, "", web_ui_allowed_cidrs=[], mem_total_mib=mem_total_mib
+            cp_size,
+            "",
+            web_ui_allowed_cidrs=[],
+            mem_total_mib=mem_total_mib,
+            cpu_count=cpu_count,
         )
     finally:
         k8s_api._request = orig  # type: ignore[assignment]
@@ -257,6 +263,19 @@ def _memtotal_mib() -> int | None:
     return None
 
 
+def _nproc() -> int | None:
+    """The same number firstboot's ``_cpu_count`` will read (#2240): ``nproc``,
+    or nothing where it is not installed (a developer mac), which is what
+    firstboot then renders from too."""
+    import shutil
+
+    exe = shutil.which("nproc")
+    if not exe:
+        return None
+    out = subprocess.run([exe], capture_output=True, text=True, check=False).stdout.strip()
+    return int(out) if out.isdigit() and int(out) > 0 else None
+
+
 def _render_firstboot_control_values() -> dict:
     """Run firstboot's own ``_render_control_helmchart`` and parse its output.
 
@@ -300,7 +319,7 @@ def test_firstboot_values_already_satisfy_the_supervisor_overrides() -> None:
     back to two helm revisions — silently, because nothing else looks.
     """
     chart_values = _render_firstboot_control_values()
-    owned = _owned(cp_size=1, mem_total_mib=_memtotal_mib())
+    owned = _owned(cp_size=1, mem_total_mib=_memtotal_mib(), cpu_count=_nproc())
 
     merged = k8s_api._deep_merge(chart_values, owned)
     if merged != chart_values:

@@ -344,8 +344,9 @@ than the uncompressed body, so rendering a two-million-record group needs a
 few hundred MB of scratch disk while it runs.
 
 A render the worker still cannot survive (killed mid-render by the OOM
-killer, or by the task's 960 s hard time limit) no longer takes the fleet
-with it. Its lease on the fleet-wide render slot lapses within
+killer, or by the task's hard time limit: 960 s, more for a large group
+since #2240) no longer takes the fleet with it. Its lease on the
+fleet-wide render slot lapses within
 `dns_agent_bundle_render_lease_seconds` (60 s). After two renders of one
 server have died that way, the next one records the reason on the server
 (`bundle_render_status = failed`, which raises the

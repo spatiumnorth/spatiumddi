@@ -725,6 +725,7 @@ backend/alembic/versions/e7a3c0d519f4_rogue_dhcp_detection.py:drop_table:121
 backend/alembic/versions/e7a3c0d519f4_rogue_dhcp_detection.py:drop_table:124
 backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:82
 backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:84
+backend/alembic/versions/e7b2d4c81f06_audit_chain_checkpoint.py:drop_table:41
 backend/alembic/versions/e7b3f29a1d6c_proxmox_last_discovery.py:drop_column:38
 backend/alembic/versions/e7b8c4f96a12_dns_zone_domain_fk.py:drop_column:48
 backend/alembic/versions/e7b8c4f96a12_dns_zone_domain_fk.py:drop_constraint_fk:46

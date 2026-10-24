@@ -23,6 +23,9 @@ we can add them later without a migration.
   tell live tokens from dead ones.
 - Revocation is soft (``is_active=False``). Hard delete is allowed
   too — both just reject future calls with 401.
+- Re-enabling an inactive token is superadmin-only and needs the
+  operator step-up; so does widening a token's scopes. Renaming,
+  narrowing scopes and revoking need neither.
 """
 
 from __future__ import annotations
@@ -30,13 +33,17 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_operator_stepup
-from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.core.permissions import (
+    is_effective_superadmin,
+    refuse_and_audit,
+    user_has_permission,
+)
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
@@ -141,7 +148,13 @@ class ApiTokenUpdate(BaseModel):
     # Operators can rotate the scope list on an existing token —
     # tighten ("oops, this token shouldn't be writing DNS") without
     # rotating the secret. Empty list explicitly clears restriction.
+    # Narrowing is free; widening needs the step-up (see update_token).
     scopes: list[str] | None = None
+    # The caller's step-up, needed only when the update re-enables an
+    # inactive token or widens its scopes. A token outlives the session that
+    # edits it, as at create time (#1355).
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("scopes")
     @classmethod
@@ -186,6 +199,25 @@ async def _validate_resource_grants(db: DB, current_user: CurrentUser, grants: l
                     "cannot grant more than its creator."
                 ),
             )
+
+
+def scopes_widen(old: list[str] | None, new: list[str]) -> bool:
+    """Whether replacing ``old`` with ``new`` lets the token do more.
+
+    An empty list means no scope restriction at all, so clearing a non-empty
+    list widens, and a non-empty list that is not a subset of the old one adds
+    a scope. Going from unrestricted to any list, or dropping scopes, narrows.
+    """
+    old_set = set(old or [])
+    new_set = set(new)
+    if not old_set:
+        return False
+    if not new_set:
+        return True
+    return not new_set <= old_set
+
+
+_STEPUP_FIELDS = ("stepup_password", "stepup_totp_code")
 
 
 def _resolve_expiry(body: ApiTokenCreate) -> datetime | None:
@@ -411,11 +443,49 @@ async def get_token(
 async def update_token(
     token_id: uuid.UUID,
     body: ApiTokenUpdate,
+    request: Request,
     db: DB,
     current_user: CurrentUser,
 ) -> APIToken:
+    """Rename, describe, revoke, re-enable or re-scope a token.
+
+    Re-enabling an inactive token is superadmin-only and needs the step-up;
+    widening its scopes needs the step-up. Everything else needs neither.
+    """
     token = await _require_owned(token_id, db, current_user)
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude=set(_STEPUP_FIELDS))
+    reenables = changes.get("is_active") is True and not token.is_active
+    widens = "scopes" in changes and scopes_widen(token.scopes, changes["scopes"])
+    # Both checks run before anything is written. An inactive token was
+    # revoked by someone; bringing it back is a superadmin decision, and an
+    # owner who needs access again mints a new token (which needs the step-up).
+    if reenables and not is_effective_superadmin(current_user):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="update",
+            resource_type="api_token",
+            resource_id=str(token.id),
+            resource_display=token.name,
+            reason="reenable_requires_superadmin",
+            detail=(
+                "Only a superadmin can re-enable an inactive API token. "
+                "Create a new token instead."
+            ),
+        )
+    stepup_method: str | None = None
+    if reenables or widens:
+        stepup_method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="update",
+            resource_type="api_token",
+            resource_id=str(token.id),
+            resource_display=token.name,
+        )
     for k, v in changes.items():
         setattr(token, k, v)
     db.add(
@@ -429,7 +499,7 @@ async def update_token(
             resource_display=token.name,
             result="success",
             changed_fields=list(changes.keys()),
-            new_value=changes,
+            new_value=({**changes, "stepup_method": stepup_method} if stepup_method else changes),
         )
     )
     await db.commit()
