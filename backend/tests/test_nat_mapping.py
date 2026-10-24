@@ -335,6 +335,43 @@ async def test_nat_mapping_count_external_match(
 
 
 @pytest.mark.asyncio
+async def test_by_subnet_lists_mapping_whose_external_ip_is_in_the_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2617 — the NAT tab read internal IPs only while the badge counts both."""
+    _, token = await _make_user(db_session)
+    sub = await _make_subnet(db_session)
+    db_session.add_all(
+        [
+            NATMapping(
+                name="ext-in",
+                kind="1to1",
+                internal_ip="172.16.0.1",
+                external_ip="10.10.0.10",
+            ),
+            NATMapping(
+                name="int-in",
+                kind="1to1",
+                internal_ip="10.10.0.11",
+                external_ip="203.0.113.11",
+            ),
+            NATMapping(
+                name="neither",
+                kind="1to1",
+                internal_ip="172.16.0.2",
+                external_ip="203.0.113.12",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    h = {"Authorization": f"Bearer {token}"}
+    r = await client.get(f"/api/v1/ipam/nat-mappings/by-subnet/{sub.id}", headers=h)
+    assert r.status_code == 200, r.text
+    assert sorted(m["name"] for m in r.json()) == ["ext-in", "int-in"]
+
+
+@pytest.mark.asyncio
 async def test_get_unknown_404(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_user(db_session)
     await db_session.commit()
