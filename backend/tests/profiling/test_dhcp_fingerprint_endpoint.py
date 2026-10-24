@@ -56,7 +56,7 @@ async def _make_dhcp_server(db: AsyncSession) -> tuple[DHCPServer, str]:
 async def test_dhcp_fingerprints_upsert_inserts_new_row(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    _, token = await _make_dhcp_server(db_session)
+    server, token = await _make_dhcp_server(db_session)
 
     # The endpoint lazy-imports the task; patch where it's defined.
     with patch("app.tasks.dhcp_fingerprint.lookup_fingerprint_task") as task_mock:
@@ -79,7 +79,8 @@ async def test_dhcp_fingerprints_upsert_inserts_new_row(
         body = resp.json()
         assert body["upserted"] == 1
         assert body["enqueued"] == 1
-        task_mock.delay.assert_called_once_with("aa:bb:cc:11:22:33")
+        # The reporting server rides along so the IP stamp stays in its spaces (#2577).
+        task_mock.delay.assert_called_once_with("aa:bb:cc:11:22:33", str(server.id))
 
     res = await db_session.execute(select(DHCPFingerprint))
     rows = res.scalars().all()
