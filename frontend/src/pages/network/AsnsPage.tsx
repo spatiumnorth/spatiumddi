@@ -171,9 +171,10 @@ function ConfirmBulkDeleteModal({
       <div className="space-y-3 text-sm">
         <p>
           Delete <span className="font-semibold">{count}</span> ASN
-          {count === 1 ? "" : "s"}? Linked RPKI ROA rows are removed (CASCADE).
-          This won't touch IPAM rows or BGP-relationship FKs (those land in
-          follow-up issues with their own delete policy).
+          {count === 1 ? "" : "s"}? The ASN's RPKI ROA rows, BGP peerings (on
+          either side) and communities are deleted with it. IP blocks, subnets,
+          VRFs, routers and providers that carry it are kept and have their ASN
+          cleared.
         </p>
         <div className="flex justify-end gap-2 pt-2">
           <button
