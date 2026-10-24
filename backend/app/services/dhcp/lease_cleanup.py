@@ -38,6 +38,7 @@ from sqlalchemy.orm import selectinload
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 
 logger = structlog.get_logger(__name__)
 
@@ -409,20 +410,9 @@ async def delete_leases_for_server(
 
 # Integration reconcilers also write ``status="dhcp"`` / ``auto_from_lease``
 # rows, with no ``dhcp_lease`` behind them at all — they are told apart by
-# their owner FK, which the orphan sweep must leave alone.
-_INTEGRATION_OWNER_COLUMNS = (
-    "kubernetes_cluster_id",
-    "docker_host_id",
-    "proxmox_node_id",
-    "tailscale_tenant_id",
-    "unifi_controller_id",
-    "cloud_endpoint_id",
-    "opnsense_router_id",
-    "netbird_instance_id",
-    "panos_firewall_id",
-    "fortinet_firewall_id",
-    "meraki_org_id",
-)
+# their owner FK, which the orphan sweep must leave alone. The FK list is the
+# shared one, so a new integration is covered here without a second edit.
+_INTEGRATION_OWNER_COLUMNS = tuple(sorted(INTEGRATION_OWNERSHIP_FKS))
 
 ORPHAN_MIRROR_GRACE = timedelta(hours=1)
 
