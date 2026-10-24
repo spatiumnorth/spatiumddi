@@ -59,9 +59,14 @@ function ProviderEditorModal({
   const [notes, setNotes] = useState(existing?.notes ?? "");
   const [error, setError] = useState<string | null>(null);
 
+  // The ASN routes take read on `manage_asns`. A user without it is not
+  // asked, and a stored Default ASN is shown as set-but-hidden, never as
+  // none (#2703).
+  const canReadAsns = usePermissions().can("read", "manage_asns");
   const asnsQuery = useQuery({
     queryKey: ["asns", "all"],
     queryFn: () => asnsApi.list({ limit: 500 }),
+    enabled: canReadAsns,
   });
 
   const mut = useMutation({
@@ -178,9 +183,17 @@ function ProviderEditorModal({
               className={inputCls}
               value={defaultAsnId}
               onChange={(e) => setDefaultAsnId(e.target.value)}
-              disabled={asnsQuery.isLoading}
+              disabled={asnsQuery.isLoading || !canReadAsns}
+              title={
+                canReadAsns ? undefined : "You may not read ASNs (manage_asns)"
+              }
             >
               <option value="">— none —</option>
+              {!canReadAsns && defaultAsnId && (
+                <option value={defaultAsnId}>
+                  set — you may not read ASNs
+                </option>
+              )}
               {(asnsQuery.data?.items ?? []).map((a) => (
                 <option key={a.id} value={a.id}>
                   AS{a.number}
@@ -262,9 +275,14 @@ export function ProvidersPage() {
       }),
   });
 
+  // The ASN routes take read on `manage_asns`. A user without it is not
+  // asked, and a stored Default ASN is shown as set-but-hidden, never as
+  // none (#2703).
+  const canReadAsns = usePermissions().can("read", "manage_asns");
   const asnsQuery = useQuery({
     queryKey: ["asns", "all"],
     queryFn: () => asnsApi.list({ limit: 500 }),
+    enabled: canReadAsns,
   });
 
   const items = query.data?.items ?? [];
@@ -475,7 +493,15 @@ export function ProvidersPage() {
                       {p.account_number ?? "—"}
                     </td>
                     <td className="px-3 py-2 align-top text-muted-foreground tabular-nums">
-                      {asnNum !== undefined ? `AS${asnNum}` : "—"}
+                      {asnNum !== undefined ? (
+                        `AS${asnNum}`
+                      ) : p.default_asn_id && !canReadAsns ? (
+                        <span title="You may not read ASNs (manage_asns)">
+                          set, hidden
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                     <td className="px-3 py-2 align-top break-all text-muted-foreground">
                       {p.contact_email ?? p.contact_phone ?? "—"}

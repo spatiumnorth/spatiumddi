@@ -3901,6 +3901,14 @@ export interface PlatformSettings {
    *  firewall keeps its unconditional port-22 floor and the list is
    *  inert; on, that floor is retired and the scope applies. */
   ssh_lockdown: boolean;
+  /** Data retention (#2273) — read by the nightly prune tasks.
+   *  Superadmin-only to change. */
+  soft_delete_purge_days: number;
+  dhcp_lease_history_retention_days: number;
+  pcap_retention_days: number;
+  appliance_revoked_retention_days: number;
+  metric_retention_days: number;
+  log_retention_hours: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
@@ -19029,6 +19037,12 @@ export interface L3VPNSummary {
   edge_circuits: L3VPNCircuitSummary[];
   edge_subnets: L3VPNSubnetSummary[];
   warnings: string[];
+  /** Section -> number of attached rows left out because the caller has no
+   *  read grant on them. Absent on an older server; a missing section was
+   *  shown in full. */
+  withheld?: Partial<
+    Record<"vrf" | "edge_sites" | "edge_circuits" | "edge_subnets", number>
+  >;
 }
 
 export interface CustomGroupedSummary {
