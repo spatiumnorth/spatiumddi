@@ -7509,7 +7509,15 @@ export function DnsSyncModal({
   }, [data]);
 
   const commitMut = useMutation({
-    mutationFn: async () => {
+    // The selection is passed in at click time rather than read from this
+    // render's closure: React Query refreshes ``mutationFn`` in an effect, so
+    // a fast click could otherwise commit an earlier, emptier selection
+    // (#2725). The Apply label reads the same state, so the two always agree.
+    mutationFn: async (sel: {
+      missing: Set<string>;
+      mismatched: Set<string>;
+      stale: Set<string>;
+    }) => {
       if (!data) throw new Error("No preview");
       // #516 — ensure reverse (PTR) zones exist before creating PTRs.
       // Idempotent; runs here (on Apply) rather than on modal open. A
@@ -7529,14 +7537,14 @@ export function DnsSyncModal({
       // written.
       const ipIds = new Set<string>();
       for (const m of data.missing) {
-        if (selMissing.has(missingKey(m))) ipIds.add(m.ip_id);
+        if (sel.missing.has(missingKey(m))) ipIds.add(m.ip_id);
       }
       return commitFn({
         create_for_ip_ids: Array.from(ipIds),
-        update_record_ids: Array.from(selMismatched),
-        delete_stale_record_ids: Array.from(selStale),
+        update_record_ids: Array.from(sel.mismatched),
+        delete_stale_record_ids: Array.from(sel.stale),
         skip_records: data.missing
-          .filter((m) => !selMissing.has(missingKey(m)))
+          .filter((m) => !sel.missing.has(missingKey(m)))
           .map((m) => ({
             ip_id: m.ip_id,
             record_type: m.record_type,
@@ -7862,7 +7870,13 @@ export function DnsSyncModal({
                   </button>
                   {!closeOnly && data && (
                     <button
-                      onClick={() => commitMut.mutate()}
+                      onClick={() =>
+                        commitMut.mutate({
+                          missing: selMissing,
+                          mismatched: selMismatched,
+                          stale: selStale,
+                        })
+                      }
                       disabled={totalSelected === 0 || commitMut.isPending}
                       className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                     >
