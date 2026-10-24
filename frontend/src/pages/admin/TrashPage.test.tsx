@@ -255,6 +255,26 @@ describe("the list (#1961, #1962)", () => {
     ).toBeTruthy();
     expect(screen.queryByText("Trash is empty.")).toBeNull();
   });
+  it("sends a search of only spaces as no search (#2737)", async () => {
+    list.mockResolvedValue({
+      items: [entry(1)],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+    mount();
+    await screen.findByText(/of 1/);
+    fireEvent.change(screen.getByPlaceholderText("Search name / CIDR…"), {
+      target: { value: "   " },
+    });
+    await waitFor(() =>
+      expect(list).toHaveBeenLastCalledWith(
+        expect.objectContaining({ q: undefined }),
+      ),
+    );
+    expect(screen.queryByText("Trash is empty.")).toBeNull();
+    expect(screen.queryByText("No rows match these filters.")).toBeNull();
+  });
 });
 
 describe("Delete permanently names what goes with the row (#2602)", () => {

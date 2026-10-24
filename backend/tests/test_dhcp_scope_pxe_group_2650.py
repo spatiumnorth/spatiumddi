@@ -58,3 +58,38 @@ async def test_pxe_profile_from_same_group_accepted(
     )
     assert r.status_code == 200, r.text
     assert r.json()["pxe_profile_id"] == str(prof.id)
+
+
+async def _create_with(client: AsyncClient, db: AsyncSession, pick: str):
+    token = await _make_token(db)
+    subnet, grp = await _subnet_and_group(db)
+    other = DHCPServerGroup(name=f"o-{uuid.uuid4().hex[:6]}")
+    db.add(other)
+    await db.flush()
+    mine = await _profile(db, grp)
+    theirs = await _profile(db, other)
+    h = {"Authorization": f"Bearer {token}"}
+    pid = mine.id if pick == "mine" else theirs.id
+    r = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet.id}/dhcp-scopes",
+        headers=h,
+        json={"group_id": str(grp.id), "name": "s", "pxe_profile_id": str(pid)},
+    )
+    return r, h, mine
+
+
+async def test_create_keeps_same_group_pxe_profile_2705(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    r, h, mine = await _create_with(client, db_session, "mine")
+    assert r.status_code in (200, 201), r.text
+    assert r.json()["pxe_profile_id"] == str(mine.id)
+    got = (await client.get(f"/api/v1/dhcp/scopes/{r.json()['id']}", headers=h)).json()
+    assert got["pxe_profile_id"] == str(mine.id)
+
+
+async def test_create_refuses_other_group_pxe_profile_2705(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    r, _, _ = await _create_with(client, db_session, "theirs")
+    assert r.status_code == 422, r.text
