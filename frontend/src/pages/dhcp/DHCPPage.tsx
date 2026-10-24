@@ -83,6 +83,7 @@ import {
   servingByScopeId,
   useGroupFailover,
 } from "./windowsFailover";
+import { deleteServerDescription } from "./serverDeleteCopy";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
@@ -3619,7 +3620,7 @@ export function DHCPPage() {
       {delServer && (
         <DeleteConfirmModal
           title="Delete DHCP Server"
-          description={`Remove server "${delServer.name}"? Its scopes remain but will be unassigned.`}
+          description={deleteServerDescription(delServer.name)}
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => {
             setDelServer(null);
