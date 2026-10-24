@@ -4,8 +4,8 @@
  * ListEmpty is the one place a list page puts its empty-state copy (#1865).
  */
 
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ListEmpty } from "./list-read-error";
 
@@ -54,5 +54,37 @@ describe("ListEmpty", () => {
     );
     expect(screen.queryByText("No VRFs yet.")).toBeNull();
     expect(screen.getByText(/Couldn't load VRFs/)).toBeTruthy();
+  });
+});
+
+describe("ListEmpty with a filter active (#2616)", () => {
+  it("says the filter matches nothing, not that the list is empty", () => {
+    render(
+      <ListEmpty error={null} what="domains" filtered>
+        No domains yet.
+      </ListEmpty>,
+    );
+    expect(screen.queryByText(/No domains yet/)).toBeNull();
+    expect(screen.getByText(/No domains match the current search or filter/));
+  });
+
+  it("offers to clear the filter", () => {
+    const clear = vi.fn();
+    render(
+      <ListEmpty error={null} what="domains" filtered onClearFilters={clear}>
+        No domains yet.
+      </ListEmpty>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the yet copy when no filter is active", () => {
+    render(
+      <ListEmpty error={null} what="domains" filtered={false}>
+        No domains yet.
+      </ListEmpty>,
+    );
+    expect(screen.getByText("No domains yet.")).toBeTruthy();
   });
 });
