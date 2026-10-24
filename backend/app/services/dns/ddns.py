@@ -304,6 +304,14 @@ async def apply_ddns_for_lease(
 
     hostname = await resolve_ddns_hostname(db, subnet, str(ipam_row.address), client_hostname)
     if not hostname:
+        if not (ipam_row.hostname or "").strip():
+            # The lease left the row with a blank name (a client that sent
+            # only spaces, say) and the policy names nothing in its place: the
+            # row publishes nothing, so the sync retracts the A / PTR an
+            # earlier name published instead of leaving them served.
+            from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+            await _sync_dns_record(db, ipam_row, subnet, action="create")
         return False
 
     # Idempotency: if the hostname is unchanged and the auto-generated
