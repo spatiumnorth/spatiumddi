@@ -25,17 +25,20 @@ transaction so lease teardown lands atomically with the scope stamp / audit.
 from __future__ import annotations
 
 import ipaddress
+import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 
 logger = structlog.get_logger(__name__)
 
@@ -306,7 +309,166 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     return leases_removed, mirrors_removed
 
 
+# Leases torn down per round trip by ``delete_leases_for_server``. Each
+# batch is flushed and its ORM rows expunged so a server holding 100k
+# leases never has them all in the identity map at once.
+SERVER_DELETE_BATCH = 500
+
+# Hard cap on leases torn down inline by a server delete. The per-lease
+# teardown measures ~15 ms (20k leases took 274 s on a dev box), so an
+# unbounded loop would run a 100k-lease delete for ~25 min inside the HTTP
+# request. Past the cap the rest cascade away with the server and their
+# mirrors are healed by the hourly ``sweep_orphaned_lease_mirrors``.
+SERVER_DELETE_INLINE_MAX = 1000
+
+# Wall-clock budget for the same inline teardown. The count cap alone assumed
+# ~15 ms a lease, but with DDNS on a teardown measured 87-102 ms, so 1,000
+# leases ran past the 60 s proxy read timeout (504) while the delete carried on.
+# Time is the real bound; the count cap stays as an upper limit. Well under 60 s.
+SERVER_DELETE_INLINE_DEADLINE_S = 20.0
+
+
+async def delete_leases_for_server(
+    db: AsyncSession,
+    server_id: uuid.UUID,
+    *,
+    max_leases: int = SERVER_DELETE_INLINE_MAX,
+    deadline_s: float = SERVER_DELETE_INLINE_DEADLINE_S,
+) -> tuple[int, int]:
+    """Purge every lease held by ``server_id`` before the server row goes (#2290).
+
+    ``dhcp_lease.server_id`` cascades on delete, so removing a server used to
+    silently drop its leases — and with them the only handle the expiry sweep
+    has on the ``auto_from_lease`` IPAM mirrors and the DDNS A/PTR records
+    they published. Those were then stranded permanently.
+
+    This is the same per-lease teardown the expiry / absence-delete paths use
+    (:func:`purge_lease`), *with* ``spare_if_peer_holds=True``: an HA / failover
+    partner (#1110) or another client on the server that still holds an active
+    lease on the address keeps the shared mirror and its DNS.
+
+    DDNS retraction is a ``DNSRecordOp`` enqueue (agent-based) or a post-commit
+    apply (agentless), not an inline server call, so it is safe to run in the
+    request; batching bounds memory and flushes so the per-lease peer checks
+    see earlier batches' deletes. The caller owns the transaction.
+
+    At most ``max_leases`` are torn down here, and none are started after
+    ``deadline_s`` seconds (bounded request time); the remainder is left for the orphan sweep once the cascade removes them.
+
+    Returns ``(leases_removed, mirrors_removed)``.
+    """
+    now = datetime.now(UTC)
+    deadline = time.monotonic() + deadline_s
+    subnet_cache = await _load_subnet_cache(db)
+    leases_removed = 0
+    mirrors_removed = 0
+    capped = False
+    while leases_removed < max_leases:
+        batch = list(
+            (
+                await db.execute(
+                    select(DHCPLease)
+                    .where(DHCPLease.server_id == server_id)
+                    .order_by(DHCPLease.id)
+                    .limit(min(SERVER_DELETE_BATCH, max_leases - leases_removed))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not batch:
+            break
+        for lease in batch:
+            if time.monotonic() >= deadline:
+                capped = True
+                break
+            sid = await _resolve_lease_subnet_id(db, lease, subnet_cache)
+            if await purge_lease(db, lease, subnet_id=sid, now=now):
+                mirrors_removed += 1
+            leases_removed += 1
+        await db.flush()
+        for lease in batch:
+            db.expunge(lease)
+        if capped:
+            break
+    else:
+        capped = True
+    if capped:
+        remaining = (
+            await db.execute(
+                select(func.count()).select_from(DHCPLease).where(DHCPLease.server_id == server_id)
+            )
+        ).scalar_one()
+        logger.warning(
+            "dhcp_server_delete_lease_teardown_capped",
+            server=str(server_id),
+            torn_down=leases_removed,
+            remaining=remaining,
+        )
+    return leases_removed, mirrors_removed
+
+
+# Integration reconcilers also write ``status="dhcp"`` / ``auto_from_lease``
+# rows, with no ``dhcp_lease`` behind them at all — they are told apart by
+# their owner FK, which the orphan sweep must leave alone. The FK list is the
+# shared one, so a new integration is covered here without a second edit.
+_INTEGRATION_OWNER_COLUMNS = tuple(sorted(INTEGRATION_OWNERSHIP_FKS))
+
+ORPHAN_MIRROR_GRACE = timedelta(hours=1)
+
+
+async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) -> int:
+    """Free ``status="dhcp"`` / ``auto_from_lease`` mirrors no lease backs (#2290).
+
+    Heals installs already stranded by a server delete (and any other path that
+    drops lease rows without their mirror). A mirror is residue only when NO
+    ``dhcp_lease`` row, on any server and in any state, carries its address —
+    so an HA peer's lease, or an expired-but-not-yet-pruned one, keeps it
+    (the expiry sweep owns those). Rows owned by an integration reconciler are
+    skipped, and so is anything seen within ``ORPHAN_MIRROR_GRACE`` so a mirror
+    mid-flight with its lease write is never raced.
+
+    Returns the number of mirror rows freed. Does not commit.
+    """
+    from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+
+    cutoff = datetime.now(UTC) - ORPHAN_MIRROR_GRACE
+    conds = [getattr(IPAddress, c).is_(None) for c in _INTEGRATION_OWNER_COLUMNS]
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(
+                    IPAddress.status == "dhcp",
+                    IPAddress.auto_from_lease.is_(True),
+                    or_(IPAddress.last_seen_at.is_(None), IPAddress.last_seen_at < cutoff),
+                    ~exists().where(DHCPLease.ip_address == IPAddress.address),
+                    *conds,
+                )
+                .options(selectinload(IPAddress.subnet))
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if row.subnet is not None:
+            try:
+                await revoke_ddns_for_lease(db, subnet=row.subnet, ipam_row=row)
+            except Exception as exc:  # noqa: BLE001 — DDNS revoke is best-effort
+                logger.warning(
+                    "dhcp_orphan_mirror_ddns_revoke_failed",
+                    ip=str(row.address),
+                    error=str(exc),
+                )
+        await db.delete(row)
+    return len(rows)
+
+
 __all__ = [
+    "delete_leases_for_server",
+    "sweep_orphaned_lease_mirrors",
     "address_still_held",
     "another_client_holds_address",
     "delete_leases_for_scope",

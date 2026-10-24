@@ -58,7 +58,6 @@ from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
-    contains_zonefile_unsafe,
     primary_ns_error,
     structured_rdata_error,
     validate_fqdn,
@@ -186,11 +185,13 @@ from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
     catalog_unsupported_message,
+    elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_single_driver,
     lock_server_row,
     move_server_to_group,
 )
+from app.services.dns.server_resync import force_zone_resync
 from app.services.dns.technitium_options import (
     allow_query_problem as technitium_query_problem,
 )
@@ -223,12 +224,14 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
+from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
+from app.services.dns.zone_synthesis import synthesised_zone_error
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -1815,20 +1818,10 @@ def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     validate WITHOUT mutating — a valid nameserver / RNAME contains none of the
     ``contains_zonefile_unsafe`` set. Empty ("" default / auto-filled) passes.
     """
-    if v is None or v == "":
-        return v or ""
-    if contains_zonefile_unsafe(v):
-        raise ValueError(
-            "must be a bare domain name — no whitespace, control characters, "
-            "or zone-file syntax (e.g. ';' '$' '@')"
-        )
-    if field == "primary_ns":
-        # #2075 — a Primary NS BIND's check-names refuses stops the zone
-        # being served at all, so it is a host name or it is not stored.
-        err = primary_ns_error(v)
-        if err is not None:
-            raise ValueError(f"Primary NS (primary_ns) {err}")
-    return v
+    err = soa_field_error(v, field)
+    if err is not None:
+        raise ValueError(err)
+    return v or ""
 
 
 # rdata for these types is a single bare target *name* — validate it as an
@@ -2180,6 +2173,58 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             ),
         )
 
+    # The zones left are the ones in Trash (the live ones were refused above).
+    # They go with the group by FK cascade, which runs no Python, so write the
+    # per-item row a Trash purge writes (#1957): name, view and record count.
+    trashed_zones = (
+        (
+            await db.execute(
+                select(DNSZone)
+                .where(DNSZone.group_id == group_id)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    view_names: dict[uuid.UUID, str] = {}
+    view_ids = {z.view_id for z in trashed_zones if z.view_id is not None}
+    if view_ids:
+        view_names = {
+            v.id: v.name
+            for v in (await db.execute(select(DNSView).where(DNSView.id.in_(view_ids))))
+            .scalars()
+            .all()
+        }
+    for z in trashed_zones:
+        record_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == z.id)
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one()
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_zone",
+                resource_id=str(z.id),
+                resource_display=z.name,
+                old_value={
+                    "name": z.name,
+                    "view": view_names.get(z.view_id) if z.view_id else None,
+                    "record_count": record_count,
+                    "purged_with": "dns_server_group",
+                    "group": group.name,
+                },
+                result="success",
+            )
+        )
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2189,6 +2234,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             resource_type="dns_server_group",
             resource_id=str(group.id),
             resource_display=group.name,
+            old_value={"trashed_zones_deleted": len(trashed_zones)},
             result="success",
         )
     )
@@ -2321,10 +2367,12 @@ async def create_server(
         # ``# TODO: encrypt`` marker.
         data["api_key_encrypted"] = encrypt_str(body.api_key)
 
-    # Auto-mark this server as primary if the group has no primary yet.
-    # Prevents the footgun where a freshly-created group has zero primaries
-    # and `enqueue_record_op` silently drops every write targeting its zones.
-    # Admins can still flip the flag later via PUT; this only fires on create.
+    # Auto-mark this server as primary if the group has no primary yet, so a
+    # freshly-created group has one from the start. (A group without one no
+    # longer drops writes — ``resolve_primary_server`` falls back to the
+    # election's pick and the beat sweep stamps it, #2276 — but the paths that
+    # read the flag directly, catalog producer and DNSSEC reporter among them,
+    # still want it set.) Admins can move it later via PUT.
     has_primary = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.is_primary.is_(True))
     )
@@ -2475,9 +2523,14 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
         setattr(server, k, v)
+    if reenabled:
+        # #2281 — it got no record ops while disabled; make its agent
+        # re-render every zone from the current records.
+        changes["zone_resync_ops_retired"] = await force_zone_resync(db, server)
 
     # Credentials contract matches DHCP:
     #   None → leave alone, {} → clear, partial dict → decrypt-merge-reencrypt
@@ -2583,11 +2636,11 @@ async def update_server(
             )
             server.is_primary = True
         else:
-            # Clearing the LAST primary re-creates the footgun create-time
-            # auto-election exists to prevent: ``enqueue_record_op`` drops
-            # every write to the group's zones with only a log line — no
-            # error reaches whoever made the change. Promote a replacement
-            # instead; that demotes this one as a side effect.
+            # Clearing the LAST primary would not stick: since #2276 the
+            # write path stands in the election's pick and the 60 s beat
+            # sweep re-stamps the flag — very likely on this same server, the
+            # oldest. Refuse, and point at the operation that does what the
+            # operator means: promote a replacement, which demotes this one.
             others = await db.execute(
                 select(DNSServer.id)
                 .where(
@@ -2601,10 +2654,10 @@ async def update_server(
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "This is the only primary in its group; clearing it would "
-                        "silently drop every DNS record write to the group's zones. "
-                        "Mark another server in the group as primary instead — that "
-                        "demotes this one."
+                        "This is the only primary in its group, and a group without "
+                        "one has a primary re-elected automatically within a minute, "
+                        "so clearing it would not stick. Mark another server in the "
+                        "group as primary instead — that demotes this one."
                     ),
                 )
             server.is_primary = False
@@ -2635,6 +2688,12 @@ async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     server = await _require_server(group_id, server_id, db)
+    # #2276 — deleting the primary elects a successor in the same transaction,
+    # the way the #934 move does. A group left without one used to drop every
+    # later record write before the agent fan-out, behind a 200.
+    successor = None
+    if server.is_primary:
+        successor = await elect_primary(db, server.group_id, exclude_id=server.id)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2644,6 +2703,11 @@ async def delete_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
+            new_value=(
+                {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
+                if successor is not None
+                else None
+            ),
             result="success",
         )
     )
@@ -2992,6 +3056,7 @@ class ZoneSyncItem(BaseModel):
     pushed: int
     server_records: int
     push_errors: list[str]
+    queued_for_agent: bool = False
     error: str | None = None
 
 
@@ -3253,6 +3318,7 @@ async def _sync_single_server(
                     pushed=result.push.pushed,
                     server_records=result.pull.server_records,
                     push_errors=result.push.push_errors,
+                    queued_for_agent=result.push.queued_for_agent,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — per-zone isolation
@@ -5454,14 +5520,7 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
-    existing = await db.execute(
-        select(DNSZone).where(
-            DNSZone.group_id == group_id,
-            DNSZone.view_id == body.view_id,
-            DNSZone.name == body.name,
-        )
-    )
-    if existing.scalar_one_or_none():
+    if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
             detail="A zone with that name already exists in this group/view",
@@ -5586,6 +5645,14 @@ class ServerZoneStateEntry(BaseModel):
     # #2042 — ops for this zone the server has not acknowledged yet (pending
     # or in flight). Non-zero means not in sync whatever the serial says.
     pending_ops: int = 0
+    # #2316 — how the server's report is weighed. ``ok``: the server is
+    # active, so its serial counts. ``unreachable``: it is not active (down,
+    # errored, disabled), so a serial it reported earlier is not evidence it
+    # serves the zone now and it is never counted as in sync. ``paused``:
+    # the operator put it in maintenance — excluded from the count and shown
+    # separately. ``counted`` is True only for ``ok``.
+    freshness: Literal["ok", "unreachable", "paused"] = "ok"
+    counted: bool = True
 
 
 class ServerZoneStateResponse(BaseModel):
@@ -5663,6 +5730,13 @@ async def get_zone_server_state(
         current = int(st.current_serial) if st else None
         reported = st.reported_at if st else None
         pending = queued.get((srv.id, zone.name), 0)
+        freshness: Literal["ok", "unreachable", "paused"]
+        if srv.maintenance_mode:
+            freshness = "paused"
+        elif srv.status != "active":
+            freshness = "unreachable"
+        else:
+            freshness = "ok"
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -5671,8 +5745,15 @@ async def get_zone_server_state(
                 current_serial=current,
                 reported_at=reported,
                 pending_ops=pending,
+                freshness=freshness,
+                counted=freshness == "ok",
             )
         )
+        if freshness == "paused":
+            continue
+        if freshness == "unreachable":
+            all_in_sync = False
+            continue
         if current is None:
             all_in_sync = False
         else:
@@ -7258,14 +7339,12 @@ async def rollover_zone_dnssec_key(
         {"name": "@", "type": "DNSSEC_OP", "key_tag": body.key_tag},
     )
     if op is None:
-        # #1946 — no row was written (no primary, or no enabled agent-based
-        # server): answering ``queued`` would claim a rollover nobody runs.
+        # #1946 — no row was written (no servers in the group, or no enabled
+        # agent-based server; a missing primary flag no longer stops it,
+        # #2276): answering ``queued`` would claim a rollover nobody runs.
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Nothing to run the rollover: the group has no primary server "
-                "or no enabled agent-based server"
-            ),
+            detail=("Nothing to run the rollover: the group has no enabled " "agent-based server"),
         )
     db.add(
         AuditLog(
@@ -8904,7 +8983,10 @@ async def bulk_delete_records(
             skipped.append(
                 {
                     "record_id": str(rec.id),
-                    "reason": "no primary configured for zone — wire delete skipped",
+                    "reason": (
+                        "no enabled server in the zone's group to send it to — "
+                        "wire delete skipped"
+                    ),
                 }
             )
             continue
@@ -9634,6 +9716,8 @@ class SyncWithServerResponse(BaseModel):
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
+    # #2667 — agent-managed server: pushed rows were queued for the agent.
+    queued_for_agent: bool = False
 
 
 @router.post(
@@ -9712,6 +9796,7 @@ async def sync_zone_with_server_endpoint(
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
+        queued_for_agent=result.push.queued_for_agent,
     )
 
 
@@ -10561,28 +10646,9 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
     Tailscale tenant (or rebind it to a different DNS group), then
     the operator can manage the zone manually.
     """
-    if zone.tailscale_tenant_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Zone {zone.name!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. The reconciler "
-                f"will overwrite any changes on the next sync. Unbind the "
-                f"DNS group on the Tailscale tenant or delete the tenant "
-                f"to release the zone."
-            ),
-        )
-    if zone.netbird_instance_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Zone {zone.name!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. The reconciler "
-                f"will overwrite any changes on the next sync. Unbind the "
-                f"DNS group on the NetBird instance or delete the instance "
-                f"to release the zone."
-            ),
-        )
+    msg = synthesised_zone_error(zone, op)
+    if msg is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:

@@ -89,10 +89,16 @@ async def _run_sync() -> dict[str, Any]:
                 # agent-based drivers just aren't in scope for this
                 # scheduler today.
                 primary_res = await db.execute(
-                    select(DNSServer).where(
+                    select(DNSServer)
+                    .where(
                         DNSServer.group_id == zone.group_id,
                         DNSServer.is_primary.is_(True),
                     )
+                    # A group holding two primaries (#2276's heal racing a
+                    # promotion) must mis-pick, not raise MultipleResultsFound
+                    # out of the whole sweep. Same cap every other lookup uses.
+                    .order_by(DNSServer.created_at, DNSServer.id)
+                    .limit(1)
                 )
                 primary = primary_res.scalar_one_or_none()
                 if primary is None:

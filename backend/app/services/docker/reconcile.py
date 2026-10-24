@@ -47,8 +47,14 @@ from app.services.docker.client import (
     DockerClientError,
 )
 from app.services.integration_ownership import (
+    SpaceRelease,
     address_taken,
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
     owned_by_other_integration,
+    owned_subnets_in_space,
+    refuse_sync_into_trashed_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -136,6 +142,9 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -332,8 +341,14 @@ async def _apply_blocks_and_subnets(
         existing_networks[supernet] = parent
         summary.blocks_created += 1
 
-    res = await db.execute(select(Subnet).where(Subnet.docker_host_id == host.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # #2577 — only subnets in the host's own space; anything it owns in
+    # another (its old space, after a space change) is released first.
+    current_subnets = {
+        str(s.network): s
+        for s in await owned_subnets_in_space(
+            db, "docker_host_id", host.id, host.ipam_space_id, summary=summary
+        )
+    }
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
@@ -435,6 +450,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -449,11 +465,9 @@ async def _apply_addresses(
     # locked; rows owned by another integration are skipped + warned.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, host.ipam_space_id, desired_addrs)
         for row in existing:
             if row.docker_host_id == host.id:
                 continue
@@ -472,8 +486,14 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.docker_host_id == host.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. One carrying our FK in another space is released first (#2577).
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "docker_host_id", host.id, host.ipam_space_id, summary=summary
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.docker_host_id == host.id}
 
@@ -498,6 +518,13 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 # Another integration's row (or another Docker host's) may
                 # already sit at the target (subnet, address); moving onto
                 # it would hit ``uq_ip_address_subnet_address`` and roll
@@ -555,6 +582,10 @@ async def _apply_addresses(
 
 async def reconcile_host(db: AsyncSession, host: DockerHost) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, host, summary):
+        return summary
 
     client_key_pem = ""
     if host.client_key_encrypted:
@@ -613,6 +644,8 @@ async def reconcile_host(db: AsyncSession, host: DockerHost) -> ReconcileSummary
             resource_id=str(host.id),
             resource_display=host.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -635,6 +668,7 @@ async def reconcile_host(db: AsyncSession, host: DockerHost) -> ReconcileSummary
     summary.ok = True
     logger.info(
         "docker_reconcile_ok",
+        **summary.released.log_fields(),
         host=str(host.id),
         containers=summary.container_count,
         blocks_created=summary.blocks_created,

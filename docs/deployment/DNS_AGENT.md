@@ -233,7 +233,18 @@ while it runs and releases only while it still holds it: a render the OOM
 killer takes mid-flight frees the slot within one lease instead of holding
 every server's render for the render ceiling. A render waiting for the slot
 keeps its server's lock, so the duplicates the sweep and further marks
-enqueue meanwhile coalesce into it.
+enqueue meanwhile coalesce into it. A render killed mid-flight records
+nothing, and the broker redelivers its task, so each render raises a
+per-server count in Redis before it runs and clears it when it returns or
+raises (#2227): once two renders of a server have died without finishing,
+the next records why on the server row (`bundle_render_status = failed`,
+the `agent_bundle_render_failed` alert) and holds that server for five
+minutes before letting one more through. Up to `dns_agent_bundle_render_slots` (2) renders run at
+once, and a server that changed again while it rendered hands its slot to a
+waiting render rather than rendering again in place. The render reads the
+group's records a batch of zones at a time and never holds them whole; for what it
+needs per zone and per record see "Control-plane memory for large groups"
+in [`DNS.md`](../features/DNS.md).
 
 *Every process that writes DNS rows must carry the listener.* It is
 installed by importing `bundle_dirty`: `app.main` does so for the api,
@@ -346,6 +357,19 @@ A failed attempt (at a million records the records query outlives the
 api's 30 s `command_timeout`) is logged and counted
 (`spatiumddi_agent_bundle_inline_failures_total`) and the poll waits for
 the worker's render; it is never recorded as the server's render failure.
+
+*A re-enabled server re-renders every zone (#2281).* A disabled server gets
+no record ops and no renders, and its agent keeps serving the config it
+last applied. In a group without views records are not part of the
+structural etag, so the bundle it gets when it is enabled again carries the
+current records but would not make the agent render them. Re-enabling
+therefore bumps `dns_server.zone_resync_seq`, which is folded into that
+server's structural etag, and retires the record ops still queued for it
+from before the disable (each carries an RRset as it was then, and shipped
+after the re-render it could put back a record deleted in between). Expect
+one full reload of that server's zones after you enable it. Moving a server
+to another group bumps the same counter. Maintenance mode does not: a
+paused server keeps receiving queued ops, which ship in order on resume.
 
 ### RFC 2136 `nsupdate` responsibility
 

@@ -28,6 +28,7 @@ from app.models.ipam import IPSpace
 from app.models.tailscale import TailscaleTenant
 from app.services.dns.bundle_dirty import mark_integration_dns_released
 from app.services.integration_credentials import credential_status
+from app.services.integration_ownership import release_integration_rows
 from app.services.tailscale.client import AUTH_REJECTED_PREFIX, is_auth_rejected
 from app.services.tailscale.token_expiry import (
     TokenExpiryRead,
@@ -425,6 +426,11 @@ async def delete_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if t is None:
         raise HTTPException(status_code=404, detail="Tailscale tenant not found")
     _audit(db, user=user, action="delete", tenant_id=t.id, tenant_name=t.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="tailscale_tenant_id", target_id=t.id, user=user, target_name=t.name
+    )
     # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
     await mark_integration_dns_released(db, own_fk="tailscale_tenant_id", target_id=t.id)
     await db.delete(t)
