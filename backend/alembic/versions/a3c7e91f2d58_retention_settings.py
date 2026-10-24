@@ -8,7 +8,7 @@ with server defaults equal to today's hard-coded values, so nothing changes
 on upgrade until an operator edits them.
 
 Revision ID: a3c7e91f2d58
-Revises: e7b3d19a4c26
+Revises: f27379a82b17
 Create Date: 2026-10-23 10:00:00.000000
 """
 
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "a3c7e91f2d58"
-down_revision = "e7b3d19a4c26"
+down_revision = "f27379a82b17"
 branch_labels = None
 depends_on = None
 
