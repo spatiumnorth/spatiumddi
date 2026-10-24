@@ -58,7 +58,6 @@ from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
-    contains_zonefile_unsafe,
     primary_ns_error,
     structured_rdata_error,
     validate_fqdn,
@@ -221,6 +220,7 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
+from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -1813,20 +1813,10 @@ def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     validate WITHOUT mutating — a valid nameserver / RNAME contains none of the
     ``contains_zonefile_unsafe`` set. Empty ("" default / auto-filled) passes.
     """
-    if v is None or v == "":
-        return v or ""
-    if contains_zonefile_unsafe(v):
-        raise ValueError(
-            "must be a bare domain name — no whitespace, control characters, "
-            "or zone-file syntax (e.g. ';' '$' '@')"
-        )
-    if field == "primary_ns":
-        # #2075 — a Primary NS BIND's check-names refuses stops the zone
-        # being served at all, so it is a host name or it is not stored.
-        err = primary_ns_error(v)
-        if err is not None:
-            raise ValueError(f"Primary NS (primary_ns) {err}")
-    return v
+    err = soa_field_error(v, field)
+    if err is not None:
+        raise ValueError(err)
+    return v or ""
 
 
 # rdata for these types is a single bare target *name* — validate it as an
@@ -5474,14 +5464,7 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
-    existing = await db.execute(
-        select(DNSZone).where(
-            DNSZone.group_id == group_id,
-            DNSZone.view_id == body.view_id,
-            DNSZone.name == body.name,
-        )
-    )
-    if existing.scalar_one_or_none():
+    if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
             detail="A zone with that name already exists in this group/view",
