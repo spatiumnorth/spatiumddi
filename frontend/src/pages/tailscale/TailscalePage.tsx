@@ -763,9 +763,10 @@ function DeleteTenantModal({
         <p className="text-sm text-muted-foreground">
           Remove the Tailscale tenant{" "}
           <span className="font-semibold">{tenant.name}</span>? This only
-          affects SpatiumDDI — nothing on the Tailscale side changes. All IPAM
-          rows mirrored from this tenant (the auto-created CGNAT block + IPv6
-          ULA block + every device IP) will be removed via the FK cascade.
+          affects SpatiumDDI — nothing on the Tailscale side changes. Only rows
+          that were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

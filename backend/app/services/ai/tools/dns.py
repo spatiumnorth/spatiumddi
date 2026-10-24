@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.safe_fetch import mask_url_credentials
 from app.models.auth import User
 from app.models.dns import (
     DNSBlockList,
@@ -307,8 +308,9 @@ class FindDnsServersArgs(BaseModel):
         "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Answers 'which group is this server in?', 'which server is "
         "primary for that group?' and "
-        "'which groups have no primary?' — the last of which silently "
-        "drops every record write to that group's zones. Read-only: "
+        "'which groups have no primary?' (one is re-elected automatically "
+        "within a minute; until then writes go to the server it will "
+        "pick). Read-only: "
         "moving a server between groups is done over the REST API or the "
         "DNS → Server Groups UI, not from here."
     ),
@@ -447,6 +449,7 @@ async def preview_dns_zone_move(
         "technitium_api_refusal": plan.technitium_api_refusal,
         "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
         "forward_transport_refusal": plan.forward_transport_refusal,
+        "technitium_acl_refusal": plan.technitium_acl_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
@@ -854,7 +857,8 @@ async def list_dns_blocklists(
             "description": r.description,
             "category": r.category,
             "source_type": r.source_type,
-            "feed_url": r.feed_url,
+            # Credentials in the URL are masked, as in the REST response.
+            "feed_url": mask_url_credentials(r.feed_url) if r.feed_url else r.feed_url,
             "feed_format": r.feed_format,
             "update_interval_hours": r.update_interval_hours,
             "block_mode": r.block_mode,
@@ -1385,6 +1389,13 @@ class FindDNSQueriesArgs(BaseModel):
         ),
     )
     server_id: str | None = Field(default=None, description="Filter to one DNS server UUID.")
+    group_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter to every server in one DNS server group (UUID). Omit both "
+            "server_id and group_id to search every server you can read."
+        ),
+    )
     minutes: int = Field(
         default=60, ge=1, le=1440, description="Trailing window (the log is pruned at 24 h)."
     )
@@ -1404,7 +1415,10 @@ class FindDNSQueriesArgs(BaseModel):
         "DNS. rcode is null when the server group has response logging "
         "off; null means UNRECORDED, never success. Requires query "
         "logging on an agent-managed BIND9 / PowerDNS group; the log "
-        "holds 24 h."
+        "holds 24 h. Scope with server_id or group_id (every server in "
+        "that group); omit both to search every server, which is what "
+        "you want when a load balancer spreads a client's queries "
+        "across a group. Each row names the server that logged it."
     ),
     args_model=FindDNSQueriesArgs,
     category="dns",
@@ -1415,45 +1429,52 @@ async def find_dns_queries(
 ) -> list[dict[str, Any]]:
     from datetime import UTC, datetime, timedelta  # noqa: PLC0415
 
-    from app.models.logs import DNSQueryLogEntry  # noqa: PLC0415
-    from app.services.search.ranking import like_pattern  # noqa: PLC0415
+    from app.services.logs.agent_logs import (  # noqa: PLC0415
+        LogScopeError,
+        resolve_dns_log_servers,
+        search_dns_queries,
+    )
 
-    since = datetime.now(UTC) - timedelta(minutes=args.minutes)
-    stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.ts >= since)
+    client_ip: str | None = None
     if args.client_ip:
         try:
             client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
         except ValueError:
             return [{"result": f"{args.client_ip!r} is not an IP address"}]
-        stmt = stmt.where(DNSQueryLogEntry.client_ip == client_ip)
-    if args.server_id:
-        # A UUID column comparison raises a DBAPIError on anything that is
-        # not one, and the likeliest wrong value here is a server NAME the
-        # model read off another tool's output — so answer the question
-        # instead of 500ing, exactly as the client_ip guard above does.
-        try:
-            server_id = str(uuid.UUID(args.server_id.strip()))
-        except ValueError:
-            return [{"result": f"{args.server_id!r} is not a server UUID"}]
-        stmt = stmt.where(DNSQueryLogEntry.server_id == server_id)
-    if args.qtype:
-        stmt = stmt.where(DNSQueryLogEntry.qtype == args.qtype.strip().upper())
-    if args.rcode:
-        wanted = args.rcode.strip().upper()
-        if wanted == "UNKNOWN":
-            stmt = stmt.where(DNSQueryLogEntry.rcode.is_(None))
-        else:
-            stmt = stmt.where(DNSQueryLogEntry.rcode == wanted)
-    if args.qname_contains:
-        stmt = stmt.where(
-            DNSQueryLogEntry.qname.ilike(like_pattern(args.qname_contains.strip()), escape="\\")
-        )
-    stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    # A UUID column comparison raises a DBAPIError on anything that is not
+    # one, and the likeliest wrong value here is a server or group NAME the
+    # model read off another tool's output — so answer the question instead
+    # of 500ing, exactly as the client_ip guard above does.
+    scope: dict[str, uuid.UUID | None] = {"server_id": None, "group_id": None}
+    for key in ("server_id", "group_id"):
+        raw = getattr(args, key)
+        if raw:
+            try:
+                scope[key] = uuid.UUID(raw.strip())
+            except ValueError:
+                return [{"result": f"{raw!r} is not a {key.removesuffix('_id')} UUID"}]
+    # The same server resolution the REST route uses (#2120): the filter is
+    # intersected with the servers the caller may read.
+    try:
+        servers = await resolve_dns_log_servers(db, user, **scope)
+    except LogScopeError as exc:
+        return [{"result": exc.detail}]
+    names = {s.id: s.name for s in servers}
+    rows = await search_dns_queries(
+        db,
+        list(names),
+        since=datetime.now(UTC) - timedelta(minutes=args.minutes),
+        client_ip=client_ip,
+        qname_contains=args.qname_contains,
+        qtype=args.qtype,
+        rcode=args.rcode,
+        limit=args.limit,
+    )
     return [
         {
             "ts": r.ts.isoformat(),
             "server_id": str(r.server_id),
+            "server_name": names.get(r.server_id),
             "client_ip": str(r.client_ip) if r.client_ip is not None else None,
             "qname": r.qname,
             "qtype": r.qtype,

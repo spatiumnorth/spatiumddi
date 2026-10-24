@@ -67,9 +67,40 @@ def test_operator_entries_are_unioned_with_the_key_grants() -> None:
     assert 'key "spatium-default";' in out
 
 
-def test_none_is_dropped_when_mixed_with_real_entries() -> None:
-    """As an address match ``none`` can never match, so it is pure noise."""
-    assert "none" not in _render_allow_transfer(["10.0.0.0/8", "none"], [])
+def test_none_keeps_its_place_when_mixed_with_other_entries() -> None:
+    """BIND reads ``none`` as ``!any`` — deny everyone from that point on — so
+    ``["none", "10.0.0.0/8"]`` admits nobody but the key holders. Dropping
+    ``none`` would turn it into "admit 10/8", the opposite of the stored
+    list and of the Technitium translation of it."""
+    out = _render_allow_transfer(["none", "10.0.0.0/8"], _transfer_key_grants(_KEYS))
+    assert out == (
+        'allow-transfer { key "spatium-default"; key "ops-xfer."; none; 10.0.0.0/8; }; '
+    )
+
+
+def test_trailing_none_is_rendered_in_order() -> None:
+    out = _render_allow_transfer(["10.0.0.0/8", "none"], [])
+    assert out == "allow-transfer { 10.0.0.0/8; none; }; "
+
+
+def test_negated_none_is_rendered_verbatim() -> None:
+    assert _render_allow_transfer(["!none", "10.0.0.0/8"], []) == (
+        "allow-transfer { !none; 10.0.0.0/8; }; "
+    )
+
+
+def test_entries_that_would_end_the_statement_are_dropped() -> None:
+    out = _render_allow_transfer(["10.0.0.0/8", "any; }; options { x"], [])
+    assert out == "allow-transfer { 10.0.0.0/8; }; "
+
+
+def test_mixed_none_list_through_a_full_render(tmp_path: Path) -> None:
+    b = _bundle(zones=[_zone("closed.test.", allow_transfer=["none", "192.0.2.0/24"])])
+    b["options"]["allow_transfer"] = ["none", "10.0.0.0/8"]
+    conf = _render(tmp_path, b)
+    assert 'key "ops-xfer."; none; 10.0.0.0/8; };' in conf
+    zone_line = next(ln for ln in conf.splitlines() if ln.startswith('zone "closed.test."'))
+    assert 'key "ops-xfer."; none; 192.0.2.0/24; };' in zone_line
 
 
 def test_any_is_honoured_when_the_operator_asks_for_it() -> None:

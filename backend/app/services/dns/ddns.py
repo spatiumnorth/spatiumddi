@@ -134,6 +134,45 @@ async def resolve_effective_ddns(db: AsyncSession, subnet: Subnet) -> EffectiveD
     )
 
 
+async def resolve_effective_ddns_for_block(db: AsyncSession, block: IPBlock) -> EffectiveDDNS:
+    """Effective DDNS a subnet created directly under ``block`` would inherit.
+
+    The same walk ``resolve_effective_ddns`` does after its own subnet check:
+    the first non-inheriting block up the chain, else the space. Backs the
+    New Subnet dialog's DDNS tab (#2475), where the subnet does not exist yet.
+    """
+    current: IPBlock | None = block
+    while current is not None:
+        if not current.ddns_inherit_settings:
+            return EffectiveDDNS(
+                enabled=current.ddns_enabled,
+                hostname_policy=current.ddns_hostname_policy,
+                domain_override=current.ddns_domain_override,
+                ttl=current.ddns_ttl,
+                source=f"block:{current.id}",
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+            continue
+        space = await db.get(IPSpace, current.space_id)
+        if space is None:
+            break
+        return EffectiveDDNS(
+            enabled=space.ddns_enabled,
+            hostname_policy=space.ddns_hostname_policy,
+            domain_override=space.ddns_domain_override,
+            ttl=space.ddns_ttl,
+            source=f"space:{space.id}",
+        )
+    return EffectiveDDNS(
+        enabled=False,
+        hostname_policy="client_or_generated",
+        domain_override=None,
+        ttl=None,
+        source="none",
+    )
+
+
 _POLICIES: frozenset[str] = frozenset(
     {"client_provided", "client_or_generated", "always_generate", "disabled"}
 )
@@ -265,6 +304,14 @@ async def apply_ddns_for_lease(
 
     hostname = await resolve_ddns_hostname(db, subnet, str(ipam_row.address), client_hostname)
     if not hostname:
+        if not (ipam_row.hostname or "").strip():
+            # The lease left the row with a blank name (a client that sent
+            # only spaces, say) and the policy names nothing in its place: the
+            # row publishes nothing, so the sync retracts the A / PTR an
+            # earlier name published instead of leaving them served.
+            from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+            await _sync_dns_record(db, ipam_row, subnet, action="create")
         return False
 
     # Idempotency: if the hostname is unchanged and the auto-generated

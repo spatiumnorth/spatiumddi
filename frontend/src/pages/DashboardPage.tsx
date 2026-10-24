@@ -103,6 +103,9 @@ import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
@@ -1023,11 +1026,17 @@ function VrfSummaryCard() {
 // ── Domains Summary card ──────────────────────────────────────────────────────
 
 function DomainsSummaryCard() {
+  const { enabled, ready } = useFeatureModules();
+  // Wait for the real module state: ``enabled`` is optimistically true while
+  // loading, which would fire one 404 on a hard load with the module off.
+  const moduleOn = ready && enabled("network.domains");
   const { data, isLoading, isError } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
+    enabled: moduleOn,
   });
+  if (!moduleOn) return null;
 
   const inner = (() => {
     if (isLoading) {
@@ -1522,11 +1531,17 @@ export function DashboardPage() {
   const haGroups = dhcpGroups.filter((g) => g.kea_member_count >= 2);
 
   // Audit
-  const { data: recent } = useQuery({
+  // The route takes read on `audit_log`: a user without it is not asked at
+  // all (each refusal writes a `denied` audit row), and the card says so
+  // rather than "No recent activity" (#2702). A refusal also ends the poll.
+  const { can: canRead, isLoading: permsLoading } = usePermissions();
+  const canReadAudit = canRead("read", "audit_log");
+  const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
     queryFn: () => auditApi.list({ limit: 15, offset: 0 }),
     staleTime: 10_000,
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
+    enabled: canReadAudit,
   });
 
   // Integrations — only fetched when the corresponding toggle is on,
@@ -2374,7 +2389,18 @@ export function DashboardPage() {
               </div>
               <div className="overflow-x-auto">
                 <div className="min-w-[440px] divide-y">
-                  {!recent || recent.items.length === 0 ? (
+                  {recentError || (!canReadAudit && !permsLoading) ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                      {recentError ? (
+                        <ListReadError
+                          error={recentError}
+                          what="the audit log"
+                        />
+                      ) : (
+                        "You don't have permission to see the audit log."
+                      )}
+                    </div>
+                  ) : !recent || recent.items.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
                       No recent activity. Try creating a subnet or a DNS record.
                     </div>
@@ -4166,14 +4192,19 @@ function CertsExpiringKpi() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = enabled("security.tls_certs");
 
-  const { data } = useQuery({
+  // The route takes read on `tls_cert`; a user without it is not asked, and
+  // the card says it is withheld rather than "0 of 0 monitored" (#2702).
+  const { can, isLoading: permsLoading } = usePermissions();
+  const canReadCerts = can("read", "tls_cert");
+  const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
     queryFn: () => tlsCertsApi.list({ limit: 500 }),
-    enabled: ready && moduleOn,
+    enabled: ready && moduleOn && canReadCerts,
     staleTime: 60_000,
   });
 
   if (ready && !moduleOn) return null;
+  const withheld = (!canReadCerts && !permsLoading) || !!error;
 
   const items = data?.items ?? [];
   const expiring = items.filter(
@@ -4189,11 +4220,20 @@ function CertsExpiringKpi() {
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         Certs expiring ≤30d
       </p>
-      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
-        {expiring}
+      <p
+        className={cn(
+          "mt-2 text-3xl font-bold tabular-nums",
+          withheld ? "text-muted-foreground" : cls.value,
+        )}
+      >
+        {withheld ? "—" : expiring}
       </p>
       <p className="text-[11px] text-muted-foreground">
-        of {items.length} monitored · click to review
+        {withheld
+          ? error && !isRefused(error)
+            ? "couldn't load certificates"
+            : "you may not read certificates"
+          : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
   );
@@ -4923,6 +4963,32 @@ function IntegrationsDashboardTabPanel() {
         ))}
       </DashboardListCard>
 
+      <DashboardListCard
+        title="Recent reconciler warnings"
+        emptyHint="No reconciler warnings in recent history."
+      >
+        {(data.recent_warnings ?? []).map((w) => (
+          <div key={w.id} className="px-4 py-2 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="min-w-0 truncate font-medium">
+                {w.integration} · {w.target_display || w.target_id}
+              </span>
+              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                {humanTime(w.timestamp)}
+              </span>
+            </div>
+            {w.error_detail && (
+              <p
+                className="mt-0.5 break-words font-mono text-[10px] text-amber-600 dark:text-amber-400"
+                title={w.error_detail}
+              >
+                {w.error_detail}
+              </p>
+            )}
+          </div>
+        ))}
+      </DashboardListCard>
+
       <p className="text-[11px] text-muted-foreground">
         Refreshes every 30 s. A target is flagged stale when its last sync is
         older than 2× its configured
@@ -5044,11 +5110,13 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               <span
                 className={cn(
                   "shrink-0 tabular-nums",
-                  t.last_sync_error
-                    ? "text-red-600 dark:text-red-400"
-                    : t.is_stale || t.last_sync_warning
-                      ? "text-amber-600 dark:text-amber-400"
-                      : "text-muted-foreground",
+                  t.enabled === false
+                    ? "text-muted-foreground"
+                    : t.last_sync_error
+                      ? "text-red-600 dark:text-red-400"
+                      : t.is_stale || t.last_sync_warning
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-muted-foreground",
                 )}
                 title={t.last_sync_error ?? t.last_sync_warning ?? undefined}
               >

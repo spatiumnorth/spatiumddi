@@ -212,11 +212,19 @@ class _FakeDriver:
     def __init__(self, *, archives: list[Any] | None = None, payload: bytes = b"zip") -> None:
         self._archives = archives if archives is not None else [_listing("newest.zip")]
         self._payload = payload
+        self.max_bytes_seen: list[int | None] = []
 
     async def list_archives(self, *, config: dict[str, Any]) -> list[Any]:
         return self._archives
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
+        from app.services.backup.targets.base import ArchiveTooLargeError
+
+        self.max_bytes_seen.append(max_bytes)
+        if max_bytes is not None and len(self._payload) > max_bytes:
+            raise ArchiveTooLargeError(filename, max_bytes)
         return self._payload
 
 
@@ -265,6 +273,11 @@ def _wire_drill(
 
     monkeypatch.setattr(drill_mod, "preflight", _noop)
     monkeypatch.setattr(drill_mod, "_create_scratch_db", _noop)
+
+    async def _no_keeper(*_a: Any, **_k: Any) -> tuple[None, None]:
+        return None, None
+
+    monkeypatch.setattr(drill_mod, "_open_keeper", _no_keeper)
     monkeypatch.setattr(drill_mod, "_drop_scratch_db", _noop)
     monkeypatch.setattr(drill_mod, "_replay_into_scratch", _noop)
 
@@ -366,6 +379,42 @@ async def test_newest_archive_is_the_one_drilled(monkeypatch) -> None:
     target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
     outcome = await _execute(target, live_db_url="postgresql+asyncpg://u:p@h:5432/live")
     assert outcome.filename == "newest.zip"
+
+
+@pytest.mark.asyncio
+async def test_drill_download_passes_the_archive_cap(monkeypatch) -> None:
+    """The drill asks the driver to stop at the archive cap, so an archive
+    whose listing understates its size is not read into memory whole."""
+    from app.services.backup.archive import MAX_ARCHIVE_BYTES
+    from app.services.backup.drill import _execute
+
+    driver = _FakeDriver()
+    _wire_drill(
+        monkeypatch, assertions=[Assertion("core_tables_populated", PASS, "ok")], driver=driver
+    )
+    target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
+    outcome = await _execute(target, live_db_url="postgresql+asyncpg://u:p@h:5432/live")
+    assert outcome.state == "passed"
+    assert driver.max_bytes_seen == [MAX_ARCHIVE_BYTES]
+
+
+@pytest.mark.asyncio
+async def test_drill_reports_an_archive_past_the_cap_as_error(monkeypatch) -> None:
+    """A listing that declares a small size for an archive the driver then
+    finds past the cap ends the drill as an error naming the cap, not as a
+    failed backup."""
+    from app.services.backup import drill as drill_mod
+    from app.services.backup.drill import _execute
+    from app.services.backup.targets.base import ArchiveListing
+
+    monkeypatch.setattr(drill_mod, "MAX_ARCHIVE_BYTES", 2)
+    understated = ArchiveListing(filename="newest.zip", size_bytes=1, created_at=datetime.now(UTC))
+    driver = _FakeDriver(archives=[understated], payload=b"zip")
+    _wire_drill(monkeypatch, assertions=[], driver=driver)
+    target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
+    outcome = await _execute(target, live_db_url="postgresql+asyncpg://u:p@h:5432/live")
+    assert outcome.state == "error"
+    assert outcome.error is not None and "cap" in outcome.error
 
 
 def test_assertion_serialises_for_jsonb() -> None:
@@ -1000,3 +1049,80 @@ async def test_no_alert_event_rows_leak_between_targets(
     matches = await _matching_restore_drill_failed_subjects(db_session, rule)
     assert {m[1] for m in matches} == {"vault-a", "vault-b"}
     assert await db_session.scalar(select(AlertEvent).limit(1)) is None
+
+
+# ── #2272: the orphan reaper vs a live drill ─────────────────────────
+
+from app.services.backup import drill as _drill_real  # noqa: E402
+
+_REAL_CREATE = _drill_real._create_scratch_db
+_REAL_DROP = _drill_real._drop_scratch_db
+_REAL_KEEPER = _drill_real._open_keeper
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_drop_a_live_drills_scratch_db(monkeypatch) -> None:
+    """A sweep tick on another worker slot runs the reaper while this drill
+    is still writing the dump to disk — before pg_restore has connected.
+    The scratch database must survive it, and be gone once the drill ends."""
+    from app.config import settings
+    from app.services.backup import drill as drill_mod
+    from app.services.backup.drill import _execute, _query_scalar, reap_orphaned_scratch_dbs
+
+    live_url = str(settings.database_url)
+    _wire_drill(monkeypatch, assertions=[Assertion("audit_chain_intact", PASS, "ok")])
+    # Real create / drop / keeper: the property under test is what the
+    # catalogue looks like to the reaper.
+    monkeypatch.setattr(drill_mod, "_create_scratch_db", _REAL_CREATE)
+    monkeypatch.setattr(drill_mod, "_drop_scratch_db", _REAL_DROP)
+    monkeypatch.setattr(drill_mod, "_open_keeper", _REAL_KEEPER)
+
+    seen: dict[str, Any] = {}
+
+    async def _replay_while_reaper_runs(
+        _b: bytes, *, dump_format: str, scratch_db: str, live_db_url: str
+    ) -> None:
+        seen["reaped"] = await reap_orphaned_scratch_dbs(live_db_url=live_db_url)
+        seen["exists"] = await _query_scalar(
+            f"SELECT count(*) FROM pg_database WHERE datname = '{scratch_db}'",
+            live_db_url=live_db_url,
+            timeout=30,
+        )
+        seen["name"] = scratch_db
+
+    monkeypatch.setattr(drill_mod, "_replay_into_scratch", _replay_while_reaper_runs)
+    target = BackupTarget(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
+    outcome = await _execute(target, live_db_url=live_url)
+
+    assert outcome.state == "passed", outcome.error
+    assert seen["name"] not in seen["reaped"]
+    assert seen["exists"].strip() == "1"
+    after = await _query_scalar(
+        f"SELECT count(*) FROM pg_database WHERE datname = '{seen['name']}'",
+        live_db_url=live_url,
+        timeout=30,
+    )
+    assert after.strip() == "0"
+
+
+@pytest.mark.asyncio
+async def test_reaper_still_drops_a_scratch_db_nobody_holds() -> None:
+    """The keeper must not blunt the reaper: a drill killed mid-run leaves a
+    database with no backend, and that is still collected."""
+    from app.config import settings
+    from app.services.backup.drill import (
+        _create_scratch_db,
+        _query_scalar,
+        reap_orphaned_scratch_dbs,
+    )
+
+    live_url = str(settings.database_url)
+    name = f"spatiumddi_drill_orphan{uuid.uuid4().hex[:8]}"
+    await _create_scratch_db(name, live_db_url=live_url)
+    assert name in await reap_orphaned_scratch_dbs(live_db_url=live_url)
+    gone = await _query_scalar(
+        f"SELECT count(*) FROM pg_database WHERE datname = '{name}'",
+        live_db_url=live_url,
+        timeout=30,
+    )
+    assert gone.strip() == "0"

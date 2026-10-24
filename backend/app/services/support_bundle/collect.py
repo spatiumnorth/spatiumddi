@@ -30,6 +30,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.models.alerts import AlertEvent
 from app.models.audit import AuditLog
 from app.models.diagnostics import InternalError
@@ -129,7 +130,7 @@ async def collect_versions(db: AsyncSession) -> str:
 
     return _json(
         {
-            "product_version": settings.version,
+            "product_version": canonical_version(settings.version, settings.app_version),
             "appliance_mode": settings.appliance_mode,
             "appliance_version": settings.appliance_version or None,
             "schema": {
