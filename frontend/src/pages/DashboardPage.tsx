@@ -103,6 +103,9 @@ import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
@@ -1528,11 +1531,17 @@ export function DashboardPage() {
   const haGroups = dhcpGroups.filter((g) => g.kea_member_count >= 2);
 
   // Audit
-  const { data: recent } = useQuery({
+  // The route takes read on `audit_log`: a user without it is not asked at
+  // all (each refusal writes a `denied` audit row), and the card says so
+  // rather than "No recent activity" (#2702). A refusal also ends the poll.
+  const { can: canRead, isLoading: permsLoading } = usePermissions();
+  const canReadAudit = canRead("read", "audit_log");
+  const { data: recent, error: recentError } = useQuery({
     queryKey: ["audit", "recent"],
     queryFn: () => auditApi.list({ limit: 15, offset: 0 }),
     staleTime: 10_000,
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
+    enabled: canReadAudit,
   });
 
   // Integrations — only fetched when the corresponding toggle is on,
@@ -2380,7 +2389,18 @@ export function DashboardPage() {
               </div>
               <div className="overflow-x-auto">
                 <div className="min-w-[440px] divide-y">
-                  {!recent || recent.items.length === 0 ? (
+                  {recentError || (!canReadAudit && !permsLoading) ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                      {recentError ? (
+                        <ListReadError
+                          error={recentError}
+                          what="the audit log"
+                        />
+                      ) : (
+                        "You don't have permission to see the audit log."
+                      )}
+                    </div>
+                  ) : !recent || recent.items.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
                       No recent activity. Try creating a subnet or a DNS record.
                     </div>
@@ -4172,14 +4192,19 @@ function CertsExpiringKpi() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = enabled("security.tls_certs");
 
-  const { data } = useQuery({
+  // The route takes read on `tls_cert`; a user without it is not asked, and
+  // the card says it is withheld rather than "0 of 0 monitored" (#2702).
+  const { can, isLoading: permsLoading } = usePermissions();
+  const canReadCerts = can("read", "tls_cert");
+  const { data, error } = useQuery({
     queryKey: ["tls-certs", "kpi"],
     queryFn: () => tlsCertsApi.list({ limit: 500 }),
-    enabled: ready && moduleOn,
+    enabled: ready && moduleOn && canReadCerts,
     staleTime: 60_000,
   });
 
   if (ready && !moduleOn) return null;
+  const withheld = (!canReadCerts && !permsLoading) || !!error;
 
   const items = data?.items ?? [];
   const expiring = items.filter(
@@ -4195,11 +4220,20 @@ function CertsExpiringKpi() {
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         Certs expiring ≤30d
       </p>
-      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
-        {expiring}
+      <p
+        className={cn(
+          "mt-2 text-3xl font-bold tabular-nums",
+          withheld ? "text-muted-foreground" : cls.value,
+        )}
+      >
+        {withheld ? "—" : expiring}
       </p>
       <p className="text-[11px] text-muted-foreground">
-        of {items.length} monitored · click to review
+        {withheld
+          ? error && !isRefused(error)
+            ? "couldn't load certificates"
+            : "you may not read certificates"
+          : `of ${items.length} monitored · click to review`}
       </p>
     </Link>
   );
