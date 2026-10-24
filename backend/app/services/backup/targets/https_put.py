@@ -422,7 +422,10 @@ class HttpsPutDestination(BackupDestination):
             )
         if resp.status_code // 100 != 2:
             raise BackupDestinationError(
-                f"{_method(config)} to {safe_url(url)} returned {resp.status_code}: {resp.text[:300]}"
+                f"{_method(config)} to {safe_url(url)} returned {resp.status_code}: "
+                # A receiver can echo the request URL, credential included,
+                # in its error body.
+                f"{scrub_url(resp.text, url)[:300]}"
             )
 
     async def list_archives(self, *, config: dict[str, Any]) -> list[ArchiveListing]:
@@ -438,7 +441,9 @@ class HttpsPutDestination(BackupDestination):
         """
         return []
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         raise UnsupportedOperationError(
             "the https_put destination is one-way: it can send an archive to the "
             "receiver but cannot read one back. Restore from the receiver's own "

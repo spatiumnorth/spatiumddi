@@ -81,7 +81,9 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     RetentionLockedError,
+    check_size,
     describe_exc,
+    read_capped,
     safe_filename,
 )
 
@@ -366,7 +368,9 @@ class S3Destination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         key = _key(config, filename)
 
         def _do() -> bytes:
@@ -378,7 +382,16 @@ class S3Destination(BackupDestination):
             client = _client(config)
             try:
                 resp = client.get_object(Bucket=config["bucket"], Key=key)
-                return resp["Body"].read()
+                body = resp["Body"]
+                try:
+                    # ContentLength is the object's size; refuse before
+                    # reading when it is already past the cap.
+                    length = resp.get("ContentLength")
+                    if isinstance(length, int):
+                        check_size(filename, length, max_bytes)
+                    return read_capped(body.read, filename=filename, max_bytes=max_bytes)
+                finally:
+                    body.close()
             except (ClientError, BotoCoreError) as exc:
                 raise BackupDestinationError(f"S3 get_object failed: {describe_exc(exc)}") from exc
 

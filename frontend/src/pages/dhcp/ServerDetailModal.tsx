@@ -32,6 +32,8 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
@@ -585,7 +587,7 @@ function LogsTab({ serverId }: { serverId: string }) {
   const [ip, setIp] = useState("");
   const filterKey = `${q}|${severity}|${mac}|${ip}`;
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["dhcp-server-activity", serverId, filterKey],
     queryFn: () =>
       logsApi.dhcpActivity({
@@ -596,7 +598,9 @@ function LogsTab({ serverId }: { serverId: string }) {
         ip_address: ip || null,
         max_events: 200,
       }),
-    refetchInterval: 30_000,
+    // A 403 does not heal by asking again, and each refusal is a `denied`
+    // audit row (#2700).
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   return (
@@ -650,7 +654,7 @@ function LogsTab({ serverId }: { serverId: string }) {
       {isLoading ? (
         <LoadingBlock />
       ) : isError ? (
-        <ErrorBlock />
+        <ErrorBlock error={error} what="this server's activity log" />
       ) : !data || data.events.length === 0 ? (
         <p className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground">
           No activity log entries match — Kea agents ship file-output{" "}
@@ -1027,7 +1031,19 @@ function LoadingBlock() {
   );
 }
 
-function ErrorBlock() {
+function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
+  // A refusal is the reader's permissions, not a fault: say so, with the
+  // server's reason, rather than "Failed to load — try again" (#2700).
+  if (error && what && isRefused(error)) {
+    return (
+      <p
+        role="alert"
+        className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={error} what={what} />
+      </p>
+    );
+  }
   return (
     <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
       <Activity className="h-4 w-4" />

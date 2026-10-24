@@ -2752,6 +2752,12 @@ async def _apply_create_dns_zone(
     if await zone_name_taken(db, grp.id, None, name):
         raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
 
+    from app.services.dns.view_collisions import RenderGuard  # noqa: PLC0415
+
+    # #2275 — a zone with no view renders into every view of the group, so it
+    # must not land beside a same-name zone pinned to one of them.
+    render_guard = await RenderGuard.capture(db, grp.id, [name])
+
     zone = DNSZone(
         group_id=grp.id,
         name=name,
@@ -2764,6 +2770,7 @@ async def _apply_create_dns_zone(
     )
     db.add(zone)
     await db.flush()
+    await render_guard.check(db, f"create zone {name!r}", error=ValueError)
 
     # #1932 — push the create to the group's agentless servers before the
     # commit, exactly as the REST create does (#798 lockstep): a provider

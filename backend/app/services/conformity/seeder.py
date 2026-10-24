@@ -249,9 +249,10 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
     {
         "name": "Audit log is reachable and append-only",
         "description": (
-            "Confirms the audit_log table is queryable. SpatiumDDI's "
-            "DB trigger guards against DELETE — this check is the "
-            "presence signal that gets cited in the auditor PDF."
+            "Confirms the DB triggers that refuse UPDATE and DELETE on "
+            "audit_log are present and enabled. Tamper-evident, not "
+            "tamper-proof: the table owner can drop them, and this check "
+            "is what reports it in the auditor PDF."
         ),
         "framework": "SOC2",
         "reference": "CC7.1",

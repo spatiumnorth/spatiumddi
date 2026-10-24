@@ -372,6 +372,12 @@ async def move_server_to_group(
         )
     ).rowcount or 0
 
+    # #2281 — the purge above dropped ops the daemon never applied. The target
+    # group's zones nearly always move the structural etag anyway, but two
+    # groups can render the same structural payload (same zone names and
+    # settings, different records), and then nothing would re-render them.
+    server.zone_resync_seq = (server.zone_resync_seq or 0) + 1
+
     # #882 verdict refers to a bundle from the old group. NULL = UNKNOWN.
     server.config_apply_status = None
     server.config_apply_error = None
