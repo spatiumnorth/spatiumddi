@@ -39,6 +39,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.services.support_bundle import collect
 from app.services.support_bundle.scrub import Scrubber, safety_net
 
@@ -204,7 +205,7 @@ async def generate(db: AsyncSession, *, scrubbed: bool = True) -> BundleResult:
     manifest: dict[str, Any] = {
         "bundle_id": bundle_id,
         "generated_at": stamp.isoformat(),
-        "product_version": settings.version,
+        "product_version": canonical_version(settings.version, settings.app_version),
         "appliance_mode": settings.appliance_mode,
         "scrubbed": scrubbed,
         "scrub": {

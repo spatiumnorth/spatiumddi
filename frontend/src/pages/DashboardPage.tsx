@@ -5076,11 +5076,13 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               <span
                 className={cn(
                   "shrink-0 tabular-nums",
-                  t.last_sync_error
-                    ? "text-red-600 dark:text-red-400"
-                    : t.is_stale || t.last_sync_warning
-                      ? "text-amber-600 dark:text-amber-400"
-                      : "text-muted-foreground",
+                  t.enabled === false
+                    ? "text-muted-foreground"
+                    : t.last_sync_error
+                      ? "text-red-600 dark:text-red-400"
+                      : t.is_stale || t.last_sync_warning
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-muted-foreground",
                 )}
                 title={t.last_sync_error ?? t.last_sync_warning ?? undefined}
               >

@@ -8439,7 +8439,8 @@ export function EditSubnetModal({
             <span>
               Any DHCP-leased addresses in this subnet and their auto-published
               DNS (DDNS) records will be revoked and removed. Manually-allocated
-              addresses are unaffected.
+              addresses go to Trash with the subnet, and the DNS records
+              published for them stop resolving until a superadmin restores it.
             </span>
           </div>
           {deleteError && (

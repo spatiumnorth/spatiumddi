@@ -74,6 +74,9 @@ class IntegrationTargetRow(BaseModel):
     # ``None`` for integrations that don't compute warnings.
     last_sync_warning: str | None
     is_stale: bool  # last_synced_at older than 2× sync_interval, or never
+    # #2221 — a disabled target is switched off, so its old ``last_sync_error``
+    # is history: still returned, but never a live problem or a red count.
+    enabled: bool = True
     # #2138 — the target's credential: ok | expiring | expired | rejected |
     # unknown, from app/services/integration_credentials.py. ``None`` for
     # integrations that don't record a credential expiry (yet).
@@ -91,6 +94,9 @@ class IntegrationPanel(BaseModel):
     stale_count: int
     error_count: int
     warning_count: int
+    # #2221 — targets switched off. Counted here instead of in the
+    # healthy / stale / error / warning buckets, which describe live syncs.
+    disabled_count: int = 0
     # #2192 — counted over EVERY target, not the capped ``targets`` list, so
     # the card's counts stay right when the row list is trimmed. A "problem"
     # is a credential that is rejected / expired / expiring, or a sync error;
@@ -161,6 +167,10 @@ def _is_stale(last: datetime | None, interval_seconds: int, now: datetime) -> bo
 
 
 def _has_problem(r: IntegrationTargetRow) -> bool:
+    if not r.enabled:
+        # #2221 — a disabled target's leftover error is history, not a
+        # problem to act on (``credential_state`` already reads "disabled").
+        return False
     return r.credential_state in CREDENTIAL_PROBLEM_STATES or bool(r.last_sync_error)
 
 
@@ -194,6 +204,7 @@ def _build_panel(
     stale = 0
     errors = 0
     warnings = 0
+    disabled = 0
     for t in targets:
         last = getattr(t, "last_synced_at", None)
         interval = int(getattr(t, "sync_interval_seconds", 60) or 60)
@@ -206,7 +217,10 @@ def _build_panel(
         if released and released not in (last_warn or ""):
             last_warn = f"{last_warn}\n{released}" if last_warn else released
         is_stale = _is_stale(last, interval, now)
-        if last_err:
+        target_enabled = bool(getattr(t, "enabled", True))
+        if not target_enabled:
+            disabled += 1
+        elif last_err:
             errors += 1
         elif is_stale:
             stale += 1
@@ -229,6 +243,7 @@ def _build_panel(
                 last_sync_error=last_err,
                 last_sync_warning=last_warn,
                 is_stale=is_stale,
+                enabled=target_enabled,
                 credential_state=cred.state if cred else None,
                 credential_expires_at=cred.expires_at if cred else None,
                 credential_days_left=cred.days_left if cred else None,
@@ -243,9 +258,14 @@ def _build_panel(
         stale_count=stale,
         error_count=errors,
         warning_count=warnings,
+        disabled_count=disabled,
         problem_count=sum(1 for r in rows if _has_problem(r)),
-        credential_dead_count=sum(1 for r in rows if r.credential_state in ("rejected", "expired")),
-        credential_expiring_count=sum(1 for r in rows if r.credential_state == "expiring"),
+        credential_dead_count=sum(
+            1 for r in rows if r.enabled and r.credential_state in ("rejected", "expired")
+        ),
+        credential_expiring_count=sum(
+            1 for r in rows if r.enabled and r.credential_state == "expiring"
+        ),
         targets=_cap_rows(rows),
     )
 
