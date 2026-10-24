@@ -163,9 +163,15 @@ export function TagFilterChips({
             return;
           }
           if (e.key === "Escape") {
-            e.preventDefault();
-            setInput("");
-            setFocused(false);
+            // Esc closes the open list and clears the draft; it is this
+            // control's Esc, so the dialog around it must not also close
+            // (#2720). With nothing open, let it through.
+            if (focused && dropdownItems.length > 0) {
+              e.preventDefault();
+              e.stopPropagation();
+              setInput("");
+              setFocused(false);
+            }
             return;
           }
           // Backspace on an empty textbox deletes the most recent

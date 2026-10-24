@@ -37,7 +37,8 @@ sits under it; the nightly sweep holds such a row back and counts it in its
 `limit` / `offset` / `total`, `sort=oldest` for the rows the purge removes
 first). Nightly purge sweep
 is operator-configurable via
-`PlatformSettings.soft_delete_purge_days`.
+`PlatformSettings.soft_delete_purge_days` (Settings → Data Retention,
+see [§2.7](#27-audit-log-and-data-retention)).
 
 ### Platform Insights (`/admin/platform-insights`) — landed in `2026.04.26-1`
 
@@ -339,7 +340,7 @@ SyslogTarget
 
 Multiple syslog targets can be configured simultaneously (e.g., local Loki + remote SIEM).
 
-### 2.7 Audit Log Settings
+### 2.7 Audit Log and Data Retention
 
 - Retention period (default: 365 days)
 - Export audit log: date range → CSV or JSON download
@@ -347,6 +348,41 @@ Multiple syslog targets can be configured simultaneously (e.g., local Loki + rem
 - Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
 - Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
 - **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which runs at least once every 7 days, and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to a week between an edit to an old row and its alert. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
+**Audit log.** The audit log is append-only: nothing deletes from it,
+not even a superadmin, and no task prunes it, so it has no retention
+setting. Every mutation records the user, timestamp, source IP, action,
+resource, old value and new value. Export a date range as an
+auditor-facing PDF (`GET /api/v1/audit/export.pdf`), or forward events
+as they happen to syslog or a webhook (Settings → Audit Event
+Forwarding). A configurable audit retention period and archive to
+S3-compatible storage are **not implemented**; size visibility and the
+tables nothing prunes are tracked in
+[#2274](https://github.com/spatiumnorth/spatiumddi/issues/2274).
+
+**Data retention** (Settings → Application → Data Retention, #2273).
+Each window below is read by a nightly prune task, which deletes
+anything older. All are superadmin-only to change, and every change is
+written to the audit log (`resource_type=platform_settings`,
+`resource_id=retention`) with the old and new values. Shortening a
+window deletes the older data on the next nightly run.
+
+| Setting | Data | Default | Range |
+|---|---|---|---|
+| `log_retention_hours` | DNS query log and DHCP activity log rows | 24 hours | 1–168 hours |
+| `metric_retention_days` | DNS / DHCP metric samples (dashboard charts, InfluxDB backfill) | 7 days | 1–365 days |
+| `dhcp_lease_history_retention_days` | Expired / released DHCP lease history | 90 days | 0–3650 days (0 = keep forever) |
+| `soft_delete_purge_days` | Trash (soft-deleted IPAM / DNS / DHCP rows) | 30 days | 0–365 days (0 = never purge) |
+| `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
+| `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
+
+`log_retention_hours` is capped at a week because the prune is a single
+`DELETE`, and a longer window makes that one transaction larger;
+[#2185](https://github.com/spatiumnorth/spatiumddi/issues/2185) replaces
+it with partition drops and raises the cap. The agent ingest endpoints
+skip a replayed log line already older than this window rather than
+inserting a row the next prune would delete. For longer log history,
+forward to Loki or a SIEM. Backups have their own retention per
+destination (§2.9).
 
 ### 2.8 Statistics / Reporting
 
@@ -1156,7 +1192,18 @@ dns_auto_sync_enabled / dns_auto_sync_interval_minutes / dns_auto_sync_delete_st
 reverse_dns_enabled / reverse_dns_interval_minutes        -- PTR auto-population (issue #41)
 dhcp_pull_leases_enabled / dhcp_pull_leases_interval_seconds
 oui_lookup_enabled / oui_update_interval_hours
+```
+
+**Data retention** — see [§2.7](#27-audit-log-and-data-retention) for
+ranges and what each prunes
+
+```
+log_retention_hours (default 24)                          -- DNS query + DHCP activity logs
+metric_retention_days (default 7)                         -- DNS / DHCP metric samples
+dhcp_lease_history_retention_days (default 90)
 soft_delete_purge_days (default 30)                       -- trash purge sweep
+pcap_retention_days (default 7)
+appliance_revoked_retention_days (default 30)
 ```
 
 **Maintenance mode** (issue #57 — see [§5](#5-maintenance-mode))
