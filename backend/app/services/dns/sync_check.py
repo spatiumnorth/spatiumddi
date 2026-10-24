@@ -85,6 +85,11 @@ class StaleItem:
     # for ``ip-deleted``). Lets a client mark that row's DNS state as pending
     # cleanup instead of "in sync" (#2101).
     ip_id: uuid.UUID | None = None
+    # The host record (A / AAAA, not an alias) or PTR of a live address whose
+    # name is blank. Such an address publishes nothing, so the scheduled sync
+    # retracts these whatever ``dns_auto_sync_delete_stale`` says; every other
+    # stale record (aliases included) stays under that setting.
+    blank_name_host_record: bool = False
 
 
 @dataclass
@@ -950,7 +955,15 @@ async def compute_subnet_dns_drift(
         # hostname, and dynamic-pool lease mirrors on a scope that opted out of
         # dynamic-lease DNS tracking — IPAM never publishes DNS for these.
         dns_suppressed = _dns_suppressed(ip)
-        if ip.status in ("network", "broadcast", "orphan") or not ip.hostname or dns_suppressed:
+        blank_name = not (ip.hostname or "").strip()
+        # A blank or whitespace-only name is no name: its records are stale
+        # (offered for deletion), never an update to a blank owner.
+        if (
+            ip.status in ("network", "broadcast", "orphan")
+            or ip.hostname is None
+            or not ip.hostname.strip()
+            or dns_suppressed
+        ):
             reason = (
                 "dynamic-lease-untracked"
                 if dns_suppressed
@@ -971,6 +984,13 @@ async def compute_subnet_dns_drift(
                         value=r.value,
                         reason=reason,
                         ip_id=ip.id,
+                        blank_name_host_record=(
+                            blank_name
+                            and ip.status not in ("network", "broadcast", "orphan")
+                            and not dns_suppressed
+                            and not r.ip_alias
+                            and r.record_type in ("A", "AAAA", "PTR")
+                        ),
                     )
                 )
             continue
