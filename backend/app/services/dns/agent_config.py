@@ -83,10 +83,10 @@ from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
+    backed_off_match_where,
     mark_ops_applied,
     op_rrset_key,
     queued_after,
-    rrset_match_where,
     supersede,
 )
 from app.services.dns.row_locks import ids_in, lock_ops
@@ -2442,10 +2442,7 @@ async def _backed_off_candidates(
             (
                 await db.execute(
                     select(DNSRecordOp).where(
-                        DNSRecordOp.server_id == server.id,
-                        DNSRecordOp.state == "pending",
-                        DNSRecordOp.next_attempt_at > now,
-                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                        backed_off_match_where(server.id, now, keys[i : i + RRSET_KEY_CHUNK])
                     )
                 )
             )

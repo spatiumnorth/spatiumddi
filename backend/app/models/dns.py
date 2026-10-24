@@ -546,7 +546,20 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     # #1232 — the successor lookup (``record_ops._successors``) and the page
     # query both read a server's ops from a point in time onward; the table
     # is never pruned, so without this they scan every op the server ever had.
-    __table_args__ = (Index("ix_dns_record_op_server_created", "server_id", "created_at"),)
+    #
+    # #2289 — every op page looks up the ops still backing off for its RRsets
+    # (``agent_config._backed_off_candidates``); without this it read every
+    # queued op the server had, so its cost grew with the whole backlog.
+    # Partial: only the ops actually waiting out a backoff.
+    __table_args__ = (
+        Index("ix_dns_record_op_server_created", "server_id", "created_at"),
+        Index(
+            "ix_dns_record_op_server_backoff",
+            "server_id",
+            "next_attempt_at",
+            postgresql_where=sa_text("state = 'pending' AND next_attempt_at IS NOT NULL"),
+        ),
+    )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
