@@ -134,11 +134,11 @@ DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_do
 # `/subnets/{id}/orphans/purge`) → `delete` too. Endpoints under /ipam manipulate IPAM resources, so we
 # accept any of the IPAM resource types (an "IPAM Editor" role grants all
 # four; a scoped Subnet-writer role would be matched here for subnet routes
-# and fail for space routes — which is intended). ``address_set`` is included
-# so the "Address Set Editor" role (admin on address_set only, #103) clears
-# this coarse gate and reaches the per-IP delegation gate
-# (``_user_can_write_ip``), which enforces the real per-row boundary. Per-row
-# scoping happens inline in the handlers via `user_has_permission`.
+# and fail for space routes — which is intended). ``address_set`` is admitted
+# separately, on ``_ADDRESS_SET_ROUTES`` only, so the "Address Set Editor" role
+# (admin on address_set only, #103) reaches the per-IP delegation gate
+# (``_user_can_write_ip``) and nothing else. Per-row scoping happens inline in
+# the handlers via `user_has_permission`.
 _IPAM_GATE_TYPES = (
     "ip_space",
     "ip_block",
@@ -171,31 +171,52 @@ _SUBNET_INSTANCE_ROUTES = (
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
 )
 
-router = APIRouter(
-    dependencies=[
-        Depends(
-            require_any_resource_or_scoped(
-                # Unscoped types: a normal (type-level / wildcard) grant on any
-                # of these admits the request.
-                _IPAM_GATE_TYPES,
-                # Scoped-admit types (write/delete only): a delegate holding only
-                # an instance-scoped ``{write, address_set, <id>}`` grant clears
-                # this coarse gate and reaches the per-IP gate
-                # (``_user_can_write_ip``), which enforces the real range boundary
-                # (#103). require_any_resource_permission's unscoped check would
-                # 403 such a delegate before delegation ever runs.
-                ("address_set",),
-                # A grant scoped to ONE subnet (#2438) reaches that subnet's own
-                # routes, named here one by one: a route added later stays
-                # closed to it until it is listed. Left off on purpose: the DNS
-                # drift report (lists orphan records of other subnets sharing
-                # the zone), NAT by-subnet (a separate resource type), and
-                # every structural / bulk / DNS-sync / delete write.
-                instance_routes={"subnet_id": _SUBNET_INSTANCE_ROUTES},
-            )
-        )
-    ]
+# The mutating routes an address-set delegate may reach (#103). Each handler
+# here resolves the caller's writable set ranges (``_load_writable_set_ranges``)
+# and checks every address it touches with ``_user_can_write_ip``, which is the
+# real boundary of the delegation; the coarse gate ignores the grant's
+# ``resource_id``. Every other mutating IPAM route refuses such a delegate at
+# the gate, including routes added later, until they are listed here.
+# ``tests/test_ipam_address_set_route_allowlist.py`` fails when a listed route
+# stops doing the per-row check.
+_ADDRESS_SET_ROUTES = frozenset(
+    {
+        "POST /subnets/{subnet_id}/addresses",
+        "POST /subnets/{subnet_id}/next",
+        "POST /subnets/{subnet_id}/bulk-allocate/preview",
+        "POST /subnets/{subnet_id}/bulk-allocate",
+        "PUT /addresses/{address_id}",
+        "DELETE /addresses/{address_id}",
+        "POST /addresses/{address_id}/aliases",
+        "DELETE /addresses/{address_id}/aliases/{record_id}",
+        "POST /addresses/bulk-edit",
+        "POST /addresses/bulk-delete",
+        "POST /reports/stale-ips/deprecate",
+        "POST /import/addresses/preview",
+        "POST /import/addresses/commit",
+    }
 )
+
+_IPAM_GATE = require_any_resource_or_scoped(
+    # Unscoped types: a normal (type-level / wildcard) grant on any of these
+    # admits the request.
+    _IPAM_GATE_TYPES,
+    # Scoped admit (write/delete only): a delegate holding only an
+    # instance-scoped ``{write, address_set, <id>}`` grant clears this coarse
+    # gate on the routes listed in ``_ADDRESS_SET_ROUTES`` and reaches their
+    # per-IP gate (``_user_can_write_ip``), which enforces the real range
+    # boundary (#103). require_any_resource_permission's unscoped check would
+    # 403 such a delegate before delegation ever runs.
+    {"address_set": _ADDRESS_SET_ROUTES},
+    # A grant scoped to ONE subnet (#2438) reaches that subnet's own routes,
+    # named here one by one: a route added later stays closed to it until it
+    # is listed. Left off on purpose: the DNS drift report (lists orphan
+    # records of other subnets sharing the zone), NAT by-subnet (a separate
+    # resource type), and every structural / bulk / DNS-sync / delete write.
+    instance_routes={"subnet_id": _SUBNET_INSTANCE_ROUTES},
+)
+
+router = APIRouter(dependencies=[Depends(_IPAM_GATE)])
 
 
 def _require_type_write(
@@ -207,10 +228,10 @@ def _require_type_write(
     """Per-type inline gate for the structural IPAM handlers (space/block/subnet
     create, update, resize, split, merge, move, purge, DNS sync, delete). The
     router-level gate admits an any-of grant over the whole IPAM surface —
-    including peripheral types like ``nat_mapping`` and ``custom_field`` — and,
-    for mutating methods, ANY ``address_set`` grant with its ``resource_id``
-    ignored, so without this a ``write:nat_mapping`` grant or a set-scoped
-    delegate could mutate core structure it holds no permission on (#508).
+    including peripheral types like ``nat_mapping`` and ``custom_field`` — so
+    without this a ``write:nat_mapping`` grant could mutate core structure it
+    holds no permission on (#508). (An ``address_set`` grant no longer reaches
+    these routes at all: the gate admits it on ``_ADDRESS_SET_ROUTES`` only.)
     ``action`` is ``write`` (the default) or ``delete`` for the delete routes.
     Superadmin and wildcard grants pass via ``user_has_permission``."""
     if not user_has_permission(current_user, action, resource_type, resource_id):
@@ -1149,6 +1170,19 @@ async def _load_writable_set_ranges(
     """Resolve the caller's address-set-delegated writable ranges on this subnet
     (alias for :func:`app.services.ipam.address_set_gate.load_writable_set_ranges`)."""
     return await load_writable_set_ranges(db, user, subnet_id)
+
+
+async def _require_ip_writable(db: AsyncSession, user: Any, ip: IPAddress) -> None:
+    """403 unless ``user`` may write this one address: subnet-wide ``write``,
+    or an address set on its subnet whose range covers it (#103)."""
+    subnet_writable = user_has_permission(user, "write", "subnet", ip.subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, user, ip.subnet_id)
+    ip_int = int(ipaddress.ip_address(str(ip.address)))
+    if not _user_can_write_ip(user, ip_int, subnet_writable, set_ranges):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"No write permission on subnet or any address set covering {ip.address}",
+        )
 
 
 async def _writable_subnet_ids(db: AsyncSession, user: Any) -> set[uuid.UUID] | None:
@@ -9861,6 +9895,9 @@ async def add_alias(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
+    # An alias is a DNS record on this address: the same per-address write
+    # check as editing the address itself (#103).
+    await _require_ip_writable(db, current_user, ip)
     subnet = await db.get(Subnet, ip.subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -9951,6 +9988,7 @@ async def delete_alias(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
+    await _require_ip_writable(db, current_user, ip)
     rec = await db.get(DNSRecord, record_id)
     if rec is None or rec.ip_address_id != ip.id:
         raise HTTPException(status_code=404, detail="Alias not found")
@@ -10511,6 +10549,9 @@ class BulkAllocatePreviewResponse(BaseModel):
     conflicts_in_use: int
     conflicts_in_pool: int
     conflicts_fqdn: int
+    # Addresses the caller may not write (outside every address set it holds
+    # on this subnet, #103); the commit skips these as ``skipped_no_perm``.
+    conflicts_no_perm: int = 0
     sample: list[BulkAllocateItem]
     warnings: list[str]
 
@@ -10689,11 +10730,35 @@ async def bulk_allocate_preview(
     # is held to the same zone rule as the commit.
     await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
 
+    # Address-set write delegation (#103): the same per-address test the
+    # commit applies. A caller who can write nothing on this subnet is refused
+    # rather than shown its occupancy.
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+    if not subnet_writable and not set_ranges:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No write permission on subnet or any address set on it.",
+        )
+
+    def _no_perm(addr: str) -> bool:
+        try:
+            return not _user_can_write_ip(
+                current_user, int(ipaddress.ip_address(addr)), subnet_writable, set_ranges
+            )
+        except ValueError:
+            return True
+
     items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
     in_use = sum(1 for i in items if i.in_use)
     in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
     fqdn_coll = sum(1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision)
-    will_create = len(items) - in_use - in_pool - fqdn_coll
+    no_perm = sum(
+        1
+        for i in items
+        if not i.in_use and not i.in_dynamic_pool and not i.fqdn_collision and _no_perm(i.address)
+    )
+    will_create = len(items) - in_use - in_pool - fqdn_coll - no_perm
 
     sample = items if len(items) <= 7 else items[:5] + items[-2:]
 
@@ -10703,6 +10768,7 @@ async def bulk_allocate_preview(
         conflicts_in_use=in_use,
         conflicts_in_pool=in_pool,
         conflicts_fqdn=fqdn_coll,
+        conflicts_no_perm=no_perm,
         sample=sample,
         warnings=warnings,
     )
