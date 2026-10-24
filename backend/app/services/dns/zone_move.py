@@ -67,6 +67,7 @@ from app.services.dns.record_ops import (
 from app.services.dns.technitium_options import allow_query_problem, allow_transfer_problem
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 from app.services.dns.tsig_algorithms import key_refusal
+from app.services.dns.view_collisions import ExtraZone, zone_render_collisions
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 
 logger = structlog.get_logger(__name__)
@@ -174,6 +175,8 @@ class ZoneMovePlan:
     target_drivers: list[str] = field(default_factory=list)
 
     name_collision: bool = False
+    #: Views of the target that would render this zone's name twice (#2275).
+    name_collision_views: list[str] = field(default_factory=list)
     target_tsig_key_generated: bool = False
     #: Target drivers that cannot sign, when the zone is signed. A move
     #: onto one is refused rather than warned: the row keeps saying
@@ -342,13 +345,17 @@ async def assemble_move_plan(
     # then renders into no operator view at all rather than into one.
     scoped = (
         await db.execute(
-            select(DNSRecord.id, DNSRecord.view_id)
+            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at)
             .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
             .execution_options(include_deleted=True)
         )
     ).all()
-    for _rid, view_id in scoped:
-        action, _new_id, old_name = _resolve(view_id)
+    # Where the zone's LIVE scoped records would place it in the target (#2275).
+    live_record_view_ids: set[uuid.UUID] = set()
+    for _rid, view_id, deleted_at in scoped:
+        action, new_id, old_name = _resolve(view_id)
+        if deleted_at is None and new_id is not None:
+            live_record_view_ids.add(new_id)
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
@@ -378,6 +385,27 @@ async def assemble_move_plan(
         )
     )
     plan.name_collision = clash.first() is not None
+    # #2275 — the constraint is not the whole story: a zone with no view is
+    # rendered into EVERY view of the target (and a zone's scoped records place
+    # it in their views too), so it can land beside a same-name zone pinned to
+    # one of them. BIND refuses a view declaring a zone twice, and the agent
+    # then declines the whole target group's config.
+    if zone.group_id != target_group.id:
+        render = await zone_render_collisions(
+            db,
+            target_group.id,
+            names=[zone.name],
+            extra_zones=[
+                ExtraZone(
+                    id=zone.id,
+                    name=zone.name,
+                    view_id=effective_view_id,
+                    record_view_ids=live_record_view_ids,
+                )
+            ],
+        )
+        plan.name_collision_views = sorted({c.view for c in render if str(zone.id) in c.zone_ids})
+        plan.name_collision = plan.name_collision or bool(plan.name_collision_views)
 
     # ── Dynamic-update grants ─────────────────────────────────────────
     acl_rows = (
@@ -833,6 +861,8 @@ async def commit_move(
         )
     if plan.name_collision:
         where = f"view '{plan.zone_view_from}'" if plan.zone_view_to_id is not None else "no view"
+        if plan.name_collision_views:
+            where = "view(s) " + ", ".join(f"'{v}'" for v in plan.name_collision_views)
         raise ZoneMoveError(
             f"Group '{target_group.name}' already has a zone named '{zone.name}' in {where}. "
             f"Delete or rename it first.",

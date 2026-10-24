@@ -6420,8 +6420,18 @@ export const dnsApi = {
     api
       .put<DNSView>(`/dns/groups/${groupId}/views/${viewId}`, data)
       .then((r) => r.data),
-  deleteView: (groupId: string, viewId: string) =>
-    api.delete(`/dns/groups/${groupId}/views/${viewId}`),
+  // #2275 — refused (409) while the view still scopes zones or records;
+  // blocking lists scoped to it need the explicit acknowledgement.
+  deleteView: (
+    groupId: string,
+    viewId: string,
+    opts: { acknowledgeBlocklistDetach?: boolean } = {},
+  ) =>
+    api.delete(`/dns/groups/${groupId}/views/${viewId}`, {
+      params: opts.acknowledgeBlocklistDetach
+        ? { acknowledge_blocklist_detach: true }
+        : undefined,
+    }),
 
   // TLD registry (#986) — the IANA root-zone list behind zone name_scope.
   // Read by anyone who can read DNS; refresh is superadmin-only and is the

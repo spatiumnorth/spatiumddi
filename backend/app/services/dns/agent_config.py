@@ -77,7 +77,7 @@ from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
     records_for_view,
-    view_renders_zone,
+    views_rendering_zone,
 )
 from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
@@ -1429,12 +1429,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # record filtering is delegated to ``records_for_view``. The rule is
         # shared with the transfer-key resolver (#920), so the view drift and
         # sync ask for is always one that holds the zone.
-        record_view_ids = {r.view_id for r in rec_rows if r.view_id is not None}
-        zone_view_ids = {z.view_id} if z.view_id is not None else set()
-        operator_target_ids = record_view_ids | zone_view_ids
-        for vd in view_descs:
-            if not view_renders_zone(vd, operator_target_ids):
-                continue
+        # #2275 — the collision guard counts placements from the same call.
+        for vd in views_rendering_zone(view_descs, z.view_id, (r.view_id for r in rec_rows)):
             recs = records_for_view(rec_rows, vd, geo)
             copies.append(
                 {

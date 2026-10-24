@@ -5966,7 +5966,14 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
   const hasBind = servers.some((s) => s.driver === "bind9");
 
   const delMut = useMutation({
-    mutationFn: (id: string) => dnsApi.deleteView(group.id, id),
+    // The modal lists the blocking lists scoped to the view, so confirming
+    // it is the acknowledgement the API asks for (#2275).
+    mutationFn: (id: string) =>
+      dnsApi.deleteView(group.id, id, {
+        acknowledgeBlocklistDetach: blocklists.some((b) =>
+          b.applied_view_ids?.includes(id),
+        ),
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-views", group.id] });
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
@@ -6142,13 +6149,25 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           message={
             <div className="space-y-2 text-sm">
               <p>
-                Zones assigned to this view are not deleted — they fall back to
-                being served from every remaining view.
+                A view that still scopes zones or records cannot be deleted:
+                they would otherwise be served from every remaining view. Move
+                them to another view or delete them first, including any in the
+                Trash.
               </p>
-              <p>
-                Any blocking list scoped only to this view stops being applied
-                anywhere.
-              </p>
+              {(() => {
+                const scoped = blocklists.filter((b) =>
+                  b.applied_view_ids?.includes(confirmDelete.id),
+                );
+                if (scoped.length === 0) return null;
+                return (
+                  <p className="text-amber-700 dark:text-amber-400">
+                    Blocking lists scoped to this view lose that scope, so the
+                    clients it matches stop being filtered by them:{" "}
+                    {scoped.map((b) => b.name).join(", ")}. A list scoped to
+                    nothing else stops being applied anywhere.
+                  </p>
+                );
+              })()}
               {views.length === 1 && (
                 <p className="text-amber-700 dark:text-amber-400">
                   This is the last view in the group. Removing it returns the

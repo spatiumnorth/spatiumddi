@@ -101,6 +101,7 @@ from app.models.dns import (
     ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
+    DNSBlockList,
     DNSKey,
     DNSRecord,
     DNSSECPolicy,
@@ -113,6 +114,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
     DNSZoneUpdateAcl,
+    dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
 from app.services.agents.daemon_state import is_not_serving
@@ -223,6 +225,7 @@ from app.services.dns.tsig import (
     rotate_group_tsig_key,
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
+from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -5361,9 +5364,75 @@ async def update_view(
     dependencies=[Depends(require_permission("delete", "dns_group"))],
 )
 async def delete_view(
-    group_id: uuid.UUID, view_id: uuid.UUID, db: DB, current_user: CurrentUser
+    group_id: uuid.UUID,
+    view_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    acknowledge_blocklist_detach: bool = Query(
+        default=False,
+        description=(
+            "Delete the view even though blocking lists are scoped to it. Their "
+            "assignment to this view is removed with it; a list scoped to "
+            "nothing else stops filtering anywhere."
+        ),
+    ),
 ) -> None:
+    """Delete a view that no longer owns zones or records (#2275).
+
+    ``view_id`` on zones and records is ``ON DELETE SET NULL``, and NULL means
+    *shared*: rendered into every remaining view. Deleting a view that still
+    scopes anything would therefore serve its zones and records in every
+    other view (internal data answered on ``external``), and a zone with a
+    same-name twin in another view would be declared twice there, which makes
+    BIND refuse the whole group. So the delete is refused (409, naming them)
+    until the operator moves or deletes them, including rows in the Trash,
+    which keep their ``view_id`` and would come back shared on restore.
+
+    A blocking list assigned to the view loses that assignment (the
+    association row cascades); the delete asks for
+    ``acknowledge_blocklist_detach=true`` rather than doing it silently.
+    """
     view = await _require_view(group_id, view_id, db)
+    await _assert_view_is_unowned(view, db)
+
+    bl_rows = (
+        (
+            await db.execute(
+                select(DNSBlockList)
+                .join(
+                    dns_blocklist_view_assoc,
+                    dns_blocklist_view_assoc.c.blocklist_id == DNSBlockList.id,
+                )
+                .where(dns_blocklist_view_assoc.c.view_id == view.id)
+                .options(selectinload(DNSBlockList.views), selectinload(DNSBlockList.server_groups))
+                .order_by(DNSBlockList.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    orphaned = [
+        b.name for b in bl_rows if not b.server_groups and all(v.id == view.id for v in b.views)
+    ]
+    if bl_rows and not acknowledge_blocklist_detach:
+        names = ", ".join(b.name for b in bl_rows)
+        tail = (
+            f" Of those, {', '.join(orphaned)} would be scoped to nothing and stop "
+            "filtering anywhere."
+            if orphaned
+            else ""
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"View {view.name!r} has blocking lists scoped to it ({names}). "
+                "Deleting it removes that scope, so the clients it matched are no "
+                f"longer filtered by them.{tail} Re-scope them first, or delete with "
+                "acknowledge_blocklist_detach=true."
+            ),
+        )
+
+    guard = await RenderGuard.capture(db, group_id, None)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -5373,12 +5442,64 @@ async def delete_view(
             resource_type="dns_view",
             resource_id=str(view.id),
             resource_display=view.name,
+            old_value=(
+                {
+                    "blocklists_detached": [b.name for b in bl_rows],
+                    "blocklists_left_unscoped": orphaned,
+                }
+                if bl_rows
+                else None
+            ),
             result="success",
         )
     )
     collect_wake(dns_group_channel(group_id))
     await db.delete(view)
+    await guard.check(db, f"delete view {view.name!r}")
     await db.commit()
+
+
+async def _assert_view_is_unowned(view: DNSView, db: DB) -> None:
+    """409 while any zone or record, live or in the Trash, is scoped to ``view``."""
+    zone_rows = (
+        await db.execute(
+            select(DNSZone.name, DNSZone.deleted_at)
+            .where(DNSZone.view_id == view.id)
+            .order_by(DNSZone.name)
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    rec_rows = (
+        await db.execute(
+            select(DNSRecord.fqdn, DNSRecord.record_type, DNSRecord.deleted_at)
+            .where(DNSRecord.view_id == view.id)
+            .order_by(DNSRecord.fqdn, DNSRecord.record_type)
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    if not zone_rows and not rec_rows:
+        return
+
+    def _shown(labels: list[str]) -> str:
+        more = f" and {len(labels) - 5} more" if len(labels) > 5 else ""
+        return ", ".join(labels[:5]) + more
+
+    parts: list[str] = []
+    if zone_rows:
+        labels = [f"{n}{' (in Trash)' if d is not None else ''}" for n, d in zone_rows]
+        parts.append(f"{len(zone_rows)} zone(s): {_shown(labels)}")
+    if rec_rows:
+        labels = [f"{f} {t}{' (in Trash)' if d is not None else ''}" for f, t, d in rec_rows]
+        parts.append(f"{len(rec_rows)} record(s): {_shown(labels)}")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot delete view {view.name!r}: it still scopes {'; '.join(parts)}. "
+            "Deleting the view would make them shared, served in every other view. "
+            "Move them to another view (or the zone to another group) or delete them "
+            "first; rows in the Trash must be purged or restored and moved."
+        ),
+    )
 
 
 # ── Zone endpoints ──────────────────────────────────────────────────────────
@@ -5535,9 +5656,13 @@ async def create_zone(
 
     payload = body.model_dump()
     payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
+    guard = await RenderGuard.capture(db, group_id, [body.name])
     zone = DNSZone(group_id=group_id, **payload)
     db.add(zone)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
+    # #2275 — the constraint above cannot see a shared zone landing in a view
+    # that already holds a pinned zone of the same name.
+    await guard.check(db, f"create zone {body.name!r}")
 
     # Write-through: push the create to any windows_dns-with-creds server
     # in this group *before* we commit. If the Windows push fails we don't
@@ -6369,9 +6494,18 @@ async def update_zone(
         k in changes and (changes[k] or "") != (getattr(zone, k) or "")
         for k in ("primary_ns", "admin_email")
     ) or any(k in changes and changes[k] != getattr(zone, k) for k in _ZONE_FILE_TIMER_FIELDS)
+    # #2275 — re-pinning or renaming can put the zone into a view that already
+    # renders a zone of that name (clearing view_id makes it shared: every view).
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name, changes.get("name") or zone.name])
+        if {"view_id", "name"} & changes.keys()
+        else None
+    )
     before = {k: getattr(zone, k, None) for k in changes}
     for k, v in changes.items():
         setattr(zone, k, v)
+    if render_guard is not None:
+        await render_guard.check(db, f"update zone {zone.name!r}")
     if soa_changed:
         bump_zone_serial(zone)
     if dnssec_flip == "dnssec_sign":
@@ -7735,6 +7869,7 @@ async def create_zone_from_template(
             detail="A zone with that name already exists in this group/view",
         )
 
+    guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(
         group_id=group_id,
         view_id=body.view_id,
@@ -7743,6 +7878,7 @@ async def create_zone_from_template(
         kind=body.kind,
     )
     db.add(zone)
+    await guard.check(db, f"create zone {body.zone_name!r}")  # #2275
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
@@ -8502,6 +8638,10 @@ async def create_record(
         fqdn=fqdn,
     )
 
+    # #2275 — a view-scoped record also places its zone in that view.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name]) if body.view_id is not None else None
+    )
     record = DNSRecord(
         zone_id=zone_id,
         fqdn=fqdn,
@@ -8511,6 +8651,8 @@ async def create_record(
     db.add(record)
     target_serial = bump_zone_serial(zone)
     await db.flush()
+    if render_guard is not None:
+        await render_guard.check(db, f"add a record scoped to that view in {zone.name!r}")
     op = await enqueue_record_op(
         db,
         zone,
@@ -8588,8 +8730,16 @@ async def update_record(
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
+    # #2275 — moving a record between views moves its zone's placement too.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if zone is not None and "view_id" in changes and changes["view_id"] != before_view
+        else None
+    )
     for k, v in changes.items():
         setattr(record, k, v)
+    if render_guard is not None and zone is not None:
+        await render_guard.check(db, f"move this record's view in {zone.name!r}")
     # #424 — validate the merged per-type fields (record_type is immutable on
     # update, so this checks the final priority/weight/port against the row's
     # type and normalizes, e.g. defaulting MX priority to 10).
@@ -8757,6 +8907,17 @@ async def delete_record(
     # push the provider retraction with the record's pre-delete values.
     zone = await db.get(DNSZone, record.zone_id)
     rec_snapshot = record_op_payload(record)
+    # #2275 — the last view-scoped record leaving a shared zone makes it shared
+    # again, rendered into every view.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if zone is not None and record.view_id is not None
+        else None
+    )
+
+    async def _check_render() -> None:
+        if render_guard is not None and zone is not None:
+            await render_guard.check(db, f"delete this view-scoped record in {zone.name!r}")
 
     async def _push_delete() -> None:
         # enqueue_record_op dispatches per-driver: agentless is sent once the
@@ -8786,6 +8947,7 @@ async def delete_record(
                     result="success",
                 )
             )
+        await _check_render()
         await _push_delete()
         await db.commit()
         return
@@ -8805,6 +8967,7 @@ async def delete_record(
         )
     )
     await db.delete(record)
+    await _check_render()
     await _push_delete()
     await db.commit()
 
@@ -8928,6 +9091,13 @@ async def bulk_delete_records(
     if not targets:
         return BulkDeleteRecordsResponse(deleted=0, skipped=skipped)
 
+    # #2275 — see delete_record.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if any(r.view_id is not None for r in targets)
+        else None
+    )
+
     # Bump the zone serial once for the whole batch — same zone, same
     # serial bump. N singular deletes used to bump N times, which is
     # wasteful and produces confusing serial jumps in SOA queries.
@@ -9015,6 +9185,8 @@ async def bulk_delete_records(
                 )
             )
             await db.delete(rec)
+        if render_guard is not None:
+            await render_guard.check(db, f"delete these view-scoped records in {zone.name!r}")
         await db.commit()
         return BulkDeleteRecordsResponse(
             deleted=len(dispatched),
@@ -9043,6 +9215,8 @@ async def bulk_delete_records(
                 result="success",
             )
         )
+    if render_guard is not None:
+        await render_guard.check(db, f"delete these view-scoped records in {zone.name!r}")
     await db.commit()
     return BulkDeleteRecordsResponse(
         deleted=len(dispatched),
@@ -9227,9 +9401,16 @@ async def bulk_create_records(
                 **r.model_dump(),
             )
         )
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if any(r.view_id is not None for r in records)
+        else None
+    )
     db.add_all(records)
     target_serial = bump_zone_serial(zone)
     await db.flush()
+    if render_guard is not None:  # #2275 — see create_record
+        await render_guard.check(db, f"add records scoped to a view in {zone.name!r}")
 
     ops = [
         {
@@ -9556,6 +9737,11 @@ async def import_zone_commit(
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
 
+    # #2275 — a view-scoped import creates or deletes records in that view,
+    # which moves where the zone renders.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name]) if body.view_id is not None else None
+    )
     batch_id = uuid.uuid4()
     created = 0
     updated = 0
@@ -9617,6 +9803,8 @@ async def import_zone_commit(
             await db.delete(row)
             deleted += 1
 
+    if render_guard is not None:
+        await render_guard.check(db, f"import this zone file into {zone.name!r}")
     target_serial, op_rows, provider_warning = await _queue_import_ops(
         db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
     )
@@ -10258,6 +10446,8 @@ async def import_zone_spreadsheet_commit(
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
 
+    # #2275 — rows carry a view, and a record's view places its zone there.
+    render_guard = await RenderGuard.capture(db, group_id, [zone.name])
     batch_id = uuid.uuid4()
     delete_payloads: list[dict[str, Any]] = []
     update_rows: list[DNSRecord] = []
@@ -10328,6 +10518,7 @@ async def import_zone_spreadsheet_commit(
     # Comment-only edits are written without a serial bump; everything a
     # server serves goes out as record ops on one bump.
     await db.flush()
+    await render_guard.check(db, f"import this sheet into {zone.name!r}")
     target_serial, op_rows, provider_warning = await _queue_import_ops(
         db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
     )
