@@ -13,7 +13,7 @@ The downgrade is a no-op: the previous values are not recoverable and
 restoring a never-satisfiable minimum or dead grants would be meaningless.
 
 Revision ID: c3a8f5e12d94
-Revises: 8ef2ed5e45c8
+Revises: a3c7e91f2d58
 Create Date: 2026-10-24
 """
 
@@ -26,7 +26,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c3a8f5e12d94"
-down_revision = "8ef2ed5e45c8"
+down_revision = "a3c7e91f2d58"
 branch_labels = None
 depends_on = None
 
