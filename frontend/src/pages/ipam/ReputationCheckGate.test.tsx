@@ -55,7 +55,8 @@ async function show() {
       <ReputationSection address="192.0.2.10/32" />
     </QueryClientProvider>,
   );
-  await screen.findByText(/No blocklists are enabled/);
+  // The section body depends on read access; the button does not.
+  await screen.findByRole("button", { name: /Check now/ });
   await waitFor(() => expect(myPermissions).toHaveBeenCalled());
   await act(async () => {});
   return screen.getByRole("button", { name: /Check now/ }) as HTMLButtonElement;
