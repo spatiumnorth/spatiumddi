@@ -5333,6 +5333,10 @@ export interface DNSPoolMember {
   last_check_state: "unknown" | "healthy" | "unhealthy";
   last_check_at: string | null;
   last_check_error: string | null;
+  /** Verdict older than 3 x the pool's check interval; a healthy member is
+   *  still served (fail-open) (#2312). */
+  check_stale?: boolean;
+  check_age_seconds?: number | null;
   consecutive_failures: number;
   consecutive_successes: number;
   created_at: string;
