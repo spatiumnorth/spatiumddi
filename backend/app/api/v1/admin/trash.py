@@ -27,6 +27,9 @@ from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.network_service import NetworkService
+from app.models.overlay import OverlayNetwork
+from app.models.ownership import Customer
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -119,7 +122,7 @@ def _label_expr(model: type) -> Any:
     from the one shown; ``test_trash_listing_label_matches_row_display``
     pins that.
     """
-    if model is IPSpace:
+    if model in (IPSpace, Customer, OverlayNetwork, NetworkService):
         return model.name
     if model in (IPBlock, Subnet):
         network = cast(model.network, String)
@@ -767,6 +770,34 @@ async def permanent_delete_from_trash(
             # first soft-delete normally already cleaned both up).
             await remove_ipam_for_scope_statics(db, target.id)
             await delete_leases_for_scope(db, target.id)
+        elif isinstance(target, Customer):
+            # network_service.customer_id is RESTRICT, so a customer that still
+            # has services (live or in the Trash) cannot go; say which, rather
+            # than answering the generic "something references it" (#2738).
+            held = (
+                (
+                    await db.execute(
+                        select(NetworkService.name, NetworkService.deleted_at)
+                        .where(NetworkService.customer_id == target.id)
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            if held:
+                names = [n if d is None else f"{n} (in the Trash)" for n, d in held]
+                shown = ", ".join(names[:5]) + (
+                    f" and {len(names) - 5} more" if len(names) > 5 else ""
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot permanently delete customer {label}: it still has "
+                        f"services ({shown}). Delete the live ones, then purge them "
+                        "from the Trash first."
+                    ),
+                )
         elif isinstance(target, DNSZone):
             # #1830 — retract from agentless servers first; raises (row + audit
             # untouched) when the provider refuses. Same helper as the 30-day sweep.

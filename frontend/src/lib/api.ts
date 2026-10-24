@@ -15761,7 +15761,10 @@ export type TrashEntryType =
   | "subnet"
   | "dns_zone"
   | "dns_record"
-  | "dhcp_scope";
+  | "dhcp_scope"
+  | "customer"
+  | "overlay_network"
+  | "network_service";
 
 export interface TrashEntry {
   id: string;

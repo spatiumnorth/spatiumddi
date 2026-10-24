@@ -43,6 +43,9 @@ from sqlalchemy.orm import aliased
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.network_service import NetworkService
+from app.models.overlay import OverlayNetwork
+from app.models.ownership import Customer
 
 # Types the trash UI browses, and that ``restore_row`` /
 # ``permanent_delete_from_trash`` accept as an addressable target. Cascade-only
@@ -56,6 +59,11 @@ SOFT_DELETE_RESOURCE_TYPES: tuple[str, ...] = (
     "dns_zone",
     "dns_record",
     "dhcp_scope",
+    # Network → Customers / Overlays / Services (#2738). Leaves: nothing
+    # cascades from them, so each is its own batch.
+    "customer",
+    "overlay_network",
+    "network_service",
 )
 
 
@@ -74,6 +82,9 @@ TYPE_TO_MODEL: dict[str, type] = {
     "dns_zone": DNSZone,
     "dns_record": DNSRecord,
     "dhcp_scope": DHCPScope,
+    "customer": Customer,
+    "overlay_network": OverlayNetwork,
+    "network_service": NetworkService,
     # Cascade-only children — restored with the batch, never addressed alone.
     "dhcp_pool": DHCPPool,
     "dhcp_static_assignment": DHCPStaticAssignment,
@@ -157,6 +168,8 @@ def _row_display(obj: Any) -> str:
         return _record_label(obj.fqdn, obj.record_type)
     if isinstance(obj, DHCPScope):
         return obj.name or str(obj.id)
+    if isinstance(obj, (Customer, OverlayNetwork, NetworkService)):
+        return obj.name
     if isinstance(obj, DHCPPool):
         return f"{obj.pool_type} pool {obj.start_ip}-{obj.end_ip}"
     if isinstance(obj, DHCPStaticAssignment):
@@ -177,6 +190,12 @@ def _resource_type(obj: Any) -> str:
         return "dns_record"
     if isinstance(obj, DHCPScope):
         return "dhcp_scope"
+    if isinstance(obj, Customer):
+        return "customer"
+    if isinstance(obj, OverlayNetwork):
+        return "overlay_network"
+    if isinstance(obj, NetworkService):
+        return "network_service"
     if isinstance(obj, DHCPPool):
         return "dhcp_pool"
     if isinstance(obj, DHCPStaticAssignment):
@@ -496,6 +515,7 @@ _PARENT_RESOURCE_TYPE = {
     Subnet: "subnet",
     DHCPScope: "dhcp_scope",
     DNSZone: "dns_zone",
+    Customer: "customer",
 }
 
 
@@ -517,6 +537,10 @@ async def trashed_parent(db: AsyncSession, obj: Any) -> tuple[str, Any] | None:
         candidates = [("DHCP scope", DHCPScope, obj.scope_id)]
     elif isinstance(obj, DNSRecord):
         candidates = [("zone", DNSZone, obj.zone_id)]
+    elif isinstance(obj, NetworkService):
+        candidates = [("customer", Customer, obj.customer_id)]
+    elif isinstance(obj, OverlayNetwork):
+        candidates = [("customer", Customer, obj.customer_id)]
     for kind, model, parent_id in candidates:
         parent = await _trashed_parent(db, model, parent_id, batch_id)
         if parent is not None:
@@ -753,6 +777,39 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
             await _assert_no_overlap(db, obj.space_id, str(obj.network), exclude_id=obj.id)
         except HTTPException as exc:
             return str(exc.detail)
+
+    elif isinstance(obj, Customer):
+        existing = (
+            await db.execute(
+                select(Customer).where(Customer.name == obj.name, Customer.id != obj.id)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return f"An active customer named {obj.name!r} already exists"
+
+    elif isinstance(obj, OverlayNetwork):
+        existing = (
+            await db.execute(
+                select(OverlayNetwork).where(
+                    OverlayNetwork.name == obj.name, OverlayNetwork.id != obj.id
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return f"An active overlay named {obj.name!r} already exists"
+
+    elif isinstance(obj, NetworkService):
+        existing = (
+            await db.execute(
+                select(NetworkService).where(
+                    NetworkService.customer_id == obj.customer_id,
+                    NetworkService.name == obj.name,
+                    NetworkService.id != obj.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return f"An active service named {obj.name!r} already exists for this customer"
 
     elif isinstance(obj, DNSZone):
         existing = (
