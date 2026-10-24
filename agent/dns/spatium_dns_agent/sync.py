@@ -229,6 +229,9 @@ class SyncLoop:
         # but leave structural_etag alone — the agent then drains record ops
         # via RFC 2136 over loopback without bouncing the daemon.
         self._current_structural_etag: str | None = None
+        # structural_etag of the bundle _apply_with_revert is applying, so a
+        # failure is quarantined by structure (#2647).
+        self._applying_structural: str | None = None
         # #1373 — the serial last reported per zone (zone-state), so the late
         # retry of an older op can never report a zone backwards.
         # Frozen between polls (#2223), see ``_reported_serials`` below.
@@ -419,7 +422,11 @@ class SyncLoop:
                 )
             else:
                 if etag:
-                    self._quarantine.record(etag, truncate_error(str(e)))
+                    self._quarantine.record(
+                        etag,
+                        truncate_error(str(e)),
+                        structural=bundle.get("structural_etag") if bundle else None,
+                    )
                 self._bootstrap_fallback(etag, e, before_sync=before_sync)
             return False
 
@@ -1091,7 +1098,11 @@ class SyncLoop:
         # record is moot: drop it now rather than let ``retry_due`` keep
         # forcing If-None-Match off on every poll for a bundle that no
         # longer exists.
-        if self._quarantine.etag is not None and etag != self._quarantine.etag:
+        # Keyed on the structure (#2647): a record-only change gives a new full
+        # etag over the same broken structure and must not lift the quarantine.
+        if self._quarantine.etag is not None and not self._quarantine.same_structure(
+            etag, bundle.get("structural_etag")
+        ):
             self._quarantine.clear()
 
         # Atomic-swap cache always (cache is the source of truth for restarts)
@@ -1116,7 +1127,7 @@ class SyncLoop:
             # until either the operator saves something different or the
             # quarantine backoff expires, instead of re-rendering the same
             # broken config as fast as the wake tick fires.
-            if self._quarantine.blocks(etag):
+            if self._quarantine.blocks(etag, new_structural):
                 log.info("sync_skipping_quarantined_bundle", etag=etag)
                 self._return_unapplied_ops(bundle, "the bundle carrying it is quarantined")
                 # #2019 — the control plane still serves the bundle the daemon
@@ -1276,6 +1287,7 @@ class SyncLoop:
         failure at swap/reload — where the live directory has been replaced —
         needs the previous config put back on disk.
         """
+        self._applying_structural = bundle.get("structural_etag")
         try:
             self._guarded_apply(bundle, etag)
         except ConfigApplyError as e:
@@ -1421,7 +1433,11 @@ class SyncLoop:
             error=str(cause),
             daemon_disturbed=daemon_disturbed,
         )
-        self._quarantine.record(etag, truncate_error(f"{phase or 'apply'}: {cause}"))
+        self._quarantine.record(
+            etag,
+            truncate_error(f"{phase or 'apply'}: {cause}"),
+            structural=self._applying_structural,
+        )
         self._revert_landed = False
         # The failure verdict below supersedes any partial-refusal one.
         self._zones_refused = False

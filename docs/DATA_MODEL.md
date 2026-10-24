@@ -476,8 +476,18 @@ Files: [`audit.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend
 ### Audit log (append-only + hash chain)
 
 `AuditLog` (table `audit_log`) is the append-only record of every
-mutation. It is **never** deleted application-side, and a DB-level
-trigger blocks `DELETE` as a second guard (issue #73).
+mutation. It is **never** updated or deleted application-side, and
+DB-level row triggers refuse both as a second guard: `audit_log_no_delete`
+(`BEFORE DELETE`, issue #73) and `audit_log_no_update` (`BEFORE UPDATE`,
+issue #2315). `TRUNCATE` is not guarded, since the selective restore of
+the `audit` section truncates the table before reloading it.
+
+This makes the table **tamper-evident, not tamper-proof**: the database
+owner can disable or drop a trigger. The built-in conformity policy
+"Audit log is reachable and append-only" (check `audit_log_immutable`)
+reads `pg_trigger` and fails, naming the trigger, when either guard is
+missing, disabled, or altered. A migration that ever has to rewrite rows
+must disable `audit_log_no_update` for its duration.
 
 Tamper-evidence is a hash chain: each row carries a monotonic
 `BigInteger seq` (assigned from `audit_log_seq_seq`), a `row_hash`, and a

@@ -8,6 +8,8 @@ TSIG key carried in the config bundle.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import math
@@ -97,7 +99,12 @@ def _query_log_channel_settings(opts: dict[str, Any]) -> tuple[str, str, str, st
     def yn(key: str) -> str:
         return "no" if opts.get(key) is False else "yes"
 
-    return severity, yn("query_log_print_category"), yn("query_log_print_severity"), "yes"
+    return (
+        severity,
+        yn("query_log_print_category"),
+        yn("query_log_print_severity"),
+        "yes",
+    )
 
 
 def _query_log_head(opts: dict[str, Any]) -> str:
@@ -252,6 +259,55 @@ def _dedupe_key_names(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+#: A TSIG key secret as BIND reads it: one base64 string. Anything else in
+#: the quoted ``secret "…";`` — a quote, a brace, a semicolon, whitespace — is
+#: either a config BIND will not load or text outside the key statement.
+_TSIG_SECRET_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+#: Key names: the operator grammar (``[a-z0-9.-]``), the group key
+#: (``spatium-<label>``) and the per-view keys (``spatium_xfr_<view>``).
+_TSIG_NAME_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_TSIG_ALGO_SAFE_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+def _tsig_key_problem(k: dict[str, Any]) -> str | None:
+    """Why ``k`` cannot be written as a ``key {}`` stanza, or None.
+
+    The control plane validates secrets on write; a row stored before that
+    still reaches the bundle, and the key file is interpolated verbatim, so
+    the check is repeated here rather than trusted.
+    """
+    name = str(k.get("name") or "")
+    if not _TSIG_NAME_SAFE_RE.match(name):
+        return "name"
+    if not _TSIG_ALGO_SAFE_RE.match(str(k.get("algorithm") or "hmac-sha256")):
+        return "algorithm"
+    secret = str(k.get("secret") or "")
+    if len(secret) % 4 or not _TSIG_SECRET_RE.match(secret):
+        return "secret"
+    try:
+        if not base64.b64decode(secret, validate=True):
+            return "secret"
+    except (binascii.Error, ValueError):
+        return "secret"
+    return None
+
+
+def _renderable_tsig_keys(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The keys that can be written to a key file; the rest skipped and logged.
+
+    Filtered once, before any grant, include or ``allow-update`` names them,
+    so a skipped key is never referenced by the config either.
+    """
+    out: list[dict[str, Any]] = []
+    for k in keys:
+        problem = _tsig_key_problem(k)
+        if problem is not None:
+            log.warning("tsig_key_unrenderable_skipped", key=k.get("name"), field=problem)
+            continue
+        out.append(k)
+    return out
+
+
 def _transfer_key_grants(tsig_keys: list[dict[str, Any]]) -> list[str]:
     """``key "name";`` items for every TSIG key in the bundle (issue #734).
 
@@ -307,7 +363,9 @@ def _view_transfer_keys(views: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     return out
 
 
-def _render_match_clients(view: dict[str, Any], view_keys: dict[str, dict[str, Any]]) -> str:
+def _render_match_clients(
+    view: dict[str, Any], view_keys: dict[str, dict[str, Any]]
+) -> str:
     """The body of one view's ``match-clients { … }`` (#920).
 
     Order is the whole point, because BIND takes the first element that
@@ -424,19 +482,29 @@ def _render_allow_transfer(
     settable in the UI and persisted, but nothing ever rendered them — the
     operator got a 200 and silence.
 
-    The key grants are unioned in unconditionally, INCLUDING when the ACL
-    says ``none``. That is deliberate: ``none`` is the default, so honouring
-    it literally would lock the control plane out of every zone on a stock
-    install and re-break drift the moment this shipped. ``none`` is dropped
-    from the rendered list when anything else is present — as an address
-    match it never matches, so it is pure noise.
+    The key grants come first and are unioned in unconditionally, INCLUDING
+    when the ACL says ``none``. That is deliberate: ``none`` is the default,
+    so honouring it literally would lock the control plane out of every zone
+    on a stock install and re-break drift the moment this shipped.
+
+    After the key grants the operator's entries are rendered in their own
+    order, ``none`` included. BIND compiles ``none`` as ``!any`` — an
+    element that matches every request and DENIES it, ending the list — so
+    ``["none", "10.0.0.0/8"]`` admits nobody but the key holders. Dropping
+    ``none`` from such a list would turn it into "admit 10/8", the opposite
+    of what it says, and disagree with the Technitium translation of the
+    same list. The control plane refuses a ``none`` mixed with other
+    entries on write; this keeps rows stored before that meaning what BIND
+    reads them as. A list that is nothing but ``none`` renders as the key
+    grants alone, which is the same answer.
+
+    Entries that could break out of the statement (``;``, braces, newlines)
+    are dropped, as for the other address-match lists.
     """
     items = list(key_grants)
-    for entry in acl or []:
-        token = str(entry).strip()
-        if not token or token.lower() == "none":
-            continue
-        items.append(f"{token};")
+    tokens = _safe_conf_entries(acl)
+    if any(t.lower() != "none" for t in tokens):
+        items += [f"{t};" for t in tokens]
     if not items:
         return "allow-transfer { none; }; "
     return f'allow-transfer {{ {" ".join(items)} }}; '
@@ -1139,7 +1207,11 @@ def _soa_timers(zone: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]
     notes: list[tuple[str, str]] = []
     for key, before in _SOA_TIMERS:
         value = zone.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _SOA_TIMER_MAX:
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= _SOA_TIMER_MAX
+        ):
             values.append(str(value))
             continue
         if value is not None:
@@ -1335,7 +1407,12 @@ def _ds_from_key_dir(zone: str, key_dir: str) -> list[str]:
 
     out: list[str] = []
     if not os.path.isdir(key_dir):
-        log.warning("dnssec_ds_unavailable", zone=zone, reason="key_dir_missing", key_dir=key_dir)
+        log.warning(
+            "dnssec_ds_unavailable",
+            zone=zone,
+            reason="key_dir_missing",
+            key_dir=key_dir,
+        )
         return out
     origin = dns.name.from_text(zone)
     held: list[str] = []
@@ -1356,17 +1433,31 @@ def _ds_from_key_dir(zone: str, key_dir: str) -> list[str]:
                     if not s or s.startswith(";") or " DNSKEY " not in s:
                         continue
                     rdata_text = s.split(" DNSKEY ", 1)[1]
-                    key = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, rdata_text)
+                    key = dns.rdata.from_text(
+                        dns.rdataclass.IN, dns.rdatatype.DNSKEY, rdata_text
+                    )
                     ds = dns.dnssec.make_ds(origin, key, "SHA256")
                     out.append(f"{origin.to_text()} IN DS {ds.to_text().upper()}")
                     break
-        except Exception as e:  # noqa: BLE001 — one bad key file must not hide the others
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — one bad key file must not hide the others
             log.warning("dsfromkey_failed", zone=zone, file=fn, error=str(e))
     if not out:
         if held:
-            log.info("dnssec_ds_pending", zone=zone, reason="ds_not_yet_submittable", keys=held)
+            log.info(
+                "dnssec_ds_pending",
+                zone=zone,
+                reason="ds_not_yet_submittable",
+                keys=held,
+            )
         else:
-            log.warning("dnssec_ds_unavailable", zone=zone, reason="no_ksk_key_file", key_dir=key_dir)
+            log.warning(
+                "dnssec_ds_unavailable",
+                zone=zone,
+                reason="no_ksk_key_file",
+                key_dir=key_dir,
+            )
     return out
 
 
@@ -1467,6 +1558,7 @@ _CHECK_BATCH_MAX_BYTES = 256 * 1024 * 1024
 _CHECK_TIMEOUT_S = 300
 _LOADED_LINE = re.compile(r"^zone \S+: loaded serial \d+", re.MULTILINE)
 
+
 def _cgroup_cpu_quota(root: Path = Path("/sys/fs/cgroup")) -> float | None:
     """CPUs this container may use per its cgroup quota, or None if unbounded.
 
@@ -1519,7 +1611,9 @@ def _parallel_map[T, R](fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
     workers = min(_apply_workers(), len(seq))
     if workers <= 1:
         return [fn(i) for i in seq]
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bind9-apply") as ex:
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="bind9-apply"
+    ) as ex:
         futures = [ex.submit(fn, i) for i in seq]
     # The ``with`` waited for every call (shutdown without cancel_futures).
     return [f.result() for f in futures]
@@ -1636,7 +1730,9 @@ def _rpz_serial(bl: dict[str, Any]) -> int:
     key = _rpz_render_key(bl)
     if key is None:
         return 1
-    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % (2**32 - 1) + 1
+    return (
+        int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % (2**32 - 1) + 1
+    )
 
 
 def _rpz_reusable(src: Path, key: str) -> bool:
@@ -1654,7 +1750,10 @@ def _rpz_reusable(src: Path, key: str) -> bool:
     except (OSError, UnicodeDecodeError):
         return False
     return (
-        size is not None and len(recorded) == 2 and recorded[0] == key and recorded[1] == str(size)
+        size is not None
+        and len(recorded) == 2
+        and recorded[0] == key
+        and recorded[1] == str(size)
     )
 
 
@@ -1711,7 +1810,9 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     return how
 
 
-def _zones_differing(new_root: Path, old_root: Path) -> set[tuple[str, str | None]] | None:
+def _zones_differing(
+    new_root: Path, old_root: Path
+) -> set[tuple[str, str | None]] | None:
     """Zones under ``new_root`` whose file is new or differs from ``old_root``.
 
     ``None`` means "cannot tell, treat every zone as changed": no old tree,
@@ -1961,7 +2062,9 @@ def _render_allow_query_cache(
 
 
 _TRUST_ANCHOR_LABEL = r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
-_TRUST_ANCHOR_NAME_RE = re.compile(rf"^(\.|{_TRUST_ANCHOR_LABEL}(\.{_TRUST_ANCHOR_LABEL})*\.?)$")
+_TRUST_ANCHOR_NAME_RE = re.compile(
+    rf"^(\.|{_TRUST_ANCHOR_LABEL}(\.{_TRUST_ANCHOR_LABEL})*\.?)$"
+)
 _TRUST_ANCHOR_KEY_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 
@@ -2077,7 +2180,7 @@ class Bind9Driver(DriverBase):
             if str(opts.get("forward_policy", "first")).lower() == "only":
                 fwd_block += "    forward only;\n"
 
-        tsig_keys = _dedupe_key_names(bundle.get("tsig_keys") or [])
+        tsig_keys = _dedupe_key_names(_renderable_tsig_keys(bundle.get("tsig_keys") or []))
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
         # Derived from ``state_dir``, not hardcoded (#920). AGENT_STATE_DIR is
         # an honoured override and every other path the config points at —
@@ -2088,7 +2191,9 @@ class Bind9Driver(DriverBase):
         # and the apply reported ok while named held a stale key set — a TSIG
         # transfer then fails BADKEY with nothing anywhere reporting a problem.
         tsig_include = (
-            f'include "{self.state_dir / "tsig" / "ddns.key"}";\n' if tsig_keys else ""
+            f'include "{self.state_dir / self.rendered_dir_name / "tsig" / "ddns.key"}";\n'
+            if tsig_keys
+            else ""
         )
 
         # Split-horizon (issue #24): when the group defines views, every
@@ -2104,11 +2209,17 @@ class Bind9Driver(DriverBase):
         # it: ddns.key's FIRST key is the loopback identity the record-op path
         # and the ingest worker sign with, and nothing here may ever displace
         # it. Defined at global scope, above every view that names them.
-        view_keys = _view_transfer_keys(views) if has_views else {}
+        view_keys = (
+            {
+                vname: k
+                for vname, k in _view_transfer_keys(views).items()
+                if _renderable_tsig_keys([k])
+            }
+            if has_views
+            else {}
+        )
         if view_keys:
-            tsig_include += (
-                f'include "{self.state_dir / "tsig" / "view-transfer.key"}";\n'
-            )
+            tsig_include += f'include "{self.state_dir / self.rendered_dir_name / "tsig" / "view-transfer.key"}";\n'
         # Server-wide transfer policy (issue #734). Rendered once here so it
         # covers every zone type — primary, secondary, stub, RPZ — and so the
         # control plane can read any zone this server serves. A zone with its
@@ -2362,9 +2473,7 @@ class Bind9Driver(DriverBase):
                 if md and vname in view_keys:
                     md = [f'key "{view_keys[vname]["name"]}"', *md]
                 md_line = (
-                    f"    match-destinations {{ {'; '.join(md)}; }};\n"
-                    if md
-                    else ""
+                    f"    match-destinations {{ {'; '.join(md)}; }};\n" if md else ""
                 )
                 # #430 — per-view query ACLs. When the control plane sets
                 # allow_query / allow_query_cache on a view, enforce it here;
@@ -2440,16 +2549,18 @@ class Bind9Driver(DriverBase):
         # it first); the rest are operator keys.
         # Issue #249 — atomic write so a crash between write_text +
         # chmod doesn't leave a world-readable secret on disk.
+        # #2648 — staged under ``rendered.new/tsig`` with the rest of the
+        # render, never at the live path: a bundle named-checkconf then
+        # rejects used to leave these files already rewritten (the wrong
+        # signing key for record ops, or a missing include on the next named
+        # start). They go live, and are reverted, with the tree swap.
         if tsig_keys:
             self._write_key_file("ddns.key", tsig_keys)
-        # The per-view transfer keys (#920), same atomic 0600 write. Removed
-        # once the bundle stops carrying them (the group lost its views), so
-        # no secret outlives the config that needed it.
-        view_key_file = self.state_dir / "tsig" / "view-transfer.key"
+        # The per-view transfer keys (#920), same atomic 0600 write. Simply
+        # not staged once the bundle stops carrying them (the group lost its
+        # views), so no secret outlives the config that needed it.
         if view_keys:
             self._write_key_file("view-transfer.key", list(view_keys.values()))
-        elif view_key_file.exists():
-            view_key_file.unlink()
 
         # DoT / DoH listener cert (issue #50) — written to the stable
         # tls/ paths the ``tls`` statement above points at. Same atomic
@@ -2462,21 +2573,23 @@ class Bind9Driver(DriverBase):
         self._write_listener_cert(tls_cert if has_cert else None)
 
     def _write_key_file(self, filename: str, keys: list[dict[str, Any]]) -> None:
-        """Write ``key {}`` blocks to ``<state>/tsig/<filename>``, atomically, 0600.
+        """Stage ``key {}`` blocks at ``rendered.new/tsig/<filename>``, 0600.
 
         Created 0600 through ``os.open`` and renamed into place, so the
         secret is never on disk world-readable, not even between create and
         chmod (#249), and a reload racing the write reads the old file or the
         new one, never half of one.
         """
-        tsig_dir = self.state_dir / "tsig"
+        tsig_dir = self.state_dir / "rendered.new" / "tsig"
         tsig_dir.mkdir(parents=True, exist_ok=True)
         path = tsig_dir / filename
         tmp = path.with_name(path.name + ".new")
+        # Re-checked here so no caller can write an unvalidated stanza: a key
+        # that fails is left out of the file rather than written malformed.
         payload = "".join(
             f'key "{k["name"]}" {{ algorithm {k.get("algorithm", "hmac-sha256")}; '
             f'secret "{k["secret"]}"; }};\n'
-            for k in keys
+            for k in _renderable_tsig_keys(keys)
         )
         fd = os.open(
             str(tmp),
@@ -2678,7 +2791,9 @@ class Bind9Driver(DriverBase):
                     # that; it changes no byte, and the backup sharing the
                     # inode loses nothing.
                     os.utime(path)
-                _write_new_inode(_rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode())
+                _write_new_inode(
+                    _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
+                )
                 log.info(
                     "bind9_rpz_reused",
                     zone=bl["rpz_zone_name"],
@@ -2689,7 +2804,9 @@ class Bind9Driver(DriverBase):
                 return
         self._write_rpz_zone_file(path, bl)
         if key is not None:
-            _write_new_inode(_rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode())
+            _write_new_inode(
+                _rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode()
+            )
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file, streaming it to disk.
@@ -2894,13 +3011,22 @@ class Bind9Driver(DriverBase):
                 "named-checkconf is not installed, so the config cannot be "
                 "validated; refusing to apply it unchecked"
             )
+        # named-checkconf follows ``include``, and the config names the LIVE
+        # key-file paths (#2648), which still hold the previous keys. Check a
+        # copy whose includes point at the staged ones instead.
+        live_tsig = str(self.state_dir / self.rendered_dir_name / "tsig")
+        check_conf = new_dir / "named.check.conf"
+        check_conf.write_text(
+            conf.read_text().replace(live_tsig, str(new_dir / "tsig"))
+        )
         res = subprocess.run(
-            ["named-checkconf", str(conf)],
+            ["named-checkconf", str(check_conf)],
             capture_output=True,
             text=True,
             check=False,
             timeout=30,
         )
+        check_conf.unlink(missing_ok=True)
         if res.returncode != 0:
             # #882 — read stdout FIRST. ``named-checkconf`` writes its
             # diagnostics ("named.conf:20: undefined ACL 'trusted'", with the
@@ -3090,7 +3216,9 @@ class Bind9Driver(DriverBase):
             for zv in targets
             if _file_size(new_dir / _zone_rel(*zv)) <= _CHECK_BATCH_MAX_FILE_BYTES
         ]
-        if len(eligible) < _CHECK_BATCH_MIN_ZONES or not shutil.which("named-checkconf"):
+        if len(eligible) < _CHECK_BATCH_MIN_ZONES or not shutil.which(
+            "named-checkconf"
+        ):
             return set()
         chunks: list[list[tuple[str, str | None]]] = [[]]
         chunk_bytes = 0
@@ -3182,9 +3310,9 @@ class Bind9Driver(DriverBase):
                 )
             except (OSError, subprocess.SubprocessError):
                 return None
-            return res.returncode == 0 and len(_LOADED_LINE.findall(res.stdout or "")) == len(
-                chunk
-            )
+            return res.returncode == 0 and len(
+                _LOADED_LINE.findall(res.stdout or "")
+            ) == len(chunk)
         finally:
             try:
                 os.unlink(conf)
@@ -3245,7 +3373,9 @@ class Bind9Driver(DriverBase):
                 if self._await_named_started():
                     self._verify_zones_loaded(self._rndc_base(), None)
                 return
-            self._signal_reload(base if rndc else None, changed, frozen, still_frozen, rendered)
+            self._signal_reload(
+                base if rndc else None, changed, frozen, still_frozen, rendered
+            )
         finally:
             if still_frozen:
                 self._thaw(base, still_frozen)
@@ -3264,9 +3394,13 @@ class Bind9Driver(DriverBase):
 
         def thaw(zv: tuple[str, str | None]) -> None:
             zname, view = zv
-            rc, _out, err = _rndc_run(base, "thaw", zname, *(["in", view] if view else []))
+            rc, _out, err = _rndc_run(
+                base, "thaw", zname, *(["in", view] if view else [])
+            )
             if rc != 0:
-                log.warning("bind9_zone_thaw_failed", zone=zname, view=view, stderr=err[:200])
+                log.warning(
+                    "bind9_zone_thaw_failed", zone=zname, view=view, stderr=err[:200]
+                )
 
         _parallel_map(thaw, list(zones))
 
@@ -3312,7 +3446,9 @@ class Bind9Driver(DriverBase):
                 if changed is None:
                     rest = {
                         zv
-                        for zv in _zone_views_under(self.state_dir / self.rendered_dir_name)
+                        for zv in _zone_views_under(
+                            self.state_dir / self.rendered_dir_name
+                        )
                         if zv not in frozen
                     }
                 else:
@@ -3356,7 +3492,9 @@ class Bind9Driver(DriverBase):
         try:
             os.kill(self.daemon_pid, signal.SIGHUP)
         except OSError as e:
-            raise RuntimeError(f"could not signal named (pid {self.daemon_pid}): {e}") from e
+            raise RuntimeError(
+                f"could not signal named (pid {self.daemon_pid}): {e}"
+            ) from e
         log.warning(
             "named_sighup_sent_record_propagation_degraded",
             pid=self.daemon_pid,
@@ -3643,7 +3781,9 @@ class Bind9Driver(DriverBase):
                 break
             time.sleep(_ZONE_LOAD_POLL_S)
         if pending:
-            listed = [f"{_zone_label(*zv)}: {why.get(zv, 'no answer')}" for zv in pending]
+            listed = [
+                f"{_zone_label(*zv)}: {why.get(zv, 'no answer')}" for zv in pending
+            ]
             more = f" (and {len(listed) - 5} more)" if len(listed) > 5 else ""
             raise RuntimeError(
                 "named did not load the new zone files: " + "; ".join(listed[:5]) + more
@@ -3852,7 +3992,11 @@ class Bind9Driver(DriverBase):
         ttl_value = rec.get("ttl")
         ttl = ttl_value if ttl_value is not None else 3600
 
-        tsig_path = self.state_dir / "tsig" / "ddns.key"
+        tsig_path = self.state_dir / self.rendered_dir_name / "tsig" / "ddns.key"
+        if not tsig_path.exists():
+            # Upgrade: the live named.conf still includes the pre-#2648 path
+            # until the next apply swaps a new tree in.
+            tsig_path = self.state_dir / "tsig" / "ddns.key"
         keyring = None
         if tsig_path.exists():
             # Very small parser — supports the one-line key we render above.
@@ -4023,7 +4167,12 @@ class Bind9Driver(DriverBase):
             res = subprocess.run(
                 # #1946 — one view's copy under split-horizon (the key files
                 # are shared); a bare zone name is ambiguous there.
-                [*self._rndc_base(), "dnssec", "-status", *self._zone_rndc_scopes(zone)[0]],
+                [
+                    *self._rndc_base(),
+                    "dnssec",
+                    "-status",
+                    *self._zone_rndc_scopes(zone)[0],
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -4032,7 +4181,9 @@ class Bind9Driver(DriverBase):
                 # Not "the zone has no keys": named is not answering for it
                 # (still loading, zone not loaded). Reporting [] would wipe
                 # the control plane's key rows on a guess (#1934).
-                raise RuntimeError(f"rndc dnssec -status failed: {res.stderr.strip()[:200]}")
+                raise RuntimeError(
+                    f"rndc dnssec -status failed: {res.stderr.strip()[:200]}"
+                )
             keys = _parse_dnssec_status(res.stdout)
         # DS rrset(s) from the KSK public-key files BIND wrote into the
         # key-directory, computed in-process with dnspython (#1854). This
@@ -4071,7 +4222,14 @@ class Bind9Driver(DriverBase):
         # (BIND 9.20: each view's copy rolls; the key files are shared).
         failures: list[str] = []
         for scope in self._zone_rndc_scopes(zone):
-            cmd = [*self._rndc_base(), "dnssec", "-rollover", "-key", str(key_tag), *scope]
+            cmd = [
+                *self._rndc_base(),
+                "dnssec",
+                "-rollover",
+                "-key",
+                str(key_tag),
+                *scope,
+            ]
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if res.returncode != 0:
                 failures.append(f"{' '.join(scope)}: {res.stderr.strip()}")
