@@ -517,7 +517,24 @@ export function AsnsPage() {
             <div className="flex flex-col items-center gap-2 p-10 text-center">
               <Building2 className="h-8 w-8 text-muted-foreground" />
               <p className="text-sm text-muted-foreground">
-                <ListEmpty error={listError} what="ASNs">
+                <ListEmpty
+                  error={listError}
+                  what="ASNs"
+                  filtered={
+                    kindFilter !== "all" ||
+                    registryFilter !== "all" ||
+                    whoisFilter !== "all" ||
+                    search.trim() !== "" ||
+                    tagFilters.length > 0
+                  }
+                  onClearFilters={() => {
+                    setKindFilter("all");
+                    setRegistryFilter("all");
+                    setWhoisFilter("all");
+                    setSearch("");
+                    setTagFilters([]);
+                  }}
+                >
                   No ASNs tracked yet — add one to start the registry.
                 </ListEmpty>
               </p>
