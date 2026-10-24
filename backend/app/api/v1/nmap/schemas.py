@@ -91,6 +91,11 @@ class NmapScanRead(BaseModel):
     id: uuid.UUID
     target_ip: str
     ip_address_id: uuid.UUID | None
+    # The IP space of the IPAM row the scan was launched from (#2577) —
+    # where ``stamp-discovered`` writes when no space is named. Filled on
+    # the single-scan GET only.
+    ip_space_id: uuid.UUID | None = None
+    ip_space_name: str | None = None
     preset: str
     port_spec: str | None
     extra_args: str | None

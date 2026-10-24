@@ -615,7 +615,8 @@ function TreeNodeRow({
 
 // ── Properties panel ────────────────────────────────────────────────────
 
-function PropertiesPanel({
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export function PropertiesPanel({
   node,
   isRoot,
   readOnly,
@@ -781,7 +782,7 @@ function PropertiesPanel({
         )}
         {isSubnet ? null : (
           <p className="text-[11px] text-muted-foreground">
-            Gateway / VLAN appear when this node is a subnet.
+            Gateway IP appears when this node is a subnet.
           </p>
         )}
       </div>

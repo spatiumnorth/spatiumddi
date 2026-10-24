@@ -5325,6 +5325,7 @@ type SyncResultPayload =
       pushed: number;
       pushed_records: SyncRecord[];
       push_errors: string[];
+      queued_for_agent?: boolean;
     }
   | { ok: false; error: string };
 
@@ -5372,6 +5373,7 @@ function SyncResultModal({
     pushed,
     pushed_records,
     push_errors,
+    queued_for_agent,
   } = result;
   const somethingHappened =
     imported > 0 || pushed > 0 || push_errors.length > 0;
@@ -5418,7 +5420,7 @@ function SyncResultModal({
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Stat
-              label="Pushed"
+              label={queued_for_agent ? "Queued for agent" : "Pushed"}
               value={pushed}
               highlight={
                 pushed > 0 && push_errors.length === 0 ? "good" : undefined
@@ -5434,7 +5436,11 @@ function SyncResultModal({
           {pushed > 0 && (
             <RecordTable
               records={pushed_records}
-              heading="Records applied to the server"
+              heading={
+                queued_for_agent
+                  ? "Records queued for the server's agent"
+                  : "Records applied to the server"
+              }
             />
           )}
           {push_errors.length > 0 && (
@@ -9443,7 +9449,20 @@ function ZonesTab({
       )}
       {zones.length === 0 && !isFetching && (
         <p className="text-sm text-muted-foreground italic">
-          No zones yet. Click "Add Zone" to create one.
+          {tagFilters.length > 0 ? (
+            <>
+              No zones match the selected tags.{" "}
+              <button
+                type="button"
+                onClick={() => setTagFilters([])}
+                className="not-italic text-primary underline hover:no-underline"
+              >
+                Clear filters
+              </button>
+            </>
+          ) : (
+            'No zones yet. Click "Add Zone" to create one.'
+          )}
         </p>
       )}
       {hasZoneFilter && filteredZones.length === 0 && zones.length > 0 && (

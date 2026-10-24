@@ -58,7 +58,6 @@ from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
-    contains_zonefile_unsafe,
     primary_ns_error,
     structured_rdata_error,
     validate_fqdn,
@@ -221,12 +220,14 @@ from app.services.dns.tsig import (
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
+from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
 )
 from app.services.dns.zone_move import commit_move as commit_zone_move
 from app.services.dns.zone_move import preview_move as preview_zone_move
+from app.services.dns.zone_synthesis import synthesised_zone_error
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -1813,20 +1814,10 @@ def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     validate WITHOUT mutating — a valid nameserver / RNAME contains none of the
     ``contains_zonefile_unsafe`` set. Empty ("" default / auto-filled) passes.
     """
-    if v is None or v == "":
-        return v or ""
-    if contains_zonefile_unsafe(v):
-        raise ValueError(
-            "must be a bare domain name — no whitespace, control characters, "
-            "or zone-file syntax (e.g. ';' '$' '@')"
-        )
-    if field == "primary_ns":
-        # #2075 — a Primary NS BIND's check-names refuses stops the zone
-        # being served at all, so it is a host name or it is not stored.
-        err = primary_ns_error(v)
-        if err is not None:
-            raise ValueError(f"Primary NS (primary_ns) {err}")
-    return v
+    err = soa_field_error(v, field)
+    if err is not None:
+        raise ValueError(err)
+    return v or ""
 
 
 # rdata for these types is a single bare target *name* — validate it as an
@@ -3056,6 +3047,7 @@ class ZoneSyncItem(BaseModel):
     pushed: int
     server_records: int
     push_errors: list[str]
+    queued_for_agent: bool = False
     error: str | None = None
 
 
@@ -3317,6 +3309,7 @@ async def _sync_single_server(
                     pushed=result.push.pushed,
                     server_records=result.pull.server_records,
                     push_errors=result.push.push_errors,
+                    queued_for_agent=result.push.queued_for_agent,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — per-zone isolation
@@ -5474,14 +5467,7 @@ async def create_zone(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
     await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
-    existing = await db.execute(
-        select(DNSZone).where(
-            DNSZone.group_id == group_id,
-            DNSZone.view_id == body.view_id,
-            DNSZone.name == body.name,
-        )
-    )
-    if existing.scalar_one_or_none():
+    if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
             detail="A zone with that name already exists in this group/view",
@@ -9672,6 +9658,8 @@ class SyncWithServerResponse(BaseModel):
     pushed: int
     pushed_records: list[dict]
     push_errors: list[str]
+    # #2667 — agent-managed server: pushed rows were queued for the agent.
+    queued_for_agent: bool = False
 
 
 @router.post(
@@ -9750,6 +9738,7 @@ async def sync_zone_with_server_endpoint(
         pushed=result.push.pushed,
         pushed_records=result.push.pushed_records,
         push_errors=result.push.push_errors,
+        queued_for_agent=result.push.queued_for_agent,
     )
 
 
@@ -10599,28 +10588,9 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
     Tailscale tenant (or rebind it to a different DNS group), then
     the operator can manage the zone manually.
     """
-    if zone.tailscale_tenant_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Zone {zone.name!r} is synthesised by the Tailscale "
-                f"integration and cannot be {op}ed manually. The reconciler "
-                f"will overwrite any changes on the next sync. Unbind the "
-                f"DNS group on the Tailscale tenant or delete the tenant "
-                f"to release the zone."
-            ),
-        )
-    if zone.netbird_instance_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Zone {zone.name!r} is synthesised by the NetBird "
-                f"integration and cannot be {op}ed manually. The reconciler "
-                f"will overwrite any changes on the next sync. Unbind the "
-                f"DNS group on the NetBird instance or delete the instance "
-                f"to release the zone."
-            ),
-        )
+    msg = synthesised_zone_error(zone, op)
+    if msg is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
 
 
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:

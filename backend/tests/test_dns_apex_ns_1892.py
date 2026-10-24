@@ -23,7 +23,7 @@ from app.core.security import create_access_token, hash_password
 from app.drivers.dns.base import RecordChangeResult, RecordData
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
 from app.services.dns import pull_from_server as pfs
 from app.services.dns.pull_from_server import sync_zone_with_server
 
@@ -299,9 +299,14 @@ async def test_sync_does_not_push_an_apex_ns_the_read_cannot_see(
 
     for _ in range(2):
         await sync_zone_with_server(db_session, zone, apply=True)
-    # Only the delegation, which the read can see is missing, is pushed.
-    assert [p for p in fake.pushed if p[0] == "@"] == []
-    assert fake.pushed.count(("sub", "NS", "ns.partner.net.")) == 2
+    # bind9 is agent-managed, so Sync queues record ops for the agent instead
+    # of pushing through the driver (#2667). Only the delegation, which the
+    # read can see is missing, is queued, and the second Sync adds no duplicate.
+    assert fake.pushed == []
+    ops = (await db_session.execute(select(DNSRecordOp))).scalars().all()
+    queued = [(o.record["name"], o.record["type"], o.record["value"]) for o in ops]
+    assert [q for q in queued if q[0] == "@"] == []
+    assert queued.count(("sub", "NS", "ns.partner.net.")) == 1
 
 
 async def test_sync_still_pushes_a_missing_apex_ns_to_a_read_that_sees_the_apex(

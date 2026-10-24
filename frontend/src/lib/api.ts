@@ -531,6 +531,9 @@ export interface DnsSyncCommitResult {
   updated: number;
   deleted: number;
   errors: string[];
+  // #2577 — stale record IDs sent for deletion that the scope's own drift
+  // report no longer lists. The server ignored them; none were deleted.
+  skipped_stale_record_ids?: string[];
 }
 
 export interface DnsSyncSummary {
@@ -6787,6 +6790,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_errors: string[];
+        queued_for_agent?: boolean;
       }>(`/dns/groups/${groupId}/zones/${zoneId}/sync-with-server`, { apply })
       .then((r) => r.data),
   exportAllZones: (groupId: string, viewId?: string | null) =>
@@ -11129,6 +11133,9 @@ export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
   recent_errors: IntegrationsDashboardErrorRow[];
+  // #2577 — rows a sync released outside its target's IP space; same shape,
+  // `error_detail` carries what was released. Absent from older servers.
+  recent_warnings?: IntegrationsDashboardErrorRow[];
 }
 
 // Security dashboard tab (#109)
@@ -16595,6 +16602,11 @@ export interface NmapScanRead {
   id: string;
   target_ip: string;
   ip_address_id: string | null;
+  /** IP space of the IPAM row the scan was launched from (#2577) — where
+   *  stamp-discovered writes when no space is named. Single-scan GET and the
+   *  scan list both carry it. */
+  ip_space_id?: string | null;
+  ip_space_name?: string | null;
   preset: NmapPreset;
   port_spec: string | null;
   extra_args: string | null;
@@ -16659,8 +16671,11 @@ export const nmapApi = {
    *  Existing rows in ``available`` / ``discovered`` get bumped to
    *  ``discovered``; integration / operator-owned rows get a
    *  ``last_seen`` stamp only. New rows land as ``discovered``.
+   *  ``spaceId`` picks the IP space; without it the scan's own IPAM row
+   *  space is used, and with neither, hosts that fall in subnets of more
+   *  than one space are skipped as ambiguous.
    *  Returns counters for the UI to render. */
-  stampDiscovered: (scanId: string) =>
+  stampDiscovered: (scanId: string, spaceId?: string) =>
     api
       .post<{
         created: number;
@@ -16668,7 +16683,19 @@ export const nmapApi = {
         refreshed: number;
         skipped_no_subnet: number;
         skipped_addresses: string[];
-      }>(`/nmap/scans/${scanId}/stamp-discovered`)
+        /** Hosts inside subnets of several IP spaces, skipped because no
+         *  space was chosen (#2577). */
+        skipped_ambiguous: string[];
+        /** The space hosts were stamped into and why (``requested`` /
+         *  ``scan_ip_row``); null when no single space applied (#2577). */
+        space_used: {
+          id: string;
+          name: string;
+          source: "requested" | "scan_ip_row";
+        } | null;
+      }>(`/nmap/scans/${scanId}/stamp-discovered`, null, {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
       .then((r) => r.data),
   // SECURITY (#400, M8): the SSE stream is consumed via `streamScan`
   // (fetch + ReadableStream) so the access token rides the

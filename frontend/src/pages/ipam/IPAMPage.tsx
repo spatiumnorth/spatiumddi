@@ -81,6 +81,7 @@ import {
   type Router as NetworkRouter,
   type VLAN,
   type DHCPLeaseSyncResult,
+  type DnsSyncCommitResult,
   type MacHistoryEntry,
   type NATMapping,
   type NetworkContextEntry,
@@ -7416,7 +7417,7 @@ type DnsSyncScope =
   | { kind: "block"; id: string; label: string }
   | { kind: "space"; id: string; label: string };
 
-function DnsSyncModal({
+export function DnsSyncModal({
   scope,
   onClose,
 }: {
@@ -7480,21 +7481,18 @@ function DnsSyncModal({
   const [selMissing, setSelMissing] = useState<Set<string>>(new Set());
   const [selMismatched, setSelMismatched] = useState<Set<string>>(new Set());
   const [selStale, setSelStale] = useState<Set<string>>(new Set());
-  const [result, setResult] = useState<{
-    created: number;
-    updated: number;
-    deleted: number;
-    errors: string[];
-  } | null>(null);
+  const [result, setResult] = useState<DnsSyncCommitResult | null>(null);
 
-  // Default-select everything when the report first arrives so the common
-  // case (user wants to fix all drift) is one click. They can untick
-  // individual rows to skip suspected manual edits.
+  // Missing and mismatched rows start selected, so the common case (publish
+  // what IPAM expects) is one click; the operator can untick a row to skip a
+  // suspected manual edit. Stale rows start UNselected (#2577): each one is a
+  // permanent delete pushed to the DNS server, and a delete must be the
+  // operator's explicit choice, never the default a single Apply carries.
   useEffect(() => {
     if (!data) return;
     setSelMissing(new Set(data.missing.map((m) => missingKey(m))));
     setSelMismatched(new Set(data.mismatched.map((m) => m.record_id)));
-    setSelStale(new Set(data.stale.map((s) => s.record_id)));
+    setSelStale(new Set());
   }, [data]);
 
   const commitMut = useMutation({
@@ -7680,6 +7678,16 @@ function DnsSyncModal({
                 <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs">
                   Applied: {result.created} created · {result.updated} updated ·{" "}
                   {result.deleted} deleted
+                  {(result.skipped_stale_record_ids?.length ?? 0) > 0 && (
+                    <div className="mt-1 text-amber-700 dark:text-amber-400">
+                      {result.skipped_stale_record_ids!.length} stale record
+                      {result.skipped_stale_record_ids!.length === 1
+                        ? " was"
+                        : "s were"}{" "}
+                      not deleted: no longer stale in this scope. Re-check to
+                      see the current report.
+                    </div>
+                  )}
                   {result.errors.length > 0 && (
                     <div className="mt-1 text-destructive">
                       {result.errors.length} error
@@ -7776,7 +7784,7 @@ function DnsSyncModal({
               {data.stale.length > 0 && (
                 <DriftSection
                   title="Stale records"
-                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). Selecting will permanently delete them and push the delete to BIND."
+                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). None are selected by default: selecting one will permanently delete it and push the delete to the DNS server."
                   count={data.stale.length}
                   selected={selStale.size}
                   onToggleAll={() =>
@@ -14010,7 +14018,7 @@ export function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {hasBlockFilter || hasTagFilter
+                  {hasBlockFilter || hasTagFilter || hasRoleFilter
                     ? "No results match the active filters."
                     : "This block has no child blocks or subnets yet."}
                 </p>

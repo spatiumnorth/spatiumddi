@@ -608,7 +608,12 @@ export function VRFsPage() {
                   colSpan={10}
                   className="px-4 py-8 text-center text-muted-foreground"
                 >
-                  <ListEmpty error={listError} what="VRFs">
+                  <ListEmpty
+                    error={listError}
+                    what="VRFs"
+                    filtered={tagFilters.length > 0}
+                    onClearFilters={() => setTagFilters([])}
+                  >
                     No VRFs yet. Click <strong>+ New VRF</strong> to create one.
                   </ListEmpty>
                 </td>
