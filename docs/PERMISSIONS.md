@@ -44,8 +44,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `ip_address`      | Individual IPs, aliases, bulk address ops             |
 | `vlan`            | VLANs and routers                                     |
 | `vrf`             | VRFs (Virtual Routing and Forwarding) — `manage_vrfs` |
-| `asn`             | Autonomous Systems + RPKI ROAs + BGP peering / communities — `manage_asns` |
-| `domain`          | Domain registration tracking (registrar / expiry / NS drift) — `manage_domains` |
+| `manage_asns`     | Autonomous Systems + RPKI ROAs + BGP peering / communities |
+| `manage_domains`  | Domain registration tracking (registrar / expiry / NS drift) |
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
