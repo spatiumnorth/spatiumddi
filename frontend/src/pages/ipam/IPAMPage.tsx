@@ -91,7 +91,11 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -4301,9 +4305,13 @@ function SyncMenu({
   hasDhcp,
   hasDns,
   dnsGate,
+  dhcpGate,
 }: {
   // #2571 — props spread onto the DNS item when the caller may not sync it.
   dnsGate?: { disabled?: boolean; title?: string };
+  // #2699 — DHCP and All run `POST /dhcp/servers/{id}/sync-leases`, a
+  // superadmin route whatever the caller's grants.
+  dhcpGate?: { disabled?: boolean; title?: string };
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
@@ -4334,6 +4342,7 @@ function SyncMenu({
                 label: "DHCP",
                 icon: Server,
                 onSelect: onSyncDhcp,
+                ...dhcpGate,
               },
               // "All" is DHCP + the DNS drift: with DNS off it is just DHCP.
               ...(hasDns
@@ -4344,6 +4353,7 @@ function SyncMenu({
                       icon: RefreshCw,
                       separatorBefore: true,
                       onSelect: onSyncAll,
+                      ...dhcpGate,
                     },
                   ]
                 : []),
@@ -5048,6 +5058,8 @@ export function SubnetDetail({
   const canDnsSync =
     IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
   const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
+  // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
+  const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
   // Bulk delete and Clean Orphans are deletes: the router gate wants
   // ``delete``, the handler write on the row's subnet or address set.
   const canDeleteIpam = canDeleteInIpam(
@@ -5726,6 +5738,7 @@ export function SubnetDetail({
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
               hasDns={dnsOn}
               dnsGate={dnsSyncGate}
+              dhcpGate={dhcpSyncGate}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -8926,7 +8939,9 @@ function useDhcpSync(subnetId: string, enabled: boolean) {
             const next = new Map(prev);
             next.set(serverId, {
               status: "error",
-              error: err?.message ?? String(err),
+              // The server's reason ("Superadmin required"), never the
+              // transport's "Request failed with status code 403" (#2699).
+              error: formatApiError(err, err?.message ?? String(err)),
             });
             return next;
           });
@@ -9069,7 +9084,7 @@ function CounterRow({
   );
 }
 
-function DhcpSyncModal({
+export function DhcpSyncModal({
   subnetId,
   onClose,
 }: {
@@ -10030,7 +10045,9 @@ function NatRowsTable({
 }
 
 function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
-  const { data, isLoading } = useQuery({
+  // Looking Glass routes take read on 'bgp_lg_peer' (#2704).
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
+  const { data, isLoading, error } = useQuery({
     queryKey: ["bgp-lg-routes-by-subnet", subnetId],
     queryFn: () =>
       lookingGlassApi.searchRoutes({
@@ -10039,8 +10056,20 @@ function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
         limit: 200,
       }),
     staleTime: 15_000,
+    enabled: canRead,
   });
 
+  if (!canRead || error) {
+    return (
+      <p className="px-6 py-4 text-sm text-muted-foreground">
+        {error ? (
+          <ListReadError error={error} what="BGP routes" />
+        ) : (
+          "You don't have permission to see BGP routes."
+        )}
+      </p>
+    );
+  }
   if (isLoading) {
     return <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>;
   }
@@ -11663,7 +11692,7 @@ export function ConfirmDestroyModal({
  * linked VRF's name + RD + RTs as badges. Falls back to the legacy freeform
  * ``vrf_name`` / ``route_distinguisher`` / ``route_targets`` columns for
  * backward-compat with rows created before issue #86 phase 1. */
-function SpaceVrfBadges({
+export function SpaceVrfBadges({
   space,
   onEdit,
 }: {
@@ -11673,11 +11702,17 @@ function SpaceVrfBadges({
    *  that ends in "Permission denied". */
   onEdit?: () => void;
 }) {
+  // The VRF routes take read on 'vrf'. Without it the list is not asked,
+  // and a space linked to a VRF says so rather than "not configured"
+  // (#2704).
+  const canReadVrf = usePermissions().can("read", "vrf");
   const { data: vrfs } = useQuery({
     queryKey: ["vrfs-picker"],
     queryFn: () => vrfsApi.list(),
     staleTime: 60_000,
+    enabled: canReadVrf,
   });
+  const vrfHidden = !!space.vrf_id && !canReadVrf;
   const linkedVrf = space.vrf_id
     ? (vrfs ?? []).find((v) => v.id === space.vrf_id)
     : null;
@@ -11691,6 +11726,7 @@ function SpaceVrfBadges({
 
   const hasAny =
     vrfName ||
+    vrfHidden ||
     rd ||
     space.asn_id ||
     (importTargets && importTargets.length > 0) ||
@@ -11716,6 +11752,14 @@ function SpaceVrfBadges({
 
   return (
     <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      {vrfHidden && !vrfName && (
+        <span
+          className="rounded border px-1.5 py-0.5"
+          title="This space is linked to a VRF you may not read (vrf)"
+        >
+          VRF: linked, not shown
+        </span>
+      )}
       {vrfName && (
         <span className="rounded border px-1.5 py-0.5 font-mono">
           VRF: {vrfName}
@@ -11746,11 +11790,23 @@ function SpaceVrfBadges({
 }
 
 function SpaceAsnBadge({ asnId }: { asnId: string }) {
+  const canRead = usePermissions().can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: canRead,
   });
+  if (!canRead) {
+    return (
+      <span
+        className="rounded border px-1.5 py-0.5"
+        title="This space names an ASN you may not read (manage_asns)"
+      >
+        ASN: linked, not shown
+      </span>
+    );
+  }
   const asn = (data?.items ?? []).find((a) => a.id === asnId);
   if (!asn) return null;
   return (
@@ -14544,6 +14600,7 @@ function isMulticastCidr(cidr: string): boolean {
 }
 
 function BgpBlockPanel({ block }: { block: IPBlock }) {
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
   const { data, isLoading } = useQuery({
     queryKey: ["bgp-lg-routes-by-block", block.id],
     queryFn: () =>
@@ -14553,8 +14610,9 @@ function BgpBlockPanel({ block }: { block: IPBlock }) {
         limit: 200,
       }),
     staleTime: 15_000,
+    enabled: canRead,
   });
-  if (isLoading) return null;
+  if (!canRead || isLoading) return null;
   const items = data?.items ?? [];
   if (items.length === 0) return null;
 
@@ -14589,14 +14647,16 @@ function MulticastGroupsPanel({
   space: IPSpace;
   block: IPBlock;
 }) {
+  const canRead = usePermissions().can("read", "multicast");
   const { data, isLoading } = useQuery({
     queryKey: ["multicast-groups", "by-space", space.id],
     queryFn: () =>
       multicastApi.list({ space_id: space.id, limit: 500, offset: 0 }),
     staleTime: 30_000,
+    enabled: canRead,
   });
 
-  if (isLoading) return null;
+  if (!canRead || isLoading) return null;
   const allItems = data?.items ?? [];
   // Filter to addresses that fall inside this block's CIDR. The
   // backend list endpoint doesn't have a "by-CIDR" filter, so we

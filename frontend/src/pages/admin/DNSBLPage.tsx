@@ -10,8 +10,8 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
-  authApi,
   dnsblApi,
   type DNSBLList,
   type DNSBLPinnedIP,
@@ -27,8 +27,20 @@ const inputCls =
 
 export function DNSBLPage() {
   const qc = useQueryClient();
-  const { data: me } = useQuery({ queryKey: ["me"], queryFn: authApi.me });
-  const isSuperadmin = me?.is_superadmin ?? false;
+  // The router takes `require_resource_permission("dnsbl")`: write for the
+  // pin / enable / sweep-settings writes, delete for unpin and deleting a
+  // custom list. Gate each on the grant the route checks (#2698), not on
+  // superadmin: the built-in Network Editor holds admin on `dnsbl`.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dnsbl"),
+    "Requires write on DNS blocklists",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dnsbl"),
+    "Requires delete on DNS blocklists",
+  );
+  const canWrite = !writeGate.disabled;
 
   const {
     data: lists = [],
@@ -125,7 +137,8 @@ export function DNSBLPage() {
             <Toggle
               label="Enable daily DNSBL sweep"
               checked={!!settings?.dnsbl_monitoring_enabled}
-              disabled={!isSuperadmin || saveSettings.isPending}
+              disabled={!canWrite || saveSettings.isPending}
+              title={writeGate.title}
               onChange={(v) =>
                 saveSettings.mutate({ dnsbl_monitoring_enabled: v })
               }
@@ -144,7 +157,7 @@ export function DNSBLPage() {
               max={168}
               className={cn(inputCls, "w-24")}
               defaultValue={settings?.dnsbl_check_interval_hours ?? 24}
-              disabled={!isSuperadmin}
+              {...writeGate}
               onBlur={(e) =>
                 saveSettings.mutate({
                   dnsbl_check_interval_hours: Number(e.target.value),
@@ -240,19 +253,20 @@ export function DNSBLPage() {
             placeholder="203.0.113.5"
             value={newIp}
             onChange={(e) => setNewIp(e.target.value)}
-            disabled={!isSuperadmin}
+            {...writeGate}
           />
           <input
             className={cn(inputCls, "flex-1")}
             placeholder="note (optional)"
             value={newNote}
             onChange={(e) => setNewNote(e.target.value)}
-            disabled={!isSuperadmin}
+            {...writeGate}
           />
           <button
             type="button"
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
-            disabled={!isSuperadmin || !newIp.trim() || addPinned.isPending}
+            disabled={!canWrite || !newIp.trim() || addPinned.isPending}
+            title={writeGate.title}
             onClick={() =>
               addPinned.mutate({ ip: newIp.trim(), note: newNote.trim() })
             }
@@ -288,7 +302,7 @@ export function DNSBLPage() {
                 type="button"
                 className="rounded p-1.5 hover:bg-accent"
                 title="Unpin"
-                disabled={!isSuperadmin}
+                {...deleteGate}
                 onClick={() => setConfirmUnpin(p)}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -362,7 +376,8 @@ export function DNSBLPage() {
                           type="button"
                           className="rounded p-1.5 hover:bg-accent"
                           title={l.enabled ? "Disable" : "Enable"}
-                          disabled={!isSuperadmin || toggleList.isPending}
+                          disabled={!canWrite || toggleList.isPending}
+                          {...(canWrite ? {} : { title: writeGate.title })}
                           onClick={() => toggleList.mutate(l)}
                         >
                           {toggleList.isPending &&
@@ -377,7 +392,7 @@ export function DNSBLPage() {
                             type="button"
                             className="rounded p-1.5 hover:bg-accent"
                             title="Delete custom list"
-                            disabled={!isSuperadmin}
+                            {...deleteGate}
                             onClick={() => setConfirmDelete(l)}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
