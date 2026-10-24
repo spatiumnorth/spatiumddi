@@ -759,7 +759,7 @@ function LogsTab({ serverId }: { serverId: string }) {
   // Drop empty fields rather than sending "" — the backend ILIKEs the
   // empty string against every row, which is technically correct but
   // wastes a query.
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["dns-server-query-log", serverId, filterKey],
     queryFn: () =>
       logsApi.dnsQueries({
@@ -769,7 +769,7 @@ function LogsTab({ serverId }: { serverId: string }) {
         client_ip: clientIp || null,
         max_events: 200,
       }),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   return (
@@ -812,7 +812,7 @@ function LogsTab({ serverId }: { serverId: string }) {
       {isLoading ? (
         <LoadingBlock />
       ) : isError ? (
-        <ErrorBlock />
+        <ErrorBlock error={error} what="this server's query log" />
       ) : !data || data.events.length === 0 ? (
         <p className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground">
           No query log entries match — agents tail{" "}
@@ -888,7 +888,7 @@ function StatsTab({ serverId }: { serverId: string }) {
     queryKey: ["dns-server-query-analytics", serverId],
     queryFn: () =>
       logsApi.dnsQueryAnalytics({ server_id: serverId, limit: 10 }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
 
   // Convert per-bucket counters to per-second rates so the chart axis
@@ -1018,6 +1018,17 @@ function StatsTab({ serverId }: { serverId: string }) {
         </div>
       </div>
 
+      {isRefused(analytics.error) && (
+        <p
+          role="alert"
+          className="rounded-md border bg-card p-3 text-center text-xs text-muted-foreground"
+        >
+          <ListReadError
+            error={analytics.error}
+            what="this server's query analytics"
+          />
+        </p>
+      )}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         <AnalyticsCard
           title="Top qnames"
@@ -1263,7 +1274,18 @@ function LoadingBlock() {
   );
 }
 
-function ErrorBlock() {
+function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
+  // A refusal is the reader's permissions, not a fault (#2700).
+  if (error && what && isRefused(error)) {
+    return (
+      <p
+        role="alert"
+        className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={error} what={what} />
+      </p>
+    );
+  }
   return (
     <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
       <Activity className="h-4 w-4" />
