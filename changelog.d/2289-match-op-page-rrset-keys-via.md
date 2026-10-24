@@ -18,8 +18,15 @@
   candidates through a new partial index over the ops actually in
   a retry wait, so its cost follows the page and those ops. At
   1.41M queued ops it runs in 6 ms with no JIT, or 340 ms with
-  199k ops of the server backing off. It matches the same rows,
-  and the op paging and lock order are unchanged.
+  199k ops of the server backing off. The keys are matched by
+  grouping them with the candidate ops, not by joining the two, so
+  no plan can compare every op with every key: with statistics
+  taken while the queue was idle, the generic plan a prepared
+  statement switches to after five runs had joined them in a
+  nested loop, 1.6-10.9 s for 5,000 waiting ops and 3,000 keys.
+  Now 15-25 ms under both the generic and the custom plan, and the
+  failed-ack successor lookup is matched the same way. It matches
+  the same rows, and the op paging and lock order are unchanged.
 
 ### Migrations
 

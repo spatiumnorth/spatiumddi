@@ -12,10 +12,11 @@ it must still match exactly the ops it matched before.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -83,10 +84,12 @@ class _RRsetMatchStatements:
 
     def __init__(self) -> None:
         self.param_counts: list[int] = []
+        self.statements: list[tuple[str, int]] = []
 
     def __call__(self, conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
         if "dns_record_op.record ?" in statement and "upper(" in statement:
             self.param_counts.append(len(parameters or ()))
+            self.statements.append((statement, len(parameters or ())))
 
     def __enter__(self) -> _RRsetMatchStatements:
         event.listen(Engine, "before_cursor_execute", self)
@@ -208,3 +211,74 @@ def test_the_backed_off_lookup_names_the_partial_index_predicate_literally() -> 
     )
     sql = str(stmt.compile(dialect=postgresql.asyncpg.dialect()))
     assert "dns_record_op.state = 'pending'" in sql, sql
+
+
+def _joins_over_the_keys(node: dict, inside_loop: bool = False) -> list[str]:
+    """Every nested loop in ``node`` with the unnested key list under it: the
+    shape that compares every candidate with every key."""
+    found = []
+    kind = node.get("Node Type")
+    if kind == "Function Scan" and inside_loop:
+        found.append(node.get("Function Name") or node.get("Alias", "?"))
+    loop = inside_loop or kind == "Nested Loop"
+    for child in node.get("Plans", ()):
+        found.extend(_joins_over_the_keys(child, loop))
+    return found
+
+
+async def test_no_plan_of_the_rrset_match_rescans_the_keys_per_op(
+    db_session: AsyncSession,
+) -> None:
+    """QA's case 4 on #2289. With statistics taken while the queue was idle
+    (as autoanalyze takes them), the GENERIC plan a prepared statement
+    switches to after five executions estimated one waiting op and ten keys,
+    and joined them in a nested loop that rescanned the 3,000 keys once per
+    waiting op: 7.5-10.9 s for 5,000 ops, against 35 ms for the custom
+    plan. asyncpg prepares every statement, so the generic plan is the one
+    that runs. Matched by grouping, the statements have no join over the
+    keys for any plan to choose; checked on the plan Postgres builds, for the
+    page's backed-off lookup and the failed ack's successor lookup."""
+    server = await _server(db_session)
+    t0 = datetime.now(UTC) - timedelta(hours=1)
+    # An idle queue as the statistics see it: history, nothing waiting.
+    db_session.add_all(
+        [
+            _op(
+                server,
+                f"z{i % 7}.example.",
+                f"old{i}",
+                "A",
+                t0 - timedelta(days=1),
+                state="applied",
+            )
+            for i in range(500)
+        ]
+    )
+    await db_session.flush()
+    await db_session.execute(text("ANALYZE dns_record_op"))
+
+    failed = _op(server, "a.example.", "@", "MX", t0, state="in_flight")
+    db_session.add_all(
+        [_op(server, "z0.example.", f"h{i}", "A", t0 + timedelta(seconds=i)) for i in range(50)]
+        + [_op(server, "z0.example.", "h1", "A", t0 - timedelta(minutes=1), backing_off=True)]
+        + [failed, _op(server, "a.example.", "@", "MX", t0 + timedelta(minutes=1))]
+    )
+    await db_session.flush()
+
+    with _RRsetMatchStatements() as seen:
+        await page_pending_ops(db_session, server)
+        await ack_op(db_session, str(failed.id), "error", "timeout", server_id=server.id)
+    assert len(seen.statements) >= 2, "the backed-off and successor lookups did not both run"
+
+    raw = (await (await db_session.connection()).get_raw_connection()).driver_connection
+    await raw.execute("SET LOCAL plan_cache_mode = force_generic_plan")
+    for n, (statement, params) in enumerate(seen.statements):
+        await raw.execute(f"PREPARE rrset_match_{n} AS {statement}")
+        args = ", ".join(["NULL"] * params)
+        explained = await raw.fetchval(f"EXPLAIN (FORMAT JSON) EXECUTE rrset_match_{n}({args})")
+        # The session's asyncpg json codec may already have decoded it.
+        if isinstance(explained, str):
+            explained = json.loads(explained)
+        plan = explained[0]["Plan"]
+        await raw.execute(f"DEALLOCATE rrset_match_{n}")
+        assert not _joins_over_the_keys(plan), json.dumps(plan, indent=1)

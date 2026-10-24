@@ -22,19 +22,25 @@ from typing import Any
 
 import structlog
 from sqlalchemy import (
+    Select,
     Text,
     and_,
+    any_,
+    cast,
     event,
     func,
     literal,
     literal_column,
+    null,
     or_,
     select,
     tuple_,
+    union_all,
     update,
 )
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
@@ -76,7 +82,7 @@ OP_RETRY_MAX_SECONDS = 15 * 60
 # next heartbeat (~30 s) and keeps an unsent ack across failed heartbeats, so
 # five minutes is several missed heartbeats, not a slow one.
 IN_FLIGHT_ACK_TIMEOUT = timedelta(minutes=5)
-# Keys per statement when matching RRsets in SQL (``rrset_match_where``). The
+# Keys per statement when matching RRsets in SQL (``candidates_with_keys``). The
 # keys ride as three array parameters (#2289), so this no longer bounds a
 # bind-parameter count; it only bounds what one statement carries.
 RRSET_KEY_CHUNK = 3000
@@ -146,44 +152,98 @@ def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
     )
 
 
+def _rrset_candidates(*where: Any) -> Select[Any]:
+    """The ops matching ``where`` as ``(id, zone_name, name, type)`` rows, for
+    ``candidates_with_keys``. Only ops that carry an RRset have a key."""
+    return select(
+        DNSRecordOp.id.label("id"),
+        DNSRecordOp.zone_name.label("zone_name"),
+        _op_name_sql().label("name"),
+        _op_type_sql().label("type"),
+    ).where(*where, DNSRecordOp.record.has_key("rrset"))
+
+
+def candidates_with_keys(candidates: Select[Any], keys: Collection[tuple[str, str, str]]) -> Any:
+    """WHERE clause matching the ops among ``candidates`` (``_rrset_candidates``)
+    whose RRset key is one of ``keys`` — by grouping, never by a join.
+
+    The candidates and the keys go into one ``UNION ALL`` (a key as a row
+    with a NULL ``id``), grouped by RRset key; a group keeps its ids only
+    when a key row is in it. A ``GROUP BY`` is a hash or a sort, linear in
+    the rows either way, so no plan can compare every candidate with every
+    key (#2289). A join could, and did: with statistics taken while the
+    queue was idle, the GENERIC plan a prepared statement switches to after
+    five executions (asyncpg prepares every statement) estimated one
+    candidate and the unnested keys at 10 rows, and ran a nested-loop semi
+    join that rescanned the keys once per candidate — 7.5-10.9 s for 5,000
+    waiting ops and 3,000 keys, against 35 ms for the custom plan.
+
+    The ids come back as ONE array, matched with ``= ANY(..)``: computed
+    once (an InitPlan) and probed through the primary key whatever the
+    estimates, where a semi join on a high estimate could hash the matches
+    and read the whole table to probe them. ``coalesce`` keeps it an array
+    value (bare, ``ANY (SELECT ..)`` is the row-by-row subquery form) and
+    gives an empty array when nothing matches. The keys ride as three array
+    parameters, so the statement is the same size for any key count; no key
+    component is ever NULL (``op_rrset_key``), so the NULL ``id`` cannot be
+    confused with a candidate.
+    """
+    keys = list(keys)
+    wanted = (
+        func.unnest(
+            literal([k[0] for k in keys], ARRAY(Text)),
+            literal([k[1] for k in keys], ARRAY(Text)),
+            literal([k[2] for k in keys], ARRAY(Text)),
+        )
+        .table_valued("zone_name", "name", "type")
+        .render_derived()
+    )
+    c = candidates.subquery("candidates")
+    rows = union_all(
+        select(c.c.id, cast(c.c.zone_name, Text).label("zone_name"), c.c.name, c.c.type),
+        select(
+            cast(null(), PG_UUID(as_uuid=True)).label("id"),
+            wanted.c.zone_name,
+            wanted.c.name,
+            wanted.c.type,
+        ),
+    ).subquery("rrset_rows")
+    matched = (
+        select(func.unnest(func.array_agg(rows.c.id).filter(rows.c.id.is_not(None))).label("id"))
+        .group_by(rows.c.zone_name, rows.c.name, rows.c.type)
+        .having(func.bool_or(rows.c.id.is_(None)))
+        .subquery("matched")
+    )
+    return DNSRecordOp.id == any_(
+        func.coalesce(
+            select(func.array_agg(matched.c.id)).scalar_subquery(),
+            literal_column("'{}'::uuid[]"),
+        )
+    )
+
+
 def backed_off_match_where(
     server_id: uuid.UUID, now: datetime, keys: Collection[tuple[str, str, str]]
 ) -> Any:
     """WHERE clause matching ``server_id``'s ops still backing off at ``now``
     (``pending``, ``next_attempt_at`` later) whose RRset is one of ``keys``.
 
-    The candidates are read first, in a MATERIALIZED CTE served by the partial
-    ``ix_dns_record_op_server_backoff``, and the keys are matched against that
-    set only (#2289). So the cost follows the page and the ops actually
-    waiting — none, usually — and never the server's whole backlog or the
-    size of a zone: given the keys directly, the planner either read every
-    queued op of the server (the cost grew with the backlog, 88 s at 1.41M
-    ops) or, in the generic plan a prepared statement settles on, probed the
-    zone-name index once per key and read every op of each zone.
+    The candidates are only the ops actually waiting — none, usually — read
+    through the partial ``ix_dns_record_op_server_backoff``, and the keys are
+    matched against that set (``candidates_with_keys``), so the cost follows
+    the page and those ops, never the server's whole backlog or the size of
+    a zone (#2289).
     """
-    waiting = (
-        select(
-            DNSRecordOp.id.label("id"),
-            DNSRecordOp.zone_name.label("zone_name"),
-            _op_name_sql().label("name"),
-            _op_type_sql().label("type"),
-        )
-        .where(
+    return candidates_with_keys(
+        _rrset_candidates(
             DNSRecordOp.server_id == server_id,
             # A literal, not a bind parameter: the partial index's predicate
             # is ``state = 'pending'``, and a generic plan cannot prove that
             # from ``state = $1``, so it would read every op of the server.
             DNSRecordOp.state == literal_column("'pending'"),
             DNSRecordOp.next_attempt_at > now,
-            DNSRecordOp.record.has_key("rrset"),
-        )
-        .cte("backed_off")
-        .prefix_with("MATERIALIZED")
-    )
-    return DNSRecordOp.id.in_(
-        select(waiting.c.id).where(
-            _keys_in((waiting.c.zone_name, waiting.c.name, waiting.c.type), keys)
-        )
+        ),
+        keys,
     )
 
 
@@ -235,12 +295,16 @@ async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uu
                         DNSRecordOp.created_at,
                         DNSRecordOp.seq,
                     ).where(
-                        DNSRecordOp.server_id == server_id,
-                        # ``>=``: an op of the earliest op's own transaction
-                        # can follow it (#1489).
-                        DNSRecordOp.created_at >= earliest,
-                        DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
-                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                        candidates_with_keys(
+                            _rrset_candidates(
+                                DNSRecordOp.server_id == server_id,
+                                # ``>=``: an op of the earliest op's own
+                                # transaction can follow it (#1489).
+                                DNSRecordOp.created_at >= earliest,
+                                DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
+                            ),
+                            keys[i : i + RRSET_KEY_CHUNK],
+                        )
                     )
                 )
             ).all()
