@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   asnsApi,
+  formatApiError,
   providersApi,
   type ProviderCreate,
   type ProviderKind,
@@ -297,17 +298,27 @@ export function ProvidersPage() {
     [items, selectedIds],
   );
 
+  // #2707 — a refused delete (409 while circuits reference the provider, 403)
+  // used to close the confirm and say nothing.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => providersApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["providers"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete providers")),
   });
 
   const removeOne = useMutation({
     mutationFn: (id: string) => providersApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete provider")),
   });
 
   function toggle(id: string) {
@@ -357,6 +368,12 @@ export function ProvidersPage() {
             </HeaderButton>
           </div>
         </div>
+
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
 
         <div className="flex flex-wrap items-center gap-2">
           <input
