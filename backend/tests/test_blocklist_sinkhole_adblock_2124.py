@@ -306,6 +306,8 @@ class _NullEngine:
 
 def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, holder: dict) -> None:
     class _Resp:
+        is_redirect = False  # the guarded fetch follows redirects by hand
+
         def __init__(self) -> None:
             self.text = holder["body"]
 
