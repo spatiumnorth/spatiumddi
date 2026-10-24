@@ -6790,6 +6790,7 @@ export const dnsApi = {
           ttl: number | null;
         }[];
         push_errors: string[];
+        queued_for_agent?: boolean;
       }>(`/dns/groups/${groupId}/zones/${zoneId}/sync-with-server`, { apply })
       .then((r) => r.data),
   exportAllZones: (groupId: string, viewId?: string | null) =>
