@@ -1668,13 +1668,22 @@ def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
 # a maintainer retunes them here and in firstboot's mirror
 # (``_render_control_helmchart``), and ``tests/test_control_plane_sizing.py``
 # holds the two copies together.
+#
+# #2240 — the worker's share is 0.40 of the budget, capped at 16 GiB, but
+# never more than what the api and Postgres leave of it: one
+# ``render_dns_bundle`` for a server at ~2M records peaked at 5.1-5.5 GiB and
+# was OOM-killed at the old 4 GiB cap on every worker of a 7-node, 24 GiB
+# lab. "What the others leave" keeps #1115's whole-node fit: below ~22 GiB the
+# api's half and Postgres' quarter leave the worker its old quarter (an 8 GiB
+# node is unchanged, 1536Mi), and from there the 0.40 share applies (a 24 GiB
+# node gets ~8.8 GiB, a 32 GiB node 12 GiB, a 48 GiB node and up the 16 GiB cap).
 _PLATFORM_RESERVE_MIB = 2048
 _API_MEM_SHARE = 0.5
 _API_MEM_MIN_MIB = 1024
 _API_MEM_MAX_MIB = 8192
-_WORKER_MEM_SHARE = 0.25
+_WORKER_MEM_SHARE = 0.40
 _WORKER_MEM_MIN_MIB = 1024
-_WORKER_MEM_MAX_MIB = 4096
+_WORKER_MEM_MAX_MIB = 16384
 _POSTGRES_MEM_SHARE = 0.25
 _POSTGRES_MEM_MIN_MIB = 1024
 _POSTGRES_MEM_MAX_MIB = 4096
@@ -1688,9 +1697,37 @@ _POSTGRES_MEM_REQUEST_MIN_MIB = 256
 # throughput-bound on an appliance.
 _WORKER_SMALL_NODE_MIB = 12288
 
+# #2240 — CPU limits sized from the node's CPU count. The chart ships
+# Postgres at ``1000m`` and the api at ``1000m`` whatever the node has; at 1M
+# devices on 8-vCPU nodes the CloudNativePG primary used 0.98 cores and was
+# throttled in 89% of CFS periods, and the whole cluster wrote ~20 records/s.
+# At 4 cores it used 2.8 (9% throttled) and wrote ~80/s. Postgres gets half
+# the node's CPUs (floor 1, cap 8), the api a quarter (floor 1, cap 4), as
+# whole cores written in the chart's millicore form ("4000m"), so a node whose
+# sizing lands on the chart's own 1000m renders exactly the chart's string
+# and the #1005 guard writes nothing for it. The worker keeps the chart's
+# 2000m: its renders are memory-bound, not CPU-bound. Limits only: requests
+# stay the chart's, so scheduling is unchanged. firstboot mirrors these with
+# ``nproc`` (the same affinity count ``node_cpu_count`` reads).
+_POSTGRES_CPU_DIVISOR = 2
+_POSTGRES_CPU_MIN = 1
+_POSTGRES_CPU_MAX = 8
+_API_CPU_DIVISOR = 4
+_API_CPU_MIN = 1
+_API_CPU_MAX = 4
+
 
 def _clamp_mib(total_mib: int, fraction: float, lo: int, hi: int) -> int:
     return int(min(max(total_mib * fraction, lo), hi))
+
+
+def _clamp_cores(cpu_count: int, divisor: int, lo: int, hi: int) -> int:
+    return min(max(cpu_count // divisor, lo), hi)
+
+
+def _millicores(cores: int) -> str:
+    """Whole cores in the chart's own notation (``1000m``, ``2000m``)."""
+    return f"{cores * 1000}m"
 
 
 def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
@@ -1702,15 +1739,23 @@ def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
     it in bash so a fresh install's first render already carries these
     numbers."""
     budget = max(mem_total_mib - _PLATFORM_RESERVE_MIB, 0)
+    api_mib = _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB)
     postgres_mib = _clamp_mib(
         budget, _POSTGRES_MEM_SHARE, _POSTGRES_MEM_MIN_MIB, _POSTGRES_MEM_MAX_MIB
     )
+    # #2240 — the worker's share, but never more than the api and Postgres
+    # leave of the budget (and never below its floor).
+    worker_mib = max(
+        min(
+            _clamp_mib(budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB),
+            budget - api_mib - postgres_mib,
+        ),
+        _WORKER_MEM_MIN_MIB,
+    )
     shared_buffers_mb = int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE)
     return {
-        "api": _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB),
-        "worker": _clamp_mib(
-            budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB
-        ),
+        "api": api_mib,
+        "worker": worker_mib,
         "postgres": postgres_mib,
         "shared_buffers": shared_buffers_mb,
         # CloudNativePG refuses a Cluster whose memory request is below
@@ -1720,40 +1765,70 @@ def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
     }
 
 
-def control_plane_resources(mem_total_mib: int | None) -> dict[str, Any]:
-    """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
-    a node with ``mem_total_mib`` of RAM — ``{}`` when the size is unknown
-    (the chart's defaults then stand, exactly as before).
+def control_plane_cpu_sizing(cpu_count: int) -> dict[str, int]:
+    """PURE: the ``postgres`` and ``api`` CPU limits, in whole cores, for a
+    node with ``cpu_count`` CPUs (#2240): half the node for Postgres (1-8),
+    a quarter for the api (1-4). An 8-vCPU node gets 4 and 2; a 4-vCPU node
+    2 and 1. firstboot mirrors it in bash from ``nproc``."""
+    return {
+        "postgres": _clamp_cores(
+            cpu_count, _POSTGRES_CPU_DIVISOR, _POSTGRES_CPU_MIN, _POSTGRES_CPU_MAX
+        ),
+        "api": _clamp_cores(cpu_count, _API_CPU_DIVISOR, _API_CPU_MIN, _API_CPU_MAX),
+    }
 
-    The ``postgresql`` block carries the CloudNativePG instance limit, the
-    matching ``shared_buffers`` and the memory request CloudNativePG's
-    admission webhook demands at or above ``shared_buffers`` (with the
-    chart's 256Mi request alone the Cluster is refused as soon as the sizing
-    moves off 256MB); the chart renders them straight into the Cluster CR
-    (``templates/cnpg-cluster.yaml``), and a change to any of them on a
-    formed cluster is a CNPG rolling restart — replicas first, then a
+
+def control_plane_resources(
+    mem_total_mib: int | None, cpu_count: int | None = None
+) -> dict[str, Any]:
+    """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
+    a node with ``mem_total_mib`` of RAM and ``cpu_count`` CPUs. Each input
+    sizes its own keys and an unknown one sizes nothing: ``{}`` when both are
+    unknown (the chart's defaults then stand, exactly as before), only the
+    memory keys when the CPU count is unknown, only the CPU limits
+    (``api`` / ``postgresql`` ``resources.limits.cpu``, #2240) when the RAM is.
+
+    The ``postgresql`` block carries the CloudNativePG instance limits (memory
+    and, #2240, CPU), the matching ``shared_buffers`` and the memory request
+    CloudNativePG's admission webhook demands at or above ``shared_buffers``
+    (with the chart's 256Mi request alone the Cluster is refused as soon as
+    the sizing moves off 256MB); the chart renders them straight into the
+    Cluster CR (``templates/cnpg-cluster.yaml``), and a change to any of them
+    on a formed cluster is a CNPG rolling restart — replicas first, then a
     switchover of the primary. On a fresh install firstboot renders the same
     numbers into the HelmChart, so the Cluster is created with them and
-    nothing rolls; an appliance that upgrades into this sizing takes that one
-    rolling restart on its first heartbeat, and the #1005 guard keeps every
-    later heartbeat quiet."""
-    if not mem_total_mib or mem_total_mib <= 0:
-        return {}
-    sized = control_plane_sizing(mem_total_mib)
-    return {
-        "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
-        "worker": {
-            "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
-            "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
-        },
-        "postgresql": {
-            "resources": {
-                "requests": {"memory": f"{sized['postgres_request']}Mi"},
-                "limits": {"memory": f"{sized['postgres']}Mi"},
+    nothing rolls; an appliance that upgrades into this sizing (#2240's CPU
+    limits and worker memory included) takes that one rolling restart on its
+    first heartbeat, and the #1005 guard keeps every later heartbeat quiet."""
+    out: dict[str, Any] = {}
+    if mem_total_mib and mem_total_mib > 0:
+        sized = control_plane_sizing(mem_total_mib)
+        out = {
+            "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
+            "worker": {
+                "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
+                "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
             },
-            "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
-        },
-    }
+            "postgresql": {
+                "resources": {
+                    "requests": {"memory": f"{sized['postgres_request']}Mi"},
+                    "limits": {"memory": f"{sized['postgres']}Mi"},
+                },
+                "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
+            },
+        }
+    if cpu_count and cpu_count > 0:
+        cores = control_plane_cpu_sizing(cpu_count)
+        out = _deep_merge(
+            out,
+            {
+                "api": {"resources": {"limits": {"cpu": _millicores(cores["api"])}}},
+                "postgresql": {
+                    "resources": {"limits": {"cpu": _millicores(cores["postgres"])}}
+                },
+            },
+        )
+    return out
 
 
 def node_memory_mib() -> int | None:
@@ -1766,6 +1841,23 @@ def node_memory_mib() -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def node_cpu_count() -> int | None:
+    """The CPUs this node schedules on (#2240), the count ``nproc`` prints:
+    the process's CPU affinity, else ``os.cpu_count()``; ``None`` when
+    unknown. In the supervisor's pod this is the node's vCPU count (a
+    container's CPU limit is a CFS quota, not an affinity mask)."""
+    # getattr: sched_getaffinity is Linux-only (and so absent to a type check
+    # on a developer mac).
+    affinity = getattr(os, "sched_getaffinity", None)
+    try:
+        count = len(affinity(0)) if affinity is not None else 0
+    except OSError:
+        count = 0
+    if count <= 0:
+        count = os.cpu_count() or 0
+    return count if count > 0 else None
 
 
 # #1585 — the size the control plane is budgeted from. A virtio balloon
@@ -1920,16 +2012,24 @@ def apply_control_plane_overrides(
     web_ui_allowed_cidrs: list[str] | None = None,
     *,
     mem_total_mib: int | None = None,
+    cpu_count: int | None = None,
     cnpg_instances: int | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
     plus the frontend control-plane VIP, plus the api / worker / Postgres
     memory limits, Postgres' shared_buffers and the worker concurrency,
-    sized from ``mem_total_mib`` (see ``control_plane_resources``), plus the
-    api Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``).
-    Written to the spatium-control
-    HelmChartConfig so it survives a k3s restart (#272).
+    sized from ``mem_total_mib``, and the api / Postgres CPU limits, sized
+    from ``cpu_count`` (#2240; see ``control_plane_resources``), plus the api
+    Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``).
+    Written to the spatium-control HelmChartConfig so it survives a k3s
+    restart (#272).
+
+    #2240 — a sizing change on a formed cluster (an appliance upgrading into
+    the CPU limits or the larger worker cap) is one CloudNativePG rolling
+    restart and one api / worker rollout, on the first heartbeat that writes
+    it; the #1005 guard in ``_merge_owned_overrides`` keeps every later
+    heartbeat quiet.
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
     ``patch_cnpg_instances`` left on the Cluster this tick
@@ -1983,7 +2083,7 @@ def apply_control_plane_overrides(
         "podAntiAffinity": "hard",
         "tolerations": _CONTROL_PLANE_FAST_EVICT,
     }
-    sized = control_plane_resources(mem_total_mib)
+    sized = control_plane_resources(mem_total_mib, cpu_count)
 
     def owned(current_doc: dict) -> dict[str, Any]:
         # The slot-image mirror latch (#787) reads the live document, so

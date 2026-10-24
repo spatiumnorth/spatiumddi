@@ -1322,6 +1322,9 @@ export interface BulkAllocatePreviewResponse {
   conflicts_in_use: number;
   conflicts_in_pool: number;
   conflicts_fqdn: number;
+  // Addresses outside every address set the caller holds on this subnet;
+  // the commit skips them (or, with on_collision="abort", refuses).
+  conflicts_no_perm?: number;
   sample: BulkAllocateItem[];
   warnings: string[];
 }
@@ -5109,6 +5112,10 @@ export interface ZoneMovePreview {
    *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
    *  means the commit refuses — not waivable by acknowledgement. */
   forward_transport_refusal?: string | null;
+  /** #2263 — the zone's own allow_query / allow_transfer cannot be applied
+   *  by a Technitium server in the target. Non-null means the commit
+   *  refuses — not waivable by acknowledgement. */
+  technitium_acl_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5152,6 +5159,16 @@ export interface DNSServerGroup {
   scope_warnings?: string[];
   created_at: string;
   modified_at: string;
+}
+
+/** The non-secret WinRM settings stored for a Windows DNS / DHCP server, as
+ * the server echoes them (never the username or password). Seeds the edit
+ * dialog so an untouched save keeps what is stored. */
+export interface WinRMSettings {
+  winrm_port: number;
+  transport: string;
+  use_tls: boolean;
+  verify_tls: boolean;
 }
 
 export interface WindowsDNSCredentials {
@@ -5511,6 +5528,8 @@ export interface DNSServer {
    * the UI to show "Credentials set" / "Clear" and gate the Path B
    * affordances without exposing the password. */
   has_credentials: boolean;
+  /** Stored WinRM settings (windows_dns with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   /** True when the driver runs from the control plane (no agent). Used
    * by the UI to hide approval / agent-registration affordances. */
   is_agentless: boolean;
@@ -6416,8 +6435,18 @@ export const dnsApi = {
     api
       .put<DNSView>(`/dns/groups/${groupId}/views/${viewId}`, data)
       .then((r) => r.data),
-  deleteView: (groupId: string, viewId: string) =>
-    api.delete(`/dns/groups/${groupId}/views/${viewId}`),
+  // #2275 — refused (409) while the view still scopes zones or records;
+  // blocking lists scoped to it need the explicit acknowledgement.
+  deleteView: (
+    groupId: string,
+    viewId: string,
+    opts: { acknowledgeBlocklistDetach?: boolean } = {},
+  ) =>
+    api.delete(`/dns/groups/${groupId}/views/${viewId}`, {
+      params: opts.acknowledgeBlocklistDetach
+        ? { acknowledge_blocklist_detach: true }
+        : undefined,
+    }),
 
   // TLD registry (#986) — the IANA root-zone list behind zone name_scope.
   // Read by anyone who can read DNS; refresh is superadmin-only and is the
@@ -8507,6 +8536,8 @@ export interface DHCPServer {
   // seeds the checkbox from the stored value instead of resetting it (which
   // would silently re-disable verification). Null for non-cloud drivers.
   verify_tls?: boolean | null;
+  /** Stored WinRM settings (windows_dhcp with credentials), else null. */
+  winrm_settings?: WinRMSettings | null;
   // Per-server maintenance mode (issue #182). When true the control
   // plane skips shipping pending DHCPConfigOp rows + suppresses the
   // heartbeat-stale alert; the UI renders an amber Maintenance chip.
@@ -10666,6 +10697,10 @@ export interface ApiTokenUpdate {
   description?: string;
   is_active?: boolean;
   scopes?: ApiTokenScope[];
+  /** Needed to re-enable an inactive token (superadmin only) or to widen
+   *  its scopes. Renaming, narrowing and revoking need neither. */
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 /**

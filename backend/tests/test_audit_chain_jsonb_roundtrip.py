@@ -130,11 +130,15 @@ async def test_normaliser_matches_a_real_jsonb_round_trip() -> None:
 async def test_break_names_the_row() -> None:
     row = _row(new_value={"a": 1})
     await _insert(row)
+    # audit_log refuses UPDATE (#2315); tampering takes the table owner
+    # switching the guard off first, which is what this models.
     async with AsyncSessionLocal() as session:
+        await session.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update"))
         await session.execute(
             text("UPDATE audit_log SET resource_display = 'edited' WHERE id = :id"),
             {"id": row.id},
         )
+        await session.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update"))
         await session.commit()
 
     result = await _verify()

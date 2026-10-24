@@ -14,6 +14,14 @@ OOM-killed the primary with 7.6 GiB free on a 12 GiB seed. The three are now
 one whole-node budget: a 2 GiB platform reserve, the remainder split api 1/2,
 worker 1/4, Postgres 1/4, clamped 1–8 / 1–4 / 1–4 GiB, shared_buffers a
 quarter of the Postgres cap.
+
+#2240 — at 1M devices on a seven-node lab of 24 GiB / 8 vCPU nodes the worker
+was OOM-killed at its 4 GiB cap rendering one ~2M-record DNS bundle, and the
+CloudNativePG primary was throttled in 89% of CFS periods at the chart's fixed
+1000m. The worker's share is now 2/5 of the budget, capped at 16 GiB, but never
+more than the api and Postgres leave of it (so #1115's whole-node fit holds),
+and the api / Postgres CPU limits are sized from the node's CPU count: Postgres
+half (1-8 cores), the api a quarter (1-4).
 """
 
 from __future__ import annotations
@@ -78,11 +86,18 @@ def test_sizing_scales_with_ram_inside_the_clamps() -> None:
     assert _limit(small, "worker") == "1024Mi"
     assert _limit(small, "postgresql") == "1024Mi"
     assert small["postgresql"]["cnpg"]["parameters"]["shared_buffers"] == "256MB"
+    # #2240 — the scale lab's 24 GiB node: the worker's 2/5 share (~8.8
+    # GiB) is under what the api's and Postgres' caps leave (10 GiB).
+    lab = k8s_api.control_plane_resources(24576)
+    assert _limit(lab, "api") == "8192Mi"
+    assert _limit(lab, "worker") == "9011Mi"
+    assert _limit(lab, "postgresql") == "4096Mi"
+    assert lab["worker"]["concurrency"] == 4
     # Ceilings: a 64 GiB box does not hand the api half of it, nor the
-    # database a quarter.
+    # database a quarter, nor the worker more than its 16 GiB cap.
     big = k8s_api.control_plane_resources(65536)
     assert _limit(big, "api") == "8192Mi"
-    assert _limit(big, "worker") == "4096Mi"
+    assert _limit(big, "worker") == "16384Mi"
     assert _limit(big, "postgresql") == "4096Mi"
     assert big["postgresql"]["cnpg"]["parameters"]["shared_buffers"] == "1024MB"
     assert big["worker"]["concurrency"] == 4
@@ -107,7 +122,9 @@ def test_the_budget_fits_the_node_beside_the_reserve() -> None:
     """The point of budgeting the whole node (#1115): api RAM/2 + worker RAM/4
     + Postgres RAM/4 left nothing for the platform, and the 6 GiB members of
     the seven-node lab bottomed out at 551 MiB MemAvailable under load."""
-    for mem in (8192, 12288, 16384, 24576):
+    # #2240 — still true with the worker's larger share: it only takes what
+    # the api and Postgres leave.
+    for mem in (6144, 8192, 12288, 16384, 20480, 22528, 24030, 24576, 32768, 65536):
         s = k8s_api.control_plane_sizing(mem)
         assert s["api"] + s["worker"] + s["postgres"] + 2048 <= mem, (mem, s)
     s = k8s_api.control_plane_sizing(12288)
@@ -120,9 +137,77 @@ def test_the_budget_fits_the_node_beside_the_reserve() -> None:
     }
 
 
+def test_the_worker_share_and_cap_2240() -> None:
+    """Below ~22 GiB the api's half and Postgres' quarter leave the worker
+    its old quarter (small nodes are unchanged); from there the 2/5 share
+    applies, up to the 16 GiB cap; the floor still holds on a tiny node."""
+    worker = {m: k8s_api.control_plane_sizing(m)["worker"] for m in (
+        2048, 8192, 12288, 16384, 20480, 22528, 24576, 32768, 49152, 262144
+    )}
+    assert worker == {
+        2048: 1024,     # floor
+        8192: 1536,     # as before #2240
+        12288: 2560,    # as before #2240
+        16384: 3584,    # what the api and Postgres leave
+        20480: 6144,    # what they leave (the 2/5 share would be 7372)
+        22528: 8192,    # the two meet
+        24576: 9011,    # 2/5 of the 22528 MiB budget
+        32768: 12288,
+        49152: 16384,   # cap
+        262144: 16384,
+    }
+
+
+def test_cpu_limits_are_sized_from_the_cpu_count_2240() -> None:
+    cores = {n: k8s_api.control_plane_cpu_sizing(n) for n in (1, 2, 3, 4, 6, 8, 16, 64)}
+    assert cores == {
+        1: {"postgres": 1, "api": 1},   # floors
+        2: {"postgres": 1, "api": 1},
+        3: {"postgres": 1, "api": 1},
+        4: {"postgres": 2, "api": 1},
+        6: {"postgres": 3, "api": 1},
+        8: {"postgres": 4, "api": 2},   # the scale lab's node
+        16: {"postgres": 8, "api": 4},  # caps
+        64: {"postgres": 8, "api": 4},
+    }
+    # Written in the chart's millicore form, beside the memory limits.
+    doc = k8s_api.control_plane_resources(24576, 8)
+    assert doc["api"]["resources"]["limits"] == {"memory": "8192Mi", "cpu": "2000m"}
+    assert doc["postgresql"]["resources"]["limits"] == {"memory": "4096Mi", "cpu": "4000m"}
+    assert doc["postgresql"]["resources"]["requests"] == {"memory": "1024Mi"}
+    # The worker keeps the chart's CPU limit; requests are never set.
+    assert "cpu" not in doc["worker"]["resources"]["limits"]
+    assert "cpu" not in doc["postgresql"]["resources"]["requests"]
+
+
+def test_a_small_node_renders_the_charts_own_cpu_strings_2240() -> None:
+    """charts/spatiumddi/values.yaml ships ``limits: { cpu: 1000m }`` for the
+    api and Postgres; a node that sizes to one core writes that exact string,
+    so the effective values do not change and the #1005 guard writes nothing
+    for it."""
+    doc = k8s_api.control_plane_resources(None, 2)
+    assert doc == {
+        "api": {"resources": {"limits": {"cpu": "1000m"}}},
+        "postgresql": {"resources": {"limits": {"cpu": "1000m"}}},
+    }
+
+
+def test_each_input_sizes_only_its_own_keys_2240() -> None:
+    mem_only = k8s_api.control_plane_resources(8192, None)
+    assert "cpu" not in mem_only["api"]["resources"]["limits"]
+    assert "cpu" not in mem_only["postgresql"]["resources"]["limits"]
+    cpu_only = k8s_api.control_plane_resources(None, 8)
+    assert cpu_only == {
+        "api": {"resources": {"limits": {"cpu": "2000m"}}},
+        "postgresql": {"resources": {"limits": {"cpu": "4000m"}}},
+    }
+
+
 def test_unknown_ram_leaves_the_chart_defaults_alone() -> None:
     assert k8s_api.control_plane_resources(None) == {}
     assert k8s_api.control_plane_resources(0) == {}
+    assert k8s_api.control_plane_resources(None, None) == {}
+    assert k8s_api.control_plane_resources(0, 0) == {}
 
 
 def test_the_overrides_carry_the_sizing_and_state_the_redis_kind(monkeypatch) -> None:
@@ -144,6 +229,39 @@ def test_the_overrides_carry_the_sizing_and_state_the_redis_kind(monkeypatch) ->
         "resources": {"requests": {"memory": "384Mi"}, "limits": {"memory": "1536Mi"}},
     }
     assert doc["redis"] == {"kind": "sentinel", "sentinel": {"replicas": 1}}
+
+
+def test_the_overrides_carry_the_cpu_limits_2240(monkeypatch) -> None:
+    rec = _Recorder()
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    ok, err = k8s_api.apply_control_plane_overrides(
+        7, "", mem_total_mib=24576, cpu_count=8, cnpg_instances=7
+    )
+
+    assert (ok, err) == (True, None)
+    doc = rec.doc
+    assert doc["api"]["resources"] == {"limits": {"memory": "8192Mi", "cpu": "2000m"}}
+    assert doc["worker"]["resources"] == {"limits": {"memory": "9011Mi"}}
+    assert doc["postgresql"] == {
+        "cnpg": {"instances": 7, "parameters": {"shared_buffers": "1024MB"}},
+        "resources": {
+            "requests": {"memory": "1024Mi"},
+            "limits": {"memory": "4096Mi", "cpu": "4000m"},
+        },
+    }
+
+
+def test_an_unknown_cpu_count_writes_no_cpu_limit(monkeypatch) -> None:
+    rec = _Recorder()
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    ok, _err = k8s_api.apply_control_plane_overrides(1, "", mem_total_mib=8192)
+
+    assert ok
+    doc = rec.doc
+    assert doc["api"]["resources"] == {"limits": {"memory": "3072Mi"}}
+    assert doc["postgresql"]["resources"]["limits"] == {"memory": "1536Mi"}
 
 
 def test_without_a_size_the_document_is_what_it_was(monkeypatch) -> None:
@@ -223,3 +341,22 @@ def test_node_memory_reads_meminfo(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr("builtins.open", fake_open)
     assert k8s_api.node_memory_mib() == 8123456 // 1024
+
+
+def test_node_cpu_count_reads_the_affinity_then_cpu_count(monkeypatch) -> None:
+    """The count ``nproc`` prints (firstboot's input): the affinity mask,
+    falling back to ``os.cpu_count()`` where there is none (macOS), and
+    ``None`` when neither knows."""
+    monkeypatch.setattr(
+        k8s_api.os, "sched_getaffinity", lambda _pid: set(range(8)), raising=False
+    )
+    monkeypatch.setattr(k8s_api.os, "cpu_count", lambda: 64)
+    assert k8s_api.node_cpu_count() == 8
+
+    def no_affinity(_pid):
+        raise OSError("no")
+
+    monkeypatch.setattr(k8s_api.os, "sched_getaffinity", no_affinity, raising=False)
+    assert k8s_api.node_cpu_count() == 64
+    monkeypatch.setattr(k8s_api.os, "cpu_count", lambda: None)
+    assert k8s_api.node_cpu_count() is None
