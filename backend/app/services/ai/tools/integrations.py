@@ -43,6 +43,7 @@ from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
 from app.services.ai.tools.base import register_tool
 from app.services.integration_credentials import credential_status
+from app.services.ipam.integration_space_audit import find_cross_space_adoptions, suspect_to_dict
 from app.services.tailscale.client import is_auth_rejected
 
 
@@ -997,3 +998,46 @@ async def list_firewall_feeds(
         }
         for f in rows
     ]
+
+
+# ── find_cross_space_integration_adoptions (#2577) ────────────────────
+
+
+class FindCrossSpaceAdoptionsArgs(BaseModel):
+    include_same_space: bool = Field(
+        default=False,
+        description=(
+            "Also list operator-origin rows an integration adopted inside its own "
+            "space (normal, documented adoption — not #2577 damage)."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_cross_space_integration_adoptions",
+    permission="superadmin",
+    description=(
+        "Find IP address rows an integration mirror (UniFi, Docker, Kubernetes, "
+        "Proxmox, Tailscale, NetBird, Cloud, OPNsense, firewalls) took from "
+        "ANOTHER IP space on a build before the #2577 fix. Each row carries the "
+        "integration + target, the subnet/space it sits in now, the evidence "
+        "(operator_create_audit / created_before_target / outside_target_space / "
+        "dhcp_reservation_in_other_space / predates_its_space_subnets), "
+        "likely_cross_space (set only with evidence the row lived in another "
+        "space), needs_review (operator row whose address also exists in another "
+        "space but with no such evidence — may be a normal same-space adoption; "
+        "confirm before moving), and home_candidates: subnets in other spaces that "
+        "contain the address and whether the address is free there. Read-only; "
+        "the repair is manual (docs/TROUBLESHOOTING.md). Superadmin only."
+    ),
+    args_model=FindCrossSpaceAdoptionsArgs,
+    category="integrations",
+)
+async def find_cross_space_integration_adoptions(
+    db: AsyncSession, user: User, args: FindCrossSpaceAdoptionsArgs
+) -> list[dict[str, Any]]:
+    rows = await find_cross_space_adoptions(
+        db, include_same_space=args.include_same_space, limit=args.limit
+    )
+    return [suspect_to_dict(r) for r in rows]
