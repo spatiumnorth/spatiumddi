@@ -229,7 +229,7 @@ async def test_inline_teardown_stops_at_the_deadline(
 ) -> None:
     """#2338 case 6 — with DDNS on a teardown costs ~100 ms, so the count cap
     alone ran a 1,600-lease delete past the proxy timeout. Time bounds it."""
-    import app.services.dhcp.lease_cleanup as lc
+    from app.services.dhcp import lease_cleanup as lc
 
     subnet, scope, (srv,) = await _world(db_session)
     sid, subid = srv.id, subnet.id
