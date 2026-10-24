@@ -24,7 +24,7 @@ from app.services.dns_blocklist import parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
 from app.tasks.module_gate import module_gated
 
-# If an agent hasn't heartbeat'd in this long, we fall back to an active probe.
+# If an agent hasn't heartbeat'd in this long, the server is unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
 # Timeout for a SOA probe against the server.
 DNS_PROBE_TIMEOUT = 3.0
@@ -391,8 +391,13 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
             # rides this 60 s sweep rather than a beat entry of its own.
             from app.services.dns.record_ops import heal_primaryless_groups
 
-            healed = await heal_primaryless_groups(db)
+            healed_groups: list = []
+            healed = await heal_primaryless_groups(db, healed_groups)
             await db.commit()
+            if healed_groups:
+                from app.core.agent_wake import dns_group_channel, publish_wake
+
+                await publish_wake(*(dns_group_channel(g) for g in healed_groups))
             if changed:
                 logger.info("dns_agent_stale_sweep", marked_unreachable=changed)
             return {"marked_unreachable": changed, "primaries_healed": healed}
@@ -501,6 +506,18 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 await db.commit()
                 return
 
+            # Issue #182 — a paused (maintenance) server is intentionally
+            # offline: leave its status alone, as the DHCP health task does.
+            if server.maintenance_mode:
+                server.last_health_check_at = now
+                await db.commit()
+                logger.info(
+                    "dns_health_skipped_maintenance",
+                    server_id=str(server_id),
+                    host=server.host,
+                )
+                return
+
             new_status: str
             health_detail: str | None = None
 
@@ -528,17 +545,22 @@ async def _check_health(server_id: uuid.UUID) -> None:
                         error=str(exc),
                     )
             else:
-                # Agent-based: trust a fresh heartbeat; otherwise SOA probe.
-                last_seen = server.last_health_check_at
-                if (
-                    last_seen is not None
-                    and (now - last_seen) <= AGENT_STALE_AFTER
-                    and server.status == "active"
-                ):
-                    new_status = "active"
-                else:
+                # Agent-based (#2314): judge freshness by ``last_seen_at``,
+                # which only the agent's heartbeat writes. The task's own
+                # ``last_health_check_at`` stamp must never count as a
+                # heartbeat, or an active server renews its own freshness
+                # forever. A stale agent stays ``unreachable`` even when
+                # named still answers SOA (a wedged agent is not healthy);
+                # the SOA probe is only the fallback for a server whose agent
+                # has never reported in.
+                last_seen = server.last_seen_at
+                if last_seen is None:
                     reachable = await _probe_server_soa(server.host, server.port)
                     new_status = "active" if reachable else "unreachable"
+                elif (now - last_seen) <= AGENT_STALE_AFTER:
+                    new_status = "active"
+                else:
+                    new_status = "unreachable"
 
             server.status = new_status
             server.last_health_check_at = now

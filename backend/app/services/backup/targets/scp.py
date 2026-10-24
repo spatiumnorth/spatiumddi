@@ -59,11 +59,14 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
     describe_exc,
+    read_capped,
     safe_filename,
 )
 
@@ -366,7 +369,9 @@ class ScpDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
@@ -376,7 +381,10 @@ class ScpDestination(BackupDestination):
                 sftp = _open_sftp(client)
                 try:
                     with sftp.file(remote, "rb") as fh:
-                        return fh.read()
+                        check_size(safe, fh.stat().st_size or 0, max_bytes)
+                        return read_capped(fh.read, filename=safe, max_bytes=max_bytes)
+                except ArchiveTooLargeError:
+                    raise
                 except FileNotFoundError as exc:
                     raise BackupDestinationError(f"archive {safe!r} not found at {remote}") from exc
                 except Exception as exc:  # noqa: BLE001

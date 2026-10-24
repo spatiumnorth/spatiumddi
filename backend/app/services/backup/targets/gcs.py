@@ -43,6 +43,7 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
@@ -209,7 +210,9 @@ class GcsDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         name = _object_name(config, filename)
 
         def _do() -> bytes:
@@ -222,7 +225,15 @@ class GcsDestination(BackupDestination):
             try:
                 bucket = client.bucket(config["bucket"])
                 blob = bucket.blob(name)
-                return blob.download_as_bytes()
+                if max_bytes is None:
+                    return blob.download_as_bytes()
+                # Ask for at most one byte past the cap (``end`` is
+                # inclusive): an archive within the cap arrives whole, and
+                # one past it is detected without fetching the rest.
+                data = blob.download_as_bytes(start=0, end=max_bytes)
+                if len(data) > max_bytes:
+                    raise ArchiveTooLargeError(filename, max_bytes)
+                return data
             except NotFound as exc:
                 raise BackupDestinationError(
                     f"archive {filename!r} not found in bucket {config['bucket']!r}"

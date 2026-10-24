@@ -256,3 +256,43 @@ describe("the list (#1961, #1962)", () => {
     expect(screen.queryByText("Trash is empty.")).toBeNull();
   });
 });
+
+describe("Delete permanently names what goes with the row (#2602)", () => {
+  async function openDelete(type: TrashEntry["type"], batchSize: number) {
+    list.mockResolvedValue({
+      items: [{ ...entry(batchSize), type, name_or_cidr: "row-x" }],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Delete"));
+    return (await screen.findByText(/This permanently removes/)).textContent;
+  }
+
+  it("names a subnet's scopes, addresses and records, and counts the batch", async () => {
+    const t = await openDelete("subnet", 4);
+    expect(t).toMatch(/DHCP scopes \(with their pools and static/);
+    expect(t).toMatch(/addresses and the DNS records published for them/);
+    expect(t).toMatch(/3 other rows deleted with it are removed too/);
+  });
+
+  it("names a zone's records and pools", async () => {
+    const t = await openDelete("dns_zone", 3);
+    expect(t).toMatch(/All of its DNS records and its DNS pools/);
+    expect(t).toMatch(/2 other rows/);
+  });
+
+  it("adds no count for a row deleted alone", async () => {
+    const t = await openDelete("dns_zone", 1);
+    expect(t).not.toMatch(/other row/);
+  });
+});

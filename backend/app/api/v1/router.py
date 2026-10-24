@@ -54,6 +54,7 @@ from app.api.v1.firewall_feeds.router import router as firewall_feeds_router
 from app.api.v1.fortinet.router import router as fortinet_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router
+from app.api.v1.ipam.integration_space_audit import router as integration_space_audit_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
@@ -364,6 +365,11 @@ api_v1_router.include_router(
 # path param and 422). Registering the static-prefix router first wins.
 api_v1_router.include_router(time_bound_grants_router, prefix="/groups", tags=["time-bound-grants"])
 api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
+# #2577 — superadmin read-only report of rows an integration took from another
+# IP space. Deliberately NOT token-scoped: it spans every space, so a
+# resource-bound token is refused on it. Mounted before the IPAM router so no
+# parameterised IPAM path can shadow the literal one.
+api_v1_router.include_router(integration_space_audit_router, prefix="/ipam", tags=["ipam"])
 include_token_scoped(
     api_v1_router,
     ipam_router,

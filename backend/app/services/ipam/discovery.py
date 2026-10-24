@@ -445,7 +445,10 @@ async def record_mac_observation(
     if not mac_address:
         return None
 
-    classification = await classify_mac(db, mac_address)
+    # Classify against the known fleet of the sighting's own IP space
+    # (#2577) — a MAC allocated in another space says nothing about this one.
+    # The row's space is resolved inside the fleet query, not looked up first.
+    classification = await classify_mac(db, mac_address, same_space_as_ip=ip_id)
     is_randomized = is_locally_administered(mac_address)
     row = (
         await db.execute(

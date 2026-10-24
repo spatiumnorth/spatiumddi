@@ -177,6 +177,13 @@ describe("DHCP: Delete Server Group", () => {
       listGroups: async () => [DHCP_GROUP],
       listServers: async () => [],
       listScopesByGroup: async () => [],
+      // The delete path counts the group's own configuration (#2607).
+      listMacBlocks: async () => [],
+      listClientClasses: async () => [],
+      listOptionTemplates: async () => [],
+      listPxeProfiles: async () => [],
+      listDevicePolicies: async () => [],
+      listPhoneProfiles: async () => [],
       ...extra,
     };
   }
