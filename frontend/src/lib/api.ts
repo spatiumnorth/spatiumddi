@@ -10694,6 +10694,10 @@ export interface ApiTokenUpdate {
   description?: string;
   is_active?: boolean;
   scopes?: ApiTokenScope[];
+  /** Needed to re-enable an inactive token (superadmin only) or to widen
+   *  its scopes. Renaming, narrowing and revoking need neither. */
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 /**
