@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DDL, BigInteger, DateTime, Index, Sequence, String, Text, event, func
+from sqlalchemy import (
+    DDL,
+    BigInteger,
+    DateTime,
+    Index,
+    Integer,
+    Sequence,
+    String,
+    Text,
+    event,
+    func,
+)
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -134,4 +145,30 @@ for _trigger, (_event, _function) in AUDIT_LOG_GUARD_TRIGGERS.items():
             f"CREATE TRIGGER {_trigger} BEFORE {_event} ON audit_log "
             f"FOR EACH ROW EXECUTE FUNCTION {_function}()"
         ),
+    )
+
+
+class AuditChainCheckpoint(Base):
+    """Singleton: how far the nightly verifier has walked the chain (#2286).
+
+    ``verified_seq`` / ``verified_hash`` name the last row verified clean in
+    a walk that began at the first row, so the next run starts after it
+    instead of re-reading the table. ``full_pass_done_at`` is when that walk
+    first reached the end of the table; the verifier discards the checkpoint
+    a week later and walks everything again. The verifier re-checks that the
+    row still carries ``verified_hash`` before trusting it, so a stale
+    checkpoint (restore, rewritten row) costs a full pass, never a false
+    "verified".
+    """
+
+    __tablename__ = "audit_chain_checkpoint"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    verified_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    verified_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    full_pass_done_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

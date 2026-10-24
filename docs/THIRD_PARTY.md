@@ -352,6 +352,7 @@ because CI gates depend on specific behaviour from several.
 |---|---|---|
 | [mkosi](https://github.com/systemd/mkosi) | LGPL 2.1 | Builds the appliance disk image |
 | [Go](https://go.dev/) | BSD 3-Clause | Builds GoBGP from source in the Looking Glass image |
+| [skopeo](https://github.com/containers/skopeo) | Apache 2.0 | skopeo v1.20.0 in a container: registry-to-archive fallback in the appliance image bake (#2393) |
 | [Trivy](https://trivy.dev/) | Apache 2.0 | Image CVE gate (HIGH/CRITICAL, `--ignore-unfixed`) |
 | [pytest](https://pytest.org/) + pytest-asyncio / cov / xdist / split | MIT | Backend test suite |
 | [ruff](https://docs.astral.sh/ruff/) / [black](https://black.readthedocs.io/) / [mypy](https://mypy-lang.org/) | MIT | Backend lint + typecheck |

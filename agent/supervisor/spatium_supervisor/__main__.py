@@ -29,7 +29,7 @@ import structlog
 
 import dataclasses
 
-from . import appliance_state, approval_state, cp_tls
+from . import appliance_state, approval_state, cp_tls, self_bootstrap_token
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url, heartbeat_once, next_heartbeat_delay
@@ -65,10 +65,13 @@ def _self_bootstrap_or_skip(
 
     Only fires on the control-plane appliance where the
     installer wizard didn't capture a pairing code (the control plane
-    IS local). The api gates the endpoint on (1) the host bind-mounted
-    ``role-config:ROLE`` matching this claim and (2) no existing
-    Appliance rows, so calling it from anywhere other than the local
-    supervisor on a fresh install fails 403/409.
+    IS local). The api gates the endpoint on (1) a one-time token this
+    function writes to the host release-state directory and presents in
+    the body — the proof that the caller is on this host, since the
+    endpoint is also reachable through the frontend's ``/api/`` proxy —
+    (2) the host bind-mounted ``role-config:ROLE`` matching this claim
+    and (3) no live Appliance rows. The token file is removed again once
+    the call returns, whatever its outcome.
 
     On success we return a frozen copy of ``cfg`` with the new code +
     control-plane URL stamped in. On any failure (api not reachable,
@@ -94,11 +97,20 @@ def _self_bootstrap_or_skip(
     # makes the name absolute and skips the search list entirely.
     api_url = "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local.:8000"
     log.info("supervisor.self_bootstrap.attempting", variant=variant, api_url=api_url)
+    token = self_bootstrap_token.write()
+    if token is None:
+        # The api refuses a call without the token, so there is no point
+        # sending one; the next register-loop tick tries again.
+        log.warning(
+            "supervisor.self_bootstrap.skipped",
+            reason="could not write the self-bootstrap token",
+        )
+        return cfg
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.post(
                 f"{api_url}/api/v1/appliance/self-register-bootstrap",
-                json={"appliance_variant": variant},
+                json={"appliance_variant": variant, "bootstrap_token": token},
             )
     except httpx.HTTPError as exc:
         log.warning(
@@ -107,6 +119,8 @@ def _self_bootstrap_or_skip(
             hint="will retry on next register-loop tick",
         )
         return cfg
+    finally:
+        self_bootstrap_token.remove()
     if resp.status_code == 409:
         log.info("supervisor.self_bootstrap.already_registered")
         return cfg

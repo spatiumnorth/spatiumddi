@@ -52,10 +52,12 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
     describe_exc,
     safe_filename,
     safe_url,
@@ -284,22 +286,38 @@ class WebDAVDestination(BackupDestination):
         rows.sort(key=lambda r: r.created_at, reverse=True)
         return rows
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         target = self._archive_url(config, filename)
+        name = safe_filename(filename)
         async with self._client(config) as client:
             try:
-                resp = await client.get(target)
+                # Streamed, so an archive past ``max_bytes`` is abandoned
+                # as the running total crosses the cap rather than read
+                # into memory whole first.
+                async with client.stream("GET", target) as resp:
+                    if resp.status_code == 404:
+                        raise BackupDestinationError(
+                            f"archive {name!r} not found at {safe_url(target)}"
+                        )
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode("utf-8", errors="replace")
+                        raise BackupDestinationError(
+                            f"WebDAV GET returned {resp.status_code}: "
+                            f"{scrub_url(body, target)[:300]}"
+                        )
+                    length = resp.headers.get("content-length")
+                    if length and length.isdigit():
+                        check_size(name, int(length), max_bytes)
+                    out = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        out += chunk
+                        if max_bytes is not None and len(out) > max_bytes:
+                            raise ArchiveTooLargeError(name, max_bytes)
+                    return bytes(out)
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 raise BackupDestinationError(f"WebDAV GET failed: {describe_exc(exc)}") from exc
-        if resp.status_code == 404:
-            raise BackupDestinationError(
-                f"archive {safe_filename(filename)!r} not found at {safe_url(target)}"
-            )
-        if resp.status_code != 200:
-            raise BackupDestinationError(
-                f"WebDAV GET returned {resp.status_code}: {resp.text[:300]}"
-            )
-        return resp.content
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         target = self._archive_url(config, filename)

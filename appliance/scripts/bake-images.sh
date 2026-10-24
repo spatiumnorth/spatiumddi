@@ -483,17 +483,137 @@ if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
     fi
 fi
 
-# ``BAKE_SAVE_PLATFORM`` (optional, e.g. ``linux/amd64``): passed as
-# ``docker save --platform``. Required on a Docker host that uses the
-# containerd image store (Docker Desktop on Apple Silicon): a registry
-# image's index there lists platforms whose blobs were never pulled, and a
-# plain ``docker save`` fails with "content digest … not found". Also
-# guarantees the archive carries the appliance's architecture rather than
-# the build host's. Empty (the CI default) keeps the historical behaviour.
-SAVE_PLATFORM_FLAG=()
-if [ -n "${BAKE_SAVE_PLATFORM:-}" ]; then
-    SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
+# ``BAKE_SAVE_PLATFORM`` (e.g. ``linux/amd64``): passed as
+# ``docker save --platform``. Always set (#2393). On a Docker host that
+# uses the containerd image store (Docker Desktop on Apple Silicon, and
+# current Docker Engine), a platform-less ``docker save`` of a freshly
+# pulled multi-arch image writes only the content the store holds
+# locally, which can be the index and manifests with no config and no
+# layers: the bake "succeeds", and the appliance later tries to pull the
+# image from the registry at pod start, which fails air-gapped. Others
+# fail outright with "content digest … not found". Pinning the platform
+# also guarantees the archive carries the appliance's architecture rather
+# than the build host's. The Makefile passes it; when unset it defaults to
+# the appliance architecture (APPLIANCE_ARCH, else this host's own).
+if [ -z "${BAKE_SAVE_PLATFORM:-}" ]; then
+    if [ -n "${APPLIANCE_ARCH:-}" ]; then
+        _bake_arch="${APPLIANCE_ARCH##*/}"
+    else
+        case "$(uname -m)" in
+            x86_64|amd64) _bake_arch=amd64 ;;
+            aarch64|arm64) _bake_arch=arm64 ;;
+            *) echo "ERROR: cannot map $(uname -m) to a Docker platform; set BAKE_SAVE_PLATFORM." >&2; exit 2 ;;
+        esac
+    fi
+    BAKE_SAVE_PLATFORM="linux/${_bake_arch}"
 fi
+SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
+# Build-time tool only (run in a container, never shipped): the registry ->
+# archive fallback in save_with_recovery. See versions.json "skopeo".
+SKOPEO_IMAGE="quay.io/skopeo/stable:v1.20.0"
+echo "→ Saving images for platform $BAKE_SAVE_PLATFORM"
+# Log the engine version and image-store type: a containerd-store builder
+# behaves differently from the classic one, and it is the first thing asked
+# when a platform save fails. Informational only, never fatal.
+echo "→ Docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)," \
+     "image store: $(docker info --format '{{.DriverStatus}}' 2>/dev/null \
+        | grep -q 'io.containerd.snapshotter' && echo containerd || echo classic/unknown)"
+
+# #2393 — after each save, prove the archive holds the config + layers of
+# the target-platform manifest. A size floor cannot: small images exist.
+verify_archive() {
+    local archive="$1" name="$2"
+    if ! zstd -dc "$archive" \
+        | python3 "$SCRIPT_DIR/verify-image-archive.py" \
+            --platform "$BAKE_SAVE_PLATFORM" --name "$name"; then
+        rm -f "$archive"
+        echo "ERROR: $name was saved without its layers; refusing to bake it." >&2
+        exit 5
+    fi
+}
+
+# One ``docker save --platform | zstd`` attempt. Returns the pipeline status.
+save_archive() {
+    local ref="$1" tmp="$2"
+    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
+    # overwrite it — which made every later bake fail on the same file.
+    rm -f "$tmp"
+    docker save "${SAVE_PLATFORM_FLAG[@]}" "$ref" | zstd -T0 -19 -o "$tmp"
+}
+
+# Registry -> archive with skopeo, run in a container so a build host needs
+# nothing installed. It never touches Docker's image store, which is the
+# point: on a containerd-store builder the store can hold a platform
+# manifest whose layer blobs are gone, and neither ``docker pull`` (it skips
+# layers whose unpacked snapshot already exists) nor rmi+pull brings the
+# blobs back, so ``docker save`` keeps failing. Copying straight from the
+# registry yields a complete docker-archive regardless of what is local.
+#   $1 pull ref   $2 archive tag   $3 tmp file (zstd output)
+save_from_registry() {
+    local pull_ref="$1" archive_tag="$2" tmp="$3" os arch dir rc
+    os="${BAKE_SAVE_PLATFORM%%/*}"
+    arch="${BAKE_SAVE_PLATFORM#*/}"
+    dir="$(mktemp -d)" || return 1
+    rm -f "$tmp"
+    if docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$dir:/out" \
+            "$SKOPEO_IMAGE" copy --override-os "$os" --override-arch "$arch" \
+            "docker://$pull_ref" "docker-archive:/out/image.tar:$archive_tag" >&2 \
+        && zstd -T0 -19 -o "$tmp" < "$dir/image.tar"; then
+        rc=0
+    else
+        rc=1
+    fi
+    rm -rf "$dir"
+    return "$rc"
+}
+
+# Save with recovery. A containerd-store builder can hold a local copy that
+# lost most layer blobs for the target platform; ``docker save --platform``
+# then fails with "no suitable export target found". Two escalating steps,
+# each result logged:
+#   1. remove ONLY that reference, pull it again for the platform, retag,
+#      retry the save (fixes a store whose pull does refetch the blobs);
+#   2. copy registry -> archive with skopeo (see save_from_registry), which
+#      does not depend on the local store at all.
+# Still failing -> refuse. ``pull_ref`` is empty for a locally built image
+# (nothing to re-pull) — then there is no recovery.
+#   $1 save ref   $2 tmp file   $3 pull ref (or empty)   $4 retag target (or empty)
+save_with_recovery() {
+    local ref="$1" tmp="$2" pull_ref="$3" retag="$4" out
+    if save_archive "$ref" "$tmp"; then
+        return 0
+    fi
+    if [ -z "$pull_ref" ]; then
+        rm -f "$tmp"
+        echo "ERROR: docker save --platform $BAKE_SAVE_PLATFORM failed for $ref; refusing to bake it." >&2
+        exit 5
+    fi
+    echo "  ! save of $ref for $BAKE_SAVE_PLATFORM failed; removing the local $pull_ref, re-pulling and retrying once" >&2
+    if out="$(docker rmi "$pull_ref" 2>&1)"; then
+        echo "    rmi $pull_ref: ok" >&2
+    else
+        echo "    rmi $pull_ref failed (continuing): $out" >&2
+    fi
+    if out="$(docker pull --platform "$BAKE_SAVE_PLATFORM" "$pull_ref" 2>&1)"; then
+        echo "    pull $pull_ref: ok" >&2
+        if { [ -z "$retag" ] || docker tag "$pull_ref" "$retag"; } \
+            && save_archive "$ref" "$tmp"; then
+            echo "  ✓ recovered $ref after re-pull"
+            return 0
+        fi
+        echo "    save after re-pull still fails for $ref" >&2
+    else
+        echo "    pull $pull_ref failed: $out" >&2
+    fi
+    echo "  ! copying $pull_ref for $BAKE_SAVE_PLATFORM straight from the registry with skopeo ($SKOPEO_IMAGE)" >&2
+    if save_from_registry "$pull_ref" "$ref" "$tmp"; then
+        echo "  ✓ recovered $ref from the registry (skopeo)"
+        return 0
+    fi
+    rm -f "$tmp"
+    echo "ERROR: docker save --platform $BAKE_SAVE_PLATFORM still fails for $ref after re-pulling it and copying it from the registry; refusing to bake it." >&2
+    exit 5
+}
 
 for repo in "${IMAGES[@]}"; do
     short="$(basename "$repo")"
@@ -503,7 +623,7 @@ for repo in "${IMAGES[@]}"; do
 
     if [ "$BAKE_SOURCE" = "ghcr" ]; then
         echo "→ Pulling $source_tag …"
-        docker pull "$source_tag" >/dev/null
+        docker pull --platform "$BAKE_SAVE_PLATFORM" "$source_tag" >/dev/null
     elif ! docker image inspect "$source_tag" >/dev/null 2>&1; then
         echo "ERROR: no local image found for $repo. Tried:" >&2
         echo "         ${repo}:dev" >&2
@@ -526,10 +646,10 @@ for repo in "${IMAGES[@]}"; do
     # docker save | zstd → containerd-readable archive. Atomic via
     # .new sibling so a crash mid-bake doesn't ship a torn tarball.
     tmp="${out_tar}.new"
-    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
-    # overwrite it — which made every later bake fail on the same file.
-    rm -f "$tmp"
-    docker save "${SAVE_PLATFORM_FLAG[@]}" "$target_tag" | zstd -T0 -19 -o "$tmp"
+    pull_ref=""
+    [ "$BAKE_SOURCE" = "ghcr" ] && pull_ref="$source_tag"
+    save_with_recovery "$target_tag" "$tmp" "$pull_ref" "$target_tag"
+    verify_archive "$tmp" "$target_tag"
     mv "$tmp" "$out_tar"
 
     size="$(du -h "$out_tar" | awk '{print $1}')"
@@ -549,23 +669,16 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[
     short="$(basename "${image%%:*}")"
     out_tar="$IMAGES_DIR/${short}.tar.zst"
 
-    # With a save platform pinned, always pull for that platform: a local
-    # copy pulled for the build host's own arch (a dev-compose ``redis``
-    # on an arm64 laptop) satisfies ``image inspect`` but cannot be saved
-    # as the appliance's arch.
-    if [ -n "${BAKE_SAVE_PLATFORM:-}" ]; then
-        docker pull --platform "$BAKE_SAVE_PLATFORM" "$image" >/dev/null
-    elif ! docker image inspect "$image" >/dev/null 2>&1; then
-        echo "→ Pulling $image …"
-        docker pull "$image" >/dev/null
-    fi
+    # Always pull for the save platform: a local copy pulled for the
+    # build host's own arch (a dev-compose ``redis`` on an arm64 laptop)
+    # satisfies ``image inspect`` but cannot be saved as the appliance's
+    # arch.
+    docker pull --platform "$BAKE_SAVE_PLATFORM" "$image" >/dev/null
 
     echo "→ Baking $image → $out_tar"
     tmp="${out_tar}.new"
-    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
-    # overwrite it — which made every later bake fail on the same file.
-    rm -f "$tmp"
-    docker save "${SAVE_PLATFORM_FLAG[@]}" "$image" | zstd -T0 -19 -o "$tmp"
+    save_with_recovery "$image" "$tmp" "$image" ""
+    verify_archive "$tmp" "$image"
     mv "$tmp" "$out_tar"
 
     size="$(du -h "$out_tar" | awk '{print $1}')"

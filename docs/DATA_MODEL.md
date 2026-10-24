@@ -496,7 +496,10 @@ Tamper-evidence is a hash chain: each row carries a monotonic
 a SQLAlchemy `before_flush` listener that takes a Postgres advisory lock
 to serialize "look up previous row → hash → append", so concurrent
 inserts can't interleave and break the chain. `prev_hash` is NULL only on
-the first row. A nightly `verify_chain` task re-walks and validates it.
+the first row. A nightly task validates it with `verify_chain`, a keyset
+walk in pages, resuming from the singleton `audit_chain_checkpoint` row
+(last verified `seq` + hash) and re-walking the whole chain at least weekly
+(#2286).
 
 Each row records *who* (`user_id`, `user_display_name`, `auth_source`,
 `source_ip`, `user_agent`), *what* (`action`, `resource_type`,

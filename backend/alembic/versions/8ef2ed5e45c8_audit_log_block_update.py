@@ -16,14 +16,14 @@ TRUNCATE is deliberately not guarded: the per-test truncation and the
 selective restore of the ``audit`` section both TRUNCATE the table.
 
 Revision ID: 8ef2ed5e45c8
-Revises: e7b3d19a4c26
+Revises: e7b2d4c81f06
 Create Date: 2026-10-23 10:00:00.000000
 """
 
 from alembic import op
 
 revision = "8ef2ed5e45c8"
-down_revision = "e7b3d19a4c26"
+down_revision = "e7b2d4c81f06"
 branch_labels = None
 depends_on = None
 
