@@ -351,7 +351,7 @@ export function CustomersPage() {
                 const ids = Array.from(selectedIds);
                 setConfirm({
                   title: "Delete customers",
-                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Cross-references on subnets / zones / ASNs will be cleared.`,
+                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Subnets, zones and ASNs that name them are not changed and keep pointing at the hidden customer.`,
                   confirmLabel: "Delete",
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
@@ -440,7 +440,7 @@ export function CustomersPage() {
                       onClick={() => {
                         setConfirm({
                           title: "Delete customer",
-                          message: `Soft-delete customer "${c.name}"? Cross-references will be cleared.`,
+                          message: `Soft-delete customer "${c.name}"? Anything that names it is not changed and keeps pointing at the hidden customer.`,
                           confirmLabel: "Delete",
                           onConfirm: () => removeOne.mutate(c.id),
                         });
