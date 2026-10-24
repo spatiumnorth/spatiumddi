@@ -2213,8 +2213,10 @@ A blank or whitespace-only hostname on a stored row means the address
 publishes nothing. Every path that meets one retracts the address's own
 auto-generated A / AAAA and PTR through the record-op queue: the sync on its
 strict paths (Sync DNS commit, the scheduled auto-sync) as well as its
-background ones, a DHCP reservation update, and the DDNS lease path when the
-policy names nothing in the blank's place. The drift check reports those
+background ones, and a DHCP reservation update. A DHCP lease is different: lease
+ingest reads a blank or omitted hostname as "no name sent" and keeps the
+address's earlier name, so a client that stops sending option 12 does not lose
+its records. The drift check reports those
 records as stale (`no-hostname`) rather than as an update to a blank owner,
 and the scheduled auto-sync deletes them even with
 `dns_auto_sync_delete_stale` off. The address's aliases are left to that

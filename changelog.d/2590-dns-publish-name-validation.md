@@ -6,8 +6,7 @@
   BIND reads as another record at the previous host's name. Such a hostname
   is now stored as no hostname. A blank or whitespace-only hostname means
   the address publishes nothing: wherever the sync meets one on a stored
-  row (a DHCP reservation update, a lease whose name turned blank, Sync DNS,
-  the scheduled auto-sync), the A / AAAA and PTR an earlier name published
+  row (a DHCP reservation update, Sync DNS, the scheduled auto-sync), the A / AAAA and PTR an earlier name published
   are retracted rather than refused or left served. Sync DNS offers those
   records for deletion instead of an update to a blank owner, and the
   scheduled auto-sync retracts them even with "delete stale records" off;
@@ -24,3 +23,7 @@
   whitespace or a control character, or whose value contains a newline, so
   a row stored before these rules cannot render a blank-owner line or a
   second record.
+
+  A DHCP lease that arrives with a blank or omitted hostname keeps the
+  address's earlier name, as before, so a client that stops sending
+  option 12 does not lose its records.
