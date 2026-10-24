@@ -11,7 +11,7 @@
   A restore that would collide with a live row of the same name is refused
   (409) with the reason, and so is restoring a service or overlay whose customer
   is still in the Trash. Permanently deleting a customer is refused while it
-  still has services. Rows deleted before this release appear in the Trash with
-  their original delete time, so the ones older than the retention period are
-  purged by the next nightly sweep. A name conflict on create now says which
+  still has services. Rows deleted before this release appear in the Trash, and
+  each gets a full retention period from the upgrade, so none is purged by the
+  first sweep. A name conflict on create now says which
   field is in use.

@@ -240,16 +240,53 @@ async def test_partial_unique_index_is_in_the_schema(db_session: AsyncSession) -
     assert all("WHERE (deleted_at IS NULL)" in r.indexdef for r in rows), rows
 
 
-async def test_rows_deleted_before_the_upgrade_are_listed_and_restorable(
+async def test_rows_deleted_before_the_upgrade_are_listed_restorable_and_get_a_fresh_clock(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """The old handlers stamped deleted_at only (no batch id, no user)."""
+    """The old handlers stamped deleted_at only (no batch id, no user); the
+    migration restarts their retention clock so the first sweep purges none."""
+    import importlib.util
+    from pathlib import Path
+
+    from app.models.settings import PlatformSettings
+    from app.tasks.trash_purge import _sweep
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic/versions/c8d3a1f47e92_trash_name_partial_unique.py"
+    )
+    spec = importlib.util.spec_from_file_location("mig_c8d3a1f47e92", path)
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
     h = await _admin(db_session)
+    if (await db_session.execute(select(PlatformSettings).limit(1))).scalar_one_or_none() is None:
+        db_session.add(PlatformSettings())
     ov = await _mk_overlay(client, h, f"legacy-{uuid.uuid4().hex[:6]}")
+    cu = await _mk_customer(client, h, f"legacy-{uuid.uuid4().hex[:6]}")
     await db_session.execute(
-        text("UPDATE overlay_network SET deleted_at = now() WHERE id = :i"), {"i": ov["id"]}
+        text("UPDATE overlay_network SET deleted_at = now() - interval '90 days' WHERE id = :i"),
+        {"i": ov["id"]},
+    )
+    await db_session.execute(
+        text("UPDATE customer SET deleted_at = now() - interval '90 days' WHERE id = :i"),
+        {"i": cu["id"]},
     )
     await db_session.commit()
+
+    await db_session.run_sync(lambda s: mig.restart_retention_clock(s.connection()))
+    await db_session.commit()
+    age = (
+        await db_session.execute(
+            text("SELECT now() - deleted_at FROM overlay_network WHERE id = :i"), {"i": ov["id"]}
+        )
+    ).scalar_one()
+    assert age.total_seconds() < 300
+
+    result = await _sweep()
+    assert result["per_type"]["overlay_network"] == 0, result
+    assert result["per_type"]["customer"] == 0, result
+
     items = await _trash(client, h, "overlay_network")
     assert [i["id"] for i in items] == [ov["id"]]
     assert items[0]["deletion_batch_id"] is None and items[0]["batch_size"] == 1
