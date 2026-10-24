@@ -2203,11 +2203,22 @@ line that starts with whitespace, which BIND reads as another record at the
 previous owner.
 
 Every path that publishes applies the same field rules before that point:
-the REST record endpoints, the IPAM → DNS sync (a hostname that is blank or
-not a legal owner is published nowhere, and what an earlier name published
-is retracted), DHCP reservations (a whitespace-only hostname is stored as no
+the REST record endpoints, the IPAM → DNS sync (a hostname that is not a
+legal owner is published nowhere, and what an earlier name published is
+retracted), DHCP reservations (a whitespace-only hostname is stored as no
 hostname), and the operation layer behind the requests portal and the
 Copilot, which shares `app.core.dns_names.record_value_error` with REST.
+
+A blank or whitespace-only hostname on a stored row means the address
+publishes nothing. Every path that meets one retracts the address's own
+auto-generated A / AAAA and PTR through the record-op queue: the sync on its
+strict paths (Sync DNS commit, the scheduled auto-sync) as well as its
+background ones, a DHCP reservation update, and the DDNS lease path when the
+policy names nothing in the blank's place. The drift check reports those
+records as stale (`no-hostname`) rather than as an update to a blank owner,
+and the scheduled auto-sync deletes them even with
+`dns_auto_sync_delete_stale` off. The address's aliases are left to that
+setting.
 
 ### 18.3 Auditing existing rows
 

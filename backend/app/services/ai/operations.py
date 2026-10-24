@@ -31,7 +31,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2045,16 +2045,18 @@ class CreateDNSRecordArgs(BaseModel):
     def _name(cls, v: str) -> str:
         return validate_record_owner(v, field="record name")
 
-    @model_validator(mode="after")
-    def _value(self) -> CreateDNSRecordArgs:
-        rtype = self.record_type.strip().upper()
-        if contains_control_chars(self.value) or rtype in (
-            {"A", "AAAA"} | HOSTNAME_TARGET_RECORD_TYPES
-        ):
-            err = record_value_error(rtype, self.value)
+    # A field validator, not a model one, so the refusal names ``value`` the
+    # way the other field refusals name theirs. ``record_type`` is declared
+    # first, so it is in ``info.data`` here unless it failed its own check.
+    @field_validator("value")
+    @classmethod
+    def _value(cls, v: str, info: ValidationInfo) -> str:
+        rtype = str(info.data.get("record_type") or "").strip().upper()
+        if contains_control_chars(v) or rtype in ({"A", "AAAA"} | HOSTNAME_TARGET_RECORD_TYPES):
+            err = record_value_error(rtype, v)
             if err is not None:
                 raise ValueError(err)
-        return self
+        return v
 
 
 async def _preview_create_dns_record(

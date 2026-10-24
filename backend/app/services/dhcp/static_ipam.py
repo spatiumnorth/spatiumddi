@@ -191,7 +191,7 @@ async def upsert_ipam_for_static(
     # stale A record off it, with no number of polls able to converge them.
     # Stripped: a whitespace-only name (a row stored before the request
     # validator folded it to "", or one written by an importer) is no name,
-    # and must not reach the DNS sync below as a truthy owner of blanks.
+    # and the DNS sync below retracts what an earlier name published.
     row.hostname = (st.hostname or "").strip()
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
@@ -218,7 +218,10 @@ async def upsert_ipam_for_static(
     from app.services.dns.sync_check import address_own_forward_zone_id  # noqa: PLC0415
 
     subnet_row = await db.get(Subnet, scope.subnet_id)
-    if subnet_row is not None and row.hostname:
+    # Run even when the reservation carries no name: the sync then retracts
+    # the A / PTR an earlier name published, rather than leaving them served
+    # for a name the row no longer carries.
+    if subnet_row is not None:
         try:
             # #2104 — keep the row in the zone it was put in (#493): with no
             # zone the sync resolves the subnet's and re-homes the host.

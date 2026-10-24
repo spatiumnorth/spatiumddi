@@ -2134,6 +2134,56 @@ def _own_alias_clash_detail(ip: IPAddress, zone: DNSZone, alias: DNSRecord) -> s
     )
 
 
+async def _retract_host_records(db: AsyncSession, ip: IPAddress) -> bool:
+    """Retract the address's own auto-generated host records (A / AAAA + PTR).
+
+    For an address whose name is blank: it publishes nothing, so the host
+    record and the PTR an earlier name published are withdrawn through the
+    record-op queue (agents and agentless drivers alike). Aliases are left
+    alone, as the unpublishable-owner branch of :func:`_sync_dns_record`
+    leaves them. ``forward_zone_id`` is kept so a later name returns to the
+    same zone (#493). Returns whether anything was retracted.
+    """
+    result = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_alias.is_(False),
+            DNSRecord.record_type.in_(["A", "AAAA", "PTR"]),
+        )
+    )
+    # #1800 — PTRs first, as the delete action orders them.
+    records = sorted(result.scalars().all(), key=lambda r: r.record_type != "PTR")
+    for record in records:
+        zone = await db.get(DNSZone, record.zone_id)
+        # #1633 — a zone IPAM does not author never took the record: drop the
+        # row, queue no op it would refuse.
+        if zone is not None and ipam_authors_zone(zone):
+            await _enqueue_dns_op(
+                db,
+                zone,
+                "delete",
+                record.name,
+                record.record_type,
+                record.value,
+                record.ttl,
+                record_id=record.id,
+            )
+        await db.delete(record)
+    if not records:
+        return False
+    ip.dns_record_id = None
+    ip.fqdn = None
+    if any(r.record_type == "PTR" for r in records):
+        ip.reverse_zone_id = None
+    logger.info(
+        "ipam_dns_blank_hostname_retracted",
+        ip=str(ip.address),
+        records=len(records),
+    )
+    return True
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -2183,6 +2233,10 @@ async def _sync_dns_record(
     ``skip_create`` holds ``(record_type, zone_id)`` keys whose record is NOT
     to be newly written, however missing: the Sync DNS rows the operator
     unticked (#2471). Records that already exist are still updated.
+
+    A blank or whitespace-only hostname publishes nothing: the address's own
+    auto-generated host record and PTR are retracted, on strict and
+    background paths alike, and the sync returns False.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -2238,7 +2292,15 @@ async def _sync_dns_record(
     # old records (issue #25).
     if effective_zone_id is None:
         effective_zone_id = ip.forward_zone_id
-    if not ip.hostname:
+    if ip.hostname is None or not ip.hostname.strip():
+        # A blank or whitespace-only name publishes nothing. Whatever host
+        # record an earlier name published is retracted here, on every path
+        # (strict or not), rather than refused or skipped: the request models
+        # refuse a blank name at input, so a row only arrives here blank by a
+        # path that stored it (a reservation whose name was cleared, a lease,
+        # an importer, a row from before the validator), and leaving its old
+        # A / PTR served would answer for a name the row no longer carries.
+        await _retract_host_records(db, ip)
         return False
     if effective_zone_id is None and not ip.extra_zone_ids:
         # Nothing to publish to — no primary zone, no extras.
@@ -2246,10 +2308,11 @@ async def _sync_dns_record(
     # The hostname becomes the record owner verbatim. The request models
     # validate it, but a row reaches this sync by other paths too (DHCP
     # reservations, importers, rows stored before a validator existed). A
-    # blank, whitespace-bearing or control-character owner renders a zone
-    # line BIND reads as another owner's record, or as two records, so such a
-    # name is published nowhere: strict paths answer 422, others skip every
-    # zone, which also retracts what an earlier name published there.
+    # whitespace-bearing or control-character owner renders a zone line BIND
+    # reads as another owner's record, or as two records, so such a name is
+    # published nowhere: strict paths answer 422, others skip every zone,
+    # which also retracts what an earlier name published there. (A blank name
+    # was handled above: it always retracts.)
     owner_err = publishable_host_owner_error(ip.hostname)
     if owner_err is not None:
         if strict:

@@ -237,7 +237,8 @@ async def test_static_update_whitespace_hostname_clears_it(
     resp = await client.put(f"/api/v1/dhcp/statics/{sid}", headers=headers, json={"hostname": "  "})
     assert resp.status_code == 200, resp.text
     assert resp.json()["hostname"] == ""
-    assert all(r.name.strip() for r in await _records_at(db_session, "10.61.5.21"))
+    # The old name's A is retracted, not left served.
+    assert await _records_at(db_session, "10.61.5.21") == []
 
 
 # ── IPAM mirror + sync ────────────────────────────────────────────────────────
@@ -265,7 +266,7 @@ async def test_mirror_of_stored_whitespace_hostname_publishes_nothing(
     assert await _records_at(db_session, "10.61.5.30") == []
 
 
-@pytest.mark.parametrize("hostname", ["   ", "web1\nevil", " web1"])
+@pytest.mark.parametrize("hostname", ["web1\nevil", " web1"])
 @pytest.mark.asyncio
 async def test_sync_skips_an_unpublishable_hostname(
     db_session: AsyncSession, hostname: str
@@ -322,6 +323,12 @@ def test_dns_record_args_refuse_a_newline_value() -> None:
         zone_id=str(uuid.uuid4()), name="H1", record_type="A", value="10.0.0.1"
     )
     assert ok.name == "h1"
+
+
+def test_dns_record_args_newline_value_refusal_names_the_field() -> None:
+    with pytest.raises(ValidationError) as exc:
+        CreateDNSRecordArgs(zone_id=str(uuid.uuid4()), name="h", record_type="A", value=INJECTED_A)
+    assert [e["loc"] for e in exc.value.errors()] == [("value",)]
 
 
 def test_ip_address_args_match_the_rest_create_rules() -> None:
@@ -432,6 +439,17 @@ async def test_portal_refuses_what_rest_refuses_at_submit(
         )
         == 400
     )
+    named = await client.post(
+        "/api/v1/requests",
+        headers=headers,
+        json={
+            "kind": "dns_record",
+            "args": {"zone_id": zid, "name": "h1", "record_type": "A", "value": INJECTED_A},
+            "justification": "test",
+        },
+    )
+    # The refusal names the field, as the status and hostname refusals do.
+    assert "value: Value error, A record value contains" in named.json()["detail"]
     assert (
         await submit(
             "ip_address",
