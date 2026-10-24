@@ -358,6 +358,19 @@ api's 30 s `command_timeout`) is logged and counted
 (`spatiumddi_agent_bundle_inline_failures_total`) and the poll waits for
 the worker's render; it is never recorded as the server's render failure.
 
+*A re-enabled server re-renders every zone (#2281).* A disabled server gets
+no record ops and no renders, and its agent keeps serving the config it
+last applied. In a group without views records are not part of the
+structural etag, so the bundle it gets when it is enabled again carries the
+current records but would not make the agent render them. Re-enabling
+therefore bumps `dns_server.zone_resync_seq`, which is folded into that
+server's structural etag, and retires the record ops still queued for it
+from before the disable (each carries an RRset as it was then, and shipped
+after the re-render it could put back a record deleted in between). Expect
+one full reload of that server's zones after you enable it. Moving a server
+to another group bumps the same counter. Maintenance mode does not: a
+paused server keeps receiving queued ops, which ship in order on resume.
+
 ### RFC 2136 `nsupdate` responsibility
 
 **Agent-local.** The control-plane BIND9 driver does **not** connect to `named` directly. Instead:

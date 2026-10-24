@@ -211,3 +211,28 @@ async def test_revoking_the_appliance_that_owned_the_primary_elects_a_successor(
     )
     assert resp.status_code == 200, resp.text
     assert await _primaries(db_session, gid) == [survivor_id]
+
+
+@pytest.mark.asyncio
+async def test_heal_marks_the_group_bundles_dirty_2655(db_session: AsyncSession) -> None:
+    from sqlalchemy import select
+
+    from app.models.dns import DNSServer
+    from app.services.dns.record_ops import heal_primaryless_groups
+
+    grp = await _group(db_session, "g2655")
+    a = await _server(db_session, grp, "a")
+    await db_session.commit()
+    a_id = a.id
+
+    async def seq() -> int:
+        return (
+            await db_session.execute(select(DNSServer.bundle_dirty_seq).where(DNSServer.id == a_id))
+        ).scalar_one()
+
+    before = await seq()
+    groups: list = []
+    assert await heal_primaryless_groups(db_session, groups) == 1
+    await db_session.commit()
+    assert groups == [grp.id]
+    assert await seq() > before

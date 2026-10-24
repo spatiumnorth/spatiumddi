@@ -24,6 +24,7 @@ healthy install it finds nothing and writes nothing (not even an audit row).
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import structlog
@@ -32,6 +33,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
+from app.services.dhcp.lease_cleanup import sweep_orphaned_lease_mirrors
 from app.services.dhcp.static_ipam import sweep_orphaned_static_mirrors
 from app.services.feature_modules import is_module_enabled
 from app.tasks.module_gate import module_gated
@@ -42,6 +44,7 @@ logger = structlog.get_logger(__name__)
 # can't turn one tick into an hour-long transaction holding locks on ip_address.
 # Whatever is left over is picked up on the next tick — the sweep is idempotent.
 _MAX_PER_RUN = 500
+_LEASE_SWEEP_BUDGET_S = 240.0
 
 
 async def _sweep() -> int:
@@ -51,6 +54,21 @@ async def _sweep() -> int:
         if not await is_module_enabled(db, "core.dhcp"):
             return 0
         freed = await sweep_orphaned_static_mirrors(db, limit=_MAX_PER_RUN)
+        # #2290 — dynamic-lease mirrors whose lease rows are gone (server delete).
+        # Loop in committed batches under a time budget: a deleted server can
+        # strand 100k mirrors and one batch per hour would take a week.
+        deadline = time.monotonic() + _LEASE_SWEEP_BUDGET_S
+        capped = False
+        while True:
+            n = await sweep_orphaned_lease_mirrors(db, limit=_MAX_PER_RUN)
+            freed += n
+            if n < _MAX_PER_RUN:
+                break
+            if time.monotonic() > deadline:
+                # A full batch and out of budget: mirrors may remain.
+                capped = True
+                break
+            await db.commit()
         if freed:
             # Only audit when we actually changed something — a row per hour
             # saying "found nothing" would bury the one that matters. Freeing an
@@ -64,9 +82,9 @@ async def _sweep() -> int:
                     action="dhcp-mirror-sweep",
                     resource_type="platform",
                     resource_id="dhcp-mirror-sweep",
-                    resource_display="orphaned reservation mirrors",
+                    resource_display="orphaned DHCP mirrors (reservation + lease)",
                     result="success",
-                    new_value={"mirrors_freed": freed, "capped": freed >= _MAX_PER_RUN},
+                    new_value={"mirrors_freed": freed, "capped": capped},
                 )
             )
         await db.commit()

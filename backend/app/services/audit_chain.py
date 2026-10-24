@@ -33,8 +33,9 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -268,15 +269,62 @@ class ChainVerifyResult:
     ok: bool
     rows_checked: int
     breaks: list[ChainBreak]
-    # Range actually walked (None on an empty table) and whether rows
-    # outside it exist, so a caller never reads a window as the whole log.
+    # How far the walk got (#2286, #2297): the range actually walked
+    # (``first_seq`` None when no row was read), the highest ``seq`` examined
+    # and its ``row_hash``, and whether rows outside that range exist.
+    # ``ok`` with ``partial=True`` means "clean within the walked range"
+    # and nothing more, so a caller never reads a window as the whole log.
     first_seq: int | None = None
     last_seq: int | None = None
+    last_hash: str | None = None
     partial: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not self.partial
+
+
+#: Rows fetched per keyset page. Memory is O(chunk), not O(table).
+VERIFY_CHUNK_SIZE = 5000
+
+#: The columns the hash covers, plus the chain fields. Selecting them (not
+#: the entity) keeps a page to plain tuples, so nothing accrues in the
+#: session's identity map across the walk.
+_VERIFY_COLUMNS = (
+    AuditLog.seq,
+    AuditLog.id,
+    AuditLog.timestamp,
+    AuditLog.user_id,
+    AuditLog.user_display_name,
+    AuditLog.auth_source,
+    AuditLog.source_ip,
+    AuditLog.user_agent,
+    AuditLog.action,
+    AuditLog.resource_type,
+    AuditLog.resource_id,
+    AuditLog.resource_display,
+    AuditLog.old_value,
+    AuditLog.new_value,
+    AuditLog.changed_fields,
+    AuditLog.request_id,
+    AuditLog.result,
+    AuditLog.error_detail,
+    AuditLog.row_hash,
+    AuditLog.prev_hash,
+)
+
+#: ``on_chunk(last_seq, last_hash, rows_checked, breaks_so_far)``.
+ChunkCallback = Callable[[int, str, int, int], Awaitable[None]]
 
 
 async def verify_chain(
-    db: AsyncSession, *, max_rows: int | None = None, newest: bool = False
+    db: AsyncSession,
+    *,
+    max_rows: int | None = None,
+    start_after: tuple[int, str] | None = None,
+    chunk_size: int = VERIFY_CHUNK_SIZE,
+    on_chunk: ChunkCallback | None = None,
+    newest: bool = False,
 ) -> ChainVerifyResult:
     """Walk the audit_log in seq order and check each row's hash.
 
@@ -292,78 +340,143 @@ async def verify_chain(
     Distinct codes so the alert message can tell operators *what*
     kind of tampering they're looking at.
 
-    ``max_rows`` caps the walk. By default it covers the OLDEST rows;
-    with ``newest=True`` it covers the NEWEST ``max_rows`` rows, anchored
-    on the ``row_hash`` of the row just before the window (#2297) so the
-    window's first ``prev_hash`` is still checked. Recent rows are where
-    tampering matters, so the Audit page badge uses the newest window.
+    The walk is a keyset scan (``seq > last ORDER BY seq LIMIT chunk``)
+    carrying the previous hash across pages, so memory is bounded by
+    ``chunk_size`` however large the table is (#2286). ``start_after`` is
+    ``(seq, row_hash)`` of an already-verified row: the walk then covers
+    only later rows, the first of which must chain from that hash.
+    ``on_chunk`` runs after each page so a caller can checkpoint progress.
+    Any database error propagates; a walk that did not finish is never
+    returned as a result.
+
+    ``max_rows`` caps the walk. By default it covers the OLDEST rows; with
+    ``newest=True`` it covers the NEWEST ``max_rows`` rows, anchored on the
+    ``row_hash`` of the row just before the window (#2297) so the window's
+    first ``prev_hash`` is still checked. Recent rows are where tampering
+    matters, so the Audit page badge uses the newest window.
     """
-    partial = False
-    anchor: str | None = None
-    if max_rows is not None and newest:
-        stmt = select(AuditLog).order_by(AuditLog.seq.desc()).limit(max_rows)
-        rows = list((await db.execute(stmt)).scalars().all())
-        rows.reverse()
-        if rows:
+    chunk_size = max(1, chunk_size)
+    window_anchored = False
+    if newest and max_rows is not None and start_after is None:
+        # First row of the newest ``max_rows`` window, then the row before
+        # it as the anchor; the rest is an ordinary keyset walk from there.
+        first_in_window = (
+            await db.execute(
+                select(AuditLog.seq).order_by(AuditLog.seq.desc()).offset(max_rows - 1).limit(1)
+            )
+        ).scalar()
+        if first_in_window is not None:
             pred = (
                 await db.execute(
-                    select(AuditLog.row_hash)
-                    .where(AuditLog.seq < rows[0].seq)
+                    select(AuditLog.seq, AuditLog.row_hash)
+                    .where(AuditLog.seq < first_in_window)
                     .order_by(AuditLog.seq.desc())
                     .limit(1)
                 )
             ).first()
             if pred is not None:
-                partial = True
-                anchor = pred[0]
-    else:
-        stmt = select(AuditLog).order_by(AuditLog.seq.asc())
-        if max_rows is not None:
-            stmt = stmt.limit(max_rows + 1)
-        rows = list((await db.execute(stmt)).scalars().all())
-        if max_rows is not None and len(rows) > max_rows:
-            rows = rows[:max_rows]
-            partial = True
-
+                start_after = (pred.seq, pred.row_hash)
+                window_anchored = True
+        max_rows = None
     breaks: list[ChainBreak] = []
-    expected_prev: str | None = anchor
+    expected_prev: str | None = None
+    last_seq = 0
+    if start_after is not None:
+        last_seq, expected_prev = start_after
     rows_checked = 0
-    for row in rows:
-        rows_checked += 1
-        if row.prev_hash != expected_prev:
-            breaks.append(
-                ChainBreak(
-                    seq=row.seq,
-                    audit_id=str(row.id),
-                    expected_hash=expected_prev or "",
-                    actual_hash=row.prev_hash or "",
-                    reason="prev_hash_mismatch",
-                    action=row.action,
-                    resource_type=row.resource_type,
-                    resource_id=row.resource_id,
-                )
+    last_hash: str | None = expected_prev if start_after is not None else None
+    seen_seq: int | None = start_after[0] if start_after is not None else None
+    first_seq: int | None = None
+    complete = False
+
+    while True:
+        limit = chunk_size
+        if max_rows is not None:
+            remaining = max_rows - rows_checked
+            if remaining <= 0:
+                break
+            limit = min(limit, remaining)
+        page = (
+            await db.execute(
+                select(*_VERIFY_COLUMNS)
+                .where(AuditLog.seq > last_seq)
+                .order_by(AuditLog.seq.asc())
+                .limit(limit)
             )
-        canonical = canonical_json(row)
-        recomputed = hash_row(row.prev_hash, canonical)
-        if recomputed != row.row_hash:
-            breaks.append(
-                ChainBreak(
-                    seq=row.seq,
-                    audit_id=str(row.id),
-                    expected_hash=recomputed,
-                    actual_hash=row.row_hash,
-                    reason="row_hash_mismatch",
-                    action=row.action,
-                    resource_type=row.resource_type,
-                    resource_id=row.resource_id,
+        ).all()
+        for row in page:
+            rows_checked += 1
+            if first_seq is None:
+                first_seq = row.seq
+            if row.prev_hash != expected_prev:
+                breaks.append(
+                    ChainBreak(
+                        seq=row.seq,
+                        audit_id=str(row.id),
+                        expected_hash=expected_prev or "",
+                        actual_hash=row.prev_hash or "",
+                        reason="prev_hash_mismatch",
+                        action=row.action,
+                        resource_type=row.resource_type,
+                        resource_id=row.resource_id,
+                    )
                 )
-            )
-        expected_prev = row.row_hash
+            recomputed = hash_row(row.prev_hash, canonical_json(row))  # type: ignore[arg-type]
+            if recomputed != row.row_hash:
+                breaks.append(
+                    ChainBreak(
+                        seq=row.seq,
+                        audit_id=str(row.id),
+                        expected_hash=recomputed,
+                        actual_hash=row.row_hash,
+                        reason="row_hash_mismatch",
+                        action=row.action,
+                        resource_type=row.resource_type,
+                        resource_id=row.resource_id,
+                    )
+                )
+            expected_prev = row.row_hash
+        if page:
+            last_seq = seen_seq = page[-1].seq
+            last_hash = page[-1].row_hash
+            if on_chunk is not None:
+                await on_chunk(last_seq, last_hash, rows_checked, len(breaks))
+        if len(page) < limit:
+            complete = True
+            break
+
+    if not complete:
+        # Stopped on ``max_rows``: complete only if nothing follows.
+        more = (
+            await db.execute(select(AuditLog.seq).where(AuditLog.seq > last_seq).limit(1))
+        ).first()
+        complete = more is None
     return ChainVerifyResult(
         ok=not breaks,
         rows_checked=rows_checked,
         breaks=breaks,
-        first_seq=rows[0].seq if rows else None,
-        last_seq=rows[-1].seq if rows else None,
-        partial=partial,
+        first_seq=first_seq,
+        last_seq=seen_seq,
+        last_hash=last_hash,
+        partial=window_anchored or not complete,
     )
+
+
+# ── Verified-up-to checkpoint (#2286) ───────────────────────────────
+
+#: A clean-from-zero checkpoint older than this is discarded and the next
+#: run walks the whole chain again. The incremental pass trusts everything
+#: at or below the checkpoint, so this bounds how long an edit to an
+#: already-verified row can go unseen.
+FULL_PASS_INTERVAL = timedelta(days=7)
+
+
+async def checkpoint_still_valid(db: AsyncSession, seq: int, row_hash: str) -> bool:
+    """Is the row the checkpoint vouches for still there, unchanged?
+
+    A missing row or a different hash means the checkpoint describes a
+    chain this table no longer holds (restore, deletion, rewrite), so the
+    caller walks from the start instead of trusting it.
+    """
+    found = (await db.execute(select(AuditLog.row_hash).where(AuditLog.seq == seq))).scalar()
+    return found == row_hash
