@@ -2178,6 +2178,58 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             ),
         )
 
+    # The zones left are the ones in Trash (the live ones were refused above).
+    # They go with the group by FK cascade, which runs no Python, so write the
+    # per-item row a Trash purge writes (#1957): name, view and record count.
+    trashed_zones = (
+        (
+            await db.execute(
+                select(DNSZone)
+                .where(DNSZone.group_id == group_id)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    view_names: dict[uuid.UUID, str] = {}
+    view_ids = {z.view_id for z in trashed_zones if z.view_id is not None}
+    if view_ids:
+        view_names = {
+            v.id: v.name
+            for v in (await db.execute(select(DNSView).where(DNSView.id.in_(view_ids))))
+            .scalars()
+            .all()
+        }
+    for z in trashed_zones:
+        record_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == z.id)
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one()
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_zone",
+                resource_id=str(z.id),
+                resource_display=z.name,
+                old_value={
+                    "name": z.name,
+                    "view": view_names.get(z.view_id) if z.view_id else None,
+                    "record_count": record_count,
+                    "purged_with": "dns_server_group",
+                    "group": group.name,
+                },
+                result="success",
+            )
+        )
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2187,6 +2239,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             resource_type="dns_server_group",
             resource_id=str(group.id),
             resource_display=group.name,
+            old_value={"trashed_zones_deleted": len(trashed_zones)},
             result="success",
         )
     )
