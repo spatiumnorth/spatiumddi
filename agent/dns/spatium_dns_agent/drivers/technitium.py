@@ -1373,6 +1373,11 @@ _UNAPPLIED_ACL_MESSAGES = {
         "express (localnets, an undefined ACL name or a key), so query "
         "access was left as the daemon has it on {zones} zone(s)"
     ),
+    "zone_allow_query": (
+        "allow_query: the zone's own list has an element Technitium cannot "
+        "express (localnets, an undefined ACL name or a key), so query "
+        "access was left as the daemon has it on {zones} zone(s)"
+    ),
     "allow_transfer": (
         "allow_transfer: the list has an element Technitium cannot express "
         "(localnets, a key beside an address, a negated key or ACL, an "
@@ -1763,6 +1768,35 @@ def _notify_options(
     return {"notify": notify, "notifyNameServers": targets}, unapplied
 
 
+#: Zone types whose OWN ``allow_query`` overrides the group's (#2263). BIND
+#: accepts a zone-level ``allow-query`` on master / slave / stub zones only,
+#: and the BIND9 agent renders it there and nowhere else, so a Forwarder zone
+#: keeps the group's list here too.
+_ZONE_QUERY_OVERRIDE_TYPES = frozenset({"Primary", "Secondary", "Stub"})
+
+
+def _effective_allow_query(
+    ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None
+) -> tuple[Any, bool]:
+    """The ``allow_query`` list in force for one zone, and whether it is the
+    zone's own (#2263).
+
+    The zone's value shadows the group's, as a zone-level ``allow-query``
+    does in BIND. ``None`` inherits; so does an empty list, because the
+    BIND9 agent renders nothing for one and the zone then falls back to the
+    options-level list. Reading ``[]`` as ``Allow`` here would open a zone
+    the group restricts.
+    """
+    own = (zone or {}).get("allow_query")
+    if (
+        ztype in _ZONE_QUERY_OVERRIDE_TYPES
+        and own is not None
+        and any(str(e).strip() for e in own)
+    ):
+        return own, True
+    return (bundle.get("options") or {}).get("allow_query"), False
+
+
 def _zone_options_payload(
     ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1803,17 +1837,30 @@ def _zone_options_payload(
     unapplied: list[dict[str, str]] = []
     acls = _bundle_acls(bundle)
     if ztype in _QUERY_ACCESS_ZONE_TYPES:
-        # The group's ``allow_query`` (#1763). Always sent, ``Allow`` included,
-        # so widening the list back to ``any`` un-restricts a zone an earlier
-        # bundle restricted; an empty ACL clears the stored one.
-        qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+        # The group's ``allow_query`` (#1763), or the zone's own (#2263).
+        # Always sent, ``Allow`` included, so widening the list back to
+        # ``any`` un-restricts a zone an earlier bundle restricted; an empty
+        # ACL clears the stored one.
+        source, own = _effective_allow_query(ztype, bundle, zone)
+        qa = _query_access(source, acls)
         if qa is None:
             unapplied.append(
                 {
-                    "kind": "allow_query",
+                    "kind": "zone_allow_query" if own else "allow_query",
                     "reason": "allow_query has an element Technitium cannot express",
                 }
             )
+            if own:
+                # A Primary this pass creates is held at ``Deny`` and then
+                # released (#1758); with no query access to release it to,
+                # the release falls back to ``Allow``. For a zone whose own
+                # list is meant to restrict it, that is wider than the group's
+                # list, which a zone without the override would have got. So
+                # the release uses the group's list when it is expressible
+                # (#2263). An existing zone is still left as the daemon has it.
+                group_qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+                if group_qa is not None:
+                    payload["_release_query_access"] = group_qa
         else:
             payload["queryAccess"] = qa[0]
             payload["queryAccessNetworkACL"] = qa[1]
@@ -3945,14 +3992,19 @@ class TechnitiumDriver(DriverBase):
         No query access in the bundle (an ``allow_query`` Technitium cannot
         express, which a normal pass leaves as the daemon has it) means
         ``Allow``: what the zone had before the hold (``ApexZone`` ctor,
-        15.4.0), not a translation of the operator's list. If the options
+        15.4.0), not a translation of the operator's list. The exception is
+        a zone whose OWN list cannot be expressed (#2263): it is released
+        to the group's list (``_release_query_access``) when that one can
+        be, so it is never opened wider than a zone without the override.
+        If the options
         call is refused or not sent (a bad ``zoneTransfer`` is never sent),
         the query access still goes out on its own: a zone left at ``Deny``
         is not served at all.
         """
         params = dict(options)
         if "queryAccess" not in params:
-            params.update(queryAccess="Allow", queryAccessNetworkACL=[])
+            access, acl = params.get("_release_query_access") or ("Allow", [])
+            params.update(queryAccess=access, queryAccessNetworkACL=list(acl))
         try:
             if self._apply_zone_options(token, zone, params):
                 return True
@@ -4698,6 +4750,8 @@ class TechnitiumDriver(DriverBase):
         True when there was nothing to send or the daemon took it.
         """
         options = dict(options)
+        # Only the hold release reads it (#2263); never a daemon parameter.
+        options.pop("_release_query_access", None)
         for item in options.pop("_unapplied", None) or []:
             # Left as the daemon has it rather than guessed at (see
             # ``_query_access`` / ``_transfer_access``); the API refuses to

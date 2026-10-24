@@ -586,7 +586,8 @@ DNSServerOptions.blackhole: list[str]           -- queries from these addresses 
 - **BIND9:** `allow-query { <acl>; };`, `allow-query-cache { <acl>; };`, `allow-transfer { <acl>; };`, `blackhole { <acl>; };` in `options {}` or per-view
 - All values accept BIND9 ACL names (see §3.7), CIDRs, or literals (`any`, `none`, `localhost`, `localnets`)
 - Can be overridden at the **view** level and further overridden at the **zone** level
-- `blackhole` is applied before any ACL processing — matching queries receive no response (useful for DoS mitigation)
+- `blackhole` is applied before any ACL processing — matching queries receive no response (useful for DoS mitigation). BIND9 only: Technitium and PowerDNS cannot drop a client by address, so the API refuses a non-empty `blackhole` on a group with either (422)
+- **Technitium:** the group `allow_query` and a primary / secondary / stub zone's own `allow_query` become that zone's query access (`queryAccess` + `queryAccessNetworkACL`); an empty or unset zone list inherits the group's, and a forward zone always uses the group's, as on BIND. An element Technitium cannot express (`localnets`, a key, an undefined ACL) is refused with a 422 rather than stored and left unenforced
 - `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`). The group-level value renders on BIND9 only (#2264) and only when it differs from the stored default `["localhost", "localnets"]`; an untouched group leaves BIND's own default (derived from `allow-recursion`). PowerDNS and Technitium have no cache-access ACL, so a non-default value is refused (422) for a group holding one of them.
 
 ### 3.7 DNS ACLs (Named Access Control Lists)

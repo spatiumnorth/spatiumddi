@@ -193,6 +193,9 @@ from app.services.dns.server_move import (
 )
 from app.services.dns.server_resync import force_zone_resync
 from app.services.dns.technitium_options import (
+    allow_query_problem as technitium_query_problem,
+)
+from app.services.dns.technitium_options import (
     allow_transfer_problem as technitium_transfer_problem,
 )
 from app.services.dns.technitium_options import (
@@ -3868,15 +3871,23 @@ async def _options_response(
         # Zone-level overrides saved before the gate (#1765).
         zones = (
             await db.execute(
-                select(DNSZone.name, DNSZone.allow_transfer).where(
-                    DNSZone.group_id == group_id, DNSZone.allow_transfer.is_not(None)
+                select(DNSZone.name, DNSZone.allow_transfer, DNSZone.allow_query).where(
+                    DNSZone.group_id == group_id,
+                    or_(DNSZone.allow_transfer.is_not(None), DNSZone.allow_query.is_not(None)),
                 )
             )
         ).all()
-        for name, allow_transfer in zones:
-            if problem := technitium_transfer_problem(allow_transfer, acls):
+        for name, allow_transfer, allow_query in zones:
+            if allow_transfer is not None and (
+                problem := technitium_transfer_problem(allow_transfer, acls)
+            ):
                 out.technitium_warnings.append(
                     f"zone {name}: {problem}; zone transfer is left as the daemon has it"
+                )
+            # #2263 — the zone's own allow_query, saved before the gate.
+            if allow_query is not None and (problem := technitium_query_problem(allow_query, acls)):
+                out.technitium_warnings.append(
+                    f"zone {name}: {problem}; query access is left as the daemon has it"
                 )
     return out
 
@@ -3997,6 +4008,26 @@ async def _validated_zone_named_conf_fields(
             "This group has a Technitium server, which cannot apply this zone's "
             f"{problem}. Move the Technitium server to its own group, or use addresses, "
             "'!' exclusions, 'key <name>' on its own, or a defined ACL.",
+        )
+    # The zone's own allow_query (#2263): the Technitium agent applies it as
+    # the zone's ``queryAccess``, through the same translation as the group's
+    # list (#1763), and leaves the zone as the daemon has it when an element
+    # has no equivalent — which, for a zone meant to be restricted, means
+    # left open. Refused here rather than stored and ignored.
+    if (
+        "allow_query" in cleaned
+        and "technitium" in await _group_driver_names(db, group_id)
+        and (
+            problem := technitium_query_problem(
+                cleaned["allow_query"], await _group_acl_definitions(db, group_id)
+            )
+        )
+    ):
+        raise HTTPException(
+            422,
+            "This group has a Technitium server, which cannot apply this zone's "
+            f"{problem}. Move the Technitium server to its own group, or use addresses, "
+            "'!' exclusions, 'localhost' or a defined ACL.",
         )
     if (
         "also_notify" in cleaned
@@ -4201,6 +4232,22 @@ async def update_options(
                 + ". Move the Technitium server to its own group, or leave these at "
                 "their defaults.",
             )
+    # #2263: ``blackhole`` is rendered by the BIND9 agent only. pdns auth has
+    # no client ACL of any kind (the agent already says so for allow_query),
+    # so a PowerDNS server would serve the clients the operator meant to drop.
+    # Same transition-only semantics as the Technitium gate: re-saving a stored
+    # value, or clearing it, stays allowed.
+    if (
+        changes.get("blackhole")
+        and changes["blackhole"] != list(getattr(opts, "blackhole", None) or [])
+        and "powerdns" in await _group_driver_names(db, group_id)
+    ):
+        raise HTTPException(
+            422,
+            "This group has a PowerDNS server, which cannot apply: blackhole: PowerDNS "
+            "authoritative has no setting to drop queries from a client address. Move "
+            "the PowerDNS server to its own group, or leave blackhole empty.",
+        )
     # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
     # setting either, so refuse a changed non-default value rather than store
     # one the daemon ignores (same rule as the Technitium gate above).
@@ -7369,6 +7416,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: group cannot serve; non-null means the commit refuses, not waivable
     #: by acknowledgement.
     forward_transport_refusal: str | None = None
+    #: #2263 — the zone's own allow_query / allow_transfer cannot be applied
+    #: by a Technitium server in the target; non-null means the commit
+    #: refuses, not waivable by acknowledgement.
+    technitium_acl_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -7408,6 +7459,7 @@ class ZoneMovePreviewResponse(BaseModel):
             technitium_api_refusal=plan.technitium_api_refusal,
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             forward_transport_refusal=plan.forward_transport_refusal,
+            technitium_acl_refusal=plan.technitium_acl_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
