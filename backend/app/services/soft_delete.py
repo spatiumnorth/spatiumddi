@@ -840,6 +840,31 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return "An active DHCP scope already exists for this group + subnet"
+        # #844's group-wide prefix guard, the one create and the inactive →
+        # active flip run (#2733). A trashed scope frees its prefix in the
+        # group, so a scope on the same CIDR of another IP space may have been
+        # created meanwhile; restoring this one active would put two scopes on
+        # one prefix in the group, and the bundle builder would silently drop
+        # the newer, live one. An inactive scope renders nothing and is free to
+        # come back, as it could be created.
+        if obj.is_active:
+            subnet_stmt: Any = (
+                select(Subnet)
+                .where(Subnet.id == obj.subnet_id)
+                .execution_options(include_deleted=True)
+            )
+            subnet = (await db.execute(subnet_stmt)).scalar_one_or_none()
+            if subnet is not None:
+                from app.api.v1.dhcp.scopes import (  # noqa: PLC0415
+                    _assert_no_overlapping_group_cidr,
+                )
+
+                try:
+                    await _assert_no_overlapping_group_cidr(
+                        db, obj.group_id, subnet, exclude_scope_id=obj.id
+                    )
+                except HTTPException as exc:
+                    return str(exc.detail)
 
     elif isinstance(obj, DHCPStaticAssignment):
         # A reservation's MAC is unique across the whole group, not just the
