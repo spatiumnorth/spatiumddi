@@ -121,7 +121,20 @@ DOCKER_STUB = """#!/bin/sh
 echo "docker $*" >> "$STUB_LOG"
 case "$1" in
   image) exit 0 ;;
+  rmi)
+    # STUB_RMI_FAILS=1: rmi's own output must reach the log, not /dev/null.
+    if [ -n "${STUB_RMI_FAILS:-}" ]; then echo "Error: stub rmi refused" >&2; exit 1; fi
+    exit 0 ;;
   pull|tag) exit 0 ;;
+  run)
+    # The skopeo fallback: ``docker run ... -v DIR:/out IMG copy ...`` writes
+    # DIR/image.tar (from archive.tar.skopeo when the test supplies one).
+    # STUB_SKOPEO_FAILS=1 makes the copy fail too.
+    [ -n "${STUB_SKOPEO_FAILS:-}" ] && { echo "skopeo: stub copy failed" >&2; exit 1; }
+    prev=""; dir=""
+    for a in "$@"; do [ "$prev" = "-v" ] && dir="${a%%:*}"; prev="$a"; done
+    src="$STUB_ARCHIVE"; [ -f "$STUB_ARCHIVE.skopeo" ] && src="$STUB_ARCHIVE.skopeo"
+    cat "$src" > "$dir/image.tar" ;;
   save)
     # STUB_SAVE_FAILS=N: the first N saves fail like a containerd store that
     # lost the platform's layer blobs ("no suitable export target found").
@@ -167,9 +180,11 @@ def rig(tmp_path):
     log = tmp_path / "docker.log"
     log.write_text("")
 
-    def run(archive: bytes, **env):
+    def run(archive: bytes, skopeo_archive: bytes | None = None, **env):
         arch = tmp_path / "archive.tar"
         arch.write_bytes(archive)
+        if skopeo_archive is not None:
+            (tmp_path / "archive.tar.skopeo").write_bytes(skopeo_archive)
         e = {
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(tmp_path),
@@ -264,19 +279,79 @@ def test_failed_platform_save_recovers_with_rmi_pull_retry(rig):
     assert "images baked" in r.stdout
 
 
-def test_save_failing_after_the_retry_too_refuses_naming_the_image(rig):
+def test_save_failing_after_the_retry_recovers_from_the_registry(rig):
+    # The QA builder's shape: rmi + pull cannot repair the local store, so
+    # both saves fail; the registry copy must still produce a good archive.
     r, log, root = rig(
         oci_archive(with_layers=True),
         BAKE_SAVE_PLATFORM="linux/amd64",
-        STUB_SAVE_FAILS="2",
+        STUB_SAVE_FAILS="99",
+    )
+    assert r.returncode == 0, r.stderr
+    assert "recovered" in r.stdout and "skopeo" in r.stdout
+    runs = [ln for ln in log.splitlines() if ln.startswith("docker run")]
+    assert runs
+    assert all("--override-os linux --override-arch amd64" in ln for ln in runs)
+    assert all("quay.io/skopeo/stable:v" in ln for ln in runs)
+    assert all("docker://" in ln and "docker-archive:/out/image.tar:" in ln for ln in runs)
+    assert "images baked" in r.stdout
+    d = root / "mkosi.extra/var/lib/rancher/k3s/agent/images"
+    assert not list(d.glob("*.tar.zst.new"))
+
+
+def test_registry_copy_archive_is_still_verified(rig):
+    # Negative control: a skopeo archive without its layers must be refused,
+    # not baked on the strength of the recovery having "succeeded".
+    r, log, root = rig(
+        oci_archive(with_layers=True),
+        skopeo_archive=oci_archive(with_layers=False),
+        BAKE_SAVE_PLATFORM="linux/amd64",
+        STUB_SAVE_FAILS="99",
+    )
+    assert r.returncode != 0
+    assert "without its layers" in r.stderr
+    assert "images baked" not in r.stdout
+
+
+def test_save_and_registry_copy_both_failing_refuses_naming_the_image(rig):
+    r, log, root = rig(
+        oci_archive(with_layers=True),
+        BAKE_SAVE_PLATFORM="linux/amd64",
+        STUB_SAVE_FAILS="99",
+        STUB_SKOPEO_FAILS="1",
     )
     assert r.returncode != 0
     assert "ghcr.io/spatiumnorth/" in r.stderr
-    assert "after re-pulling" in r.stderr
+    assert "after re-pulling it and copying it from the registry" in r.stderr
     assert "images baked" not in r.stdout
     assert len([ln for ln in log.splitlines() if ln.startswith("docker save")]) == 2
     d = root / "mkosi.extra/var/lib/rancher/k3s/agent/images"
     assert not list(d.glob("*.tar.zst.new"))
+
+
+def test_recovery_logs_rmi_and_pull_results_instead_of_discarding_them(rig):
+    r, log, _ = rig(
+        oci_archive(with_layers=True),
+        BAKE_SAVE_PLATFORM="linux/amd64",
+        STUB_SAVE_FAILS="1",
+        STUB_RMI_FAILS="1",
+    )
+    assert r.returncode == 0, r.stderr
+    assert "rmi ghcr.io/spatiumnorth/" in r.stderr and "stub rmi refused" in r.stderr
+    assert "pull ghcr.io/spatiumnorth/" in r.stderr and ": ok" in r.stderr
+
+
+def test_a_locally_built_image_has_no_registry_fallback(rig):
+    # Negative control for the skopeo step: with no pull ref (BAKE_SOURCE
+    # local) a failed save refuses outright and never runs skopeo.
+    r, log, _ = rig(
+        oci_archive(with_layers=True),
+        BAKE_SAVE_PLATFORM="linux/amd64",
+        BAKE_SOURCE="local",
+        STUB_SAVE_FAILS="99",
+    )
+    assert r.returncode != 0
+    assert not any(ln.startswith("docker run") for ln in log.splitlines())
 
 
 def test_bake_logs_docker_version_and_store(rig):

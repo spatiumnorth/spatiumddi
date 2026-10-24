@@ -508,6 +508,9 @@ if [ -z "${BAKE_SAVE_PLATFORM:-}" ]; then
     BAKE_SAVE_PLATFORM="linux/${_bake_arch}"
 fi
 SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
+# Build-time tool only (run in a container, never shipped): the registry ->
+# archive fallback in save_with_recovery. See versions.json "skopeo".
+SKOPEO_IMAGE="quay.io/skopeo/stable:v1.20.0"
 echo "→ Saving images for platform $BAKE_SAVE_PLATFORM"
 # Log the engine version and image-store type: a containerd-store builder
 # behaves differently from the classic one, and it is the first thing asked
@@ -538,15 +541,45 @@ save_archive() {
     docker save "${SAVE_PLATFORM_FLAG[@]}" "$ref" | zstd -T0 -19 -o "$tmp"
 }
 
-# Save with one recovery attempt. A containerd-store builder can hold a
-# local copy that lost most layer blobs for the target platform: ``docker
-# pull --platform`` returns 0 without refetching them, and the save fails
-# with "no suitable export target found". Remove ONLY that reference, pull
-# it again for the platform, retag, and retry once. ``pull_ref`` is empty
-# for a locally built image (nothing to re-pull) — then there is no retry.
+# Registry -> archive with skopeo, run in a container so a build host needs
+# nothing installed. It never touches Docker's image store, which is the
+# point: on a containerd-store builder the store can hold a platform
+# manifest whose layer blobs are gone, and neither ``docker pull`` (it skips
+# layers whose unpacked snapshot already exists) nor rmi+pull brings the
+# blobs back, so ``docker save`` keeps failing. Copying straight from the
+# registry yields a complete docker-archive regardless of what is local.
+#   $1 pull ref   $2 archive tag   $3 tmp file (zstd output)
+save_from_registry() {
+    local pull_ref="$1" archive_tag="$2" tmp="$3" os arch dir rc
+    os="${BAKE_SAVE_PLATFORM%%/*}"
+    arch="${BAKE_SAVE_PLATFORM#*/}"
+    dir="$(mktemp -d)" || return 1
+    rm -f "$tmp"
+    if docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$dir:/out" \
+            "$SKOPEO_IMAGE" copy --override-os "$os" --override-arch "$arch" \
+            "docker://$pull_ref" "docker-archive:/out/image.tar:$archive_tag" >&2 \
+        && zstd -T0 -19 -o "$tmp" < "$dir/image.tar"; then
+        rc=0
+    else
+        rc=1
+    fi
+    rm -rf "$dir"
+    return "$rc"
+}
+
+# Save with recovery. A containerd-store builder can hold a local copy that
+# lost most layer blobs for the target platform; ``docker save --platform``
+# then fails with "no suitable export target found". Two escalating steps,
+# each result logged:
+#   1. remove ONLY that reference, pull it again for the platform, retag,
+#      retry the save (fixes a store whose pull does refetch the blobs);
+#   2. copy registry -> archive with skopeo (see save_from_registry), which
+#      does not depend on the local store at all.
+# Still failing -> refuse. ``pull_ref`` is empty for a locally built image
+# (nothing to re-pull) — then there is no recovery.
 #   $1 save ref   $2 tmp file   $3 pull ref (or empty)   $4 retag target (or empty)
 save_with_recovery() {
-    local ref="$1" tmp="$2" pull_ref="$3" retag="$4"
+    local ref="$1" tmp="$2" pull_ref="$3" retag="$4" out
     if save_archive "$ref" "$tmp"; then
         return 0
     fi
@@ -556,15 +589,29 @@ save_with_recovery() {
         exit 5
     fi
     echo "  ! save of $ref for $BAKE_SAVE_PLATFORM failed; removing the local $pull_ref, re-pulling and retrying once" >&2
-    docker rmi "$pull_ref" >/dev/null 2>&1 || true
-    if docker pull --platform "$BAKE_SAVE_PLATFORM" "$pull_ref" >/dev/null \
-        && { [ -z "$retag" ] || docker tag "$pull_ref" "$retag"; } \
-        && save_archive "$ref" "$tmp"; then
-        echo "  ✓ recovered $ref after re-pull"
+    if out="$(docker rmi "$pull_ref" 2>&1)"; then
+        echo "    rmi $pull_ref: ok" >&2
+    else
+        echo "    rmi $pull_ref failed (continuing): $out" >&2
+    fi
+    if out="$(docker pull --platform "$BAKE_SAVE_PLATFORM" "$pull_ref" 2>&1)"; then
+        echo "    pull $pull_ref: ok" >&2
+        if { [ -z "$retag" ] || docker tag "$pull_ref" "$retag"; } \
+            && save_archive "$ref" "$tmp"; then
+            echo "  ✓ recovered $ref after re-pull"
+            return 0
+        fi
+        echo "    save after re-pull still fails for $ref" >&2
+    else
+        echo "    pull $pull_ref failed: $out" >&2
+    fi
+    echo "  ! copying $pull_ref for $BAKE_SAVE_PLATFORM straight from the registry with skopeo ($SKOPEO_IMAGE)" >&2
+    if save_from_registry "$pull_ref" "$ref" "$tmp"; then
+        echo "  ✓ recovered $ref from the registry (skopeo)"
         return 0
     fi
     rm -f "$tmp"
-    echo "ERROR: docker save --platform $BAKE_SAVE_PLATFORM still fails for $ref after re-pulling it; refusing to bake it." >&2
+    echo "ERROR: docker save --platform $BAKE_SAVE_PLATFORM still fails for $ref after re-pulling it and copying it from the registry; refusing to bake it." >&2
     exit 5
 }
 
