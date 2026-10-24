@@ -92,6 +92,15 @@ class Operation:
     # (e.g. archiving your own chat session) that gate on ownership
     # inside their own apply rather than on a coarse RBAC permission.
     required_permission: tuple[str, str] | None = None
+    # The gate for operations whose REST equivalent is superadmin-only
+    # (webhooks, DNSSEC sign/unsign, zone update ACL, SNMP/NTP/syslog
+    # settings, the importers, alert rules, temporary access, service
+    # restart). There is no RBAC permission to name for those, so instead of
+    # ``required_permission`` they set this, and ``enforce_operation_permission``
+    # refuses a non-superadmin at apply time. Their ``_apply_*`` still checks
+    # inline too. ``tests/test_operation_permission_declared.py`` fails for any
+    # operation that sets neither.
+    requires_superadmin: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,8 +158,8 @@ class OperationPermissionError(PermissionError):
     alert rows the equivalent REST route would 403.
     """
 
-    def __init__(self, action: str, resource_type: str) -> None:
-        super().__init__(f"Permission denied: need '{action}' on '{resource_type}'")
+    def __init__(self, action: str, resource_type: str, message: str | None = None) -> None:
+        super().__init__(message or f"Permission denied: need '{action}' on '{resource_type}'")
         self.action = action
         self.resource_type = resource_type
 
@@ -160,11 +169,22 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
 
     Called both by ``apply_proposal`` (the authoritative gate) and by
     each ``_apply_*`` (defense in depth, so the gate holds even if the
-    op is ever dispatched outside the apply endpoint). No-op when the
-    operation declares ``required_permission=None`` (self-scoped ops).
+    op is ever dispatched outside the apply endpoint). Refuses a
+    non-superadmin for ``requires_superadmin`` operations. No-op when the
+    operation declares neither gate (self-scoped ops such as
+    ``archive_session``, which check ownership inside their own apply).
     """
-    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        is_effective_superadmin,
+        user_has_permission,
+    )
 
+    if op.requires_superadmin and not is_effective_superadmin(user):
+        raise OperationPermissionError(
+            "superadmin",
+            op.name,
+            f"Permission denied: operation '{op.name}' is restricted to superadmin users",
+        )
     if op.required_permission is None:
         return
     action, resource_type = op.required_permission
@@ -3025,6 +3045,7 @@ register(
         preview=_preview_create_alert_rule,
         apply=_apply_create_alert_rule,
         category="ops",
+        requires_superadmin=True,
     )
 )
 
@@ -4478,6 +4499,7 @@ register(
         preview=_preview_grant_temporary_access,
         apply=_apply_grant_temporary_access,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -5465,5 +5487,6 @@ register(
         preview=_preview_restart_service,
         apply=_apply_restart_service,
         category="admin",
+        requires_superadmin=True,
     )
 )
