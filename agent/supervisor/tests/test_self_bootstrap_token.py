@@ -73,7 +73,8 @@ def test_write_failure_returns_none(
 ) -> None:
     missing = tmp_path / "no-such-dir" / "self-bootstrap.token"
     monkeypatch.setattr(self_bootstrap_token, "TOKEN_PATH", missing)
-    assert self_bootstrap_token.write() is None
+    written = self_bootstrap_token.write()
+    assert written is None
 
 
 def test_self_bootstrap_presents_the_token_on_disk_then_removes_it(
