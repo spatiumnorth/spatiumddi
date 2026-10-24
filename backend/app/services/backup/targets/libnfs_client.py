@@ -60,6 +60,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from app.services.backup.targets.base import ArchiveTooLargeError
+
 __all__ = [
     "NfsError",
     "NfsUnavailableError",
@@ -449,7 +451,10 @@ class NfsConnection:
             self._lib.nfs_closedir(self._ctx, handle)
         return out
 
-    def read(self, path: str) -> bytes:
+    def read(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Read ``path`` whole. With ``max_bytes`` set, stop with
+        :class:`ArchiveTooLargeError` once more than that has arrived,
+        so an oversized file is never held in memory whole."""
         handle = ctypes.c_void_p()
         rc = self._lib.nfs_open(self._ctx, path.encode(), _O_RDONLY, ctypes.byref(handle))
         if rc < 0:
@@ -470,6 +475,8 @@ class NfsConnection:
                     break
                 out += memoryview(buf)[:got]
                 offset += got
+                if max_bytes is not None and offset > max_bytes:
+                    raise ArchiveTooLargeError(path.rsplit("/", 1)[-1], max_bytes)
         finally:
             self._lib.nfs_close(self._ctx, handle)
         return bytes(out)

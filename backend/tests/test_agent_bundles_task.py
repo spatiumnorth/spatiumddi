@@ -140,7 +140,7 @@ async def test_the_sweep_enqueues_stale_agent_based_servers_only(
 
     captured: list[str] = []
     monkeypatch.setattr(
-        agent_bundles, "enqueue_render", lambda sid: (captured.append(sid), True)[1]
+        agent_bundles, "enqueue_render", lambda sid, **_kw: (captured.append(sid), True)[1]
     )
     result = await agent_bundles._sweep()
     assert result == {"stale": 1, "enqueued": 1}
@@ -173,12 +173,12 @@ async def test_with_redis_a_concurrent_request_coalesces_and_the_holder_renders_
         real_render = agent_bundles._render_once
         calls: list[int] = []
 
-        async def _render_then_dirty(server_id):  # noqa: ANN001
+        async def _render_then_dirty(server_id, *rest):  # noqa: ANN001
             calls.append(1)
             if len(calls) == 1:
                 # simulate a change committed while rendering
                 await client.set(dirty_key, "1", ex=60)
-            return await real_render(server_id)
+            return await real_render(server_id, *rest)
 
         monkeypatch.setattr(agent_bundles, "_render_once", _render_then_dirty)
         result = await agent_bundles._run(str(server.id))
@@ -203,7 +203,7 @@ async def test_the_sweep_re_renders_a_bundle_from_an_older_renderer_revision(
 
     captured: list[str] = []
     monkeypatch.setattr(
-        agent_bundles, "enqueue_render", lambda sid: (captured.append(sid), True)[1]
+        agent_bundles, "enqueue_render", lambda sid, **_kw: (captured.append(sid), True)[1]
     )
     assert (await agent_bundles._sweep())["stale"] == 0
 

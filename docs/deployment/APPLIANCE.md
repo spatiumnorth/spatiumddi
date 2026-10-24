@@ -88,12 +88,15 @@ not the operator's:
   bundle for a group of this size, and the default worker limit (1Gi with
   four prefork processes) is OOM-killed under lease/DDNS churn long before
   the VM runs short. The supervisor therefore sizes both from the node's
-  RAM — api = ½ RAM (1–8 GiB), worker = ¼ RAM (1–4 GiB), two worker
-  processes on nodes of 12 GiB or less — and writes them into the
-  `spatium-control` HelmChartConfig, where they survive k3s restarts and
-  helm re-applies. (`kubectl set resources` on the Deployment does not:
-  k3s re-applies the on-disk HelmChart manifest on every restart.) These
-  limits are keys the supervisor **owns**, so a different value written
+  RAM — api = ½ RAM (1–8 GiB), worker = ⅖ RAM (1–16 GiB, but never more
+  than the api and Postgres leave), two worker processes on nodes of 12 GiB
+  or less — and writes them into the `spatium-control` HelmChartConfig,
+  where they survive k3s restarts and helm re-applies. (`kubectl set
+  resources` on the Deployment does not: k3s re-applies the on-disk
+  HelmChart manifest on every restart.) The api and Postgres CPU limits are
+  sized the same way from the node's CPU count (#2240): the api a quarter
+  of the cores (1–4), Postgres half (1–8), where both were a fixed 1 core.
+  These limits are keys the supervisor **owns**, so a different value written
   into that HelmChartConfig by hand is put back on the next heartbeat; there
   is no supported per-install override for them today (see "Who owns which
   HelmChartConfig key" below).
@@ -559,8 +562,9 @@ state on its heartbeat:
   first heartbeat rewrote them, a second `spatium-control` revision, a second
   migrate Job (which replaces a running one) and a second api / worker
   rollout. firstboot now brings the sizing keys an existing Config already
-  carries (api / worker memory and concurrency, the Postgres requests /
-  limits and `shared_buffers`) to the values this boot's HelmChart renders.
+  carries (api / worker memory and concurrency, the api and Postgres CPU
+  limits, the Postgres requests / limits and `shared_buffers`) to the values
+  this boot's HelmChart renders.
   It computes them while that HelmChart is still held back as `.deferred`
   and writes them as soon as k3s has applied it, so helm-controller's job
   for the new chart is replaced, before it runs, by one carrying the new
@@ -602,7 +606,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 

@@ -55,9 +55,10 @@ import hmac
 import os
 import shutil
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -74,9 +75,11 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import Response
 
 from app.api.deps import DB, SuperAdmin
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
@@ -94,7 +97,62 @@ from app.services.appliance.upgrade_image_catalog import FleetArchitectures
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter()
+
+def _request_content_length(request: Request) -> int | None:
+    """The declared body size of an upload, or None when it is absent or
+    unparseable (a chunked transfer, which this guard then lets pass)."""
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def _require_spool_headroom(content_length: int | None) -> None:
+    """422 when buffering an upload of ``content_length`` bytes would push
+    THIS api pod's node under the kubelet's eviction margin (#2572).
+
+    #2452's :func:`_require_store_headroom` checks where the bytes are
+    finally written (the mirror's PVC when the mirror is on). But an
+    air-gapped multipart upload is spooled whole onto the receiving pod's
+    node ``/var`` first, which is a different node, so the store check
+    never sees it. This must run before the body is read."""
+    if content_length is None:
+        return
+    usage = upgrade_image_space.local_volume_usage()
+    if usage is None:
+        return
+    message = upgrade_image_space.spool_shortfall_message(usage, content_length)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
+class _SpoolHeadroomRoute(APIRoute):
+    """Refuse an upgrade-image upload that cannot be buffered on the
+    receiving node before FastAPI spools its multipart body (#2572).
+
+    FastAPI reads the request body (``await request.form()``) before it
+    resolves dependencies or runs the handler, so the node's ``/var`` has
+    already taken the whole upload by the time any in-handler or
+    dependency check could run. Wrapping the route handler is the only
+    hook that runs first. Only the upload route is wrapped; every other
+    route on the router is returned untouched."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        original = super().get_route_handler()
+        if getattr(self.endpoint, "__name__", "") != "upload_upgrade_image":
+            return original
+
+        async def guarded(request: Request) -> Response:
+            await _require_spool_headroom(_request_content_length(request))
+            return await original(request)
+
+        return guarded
+
+
+router = APIRouter(route_class=_SpoolHeadroomRoute)
 
 
 # On-disk storage. The api container's docker-compose entry binds

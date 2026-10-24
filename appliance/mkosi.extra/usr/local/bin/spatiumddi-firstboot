@@ -936,16 +936,32 @@ _render_control_helmchart() {
     _mem_total_mib() {
         awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || true
     }
+    # #2240 — the CPU count the api / Postgres CPU limits are sized from; the
+    # supervisor's node_cpu_count reads the same affinity count.
+    _cpu_count() {
+        nproc 2>/dev/null || true
+    }
     _clamp_mib() {  # total, numerator, denominator, lo, hi
         local v=$(( $1 * $2 / $3 ))
         [ "$v" -lt "$4" ] && v="$4"
         [ "$v" -gt "$5" ] && v="$5"
         printf '%s' "$v"
     }
-    local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_CONCURRENCY
+    _clamp_cores() {  # count, divisor, lo, hi
+        local v=$(( $1 / $2 ))
+        [ "$v" -lt "$3" ] && v="$3"
+        [ "$v" -gt "$4" ] && v="$4"
+        printf '%s' "$v"
+    }
+    _join_lines() {  # $1 then $2 on the next line; $2 alone when $1 is empty
+        if [ -n "$1" ]; then printf '%s\n%s' "$1" "$2"; else printf '%s' "$2"; fi
+    }
+    local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_LEFT_MIB WORKER_CONCURRENCY
     local POSTGRES_MEM_MIB POSTGRES_SHARED_BUFFERS_MB POSTGRES_MEM_REQUEST_MIB
+    local CPU_COUNT API_CPU_CORES POSTGRES_CPU_CORES API_LIMITS_YAML POSTGRES_LIMITS_YAML
     local API_SIZING_YAML WORKER_SIZING_YAML POSTGRES_SIZING_YAML POSTGRES_PARAMETERS_YAML
     MEM_TOTAL_MIB=$(_mem_total_mib)
+    CPU_COUNT=$(_cpu_count)
     API_MEM_MIB=""
     WORKER_MEM_MIB=""
     WORKER_CONCURRENCY=""
@@ -955,17 +971,21 @@ _render_control_helmchart() {
     if [ -n "$MEM_TOTAL_MIB" ] && [ "$MEM_TOTAL_MIB" -gt 0 ] 2>/dev/null; then
         # #1115 — a whole-node budget: _PLATFORM_RESERVE_MIB = 2048 for k3s,
         # the supervisor, the bind9/kea DaemonSets and the CNPG operator, then
-        # the remainder split api 1/2, worker 1/4, Postgres 1/4 as integer
-        # ratios; clamps 1024..8192, 1024..4096 and 1024..4096. Postgres'
-        # floor is the chart's own 1Gi. The Postgres limit is rendered HERE,
-        # not left to the supervisor, because a resources change on a formed
-        # CloudNativePG cluster is a rolling restart: the Cluster must be
-        # created with its final size.
+        # the remainder split api 1/2, Postgres 1/4 as integer ratios, clamps
+        # 1024..8192 and 1024..4096. Postgres' floor is the chart's own 1Gi.
+        # #2240 — the worker 2/5 (1024..16384), but never more than the api
+        # and Postgres leave of the budget, and never below its floor.
+        # The Postgres limit is rendered HERE, not left to the supervisor,
+        # because a resources change on a formed CloudNativePG cluster is a
+        # rolling restart: the Cluster must be created with its final size.
         BUDGET_MIB=$(( MEM_TOTAL_MIB - 2048 ))
         if [ "$BUDGET_MIB" -lt 0 ]; then BUDGET_MIB=0; fi
         API_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 1 2 1024 8192)
-        WORKER_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 1 4 1024 4096)
         POSTGRES_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 1 4 1024 4096)
+        WORKER_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 2 5 1024 16384)
+        WORKER_LEFT_MIB=$(( BUDGET_MIB - API_MEM_MIB - POSTGRES_MEM_MIB ))
+        if [ "$WORKER_MEM_MIB" -gt "$WORKER_LEFT_MIB" ]; then WORKER_MEM_MIB=$WORKER_LEFT_MIB; fi
+        if [ "$WORKER_MEM_MIB" -lt 1024 ]; then WORKER_MEM_MIB=1024; fi
         # _POSTGRES_SHARED_BUFFERS_SHARE = 1/4 of the Postgres cap (Postgres'
         # guidance; the chart's 256MB-of-1Gi is the same ratio).
         POSTGRES_SHARED_BUFFERS_MB=$(( POSTGRES_MEM_MIB / 4 ))
@@ -991,6 +1011,22 @@ _render_control_helmchart() {
     else
         echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
     fi
+    # #2240 — CPU limits from the CPU count: Postgres half the node (1..8
+    # cores), the api a quarter (1..4), in the chart's millicore form so a
+    # node that lands on the chart's own 1000m renders exactly it. Sized
+    # apart from the memory: an unknown count leaves the chart's CPU limits,
+    # an unknown MemTotal does not take these with it. Rendered here for the
+    # same reason as the Postgres memory: a change on a formed cluster is a
+    # CloudNativePG rolling restart.
+    API_CPU_CORES=""
+    POSTGRES_CPU_CORES=""
+    if [ -n "$CPU_COUNT" ] && [ "$CPU_COUNT" -gt 0 ] 2>/dev/null; then
+        POSTGRES_CPU_CORES=$(_clamp_cores "$CPU_COUNT" 2 1 8)
+        API_CPU_CORES=$(_clamp_cores "$CPU_COUNT" 4 1 4)
+        echo "Sizing control-plane CPU for ${CPU_COUNT} CPUs: api=${API_CPU_CORES}000m postgres=${POSTGRES_CPU_CORES}000m" >&2
+    else
+        echo "CPU count unreadable — leaving the chart's default control-plane CPU limits in place" >&2
+    fi
     # Rendered into the values block below. Empty string = emit nothing, so an
     # unreadable MemTotal leaves the chart's defaults untouched rather than
     # emitting a malformed `memory: Mi`.
@@ -998,15 +1034,32 @@ _render_control_helmchart() {
     WORKER_SIZING_YAML=""
     POSTGRES_SIZING_YAML=""
     POSTGRES_PARAMETERS_YAML=""
+    # The limits lines first (memory and / or cpu, each only when sized), then
+    # the blocks around them, so either input alone still renders valid YAML.
+    API_LIMITS_YAML=""
+    POSTGRES_LIMITS_YAML=""
     if [ -n "$API_MEM_MIB" ]; then
-        API_SIZING_YAML=$(printf '      resources:\n        limits:\n          memory: "%sMi"' \
-            "$API_MEM_MIB")
+        API_LIMITS_YAML=$(printf '          memory: "%sMi"' "$API_MEM_MIB")
+        POSTGRES_LIMITS_YAML=$(printf '          memory: "%sMi"' "$POSTGRES_MEM_MIB")
+    fi
+    if [ -n "$API_CPU_CORES" ]; then
+        API_LIMITS_YAML=$(_join_lines "$API_LIMITS_YAML" \
+            "$(printf '          cpu: "%s000m"' "$API_CPU_CORES")")
+        POSTGRES_LIMITS_YAML=$(_join_lines "$POSTGRES_LIMITS_YAML" \
+            "$(printf '          cpu: "%s000m"' "$POSTGRES_CPU_CORES")")
+    fi
+    if [ -n "$API_LIMITS_YAML" ]; then
+        API_SIZING_YAML=$(printf '      resources:\n        limits:\n%s' "$API_LIMITS_YAML")
+    fi
+    if [ -n "$API_MEM_MIB" ]; then
         WORKER_SIZING_YAML=$(printf '      concurrency: %s\n      resources:\n        limits:\n          memory: "%sMi"' \
             "$WORKER_CONCURRENCY" "$WORKER_MEM_MIB")
-        POSTGRES_SIZING_YAML=$(printf '      resources:\n        requests:\n          memory: "%sMi"\n        limits:\n          memory: "%sMi"' \
-            "$POSTGRES_MEM_REQUEST_MIB" "$POSTGRES_MEM_MIB")
+        POSTGRES_SIZING_YAML=$(printf '      resources:\n        requests:\n          memory: "%sMi"\n        limits:\n%s' \
+            "$POSTGRES_MEM_REQUEST_MIB" "$POSTGRES_LIMITS_YAML")
         POSTGRES_PARAMETERS_YAML=$(printf '        parameters:\n          shared_buffers: "%sMB"' \
             "$POSTGRES_SHARED_BUFFERS_MB")
+    elif [ -n "$POSTGRES_LIMITS_YAML" ]; then
+        POSTGRES_SIZING_YAML=$(printf '      resources:\n        limits:\n%s' "$POSTGRES_LIMITS_YAML")
     fi
     # #983 — first of two gates on naming ``spatium-control-plane`` here.
     # This one is cheap and early: no appliance chart tarball means the chart
@@ -1648,10 +1701,12 @@ import yaml
 
 PATHS = (
     ("api", "resources", "limits", "memory"),
+    ("api", "resources", "limits", "cpu"),
     ("worker", "concurrency"),
     ("worker", "resources", "limits", "memory"),
     ("postgresql", "resources", "requests", "memory"),
     ("postgresql", "resources", "limits", "memory"),
+    ("postgresql", "resources", "limits", "cpu"),
     ("postgresql", "cnpg", "parameters", "shared_buffers"),
 )
 MISSING = object()

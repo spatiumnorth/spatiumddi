@@ -849,7 +849,24 @@ export function CircuitsPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={13}
                   >
-                    <ListEmpty error={query.error} what="circuits">
+                    <ListEmpty
+                      error={query.error}
+                      what="circuits"
+                      filtered={
+                        search !== "" ||
+                        statusFilter !== "" ||
+                        transportFilter !== "" ||
+                        providerFilter !== "" ||
+                        tagFilters.length > 0
+                      }
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                        setTransportFilter("");
+                        setProviderFilter("");
+                        setTagFilters([]);
+                      }}
+                    >
                       No circuits yet — click "New circuit" to add one.
                     </ListEmpty>
                   </td>

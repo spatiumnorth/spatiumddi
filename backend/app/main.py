@@ -3,10 +3,12 @@ import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import structlog
 import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -319,14 +321,17 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface: "
-        "TLS cert upload, release manager, "
-        "container start/stop/restart + live logs, host network + "
-        "firewall config, maintenance mode, diagnostic bundle download. "
-        "Intended for ops staff who manage the appliance lifecycle "
-        "without needing full superadmin over the DDI data plane. "
-        "Granted ``admin`` on resource_type=appliance; superadmin "
-        "always bypasses anyway.",
+        "Runs the SpatiumDDI OS appliance on this node: TLS cert upload "
+        "and ACME, the read-only releases catalogue, node-local slot "
+        "apply and rollback, container start/stop/restart + live logs, "
+        "host network + firewall config, maintenance mode, diagnostic "
+        "bundle download. Fleet management is NOT included and still "
+        "needs a superadmin: the upgrade-image store, every Fleet member "
+        "action (approve, role assignment, OS upgrade, reboot), "
+        "MetalLB, the kube-api CIDRs and pairing codes. Intended for ops "
+        "staff who manage a node's lifecycle without superadmin over the "
+        "DDI data plane. Granted ``admin`` on resource_type=appliance; "
+        "superadmin always bypasses anyway.",
         [
             {"action": "admin", "resource_type": "appliance"},
         ],
@@ -1344,6 +1349,32 @@ def create_app() -> FastAPI:
     # permission / validation errors raise typed HTTPException
     # subclasses that FastAPI's own machinery turns into 4xx
     # responses without ever hitting this path.
+    # FastAPI's stock 422 handler runs ``jsonable_encoder(exc.errors())``, and
+    # for a body that is not valid JSON the error's ``input`` is the raw
+    # ``bytes``, which the encoder decodes strictly as UTF-8 - so a body that
+    # is not UTF-8 (sent with a non-JSON or empty Content-Type) raised
+    # UnicodeDecodeError inside the handler: a 500 and a Diagnostics row for
+    # what is a client error (#2677). Same response as the stock handler;
+    # only ``bytes`` are decoded leniently (identical for valid UTF-8).
+    def _safe_errors(value: Any) -> Any:
+        if isinstance(value, bytes | bytearray):
+            return bytes(value).decode("utf-8", errors="backslashreplace")
+        if isinstance(value, dict):
+            return {k: _safe_errors(v) for k, v in value.items()}
+        if isinstance(value, list | tuple):
+            return [_safe_errors(v) for v in value]
+        return value
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_422(request: Request, exc: RequestValidationError) -> Response:
+        from fastapi.encoders import jsonable_encoder  # noqa: PLC0415
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(_safe_errors(exc.errors()))},
+        )
+
     @app.exception_handler(Exception)
     async def _capture_unhandled(request: Request, exc: Exception) -> Response:
         # Lazy imports — keep app boot-time import graph small + avoid

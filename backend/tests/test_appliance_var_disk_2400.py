@@ -133,6 +133,11 @@ def test_eviction_headroom_is_hard_plus_minimum_reclaim() -> None:
 
     assert var_disk.EVICTION_HEADROOM_PCT == 15
     assert upgrade_image_space.EVICTION_HEADROOM_PCT == var_disk.EVICTION_HEADROOM_PCT
+    # #2572's spool rule reads the same 5 % trigger, defined once.
+    assert upgrade_image_space.EVICTION_HARD_PCT is var_disk.EVICTION_HARD_PCT == 5
+    assert var_disk.EVICTION_HEADROOM_PCT == (
+        var_disk.EVICTION_HARD_PCT + var_disk.EVICTION_MINIMUM_RECLAIM_PCT
+    )
 
 
 @pytest.mark.parametrize(
