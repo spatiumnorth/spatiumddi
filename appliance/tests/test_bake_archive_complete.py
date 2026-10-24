@@ -122,7 +122,18 @@ echo "docker $*" >> "$STUB_LOG"
 case "$1" in
   image) exit 0 ;;
   pull|tag) exit 0 ;;
-  save) cat "$STUB_ARCHIVE" ;;
+  save)
+    # STUB_SAVE_FAILS=N: the first N saves fail like a containerd store that
+    # lost the platform's layer blobs ("no suitable export target found").
+    if [ -n "${STUB_SAVE_FAILS:-}" ]; then
+      n=$(cat "$STUB_LOG.saves" 2>/dev/null || echo 0)
+      if [ "$n" -lt "$STUB_SAVE_FAILS" ]; then
+        echo $((n + 1)) > "$STUB_LOG.saves"
+        echo "no suitable export target found: does not provide the specified platform" >&2
+        exit 1
+      fi
+    fi
+    cat "$STUB_ARCHIVE" ;;
 esac
 """
 
@@ -229,3 +240,46 @@ def test_unset_everything_defaults_to_the_host_arch(rig):
     r, log, _ = rig(oci_archive(with_layers=True, arch=host))
     assert r.returncode == 0, r.stderr
     assert f"--platform linux/{host}" in log
+
+
+def test_failed_platform_save_recovers_with_rmi_pull_retry(rig):
+    r, log, root = rig(
+        oci_archive(with_layers=True),
+        BAKE_SAVE_PLATFORM="linux/amd64",
+        STUB_SAVE_FAILS="1",
+    )
+    assert r.returncode == 0, r.stderr
+    lines = log.splitlines()
+    first_save = next(i for i, ln in enumerate(lines) if ln.startswith("docker save"))
+    after = lines[first_save + 1 :]
+    # Only the failed reference is removed, then re-pulled for the platform,
+    # then the save is retried.
+    rmis = [ln for ln in lines if ln.startswith("docker rmi")]
+    assert len(rmis) == 1 and len(rmis[0].split()) == 3
+    assert not any("prune" in ln for ln in lines)
+    assert after[0].startswith("docker rmi")
+    assert after[1].startswith("docker pull --platform linux/amd64")
+    assert any(ln.startswith("docker save") for ln in after)
+    assert "recovered" in r.stdout
+    assert "images baked" in r.stdout
+
+
+def test_save_failing_after_the_retry_too_refuses_naming_the_image(rig):
+    r, log, root = rig(
+        oci_archive(with_layers=True),
+        BAKE_SAVE_PLATFORM="linux/amd64",
+        STUB_SAVE_FAILS="2",
+    )
+    assert r.returncode != 0
+    assert "ghcr.io/spatiumnorth/" in r.stderr
+    assert "after re-pulling" in r.stderr
+    assert "images baked" not in r.stdout
+    assert len([ln for ln in log.splitlines() if ln.startswith("docker save")]) == 2
+    d = root / "mkosi.extra/var/lib/rancher/k3s/agent/images"
+    assert not list(d.glob("*.tar.zst.new"))
+
+
+def test_bake_logs_docker_version_and_store(rig):
+    r, log, _ = rig(oci_archive(with_layers=True), BAKE_SAVE_PLATFORM="linux/amd64")
+    assert r.returncode == 0, r.stderr
+    assert "→ Docker:" in r.stdout and "image store:" in r.stdout

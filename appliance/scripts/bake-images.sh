@@ -509,6 +509,12 @@ if [ -z "${BAKE_SAVE_PLATFORM:-}" ]; then
 fi
 SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
 echo "→ Saving images for platform $BAKE_SAVE_PLATFORM"
+# Log the engine version and image-store type: a containerd-store builder
+# behaves differently from the classic one, and it is the first thing asked
+# when a platform save fails. Informational only, never fatal.
+echo "→ Docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)," \
+     "image store: $(docker info --format '{{.DriverStatus}}' 2>/dev/null \
+        | grep -q 'io.containerd.snapshotter' && echo containerd || echo classic/unknown)"
 
 # #2393 — after each save, prove the archive holds the config + layers of
 # the target-platform manifest. A size floor cannot: small images exist.
@@ -521,6 +527,45 @@ verify_archive() {
         echo "ERROR: $name was saved without its layers; refusing to bake it." >&2
         exit 5
     fi
+}
+
+# One ``docker save --platform | zstd`` attempt. Returns the pipeline status.
+save_archive() {
+    local ref="$1" tmp="$2"
+    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
+    # overwrite it — which made every later bake fail on the same file.
+    rm -f "$tmp"
+    docker save "${SAVE_PLATFORM_FLAG[@]}" "$ref" | zstd -T0 -19 -o "$tmp"
+}
+
+# Save with one recovery attempt. A containerd-store builder can hold a
+# local copy that lost most layer blobs for the target platform: ``docker
+# pull --platform`` returns 0 without refetching them, and the save fails
+# with "no suitable export target found". Remove ONLY that reference, pull
+# it again for the platform, retag, and retry once. ``pull_ref`` is empty
+# for a locally built image (nothing to re-pull) — then there is no retry.
+#   $1 save ref   $2 tmp file   $3 pull ref (or empty)   $4 retag target (or empty)
+save_with_recovery() {
+    local ref="$1" tmp="$2" pull_ref="$3" retag="$4"
+    if save_archive "$ref" "$tmp"; then
+        return 0
+    fi
+    if [ -z "$pull_ref" ]; then
+        rm -f "$tmp"
+        echo "ERROR: docker save --platform $BAKE_SAVE_PLATFORM failed for $ref; refusing to bake it." >&2
+        exit 5
+    fi
+    echo "  ! save of $ref for $BAKE_SAVE_PLATFORM failed; removing the local $pull_ref, re-pulling and retrying once" >&2
+    docker rmi "$pull_ref" >/dev/null 2>&1 || true
+    if docker pull --platform "$BAKE_SAVE_PLATFORM" "$pull_ref" >/dev/null \
+        && { [ -z "$retag" ] || docker tag "$pull_ref" "$retag"; } \
+        && save_archive "$ref" "$tmp"; then
+        echo "  ✓ recovered $ref after re-pull"
+        return 0
+    fi
+    rm -f "$tmp"
+    echo "ERROR: docker save --platform $BAKE_SAVE_PLATFORM still fails for $ref after re-pulling it; refusing to bake it." >&2
+    exit 5
 }
 
 for repo in "${IMAGES[@]}"; do
@@ -554,10 +599,9 @@ for repo in "${IMAGES[@]}"; do
     # docker save | zstd → containerd-readable archive. Atomic via
     # .new sibling so a crash mid-bake doesn't ship a torn tarball.
     tmp="${out_tar}.new"
-    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
-    # overwrite it — which made every later bake fail on the same file.
-    rm -f "$tmp"
-    docker save "${SAVE_PLATFORM_FLAG[@]}" "$target_tag" | zstd -T0 -19 -o "$tmp"
+    pull_ref=""
+    [ "$BAKE_SOURCE" = "ghcr" ] && pull_ref="$source_tag"
+    save_with_recovery "$target_tag" "$tmp" "$pull_ref" "$target_tag"
     verify_archive "$tmp" "$target_tag"
     mv "$tmp" "$out_tar"
 
@@ -586,10 +630,7 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[
 
     echo "→ Baking $image → $out_tar"
     tmp="${out_tar}.new"
-    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
-    # overwrite it — which made every later bake fail on the same file.
-    rm -f "$tmp"
-    docker save "${SAVE_PLATFORM_FLAG[@]}" "$image" | zstd -T0 -19 -o "$tmp"
+    save_with_recovery "$image" "$tmp" "$image" ""
     verify_archive "$tmp" "$image"
     mv "$tmp" "$out_tar"
 
