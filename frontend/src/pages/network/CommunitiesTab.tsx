@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
 
 import {
   asnsApi,
+  formatApiError,
   type BGPCommunity,
   type BGPCommunityCreate,
   type BGPCommunityKind,
@@ -113,11 +114,7 @@ function CommunityFormModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

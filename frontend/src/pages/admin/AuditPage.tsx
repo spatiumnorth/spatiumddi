@@ -42,7 +42,7 @@ const RESOURCE_TYPE_OPTIONS = [
   "ip_block",
   "subnet",
   "ip_address",
-  "dns_group",
+  "dns_server_group",
   "dns_zone",
   "dns_record",
   "dhcp_server_group",

@@ -2227,13 +2227,13 @@ export function SettingsPage() {
               <>
                 <Field
                   label="Minimum length"
-                  description="Hard floor at 6 characters. Bcrypt truncates above 72 bytes — past that the extra characters aren't actually being checked."
+                  description="Between 6 and 72 characters. Passwords longer than 72 bytes are refused (bcrypt only hashes the first 72), so the minimum cannot go above 72."
                 >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={6}
-                      max={128}
+                      max={72}
                       value={values.password_min_length ?? 12}
                       onChange={(e) =>
                         set("password_min_length", Number(e.target.value))
