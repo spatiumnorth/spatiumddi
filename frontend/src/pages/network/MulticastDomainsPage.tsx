@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -314,14 +315,16 @@ export function MulticastDomainsTab() {
               </tr>
             </thead>
             <tbody className={zebraBodyCls}>
-              {items.length === 0 && !query.isFetching && (
+              {items.length === 0 && (!query.isFetching || query.error) && (
                 <tr>
                   <td
                     colSpan={6}
                     className="px-3 py-10 text-center text-sm text-muted-foreground"
                   >
-                    No PIM domains yet. Click <strong>New domain</strong> to add
-                    the first.
+                    <ListEmpty error={query.error} what="PIM domains">
+                      No PIM domains yet. Click <strong>New domain</strong> to
+                      add the first.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}

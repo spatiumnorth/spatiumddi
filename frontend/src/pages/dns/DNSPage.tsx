@@ -3972,10 +3972,17 @@ function ZoneDetailView({
   // feature module so disabling it stops the extra query entirely.
   const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
   const tlsCertsOn = moduleEnabled("security.tls_certs");
-  const { data: tlsCerts, isLoading: tlsCertsLoading } = useQuery({
+  // The route takes read on 'tls_cert': a user without it is not asked, and
+  // the tab says so instead of "Certificates (0)" (#2704).
+  const canReadCerts = usePermissions().can("read", "tls_cert");
+  const {
+    data: tlsCerts,
+    isLoading: tlsCertsLoading,
+    error: tlsCertsError,
+  } = useQuery({
     queryKey: ["tls-certs", "dns-zone", zone.id],
     queryFn: () => tlsCertsApi.list({ dns_zone_id: zone.id, limit: 200 }),
-    enabled: modulesReady && tlsCertsOn,
+    enabled: modulesReady && tlsCertsOn && canReadCerts,
   });
   // #118 — toggle auto-discovery of cert probe targets for this zone's
   // A/AAAA records. The discovery reconciler picks the change up on its
@@ -4629,7 +4636,10 @@ function ZoneDetailView({
                   : "border-transparent text-muted-foreground hover:text-foreground")
               }
             >
-              Certificates ({tlsCerts?.items.length ?? 0})
+              Certificates
+              {canReadCerts && !tlsCertsError
+                ? ` (${tlsCerts?.items.length ?? 0})`
+                : ""}
             </button>
           )}
           {/* No count — the drift report AXFRs every server in the group, so
@@ -4684,11 +4694,27 @@ function ZoneDetailView({
                   Auto-discover &amp; probe every A/AAAA record in this zone
                 </span>
               </label>
-              <CertsCompactTable
-                targets={tlsCerts?.items ?? []}
-                isLoading={tlsCertsLoading}
-                emptyLabel="No TLS certificates linked to records in this zone."
-              />
+              {tlsCertsError || !canReadCerts ? (
+                <p className="text-sm">
+                  {tlsCertsError ? (
+                    <ListReadError
+                      error={tlsCertsError}
+                      what="this zone's TLS certificates"
+                    />
+                  ) : (
+                    <span className="text-muted-foreground">
+                      You don't have permission to see this zone's TLS
+                      certificates.
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <CertsCompactTable
+                  targets={tlsCerts?.items ?? []}
+                  isLoading={tlsCertsLoading}
+                  emptyLabel="No TLS certificates linked to records in this zone."
+                />
+              )}
             </>
           )}
         </div>
