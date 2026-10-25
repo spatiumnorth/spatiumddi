@@ -407,6 +407,25 @@ def _compute_desired(
 # linked to a VLAN entry.
 
 
+def _management_ip_for(controller: UnifiController) -> str | None:
+    """The address to record as the Router's ``management_ip``, or None.
+
+    ``Router.management_ip`` is an INET column. A local controller added by
+    host NAME must not have the name written there: the insert fails and
+    the whole reconcile rolls back on every pass (#2797). Only an IP
+    literal (v4 or v6, optionally bracketed) is recorded; a name leaves it
+    NULL (the name stays on the controller row), because resolving it here
+    would add a DNS lookup to every sync for a cosmetic field.
+    """
+    if controller.mode != "local" or not controller.host:
+        return None
+    host = controller.host.strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
 async def _apply_router_and_vlans(
     db: AsyncSession,
     controller: UnifiController,
@@ -427,9 +446,7 @@ async def _apply_router_and_vlans(
     ).scalar_one_or_none()
 
     desired_router_name = controller.name
-    desired_management_ip = (
-        controller.host if controller.mode == "local" and controller.host else None
-    )
+    desired_management_ip = _management_ip_for(controller)
     desired_description = f"Auto-created from UniFi controller {controller.name}" + (
         f" ({controller.controller_version})" if controller.controller_version else ""
     )
