@@ -248,6 +248,22 @@ def builtin_policy_set() -> PolicySet:
     return ps
 
 
+def _nft_comment_text(comment: str | None) -> str | None:
+    """A stored rule comment made safe to place inside ``comment "..."``.
+
+    The rule API rejects double quotes, backslashes and control characters
+    in a comment. This covers rows stored before it did: those characters
+    are dropped rather than the rule, because the comment is a label and
+    the rule is what the operator asked for. Without this, a newline would
+    end the rule line and the rest would be read as rules of its own."""
+    if not comment:
+        return comment
+    cleaned = "".join(
+        c for c in comment if c not in '"\\' and not (ord(c) < 0x20 or ord(c) == 0x7F)
+    )
+    return cleaned or None
+
+
 def _policy_from_orm(p: FirewallPolicy) -> _Policy:
     rule_objs = tuple(
         _Rule(
@@ -259,7 +275,7 @@ def _policy_from_orm(p: FirewallPolicy) -> _Policy:
             source_cidrs=tuple(str(x) for x in (r.source_cidrs or [])),
             source_alias=r.source_alias,
             family=r.family,
-            comment=r.comment,
+            comment=_nft_comment_text(r.comment),
             render_guard=dict(r.render_guard) if r.render_guard else None,
             enabled=r.enabled,
         )
