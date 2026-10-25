@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { UpdateCheckError } from "@/components/UpdateCheckError";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   settingsApi,
@@ -6,6 +7,7 @@ import {
   formatApiError,
   type OUITaskStatus,
   type PlatformSettings,
+  versionApi,
 } from "@/lib/api";
 import {
   AlertCircle,
@@ -1283,6 +1285,13 @@ export function SettingsPage() {
   const [form, setForm] = useState<Partial<PlatformSettings>>({});
   const [saved, setSaved] = useState(false);
   const [activeId, setActiveId] = useState<SectionId>("branding");
+  // Shares the sidebar's ["version"] query so the Updates section shows the
+  // stored result of the last release check without a second request.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 60 * 60 * 1000,
+  });
   const [search, setSearch] = useState("");
   // #2130 — sections that belong to a feature module exist only while it is
   // on. The agent bootstrap keys deliberately do NOT carry a module: agents
@@ -2650,6 +2659,7 @@ export function SettingsPage() {
 
             {activeId === "updates" && (
               <>
+                {versionInfo && <UpdateCheckError info={versionInfo} />}
                 <Field
                   label="Check for GitHub Releases"
                   description="Once a day, ask GitHub whether a newer SpatiumDDI release exists, so the UI can show an update pill."

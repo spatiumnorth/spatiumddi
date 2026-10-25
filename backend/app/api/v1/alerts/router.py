@@ -18,11 +18,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select, update
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.permissions import require_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
@@ -312,13 +313,21 @@ class EvaluateResponse(BaseModel):
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 
-@router.get("/rules", response_model=list[AlertRuleResponse])
+@router.get(
+    "/rules",
+    response_model=list[AlertRuleResponse],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     res = await db.execute(select(AlertRule).order_by(AlertRule.name))
     return list(res.scalars().all())
 
 
-@router.get("/rule-types", response_model=list[RuleTypeSpec])
+@router.get(
+    "/rule-types",
+    response_model=list[RuleTypeSpec],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_rule_types(db: DB, current_user: CurrentUser) -> list[RuleTypeSpec]:
     """Every rule type, its label, and the parameters its evaluator reads (#1997).
 
@@ -366,7 +375,11 @@ async def create_rule(body: AlertRuleCreate, db: DB, current_user: SuperAdmin) -
     return rule
 
 
-@router.get("/rules/{rule_id}", response_model=AlertRuleResponse)
+@router.get(
+    "/rules/{rule_id}",
+    response_model=AlertRuleResponse,
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def get_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertRule:
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
@@ -472,7 +485,11 @@ async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> N
 # ── Events ─────────────────────────────────────────────────────────────────
 
 
-@router.get("/events", response_model=list[AlertEventResponse])
+@router.get(
+    "/events",
+    response_model=list[AlertEventResponse],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_events(
     db: DB,
     current_user: CurrentUser,
@@ -560,4 +577,17 @@ async def evaluate_now(db: DB, current_user: SuperAdmin) -> EvaluateResponse:
     configured syslog / webhook / SMTP targets.
     """
     result = await alert_service.evaluate_all(db)
+    db.add(
+        AuditLog(
+            action="evaluate",
+            resource_type="alert_rule",
+            resource_id="*",
+            resource_display="alert evaluator (manual run)",
+            user_id=current_user.id,
+            user_display_name=current_user.username,
+            result="success",
+            new_value={k: result.get(k) for k in EvaluateResponse.model_fields},
+        )
+    )
+    await db.commit()
     return EvaluateResponse(**result)

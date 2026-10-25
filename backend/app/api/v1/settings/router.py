@@ -27,6 +27,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.celery_dispatch import dispatch
 from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
@@ -2920,7 +2921,7 @@ async def trigger_reverse_dns_run(current_user: CurrentUser, db: DB) -> ReverseD
     try:
         from app.tasks.reverse_dns import sweep_reverse_dns
 
-        result = sweep_reverse_dns.delay(force=True)
+        result = await dispatch(sweep_reverse_dns, force=True)
         task_id = result.id
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         logger.warning("reverse_dns_trigger_enqueue_failed", error=str(exc))
@@ -3232,7 +3233,7 @@ async def trigger_oui_refresh(current_user: CurrentUser, db: DB) -> OUIRefreshRe
     # into its startup path.
     from app.tasks.oui_update import update_oui_database_now  # noqa: PLC0415
 
-    result = update_oui_database_now.delay()
+    result = await dispatch(update_oui_database_now)
     logger.info("oui_refresh_triggered", user=current_user.username, task_id=result.id)
     return OUIRefreshResponse(status="queued", task_id=result.id)
 

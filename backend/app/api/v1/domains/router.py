@@ -27,6 +27,7 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission, user_has_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
@@ -352,7 +353,7 @@ async def create_domain(body: DomainCreate, db: DB, current_user: CurrentUser) -
     try:
         from app.tasks.domain_whois_refresh import refresh_one_domain_by_id
 
-        refresh_one_domain_by_id.delay(str(d.id))
+        await dispatch(refresh_one_domain_by_id, str(d.id))
     except Exception as exc:  # noqa: BLE001
         logger.warning("domain_whois_refresh_dispatch_failed", domain=d.name, error=str(exc))
 
