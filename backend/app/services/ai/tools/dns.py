@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.safe_fetch import mask_url_credentials
 from app.models.auth import User
 from app.models.dns import (
     DNSBlockList,
@@ -448,6 +449,7 @@ async def preview_dns_zone_move(
         "technitium_api_refusal": plan.technitium_api_refusal,
         "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
         "forward_transport_refusal": plan.forward_transport_refusal,
+        "technitium_acl_refusal": plan.technitium_acl_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
@@ -855,7 +857,8 @@ async def list_dns_blocklists(
             "description": r.description,
             "category": r.category,
             "source_type": r.source_type,
-            "feed_url": r.feed_url,
+            # Credentials in the URL are masked, as in the REST response.
+            "feed_url": mask_url_credentials(r.feed_url) if r.feed_url else r.feed_url,
             "feed_format": r.feed_format,
             "update_interval_hours": r.update_interval_hours,
             "block_mode": r.block_mode,

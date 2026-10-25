@@ -431,13 +431,15 @@ class NfsDestination(BackupDestination):
 
         return await asyncio.to_thread(self._guarded, _do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         target = _remote_path(config, filename)
 
         def _do() -> bytes:
             with _open(config) as conn:
                 try:
-                    return conn.read(target)
+                    return conn.read(target, max_bytes=max_bytes)
                 except NfsError as exc:
                     if exc.errno == _errno.ENOENT:
                         raise BackupDestinationError(

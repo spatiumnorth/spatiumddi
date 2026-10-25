@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -572,7 +573,22 @@ function SummaryTab({ serviceId }: { serviceId: string }) {
   return <CustomSummaryView summary={summary} />;
 }
 
-function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
+/** One line naming how many attached rows a section leaves out because the
+ *  caller has no read grant on them. Renders nothing when none are. */
+function WithheldNote({ count }: { count: number | undefined }) {
+  if (!count) return null;
+  return (
+    <p className="mt-1 text-xs italic text-muted-foreground">
+      {count} not shown (no read permission)
+    </p>
+  );
+}
+
+export function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
+  const withheld = summary.withheld ?? {};
+  const sites = summary.edge_sites.length + (withheld.edge_sites ?? 0);
+  const circuits = summary.edge_circuits.length + (withheld.edge_circuits ?? 0);
+  const subnets = summary.edge_subnets.length + (withheld.edge_subnets ?? 0);
   return (
     <div className="space-y-3">
       <div className="rounded-md border bg-muted/20 p-3">
@@ -588,6 +604,10 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
               {summary.vrf.export_targets.join(", ") || "—"}
             </div>
           </div>
+        ) : withheld.vrf ? (
+          <p className="mt-1 text-sm italic text-muted-foreground">
+            Not shown (no read permission)
+          </p>
         ) : (
           <p className="mt-1 text-sm text-muted-foreground">
             No VRF attached. L3VPN services should have exactly one — attach via
@@ -599,10 +619,13 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div className="rounded-md border p-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Edge sites ({summary.edge_sites.length})
+            Edge sites ({sites})
           </div>
+          <WithheldNote count={withheld.edge_sites} />
           {summary.edge_sites.length === 0 ? (
-            <p className="mt-1 text-xs text-muted-foreground">None</p>
+            !withheld.edge_sites && (
+              <p className="mt-1 text-xs text-muted-foreground">None</p>
+            )
           ) : (
             <ul className="mt-1 space-y-1 text-sm">
               {summary.edge_sites.map((s) => (
@@ -623,10 +646,13 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
         </div>
         <div className="rounded-md border p-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Edge circuits ({summary.edge_circuits.length})
+            Edge circuits ({circuits})
           </div>
+          <WithheldNote count={withheld.edge_circuits} />
           {summary.edge_circuits.length === 0 ? (
-            <p className="mt-1 text-xs text-muted-foreground">None</p>
+            !withheld.edge_circuits && (
+              <p className="mt-1 text-xs text-muted-foreground">None</p>
+            )
           ) : (
             <ul className="mt-1 space-y-1 text-sm">
               {summary.edge_circuits.map((c) => (
@@ -648,10 +674,13 @@ function L3VPNSummaryView({ summary }: { summary: L3VPNSummary }) {
         </div>
         <div className="rounded-md border p-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Edge subnets ({summary.edge_subnets.length})
+            Edge subnets ({subnets})
           </div>
+          <WithheldNote count={withheld.edge_subnets} />
           {summary.edge_subnets.length === 0 ? (
-            <p className="mt-1 text-xs text-muted-foreground">None</p>
+            !withheld.edge_subnets && (
+              <p className="mt-1 text-xs text-muted-foreground">None</p>
+            )
           ) : (
             <ul className="mt-1 space-y-1 text-sm tabular-nums">
               {summary.edge_subnets.map((s) => (
@@ -1343,9 +1372,30 @@ export function ServicesPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    {byResourceActive
-                      ? `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
-                      : 'No services yet — click "New service" to add one.'}
+                    {byResourceActive ? (
+                      `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
+                    ) : (
+                      <ListEmpty
+                        error={query.error}
+                        what="services"
+                        filtered={
+                          search !== "" ||
+                          statusFilter !== "" ||
+                          kindFilter !== "" ||
+                          customerFilter !== "" ||
+                          tagFilters.length > 0
+                        }
+                        onClearFilters={() => {
+                          setSearch("");
+                          setStatusFilter("");
+                          setKindFilter("");
+                          setCustomerFilter("");
+                          setTagFilters([]);
+                        }}
+                      >
+                        No services yet — click "New service" to add one.
+                      </ListEmpty>
+                    )}
                   </td>
                 </tr>
               )}

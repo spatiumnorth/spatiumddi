@@ -442,7 +442,7 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _pxe_class(p: dict[str, Any]) -> dict[str, Any]:
+def _pxe_class(p: dict[str, Any], *, additional: bool = False) -> dict[str, Any]:
     """Render a PXE / iPXE client class (#51) — Dhcp4 only.
 
     Mirrors ``_render_pxe_class`` in ``backend/app/drivers/dhcp/kea.py``.
@@ -451,6 +451,12 @@ def _pxe_class(p: dict[str, Any]) -> dict[str, Any]:
     a different boot binary per architecture. An empty ``match_expression``
     means "always match" — a low-priority fallthrough — so the key is omitted
     rather than emitted empty, which Kea would reject.
+
+    #2731: ``additional`` renders the class ``only-in-additional-list``, so
+    Kea evaluates it only for the subnets that list it, which are the scopes
+    bound to its profile (``_scope_to_subnet``). Its boot fields still reach
+    the OFFER, and with no ``test`` it is added for every client of those
+    subnets (both measured on kea-dhcp4 3.0.3).
     """
     out: dict[str, Any] = {
         "name": p["name"],
@@ -472,6 +478,8 @@ def _pxe_class(p: dict[str, Any]) -> dict[str, Any]:
             out["next-server"] = next_server
     if p.get("match_expression"):
         out["test"] = p["match_expression"]
+    if additional:
+        out["only-in-additional-list"] = True
     return out
 
 
@@ -925,6 +933,13 @@ def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
     relay = scope.get("relay_addresses")
     if relay:
         out["relay"] = {"ip-addresses": list(relay)}
+    # #2731: the classes of the scope's own PXE profile, in the order the
+    # control plane sent them. Rendered ``only-in-additional-list`` (see
+    # ``render``), they are evaluated for the subnets that list them and no
+    # other, so one scope's profile no longer boots every scope's clients.
+    pxe = scope.get("pxe_class_names")
+    if pxe:
+        out["evaluate-additional-classes"] = list(pxe)
     return out
 
 
@@ -1387,6 +1402,7 @@ def render(
     # into ``subnet4`` here, v6 scopes into a ``Dhcp6`` block below. The
     # legacy ``subnets`` shape is v4-only by construction.
     scopes = bundle.get("scopes")
+    v4_scopes: list[dict[str, Any]] = []
     v6_scopes: list[dict[str, Any]] = []
     if scopes is not None:
         v4_scopes = [s for s in scopes if (s.get("address_family") or "ipv4") != "ipv6"]
@@ -1422,7 +1438,15 @@ def render(
     # how both the appliance and the Compose stack run DHCP. Order matches the
     # backend driver: operator classes, then PXE, then phone. Kea evaluates
     # client-classes in declaration order, so this is behaviour, not style.
-    rendered_classes += [_pxe_class(p) for p in (bundle.get("pxe_classes") or [])]
+    #
+    # #2731: a PXE class belongs to the scopes bound to its profile. Each of
+    # those subnets lists it (``_scope_to_subnet``) and Kea evaluates it there
+    # and nowhere else. A bundle from a control plane older than #2731 lists
+    # no scope's classes, and they stay global, as they always were.
+    pxe_scoped = any("pxe_class_names" in s for s in v4_scopes)
+    rendered_classes += [
+        _pxe_class(p, additional=pxe_scoped) for p in (bundle.get("pxe_classes") or [])
+    ]
     rendered_classes += [_phone_class(c) for c in (bundle.get("phone_classes") or [])]
     # #700 — device policies last, matching the backend driver's order, so an
     # operator's own class of the same shape is evaluated first. Kea stops at

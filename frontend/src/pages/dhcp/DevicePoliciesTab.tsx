@@ -16,6 +16,7 @@ import {
   DeleteConfirmModal,
 } from "./_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { deletePolicyDescription } from "./devicePolicyCopy";
 
 const KEY_BASE = "dhcp-device-policies";
 const OBS_KEY = "dhcp-device-observations";
@@ -227,7 +228,7 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
       {del && (
         <DeleteConfirmModal
           title="Delete device policy"
-          description={`Delete "${del.name}"? Pools restricted to ${del.class_name} will no longer match any class.`}
+          description={deletePolicyDescription(del.name, del.class_name)}
           onConfirm={() => delMut.mutate(del.id)}
           onClose={() => setDel(null)}
           isPending={delMut.isPending}

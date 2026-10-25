@@ -785,7 +785,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     async def _ok(name: per_node.StepName) -> per_node.StepResult:
         return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(True)
 
-    async def _fail_cordon(_node: str) -> per_node.StepResult:
+    async def _fail_cordon(_node: str, **_kw: Any) -> per_node.StepResult:
         return per_node.StepResult(name="cordon", started_at="t", finished_at="t").finish(
             False, error="kubeapi status 403"
         )

@@ -40,13 +40,20 @@ from typing import Any
 import structlog
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.services.appliance import k8s
 from app.services.appliance.containers import (
     DockerUnavailableError,
     get_container_logs,
     list_containers,
 )
-from app.services.support_bundle.scrub import redact_secrets, render_env, render_env_file
+from app.services.support_bundle.scrub import (
+    LOG_CONTEXT_LINES,
+    redact_log_tail,
+    redact_secrets,
+    render_env,
+    render_env_file,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -341,7 +348,7 @@ def generate_diagnostic_bundle() -> bytes:
             "appliance_mode": settings.appliance_mode,
             "appliance_version": settings.appliance_version,
             "appliance_hostname": settings.appliance_hostname,
-            "version": settings.version,
+            "version": canonical_version(settings.version, settings.app_version),
         }
         _put(
             zf,
@@ -373,7 +380,12 @@ def generate_diagnostic_bundle() -> bytes:
                 if not c.is_spatium:
                     continue
                 try:
-                    logs = get_container_logs(c.name, tail=500)
+                    # Context before the 500-line window, so a key the
+                    # window starts inside is caught by its BEGIN line.
+                    requested = 500 + LOG_CONTEXT_LINES
+                    logs = redact_log_tail(
+                        get_container_logs(c.name, tail=requested), 500, requested=requested
+                    )
                 except DockerUnavailableError as exc:
                     logs = f"[unable to fetch logs: {exc}]"
                 _put(zf, f"pods/{c.name}.log", logs)

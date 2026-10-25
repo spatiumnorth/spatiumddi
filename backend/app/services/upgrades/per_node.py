@@ -103,6 +103,9 @@ from app.services.appliance.slot_image_target import (
 )
 from app.services.upgrades import chart_bump, preflight, safety
 
+# The classifier moved to kubeapi_retry (#2767) so the plan path shares it.
+from app.services.upgrades.kubeapi_retry import _kubeapi_transient
+
 logger = structlog.get_logger(__name__)
 
 
@@ -181,6 +184,17 @@ DB_FAILOVER_BUDGET_S = 90.0
 _DB_RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
 # Separate outages one step rides out before the next one fails it.
 _DB_MAX_OUTAGES_PER_STEP = 3
+
+# #2449 — a transient kubeapi answer at an idempotent per-node write is retried
+# in place, the way a shared-tag write is (orchestrator._retry_shared_tag_step).
+# The API server behind a rolling control plane can answer a CNPG admission
+# PATCH with a 500 while CloudNativePG's mutating webhook is briefly between
+# endpoints (its operator pod rescheduling off a cordoned node). One 500 used to
+# fail the step and the whole run at cnpg_maintenance_on. Only the writes that
+# are safe to repeat retry, and only a kubeapi helper's own answer.
+KUBEAPI_RETRY_STEPS: frozenset[StepName] = frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})
+KUBEAPI_RETRY_BUDGET_S = 300.0
+_KUBEAPI_RETRY_INTERVAL_S = 15.0
 
 
 @dataclass
@@ -507,19 +521,33 @@ async def _step_cnpg_maintenance_on(cluster_name: str, namespace: str | None) ->
 # ── Step 7: cordon ────────────────────────────────────────────────────
 
 
-async def _step_cordon(node_name: str) -> StepResult:
+async def _step_cordon(
+    node_name: str, *, pre_cordon: dict[str, bool | None] | None = None
+) -> StepResult:
     step = StepResult(name="cordon", started_at=_now_iso(), detail={"node": node_name})
     # Record whether the node was already unschedulable BEFORE this cordon,
     # so a failure's release (#1542) does not uncordon a node an operator
     # had cordoned on purpose. ``None`` = could not tell; the release then
     # uncordons, as it did before this was recorded.
+    #
+    # #2449 — the step is retried in place on a transient kubeapi answer, and
+    # a PATCH whose answer was lost (a socket timeout) may still have landed.
+    # Re-reading the node on the retry would then see this run's own cordon
+    # and record it as the operator's, so the release would leave the node
+    # cordoned after a failed run. ``pre_cordon`` carries the FIRST attempt's
+    # reading across retries; only that one was taken before any cordon.
     was_unschedulable: bool | None = None
-    try:
-        status, node = k8s.get_node(node_name)
-    except k8s.KubeapiUnavailableError:
-        status, node = 0, None
-    if status == 200 and node is not None:
-        was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+    if pre_cordon is not None and "was_unschedulable" in pre_cordon:
+        was_unschedulable = pre_cordon["was_unschedulable"]
+    else:
+        try:
+            status, node = k8s.get_node(node_name)
+        except k8s.KubeapiUnavailableError:
+            status, node = 0, None
+        if status == 200 and node is not None:
+            was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+        if pre_cordon is not None:
+            pre_cordon["was_unschedulable"] = was_unschedulable
     step.detail["was_unschedulable"] = was_unschedulable
     ok, err = k8s.cordon_node(node_name)
     if not ok:
@@ -1304,6 +1332,9 @@ async def _step_uncordon(
             False,
             error=f"uncordon ok, maintenance-window clear failed: {err}",
             uncordon_ok=True,
+            # #2449 — the helper's own answer, so the retry can classify it:
+            # the step's error is prefixed and no longer starts "kubeapi ".
+            kubeapi_error=err,
         )
     return step.finish(True)
 
@@ -1668,7 +1699,9 @@ async def single_node_upgrade(
         ):
             return _failed(node_name, target_version, "cnpg_maintenance_on", results)
         window_set = True
-    if not await _run("cordon", lambda: _step_cordon(node_name)):
+    # #2449 — shared across the cordon step's retries; see ``_step_cordon``.
+    pre_cordon: dict[str, bool | None] = {}
+    if not await _run("cordon", lambda: _step_cordon(node_name, pre_cordon=pre_cordon)):
         # The window may already be set — release it (#1542). The node is
         # not uncordoned: this run did not cordon it.
         return await _fail("cordon")
@@ -1771,15 +1804,25 @@ async def _run_step_riding_db_failover(
     error is retried (``is_transient_db_error``); anything else, and a
     database still unreachable once the budget is spent, is recorded as the
     step crashing, as before. ``make`` builds a fresh coroutine per attempt.
+
+    #2449 — a step in ``KUBEAPI_RETRY_STEPS`` that *returned* a failed result
+    whose error is a transient kubeapi answer (``_kubeapi_transient``) is tried
+    again in place, for ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer:
+    a CNPG admission PATCH that met a 500 while CloudNativePG's mutating webhook
+    was between endpoints used to fail the run. Only the idempotent writes retry,
+    and a kubeapi error still failing once the budget is spent is returned as it
+    was, as before.
     """
     budget = DB_FAILOVER_BUDGET_S if budget_s is None else budget_s
     first_failure: float | None = None
     outages = 0
     attempt = 0
+    kubeapi_first: float | None = None
+    kubeapi_attempt = 0
     while True:
         attempt_started = _db_retry_clock()
         try:
-            return await make()
+            result = await make()
         except Exception as exc:  # noqa: BLE001 — last-resort wrapper
             if is_transient_db_error(exc):
                 now = _db_retry_clock()
@@ -1832,6 +1875,39 @@ async def _run_step_riding_db_failover(
             return StepResult(name=step, started_at=_now_iso()).finish(
                 False, error=f"step crashed: {exc}"
             )
+        # #2449 — make() returned (no exception). An idempotent write that the
+        # API server answered with a transient kubeapi error (a 5xx, 408, 409,
+        # 429, or a socket error that never reached it) is tried again in place,
+        # within ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer, so a CNPG
+        # admission webhook briefly between endpoints does not fail the run.
+        # A step whose error wraps the helper's answer (uncordon's window clear)
+        # carries the answer itself as ``detail["kubeapi_error"]``.
+        kubeapi_error = result.detail.get("kubeapi_error", result.error)
+        if not result.ok and step in KUBEAPI_RETRY_STEPS and _kubeapi_transient(kubeapi_error):
+            now = _db_retry_clock()
+            if kubeapi_first is None:
+                kubeapi_first = now
+            if now - kubeapi_first + _KUBEAPI_RETRY_INTERVAL_S <= KUBEAPI_RETRY_BUDGET_S:
+                kubeapi_attempt += 1
+                logger.warning(
+                    "single_node_upgrade_step_kubeapi_transient",
+                    step=step,
+                    node=node_name,
+                    attempt=kubeapi_attempt,
+                    retry_in_s=_KUBEAPI_RETRY_INTERVAL_S,
+                    error=result.error,
+                )
+                await _db_retry_sleep(_KUBEAPI_RETRY_INTERVAL_S)
+                continue
+            logger.warning(
+                "single_node_upgrade_step_kubeapi_gave_up",
+                step=step,
+                node=node_name,
+                attempts=kubeapi_attempt,
+                kubeapi_unavailable_s=round(now - kubeapi_first),
+                error=result.error,
+            )
+        return result
 
 
 def _failed(

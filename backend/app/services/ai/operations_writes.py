@@ -32,16 +32,24 @@ returns a file stream rather than an apply-shaped mutation. The backup
 from __future__ import annotations
 
 import uuid
+from ipaddress import ip_network
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dhcp._audit import write_audit
+from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
-from app.services.ai.operations import Operation, PreviewResult, register
+from app.services.ai.operations import (
+    Operation,
+    PreviewResult,
+    enforce_operation_permission,
+    get_operation,
+    register,
+)
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
 # Re-declared here (tiny) rather than imported from the routers, so this
@@ -53,6 +61,16 @@ _CONFORMITY_TARGET_KINDS = frozenset(
 _CONFORMITY_BUILTIN_MUTABLE = frozenset(
     {"enabled", "eval_interval_hours", "severity", "fail_alert_rule_id", "description"}
 )
+
+
+def _enforce_declared_gate(user: User, name: str) -> None:
+    """Defense in depth: re-check the operation's declared gate inside its
+    own apply, so it holds even if the operation is dispatched outside the
+    apply endpoint (which enforces the same gate first)."""
+    op = get_operation(name)
+    if op is None:  # pragma: no cover — every caller names a registered op
+        raise ValueError(f"Operation {name!r} is not registered")
+    enforce_operation_permission(user, op)
 
 
 def _clip(text: str, n: int = 80) -> str:
@@ -128,6 +146,7 @@ async def _preview_create_conformity_policy(
 async def _apply_create_conformity_policy(
     db: AsyncSession, user: User, args: CreateConformityPolicyArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "create_conformity_policy")
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
 
     err = _validate_conformity_common(args)
@@ -226,6 +245,7 @@ async def _preview_update_conformity_policy(
 async def _apply_update_conformity_policy(
     db: AsyncSession, user: User, args: UpdateConformityPolicyArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "update_conformity_policy")
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
 
     p = await db.get(ConformityPolicy, args.policy_id)
@@ -301,6 +321,7 @@ async def _preview_evaluate_conformity_policy(
 async def _apply_evaluate_conformity_policy(
     db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "evaluate_conformity_policy")
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
     from app.services import alerts as alert_service  # noqa: PLC0415
     from app.services.conformity import evaluate_policy  # noqa: PLC0415
@@ -333,6 +354,7 @@ register(
         preview=_preview_create_conformity_policy,
         apply=_apply_create_conformity_policy,
         category="compliance",
+        required_permission=("admin", "conformity"),
     )
 )
 register(
@@ -343,6 +365,7 @@ register(
         preview=_preview_update_conformity_policy,
         apply=_apply_update_conformity_policy,
         category="compliance",
+        required_permission=("admin", "conformity"),
     )
 )
 register(
@@ -353,6 +376,7 @@ register(
         preview=_preview_evaluate_conformity_policy,
         apply=_apply_evaluate_conformity_policy,
         category="compliance",
+        required_permission=("admin", "conformity"),
     )
 )
 
@@ -637,6 +661,7 @@ register(
         preview=_preview_create_webhook,
         apply=_apply_create_webhook,
         category="webhooks",
+        requires_superadmin=True,
     )
 )
 register(
@@ -647,6 +672,7 @@ register(
         preview=_preview_update_webhook,
         apply=_apply_update_webhook,
         category="webhooks",
+        requires_superadmin=True,
     )
 )
 register(
@@ -657,6 +683,7 @@ register(
         preview=_preview_test_webhook,
         apply=_apply_test_webhook,
         category="webhooks",
+        requires_superadmin=True,
     )
 )
 
@@ -727,6 +754,7 @@ async def _preview_create_multicast_domain(
 async def _apply_create_multicast_domain(
     db: AsyncSession, user: User, args: CreateMulticastDomainArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "create_multicast_domain")
     from app.api.v1.multicast.router import (  # noqa: PLC0415
         _check_device,
         _check_vrf,
@@ -828,6 +856,7 @@ async def _preview_update_multicast_domain(
 async def _apply_update_multicast_domain(
     db: AsyncSession, user: User, args: UpdateMulticastDomainArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "update_multicast_domain")
     from app.models.multicast import MulticastDomain  # noqa: PLC0415
 
     row = await db.get(MulticastDomain, args.domain_id)
@@ -904,6 +933,7 @@ async def _preview_delete_multicast_domain(
 async def _apply_delete_multicast_domain(
     db: AsyncSession, user: User, args: DeleteMulticastDomainArgs
 ) -> dict[str, Any]:
+    _enforce_declared_gate(user, "delete_multicast_domain")
     from app.models.multicast import MulticastDomain  # noqa: PLC0415
 
     row = await db.get(MulticastDomain, args.domain_id)
@@ -932,6 +962,7 @@ register(
         preview=_preview_create_multicast_domain,
         apply=_apply_create_multicast_domain,
         category="multicast",
+        required_permission=("write", "multicast"),
     )
 )
 register(
@@ -942,6 +973,7 @@ register(
         preview=_preview_update_multicast_domain,
         apply=_apply_update_multicast_domain,
         category="multicast",
+        required_permission=("write", "multicast"),
     )
 )
 register(
@@ -952,6 +984,7 @@ register(
         preview=_preview_delete_multicast_domain,
         apply=_apply_delete_multicast_domain,
         category="multicast",
+        required_permission=("delete", "multicast"),
     )
 )
 
@@ -1106,6 +1139,7 @@ register(
         preview=_preview_sign_zone_dnssec,
         apply=_apply_sign_zone_dnssec,
         category="dns",
+        requires_superadmin=True,
     )
 )
 register(
@@ -1116,6 +1150,7 @@ register(
         preview=_preview_unsign_zone_dnssec,
         apply=_apply_unsign_zone_dnssec,
         category="dns",
+        requires_superadmin=True,
     )
 )
 
@@ -1297,6 +1332,7 @@ register(
         preview=_preview_set_zone_update_acl,
         apply=_apply_set_zone_update_acl,
         category="dns",
+        requires_superadmin=True,
     )
 )
 
@@ -1322,6 +1358,45 @@ class UpdateSNMPSettingsArgs(BaseModel):
     )
     sys_contact: str | None = None
     sys_location: str | None = None
+
+    # The same checks ``PUT /settings`` applies: every one of these values is
+    # written into a line of snmpd.conf, which ends a directive at the
+    # newline.
+    @field_validator("sys_contact", "sys_location")
+    @classmethod
+    def _valid_sys_text(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is None:
+            return None
+        return reject_control_chars(v, info.field_name or "value")
+
+    @field_validator("community")
+    @classmethod
+    def _valid_community(cls, v: str | None) -> str | None:
+        if v and (has_control_chars(v) or any(c.isspace() for c in v)):
+            raise ValueError("community must not contain whitespace or control characters")
+        return v
+
+    @field_validator("allowed_sources")
+    @classmethod
+    def _valid_sources(cls, v: list[str] | None) -> list[str] | None:
+        return _canonical_networks(v)
+
+
+def _canonical_networks(v: list[str] | None) -> list[str] | None:
+    """Canonical network strings for a source list; ``ValueError`` on an
+    entry that is not a network. Empty entries are dropped."""
+    if v is None:
+        return None
+    out: list[str] = []
+    for raw in v:
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            out.append(str(ip_network(s, strict=False)))
+        except ValueError as exc:
+            raise ValueError(f"invalid CIDR or host: {raw!r} ({exc})") from exc
+    return out
 
 
 async def _preview_update_snmp_settings(
@@ -1388,6 +1463,30 @@ class UpdateNTPSettingsArgs(BaseModel):
     allow_clients: bool | None = None
     allow_client_networks: list[str] | None = None
 
+    # The same checks ``PUT /settings`` applies: each value is written into
+    # a line of chrony.conf.
+    @field_validator("pool_servers")
+    @classmethod
+    def _valid_pool_servers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = str(raw).strip()
+            if not s:
+                continue
+            if has_control_chars(s) or any(c.isspace() for c in s):
+                raise ValueError(
+                    f"pool hostname may not contain whitespace or control characters: {raw!r}"
+                )
+            out.append(s)
+        return out
+
+    @field_validator("allow_client_networks")
+    @classmethod
+    def _valid_allow_networks(cls, v: list[str] | None) -> list[str] | None:
+        return _canonical_networks(v)
+
 
 async def _preview_update_ntp_settings(
     db: AsyncSession, user: User, args: UpdateNTPSettingsArgs
@@ -1449,6 +1548,7 @@ register(
         preview=_preview_update_snmp_settings,
         apply=_apply_update_snmp_settings,
         category="admin",
+        requires_superadmin=True,
     )
 )
 register(
@@ -1459,6 +1559,7 @@ register(
         preview=_preview_update_ntp_settings,
         apply=_apply_update_ntp_settings,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -1612,6 +1713,7 @@ register(
         preview=_preview_update_syslog_settings,
         apply=_apply_update_syslog_settings,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -1882,6 +1984,7 @@ register(
         preview=_preview_commit_dns_import,
         apply=_apply_commit_dns_import,
         category="dns",
+        requires_superadmin=True,
     )
 )
 register(
@@ -1892,6 +1995,7 @@ register(
         preview=_preview_commit_dhcp_import,
         apply=_apply_commit_dhcp_import,
         category="dhcp",
+        requires_superadmin=True,
     )
 )
 
@@ -2027,6 +2131,7 @@ register(
         preview=_preview_commit_netbox_import,
         apply=_apply_commit_netbox_import,
         category="ipam",
+        requires_superadmin=True,
     )
 )
 

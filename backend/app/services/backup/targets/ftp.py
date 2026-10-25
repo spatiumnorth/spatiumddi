@@ -48,6 +48,7 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
@@ -330,7 +331,9 @@ class FtpDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
@@ -338,8 +341,18 @@ class FtpDestination(BackupDestination):
             client = self._connect(config)
             try:
                 buf = io.BytesIO()
-                client.retrbinary(f"RETR {remote}", buf.write)
+
+                def _sink(chunk: bytes) -> None:
+                    buf.write(chunk)
+                    # Raising out of the callback aborts the transfer;
+                    # the connection is closed in ``finally``.
+                    if max_bytes is not None and buf.tell() > max_bytes:
+                        raise ArchiveTooLargeError(safe, max_bytes)
+
+                client.retrbinary(f"RETR {remote}", _sink)
                 return buf.getvalue()
+            except ArchiveTooLargeError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise BackupDestinationError(f"FTP read failed: {describe_exc(exc)}") from exc
             finally:

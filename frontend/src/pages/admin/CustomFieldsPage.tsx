@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { customFieldsApi, authApi, type CustomField } from "@/lib/api";
+import { customFieldsApi, type CustomField } from "@/lib/api";
 import {
   customFieldCreatePayload,
   customFieldUpdatePayload,
   type CustomFieldForm,
 } from "@/lib/formPayloads";
 import { Plus, Pencil, Trash2, X, Check } from "lucide-react";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
@@ -326,12 +327,13 @@ function DeleteFieldDialog({
 
 export function CustomFieldsPage() {
   const qc = useQueryClient();
-  const { data: me } = useQuery({
-    queryKey: ["me"],
-    queryFn: authApi.me,
-    staleTime: 60_000,
-  });
-  const isSuperadmin = me?.is_superadmin ?? false;
+  // The router takes `require_resource_permission("custom_field")`: write for
+  // create / update, delete for delete. Gate on those grants, not on
+  // superadmin (#2697): the built-in IPAM Editor holds admin on it.
+  const perms = usePermissions();
+  const canWrite = perms.can("write", "custom_field");
+  const canDelete = perms.can("delete", "custom_field");
+  const canAct = canWrite || canDelete;
 
   const [filterType, setFilterType] = useState<string>("all");
   const [modal, setModal] = useState<{
@@ -428,7 +430,7 @@ export function CustomFieldsPage() {
             Define extra metadata fields for IPAM resources.
           </p>
         </div>
-        {isSuperadmin && (
+        {canWrite && (
           <button
             onClick={() => {
               setModal({ mode: "create" });
@@ -464,7 +466,7 @@ export function CustomFieldsPage() {
       {fields.length === 0 && (
         <div className="rounded-lg border border-dashed py-12 text-center text-sm text-muted-foreground">
           No custom fields defined yet.
-          {isSuperadmin && ' Click "New Field" to add one.'}
+          {canWrite && ' Click "New Field" to add one.'}
         </div>
       )}
 
@@ -484,7 +486,7 @@ export function CustomFieldsPage() {
                     <th className="px-5 py-2 text-left font-medium">Label</th>
                     <th className="px-5 py-2 text-left font-medium">Type</th>
                     <th className="px-5 py-2 text-left font-medium">Flags</th>
-                    {isSuperadmin && (
+                    {canAct && (
                       <th className="px-5 py-2 text-right font-medium">
                         Actions
                       </th>
@@ -518,26 +520,30 @@ export function CustomFieldsPage() {
                           )}
                         </div>
                       </td>
-                      {isSuperadmin && (
+                      {canAct && (
                         <td className="px-5 py-2 text-right">
                           <div className="flex justify-end gap-1">
-                            <button
-                              onClick={() => {
-                                setModal({ mode: "edit", field });
-                                setModalError("");
-                              }}
-                              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                              title="Edit"
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              onClick={() => setDeleteConfirm(field)}
-                              className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                              title="Delete"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
+                            {canWrite && (
+                              <button
+                                onClick={() => {
+                                  setModal({ mode: "edit", field });
+                                  setModalError("");
+                                }}
+                                className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                                title="Edit"
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            {canDelete && (
+                              <button
+                                onClick={() => setDeleteConfirm(field)}
+                                className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                title="Delete"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
                           </div>
                         </td>
                       )}

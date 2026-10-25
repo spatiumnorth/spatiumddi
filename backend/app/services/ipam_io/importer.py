@@ -734,7 +734,14 @@ async def preview_address_import(
     subnet_id: uuid.UUID,
     strategy: Strategy = "fail",
     current_user: Any = None,
+    can_write_ip: Callable[[str], bool] | None = None,
 ) -> ImportPreview:
+    """Dry-run of :func:`commit_address_import`.
+
+    ``can_write_ip`` is the same #103 per-address gate the commit takes: a row
+    it refuses is reported as an error (the commit skips it as
+    ``skipped_no_perm``) and the existing row at that address is not shown.
+    """
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
 
@@ -853,6 +860,17 @@ async def preview_address_import(
             )
             continue
         seen.add(canonical)
+
+        if can_write_ip is not None and not can_write_ip(canonical):
+            preview.errors.append(
+                DiffRow(
+                    kind="address",
+                    action="error",
+                    network=canonical,
+                    reason="No write permission on this address; commit will skip it",
+                )
+            )
+            continue
 
         row_hostname = fields.get("hostname") or ""
         existing_ip = existing.get(canonical)

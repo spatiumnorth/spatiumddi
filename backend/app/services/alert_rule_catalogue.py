@@ -69,6 +69,10 @@ class RuleTypeSpec(BaseModel):
     group: str
     description: str | None = None
     params: list[ParamSpec] = []
+    # A type the platform seeds and drives itself (#2748): it is described
+    # so its Edit dialog can say so, but an operator cannot create one, so
+    # the editor leaves it out of the New-rule picker.
+    system_driven: bool = False
 
 
 def _pct(label: str, default: int | None, hint: str, *, initial: int | None = None) -> ParamSpec:
@@ -91,12 +95,12 @@ def _count(
     hint: str,
     *,
     min_: int = 0,
-    max_: int | None = 100,
+    max_: int | None = None,
     initial: int | None = None,
     name: str = "threshold_percent",
 ) -> ParamSpec:
-    # ``threshold_percent`` is reused as a raw count by several rules; the
-    # API validator still bounds it to 0..100.
+    # ``threshold_percent`` is reused as a raw count by several rules; a
+    # count has no upper bound of its own (#2746), unlike ``_pct``.
     return ParamSpec(
         name=name,
         label=label,
@@ -437,6 +441,23 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     ),
     (a.RULE_TYPE_CLUSTER_DNS_DEGRADED, "Cluster DNS (CoreDNS) degraded", "Infrastructure", []),
     (a.RULE_TYPE_APPLIANCE_STORAGE_DEGRADED, "Appliance storage degraded", "Infrastructure", []),
+    (
+        a.RULE_TYPE_APPLIANCE_DISK_USAGE,
+        "Appliance data partition (/var) filling",
+        "Infrastructure",
+        [
+            _pct(
+                "Warning threshold (%)",
+                80,
+                "Warns when a node's /var data partition is at least this full. "
+                f"Separate from the fixed {a._APPLIANCE_DISK_CRITICAL_PCT}% critical "
+                "level, a few points before the kubelet starts evicting pods at "
+                "about 90% (ext4 keeps 5% of /var for root, so about 90% used "
+                "leaves the kubelet its last 5%). Silent on nodes whose supervisor "
+                "does not report /var.",
+            )
+        ],
+    ),
     (a.RULE_TYPE_APPLIANCE_HEARTBEAT_STALE, "Appliance heartbeat lost", "Infrastructure", []),
     (a.RULE_TYPE_FIREWALL_APPLY_STALLED, "Firewall apply stalled", "Infrastructure", []),
     (a.RULE_TYPE_AGENT_CONFIG_REJECTED, "Agent rejected its configuration", "Infrastructure", []),
@@ -659,6 +680,25 @@ _DESCRIPTIONS: dict[str, str] = {
 }
 
 
+# Seeded by the platform and opened by its own subsystem, deliberately not in
+# ``RULE_TYPES`` (operators cannot create one) — but a stored rule of the type
+# exists on every appliance, and its Edit dialog must be able to describe it.
+_SYSTEM_DRIVEN_SPECS: list[RuleTypeSpec] = [
+    RuleTypeSpec(
+        rule_type=a._CLUSTER_UPGRADE_FAILED,
+        label="Cluster upgrade failed",
+        group="Infrastructure",
+        description=(
+            "Seeded by the platform. The rolling-upgrade orchestrator opens an "
+            "event when an upgrade run fails, while this rule is enabled; it has "
+            "no parameters to set."
+        ),
+        params=[],
+        system_driven=True,
+    ),
+]
+
+
 def build_catalogue() -> list[RuleTypeSpec]:
     """The catalogue, in display order (group, then declaration order)."""
     groups: list[str] = []
@@ -666,7 +706,7 @@ def build_catalogue() -> list[RuleTypeSpec]:
         if group not in groups:
             groups.append(group)
     ordered = sorted(_SPECS, key=lambda s: groups.index(s[2]))
-    return [
+    specs = [
         RuleTypeSpec(
             rule_type=rt,
             label=label,
@@ -676,6 +716,8 @@ def build_catalogue() -> list[RuleTypeSpec]:
         )
         for rt, label, group, params in ordered
     ]
+    specs.extend(_SYSTEM_DRIVEN_SPECS)
+    return specs
 
 
 def rule_type_names() -> set[str]:
