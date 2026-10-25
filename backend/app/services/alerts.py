@@ -944,6 +944,45 @@ def _include_subnet(subnet: Subnet, settings: PlatformSettings | None) -> bool:
     return prefix <= max_prefix
 
 
+# ── Resolve hysteresis for percentage-threshold rules (#2778) ───────────────
+#
+# A rule that opens at ``pct >= threshold`` and, in the same pass, resolves
+# the moment ``pct < threshold`` re-fires and re-delivers on every crossing of
+# a value that merely hovers at the line (a node GC trimming around 80%).
+# ``evaluate_all`` closes every open event whose subject a pass leaves out,
+# so hysteresis lives in the matcher: a subject that ALREADY has an open
+# event keeps matching until it falls ``_PCT_RESOLVE_MARGIN`` points below
+# the threshold. Opening is unchanged (still at the threshold), and a
+# subject with no open event never gets the margin, so existing rules and
+# existing open events behave as before apart from resolving a little later.
+# Severity needs no hysteresis of its own: ``evaluate_all`` only ever raises
+# an open event's severity, so an open critical stays critical until the event
+# resolves, which happens only below the WARNING threshold minus the margin.
+# A critical that dips under its own line therefore neither de-escalates nor
+# re-delivers.
+_PCT_RESOLVE_MARGIN = 5.0
+
+
+def _pct_resolve_floor(threshold: float) -> float:
+    """The value an open event must fall below to resolve."""
+    return threshold - _PCT_RESOLVE_MARGIN
+
+
+async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
+    """``subject_id`` of every unresolved event of ``rule`` (conformity
+    events excluded, as ``evaluate_all`` ignores them)."""
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+
+    rows = await db.execute(
+        select(AlertEvent.subject_id).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+            AlertEvent.subject_type != "conformity",
+        )
+    )
+    return {r[0] for r in rows.all()}
+
+
 # ── Subject evaluation ─────────────────────────────────────────────────────
 
 
@@ -954,13 +993,17 @@ async def _matching_subnet_subjects(
 ) -> list[tuple[str, str, str]]:
     """Return [(subject_id, display, message), ...] for a subnet_utilization rule."""
     threshold = rule.threshold_percent if rule.threshold_percent is not None else 90
-    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= threshold))
+    open_ids = await _open_subject_ids(db, rule)
+    floor = _pct_resolve_floor(float(threshold))
+    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= floor))
     subnets = list(res.scalars().all())
     matches: list[tuple[str, str, str]] = []
     for s in subnets:
         if not _include_subnet(s, settings):
             continue
         pct = float(s.utilization_percent)
+        if pct < threshold and str(s.id) not in open_ids:
+            continue  # inside the resolve margin, but nothing open to hold (#2778)
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
             f"Subnet {display} utilisation {pct:.1f}% (threshold {threshold}%) — "
@@ -1057,13 +1100,18 @@ async def _matching_dhcp_pool_exhaustion_subjects(
 
     # One batched lease query for all pools rather than one per pool (N+1).
     occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+    open_ids = await _open_subject_ids(db, rule)
 
     matches: list[tuple[str, str, str]] = []
     for pool in pools:
         occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
-        over_pct = pct_threshold is not None and occ.percent >= pct_threshold
+        over_pct = pct_threshold is not None and (
+            occ.percent >= pct_threshold
+            # Open event: hold until the margin below the threshold (#2778).
+            or (str(pool.id) in open_ids and occ.percent >= _pct_resolve_floor(pct_threshold))
+        )
         under_free = min_free is not None and occ.free < min_free
         if not (over_pct or under_free):
             continue
@@ -4645,6 +4693,7 @@ async def _matching_appliance_disk_usage_subjects(
         used, total = usage
         pct = used * 100 / total
         size = f"{_fmt_bytes(used)} of {_fmt_bytes(total)}"
+        held_sev = open_severity_by_subject.get(subject_id)
         if pct >= _APPLIANCE_DISK_CRITICAL_PCT:
             matches.append(
                 (
@@ -4669,6 +4718,21 @@ async def _matching_appliance_disk_usage_subjects(
                     "kubelet starts evicting pods (at about 90%); free space or grow "
                     "the data disk before then.",
                     "warning",
+                )
+            )
+        elif held_sev is not None and pct >= _pct_resolve_floor(threshold):
+            # Below the line but inside the resolve margin: an open event
+            # stands (at its own severity, which evaluate_all never lowers)
+            # instead of resolving and re-opening as /var hovers (#2778).
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), below the "
+                    f"rule's {threshold:.0f}% threshold but not yet under "
+                    f"{_pct_resolve_floor(threshold):.0f}%; the alert resolves "
+                    "below that.",
+                    held_sev,
                 )
             )
     return matches

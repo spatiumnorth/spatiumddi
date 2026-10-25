@@ -182,7 +182,7 @@ async def test_endpoint_serves_the_catalogue_to_any_signed_in_user(client, db_se
     import uuid
 
     from app.core.security import create_access_token, hash_password
-    from app.models.auth import User
+    from app.models.auth import Group, Role, User
 
     u = User(
         username=f"u-{uuid.uuid4().hex[:6]}",
@@ -192,6 +192,19 @@ async def test_endpoint_serves_the_catalogue_to_any_signed_in_user(client, db_se
         is_superadmin=False,
     )
     db_session.add(u)
+    await db_session.flush()
+    # The alert routes are gated on ``read:alert`` now.
+    role = Role(
+        name=f"r-{uuid.uuid4().hex[:6]}",
+        description="",
+        permissions=[{"action": "read", "resource_type": "alert"}],
+    )
+    db_session.add(role)
+    await db_session.flush()
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    group.users = [u]
+    db_session.add(group)
     await db_session.commit()
     tok = create_access_token(str(u.id))
 

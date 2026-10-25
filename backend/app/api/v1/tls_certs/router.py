@@ -27,6 +27,7 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
 from app.models.settings import PlatformSettings
 from app.models.tls_cert import (
@@ -294,7 +295,7 @@ async def create_target(body: TLSCertTargetCreate, db: DB, user: CurrentUser) ->
     try:
         from app.tasks.tls_certs import probe_one_target_by_id  # noqa: PLC0415
 
-        probe_one_target_by_id.delay(str(row.id))
+        await dispatch(probe_one_target_by_id, str(row.id))
     except Exception:  # noqa: BLE001
         pass
 
