@@ -26,7 +26,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -94,6 +94,10 @@ class RestoreResponse(BaseModel):
     # Rows left in the trash because a live duplicate exists — only ever
     # non-empty with ``?skip_conflicts=true``; without it a conflict is a 409.
     skipped: list[RestoreConflict] = []
+    # IPAM records not restored because their address's subnet is still in the
+    # Trash (#2732): moved into that subnet's batch, one entry per subnet. They
+    # come back when the subnet is restored and go if it is purged.
+    held_back: list[RestoreConflict] = []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -325,34 +329,19 @@ async def _prepare_subnet_purge(
     auto-generated A / AAAA / PTR / alias records IPAM published for them would
     survive as ownerless rows the agents keep serving. Withdraw them first,
     through the record-op queue.
-    spatiumddi#1906 — the records retracted when the subnet was trashed sit in
-    the Trash under its batch, ownerless once the addresses cascade. They are
-    not served; drop them with the subnet instead of leaving a stray Trash
-    entry per record.
+    spatiumddi#1906 / #2732 — the ones already in the Trash (under the subnet's
+    batch, or a zone's deleted before it) are dropped with the subnet by the
+    same helper, instead of surviving ownerless for a later restore to publish.
     """
     if not subnets:
         return 0, set()
-    subnet_ids = [sub.id for sub in subnets]
-    retracted, groups = await retract_address_records(db, subnet_ids)
+    retracted, groups = await retract_address_records(db, [sub.id for sub in subnets])
     # spatiumddi#2734 — the reverse zones IPAM auto-created for them go too.
     from app.services.dns.reverse_zone import purge_auto_reverse_zones  # noqa: PLC0415
 
     groups = groups | await purge_auto_reverse_zones(
         db, subnets, audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z))
     )
-    batch_ids = {sub.deletion_batch_id for sub in subnets if sub.deletion_batch_id is not None}
-    if batch_ids:
-        await db.execute(
-            sa_delete(DNSRecord)
-            .where(
-                DNSRecord.deletion_batch_id.in_(batch_ids),
-                DNSRecord.auto_generated.is_(True),
-                DNSRecord.ip_address_id.in_(
-                    select(IPAddress.id).where(IPAddress.subnet_id.in_(subnet_ids))
-                ),
-            )
-            .execution_options(include_deleted=True, synchronize_session=False)
-        )
     return retracted, groups
 
 
@@ -710,12 +699,14 @@ async def restore_row(
         batch_id=str(batch_id),
         restored=result.total,
         skipped=len(conflicts),
+        held_back=len(result.held_back),
         user_id=str(current_user.id),
     )
     return RestoreResponse(
         batch_id=batch_id,
         restored=result.total,
         skipped=[RestoreConflict(**c) for c in conflicts],
+        held_back=[RestoreConflict(**c) for c in result.held_back],
     )
 
 

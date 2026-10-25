@@ -1,0 +1,335 @@
+"""A per-node write rides out a transient kubeapi answer (#2449).
+
+Found by ddi-pg's QA of spatiumddi#2388's rolling walk: a three-node Rolling
+Upgrade failed with ``node ddipg-member-3 failed at step cnpg_maintenance_on:
+kubeapi status 500: ...failed calling webhook "mcluster.cnpg.io"...``. The
+step PATCHes the CNPG Cluster once; CloudNativePG's mutating webhook was briefly
+between endpoints (its operator pod had rescheduled off a cordoned node), so the
+API server answered 500, and the single try failed the whole run.
+
+``_run_step_riding_db_failover`` already retries a step that *raised* a transient
+database error (#2177). It did not retry a step that *returned* a failed result,
+which is how the kubeapi helpers report a 500 (``k8s.py`` catches the socket
+error and the HTTP status into ``(False, "kubeapi ...")``). The fix tries the
+idempotent writes again, within a budget, for a transient kubeapi answer only.
+
+* cnpg_maintenance_on, cordon and uncordon ride out a transient 500/408/409/429
+  and a socket error, and succeed when it clears.
+* An answer that never clears fails the step once the budget is spent, with the
+  server's own error, as before.
+* A permission refusal, a sub-500 status, a non-kubeapi error, and a transient
+  answer at a step that is not an idempotent write are not retried.
+* The helpers behind those writes keep the API server's whole answer in the
+  error (up to a bound only a pathological body reaches), so a failed run says
+  why: #2449's run lost the webhook's own reason to a 200-byte cut.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.services.appliance import k8s
+from app.services.upgrades import per_node
+
+# The shape spatiumddi#2449's node saw (truncated as the k8s helper truncates).
+WEBHOOK_500 = (
+    'kubeapi status 500: b\'{"status":"Failure","message":"Internal error '
+    'occurred: failed calling webhook \\"mcluster.cnpg.io\\": failed to call '
+    "webhook: Post ...'"
+)
+SOCKET_ERR = "kubeapi PATCH /api/v1/nodes/ddipg-member-3: [Errno 111] Connection refused"
+
+
+def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """A monotonic clock the step's own sleep advances, so the retry budget is
+    spent without real time passing (the #2177 tests' pattern)."""
+    now = [0.0]
+
+    async def _sleep(delay_s: float) -> None:
+        now[0] += delay_s
+
+    monkeypatch.setattr(per_node, "_db_retry_sleep", _sleep, raising=False)
+    monkeypatch.setattr(per_node, "_db_retry_clock", lambda: now[0], raising=False)
+    return now
+
+
+def _answers(step: str, errors: list[str | None], calls: list[str]):
+    """A ``make`` that returns one StepResult per call from ``errors`` (None =
+    ok), then ok once the list is spent. Records each call."""
+
+    async def make() -> per_node.StepResult:
+        i = len(calls)
+        calls.append(step)
+        err = errors[i] if i < len(errors) else None
+        return per_node.StepResult(name=step, started_at="t").finish(err is None, error=err)
+
+    return make
+
+
+async def _run(
+    step: str,
+    errors: list[str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[per_node.StepResult, list[str]]:
+    _fake_clock(monkeypatch)
+    calls: list[str] = []
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(), step, "ddipg-member-3", _answers(step, errors, calls)
+    )
+    return result, calls
+
+
+# ── the defect: cnpg_maintenance_on rides out the webhook 500 ────────────────
+
+
+async def test_cnpg_maintenance_on_retries_the_webhook_500_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, calls = await _run("cnpg_maintenance_on", [WEBHOOK_500] * 3, monkeypatch)
+    assert result.ok is True
+    assert len(calls) == 4  # three 500s ridden out, then the window is set
+
+
+async def test_a_socket_error_is_also_ridden_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, calls = await _run("cnpg_maintenance_on", [SOCKET_ERR, SOCKET_ERR], monkeypatch)
+    assert result.ok is True
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("step", ["cordon", "uncordon"])
+async def test_cordon_and_uncordon_also_retry_a_transient_answer(
+    step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, calls = await _run(step, [WEBHOOK_500], monkeypatch)
+    assert result.ok is True
+    assert len(calls) == 2
+
+
+async def test_an_answer_that_never_clears_fails_with_its_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Always 500: retried until the budget is spent, then returned as it was.
+    result, calls = await _run("cnpg_maintenance_on", [WEBHOOK_500] * 100, monkeypatch)
+    assert result.ok is False
+    assert result.error == WEBHOOK_500
+    assert len(calls) > 2  # it was tried again and again, not failed at the first
+
+
+# ── scope: only the idempotent writes, only a transient kubeapi answer ───────
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "ServiceAccount not mounted",
+        "kubeapi status 403: b'forbidden'",
+        "kubeapi status 404: b'not found'",
+        "kubeapi status 422: b'invalid'",
+        "rbac forbidden",
+        "step crashed: boom",
+        None,
+    ],
+)
+async def test_cnpg_maintenance_on_does_not_retry_a_non_transient_answer(
+    error: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # None here means "ok on the first call"; the others fail once and stay.
+    result, calls = await _run("cnpg_maintenance_on", [error], monkeypatch)
+    assert len(calls) == 1
+    assert result.ok is (error is None)
+
+
+@pytest.mark.parametrize("step", ["health_gate", "drain", "stage", "cluster_verify"])
+async def test_a_transient_500_at_a_non_write_step_is_not_retried(
+    step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, calls = await _run(step, [WEBHOOK_500], monkeypatch)
+    assert len(calls) == 1  # out of KUBEAPI_RETRY_STEPS: failed at the first try
+    assert result.ok is False
+
+
+# ── the classifier ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("error", "transient"),
+    [
+        (WEBHOOK_500, True),
+        (SOCKET_ERR, True),
+        ("kubeapi status 503: b'unavailable'", True),
+        ("kubeapi status 408: b'timeout'", True),
+        ("kubeapi status 409: b'conflict'", True),
+        ("kubeapi status 429: b'slow down'", True),
+        ("kubeapi status 403: b'forbidden'", False),
+        ("kubeapi status 404: b'gone'", False),
+        ("kubeapi status 422: b'invalid'", False),
+        ("ServiceAccount not mounted", False),
+        ("rbac forbidden", False),
+        ("step crashed: InterfaceError", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_kubeapi_transient_classification(error: str | None, transient: bool) -> None:
+    assert per_node._kubeapi_transient(error) is transient
+
+
+def test_the_retry_steps_are_the_idempotent_writes() -> None:
+    # The write steps that hold or release the node; never a read or a wait.
+    assert per_node.KUBEAPI_RETRY_STEPS == frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})
+
+
+# ── idea 2: the helpers behind the retried writes keep the whole answer ─────
+#
+# #2449's run ended with the API server's answer cut at 200 bytes, just before
+# the admission webhook's own reason. The three helpers behind the retried
+# steps now keep the whole answer, up to a bound only a pathological body
+# reaches.
+
+_WEBHOOK_REASON = (
+    'failed calling webhook "mcluster.cnpg.io": failed to call webhook: Post '
+    '"https://cnpg-webhook-service.spatium.svc:443/mutate-postgresql-cnpg-io-v1-cluster'
+    '?timeout=10s": no endpoints available for service "cnpg-webhook-service"'
+)
+# A Status as the API server returns it for a failed admission call: compact
+# JSON, the message repeated under details.causes.
+WEBHOOK_STATUS_BODY = json.dumps(
+    {
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Failure",
+        "message": f"Internal error occurred: {_WEBHOOK_REASON}",
+        "reason": "InternalError",
+        "details": {"causes": [{"message": _WEBHOOK_REASON}]},
+        "code": 500,
+    },
+    separators=(",", ":"),
+).encode()
+
+_HELPERS = {
+    "cnpg_window": lambda: k8s.patch_cnpg_maintenance_window(
+        "spatium-control-spatiumddi-postgresql", in_progress=True, namespace="spatium"
+    ),
+    "cordon": lambda: k8s.cordon_node("ddipg-member-3"),
+    "uncordon": lambda: k8s.uncordon_node("ddipg-member-3"),
+}
+
+
+def _kubeapi_answers(monkeypatch: pytest.MonkeyPatch, status: int, body: bytes) -> None:
+    monkeypatch.setattr(k8s, "get_config", MagicMock)
+    monkeypatch.setattr(k8s, "_request", lambda *a, **k: (status, body))
+
+
+@pytest.mark.parametrize("helper", sorted(_HELPERS))
+def test_the_helper_keeps_the_api_servers_whole_answer(
+    helper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert len(WEBHOOK_STATUS_BODY) > 200  # the reason sits past the old cut
+    _kubeapi_answers(monkeypatch, 500, WEBHOOK_STATUS_BODY)
+    ok, err = _HELPERS[helper]()
+    assert ok is False
+    assert err == f"kubeapi status 500: {WEBHOOK_STATUS_BODY!r}"
+    assert err is not None and "no endpoints available for service" in err
+    assert per_node._kubeapi_transient(err) is True  # the retry still classifies it
+
+
+@pytest.mark.parametrize("helper", sorted(_HELPERS))
+def test_a_pathological_body_is_still_bounded(helper: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _kubeapi_answers(monkeypatch, 502, b"x" * 100_000)
+    ok, err = _HELPERS[helper]()
+    assert ok is False
+    assert err is not None
+    assert err.count("x") == k8s.KUBEAPI_ERROR_BODY_MAX
+
+
+# ── the real step bodies through the wrapper ────────────────────────────────
+#
+# The tests above drive the wrapper with synthetic results. These run the
+# actual step functions with the kubeapi helpers faked, which is where two
+# gaps sat: uncordon's window clear wraps the helper's answer in its own
+# prefix, and cordon re-reads the node on every attempt.
+
+
+async def test_uncordon_retries_a_transient_window_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The window clear meets the webhook 500 once. The step's error is
+    # "uncordon ok, maintenance-window clear failed: kubeapi status 500 ...",
+    # which does not start "kubeapi ", so the retry has to read the helper's
+    # own answer from the detail.
+    _fake_clock(monkeypatch)
+    window_answers = [(False, WEBHOOK_500), (True, None)]
+    uncordons: list[str] = []
+    monkeypatch.setattr(
+        k8s, "uncordon_node", lambda name: (uncordons.append(name), (True, None))[1]
+    )
+    monkeypatch.setattr(k8s, "patch_cnpg_maintenance_window", lambda *a, **k: window_answers.pop(0))
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(),
+        "uncordon",
+        "ddipg-member-3",
+        lambda: per_node._step_uncordon("ddipg-member-3", "pg-cluster", "spatium"),
+    )
+    assert result.ok is True
+    assert window_answers == []  # the clear was tried twice
+    assert len(uncordons) == 2  # the whole (idempotent) step re-ran
+
+
+async def test_uncordon_does_not_retry_a_refused_window_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_clock(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(k8s, "uncordon_node", lambda name: (True, None))
+
+    def _window(*a: object, **k: object) -> tuple[bool, str]:
+        calls.append("clear")
+        return False, "kubeapi status 403: b'forbidden'"
+
+    monkeypatch.setattr(k8s, "patch_cnpg_maintenance_window", _window)
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(),
+        "uncordon",
+        "ddipg-member-3",
+        lambda: per_node._step_uncordon("ddipg-member-3", "pg-cluster", "spatium"),
+    )
+    assert result.ok is False
+    assert calls == ["clear"]
+    assert result.error is not None and result.error.startswith("uncordon ok,")
+
+
+async def test_a_cordon_retry_keeps_the_first_pre_cordon_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first cordon PATCH landed but its answer was lost (a socket error).
+    # Re-reading the node on the retry would see this run's own cordon and
+    # record it as the operator's, so a failed run's release would leave the
+    # node cordoned. The retry keeps the reading taken before any cordon.
+    _fake_clock(monkeypatch)
+    node_state = {"unschedulable": False}
+
+    def _get_node(name: str) -> tuple[int, dict]:
+        return 200, {"spec": dict(node_state)}
+
+    cordon_answers = [(False, SOCKET_ERR), (True, None)]
+
+    def _cordon(name: str) -> tuple[bool, str | None]:
+        node_state["unschedulable"] = True  # lands whether or not it answers
+        return cordon_answers.pop(0)
+
+    monkeypatch.setattr(k8s, "get_node", _get_node)
+    monkeypatch.setattr(k8s, "cordon_node", _cordon)
+    pre_cordon: dict[str, bool | None] = {}
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(),
+        "cordon",
+        "ddipg-member-3",
+        lambda: per_node._step_cordon("ddipg-member-3", pre_cordon=pre_cordon),
+    )
+    assert result.ok is True
+    assert cordon_answers == []
+    assert result.detail["was_unschedulable"] is False
