@@ -406,3 +406,177 @@ def test_the_bundle_pod_log_is_read_with_context(monkeypatch: pytest.MonkeyPatch
     assert len(pod_log.splitlines()) <= 500
     for line in OPEN_KEY_BODY:
         assert line not in pod_log
+
+
+# ── A key whose last body line is short ─────────────────────────────────
+#
+# A body line is recognised by a 16-character base64 token, and a key's
+# last line is usually shorter. With no END after it, the BEGIN branch of
+# the fragment pass has to take that line by its shape: a base64 token
+# shorter than the full-width lines, with the same log prefix in front.
+
+SHORT_LAST = "AAAAC3NzaC1l"  # 12 characters
+SHORT_KEY_BODY = (*OPEN_KEY_BODY[:9], SHORT_LAST)
+SHORT_KEY_LOG = "\n".join(
+    (
+        "starting",
+        "listening on 8080",
+        "worker ready",
+        "before",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        *SHORT_KEY_BODY,
+    )
+)
+
+
+@pytest.mark.parametrize("window", [5, 11, 12, 14])
+@pytest.mark.parametrize(("path", "param"), ONE_SHOT)
+async def test_a_short_last_key_line_is_not_shown_after_the_marker(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    param: str,
+    window: int,
+) -> None:
+    _stub_tail(monkeypatch, SHORT_KEY_LOG)
+    headers = await _headers(db_session, "admin")
+    r = await client.get(path, params={param: window}, headers=headers)
+    assert r.status_code == 200, r.text
+    for line in SHORT_KEY_BODY:
+        assert line not in r.text, f"{line!r} reached {path} with a {window}-line window"
+    tail = r.json()["tail"]
+    assert tail.splitlines()[-1].endswith("[REDACTED]:pem")
+    assert len(tail.splitlines()) <= window
+
+
+def test_the_diagnostic_bundle_hides_a_short_last_key_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import zipfile
+    from types import SimpleNamespace
+
+    from app.services.appliance import diagnostics as diag_svc
+
+    log_lines = SHORT_KEY_LOG.split("\n")
+    monkeypatch.setattr(diag_svc, "list_log_sources", lambda: [])
+    monkeypatch.setattr(
+        diag_svc, "list_containers", lambda: [SimpleNamespace(name="api-0", is_spatium=True)]
+    )
+    monkeypatch.setattr(
+        diag_svc, "get_container_logs", lambda _n, tail=500: "\n".join(log_lines[-tail:])
+    )
+    monkeypatch.setattr(diag_svc, "run_self_test", lambda: None)
+    monkeypatch.setattr(diag_svc, "_format_self_test_report", lambda _r: "ok")
+    blob = diag_svc.generate_diagnostic_bundle()
+    pod_log = zipfile.ZipFile(io.BytesIO(blob)).read("pods/api-0.log").decode()
+    for line in SHORT_KEY_BODY:
+        assert line not in pod_log
+    assert "[REDACTED]:pem" in pod_log
+
+
+@pytest.mark.parametrize("trailing_newline", [False, True])
+def test_a_short_last_key_line_that_ends_the_text_is_removed(trailing_newline: bool) -> None:
+    from app.services.support_bundle.scrub import redact_secrets
+
+    text = SHORT_KEY_LOG + ("\n" if trailing_newline else "")
+    out = redact_secrets(text)[0]
+    assert SHORT_LAST not in out
+    assert out.rstrip("\n").endswith("[REDACTED]:pem")
+    assert out.startswith("starting\nlistening on 8080\nworker ready\nbefore\n")
+
+
+def test_a_log_line_after_a_short_last_key_line_is_kept() -> None:
+    from app.services.support_bundle.scrub import redact_log_tail, redact_secrets
+
+    text = SHORT_KEY_LOG + "\nserver started on port 8080\nready"
+    out = redact_secrets(text)[0]
+    assert SHORT_LAST not in out
+    assert out.endswith("[REDACTED]:pem\nserver started on port 8080\nready")
+    tail = redact_log_tail(text, 3, requested=100).split("\n")
+    assert tail[0].endswith("[REDACTED]:pem")
+    assert tail[1:] == ["server started on port 8080", "ready"]
+
+
+def test_a_log_line_right_after_the_full_width_lines_is_kept() -> None:
+    """No short last line: the ordinary line after the key is not taken
+    for one, since it says more than one base64-shaped word."""
+    from app.services.support_bundle.scrub import redact_secrets
+
+    text = "\n".join(("-----BEGIN PRIVATE KEY-----", *OPEN_KEY_BODY[:3], "worker ready", "done"))
+    out = redact_secrets(text)[0].split("\n")
+    assert out[-2:] == ["worker ready", "done"]
+    for line in OPEN_KEY_BODY[:3]:
+        assert line not in "\n".join(out)
+
+
+def test_a_prefixed_short_last_key_line_is_removed_and_the_next_line_kept() -> None:
+    """Body lines behind a container-runtime prefix: the short last line has
+    the same prefix and goes; a log line behind that prefix says more and
+    stays."""
+    from app.services.support_bundle.scrub import redact_secrets
+
+    def stamp(n: int, msg: str) -> str:
+        return f"2026-10-24T10:00:{n:02d}.123456789Z stdout F {msg}"
+
+    lines = [stamp(0, "-----BEGIN OPENSSH PRIVATE KEY-----")]
+    lines += [stamp(n + 1, body) for n, body in enumerate(SHORT_KEY_BODY)]
+    lines.append(stamp(30, "listening on 8080"))
+    out = redact_secrets("\n".join(lines))[0]
+    for body in SHORT_KEY_BODY:
+        assert body not in out
+    assert out.endswith(stamp(30, "listening on 8080"))
+
+
+def test_a_short_word_with_a_different_prefix_is_kept() -> None:
+    from app.services.support_bundle.scrub import redact_secrets
+
+    text = "\n".join(
+        ("-----BEGIN PRIVATE KEY-----", *OPEN_KEY_BODY[:2], "INFO done", "kernel: eth0 up")
+    )
+    out = redact_secrets(text)[0].split("\n")
+    assert out[-2:] == ["INFO done", "kernel: eth0 up"]
+
+
+def test_a_short_last_key_line_before_an_end_is_still_removed() -> None:
+    from app.services.support_bundle.scrub import redact_secrets
+
+    text = "\n".join((*SHORT_KEY_BODY, "-----END OPENSSH PRIVATE KEY-----", "next"))
+    out = redact_secrets(text)[0]
+    for line in SHORT_KEY_BODY:
+        assert line not in out
+    assert out.endswith("[REDACTED]:pem\nnext")
+
+
+def test_the_stream_hides_a_short_last_key_line() -> None:
+    from app.services.support_bundle.scrub import LogStreamRedactor
+
+    # BEGIN with no END: everything after the marker is withheld.
+    r = LogStreamRedactor()
+    sent = []
+    for line in SHORT_KEY_LOG.split("\n"):
+        sent += r.feed(line)
+    sent += r.flush()
+    joined = "\n".join(sent)
+    for line in SHORT_KEY_BODY:
+        assert line not in joined
+    assert sent[-1].endswith("[REDACTED]:pem")
+
+    # END with no BEGIN: the held body, short last line included, is dropped.
+    r = LogStreamRedactor()
+    sent = []
+    for line in (*SHORT_KEY_BODY, "-----END OPENSSH PRIVATE KEY-----", "next"):
+        sent += r.feed(line)
+    sent += r.flush()
+    joined = "\n".join(sent)
+    for line in SHORT_KEY_BODY:
+        assert line not in joined
+    assert sent[-1] == "next"
+
+
+def test_a_tail_starting_inside_a_key_drops_its_short_last_line() -> None:
+    from app.services.support_bundle.scrub import redact_log_tail
+
+    text = "\n".join((*SHORT_KEY_BODY, "after the key"))
+    assert redact_log_tail(text, 3, requested=len(SHORT_KEY_BODY) + 1) == "after the key"

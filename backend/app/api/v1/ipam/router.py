@@ -2555,6 +2555,7 @@ async def _sync_dns_record(
         try:
             from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
+            # Honours the subnet's stored skip_reverse_zone opt-out (#2735).
             await ensure_reverse_zones_for_subnet(db, subnet, None)
         except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
             pass
@@ -3795,6 +3796,7 @@ class SubnetUpdate(BaseModel):
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
     show_free_ranges: bool | None = None  # #2137 — explicit null restores default
+    skip_reverse_zone: bool | None = None  # #2735
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -3959,6 +3961,8 @@ class SubnetResponse(BaseModel):
     # per-row would put a hierarchy walk inside every list page.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    # #2735 — opted out of the auto-created reverse zone.
+    skip_reverse_zone: bool = False
     # #2137 — the subnet's own choice; None = use the default rule.
     show_free_ranges: bool | None = None
     # #2137 — name of the integration mirroring this subnet (kubernetes,
@@ -5994,7 +5998,6 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             **body.model_dump(
                 exclude={
                     "skip_auto_addresses",
-                    "skip_reverse_zone",
                     "dns_group_id",
                     "template_id",
                 }
@@ -8878,7 +8881,7 @@ class BackfillReverseZonesResponse(BaseModel):
 
 
 async def _backfill_reverse_zones(
-    db: AsyncSession, subnets: list[Subnet], user: Any
+    db: AsyncSession, subnets: list[Subnet], user: Any, *, honour_opt_out: bool = True
 ) -> BackfillReverseZonesResponse:
     from app.services.dns.reverse_zone import (
         compute_reverse_zone_names,
@@ -8907,7 +8910,9 @@ async def _backfill_reverse_zones(
             resp.skipped += 1
             continue
         try:
-            zones = await ensure_reverse_zones_for_subnet(db, s, user)
+            zones = await ensure_reverse_zones_for_subnet(
+                db, s, user, honour_opt_out=honour_opt_out
+            )
         except Exception:  # noqa: BLE001
             resp.skipped += 1
             continue
@@ -8934,7 +8939,8 @@ async def backfill_reverse_zones_subnet(
     s = await db.get(Subnet, subnet_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
-    resp = await _backfill_reverse_zones(db, [s], current_user)
+    # Asked for by name on this one subnet: overrides its create-time opt-out (#2735).
+    resp = await _backfill_reverse_zones(db, [s], current_user, honour_opt_out=False)
     await db.commit()
     return resp
 

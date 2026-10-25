@@ -43,6 +43,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.config_text import has_control_chars
 from app.core.permissions import user_has_permission
 from app.core.request_meta import get_trusted_client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
@@ -164,6 +165,22 @@ class RuleIn(BaseModel):
             raise ValueError(f"family must be one of {sorted(_FAMILIES)}")
         return v
 
+    @field_validator("comment")
+    @classmethod
+    def _v_comment(cls, v: str | None) -> str | None:
+        # Rendered inside ``comment "..."`` on an nftables rule line. A
+        # double quote or backslash would end or escape that string, and a
+        # newline would end the rule, so the rest would be read as rules of
+        # its own.
+        if v is None:
+            return None
+        if '"' in v or "\\" in v or has_control_chars(v):
+            raise ValueError(
+                "comment must not contain double quotes, backslashes or control "
+                "characters (newline, carriage return, NUL, tab, ...)"
+            )
+        return v
+
     @field_validator("ports")
     @classmethod
     def _v_ports(cls, v: list[int]) -> list[int]:
@@ -197,6 +214,13 @@ class RuleResponse(RuleIn):
     policy_id: uuid.UUID
 
     model_config = {"from_attributes": True}
+
+    @field_validator("comment")
+    @classmethod
+    def _v_comment(cls, v: str | None) -> str | None:
+        # Reading a rule back must not fail on a comment stored before the
+        # write-side check existed; the renderer cleans those on output.
+        return v
 
 
 class PolicyCreate(BaseModel):
