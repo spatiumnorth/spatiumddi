@@ -445,8 +445,9 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "Warning threshold (%)",
                 80,
                 "Warns when a node's /var data partition is at least this full. "
-                "Separate from the fixed 90% critical level, where the kubelet "
-                "starts evicting pods (ext4 keeps 5% of /var for root, so 90% used "
+                f"Separate from the fixed {a._APPLIANCE_DISK_CRITICAL_PCT}% critical "
+                "level, a few points before the kubelet starts evicting pods at "
+                "about 90% (ext4 keeps 5% of /var for root, so about 90% used "
                 "leaves the kubelet its last 5%). Silent on nodes whose supervisor "
                 "does not report /var.",
             )

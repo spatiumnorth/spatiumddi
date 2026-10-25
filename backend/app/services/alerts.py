@@ -386,12 +386,17 @@ RULE_TYPE_APPLIANCE_STORAGE_DEGRADED = "appliance_storage_degraded"
 # Two levels that deliberately do NOT share a knob, as in ``node_pressure``:
 #   * WARNING at the rule's ``threshold_percent`` (default 80): free space or
 #     grow the data disk while the node is still healthy.
-#   * CRITICAL at a fixed 90%, whatever the threshold says. ``/var`` is ext4
-#     with the default 5% reserved for root, and the supervisor's ``used``
-#     counts that reserve as free (``blocks - bfree``), so 90% used leaves the
-#     kubelet its last 5%: ``nodefs.available<5%`` (``eviction-hard`` in the
-#     appliance's k3s config) starts evicting pods there. That line is not a
-#     tuning question, so a threshold set above it does not silence it.
+#   * CRITICAL at a fixed 87%, whatever the threshold says: a few points
+#     BEFORE the kubelet's eviction line, not on it. ``/var`` is ext4 with
+#     the default 5% reserved for root, and the supervisor's ``used`` counts
+#     that reserve as free (``blocks - bfree``), so in those terms the
+#     kubelet's ``nodefs.available<5%`` (``eviction-hard`` in the appliance's
+#     k3s config) and its ``image-gc-high-threshold=95`` both begin at about
+#     89.8% used (the reserve is about 5.2% of the blocks ``statvfs``
+#     counts). The evaluator runs every 60 s on 30 s heartbeats, so a
+#     critical on that line would arrive after the first evictions; at 87% it
+#     pages while there is still room to act. That line is not a tuning
+#     question, so a threshold set above it does not silence it.
 RULE_TYPE_APPLIANCE_DISK_USAGE = "appliance_disk_usage"
 
 
@@ -420,10 +425,11 @@ _APPLIANCE_STORAGE_RULE_NAME = "Appliance storage redundancy degraded"
 _APPLIANCE_DISK_RULE_NAME = "Appliance data partition (/var) filling"
 # The warning threshold when the rule leaves ``threshold_percent`` NULL.
 _APPLIANCE_DISK_USAGE_DEFAULT_PCT = 80
-# Fixed, like ``_NODE_PRESSURE_FULL_CRITICAL_PCT``: where the kubelet's
-# ``nodefs.available<5%`` begins on the appliance's ext4 ``/var`` (5% is
-# reserved for root), counted the way the supervisor reports ``used``.
-_APPLIANCE_DISK_CRITICAL_PCT = 90
+# Fixed, like ``_NODE_PRESSURE_FULL_CRITICAL_PCT``: a few points before the
+# kubelet's ``nodefs.available<5%``, which begins at about 89.8% of the
+# appliance's ext4 ``/var`` counted the way the supervisor reports ``used``
+# (see ``RULE_TYPE_APPLIANCE_DISK_USAGE``).
+_APPLIANCE_DISK_CRITICAL_PCT = 87
 # A ``/var`` reading older than this says nothing about now. The upgrade
 # pre-flight's own bound (``_NODE_DISK_REPORT_MAX_AGE_SECONDS``, #1234); the
 # supervisor heartbeats every ~30 s.
@@ -4639,11 +4645,11 @@ async def _matching_appliance_disk_usage_subjects(
                 (
                     subject_id,
                     a.hostname,
-                    f"/var on {a.hostname} is {pct:.0f}% full ({size}). The kubelet "
-                    "is down to its last 5% of free space there (ext4 keeps "
-                    "another 5% for root) and evicts pods, the control plane's "
-                    "among them, until space is freed. Free space or grow the data "
-                    "disk now.",
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or near "
+                    "the kubelet's eviction line: from about 90% used the kubelet "
+                    "is down to its last 5% of free space (ext4 keeps another 5% "
+                    "for root) and evicts pods, the control plane's among them, "
+                    "until space is freed. Free space or grow the data disk now.",
                     "critical",
                 )
             )
@@ -4653,9 +4659,10 @@ async def _matching_appliance_disk_usage_subjects(
                     subject_id,
                     a.hostname,
                     f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or above "
-                    f"the rule's {threshold:.0f}% threshold. The kubelet starts "
-                    f"evicting pods at {_APPLIANCE_DISK_CRITICAL_PCT}% used; free "
-                    "space or grow the data disk before then.",
+                    f"the rule's {threshold:.0f}% threshold. The alert turns critical "
+                    f"at {_APPLIANCE_DISK_CRITICAL_PCT}% used, a few points before the "
+                    "kubelet starts evicting pods (at about 90%); free space or grow "
+                    "the data disk before then.",
                     "warning",
                 )
             )
@@ -5597,13 +5604,15 @@ async def seed_appliance_disk_usage_alert_rule() -> None:
                 description=(
                     "Fires when an appliance's /var data partition (Postgres, "
                     "container images, logs) fills. Warning at the threshold "
-                    "(80% by default); critical at 90% used whatever the "
-                    "threshold, where the kubelet is down to its last 5% of free "
-                    "space (ext4 keeps another 5% for root) and starts evicting "
-                    "pods, the control plane's among them. Silent on supervisors "
-                    "that do not report /var; a reading that stops arriving holds "
-                    "an open alert rather than resolving it. Auto-resolves when "
-                    "usage drops below the threshold."
+                    f"({_APPLIANCE_DISK_USAGE_DEFAULT_PCT}% by default); critical at "
+                    f"{_APPLIANCE_DISK_CRITICAL_PCT}% used whatever the threshold, a "
+                    "few points before the kubelet's eviction line: from about 90% "
+                    "used the kubelet is down to its last 5% of free space (ext4 "
+                    "keeps another 5% for root) and evicts pods, the control "
+                    "plane's among them. Silent on supervisors that do not report "
+                    "/var; a reading that stops arriving holds an open alert rather "
+                    "than resolving it. Auto-resolves when usage drops below the "
+                    "threshold."
                 ),
                 rule_type=RULE_TYPE_APPLIANCE_DISK_USAGE,
                 severity="warning",

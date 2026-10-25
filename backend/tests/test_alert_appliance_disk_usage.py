@@ -7,8 +7,9 @@ alarmed on it. A seven-node cluster loaded towards a million devices filled
 quiet. The kubelet starts evicting pods, the control plane's included, once
 less than 5% of ``/var`` is available to it.
 
-The rule warns at the operator's threshold and is critical at the kubelet's
-eviction line, per appliance, and follows the ``appliance_storage_degraded``
+The rule warns at the operator's threshold and is critical a few points
+before the kubelet's eviction line, per appliance, and follows the
+``appliance_storage_degraded``
 (#999) conventions: a reading that does not exist is not a match, and a
 reading that disappears or goes stale holds an open event instead of
 announcing a recovery that nobody observed.
@@ -146,6 +147,8 @@ def test_rule_type_is_registered_and_catalogued() -> None:
     assert [p.name for p in spec.params] == ["threshold_percent"]
     assert spec.params[0].default == 80
     assert spec.params[0].unit == "%"
+    # The editor's hint quotes the critical level the matcher uses.
+    assert "fixed 87% critical level" in (spec.params[0].hint or "")
 
 
 # ── the matcher ────────────────────────────────────────────────────────────
@@ -170,26 +173,37 @@ async def test_var_at_or_over_the_threshold_warns_and_below_is_silent(
     assert "34.4 GiB of 40.0 GiB" in message
 
 
-async def test_the_kubelet_eviction_line_is_critical_whatever_the_threshold(
+async def test_critical_comes_before_the_kubelet_eviction_line_whatever_the_threshold(
     db_session: AsyncSession,
 ) -> None:
-    """At 90% used by the supervisor's count, the 5% ext4 keeps for root
-    leaves the kubelet its last 5%: ``nodefs.available<5%`` starts evicting.
-    That is not a tuning question, so a threshold set above it does not
-    silence it, the same way ``node_pressure``'s fixed full-stall floor is
-    critical whatever its threshold says."""
-    line = await _node(db_session, var=_pct_of(40 * GIB, 90))
+    """Critical at 87% used by the supervisor's count, a few points BEFORE the
+    eviction line. ext4 keeps about 5.2% of the blocks ``statvfs`` counts for
+    root and the supervisor counts that reserve as free, so the kubelet's
+    ``nodefs.available<5%`` (and ``image-gc-high-threshold=95``) begin at about
+    89.8% used. The evaluator runs every 60 s on 30 s heartbeats, so a critical
+    ON that line would page after the first evictions. The line is not a tuning
+    question, so a threshold set above it does not silence it, the same way
+    ``node_pressure``'s fixed full-stall floor is critical whatever its
+    threshold says."""
+    # 100 GiB keeps 87% exact; of 40 GiB, int() makes it 86.99999...%.
+    at = await _node(db_session, var=_pct_of(100 * GIB, 87))
+    line = await _node(db_session, var=_pct_of(100 * GIB, 89.8))
     past = await _node(db_session, var=_pct_of(64 * GIB, 97))
-    under = await _node(db_session, var=_pct_of(40 * GIB, 89.9))
+    under = await _node(db_session, var=_pct_of(100 * GIB, 86.9))
 
     got = await _match(db_session)
+    assert got[str(at.id)][2] == "critical"
     assert got[str(line.id)][2] == "critical"
     assert got[str(past.id)][2] == "critical"
     assert got[str(under.id)][2] == "warning"
-    assert "evict" in got[str(past.id)][1]
+    assert "evict" in got[str(at.id)][1] and "evict" in got[str(past.id)][1]
+    # The warning names where it turns critical, and the eviction line after it.
+    assert "critical at 87% used" in got[str(under.id)][1]
+    assert "about 90%" in got[str(under.id)][1]
 
     # A threshold above the line still leaves the line critical.
     got = await _match(db_session, _rule(threshold=95))
+    assert got[str(at.id)][2] == "critical"
     assert got[str(line.id)][2] == "critical"
     assert got[str(past.id)][2] == "critical"
     assert str(under.id) not in got
@@ -362,6 +376,8 @@ async def test_seed_creates_one_enabled_rule_and_never_overrides_the_operator(
     assert len(rules) == 1
     assert rules[0].enabled is True
     assert rules[0].threshold_percent == 80
+    # The description quotes the levels the matcher uses.
+    assert "(80% by default); critical at 87% used" in rules[0].description
 
     rules[0].enabled = False
     await db_session.commit()

@@ -5,9 +5,10 @@
   devices filled `/var` to 88-91% on every node with no alert.
   - **`appliance_disk_usage` rule:** seeded on. It warns when a node's
     `/var` data partition passes its threshold (80% by default) and is
-    critical at 90%, where the kubelet starts evicting pods. A node that
-    reports no `/var` never matches, and a reading that disappears or
-    goes stale holds the open alert instead of resolving it.
+    critical at 87%, a few points before the kubelet starts evicting pods
+    at about 90%. A node that reports no `/var` never matches, and a
+    reading that disappears or goes stale holds the open alert instead of
+    resolving it.
   - **Sizing:** `docs/deployment/APPLIANCE.md` gives the `/var` each disk
     size leaves and recommends 64 GiB or more per control-plane node for
     about 1M devices.
