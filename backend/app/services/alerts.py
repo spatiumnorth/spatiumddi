@@ -372,6 +372,33 @@ RULE_TYPE_CLUSTER_DNS_DEGRADED = "cluster_dns_degraded"
 # not a clean bill of health.
 RULE_TYPE_APPLIANCE_STORAGE_DEGRADED = "appliance_storage_degraded"
 
+# Issue #2240: an appliance's ``/var`` data partition filling. Subject =
+# appliance.
+#
+# ``/var`` holds Postgres, the container images and the logs, and every
+# supervisor already reports it (``host_disk_partitions`` inside
+# ``cluster_health``, #402) for the Cluster overview's node cards and the
+# upgrade pre-flight. Nothing alarmed on it: a seven-node cluster loaded
+# towards a million devices filled ``/var`` (23 GiB of a 40 GiB disk) to
+# 88-91% on every node with every alert quiet, a few points short of the
+# kubelet's eviction line.
+#
+# Two levels that deliberately do NOT share a knob, as in ``node_pressure``:
+#   * WARNING at the rule's ``threshold_percent`` (default 80): free space or
+#     grow the data disk while the node is still healthy.
+#   * CRITICAL at a fixed 87%, whatever the threshold says: a few points
+#     BEFORE the kubelet's eviction line, not on it. ``/var`` is ext4 with
+#     the default 5% reserved for root, and the supervisor's ``used`` counts
+#     that reserve as free (``blocks - bfree``), so in those terms the
+#     kubelet's ``nodefs.available<5%`` (``eviction-hard`` in the appliance's
+#     k3s config) and its ``image-gc-high-threshold=95`` both begin at about
+#     89.8% used (the reserve is about 5.2% of the blocks ``statvfs``
+#     counts). The evaluator runs every 60 s on 30 s heartbeats, so a
+#     critical on that line would arrive after the first evictions; at 87% it
+#     pages while there is still room to act. That line is not a tuning
+#     question, so a threshold set above it does not silence it.
+RULE_TYPE_APPLIANCE_DISK_USAGE = "appliance_disk_usage"
+
 
 class AlertDataUnavailable(Exception):
     """A rule could not be evaluated because its input is temporarily gone.
@@ -395,6 +422,18 @@ _NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
 _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
 _APPLIANCE_STORAGE_RULE_NAME = "Appliance storage redundancy degraded"
+_APPLIANCE_DISK_RULE_NAME = "Appliance data partition (/var) filling"
+# The warning threshold when the rule leaves ``threshold_percent`` NULL.
+_APPLIANCE_DISK_USAGE_DEFAULT_PCT = 80
+# Fixed, like ``_NODE_PRESSURE_FULL_CRITICAL_PCT``: a few points before the
+# kubelet's ``nodefs.available<5%``, which begins at about 89.8% of the
+# appliance's ext4 ``/var`` counted the way the supervisor reports ``used``
+# (see ``RULE_TYPE_APPLIANCE_DISK_USAGE``).
+_APPLIANCE_DISK_CRITICAL_PCT = 87
+# A ``/var`` reading older than this says nothing about now. The upgrade
+# pre-flight's own bound (``_NODE_DISK_REPORT_MAX_AGE_SECONDS``, #1234); the
+# supervisor heartbeats every ~30 s.
+_APPLIANCE_DISK_REPORT_MAX_AGE = timedelta(minutes=10)
 
 # Appliance heartbeat silence (#2259). Subject = the appliance. The
 # supervisor heartbeats every ~30 s; the Fleet UI greys its reported-state
@@ -691,6 +730,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+        RULE_TYPE_APPLIANCE_DISK_USAGE,
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
@@ -910,6 +950,45 @@ def _include_subnet(subnet: Subnet, settings: PlatformSettings | None) -> bool:
     return prefix <= max_prefix
 
 
+# ── Resolve hysteresis for percentage-threshold rules (#2778) ───────────────
+#
+# A rule that opens at ``pct >= threshold`` and, in the same pass, resolves
+# the moment ``pct < threshold`` re-fires and re-delivers on every crossing of
+# a value that merely hovers at the line (a node GC trimming around 80%).
+# ``evaluate_all`` closes every open event whose subject a pass leaves out,
+# so hysteresis lives in the matcher: a subject that ALREADY has an open
+# event keeps matching until it falls ``_PCT_RESOLVE_MARGIN`` points below
+# the threshold. Opening is unchanged (still at the threshold), and a
+# subject with no open event never gets the margin, so existing rules and
+# existing open events behave as before apart from resolving a little later.
+# Severity needs no hysteresis of its own: ``evaluate_all`` only ever raises
+# an open event's severity, so an open critical stays critical until the event
+# resolves, which happens only below the WARNING threshold minus the margin.
+# A critical that dips under its own line therefore neither de-escalates nor
+# re-delivers.
+_PCT_RESOLVE_MARGIN = 5.0
+
+
+def _pct_resolve_floor(threshold: float) -> float:
+    """The value an open event must fall below to resolve."""
+    return threshold - _PCT_RESOLVE_MARGIN
+
+
+async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
+    """``subject_id`` of every unresolved event of ``rule`` (conformity
+    events excluded, as ``evaluate_all`` ignores them)."""
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+
+    rows = await db.execute(
+        select(AlertEvent.subject_id).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+            AlertEvent.subject_type != "conformity",
+        )
+    )
+    return {r[0] for r in rows.all()}
+
+
 # ── Subject evaluation ─────────────────────────────────────────────────────
 
 
@@ -920,13 +999,17 @@ async def _matching_subnet_subjects(
 ) -> list[tuple[str, str, str]]:
     """Return [(subject_id, display, message), ...] for a subnet_utilization rule."""
     threshold = rule.threshold_percent if rule.threshold_percent is not None else 90
-    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= threshold))
+    open_ids = await _open_subject_ids(db, rule)
+    floor = _pct_resolve_floor(float(threshold))
+    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= floor))
     subnets = list(res.scalars().all())
     matches: list[tuple[str, str, str]] = []
     for s in subnets:
         if not _include_subnet(s, settings):
             continue
         pct = float(s.utilization_percent)
+        if pct < threshold and str(s.id) not in open_ids:
+            continue  # inside the resolve margin, but nothing open to hold (#2778)
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
             f"Subnet {display} utilisation {pct:.1f}% (threshold {threshold}%) — "
@@ -1023,13 +1106,18 @@ async def _matching_dhcp_pool_exhaustion_subjects(
 
     # One batched lease query for all pools rather than one per pool (N+1).
     occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+    open_ids = await _open_subject_ids(db, rule)
 
     matches: list[tuple[str, str, str]] = []
     for pool in pools:
         occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
-        over_pct = pct_threshold is not None and occ.percent >= pct_threshold
+        over_pct = pct_threshold is not None and (
+            occ.percent >= pct_threshold
+            # Open event: hold until the margin below the threshold (#2778).
+            or (str(pool.id) in open_ids and occ.percent >= _pct_resolve_floor(pct_threshold))
+        )
         under_free = min_free is not None and occ.free < min_free
         if not (over_pct or under_free):
             continue
@@ -4531,6 +4619,192 @@ async def _matching_appliance_storage_subjects(
     return matches
 
 
+def _var_usage(cluster_health: Any) -> tuple[int, int] | None:
+    """``(used_bytes, total_bytes)`` of a node's ``/var`` from its reported
+    ``host_disk_partitions``, or None when there is no usable reading.
+
+    None means UNKNOWN (key absent, no ``/var`` entry, a non-integer, a
+    boolean, a zero total, a used figure outside ``0..total``), never empty
+    and never full. The upgrade pre-flight's ``_node_var_free_bytes`` reads
+    the same entry with the same type checks, and parts from this only on
+    readings a supervisor never sends (``read_host_disk_partitions`` reports
+    one ``/var``, ``used = blocks - bfree`` of ``total = blocks``): it takes a
+    used figure outside ``0..total`` (one above the total as no free space),
+    and it reads on past a malformed ``/var`` entry to a later one. On every
+    reading a supervisor can send, the two agree about one node.
+    """
+    if not isinstance(cluster_health, dict):
+        return None
+    parts = cluster_health.get("host_disk_partitions")
+    if not isinstance(parts, list):
+        return None
+    for p in parts:
+        if not isinstance(p, dict) or p.get("mount") != "/var":
+            continue
+        total, used = p.get("total_bytes"), p.get("used_bytes")
+        if (
+            isinstance(total, int)
+            and isinstance(used, int)
+            and not isinstance(total, bool)
+            and not isinstance(used, bool)
+            and total > 0
+            and 0 <= used <= total
+        ):
+            return used, total
+        return None
+    return None
+
+
+async def _matching_appliance_disk_usage_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for appliances
+    whose ``/var`` data partition is filling (#2240).
+
+    Reads the ``host_disk_partitions`` the supervisor folds into its
+    ``cluster_health`` (#402), the reading behind the Cluster overview's node
+    cards and the upgrade pre-flight's headroom check. Warning at the rule's
+    ``threshold_percent`` (default :data:`_APPLIANCE_DISK_USAGE_DEFAULT_PCT`),
+    critical at :data:`_APPLIANCE_DISK_CRITICAL_PCT` whatever the threshold
+    (see ``RULE_TYPE_APPLIANCE_DISK_USAGE``).
+
+    Silent where there is no reading: revoked and unapproved rows, and a
+    supervisor that reports no usable ``/var``. A reading that DISAPPEARS, or
+    one older than :data:`_APPLIANCE_DISK_REPORT_MAX_AGE` (the node stopped
+    heartbeating, and its last ``cluster_health`` is all that is left), opens
+    nothing new. If it already has an OPEN event, the appliance is re-matched
+    at that event's severity, which ``evaluate_all`` treats as a no-op (it
+    never downgrades and never re-delivers an unchanged severity), so the
+    event stands until a fresh reading decides: ``evaluate_all`` resolves
+    every subject a pass leaves out, and unknown is not recovered. The same
+    hold ``appliance_storage_degraded`` applies; ``appliance_heartbeat_stale``
+    reports the silence itself.
+    """
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+
+    # ``is not None``, not ``or``: 0 is a legitimate (if loud) threshold that
+    # matches every node reporting ``/var``, and ``or`` would rewrite it to 80.
+    threshold = float(
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _APPLIANCE_DISK_USAGE_DEFAULT_PCT
+    )
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.revoked_at.is_(None),
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    open_severity_by_subject: dict[str, str] = {
+        ev.subject_id: ev.severity
+        for ev in (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+
+    cutoff = now - _APPLIANCE_DISK_REPORT_MAX_AGE
+    matches: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        subject_id = str(a.id)
+        seen = a.last_seen_at
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        fresh = seen is not None and seen >= cutoff
+        usage = _var_usage(a.cluster_health) if fresh else None
+        if usage is None:
+            held = open_severity_by_subject.get(subject_id)
+            if held is None:
+                continue  # no reading: UNKNOWN, not healthy, not an alarm
+            if not fresh:
+                since = seen.isoformat() if seen is not None else "never"
+                why = (
+                    f"The supervisor on {a.hostname} has not reported /var for over "
+                    f"{int(_APPLIANCE_DISK_REPORT_MAX_AGE.total_seconds() // 60)} min "
+                    f"(last heartbeat: {since}), so its last reading says nothing "
+                    "about now."
+                )
+            else:
+                why = (
+                    f"/var on {a.hostname} can no longer be read: the supervisor has "
+                    "stopped reporting its partitions (it may have been rolled back "
+                    "to a slot that predates them)."
+                )
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"{why} The open alert is left standing because unknown is not " "recovered.",
+                    held,
+                )
+            )
+            continue
+        used, total = usage
+        pct = used * 100 / total
+        size = f"{_fmt_bytes(used)} of {_fmt_bytes(total)}"
+        held_sev = open_severity_by_subject.get(subject_id)
+        if pct >= _APPLIANCE_DISK_CRITICAL_PCT:
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or near "
+                    "the kubelet's eviction line: from about 90% used the kubelet "
+                    "is down to its last 5% of free space (ext4 keeps another 5% "
+                    "for root) and evicts pods, the control plane's among them, "
+                    "until space is freed. Free space or grow the data disk now.",
+                    "critical",
+                )
+            )
+        elif pct >= threshold:
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or above "
+                    f"the rule's {threshold:.0f}% threshold. The alert turns critical "
+                    f"at {_APPLIANCE_DISK_CRITICAL_PCT}% used, a few points before the "
+                    "kubelet starts evicting pods (at about 90%); free space or grow "
+                    "the data disk before then.",
+                    "warning",
+                )
+            )
+        elif held_sev is not None and pct >= _pct_resolve_floor(threshold):
+            # Below the line but inside the resolve margin: an open event
+            # stands (at its own severity, which evaluate_all never lowers)
+            # instead of resolving and re-opening as /var hovers (#2778).
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), below the "
+                    f"rule's {threshold:.0f}% threshold but not yet under "
+                    f"{_pct_resolve_floor(threshold):.0f}%; the alert resolves "
+                    "below that.",
+                    held_sev,
+                )
+            )
+    return matches
+
+
 async def _evaluate_circuit_status_changed_rule(
     db: AsyncSession,
     rule: AlertRule,
@@ -5448,6 +5722,51 @@ async def seed_appliance_storage_alert_rule() -> None:
                 rule_type=RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
                 severity="warning",
                 enabled=True,
+            )
+        )
+        await session.commit()
+
+
+async def seed_appliance_disk_usage_alert_rule() -> None:
+    """Seed the #2240 rule, ENABLED by default, warning at 80%.
+
+    Safe on everywhere: it needs no configuration, cannot fire where the
+    reading does not exist (a supervisor that reports no ``/var`` is
+    skipped), and is silent on every node below 80%. Severity is decided by
+    the matcher per node, so the rule's own severity is only the floor.
+
+    Keyed on ``name``, like the other startup-seeded infrastructure rules: an
+    operator who disables or retunes it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _APPLIANCE_DISK_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_APPLIANCE_DISK_RULE_NAME,
+                description=(
+                    "Fires when an appliance's /var data partition (Postgres, "
+                    "container images, logs) fills. Warning at the threshold "
+                    f"({_APPLIANCE_DISK_USAGE_DEFAULT_PCT}% by default); critical at "
+                    f"{_APPLIANCE_DISK_CRITICAL_PCT}% used whatever the threshold, a "
+                    "few points before the kubelet's eviction line: from about 90% "
+                    "used the kubelet is down to its last 5% of free space (ext4 "
+                    "keeps another 5% for root) and evicts pods, the control "
+                    "plane's among them. Silent on supervisors that do not report "
+                    "/var; a reading that stops arriving holds an open alert rather "
+                    "than resolving it. Auto-resolves when usage drops below the "
+                    "threshold."
+                ),
+                rule_type=RULE_TYPE_APPLIANCE_DISK_USAGE,
+                severity="warning",
+                enabled=True,
+                threshold_percent=_APPLIANCE_DISK_USAGE_DEFAULT_PCT,
             )
         )
         await session.commit()
@@ -7532,6 +7851,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in storage_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_DISK_USAGE:
+                disk_hits = await _matching_appliance_disk_usage_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in disk_hits]
                 subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_APPLIANCE_HEARTBEAT_STALE:
                 silent_nodes = await _matching_appliance_heartbeat_stale_subjects(db, rule, now)

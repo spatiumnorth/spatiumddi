@@ -523,6 +523,28 @@ reports them, so re-create the address before committing any deletions.
 
 ---
 
+## A Postgres standby is `lost` and never rejoins (CNPG)
+
+With no WAL archive, WAL lives only in each instance's `pg_wal`. The Cluster caps
+what a replication slot may hold back (`max_slot_wal_keep_size: 3GB`, #2317), so
+a standby that falls further behind than that loses its slot (`wal_status =
+lost`) and can never catch up by streaming. A former primary whose `pg_rewind`
+needs WAL that is gone loops the same way. CNPG retries both for ever, and the
+cluster-health database row reads `degraded` (`readyInstances` below `instances`).
+
+Rebuild that one instance from the primary. Never the primary itself:
+
+```bash
+# k3s appliance; <n> is the stuck instance's number, not the primary's.
+kubectl -n spatium cnpg destroy <cluster> <n>
+# or, without the plugin: delete its PVC, then its pod
+kubectl -n spatium delete pvc <cluster>-<n>
+kubectl -n spatium delete pod <cluster>-<n>
+```
+
+CNPG joins a fresh copy from the primary. Do one instance at a time and wait for it
+to be Ready.
+
 ## `/health/platform` says `celery-beat` is unhealthy
 
 **Read the component name as a symptom, not a diagnosis.** Beat only

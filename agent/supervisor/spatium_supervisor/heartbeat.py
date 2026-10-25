@@ -762,6 +762,65 @@ def _maybe_apply_firewall(
         log.warning("supervisor.firewall.trigger_write_failed", error=str(exc))
 
 
+def _dispatch_firewall(
+    fw_settings: object,
+    role_assignment: dict[str, Any] | None,
+    log: structlog.stdlib.BoundLogger,
+    cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
+) -> None:
+    """#285 Phase 2a bundle-first / renderer-fallback dispatch, one tick.
+
+    Extracted from ``heartbeat_once`` (#2774) so the guard and its fallback are
+    tested as the single decision they are: a refused server body must still
+    leave the node converging on the in-pod render.
+    """
+    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
+
+    if use_bundle:
+        if appliance_state.maybe_fire_firewall_reload(fw_settings):
+            log.info(
+                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
+            )
+    else:
+        # #5 fallback — control plane too old to render, firewall_enabled
+        # still off, or its body refused by the #593 guard; render in-pod from
+        # the same derived inputs. The in-pod render carries NO fleet-policy
+        # rules (those are server-only), so a refusal costs enforcement on this
+        # node until the server body is acceptable — which is why the guard
+        # must refuse only a body that would really partition (#2774).
+        #
+        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
+        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
+        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
+        # rendered drop-in is now the SOLE source of that accept, so it must be
+        # present on EVERY appliance node — including idle / non-CP nodes that
+        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
+        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
+        # runner short-circuits on an unchanged body hash, so an unconditional
+        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
+        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
+        # a separate file the glob pulls in, so even a total drop-in failure
+        # still leaves the node SSH-recoverable.
+        _maybe_apply_firewall(
+            role_assignment,
+            log,
+            cluster_peer_cidrs,
+            pod_cidrs=pod_cidrs,
+            service_cidrs=service_cidrs,
+            cp_member_count=cp_member_count,
+            vip_configured=vip_configured,
+            web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+            ssh_scope_cidrs=ssh_scope_cidrs,
+        )
+
+
 def _server_firewall_body_is_usable(
     fw_settings: object, log: structlog.stdlib.BoundLogger
 ) -> bool:
@@ -781,14 +840,38 @@ def _server_firewall_body_is_usable(
 
     The structural test runs first, so a body that already opens 2380 — every
     healthy control-plane node — costs no apiserver read.
+
+    #2774 — the decision is the SAME predicate the in-pod path uses
+    (``would_self_partition`` over the live peer set), so the two paths cannot
+    disagree about a node. A readable sole etcd member (a one-node install) has
+    no raft peer to be cut off from, so the server's correct body has no peer
+    rule and must be used: refusing it sent every one-node install down the
+    in-pod renderer, which carries no fleet-policy rules, so an enforced fleet
+    rule never reached the host and the Firewall view reported drift forever.
+    The in-pod path got this exemption in #610; this path never did.
     """
     if not isinstance(fw_settings, dict) or not fw_settings.get("config_hash"):
         return False
 
     conf = str(fw_settings.get("firewall_conf") or "")
     if firewall_peer_audit.body_opens_etcd_peers(conf):
+        # A body we are willing to pipe is, by construction, one that keeps
+        # this node in raft — drop any earlier refusal marker, or a node that
+        # healed keeps reporting a divergence it no longer has. The in-pod
+        # path clears it the same way when it writes.
+        appliance_state.clear_firewall_refusal()
         return True
-    if firewall_peer_audit.local_node_is_etcd_member() is not True:
+
+    is_etcd_member = firewall_peer_audit.local_node_is_etcd_member()
+    live_peers = None
+    if is_etcd_member is True:
+        live_peers = firewall_peer_audit.observed_peer_cidrs(
+            appliance_state.read_node_ips() or []
+        )
+    if not firewall_peer_audit.would_self_partition(
+        conf, is_etcd_member=is_etcd_member, live_peers=live_peers
+    ):
+        appliance_state.clear_firewall_refusal()
         return True
 
     reason = (
@@ -1634,6 +1717,14 @@ def heartbeat_once(
         _local_changed, local_err = k8s_api.ensure_kube_dns_node_local()
         if local_err:
             log.warning("supervisor.heartbeat.kube_dns_node_local_failed", error=local_err)
+        # #2240: the CNPG operator IS Postgres failover, and firstboot starts
+        # both its replicas on the seed while the seed is alone; preferred
+        # anti-affinity never moves them. From three nodes the reconciler
+        # makes the spread required (a two-replica rollout needs a third node
+        # for its surge pod), and removes it again below three.
+        _op_changed, op_err = k8s_api.ensure_cnpg_operator_spread()
+        if op_err:
+            log.warning("supervisor.heartbeat.cnpg_operator_spread_failed", error=op_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
@@ -1684,41 +1775,18 @@ def heartbeat_once(
     # the BYTE-IDENTICAL body, so applied state is the same whichever ran —
     # this is what makes the rolling upgrade (supervisor/control-plane skew in
     # either direction) safe.
-    fw_settings = body_out.get("firewall_settings")
-    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
-
-    if use_bundle:
-        if appliance_state.maybe_fire_firewall_reload(fw_settings):
-            log.info(
-                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
-            )
-    else:
-        # #5 fallback — control plane too old to render, or firewall_enabled
-        # still off; render in-pod from the same derived inputs.
-        #
-        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
-        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
-        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
-        # rendered drop-in is now the SOLE source of that accept, so it must be
-        # present on EVERY appliance node — including idle / non-CP nodes that
-        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
-        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
-        # runner short-circuits on an unchanged body hash, so an unconditional
-        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
-        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
-        # a separate file the glob pulls in, so even a total drop-in failure
-        # still leaves the node SSH-recoverable.
-        _maybe_apply_firewall(
-            role_assignment,
-            log,
-            cluster_peer_cidrs,
-            pod_cidrs=fw_pod_cidrs,
-            service_cidrs=fw_service_cidrs,
-            cp_member_count=fw_cp_member_count,
-            vip_configured=fw_vip_configured,
-            web_ui_allowed_cidrs=fw_web_ui_cidrs,
-            ssh_scope_cidrs=fw_ssh_scope_cidrs,
-        )
+    _dispatch_firewall(
+        body_out.get("firewall_settings"),
+        role_assignment,
+        log,
+        cluster_peer_cidrs,
+        pod_cidrs=fw_pod_cidrs,
+        service_cidrs=fw_service_cidrs,
+        cp_member_count=fw_cp_member_count,
+        vip_configured=fw_vip_configured,
+        web_ui_allowed_cidrs=fw_web_ui_cidrs,
+        ssh_scope_cidrs=fw_ssh_scope_cidrs,
+    )
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
