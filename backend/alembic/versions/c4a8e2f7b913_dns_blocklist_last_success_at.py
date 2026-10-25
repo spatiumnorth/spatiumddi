@@ -7,7 +7,7 @@ Backfilled from the rows whose last attempt succeeded; a row whose last
 attempt failed stays NULL, because nothing recorded when it last worked.
 
 Revision ID: c4a8e2f7b913
-Revises: c8d3a1f47e92
+Revises: c2b203844c95
 Create Date: 2026-10-23 09:00:00.000000
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c4a8e2f7b913"
-down_revision = "c8d3a1f47e92"
+down_revision = "c2b203844c95"
 branch_labels = None
 depends_on = None
 
