@@ -34,6 +34,7 @@ drop a lease).
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import unicodedata
 
@@ -675,3 +676,104 @@ def structured_rdata_error(
     except Exception as exc:  # noqa: BLE001 — from_text raises a different type per rdata class
         return f"{rtype} record value {value!r} is not valid {rtype} rdata: {exc}"
     return None
+
+
+def validate_optional_hostname(v: str | None, *, field: str = "hostname") -> str | None:
+    """An optional host name: ``None`` stays ``None``, blank becomes ``""``.
+
+    A whitespace-only value is "no hostname", not a hostname of spaces: kept
+    verbatim it reached the IPAM mirror as a truthy name and was published as
+    a record owner of blanks. A non-blank value must be a legal RFC 1123 host
+    name and is returned normalized (see :func:`validate_hostname`).
+    """
+    if v is None:
+        return None
+    if v.strip() == "":
+        return ""
+    return validate_hostname(v, field=field)
+
+
+def publishable_host_owner_error(hostname: str | None) -> str | None:
+    """Why *hostname* cannot be published as a record owner, or None.
+
+    The IPAM → DNS sync writes ``hostname`` verbatim as the owner of the
+    address's A / AAAA record. The request models validate it, but a row can
+    reach the sync by other paths (importers, integration mirrors, rows stored
+    before a validator existed), so the sync checks it once more. Refused:
+    a blank or whitespace-only name, surrounding whitespace, any control
+    character, the apex (``@``), and anything the RFC 2181 owner rule rejects.
+    """
+    if hostname is None or hostname.strip() == "":
+        return "hostname is blank"
+    if hostname != hostname.strip() or contains_control_chars(hostname):
+        return "hostname contains whitespace or a control character"
+    try:
+        owner = validate_record_owner(hostname, field="hostname")
+    except ValueError as exc:
+        return str(exc)
+    if owner == "@":
+        return "hostname cannot name the zone apex"
+    return None
+
+
+# Record types whose rdata is a single bare target *name*, validated as an
+# FQDN (issue #597). MX / SRV are deliberately excluded: their value may carry
+# the priority / weight / port inline (``10 mail.example.com``) on some client
+# and driver paths, so an FQDN check would reject a legitimate value — the
+# control-character guard still protects them. TXT (freeform, quoted at
+# render), the structured types and A / AAAA are checked their own way.
+HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
+
+
+def record_value_error(
+    record_type: str,
+    value: str,
+    *,
+    priority: int | None = None,
+    weight: int | None = None,
+    port: int | None = None,
+    origin: str | None = None,
+) -> str | None:
+    """Why *value* is not acceptable record data for *record_type*, or None.
+
+    The one rule the REST record endpoints and the operation layer (requests
+    portal, Copilot) share, so the two cannot accept different values:
+
+    * a control character or newline is refused for every type — it is the
+      one thing that ends a zone-file line early and starts another record;
+    * A / AAAA must be a single address of the matching family;
+    * a bare-name target type must be a valid FQDN;
+    * any other type must be rdata dnspython can read
+      (:func:`structured_rdata_error`).
+    """
+    rtype = record_type.upper()
+    if contains_control_chars(value):
+        return (
+            f"{rtype} record value contains a control character or newline, "
+            "which is not allowed in DNS record data."
+        )
+    if rtype in HOSTNAME_TARGET_RECORD_TYPES:
+        try:
+            validate_fqdn(value, field=f"{rtype} record target")
+        except ValueError as exc:
+            return str(exc)
+        return None
+    if rtype not in ("A", "AAAA"):
+        return structured_rdata_error(
+            rtype, value, priority=priority, weight=weight, port=port, origin=origin
+        )
+    try:
+        parsed = ipaddress.ip_address(value.strip())
+    except ValueError:
+        parsed = None
+    if parsed is not None and (
+        (rtype == "A" and parsed.version == 4) or (rtype == "AAAA" and parsed.version == 6)
+    ):
+        return None
+    fam = "IPv4" if rtype == "A" else "IPv6"
+    return (
+        f"{rtype} record value must be a single {fam} address. To point one "
+        "name at several IPs, add one record per address (round-robin) or "
+        "use a DNS Pool for health-checked failover — not a comma-separated "
+        "list in one record."
+    )

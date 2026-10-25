@@ -1418,6 +1418,41 @@ due together are queued a minute apart, at most 55 per sweep so each has run
 before the next sweep looks again; any beyond that go in the next hour,
 longest-overdue first.
 
+#### Which feed URLs can be fetched?
+
+A feed URL is fetched by the control plane, so it goes through the same
+outbound address check as the other operator-configured fetches (integration
+test-connection, WoL calendar feeds):
+
+- **`http` or `https` only.** Any other scheme is a 422 when the list is
+  saved.
+- **Loopback, link-local and the unspecified address are refused**:
+  `127.0.0.0/8`, `::1`, `169.254.0.0/16` (which covers the cloud metadata
+  address), `fe80::/10`, `0.0.0.0/8`, `::`, and IPv4-mapped forms of them.
+  The address is checked when the list is saved (422), again before each
+  fetch, and again when the connection is opened, so a name that answers
+  differently the second time is still refused. Each redirect hop is
+  checked the same way, up to 5 hops.
+- **Private addresses (RFC 1918, IPv6 unique-local) are allowed**, so an
+  internal feed mirror keeps working. There is no setting for this; it is
+  the same line the other guarded fetches draw.
+
+A refused fetch shows `Fetch refused: feed URL target is not permitted` on
+the list and is not retried. Other failures show only the HTTP status or the
+kind of failure (`could not connect`, `timed out`); the detail is in the
+worker log, with the feed URL reduced to its scheme and host. The fetch goes
+direct: `HTTP_PROXY` / `HTTPS_PROXY` in the worker's environment are not
+used.
+
+A feed URL can carry credentials (`https://user:pass@host/list.txt`, or a
+query parameter such as `?token=…`). They are used for the fetch and shown
+nowhere else: the API, the UI and the copilot return the URL with the
+password and any credential-looking query value replaced by `***`, and no
+failure message, worker log line or Celery retry record includes the URL.
+Editing a list sends the masked URL back unchanged, which keeps the stored
+one; to change the URL, type it in full with its credentials — a URL that
+still contains `***` in a credential position is refused (422).
+
 #### Do feed entries block subdomains?
 
 Yes by default, and it is a **per-list** setting — *Block subdomains of
@@ -2217,6 +2252,37 @@ that never passed a field validator — an importer row, a legacy row, a
 future code path — so they still cannot break out of their own record.
 Spaces and quotes are left intact, so structured rdata (CAA / LOC / NAPTR /
 SVCB) renders unharmed.
+
+Those are the control-plane drivers. The zone file an agent-managed BIND9
+server actually loads is written by the **agent**
+(`agent/dns/spatium_dns_agent/drivers/bind9.py`, `_write_zone_file`), which
+does not strip: a record whose owner is blank or contains whitespace or a
+control character, or whose value contains a newline or other control
+character, is **left out** and reported through the partial-apply channel,
+like a record whose rdata does not parse (#2510). Stripping would publish a
+different record than the one stored; a blank owner in particular renders a
+line that starts with whitespace, which BIND reads as another record at the
+previous owner.
+
+Every path that publishes applies the same field rules before that point:
+the REST record endpoints, the IPAM → DNS sync (a hostname that is not a
+legal owner is published nowhere, and what an earlier name published is
+retracted), DHCP reservations (a whitespace-only hostname is stored as no
+hostname), and the operation layer behind the requests portal and the
+Copilot, which shares `app.core.dns_names.record_value_error` with REST.
+
+A blank or whitespace-only hostname on a stored row means the address
+publishes nothing. Every path that meets one retracts the address's own
+auto-generated A / AAAA and PTR through the record-op queue: the sync on its
+strict paths (Sync DNS commit, the scheduled auto-sync) as well as its
+background ones, and a DHCP reservation update. A DHCP lease is different: lease
+ingest reads a blank or omitted hostname as "no name sent" and keeps the
+address's earlier name, so a client that stops sending option 12 does not lose
+its records. The drift check reports those
+records as stale (`no-hostname`) rather than as an update to a blank owner,
+and the scheduled auto-sync deletes them even with
+`dns_auto_sync_delete_stale` off. The address's aliases are left to that
+setting.
 
 ### 18.3 Auditing existing rows
 
