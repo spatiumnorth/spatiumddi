@@ -57,6 +57,12 @@ export type HeaderMenuItem = {
   destructive?: boolean;
   /** Draws a divider ABOVE this item. */
   separatorBefore?: boolean;
+  /**
+   * Makes this a checkbox item (`menuitemcheckbox`): `onSelect` toggles
+   * the option and the menu STAYS OPEN, so the choice can be made before
+   * the action it modifies (Export's "Include IP addresses", #2722).
+   */
+  checked?: boolean;
 };
 
 type HeaderMenuProps = {
@@ -253,11 +259,14 @@ export function HeaderMenu({
               {it.separatorBefore && <div className="border-t" />}
               <button
                 type="button"
-                role="menuitem"
+                role={
+                  it.checked === undefined ? "menuitem" : "menuitemcheckbox"
+                }
+                aria-checked={it.checked}
                 title={it.title}
                 disabled={it.disabled}
                 onClick={() => {
-                  setOpen(false);
+                  if (it.checked === undefined) setOpen(false);
                   it.onSelect();
                 }}
                 className={cn(
@@ -271,6 +280,14 @@ export function HeaderMenu({
                   <it.icon
                     className={cn("h-3.5 w-3.5 shrink-0", it.iconClassName)}
                   />
+                )}
+                {it.checked !== undefined && (
+                  <span
+                    aria-hidden="true"
+                    className="inline-block w-3 shrink-0 text-center"
+                  >
+                    {it.checked ? "✓" : ""}
+                  </span>
                 )}
                 <span className="min-w-0">{it.label}</span>
               </button>

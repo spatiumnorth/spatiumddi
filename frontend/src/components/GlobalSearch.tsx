@@ -6,6 +6,7 @@ import {
   useCallback,
   useMemo,
 } from "react";
+import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import {
   Search,
@@ -587,166 +588,140 @@ export function GlobalSearch() {
         </kbd>
       </button>
 
-      {/* Modal overlay */}
-      {open && (
-        <div
-          className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
-          onClick={() => setOpen(false)}
-        >
-          <div className="absolute inset-0 bg-black/50" />
-
+      {/* Modal overlay. Portalled to <body> like every dialog: rendered in
+          place it sits inside #root and paints BENEATH a dialog opened
+          before it, while holding the keyboard as the top layer (#2721). */}
+      {open &&
+        createPortal(
           <div
-            ref={cardRef}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Search"
-            className="relative z-10 w-full max-w-xl rounded-xl border bg-card shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+            onClick={() => setOpen(false)}
           >
-            {/* Input */}
-            <div className="flex items-center gap-3 border-b px-4 py-3">
-              <Search className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-              <input
-                ref={inputRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={handleKeyDown}
-                role="combobox"
-                aria-label="Search"
-                aria-autocomplete="list"
-                aria-expanded={rows.length > 0}
-                aria-controls={`${uid}-list`}
-                aria-activedescendant={activeOptionId}
-                placeholder="Search IP, hostname, MAC, subnet, zone, record, page…"
-                className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-              />
-              {query && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setQuery("");
-                    inputRef.current?.focus();
-                  }}
-                  aria-label="Clear search"
-                  title="Clear search"
-                  className="text-muted-foreground hover:text-foreground"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              )}
-              <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground">
-                ESC
-              </kbd>
-            </div>
+            <div className="absolute inset-0 bg-black/50" />
 
-            {/* Scope chips */}
-            {scopes.length > 1 && (
-              <div className="flex flex-wrap items-center gap-1 border-b px-3 py-2">
-                {[{ id: "all", label: "All" }, ...scopes].map((s) => (
+            <div
+              ref={cardRef}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Search"
+              className="relative z-10 w-full max-w-xl rounded-xl border bg-card shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Input */}
+              <div className="flex items-center gap-3 border-b px-4 py-3">
+                <Search className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+                <input
+                  ref={inputRef}
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  role="combobox"
+                  aria-label="Search"
+                  aria-autocomplete="list"
+                  aria-expanded={rows.length > 0}
+                  aria-controls={`${uid}-list`}
+                  aria-activedescendant={activeOptionId}
+                  placeholder="Search IP, hostname, MAC, subnet, zone, record, page…"
+                  className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                />
+                {query && (
                   <button
-                    key={s.id}
                     type="button"
-                    onClick={() => setScope(s.id)}
-                    className={cn(
-                      "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                      scope === s.id
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-muted/60 text-muted-foreground hover:bg-muted",
-                    )}
+                    onClick={() => {
+                      setQuery("");
+                      inputRef.current?.focus();
+                    }}
+                    aria-label="Clear search"
+                    title="Clear search"
+                    className="text-muted-foreground hover:text-foreground"
                   >
-                    {s.label}
+                    <X className="h-4 w-4" />
                   </button>
-                ))}
+                )}
+                <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground">
+                  ESC
+                </kbd>
               </div>
-            )}
 
-            {/* Results. Status text (hint, "Searching…", "No results") sits
+              {/* Scope chips */}
+              {scopes.length > 1 && (
+                <div className="flex flex-wrap items-center gap-1 border-b px-3 py-2">
+                  {[{ id: "all", label: "All" }, ...scopes].map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => setScope(s.id)}
+                      className={cn(
+                        "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
+                        scope === s.id
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted/60 text-muted-foreground hover:bg-muted",
+                      )}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Results. Status text (hint, "Searching…", "No results") sits
                 outside the listbox, whose children are options, in a polite
                 live region so a screen reader hears it change. */}
-            <div ref={listRef} className="max-h-96 overflow-y-auto">
-              <div aria-live="polite">
-                {!query && recents.length === 0 && (
-                  <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                    Search IP addresses, subnets, zones, records, scopes, VLANs
-                    and more — or type a page name to jump straight to it.
-                  </p>
-                )}
-                {query && isFetching && results.length === 0 && (
-                  <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                    Searching…
-                  </p>
-                )}
-                {query &&
-                  !isFetching &&
-                  rows.length === 0 &&
-                  debouncedQuery.length > 0 && (
+              <div ref={listRef} className="max-h-96 overflow-y-auto">
+                <div aria-live="polite">
+                  {!query && recents.length === 0 && (
                     <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                      No results for{" "}
-                      <span className="font-mono font-medium">
-                        "{debouncedQuery}"
-                      </span>
-                      {scope !== "all" && " in this scope"}
+                      Search IP addresses, subnets, zones, records, scopes,
+                      VLANs and more — or type a page name to jump straight to
+                      it.
                     </p>
                   )}
-              </div>
-              <div
-                id={`${uid}-list`}
-                role="listbox"
-                aria-label="Search results"
-              >
-                {!query && recents.length > 0 && (
-                  <div className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-                    Recent searches
-                  </div>
-                )}
-                {rows.map((row, i) => {
-                  const isActive = i === activeIdx;
-                  if (row.kind === "result") {
-                    return (
-                      <div key={row.key} data-active={isActive}>
-                        <ResultRow
-                          result={row.result}
-                          isActive={isActive}
-                          onSelect={handleSelect}
-                          optionId={optionId(i)}
-                        />
-                      </div>
-                    );
-                  }
-                  if (row.kind === "recent") {
-                    return (
-                      <button
-                        key={row.key}
-                        type="button"
-                        id={optionId(i)}
-                        role="option"
-                        aria-selected={isActive}
-                        tabIndex={-1}
-                        data-active={isActive}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          activate(row);
-                        }}
-                        className={cn(
-                          "flex w-full items-center gap-3 px-4 py-2 text-left text-sm transition-colors",
-                          isActive ? "bg-accent" : "hover:bg-accent/50",
-                        )}
-                      >
-                        <Clock className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                        <span className="truncate font-mono">{row.query}</span>
-                      </button>
-                    );
-                  }
-                  if (row.kind === "command") {
-                    const Icon = row.dest.icon;
-                    return (
-                      <div key={row.key}>
-                        {i === firstCommandIdx && (
-                          <div className="border-t px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-                            Go to
-                          </div>
-                        )}
+                  {query && isFetching && results.length === 0 && (
+                    <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      Searching…
+                    </p>
+                  )}
+                  {query &&
+                    !isFetching &&
+                    rows.length === 0 &&
+                    debouncedQuery.length > 0 && (
+                      <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                        No results for{" "}
+                        <span className="font-mono font-medium">
+                          "{debouncedQuery}"
+                        </span>
+                        {scope !== "all" && " in this scope"}
+                      </p>
+                    )}
+                </div>
+                <div
+                  id={`${uid}-list`}
+                  role="listbox"
+                  aria-label="Search results"
+                >
+                  {!query && recents.length > 0 && (
+                    <div className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+                      Recent searches
+                    </div>
+                  )}
+                  {rows.map((row, i) => {
+                    const isActive = i === activeIdx;
+                    if (row.kind === "result") {
+                      return (
+                        <div key={row.key} data-active={isActive}>
+                          <ResultRow
+                            result={row.result}
+                            isActive={isActive}
+                            onSelect={handleSelect}
+                            optionId={optionId(i)}
+                          />
+                        </div>
+                      );
+                    }
+                    if (row.kind === "recent") {
+                      return (
                         <button
+                          key={row.key}
                           type="button"
                           id={optionId(i)}
                           role="option"
@@ -762,70 +737,104 @@ export function GlobalSearch() {
                             isActive ? "bg-accent" : "hover:bg-accent/50",
                           )}
                         >
-                          <Icon className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-                          <span className="flex-1 truncate">
-                            {row.dest.label}
+                          <Clock className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                          <span className="truncate font-mono">
+                            {row.query}
                           </span>
-                          <span className="text-[11px] text-muted-foreground">
-                            {row.dest.section}
-                          </span>
-                          <CornerDownLeft className="h-3 w-3 flex-shrink-0 text-muted-foreground/60" />
                         </button>
-                      </div>
+                      );
+                    }
+                    if (row.kind === "command") {
+                      const Icon = row.dest.icon;
+                      return (
+                        <div key={row.key}>
+                          {i === firstCommandIdx && (
+                            <div className="border-t px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+                              Go to
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            id={optionId(i)}
+                            role="option"
+                            aria-selected={isActive}
+                            tabIndex={-1}
+                            data-active={isActive}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              activate(row);
+                            }}
+                            className={cn(
+                              "flex w-full items-center gap-3 px-4 py-2 text-left text-sm transition-colors",
+                              isActive ? "bg-accent" : "hover:bg-accent/50",
+                            )}
+                          >
+                            <Icon className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+                            <span className="flex-1 truncate">
+                              {row.dest.label}
+                            </span>
+                            <span className="text-[11px] text-muted-foreground">
+                              {row.dest.section}
+                            </span>
+                            <CornerDownLeft className="h-3 w-3 flex-shrink-0 text-muted-foreground/60" />
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
+                      <button
+                        key={row.key}
+                        type="button"
+                        id={optionId(i)}
+                        role="option"
+                        aria-selected={isActive}
+                        tabIndex={-1}
+                        data-active={isActive}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          activate(row);
+                        }}
+                        className={cn(
+                          "flex w-full items-center gap-3 border-t px-4 py-2.5 text-left text-sm transition-colors",
+                          isActive ? "bg-primary/5" : "hover:bg-accent/50",
+                        )}
+                      >
+                        <Sparkles className="h-4 w-4 flex-shrink-0 text-primary" />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate">
+                            Ask AI:{" "}
+                            <span className="font-medium">
+                              "{debouncedQuery}"
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-muted-foreground">
+                            Open Copilot with this query pre-filled
+                          </div>
+                        </div>
+                      </button>
                     );
-                  }
-                  return (
-                    <button
-                      key={row.key}
-                      type="button"
-                      id={optionId(i)}
-                      role="option"
-                      aria-selected={isActive}
-                      tabIndex={-1}
-                      data-active={isActive}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        activate(row);
-                      }}
-                      className={cn(
-                        "flex w-full items-center gap-3 border-t px-4 py-2.5 text-left text-sm transition-colors",
-                        isActive ? "bg-primary/5" : "hover:bg-accent/50",
-                      )}
-                    >
-                      <Sparkles className="h-4 w-4 flex-shrink-0 text-primary" />
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate">
-                          Ask AI:{" "}
-                          <span className="font-medium">
-                            "{debouncedQuery}"
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-muted-foreground">
-                          Open Copilot with this query pre-filled
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
+                  })}
+                </div>
               </div>
-            </div>
 
-            {results.length > 0 && (
-              <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
-                <span>
-                  {data?.total ?? 0} result{(data?.total ?? 0) !== 1 ? "s" : ""}
-                  {(data?.total ?? 0) > results.length &&
-                    ` · showing top ${results.length}`}
-                </span>
-                <span className="flex items-center gap-2">
-                  <span>↑↓ navigate</span>
-                  <span>↵ select</span>
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+              {results.length > 0 && (
+                <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
+                  <span>
+                    {data?.total ?? 0} result
+                    {(data?.total ?? 0) !== 1 ? "s" : ""}
+                    {(data?.total ?? 0) > results.length &&
+                      ` · showing top ${results.length}`}
+                  </span>
+                  <span className="flex items-center gap-2">
+                    <span>↑↓ navigate</span>
+                    <span>↵ select</span>
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>,
+          document.body,
+        )}
     </>
   );
 }

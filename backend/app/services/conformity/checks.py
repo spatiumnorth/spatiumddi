@@ -41,12 +41,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertRule
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.models.audit import AuditLog
+from app.models.audit import AUDIT_LOG_GUARD_TRIGGERS
 from app.models.av import AVFlowProfile, AVReservedRange
 from app.models.bacnet import BACnetDevice
 from app.models.dicom import DICOMApplicationEntity
@@ -637,29 +637,76 @@ async def check_audit_log_immutable(
     args: dict[str, Any],
     now: datetime,
 ) -> CheckOutcome:
-    """Pass when the audit_log table is queryable and reachable.
+    """Pass when every trigger that makes ``audit_log`` append-only is
+    present and enabled.
 
-    Platform-level. Useful for the auditor checkbox "audit log is
-    append-only and tamper-resistant" — the SpatiumDDI promise is
-    that ``audit_log`` rows never mutate (DB trigger guards
-    DELETE) so this check always passes when the table is healthy.
-    Used as a positive presence signal in the PDF artifact.
+    Platform-level. The guards are the row triggers named in
+    ``AUDIT_LOG_GUARD_TRIGGERS`` — ``BEFORE DELETE`` (#73) and
+    ``BEFORE UPDATE`` (#2315), each raising. The check reads them from
+    ``pg_trigger`` and fails, naming each one, when a trigger is missing,
+    disabled (``ALTER TABLE … DISABLE TRIGGER``, or enabled for replica
+    sessions only), or no longer a ``BEFORE … FOR EACH ROW`` trigger on
+    that event running the expected function. It used to count rows,
+    which passed with the guard dropped (#2315).
+
+    Tamper-evident, not tamper-proof: the table owner can drop a trigger.
+    This check is how that becomes visible; the hash-chain verifier
+    covers rewritten content.
     """
     if target_kind != "platform":
         return CheckOutcome.not_applicable(
             f"requires target_kind=platform (got {target_kind})",
         )
     try:
-        count = (await db.execute(select(func.count()).select_from(AuditLog))).scalar_one()
+        rows = (
+            await db.execute(
+                text(
+                    "SELECT t.tgname, t.tgtype, t.tgenabled::text, p.proname "
+                    "FROM pg_catalog.pg_trigger t "
+                    "JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid "
+                    "WHERE t.tgrelid = to_regclass('audit_log') "
+                    "AND NOT t.tgisinternal"
+                )
+            )
+        ).all()
     except Exception as exc:  # noqa: BLE001
         return CheckOutcome.fail(
-            "audit_log table is unreachable",
+            "audit_log triggers could not be read",
             {"error": str(exc)},
         )
+    present = {row[0]: (int(row[1]), str(row[2]), str(row[3])) for row in rows}
+    problems: dict[str, str] = {}
+    for name, (event_name, function) in AUDIT_LOG_GUARD_TRIGGERS.items():
+        found = present.get(name)
+        if found is None:
+            problems[name] = "missing"
+            continue
+        tgtype, enabled, proname = found
+        event_bit = _TRIGGER_EVENT_BITS[event_name]
+        if not (
+            tgtype & _TRIGGER_TYPE_ROW and tgtype & _TRIGGER_TYPE_BEFORE and tgtype & event_bit
+        ):
+            problems[name] = f"not a BEFORE {event_name} row trigger"
+        elif proname != function:
+            problems[name] = f"runs {proname}(), expected {function}()"
+        elif enabled not in ("O", "A"):
+            problems[name] = "disabled"
+    if problems:
+        detail = ", ".join(f"{n} ({why})" for n, why in sorted(problems.items()))
+        return CheckOutcome.fail(
+            f"audit_log is not append-only: {detail}",
+            {"problems": problems},
+        )
     return CheckOutcome.passed(
-        f"audit_log healthy ({int(count)} row(s))",
-        {"row_count": int(count)},
+        "audit_log refuses UPDATE and DELETE (guard triggers present and enabled)",
+        {"triggers": sorted(AUDIT_LOG_GUARD_TRIGGERS)},
     )
+
+
+# ``pg_trigger.tgtype`` bits (PostgreSQL ``catalog/pg_trigger.h``).
+_TRIGGER_TYPE_ROW = 1 << 0
+_TRIGGER_TYPE_BEFORE = 1 << 1
+_TRIGGER_EVENT_BITS = {"INSERT": 1 << 2, "DELETE": 1 << 3, "UPDATE": 1 << 4}
 
 
 # ── Check 7: voice_segment_not_internet_facing ──────────────────────
@@ -1943,7 +1990,7 @@ CHECK_CATALOG: list[dict[str, Any]] = [
     },
     {
         "name": "audit_log_immutable",
-        "label": "Audit log is reachable and append-only",
+        "label": "Audit log refuses UPDATE and DELETE",
         "supports": ["platform"],
         "args": [],
     },

@@ -151,6 +151,17 @@ on inactive.
    resize / split / merge / next-IP / bulk / DNS-sync, and editing or
    deleting an existing address stay refused unless a type-level grant
    covers them.
+   **IPAM address sets (#103).** A `write` / `admin` grant on an address set
+   (the Address Set Editor role, scoped to one set) reaches an allow-list of
+   address routes and nothing else in IPAM: create, next-IP, bulk-allocate
+   (preview and commit), edit and delete an address, add and remove its
+   aliases, bulk-edit and bulk-delete addresses, deprecate stale IPs, and the
+   address import (preview and commit). Each of those checks every address it
+   touches against the set's range, so the holder changes only addresses
+   inside the sets it holds. Every other mutating IPAM route, including one
+   added later, refuses such a holder with 403 until it is listed
+   (`_ADDRESS_SET_ROUTES` in `backend/app/api/v1/ipam/router.py`). Reads
+   still need a normal read grant.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —

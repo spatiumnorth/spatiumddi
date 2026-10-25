@@ -20,7 +20,10 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
-import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import {
+  useApplianceAdminGate,
+  useCanReadApplianceLogs,
+} from "@/hooks/useApplianceAdmin";
 
 /**
  * Phase 4d (rewritten as Phase 11 wave 4) — Pod management tab.
@@ -142,6 +145,9 @@ function ContainerCard({
 }) {
   // #1342 — a pod's Restart / Stop / Start takes `admin` on `appliance`.
   const applianceGate = useApplianceAdminGate();
+  // Pod log text takes `admin` on `appliance`; the button is not drawn
+  // for a role that would be refused.
+  const canReadLogs = useCanReadApplianceLogs();
   const isRunning = container.state === "running";
   const healthTone =
     container.health === "healthy"
@@ -184,15 +190,17 @@ function ContainerCard({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            onClick={onLogs}
-            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
-            title="Stream logs"
-          >
-            <ScrollText className="h-3 w-3" />
-            Logs
-          </button>
+          {canReadLogs && (
+            <button
+              type="button"
+              onClick={onLogs}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+              title="Stream logs"
+            >
+              <ScrollText className="h-3 w-3" />
+              Logs
+            </button>
+          )}
           {container.is_spatium && isRunning && (
             <>
               <ActionButton

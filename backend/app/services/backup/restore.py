@@ -78,6 +78,7 @@ from app.services.backup.rewrap import (
     RewrapOutcome,
     rewrap_secrets,
 )
+from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -904,7 +905,44 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    _prune_pre_restore_safety_dumps(keep=out_path)
     return str(out_path)
+
+
+def _prune_pre_restore_safety_dumps(*, keep: Path) -> None:
+    """Keep the newest ``PRE_RESTORE_KEEP_LAST_N`` safety dumps in
+    ``PRE_RESTORE_DIR`` and delete the rest.
+
+    Each dump holds the SECRET_KEY under a passphrase anyone can read in
+    this file, so old copies are not harmless clutter. A target's
+    retention already prunes them when a local-volume target points at
+    this directory; without one they used to accumulate. Runs only after
+    a new dump is written, never removes ``keep`` (the dump just taken),
+    and only touches regular files named like a safety dump. A failure to
+    delete is logged and does not fail the restore.
+    """
+    try:
+        dumps = [
+            p
+            for p in PRE_RESTORE_DIR.iterdir()
+            if p.name.startswith(PRE_RESTORE_PREFIX)
+            and p.name.endswith(".zip")
+            and not p.is_symlink()
+            and p.is_file()
+        ]
+        dumps.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError as exc:
+        logger.warning("pre_restore_safety_prune_failed", path=str(PRE_RESTORE_DIR), error=str(exc))
+        return
+    # The dump just written counts first whatever its mtime says, so a
+    # clock step cannot make the prune delete it.
+    ordered = [keep] + [p for p in dumps if p != keep]
+    for dump in ordered[max(PRE_RESTORE_KEEP_LAST_N, 1) :]:
+        try:
+            dump.unlink()
+            logger.info("pre_restore_safety_dump_pruned", path=str(dump))
+        except OSError as exc:
+            logger.warning("pre_restore_safety_prune_failed", path=str(dump), error=str(exc))
 
 
 async def _collect_post_restore_warnings(db_url: str) -> list[str]:

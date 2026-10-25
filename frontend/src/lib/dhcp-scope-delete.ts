@@ -1,6 +1,7 @@
 /** #2446 — one wording for "delete a DHCP scope", used by the Scopes tab and
  *  the IPAM subnet panel. The delete is a soft-delete of the scope with its
- *  pools and reservations as one set, restorable from Trash. */
+ *  pools and reservations as one set, restorable from Trash by a
+ *  superadmin (every Trash route is superadmin-only, #2706). */
 export function scopeDeleteCopy(
   scopeName: string,
   poolCount: number,
@@ -17,7 +18,8 @@ export function scopeDeleteCopy(
     description:
       `Delete scope "${scopeName}"? ` +
       "Its pools and reservations go with it — they stop being served straight " +
-      "away, and are restorable as a set from Administration → Trash. Any " +
+      "away. A superadmin can restore them as a set from Administration → " +
+      "Trash. Any " +
       "dynamic clients (leases) it learned are released too, and their IPAM " +
       "and DNS entries removed.",
     referencesTitle: references.length

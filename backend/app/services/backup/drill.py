@@ -66,6 +66,7 @@ from app.services.backup.archive import (
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.restore import SUPPORTED_FORMAT_VERSIONS
 from app.services.backup.targets import (
+    ArchiveTooLargeError,
     BackupDestinationError,
     SecretFieldError,
     decrypt_config_secrets,
@@ -1052,8 +1053,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         # of their own, and an unbounded fetch would make the sweep's
         # stale-mutex threshold meaningless (see
         # STALE_IN_PROGRESS_SECONDS).
+        # ``max_bytes`` backs up the declared-size check above: the
+        # listing's size is the destination's word, and the driver stops
+        # reading at the cap whatever the archive turns out to be.
         archive_bytes = await asyncio.wait_for(
-            driver.download(config=plain_config, filename=newest.filename),
+            driver.download(
+                config=plain_config, filename=newest.filename, max_bytes=MAX_ARCHIVE_BYTES
+            ),
             timeout=_DOWNLOAD_TIMEOUT_SECONDS,
         )
     except TimeoutError:
@@ -1065,6 +1071,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                 f"downloading {newest.filename} from the destination exceeded "
                 f"{_DOWNLOAD_TIMEOUT_SECONDS}s"
             ),
+        )
+    except ArchiveTooLargeError as exc:
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=str(exc),
         )
     except BackupDestinationError as exc:
         return DrillOutcome(

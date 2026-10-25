@@ -26,7 +26,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -34,6 +34,7 @@ from app.services.dhcp.static_ipam import (
 )
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
+from app.services.dns.view_collisions import RenderGuard, collision_detail
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -93,6 +94,10 @@ class RestoreResponse(BaseModel):
     # Rows left in the trash because a live duplicate exists — only ever
     # non-empty with ``?skip_conflicts=true``; without it a conflict is a 409.
     skipped: list[RestoreConflict] = []
+    # IPAM records not restored because their address's subnet is still in the
+    # Trash (#2732): moved into that subnet's batch, one entry per subnet. They
+    # come back when the subnet is restored and go if it is purged.
+    held_back: list[RestoreConflict] = []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -315,35 +320,28 @@ async def _audit_scopes_under(db: Any, current_user: Any, subnet_ids: list[uuid.
         db.add(_purge_audit(current_user, "dhcp_scope", sc))
 
 
-async def _prepare_subnet_purge(db: Any, subnets: list[Any]) -> tuple[int, set[uuid.UUID]]:
+async def _prepare_subnet_purge(
+    db: Any, subnets: list[Any], current_user: Any
+) -> tuple[int, set[uuid.UUID]]:
     """Withdraw what IPAM published for ``subnets`` before they are hard-deleted.
 
     spatiumddi#1151 — the addresses go with the subnet (FK CASCADE); the
     auto-generated A / AAAA / PTR / alias records IPAM published for them would
     survive as ownerless rows the agents keep serving. Withdraw them first,
     through the record-op queue.
-    spatiumddi#1906 — the records retracted when the subnet was trashed sit in
-    the Trash under its batch, ownerless once the addresses cascade. They are
-    not served; drop them with the subnet instead of leaving a stray Trash
-    entry per record.
+    spatiumddi#1906 / #2732 — the ones already in the Trash (under the subnet's
+    batch, or a zone's deleted before it) are dropped with the subnet by the
+    same helper, instead of surviving ownerless for a later restore to publish.
     """
     if not subnets:
         return 0, set()
-    subnet_ids = [sub.id for sub in subnets]
-    retracted, groups = await retract_address_records(db, subnet_ids)
-    batch_ids = {sub.deletion_batch_id for sub in subnets if sub.deletion_batch_id is not None}
-    if batch_ids:
-        await db.execute(
-            sa_delete(DNSRecord)
-            .where(
-                DNSRecord.deletion_batch_id.in_(batch_ids),
-                DNSRecord.auto_generated.is_(True),
-                DNSRecord.ip_address_id.in_(
-                    select(IPAddress.id).where(IPAddress.subnet_id.in_(subnet_ids))
-                ),
-            )
-            .execution_options(include_deleted=True, synchronize_session=False)
-        )
+    retracted, groups = await retract_address_records(db, [sub.id for sub in subnets])
+    # spatiumddi#2734 — the reverse zones IPAM auto-created for them go too.
+    from app.services.dns.reverse_zone import purge_auto_reverse_zones  # noqa: PLC0415
+
+    groups = groups | await purge_auto_reverse_zones(
+        db, subnets, audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z))
+    )
     return retracted, groups
 
 
@@ -484,6 +482,64 @@ async def list_trash(
 _PARTIAL_RESTORE_TYPES = frozenset({"dns_record"})
 
 
+async def _capture_render_guards(db: Any, batch_id: uuid.UUID) -> list[RenderGuard]:
+    """Baselines for the zone names a restore of ``batch_id`` can re-place (#2275).
+
+    A restored zone renders into its view (or, when it has none, every view),
+    and a restored view-scoped record places its zone in that view too. Either
+    can put a second copy of a zone name into one view.
+    """
+    pairs = (
+        await db.execute(
+            select(DNSZone.group_id, DNSZone.name)
+            .where(DNSZone.deletion_batch_id == batch_id)
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    pairs += (
+        await db.execute(
+            select(DNSZone.group_id, DNSZone.name)
+            .join(DNSRecord, DNSRecord.zone_id == DNSZone.id)
+            .where(DNSRecord.deletion_batch_id == batch_id, DNSRecord.view_id.is_not(None))
+            .distinct()
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    by_group: dict[uuid.UUID, set[str]] = {}
+    for gid, name in pairs:
+        by_group.setdefault(gid, set()).add(name)
+    return [
+        await RenderGuard.capture(db, gid, names, savepoint=False)
+        for gid, names in by_group.items()
+    ]
+
+
+async def _refuse_render_collisions(db: Any, guards: list[RenderGuard], savepoint: Any) -> None:
+    found = []
+    for guard in guards:
+        found.extend(await guard.new_collisions(db))
+    if not found:
+        await savepoint.commit()
+        return
+    await savepoint.rollback()
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": collision_detail(found, "restore"),
+            "conflicts": [
+                {
+                    "type": "dns_zone",
+                    "id": c.zone_ids[0],
+                    "display": f"{c.zone_name}.",
+                    "reason": c.describe(),
+                }
+                for c in found
+            ],
+            "skip_conflicts_allowed": False,
+        },
+    )
+
+
 @router.post("/trash/{type}/{row_id}/restore", response_model=RestoreResponse)
 async def restore_row(
     type: str,
@@ -542,8 +598,13 @@ async def restore_row(
     async def _check(obj: Any) -> str | None:
         return await default_conflict_check(db, obj)
 
+    render_guards = await _capture_render_guards(db, batch_id)
+    # #2275 — the restore runs in a SAVEPOINT so a refused one leaves nothing.
+    restore_sp = await db.begin_nested() if render_guards else None
     result = await restore_batch(db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts)
     restored, conflicts = result.restored, result.conflicts
+    if restore_sp is not None and (not conflicts or skip_conflicts):
+        await _refuse_render_collisions(db, render_guards, restore_sp)
     if conflicts and not skip_conflicts:
         # Tell the client whether ``skip_conflicts`` would be accepted, so the
         # page offers "Restore the others" only where the 422 above will not
@@ -638,12 +699,14 @@ async def restore_row(
         batch_id=str(batch_id),
         restored=result.total,
         skipped=len(conflicts),
+        held_back=len(result.held_back),
         user_id=str(current_user.id),
     )
     return RestoreResponse(
         batch_id=batch_id,
         restored=result.total,
         skipped=[RestoreConflict(**c) for c in conflicts],
+        held_back=[RestoreConflict(**c) for c in result.held_back],
     )
 
 
@@ -715,7 +778,9 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], [], [])
             if live:
                 _refuse_live_children(label, live)
-            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, [target])
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
+                db, [target], current_user
+            )
             await _audit_scopes_under(db, current_user, [target.id])
         elif isinstance(target, (IPBlock, IPSpace)):
             # #1958 — a block or space is purged WITH the trashed subnets and
@@ -727,7 +792,9 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], blocks, subnets)
             if live:
                 _refuse_live_children(label, live)
-            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, subnets)
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
+                db, subnets, current_user
+            )
             await _audit_scopes_under(db, current_user, [sub.id for sub in subnets])
             for sub in subnets:
                 db.add(_purge_audit(current_user, "subnet", sub))

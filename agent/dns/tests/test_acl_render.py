@@ -193,9 +193,7 @@ def test_duplicate_tsig_key_names_render_one_key_statement(tmp_path: Path) -> No
     ]
     drv = Bind9Driver(state_dir=tmp_path)
     drv.render(b)
-    keyfile = (tmp_path / "rendered.new" / "tsig" / "ddns.key")
-    if not keyfile.exists():
-        keyfile = tmp_path / "tsig" / "ddns.key"
+    keyfile = tmp_path / "rendered.new" / "tsig" / "ddns.key"
     text = keyfile.read_text()
     assert text.count('key "') == 2
     assert 'key "spatium-g"' in text and 'key "foo"' in text

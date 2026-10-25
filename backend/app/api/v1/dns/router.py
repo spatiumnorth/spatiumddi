@@ -46,6 +46,7 @@ from app.api.pagination import (
     Page,
     paginate,
 )
+from app.api.v1._common import WinRMSettings, winrm_settings_from_blob
 from app.config import settings
 from app.core.agent_wake import (
     appliance_channel,
@@ -57,9 +58,8 @@ from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     bind_check_names_error,
-    contains_control_chars,
     primary_ns_error,
-    structured_rdata_error,
+    record_value_error,
     validate_fqdn,
     validate_hostname,
     validate_record_owner,
@@ -76,7 +76,7 @@ from app.core.permissions import (
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
 from app.core.update_nulls import changed_keys, resolve_update_changes
-from app.drivers._winrm import validate_transport
+from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
     CREDENTIALED_DNS_DRIVERS,
@@ -101,6 +101,7 @@ from app.models.dns import (
     ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
+    DNSBlockList,
     DNSKey,
     DNSRecord,
     DNSSECPolicy,
@@ -113,6 +114,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
     DNSZoneUpdateAcl,
+    dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
 from app.services.agents.daemon_state import is_not_serving
@@ -184,12 +186,17 @@ from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
+    ServerMoveResult,
     catalog_unsupported_message,
     elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_single_driver,
     lock_server_row,
     move_server_to_group,
+)
+from app.services.dns.server_resync import force_zone_resync
+from app.services.dns.technitium_options import (
+    allow_query_problem as technitium_query_problem,
 )
 from app.services.dns.technitium_options import (
     allow_transfer_problem as technitium_transfer_problem,
@@ -217,8 +224,10 @@ from app.services.dns.tsig import (
     group_key_names,
     normalize_tsig_name,
     rotate_group_tsig_key,
+    tsig_secret_problem,
 )
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
+from app.services.dns.view_collisions import RenderGuard
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_guards import soa_field_error, zone_name_taken
 from app.services.dns.zone_move import (
@@ -517,8 +526,9 @@ class WindowsCredentialsInput(BaseModel):
     """Windows DNS admin credentials (for driver='windows_dns' Path B).
 
     Stored Fernet-encrypted on ``DNSServer.credentials_encrypted``.
-    Server never returns the password back — responses only expose
-    ``has_credentials``.
+    The username and password are never returned — responses expose
+    ``has_credentials`` and the non-secret ``winrm_settings`` (port,
+    transport, TLS, certificate validation) only.
 
     Mirrors the DHCP-side shape. All fields are optional to support
     **partial updates**: sending ``{"transport": "credssp"}`` on an
@@ -655,6 +665,10 @@ class ServerResponse(BaseModel):
     # button, Sync Zones from Server action) without hardcoding driver
     # names client-side.
     has_credentials: bool
+    # The stored non-secret WinRM settings (windows_dns with credentials;
+    # null otherwise). Lets the edit dialog show what is stored, so an
+    # untouched save sends nothing and keeps it. Never carries the secrets.
+    winrm_settings: WinRMSettings | None = None
     is_agentless: bool
     # Agent-state fields used by the Server Detail modal — surfacing
     # these lets operators answer "what's this server doing right now"
@@ -752,6 +766,11 @@ class ServerResponse(BaseModel):
             last_health_check_at=s.last_health_check_at,
             notes=s.notes,
             has_credentials=bool(s.credentials_encrypted),
+            winrm_settings=(
+                winrm_settings_from_blob(s.credentials_encrypted)
+                if s.driver == "windows_dns"
+                else None
+            ),
             is_agentless=is_agentless(s.driver),
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
@@ -1820,16 +1839,6 @@ def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     return v or ""
 
 
-# rdata for these types is a single bare target *name* — validate it as an
-# FQDN (issue #597). MX / SRV are deliberately excluded: their value may
-# carry the priority / weight / port inline (``10 mail.example.com``) on some
-# client + driver paths, so an FQDN check would reject a legitimate value —
-# the control-character guard below still protects them. Also excludes TXT
-# (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
-# CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
-_HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
-
-
 async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, value: str) -> None:
     """422 a name target with no trailing dot on a PowerDNS group (#2060).
 
@@ -1854,75 +1863,19 @@ def _validate_address_record_value(
 ) -> None:
     """Reject rdata that would break — or inject into — a rendered zone (#467, #597).
 
-    Three checks, in order of the record's shape:
-
-    * Any value carrying a control character / newline is rejected for every
-      type — that is the one thing that injects a second zone-file record, and
-      no legitimate rdata contains one. (Spaces and quotes are *not* rejected:
-      structured rdata like CAA / LOC / NAPTR / SVCB needs them.)
-    * A / AAAA must be a single valid IP of the matching family (each row is
-      one RR line, so ``10.0.0.1, 10.0.0.2`` is malformed rdata).
-    * A bare-name target type (CNAME / NS / PTR / DNAME / ALIAS) whose value is
-      the pointed-at name must be a syntactically valid FQDN. MX / SRV are
-      excluded — their value may carry the priority inline on some paths.
+    The rule lives in ``app.core.dns_names.record_value_error`` so the
+    operation layer (requests portal, Copilot) applies exactly the same one:
+    a control character / newline is refused for every type, A / AAAA must be
+    a single address of the matching family, a bare-name target type must be a
+    valid FQDN, and any other type must be readable rdata.
 
     Raises ``HTTPException(422)`` with guidance on any failure.
     """
-    rtype = record_type.upper()
-
-    # Injection guard for EVERY type: a newline / control character is the
-    # one thing that can inject a second record into a zone-file line, and no
-    # legitimate rdata carries one. Deliberately narrower than
-    # ``contains_zonefile_unsafe`` — spaces and quotes are load-bearing in
-    # structured rdata (CAA ``0 issue "letsencrypt.org"``, LOC / NAPTR /
-    # SVCB / HTTPS), so only control bytes are rejected here. Interior
-    # whitespace in a *name-valued* type is caught by the FQDN check below;
-    # a comma-separated A/AAAA list by the IP parse.
-    if contains_control_chars(value):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{rtype} record value contains a control character or newline, "
-                "which is not allowed in DNS record data."
-            ),
-        )
-
-    if rtype in _HOSTNAME_TARGET_RECORD_TYPES:
-        try:
-            validate_fqdn(value, field=f"{rtype} record target")
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return
-
-    if rtype not in ("A", "AAAA"):
-        err = structured_rdata_error(
-            rtype, value, priority=priority, weight=weight, port=port, origin=origin
-        )
-        if err is not None:
-            raise HTTPException(status_code=422, detail=err)
-        return
-    candidate = value.strip()
-    family_ok = True
-    try:
-        parsed = ipaddress.ip_address(candidate)
-    except ValueError:
-        family_ok = False
-    else:
-        family_ok = (rtype == "A" and parsed.version == 4) or (
-            rtype == "AAAA" and parsed.version == 6
-        )
-    if family_ok:
-        return
-    fam = "IPv4" if rtype == "A" else "IPv6"
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            f"{rtype} record value must be a single {fam} address. To point one "
-            "name at several IPs, add one record per address (round-robin) or "
-            "use a DNS Pool for health-checked failover — not a comma-separated "
-            "list in one record."
-        ),
+    err = record_value_error(
+        record_type, value, priority=priority, weight=weight, port=port, origin=origin
     )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 def _enforce_bind_check_names(
@@ -2439,6 +2392,19 @@ async def _refuse_second_signer(
         raise HTTPException(status_code=422, detail=refusal)
 
 
+def _server_update_audit_value(
+    move_result: ServerMoveResult | None, winrm_diff: dict[str, dict[str, Any]]
+) -> dict[str, object] | None:
+    """The server-update audit row's ``new_value``: the group move (if any)
+    and the old → new value of each WinRM setting the update changed."""
+    value: dict[str, object] = {}
+    if move_result is not None:
+        value.update(move_result.as_audit_value())
+    if winrm_diff:
+        value["winrm_settings_changed"] = winrm_diff
+    return value or None
+
+
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
     group_id: uuid.UUID,
@@ -2519,22 +2485,33 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    reenabled = body.is_enabled is True and not server.is_enabled
     before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
         setattr(server, k, v)
+    if reenabled:
+        # #2281 — it got no record ops while disabled; make its agent
+        # re-render every zone from the current records.
+        changes["zone_resync_ops_retired"] = await force_zone_resync(db, server)
 
     # Credentials contract matches DHCP:
     #   None → leave alone, {} → clear, partial dict → decrypt-merge-reencrypt
+    winrm_diff: dict[str, dict[str, Any]] = {}
     if body.windows_credentials is not None:
         if isinstance(body.windows_credentials, WindowsCredentialsInput):
             patch = body.windows_credentials.model_dump(exclude_none=True)
             if not patch:
                 pass  # empty WindowsCredentialsInput — no-op
             elif server.credentials_encrypted:
+                # Merge: a key the request does not carry keeps its stored
+                # value, so an edit that omits the TLS settings never resets
+                # them to the create defaults.
                 existing = decrypt_dict(server.credentials_encrypted)
+                before_creds = dict(existing)
                 existing.update(patch)
                 server.credentials_encrypted = encrypt_dict(existing)
                 changes["windows_credentials_updated"] = sorted(patch.keys())
+                winrm_diff = winrm_settings_diff(before_creds, existing)
             else:
                 if not patch.get("username") or not patch.get("password"):
                     raise HTTPException(
@@ -2551,6 +2528,7 @@ async def update_server(
                 patch.setdefault("winrm_port", 5986 if patch.get("use_tls") else 5985)
                 server.credentials_encrypted = encrypt_dict(patch)
                 changes["windows_credentials_set"] = True
+                winrm_diff = winrm_settings_diff(None, patch)
         elif body.windows_credentials == {}:
             server.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
@@ -2664,7 +2642,7 @@ async def update_server(
             resource_id=str(server.id),
             resource_display=server.name,
             changed_fields=changed_keys(before, changes),
-            new_value=move_result.as_audit_value() if move_result else None,
+            new_value=_server_update_audit_value(move_result, winrm_diff),
             result="success",
         )
     )
@@ -3862,15 +3840,23 @@ async def _options_response(
         # Zone-level overrides saved before the gate (#1765).
         zones = (
             await db.execute(
-                select(DNSZone.name, DNSZone.allow_transfer).where(
-                    DNSZone.group_id == group_id, DNSZone.allow_transfer.is_not(None)
+                select(DNSZone.name, DNSZone.allow_transfer, DNSZone.allow_query).where(
+                    DNSZone.group_id == group_id,
+                    or_(DNSZone.allow_transfer.is_not(None), DNSZone.allow_query.is_not(None)),
                 )
             )
         ).all()
-        for name, allow_transfer in zones:
-            if problem := technitium_transfer_problem(allow_transfer, acls):
+        for name, allow_transfer, allow_query in zones:
+            if allow_transfer is not None and (
+                problem := technitium_transfer_problem(allow_transfer, acls)
+            ):
                 out.technitium_warnings.append(
                     f"zone {name}: {problem}; zone transfer is left as the daemon has it"
+                )
+            # #2263 — the zone's own allow_query, saved before the gate.
+            if allow_query is not None and (problem := technitium_query_problem(allow_query, acls)):
+                out.technitium_warnings.append(
+                    f"zone {name}: {problem}; query access is left as the daemon has it"
                 )
     return out
 
@@ -3991,6 +3977,26 @@ async def _validated_zone_named_conf_fields(
             "This group has a Technitium server, which cannot apply this zone's "
             f"{problem}. Move the Technitium server to its own group, or use addresses, "
             "'!' exclusions, 'key <name>' on its own, or a defined ACL.",
+        )
+    # The zone's own allow_query (#2263): the Technitium agent applies it as
+    # the zone's ``queryAccess``, through the same translation as the group's
+    # list (#1763), and leaves the zone as the daemon has it when an element
+    # has no equivalent — which, for a zone meant to be restricted, means
+    # left open. Refused here rather than stored and ignored.
+    if (
+        "allow_query" in cleaned
+        and "technitium" in await _group_driver_names(db, group_id)
+        and (
+            problem := technitium_query_problem(
+                cleaned["allow_query"], await _group_acl_definitions(db, group_id)
+            )
+        )
+    ):
+        raise HTTPException(
+            422,
+            "This group has a Technitium server, which cannot apply this zone's "
+            f"{problem}. Move the Technitium server to its own group, or use addresses, "
+            "'!' exclusions, 'localhost' or a defined ACL.",
         )
     if (
         "also_notify" in cleaned
@@ -4195,6 +4201,22 @@ async def update_options(
                 + ". Move the Technitium server to its own group, or leave these at "
                 "their defaults.",
             )
+    # #2263: ``blackhole`` is rendered by the BIND9 agent only. pdns auth has
+    # no client ACL of any kind (the agent already says so for allow_query),
+    # so a PowerDNS server would serve the clients the operator meant to drop.
+    # Same transition-only semantics as the Technitium gate: re-saving a stored
+    # value, or clearing it, stays allowed.
+    if (
+        changes.get("blackhole")
+        and changes["blackhole"] != list(getattr(opts, "blackhole", None) or [])
+        and "powerdns" in await _group_driver_names(db, group_id)
+    ):
+        raise HTTPException(
+            422,
+            "This group has a PowerDNS server, which cannot apply: blackhole: PowerDNS "
+            "authoritative has no setting to drop queries from a client address. Move "
+            "the PowerDNS server to its own group, or leave blackhole empty.",
+        )
     # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
     # setting either, so refuse a changed non-default value rather than store
     # one the daemon ignores (same rule as the Technitium gate above).
@@ -4812,12 +4834,35 @@ class TSIGKeyCreate(BaseModel):
             raise ValueError(f"algorithm must be one of {sorted(_TSIG_ALGO_LENGTHS)}")
         return v
 
+    @field_validator("secret")
+    @classmethod
+    def validate_secret(cls, v: str | None) -> str | None:
+        # The secret is written verbatim into ``secret "…";`` in the agent's
+        # key file, so it must be one base64 string of a usable length.
+        # Empty / whitespace-only still means "generate one".
+        if v is None or not v.strip():
+            return None
+        v = v.strip()
+        if problem := tsig_secret_problem(v):
+            raise ValueError(f"secret {problem}")
+        return v
+
 
 class TSIGKeyUpdate(BaseModel):
     name: str | None = None
     algorithm: str | None = None
     purpose: str | None = None
     notes: str | None = None
+    # Accepted only so a request carrying one is refused rather than silently
+    # ignored: the secret changes through /rotate, never through update.
+    secret: str | None = None
+
+    @field_validator("secret")
+    @classmethod
+    def refuse_secret(cls, v: str | None) -> None:
+        if v is not None:
+            raise ValueError("secret cannot be set on update; use the rotate action to replace it")
+        return None
 
     @field_validator("name")
     @classmethod
@@ -5037,6 +5082,7 @@ async def update_tsig_key(
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
     changes = body.model_dump(exclude_unset=True)
+    changes.pop("secret", None)  # never a column write; see TSIGKeyUpdate
     # #1858 — only a CHANGE of algorithm is refused: re-saving a key the group
     # already holds (the form posts every field) must keep working.
     new_algo = changes.get("algorithm")
@@ -5308,9 +5354,75 @@ async def update_view(
     dependencies=[Depends(require_permission("delete", "dns_group"))],
 )
 async def delete_view(
-    group_id: uuid.UUID, view_id: uuid.UUID, db: DB, current_user: CurrentUser
+    group_id: uuid.UUID,
+    view_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    acknowledge_blocklist_detach: bool = Query(
+        default=False,
+        description=(
+            "Delete the view even though blocking lists are scoped to it. Their "
+            "assignment to this view is removed with it; a list scoped to "
+            "nothing else stops filtering anywhere."
+        ),
+    ),
 ) -> None:
+    """Delete a view that no longer owns zones or records (#2275).
+
+    ``view_id`` on zones and records is ``ON DELETE SET NULL``, and NULL means
+    *shared*: rendered into every remaining view. Deleting a view that still
+    scopes anything would therefore serve its zones and records in every
+    other view (internal data answered on ``external``), and a zone with a
+    same-name twin in another view would be declared twice there, which makes
+    BIND refuse the whole group. So the delete is refused (409, naming them)
+    until the operator moves or deletes them, including rows in the Trash,
+    which keep their ``view_id`` and would come back shared on restore.
+
+    A blocking list assigned to the view loses that assignment (the
+    association row cascades); the delete asks for
+    ``acknowledge_blocklist_detach=true`` rather than doing it silently.
+    """
     view = await _require_view(group_id, view_id, db)
+    await _assert_view_is_unowned(view, db)
+
+    bl_rows = (
+        (
+            await db.execute(
+                select(DNSBlockList)
+                .join(
+                    dns_blocklist_view_assoc,
+                    dns_blocklist_view_assoc.c.blocklist_id == DNSBlockList.id,
+                )
+                .where(dns_blocklist_view_assoc.c.view_id == view.id)
+                .options(selectinload(DNSBlockList.views), selectinload(DNSBlockList.server_groups))
+                .order_by(DNSBlockList.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    orphaned = [
+        b.name for b in bl_rows if not b.server_groups and all(v.id == view.id for v in b.views)
+    ]
+    if bl_rows and not acknowledge_blocklist_detach:
+        names = ", ".join(b.name for b in bl_rows)
+        tail = (
+            f" Of those, {', '.join(orphaned)} would be scoped to nothing and stop "
+            "filtering anywhere."
+            if orphaned
+            else ""
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"View {view.name!r} has blocking lists scoped to it ({names}). "
+                "Deleting it removes that scope, so the clients it matched are no "
+                f"longer filtered by them.{tail} Re-scope them first, or delete with "
+                "acknowledge_blocklist_detach=true."
+            ),
+        )
+
+    guard = await RenderGuard.capture(db, group_id, None)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -5320,12 +5432,64 @@ async def delete_view(
             resource_type="dns_view",
             resource_id=str(view.id),
             resource_display=view.name,
+            old_value=(
+                {
+                    "blocklists_detached": [b.name for b in bl_rows],
+                    "blocklists_left_unscoped": orphaned,
+                }
+                if bl_rows
+                else None
+            ),
             result="success",
         )
     )
     collect_wake(dns_group_channel(group_id))
     await db.delete(view)
+    await guard.check(db, f"delete view {view.name!r}")
     await db.commit()
+
+
+async def _assert_view_is_unowned(view: DNSView, db: DB) -> None:
+    """409 while any zone or record, live or in the Trash, is scoped to ``view``."""
+    zone_rows = (
+        await db.execute(
+            select(DNSZone.name, DNSZone.deleted_at)
+            .where(DNSZone.view_id == view.id)
+            .order_by(DNSZone.name)
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    rec_rows = (
+        await db.execute(
+            select(DNSRecord.fqdn, DNSRecord.record_type, DNSRecord.deleted_at)
+            .where(DNSRecord.view_id == view.id)
+            .order_by(DNSRecord.fqdn, DNSRecord.record_type)
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    if not zone_rows and not rec_rows:
+        return
+
+    def _shown(labels: list[str]) -> str:
+        more = f" and {len(labels) - 5} more" if len(labels) > 5 else ""
+        return ", ".join(labels[:5]) + more
+
+    parts: list[str] = []
+    if zone_rows:
+        labels = [f"{n}{' (in Trash)' if d is not None else ''}" for n, d in zone_rows]
+        parts.append(f"{len(zone_rows)} zone(s): {_shown(labels)}")
+    if rec_rows:
+        labels = [f"{f} {t}{' (in Trash)' if d is not None else ''}" for f, t, d in rec_rows]
+        parts.append(f"{len(rec_rows)} record(s): {_shown(labels)}")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot delete view {view.name!r}: it still scopes {'; '.join(parts)}. "
+            "Deleting the view would make them shared, served in every other view. "
+            "Move them to another view (or the zone to another group) or delete them "
+            "first; rows in the Trash must be purged or restored and moved."
+        ),
+    )
 
 
 # ── Zone endpoints ──────────────────────────────────────────────────────────
@@ -5482,9 +5646,13 @@ async def create_zone(
 
     payload = body.model_dump()
     payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
+    guard = await RenderGuard.capture(db, group_id, [body.name])
     zone = DNSZone(group_id=group_id, **payload)
     db.add(zone)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
+    # #2275 — the constraint above cannot see a shared zone landing in a view
+    # that already holds a pinned zone of the same name.
+    await guard.check(db, f"create zone {body.name!r}")
 
     # Write-through: push the create to any windows_dns-with-creds server
     # in this group *before* we commit. If the Windows push fails we don't
@@ -6316,9 +6484,18 @@ async def update_zone(
         k in changes and (changes[k] or "") != (getattr(zone, k) or "")
         for k in ("primary_ns", "admin_email")
     ) or any(k in changes and changes[k] != getattr(zone, k) for k in _ZONE_FILE_TIMER_FIELDS)
+    # #2275 — re-pinning or renaming can put the zone into a view that already
+    # renders a zone of that name (clearing view_id makes it shared: every view).
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name, changes.get("name") or zone.name])
+        if {"view_id", "name"} & changes.keys()
+        else None
+    )
     before = {k: getattr(zone, k, None) for k in changes}
     for k, v in changes.items():
         setattr(zone, k, v)
+    if render_guard is not None:
+        await render_guard.check(db, f"update zone {zone.name!r}")
     if soa_changed:
         bump_zone_serial(zone)
     if dnssec_flip == "dnssec_sign":
@@ -7363,6 +7540,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: group cannot serve; non-null means the commit refuses, not waivable
     #: by acknowledgement.
     forward_transport_refusal: str | None = None
+    #: #2263 — the zone's own allow_query / allow_transfer cannot be applied
+    #: by a Technitium server in the target; non-null means the commit
+    #: refuses, not waivable by acknowledgement.
+    technitium_acl_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -7402,6 +7583,7 @@ class ZoneMovePreviewResponse(BaseModel):
             technitium_api_refusal=plan.technitium_api_refusal,
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             forward_transport_refusal=plan.forward_transport_refusal,
+            technitium_acl_refusal=plan.technitium_acl_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -7677,6 +7859,7 @@ async def create_zone_from_template(
             detail="A zone with that name already exists in this group/view",
         )
 
+    guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(
         group_id=group_id,
         view_id=body.view_id,
@@ -7685,6 +7868,7 @@ async def create_zone_from_template(
         kind=body.kind,
     )
     db.add(zone)
+    await guard.check(db, f"create zone {body.zone_name!r}")  # #2275
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
@@ -8444,6 +8628,10 @@ async def create_record(
         fqdn=fqdn,
     )
 
+    # #2275 — a view-scoped record also places its zone in that view.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name]) if body.view_id is not None else None
+    )
     record = DNSRecord(
         zone_id=zone_id,
         fqdn=fqdn,
@@ -8453,6 +8641,8 @@ async def create_record(
     db.add(record)
     target_serial = bump_zone_serial(zone)
     await db.flush()
+    if render_guard is not None:
+        await render_guard.check(db, f"add a record scoped to that view in {zone.name!r}")
     op = await enqueue_record_op(
         db,
         zone,
@@ -8530,8 +8720,16 @@ async def update_record(
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
+    # #2275 — moving a record between views moves its zone's placement too.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if zone is not None and "view_id" in changes and changes["view_id"] != before_view
+        else None
+    )
     for k, v in changes.items():
         setattr(record, k, v)
+    if render_guard is not None and zone is not None:
+        await render_guard.check(db, f"move this record's view in {zone.name!r}")
     # #424 — validate the merged per-type fields (record_type is immutable on
     # update, so this checks the final priority/weight/port against the row's
     # type and normalizes, e.g. defaulting MX priority to 10).
@@ -8699,6 +8897,17 @@ async def delete_record(
     # push the provider retraction with the record's pre-delete values.
     zone = await db.get(DNSZone, record.zone_id)
     rec_snapshot = record_op_payload(record)
+    # #2275 — the last view-scoped record leaving a shared zone makes it shared
+    # again, rendered into every view.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if zone is not None and record.view_id is not None
+        else None
+    )
+
+    async def _check_render() -> None:
+        if render_guard is not None and zone is not None:
+            await render_guard.check(db, f"delete this view-scoped record in {zone.name!r}")
 
     async def _push_delete() -> None:
         # enqueue_record_op dispatches per-driver: agentless is sent once the
@@ -8728,6 +8937,7 @@ async def delete_record(
                     result="success",
                 )
             )
+        await _check_render()
         await _push_delete()
         await db.commit()
         return
@@ -8747,6 +8957,7 @@ async def delete_record(
         )
     )
     await db.delete(record)
+    await _check_render()
     await _push_delete()
     await db.commit()
 
@@ -8870,6 +9081,13 @@ async def bulk_delete_records(
     if not targets:
         return BulkDeleteRecordsResponse(deleted=0, skipped=skipped)
 
+    # #2275 — see delete_record.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if any(r.view_id is not None for r in targets)
+        else None
+    )
+
     # Bump the zone serial once for the whole batch — same zone, same
     # serial bump. N singular deletes used to bump N times, which is
     # wasteful and produces confusing serial jumps in SOA queries.
@@ -8957,6 +9175,8 @@ async def bulk_delete_records(
                 )
             )
             await db.delete(rec)
+        if render_guard is not None:
+            await render_guard.check(db, f"delete these view-scoped records in {zone.name!r}")
         await db.commit()
         return BulkDeleteRecordsResponse(
             deleted=len(dispatched),
@@ -8985,6 +9205,8 @@ async def bulk_delete_records(
                 result="success",
             )
         )
+    if render_guard is not None:
+        await render_guard.check(db, f"delete these view-scoped records in {zone.name!r}")
     await db.commit()
     return BulkDeleteRecordsResponse(
         deleted=len(dispatched),
@@ -9169,9 +9391,16 @@ async def bulk_create_records(
                 **r.model_dump(),
             )
         )
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name])
+        if any(r.view_id is not None for r in records)
+        else None
+    )
     db.add_all(records)
     target_serial = bump_zone_serial(zone)
     await db.flush()
+    if render_guard is not None:  # #2275 — see create_record
+        await render_guard.check(db, f"add records scoped to a view in {zone.name!r}")
 
     ops = [
         {
@@ -9498,6 +9727,11 @@ async def import_zone_commit(
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
 
+    # #2275 — a view-scoped import creates or deletes records in that view,
+    # which moves where the zone renders.
+    render_guard = (
+        await RenderGuard.capture(db, group_id, [zone.name]) if body.view_id is not None else None
+    )
     batch_id = uuid.uuid4()
     created = 0
     updated = 0
@@ -9559,6 +9793,8 @@ async def import_zone_commit(
             await db.delete(row)
             deleted += 1
 
+    if render_guard is not None:
+        await render_guard.check(db, f"import this zone file into {zone.name!r}")
     target_serial, op_rows, provider_warning = await _queue_import_ops(
         db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
     )
@@ -10200,6 +10436,8 @@ async def import_zone_spreadsheet_commit(
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
 
+    # #2275 — rows carry a view, and a record's view places its zone there.
+    render_guard = await RenderGuard.capture(db, group_id, [zone.name])
     batch_id = uuid.uuid4()
     delete_payloads: list[dict[str, Any]] = []
     update_rows: list[DNSRecord] = []
@@ -10270,6 +10508,7 @@ async def import_zone_spreadsheet_commit(
     # Comment-only edits are written without a serial bump; everything a
     # server serves goes out as record ops on one bump.
     await db.flush()
+    await render_guard.check(db, f"import this sheet into {zone.name!r}")
     target_serial, op_rows, provider_warning = await _queue_import_ops(
         db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
     )

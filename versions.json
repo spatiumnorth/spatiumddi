@@ -83,6 +83,15 @@
       "note": "Bump only alongside a slot-image cut. A Kubernetes minor is NOT slot-revertible: the k3s data dir lives on persistent /var, not in the A/B slot, so reverting the slot starts the old apiserver against a store the new one has written (#974). Moving this also moves kind-node and kubeconform-k8s-target below."
     },
 
+    "skopeo": {
+      "version": "v1.20.0",
+      "pinned_in": [
+        { "path": "appliance/scripts/bake-images.sh", "match": "quay.io/skopeo/stable:{version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "skopeo {version} in a container", "count": 1 }
+      ],
+      "upstream": { "kind": "quay", "repo": "skopeo/stable", "track": "^v1\\.[0-9]+\\.[0-9]+$" },
+      "note": "Build-time tool only -- run in a container by bake-images.sh's save_with_recovery to copy an image registry -> docker-archive when a containerd-store builder lost the layer blobs and `docker save` cannot be repaired (#2393). Never shipped."
+    },
     "kind-node": {
       "version": "v1.36.4",
       "pinned_in": [

@@ -8,8 +8,12 @@ will gain dedicated summary endpoints + validators in later phases.
 
 Permissions: every endpoint is gated on ``network_service`` (admin via
 the seeded Network Editor + IPAM Editor builtin roles; superadmin
-always passes). Each mutation writes an ``audit_log`` row before
-commit per CLAUDE.md non-negotiable #4.
+always passes). A service also points at rows of other types (VRFs,
+circuits, sites, subnets, ...) that each have their own router and
+their own ``read`` grant, so attaching one needs read on that row, and
+the summary fills a section only with rows the caller may read; the
+rest are counted in ``withheld``. Each mutation writes an
+``audit_log`` row before commit per CLAUDE.md non-negotiable #4.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from sqlalchemy import func, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.circuit import Circuit
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSZone
@@ -216,6 +220,9 @@ class L3VPNSubnetSummary(BaseModel):
     role: str | None
 
 
+L3VPNSection = Literal["vrf", "edge_sites", "edge_circuits", "edge_subnets"]
+
+
 class L3VPNSummary(BaseModel):
     kind: Literal["mpls_l3vpn"] = "mpls_l3vpn"
     vrf: L3VPNVrfSummary | None
@@ -223,6 +230,11 @@ class L3VPNSummary(BaseModel):
     edge_circuits: list[L3VPNCircuitSummary]
     edge_subnets: list[L3VPNSubnetSummary]
     warnings: list[str]
+    # Section -> number of attached rows left out because the caller has no
+    # ``read`` grant on them (``vrf`` / ``site`` / ``circuit`` / ``subnet``).
+    # Those rows carry nothing in the answer: no name, id or value. A
+    # section absent from the map was shown in full.
+    withheld: dict[L3VPNSection, int] = Field(default_factory=dict)
 
 
 class CustomGroupedSummary(BaseModel):
@@ -278,16 +290,28 @@ def _to_read(svc: NetworkService, resources: list[NetworkServiceResource]) -> Se
     )
 
 
-async def _validate_attach_target(db: Any, kind: str, resource_id: uuid.UUID) -> Any:
+async def _validate_attach_target(db: Any, user: Any, kind: str, resource_id: uuid.UUID) -> Any:
     """Resolve the target row for an attach; raise 422 on miss.
 
     ``overlay_network`` lit up alongside #95 and is now a real attach
     target (services bundle overlays the same way they bundle VRFs /
     circuits).
+
+    The caller must hold ``read`` on the attached row (each resource kind
+    is also its permission resource type). Attaching links the row to the
+    service, and the service summary shows it back, so a row the caller
+    may not read through its own router may not be attached either. The
+    grant is checked before the row is looked up, so the answer does not
+    say whether an id the caller may not read exists.
     """
     model = _KIND_MODEL.get(kind)
     if model is None:
         raise HTTPException(status_code=422, detail=f"unknown resource_kind: {kind}")
+    if not user_has_permission(user, "read", kind, resource_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Permission denied: need 'read' on '{kind}' to attach it",
+        )
     row = await db.get(model, resource_id)
     if row is None or getattr(row, "deleted_at", None) is not None:
         raise HTTPException(status_code=422, detail=f"{kind} {resource_id} not found")
@@ -579,7 +603,7 @@ async def attach_resource(
     if body.resource_kind not in RESOURCE_KINDS:
         raise HTTPException(status_code=422, detail=f"unknown resource_kind: {body.resource_kind}")
 
-    await _validate_attach_target(db, body.resource_kind, body.resource_id)
+    await _validate_attach_target(db, user, body.resource_kind, body.resource_id)
     await _enforce_l3vpn_invariants_on_attach(db, svc, body.resource_kind, body.resource_id)
 
     # Idempotent reattach: same (kind, id) returns the existing row.
@@ -666,7 +690,7 @@ async def detach_resource(
 
 @router.get("/{service_id:uuid}/summary")
 async def get_service_summary(
-    service_id: uuid.UUID, db: DB, _: CurrentUser
+    service_id: uuid.UUID, db: DB, user: CurrentUser
 ) -> L3VPNSummary | CustomGroupedSummary:
     """Kind-aware summary view.
 
@@ -675,6 +699,12 @@ async def get_service_summary(
     invariants. For ``custom`` returns resources grouped by kind plus
     the raw list. Other kinds (DIA / hosted-DNS / SD-WAN) will gain
     their own shapes when those kinds light up.
+
+    The L3VPN sections carry rows of other types; each row is included
+    only when the caller may read it through its own router, and the
+    rows left out are counted in ``withheld``. The ``custom`` shape
+    carries only the service's own link rows (kind + id), which are
+    ``network_service`` data.
     """
     svc = await db.get(NetworkService, service_id)
     if svc is None or svc.deleted_at is not None:
@@ -682,7 +712,7 @@ async def get_service_summary(
     resources = await _load_resources(db, svc.id)
 
     if svc.kind == "mpls_l3vpn":
-        return await _l3vpn_summary(db, resources)
+        return await _l3vpn_summary(db, user, resources)
 
     # Default ``custom`` shape (also used as a fallback for kinds that
     # haven't grown their own summary yet).
@@ -695,10 +725,20 @@ async def get_service_summary(
     )
 
 
-async def _l3vpn_summary(db: Any, resources: list[NetworkServiceResource]) -> L3VPNSummary:
+async def _l3vpn_summary(
+    db: Any, user: Any, resources: list[NetworkServiceResource]
+) -> L3VPNSummary:
     by_kind: dict[str, list[NetworkServiceResource]] = {}
     for r in resources:
         by_kind.setdefault(r.resource_kind, []).append(r)
+
+    withheld: dict[L3VPNSection, int] = {}
+
+    def _readable(section: L3VPNSection, resource_type: str, rid: uuid.UUID) -> bool:
+        if user_has_permission(user, "read", resource_type, rid):
+            return True
+        withheld[section] = withheld.get(section, 0) + 1
+        return False
 
     warnings: list[str] = []
     vrf_summary: L3VPNVrfSummary | None = None
@@ -712,7 +752,7 @@ async def _l3vpn_summary(db: Any, resources: list[NetworkServiceResource]) -> L3
         warnings.append(f"{len(vrfs)} VRFs attached — L3VPN service must have exactly one")
     else:
         vrf_obj = await db.get(VRF, vrfs[0].resource_id)
-        if vrf_obj is not None:
+        if vrf_obj is not None and _readable("vrf", "vrf", vrf_obj.id):
             vrf_summary = L3VPNVrfSummary(
                 id=vrf_obj.id,
                 name=vrf_obj.name,
@@ -726,16 +766,20 @@ async def _l3vpn_summary(db: Any, resources: list[NetworkServiceResource]) -> L3
         site = await db.get(Site, link.resource_id)
         if site is None:
             continue
+        if not _readable("edge_sites", "site", site.id):
+            continue
         edge_sites.append(
             L3VPNSiteSummary(id=site.id, name=site.name, code=site.code, role=link.role)
         )
-    if len(edge_sites) < 2:
+    if len(edge_sites) + withheld.get("edge_sites", 0) < 2:
         warnings.append("fewer than 2 edge sites — single-site L3VPN is unusual")
 
     edge_circuits: list[L3VPNCircuitSummary] = []
     for link in by_kind.get("circuit", []):
         ckt = await db.get(Circuit, link.resource_id)
         if ckt is None or ckt.deleted_at is not None:
+            continue
+        if not _readable("edge_circuits", "circuit", ckt.id):
             continue
         edge_circuits.append(
             L3VPNCircuitSummary(
@@ -753,6 +797,8 @@ async def _l3vpn_summary(db: Any, resources: list[NetworkServiceResource]) -> L3
     for link in by_kind.get("subnet", []):
         sn = await db.get(Subnet, link.resource_id)
         if sn is None or getattr(sn, "deleted_at", None) is not None:
+            continue
+        if not _readable("edge_subnets", "subnet", sn.id):
             continue
         # If the subnet's enclosing block is in a VRF that doesn't
         # match the service VRF, that's a SHOULD-violation worth
@@ -789,6 +835,7 @@ async def _l3vpn_summary(db: Any, resources: list[NetworkServiceResource]) -> L3
         edge_circuits=edge_circuits,
         edge_subnets=edge_subnets,
         warnings=warnings,
+        withheld=withheld,
     )
 
 
