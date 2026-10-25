@@ -18,11 +18,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select, update
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.permissions import require_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
@@ -30,6 +31,52 @@ from app.services import alerts as alert_service
 from app.services.alert_rule_catalogue import RuleTypeSpec, build_catalogue
 
 router = APIRouter()
+
+
+# #2746 — the shared parameter columns (``threshold_percent``,
+# ``classification``, ...) mean different things per rule type, so each
+# value is checked against the parameter the rule type's OWN catalogue
+# entry declares for it (range for an integer, options for a select).
+# A column the type does not declare is unused by its evaluator and is
+# only held to a sanity bound.
+_SANITY_MAX = 1_000_000
+
+
+def check_rule_params(rule_type: str, values: dict[str, Any]) -> None:
+    """Raise ``ValueError`` naming the field when a value is outside what
+    ``rule_type``'s catalogue entry offers for it."""
+    spec = next((s for s in build_catalogue() if s.rule_type == rule_type), None)
+    declared = {p.name: p for p in spec.params} if spec else {}
+    for name, value in values.items():
+        if value is None or name not in _CATALOGUE_PARAM_FIELDS:
+            continue
+        param = declared.get(name)
+        if param is None:
+            if isinstance(value, int) and not (0 <= value <= _SANITY_MAX):
+                raise ValueError(f"{name} must be 0..{_SANITY_MAX}")
+            continue
+        if param.kind == "select":
+            allowed = [o.value for o in param.options]
+            if value not in allowed:
+                raise ValueError(
+                    f"{param.label} ({name}) must be one of: "
+                    f"{', '.join(repr(v) for v in allowed)}"
+                )
+            continue
+        lo = param.min
+        hi = param.max if param.max is not None else _SANITY_MAX
+        if (lo is not None and value < lo) or value > hi:
+            rng = f"at least {lo}" if param.max is None else f"between {lo} and {hi}"
+            raise ValueError(f"{param.label} ({name}) must be {rng}")
+
+
+_CATALOGUE_PARAM_FIELDS = (
+    "threshold_percent",
+    "threshold_days",
+    "min_free_addresses",
+    "classification",
+    "change_scope",
+)
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────
@@ -82,15 +129,6 @@ class AlertRuleCreate(BaseModel):
             raise ValueError(f"server_type must be one of: {', '.join(sorted(_SERVER_TYPES))}")
         return v
 
-    @field_validator("threshold_percent")
-    @classmethod
-    def _v_thr(cls, v: int | None) -> int | None:
-        if v is None:
-            return None
-        if not (0 <= v <= 100):
-            raise ValueError("threshold_percent must be 0..100")
-        return v
-
     @field_validator("threshold_days")
     @classmethod
     def _v_thr_days(cls, v: int | None) -> int | None:
@@ -113,18 +151,6 @@ class AlertRuleCreate(BaseModel):
             raise ValueError("min_free_addresses must be ≥ 1")
         return v
 
-    @field_validator("classification")
-    @classmethod
-    def _v_classification(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        if v not in alert_service.COMPLIANCE_CLASSIFICATIONS:
-            raise ValueError(
-                "classification must be one of: "
-                f"{', '.join(sorted(alert_service.COMPLIANCE_CLASSIFICATIONS))}"
-            )
-        return v
-
     @field_validator("change_scope")
     @classmethod
     def _v_change_scope(cls, v: str | None) -> str | None:
@@ -143,6 +169,10 @@ class AlertRuleCreate(BaseModel):
         # can never fire; the evaluator just warned every tick.
         if self.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not self.classification:
             raise ValueError("classification is required for compliance_change rules")
+        check_rule_params(
+            self.rule_type,
+            {f: getattr(self, f) for f in _CATALOGUE_PARAM_FIELDS},
+        )
         return self
 
 
@@ -200,15 +230,6 @@ class AlertRuleUpdate(BaseModel):
             raise ValueError(f"server_type must be one of: {', '.join(sorted(_SERVER_TYPES))}")
         return v
 
-    @field_validator("threshold_percent")
-    @classmethod
-    def _v_thr(cls, v: int | None) -> int | None:
-        if v is None:
-            return None
-        if not (0 <= v <= 100):
-            raise ValueError("threshold_percent must be 0..100")
-        return v
-
     @field_validator("threshold_days")
     @classmethod
     def _v_thr_days(cls, v: int | None) -> int | None:
@@ -225,18 +246,6 @@ class AlertRuleUpdate(BaseModel):
             return None
         if v < 1:
             raise ValueError("min_free_addresses must be ≥ 1")
-        return v
-
-    @field_validator("classification")
-    @classmethod
-    def _v_classification(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        if v not in alert_service.COMPLIANCE_CLASSIFICATIONS:
-            raise ValueError(
-                "classification must be one of: "
-                f"{', '.join(sorted(alert_service.COMPLIANCE_CLASSIFICATIONS))}"
-            )
         return v
 
     @field_validator("change_scope")
@@ -304,13 +313,21 @@ class EvaluateResponse(BaseModel):
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 
-@router.get("/rules", response_model=list[AlertRuleResponse])
+@router.get(
+    "/rules",
+    response_model=list[AlertRuleResponse],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     res = await db.execute(select(AlertRule).order_by(AlertRule.name))
     return list(res.scalars().all())
 
 
-@router.get("/rule-types", response_model=list[RuleTypeSpec])
+@router.get(
+    "/rule-types",
+    response_model=list[RuleTypeSpec],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_rule_types(db: DB, current_user: CurrentUser) -> list[RuleTypeSpec]:
     """Every rule type, its label, and the parameters its evaluator reads (#1997).
 
@@ -358,7 +375,11 @@ async def create_rule(body: AlertRuleCreate, db: DB, current_user: SuperAdmin) -
     return rule
 
 
-@router.get("/rules/{rule_id}", response_model=AlertRuleResponse)
+@router.get(
+    "/rules/{rule_id}",
+    response_model=AlertRuleResponse,
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def get_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertRule:
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
@@ -394,6 +415,10 @@ async def update_rule(
         clearable=_RULE_CLEARABLE_FIELDS,
         non_nullable=_RULE_NON_NULLABLE_FIELDS,
     )
+    try:
+        check_rule_params(rule.rule_type, changes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     changed: dict[str, Any] = {}
     for field, value in changes.items():
         old = getattr(rule, field)
@@ -460,7 +485,11 @@ async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> N
 # ── Events ─────────────────────────────────────────────────────────────────
 
 
-@router.get("/events", response_model=list[AlertEventResponse])
+@router.get(
+    "/events",
+    response_model=list[AlertEventResponse],
+    dependencies=[Depends(require_permission("read", "alert"))],
+)
 async def list_events(
     db: DB,
     current_user: CurrentUser,
@@ -548,4 +577,17 @@ async def evaluate_now(db: DB, current_user: SuperAdmin) -> EvaluateResponse:
     configured syslog / webhook / SMTP targets.
     """
     result = await alert_service.evaluate_all(db)
+    db.add(
+        AuditLog(
+            action="evaluate",
+            resource_type="alert_rule",
+            resource_id="*",
+            resource_display="alert evaluator (manual run)",
+            user_id=current_user.id,
+            user_display_name=current_user.username,
+            result="success",
+            new_value={k: result.get(k) for k in EvaluateResponse.model_fields},
+        )
+    )
+    await db.commit()
     return EvaluateResponse(**result)

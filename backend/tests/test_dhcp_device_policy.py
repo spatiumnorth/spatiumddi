@@ -737,3 +737,44 @@ async def test_manual_match_only_policy_is_not_called_unrendered(
     out_blank = await compile_device_policy(db_session, blank)
     assert not out_blank.expression
     assert any("matches nothing and is not rendered" in w for w in out_blank.warnings)
+
+
+@pytest.mark.asyncio
+async def test_disabled_policy_manual_match_is_not_called_in_force_2753(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#2753: the bundle omits a disabled policy, so its preview must not say
+    the manual match is in force; an enabled one still does."""
+    _, token = await _make_user(db_session)
+    grp, _ = await _make_group_with_server(db_session)
+    expr = "option[60].hex == 0x78702d6e6f6e65"
+    off = _policy(grp.id, device_classes=[], match_override=expr, enabled=False)
+    on = _policy(grp.id, device_classes=[], match_override=expr, enabled=True)
+    db_session.add_all([off, on])
+    await db_session.commit()
+
+    hdr = {"Authorization": f"Bearer {token}"}
+    r_off = (await client.get(f"/api/v1/dhcp/device-policies/{off.id}/preview", headers=hdr)).json()
+    r_on = (await client.get(f"/api/v1/dhcp/device-policies/{on.id}/preview", headers=hdr)).json()
+    assert r_off["renders"] is False
+    assert r_off["expression"] == expr
+    assert not any("in force" in w for w in r_off["warnings"])
+    assert any("disabled" in w for w in r_off["warnings"])
+    assert r_on["renders"] is True
+    assert any("in force" in w for w in r_on["warnings"])
+
+    # The bundle really omits the disabled policy.
+    srv = await _server_of(db_session, grp.id)
+    bundle = await build_config_bundle(db_session, srv)
+    names = {c.name for c in bundle.device_policy_classes}
+    assert on.class_name in names and off.class_name not in names
+
+
+async def _server_of(db: AsyncSession, group_id) -> DHCPServer:
+    from sqlalchemy import select
+
+    return (
+        (await db.execute(select(DHCPServer).where(DHCPServer.server_group_id == group_id)))
+        .scalars()
+        .first()
+    )

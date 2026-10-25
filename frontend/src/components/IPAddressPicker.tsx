@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Search, X } from "lucide-react";
 import { searchApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 
 /**
  * Debounced IP address picker. Used by the multicast Memberships
@@ -81,6 +82,11 @@ export function IPAddressPicker({
             setOpen(true);
           }}
           onFocus={() => setOpen(true)}
+          onKeyDown={(e) =>
+            closePopupOnEscape(e, open && debouncedQuery.length >= 2, () =>
+              setOpen(false),
+            )
+          }
           placeholder={placeholder}
           disabled={disabled}
           className="w-full rounded-md border bg-background py-1.5 pl-7 pr-7 text-sm focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"

@@ -20,13 +20,14 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import func, select, text
-from sqlalchemy import inspect as sa_inspect
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.celery_dispatch import dispatch
+from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import (
@@ -288,6 +289,15 @@ class SettingsResponse(BaseModel):
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
     ssh_lockdown: bool = False
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Read by the nightly prune tasks; every one is superadmin-only to
+    # change (not in ``SETTINGS_DELEGATE_WRITABLE``).
+    soft_delete_purge_days: int = 30
+    dhcp_lease_history_retention_days: int = 90
+    pcap_retention_days: int = 7
+    appliance_revoked_retention_days: int = 30
+    metric_retention_days: int = 7
+    log_retention_hours: int = 24
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -557,6 +567,16 @@ class SNMPV3UserUpdate(BaseModel):
             )
         return s
 
+    @field_validator("auth_pass", "priv_pass")
+    @classmethod
+    def _passphrase_single_line(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # The passphrase is written into a ``createUser`` line of
+        # snmpd.conf, which ends at the first newline. ``None`` (keep) and
+        # ``""`` (clear) pass through.
+        if v:
+            reject_control_chars(v, info.field_name or "value")
+        return v
+
     @field_validator("auth_protocol")
     @classmethod
     def _valid_auth_proto(cls, v: str) -> str:
@@ -597,7 +617,7 @@ class NTPCustomServerUpdate(BaseModel):
         # server directive, so reject whitespace in the hostname here.
         if any(c.isspace() for c in s):
             raise ValueError("host may not contain whitespace")
-        return s
+        return reject_control_chars(s, "host")
 
 
 class SyslogTargetUpdate(BaseModel):
@@ -734,7 +754,9 @@ class AptSourceUpdate(BaseModel):
     def _suites_nonempty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("suites may not be empty")
-        return v.strip()
+        # Rendered into the one-line ``deb`` entry; a newline would end it
+        # and start another entry. Spaces stay legal (several suites).
+        return reject_control_chars(v.strip(), "suites")
 
     @field_validator("signed_by_key_id")
     @classmethod
@@ -895,6 +917,19 @@ SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
         "dhcp_default_domain_search",
         "vrf_strict_rd_validation",
     }
+)
+
+
+# Data-retention windows (#2273), each read by a nightly prune task. All are
+# superadmin-only (none is in ``SETTINGS_DELEGATE_WRITABLE``): shortening one
+# deletes data on the next sweep.
+RETENTION_FIELDS: tuple[str, ...] = (
+    "soft_delete_purge_days",
+    "dhcp_lease_history_retention_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
+    "metric_retention_days",
+    "log_retention_hours",
 )
 
 
@@ -1062,6 +1097,19 @@ class SettingsUpdate(BaseModel):
     # smaller tick — an operator may have sent that one for another reason.
     ssh_lockdown_force: bool | None = None
     acknowledge_console_only: bool | None = None
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Superadmin-only. 0 turns the trash purge, lease-history prune and
+    # revoked-appliance hard-delete off (keep forever), as each task
+    # already reads it. pcap / metric / log windows have no "off": a
+    # capture holds plaintext credentials, and the other two are
+    # high-volume tables. ``log_retention_hours`` is capped at 168 until
+    # #2185 replaces the single unbatched DELETE with partition drops.
+    soft_delete_purge_days: int | None = Field(default=None, ge=0, le=365)
+    dhcp_lease_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    pcap_retention_days: int | None = Field(default=None, ge=1, le=90)
+    appliance_revoked_retention_days: int | None = Field(default=None, ge=0, le=365)
+    metric_retention_days: int | None = Field(default=None, ge=1, le=365)
+    log_retention_hours: int | None = Field(default=None, ge=1, le=168)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -1646,6 +1694,32 @@ class SettingsUpdate(BaseModel):
             raise ValueError(f"snmp_version must be one of {sorted(_SNMP_VERSIONS)}")
         return v
 
+    @field_validator("snmp_sys_contact", "snmp_sys_location")
+    @classmethod
+    def _valid_snmp_sys_text(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # Written into a ``sysContact`` / ``sysLocation`` line of
+        # snmpd.conf. That file is line-oriented, so a newline would end the
+        # line and the rest would be read as a directive of its own.
+        if v is None:
+            return None
+        return reject_control_chars(v, info.field_name or "value")
+
+    @field_validator("snmp_community")
+    @classmethod
+    def _valid_snmp_community(cls, v: str | None) -> str | None:
+        # Written unquoted as the community token of ``rocommunity
+        # <community> <source>``: a newline would start a new directive, and
+        # a space would move the next word into the source position. ``""``
+        # clears the stored community.
+        if not v:
+            return v
+        if has_control_chars(v) or any(c.isspace() for c in v):
+            raise ValueError(
+                "snmp_community must not contain whitespace or control characters "
+                "(newline, carriage return, NUL, tab or other non-printing characters)"
+            )
+        return v
+
     @field_validator("snmp_allowed_sources")
     @classmethod
     def _valid_snmp_sources(cls, v: list[str] | None) -> list[str] | None:
@@ -1690,6 +1764,7 @@ class SettingsUpdate(BaseModel):
                 continue
             if any(c.isspace() for c in s):
                 raise ValueError(f"pool hostname may not contain whitespace: {raw!r}")
+            reject_control_chars(s, "ntp_pool_servers")
             out.append(s)
         return out
 
@@ -2088,17 +2163,11 @@ async def update_settings(
     # The legacy webhook's URL + Authorization header (#1502): same
     # encrypt-and-redact shape, so neither reaches the column in clear or the
     # ``platform_settings_updated`` log line below.
-    _legacy_webhook_written: list[str] = []
     for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
         if _field in changes:
             raw = changes.pop(_field)
             setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
             changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
-            _legacy_webhook_written.append(_field)
-    if _legacy_webhook_written:
-        # GHSA-g9gv-9qp2-3qwm: blank the plaintext leftovers too, in the
-        # same transaction, or the pre-upgrade value outlives the change.
-        await _blank_legacy_plaintext(db, "platform_settings", settings.id, _legacy_webhook_written)
 
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
@@ -2371,6 +2440,15 @@ async def update_settings(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
                 ) from exc
 
+    # #2273 — remember the retention windows this request changes, for the
+    # dedicated audit row below (shortening one deletes data on the next
+    # nightly prune, so old and new values are both recorded).
+    _retention_old = {
+        f: getattr(settings, f)
+        for f in RETENTION_FIELDS
+        if f in changes and getattr(settings, f) != changes[f]
+    }
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2486,6 +2564,26 @@ async def update_settings(
                     "dnssec": settings.resolver_dnssec,
                     "dns_over_tls": settings.resolver_dns_over_tls,
                 },
+            )
+        )
+
+    # #2273 — dedicated audit row for a data-retention change (non-negotiable
+    # #4; the ``logger.info`` below is not an ``audit_log`` row). Only real
+    # changes are recorded, so echoing the form back writes nothing.
+    if _retention_old:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="retention",
+                resource_display="Data retention",
+                result="success",
+                changed_fields=sorted(_retention_old),
+                old_value=_retention_old,
+                new_value={f: getattr(settings, f) for f in _retention_old},
             )
         )
 
@@ -2816,7 +2914,7 @@ async def trigger_reverse_dns_run(current_user: CurrentUser, db: DB) -> ReverseD
     try:
         from app.tasks.reverse_dns import sweep_reverse_dns
 
-        result = sweep_reverse_dns.delay(force=True)
+        result = await dispatch(sweep_reverse_dns, force=True)
         task_id = result.id
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         logger.warning("reverse_dns_trigger_enqueue_failed", error=str(exc))
@@ -3128,7 +3226,7 @@ async def trigger_oui_refresh(current_user: CurrentUser, db: DB) -> OUIRefreshRe
     # into its startup path.
     from app.tasks.oui_update import update_oui_database_now  # noqa: PLC0415
 
-    result = update_oui_database_now.delay()
+    result = await dispatch(update_oui_database_now)
     logger.info("oui_refresh_triggered", user=current_user.username, task_id=result.id)
     return OUIRefreshResponse(status="queued", task_id=result.id)
 
@@ -3359,41 +3457,6 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
-async def _blank_legacy_plaintext(db: DB, table: str, row_id: Any, columns: list[str]) -> None:
-    """Blank the pre-#1506 plaintext leftovers for a written secret.
-
-    GHSA-g9gv-9qp2-3qwm: the ``*_encrypted`` migration kept the old
-    plaintext columns, unmapped and unread, holding the pre-upgrade
-    values. Clearing or replacing a secret changed only the encrypted
-    column, so the old value stayed readable in the DB and in full
-    backups. On any write of that secret, set its leftover column to
-    ``''`` in the same transaction — ``''`` is the column's server
-    default and the value the old application (which maps it as a
-    non-null string) reads as unset, so a rolling upgrade stays safe;
-    the migration's downgrade copies a still-encrypted value back, and
-    a cleared secret has none, so it stays ``''`` there too.
-
-    The columns are unmapped, so this is raw SQL, guarded by inspection:
-    a schema built from the models (tests, a fresh install before the
-    migration) may not have them at all, and the next release drops
-    them. Identifiers come only from the fixed call sites below, never
-    from request data.
-    """
-    if not columns:
-        return
-    conn = await db.connection()
-    existing = await conn.run_sync(
-        lambda c: {col["name"] for col in sa_inspect(c).get_columns(table)}
-    )
-    assignments = [f"{col} = ''" for col in columns if col in existing]
-    if not assignments:
-        return
-    await db.execute(
-        text(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
-        {"id": row_id},
-    )
-
-
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     from app.core.crypto import encrypt_str
 
@@ -3532,15 +3595,6 @@ async def create_audit_target(
     _apply_body(row, body)
     db.add(row)
     await db.flush()
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
@@ -3569,15 +3623,6 @@ async def update_audit_target(
     _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
     _apply_body(row, body)
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
@@ -3963,7 +4008,8 @@ async def create_influxdb_target(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        logger.warning("influxdb_target_create_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="create failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
@@ -3981,12 +4027,18 @@ async def update_influxdb_target(
         raise HTTPException(status_code=404, detail="Target not found")
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
+    # Flush before the try, as create does: a taken name raises its unique
+    # violation here, where the application's IntegrityError handler turns it
+    # into the same 409 Create gives (#2750), instead of the driver's text
+    # (statement and parameters included) becoming the response detail.
+    await db.flush()
     _audit_influx(db, current_user, "update", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        logger.warning("influxdb_target_update_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="update failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 

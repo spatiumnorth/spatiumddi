@@ -196,7 +196,8 @@ export function RuleEditorModal({
   // can still change its non-parameter fields if the catalogue is down.
   const catalogueBlocks = !existing && !spec;
   const groups: Record<string, AlertRuleTypeSpec[]> = {};
-  for (const t of types ?? []) (groups[t.group] ??= []).push(t);
+  for (const t of types ?? [])
+    if (!t.system_driven) (groups[t.group] ??= []).push(t);
 
   return (
     <Modal
