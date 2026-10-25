@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
@@ -47,6 +48,7 @@ from app.services.backup.schedule import (
 from app.services.backup.targets import (
     ARCHIVE_NAME_RE,
     ArchiveNotFoundError,
+    ArchiveTooLargeError,
     BackupDestinationError,
     DestinationConfigError,
     InvalidArchiveNameError,
@@ -62,7 +64,10 @@ from app.services.backup.targets import (
     safe_filename,
 )
 
-router = APIRouter()
+# nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
+# so every body here is authorised from its headers before it is read
+# (app.api.pre_body_auth).
+router = APIRouter(route_class=PreBodyAuthRoute)
 logger = structlog.get_logger(__name__)
 
 
@@ -84,6 +89,30 @@ def _enforce_download_size(size_bytes: int, *, filename: str) -> None:
                 f"{MAX_ARCHIVE_BYTES}-byte cap for destination downloads"
             ),
         )
+
+
+async def _enforce_declared_size(driver: Any, plain_config: dict[str, Any], filename: str) -> None:
+    """Refuse a named archive the destination's listing declares past the cap.
+
+    Runs before the download so an oversized archive is refused without a
+    byte of it being read. A listing that fails, or that does not carry the
+    name, refuses nothing here: the download then reports the destination
+    failure or the miss itself, and every driver's ``download`` stops at
+    ``max_bytes`` on its own.
+    """
+    try:
+        archives = await driver.list_archives(config=plain_config)
+    except BackupDestinationError:
+        return
+    for archive in archives:
+        if archive.filename == filename:
+            _enforce_download_size(archive.size_bytes, filename=filename)
+            return
+
+
+def _too_large(exc: ArchiveTooLargeError) -> HTTPException:
+    """413 for an archive a driver stopped reading at the cap."""
+    return HTTPException(status_code=413, detail=str(exc))
 
 
 # Pulled from the driver registry rather than hardcoded so new
@@ -845,7 +874,11 @@ async def download_latest_target_archive(
         )
     _enforce_download_size(newest.size_bytes, filename=newest.filename)
     try:
-        archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=newest.filename, max_bytes=MAX_ARCHIVE_BYTES
+        )
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
     except BackupDestinationError as exc:
         raise await _archive_miss(db, row, newest.filename, exc) from exc
     _enforce_download_size(len(archive_bytes), filename=newest.filename)
@@ -913,9 +946,14 @@ async def download_target_archive(
     # out of a real listing.
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
-        archive_bytes = await driver.download(config=plain_config, filename=safe_name)
+        await _enforce_declared_size(driver, plain_config, safe_name)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=safe_name, max_bytes=MAX_ARCHIVE_BYTES
+        )
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
     except UnsupportedOperationError as exc:
         # A write-only kind cannot read an archive back. 409 rather than
         # the generic 502 below, so the reason is legible instead of
@@ -985,9 +1023,14 @@ async def restore_from_archive(
     driver = get_destination(row.kind)
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
-        archive_bytes = await driver.download(config=plain_config, filename=body.filename)
+        await _enforce_declared_size(driver, plain_config, body.filename)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=body.filename, max_bytes=MAX_ARCHIVE_BYTES
+        )
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
     except BackupDestinationError as exc:
         raise await _archive_miss(db, row, body.filename, exc) from exc
     if not archive_bytes:

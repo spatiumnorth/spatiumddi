@@ -19,6 +19,9 @@ const TYPE_LABELS: Record<TrashEntryType, string> = {
   dns_zone: "DNS Zone",
   dns_record: "DNS Record",
   dhcp_scope: "DHCP Scope",
+  customer: "Customer",
+  overlay_network: "Overlay",
+  network_service: "Service",
 };
 
 const TYPE_BADGE: Record<TrashEntryType, string> = {
@@ -28,6 +31,9 @@ const TYPE_BADGE: Record<TrashEntryType, string> = {
   dns_zone: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
   dns_record: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
   dhcp_scope: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  customer: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
+  overlay_network: "bg-fuchsia-500/15 text-fuchsia-700 dark:text-fuchsia-300",
+  network_service: "bg-rose-500/15 text-rose-700 dark:text-rose-300",
 };
 
 const PAGE_SIZE = 100;
@@ -210,6 +216,26 @@ function ConfirmRestoreModal({
   );
 }
 
+// What a permanent delete takes with the row, beyond the row itself. These are
+// the rows its foreign keys cascade to, most of which the Trash does not list.
+// It names no count of "other rows deleted with it": the purge takes this
+// row's own subtree, never the rest of its deletion batch (its parent block,
+// its siblings), so a batch count named rows that stay (#2736).
+function purgeScope(entry: TrashEntry): string {
+  switch (entry.type) {
+    case "subnet":
+      return ` Its DHCP scopes (with their pools and static assignments), its addresses and the DNS records published for them are removed with it.`;
+    case "dns_zone":
+      return ` All of its DNS records and its DNS pools are removed with it.`;
+    case "dhcp_scope":
+      return ` Its pools and static assignments are removed with it.`;
+    case "customer":
+      return ` Subnets, zones, overlays and other rows that name it are left with no customer.`;
+    default:
+      return "";
+  }
+}
+
 function ConfirmPermanentDeleteModal({
   entry,
   onClose,
@@ -240,9 +266,9 @@ function ConfirmPermanentDeleteModal({
           <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
           {TYPE_LABELS[entry.type]}).
           {entry.type === "ip_block" || entry.type === "ip_space"
-            ? " The subnets and blocks in the Trash under it are removed with it."
-            : ""}{" "}
-          It cannot be restored.
+            ? " The subnets and blocks in the Trash under it, with their addresses, DHCP scopes and DNS records, are removed with it."
+            : ""}
+          {purgeScope(entry)} It cannot be restored.
         </p>
         {error && (
           <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
@@ -291,7 +317,7 @@ export function TrashPage() {
     () => ({
       type: filterType === "all" ? undefined : filterType,
       since: filterSince ? new Date(filterSince).toISOString() : undefined,
-      q: filterQ || undefined,
+      q: filterQ.trim() || undefined,
       limit: PAGE_SIZE,
       offset: page * PAGE_SIZE,
       sort,
@@ -324,10 +350,10 @@ export function TrashPage() {
             Trash
           </h1>
           <p className="text-sm text-muted-foreground">
-            Soft-deleted IPAM / DNS / DHCP rows. Restore by row to bring back
-            every cascaded child in the same batch. The nightly purge sweep
-            permanently removes anything older than the platform retention
-            window (default 30 days).
+            Soft-deleted IPAM, DNS, DHCP, customer, overlay and service rows.
+            Restore by row to bring back every cascaded child in the same batch.
+            The nightly purge sweep permanently removes anything older than the
+            platform retention window (default 30 days).
           </p>
         </div>
 

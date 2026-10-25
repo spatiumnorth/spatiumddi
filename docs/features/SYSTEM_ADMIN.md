@@ -37,7 +37,8 @@ sits under it; the nightly sweep holds such a row back and counts it in its
 `limit` / `offset` / `total`, `sort=oldest` for the rows the purge removes
 first). Nightly purge sweep
 is operator-configurable via
-`PlatformSettings.soft_delete_purge_days`.
+`PlatformSettings.soft_delete_purge_days` (Settings → Data Retention,
+see [§2.7](#27-audit-log-and-data-retention)).
 
 ### Platform Insights (`/admin/platform-insights`) — landed in `2026.04.26-1`
 
@@ -339,13 +340,49 @@ SyslogTarget
 
 Multiple syslog targets can be configured simultaneously (e.g., local Loki + remote SIEM).
 
-### 2.7 Audit Log Settings
+### 2.7 Audit Log and Data Retention
 
 - Retention period (default: 365 days)
 - Export audit log: date range → CSV or JSON download
 - Archive to S3-compatible storage (optional)
-- Audit log is append-only — no delete capability, even for superadmin
+- Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
 - Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
+- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which runs at least once every 7 days, and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to a week between an edit to an old row and its alert. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
+**Audit log.** The audit log is append-only: nothing deletes from it,
+not even a superadmin, and no task prunes it, so it has no retention
+setting. Every mutation records the user, timestamp, source IP, action,
+resource, old value and new value. Export a date range as an
+auditor-facing PDF (`GET /api/v1/audit/export.pdf`), or forward events
+as they happen to syslog or a webhook (Settings → Audit Event
+Forwarding). A configurable audit retention period and archive to
+S3-compatible storage are **not implemented**; size visibility and the
+tables nothing prunes are tracked in
+[#2274](https://github.com/spatiumnorth/spatiumddi/issues/2274).
+
+**Data retention** (Settings → Application → Data Retention, #2273).
+Each window below is read by a nightly prune task, which deletes
+anything older. All are superadmin-only to change, and every change is
+written to the audit log (`resource_type=platform_settings`,
+`resource_id=retention`) with the old and new values. Shortening a
+window deletes the older data on the next nightly run.
+
+| Setting | Data | Default | Range |
+|---|---|---|---|
+| `log_retention_hours` | DNS query log and DHCP activity log rows | 24 hours | 1–168 hours |
+| `metric_retention_days` | DNS / DHCP metric samples (dashboard charts, InfluxDB backfill) | 7 days | 1–365 days |
+| `dhcp_lease_history_retention_days` | Expired / released DHCP lease history | 90 days | 0–3650 days (0 = keep forever) |
+| `soft_delete_purge_days` | Trash (soft-deleted IPAM / DNS / DHCP rows) | 30 days | 0–365 days (0 = never purge) |
+| `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
+| `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
+
+`log_retention_hours` is capped at a week because the prune is a single
+`DELETE`, and a longer window makes that one transaction larger;
+[#2185](https://github.com/spatiumnorth/spatiumddi/issues/2185) replaces
+it with partition drops and raises the cap. The agent ingest endpoints
+skip a replayed log line already older than this window rather than
+inserting a row the next prune would delete. For longer log history,
+forward to Loki or a SIEM. Backups have their own retention per
+destination (§2.9).
 
 ### 2.8 Statistics / Reporting
 
@@ -383,12 +420,13 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 #### What an archive exposes
 
-**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftovers until the next release:** two of those were stored in clear until this release, and their old columns are kept, unread, for one release so a rolling upgrade's old pods keep working. They still hold the pre-upgrade values:
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftover until the next release:** one of those was stored in clear until a recent release, and its old column is kept, unread, for one release so a rolling upgrade's old pods keep working. It still holds the pre-upgrade value:
 
 - The group TSIG key (#1364, `dns_server_group.tsig_key_secret`). That key matters: the group's BIND9 servers grant zone transfers and dynamic updates to it from any address. Rotate each group's key once the upgrade has finished (**DNS → server group → Rotate group TSIG key**, or `POST /dns/groups/{id}/group-tsig-key/rotate`) and the leftover copy is a dead secret.
-- Webhook forward targets (#1502, `audit_forward_target.url` / `auth_header`, and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header`). A Slack, Discord or Teams incoming-webhook URL lets anyone who has it post into that channel. Re-issue the URL in the chat platform (and any collector token) once the upgrade has finished, paste the new one into the target, and the leftover copy is dead. That is also the only way to retire a URL that is already in an older archive.
 
-An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones. Clearing or replacing a webhook URL or header also blanks its leftover plaintext column in the same change, so a value an admin has removed does not stay in the database or in later full backups. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
+Webhook forward targets (#1502) had the same arrangement: `audit_forward_target.url` / `auth_header` and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header` were kept in clear for one release and are now dropped (migration `c2b203844c95`); any value still left in one is encrypted into its `*_encrypted` column first. An archive taken before that still carries them, so a Slack, Discord or Teams incoming-webhook URL in such an archive is readable by anyone who has it: re-issue the URL in the chat platform (and any collector token) to retire it. Restoring such an archive works either way — a full restore runs the migration over it, and a selective restore loads the old columns, encrypts what they hold, and drops them again. A target (or the Settings webhook) whose URL or header is filled from one of those old columns, on upgrade or on restore, is left **disabled**, since the value may be one an admin had cleared: an audit-log row per target records it (filter the audit log on the target), and a restore's warnings name each one. Re-enable it once the endpoint is confirmed.
+
+An "exclude secrets" diagnostic archive blanks the leftover column along with the encrypted ones. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
 
 An "exclude secrets" archive removes every secret, not only the credentials an operator types in: the appliance CA private key, the k3s join tokens and the cluster kubeconfig, persistent pairing-code reveals, the ACME account key, and the stored digests of credentials (local password hashes, API-token, session, pairing-code and agent-token digests). Its `secrets.enc` carries no `SECRET_KEY` or `CREDENTIAL_ENCRYPTION_KEY`, only the archive metadata the passphrase check needs. Restoring one succeeds and leaves an install that regenerates what it can:
 
@@ -720,7 +758,7 @@ The proxy-download endpoint streams `driver.download(filename)` straight back to
 Same code path is hit whether the archive comes from an upload or a destination download.
 
 1. **Pre-flight.** Validates archive shape, manifest `format_version` (1 or 2 currently), passphrase. The passphrase verify happens **before** any destructive step so a wrong passphrase is rejected up front.
-2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump.
+2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump. Only the newest three safety dumps are kept in that directory; older ones are deleted when a new one is written, because each carries the install's `SECRET_KEY` under that public passphrase.
 3. **Connection pool teardown.** SQLAlchemy's engine is disposed and `pg_terminate_backend` kicks every other connection so the replay's drops don't deadlock against the worker / beat / agents.
 4. **Data replay.**
    - Full restore: the schema is **cleared, then the archive replayed, in one transaction** (#1363). `psql --single-transaction --set=ON_ERROR_STOP=1` reads one script on stdin: first a block that drops every table, view, sequence, standalone type and routine in `public` (extension members excepted), then the archive's SQL. For a Phase 2+ archive (`dump_format: custom`) that SQL is `pg_restore --no-owner --no-acl --file=-`'s output, streamed rather than staged on disk. For a Phase 1 archive (plain SQL) it is the dump itself. If `pg_restore` fails part way, psql is killed before it reaches end of input, so it never commits. A replay counts as complete only when psql acknowledges the end of the script: a per-run token is `\echo`-ed after the archive's last statement, so a psql that left early with exit 0 is reported as a partial restore, not a success. Any failure before psql is given end of input (a bad statement, a `pg_restore` error, a timeout) rolls back and leaves the database exactly as it was. The one exception is a timeout after end of input, while psql may be committing. It is reported as an unknown outcome, not as a rollback, so check the database (or restore the pre-restore safety dump) before relying on it.
@@ -818,7 +856,7 @@ A backup you have never restored is a hypothesis. The **Restore Drills** tab tur
 | `dump_replays_cleanly` | `pg_restore` / `psql` aborted — the dump is truncated or corrupt. |
 | `alembic_version_present` | No single schema revision, or one this build has never heard of (the archive came from a newer SpatiumDDI). An archive *behind* the bundled head passes: a real restore migrates it forward. |
 | `core_tables_populated` | The archive restored but came back with no users — an install restored from it would have no way in. |
-| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. Capped at 250k rows — a break inside that window is plenty to prove damage, and the nightly `audit_chain_verify` task walks the live table exhaustively. |
+| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. Capped at 250k rows — a break inside that window is plenty to prove damage, and the `audit_chain_verify` task walks the whole live table at least weekly (see §2.7). |
 
 #### Requirements and costs
 
@@ -1155,7 +1193,18 @@ dns_auto_sync_enabled / dns_auto_sync_interval_minutes / dns_auto_sync_delete_st
 reverse_dns_enabled / reverse_dns_interval_minutes        -- PTR auto-population (issue #41)
 dhcp_pull_leases_enabled / dhcp_pull_leases_interval_seconds
 oui_lookup_enabled / oui_update_interval_hours
+```
+
+**Data retention** — see [§2.7](#27-audit-log-and-data-retention) for
+ranges and what each prunes
+
+```
+log_retention_hours (default 24)                          -- DNS query + DHCP activity logs
+metric_retention_days (default 7)                         -- DNS / DHCP metric samples
+dhcp_lease_history_retention_days (default 90)
 soft_delete_purge_days (default 30)                       -- trash purge sweep
+pcap_retention_days (default 7)
+appliance_revoked_retention_days (default 30)
 ```
 
 **Maintenance mode** (issue #57 — see [§5](#5-maintenance-mode))

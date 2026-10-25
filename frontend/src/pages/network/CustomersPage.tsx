@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -351,7 +352,7 @@ export function CustomersPage() {
                 const ids = Array.from(selectedIds);
                 setConfirm({
                   title: "Delete customers",
-                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Cross-references on subnets / zones / ASNs will be cleared.`,
+                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Subnets, zones and ASNs that name them are not changed and keep pointing at the hidden customer. They can be restored from Administration → Trash.`,
                   confirmLabel: "Delete",
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
@@ -399,7 +400,17 @@ export function CustomersPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={6}
                   >
-                    No customers yet — click "New customer" to add one.
+                    <ListEmpty
+                      error={query.error}
+                      what="customers"
+                      filtered={search !== "" || statusFilter !== ""}
+                      onClearFilters={() => {
+                        setSearch("");
+                        setStatusFilter("");
+                      }}
+                    >
+                      No customers yet — click "New customer" to add one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -440,7 +451,7 @@ export function CustomersPage() {
                       onClick={() => {
                         setConfirm({
                           title: "Delete customer",
-                          message: `Soft-delete customer "${c.name}"? Cross-references will be cleared.`,
+                          message: `Soft-delete customer "${c.name}"? Anything that names it is not changed and keeps pointing at the hidden customer. It can be restored from Administration → Trash.`,
                           confirmLabel: "Delete",
                           onConfirm: () => removeOne.mutate(c.id),
                         });

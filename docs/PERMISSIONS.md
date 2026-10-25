@@ -44,8 +44,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `ip_address`      | Individual IPs, aliases, bulk address ops             |
 | `vlan`            | VLANs and routers                                     |
 | `vrf`             | VRFs (Virtual Routing and Forwarding) — `manage_vrfs` |
-| `asn`             | Autonomous Systems + RPKI ROAs + BGP peering / communities — `manage_asns` |
-| `domain`          | Domain registration tracking (registrar / expiry / NS drift) — `manage_domains` |
+| `manage_asns`     | Autonomous Systems + RPKI ROAs + BGP peering / communities |
+| `manage_domains`  | Domain registration tracking (registrar / expiry / NS drift) |
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
@@ -57,6 +57,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `dhcp_static`     | Static / reserved leases                              |
 | `dhcp_client_class` | DHCP client classes                                 |
 | `audit_log`       | Audit log read                                        |
+| `alert`           | Alert rules and alert events — `read` gates `GET /alerts/rules`, `/alerts/rules/{id}`, `/alerts/rule-types` and `/alerts/events` (they carry resource names). Writing rules, resolving events and forcing an evaluation stay superadmin-only |
 | `user`            | Users — **superadmin only** in practice               |
 | `group`           | Groups — admin required                               |
 | `role`            | Roles — admin required                                |
@@ -150,6 +151,17 @@ on inactive.
    resize / split / merge / next-IP / bulk / DNS-sync, and editing or
    deleting an existing address stay refused unless a type-level grant
    covers them.
+   **IPAM address sets (#103).** A `write` / `admin` grant on an address set
+   (the Address Set Editor role, scoped to one set) reaches an allow-list of
+   address routes and nothing else in IPAM: create, next-IP, bulk-allocate
+   (preview and commit), edit and delete an address, add and remove its
+   aliases, bulk-edit and bulk-delete addresses, deprecate stale IPs, and the
+   address import (preview and commit). Each of those checks every address it
+   touches against the set's range, so the holder changes only addresses
+   inside the sets it holds. Every other mutating IPAM route, including one
+   added later, refuses such a holder with 403 until it is listed
+   (`_ADDRESS_SET_ROUTES` in `backend/app/api/v1/ipam/router.py`). Reads
+   still need a normal read grant.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —
@@ -209,16 +221,16 @@ neither on the list nor reviewed as something else.
 | -------------- | ------------------------------------------------------------ |
 | `Superadmin`   | `[{"action": "*", "resource_type": "*"}]`                    |
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
-| `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
-| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`; `read` on `manage_dns_pools` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists. Infrastructure stays superadmin-only (see below) |
-| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
-| `Auditor`        | `read` on `conformity`, `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
-| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
-| `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
-| `Change Approver`  | `approve` + `read` on `change_request` (#62) — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
-| `Requester`        | `write` + `read` on `provisioning_request` (#696) — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. |
-| `Appliance Operator` | `admin` on `appliance` (#134) — full control of the SpatiumDDI OS appliance management surface (TLS cert upload, release manager, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage the appliance lifecycle without full superadmin over the DDI data plane. |
+| `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service`; `read` on `alert` |
+| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists. Infrastructure stays superadmin-only (see below) |
+| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`; `read` on `alert` |
+| `Auditor`        | `read` on `conformity`, `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
+| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
+| `Address Set Editor` | `admin` on `address_set` (#103); `read` on `alert` — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
+| `Change Approver`  | `approve` + `read` on `change_request` (#62); `read` on `alert` — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
+| `Requester`        | `write` + `read` on `provisioning_request` (#696); `read` on `alert` — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. |
+| `Appliance Operator` | `admin` on `appliance` (#134); `read` on `alert` — runs the SpatiumDDI OS appliance on a node (TLS cert upload and ACME, the read-only releases catalogue, node-local slot apply and rollback, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage a node's lifecycle without full superadmin over the DDI data plane. **Fleet management still needs a superadmin** (#2620): the upgrade-image store, every Fleet member action (approve, role assignment, OS upgrade, reboot), MetalLB, the kube-api CIDRs and pairing codes. |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
 

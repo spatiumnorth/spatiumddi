@@ -371,10 +371,8 @@ class PlatformSettings(Base):
     )
     # The legacy single webhook's URL and optional Authorization header,
     # Fernet-encrypted at rest (#1502) like the same fields on
-    # ``audit_forward_target``. The plaintext ``audit_forward_webhook_url`` /
-    # ``audit_forward_webhook_auth_header`` columns are kept, unmapped and
-    # unread, for one release so a rolling upgrade's old pods keep working
-    # (#296); the next release drops them.
+    # ``audit_forward_target``. The plaintext columns they replaced were
+    # dropped by migration ``c2b203844c95``.
     audit_forward_webhook_url_encrypted: Mapped[bytes | None] = mapped_column(
         LargeBinary, nullable=True
     )
@@ -448,6 +446,21 @@ class PlatformSettings(Base):
     # sensitive (plaintext creds/PII) so the default is short (issue #59).
     pcap_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+
+    # How many days of per-server DNS / DHCP metric samples the nightly
+    # ``prune_metrics`` sweep keeps (#2273). The InfluxDB push (#889) can
+    # only backfill what is still inside this window.
+    metric_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+
+    # How many hours of agent-shipped DNS query log and DHCP activity log
+    # rows the nightly ``prune_logs`` sweep keeps (#2273). Capped at 168 by
+    # the API: the prune is one unbatched DELETE, so a longer window grows
+    # that single transaction. #2185 lifts the cap with partition drops.
+    log_retention_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=24, server_default=sa_text("24")
     )
 
     # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of

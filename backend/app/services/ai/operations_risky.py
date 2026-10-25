@@ -584,6 +584,13 @@ async def _apply_delete_block(
     batch = await collect_soft_delete_batch(db, block)
     # A block cascade reaches DHCP scopes (via its subnets), so it owes the same
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
+    # spatiumddi#2734 — the reverse zones its subnets auto-created ride the
+    # batch, as they do on a lone subnet delete (#1066).
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        retire_auto_reverse_zones_for_batch,
+    )
+
+    zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
     deleted_at = await apply_soft_delete(db, batch, user.id)
@@ -598,6 +605,7 @@ async def _apply_delete_block(
     _retracted, dns_wake_group_ids = await retract_trashed_subnet_records(
         db, batch, deleted_at, user.id
     )
+    dns_wake_group_ids |= zone_wake_group_ids
     for row in batch.rows:
         db.add(
             _audit(
@@ -734,6 +742,13 @@ async def _apply_delete_space(
     batch = await collect_soft_delete_batch(db, space)
     # A space cascade reaches DHCP scopes (via its subnets), so it owes the same
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
+    # spatiumddi#2734 — the reverse zones its subnets auto-created ride the
+    # batch, as they do on a lone subnet delete (#1066).
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        retire_auto_reverse_zones_for_batch,
+    )
+
+    zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
     deleted_at = await apply_soft_delete(db, batch, user.id)
@@ -744,6 +759,7 @@ async def _apply_delete_space(
     _retracted, dns_wake_group_ids = await retract_trashed_subnet_records(
         db, batch, deleted_at, user.id
     )
+    dns_wake_group_ids |= zone_wake_group_ids
     for row in batch.rows:
         db.add(
             _audit(
@@ -1199,6 +1215,26 @@ async def _apply_delete_group(
     for sc in group_scopes:
         released += await remove_ipam_for_scope_statics(db, sc.id)
         await delete_leases_for_scope(db, sc.id)
+
+    # One row per scope the group takes with it (#1957's convention, as the
+    # Trash purge writes for a subnet's scopes): the scope rows go by FK
+    # CASCADE, which runs no Python.
+    for sc in group_scopes:
+        write_audit(
+            db,
+            user=user,
+            action="delete",
+            resource_type="dhcp_scope",
+            resource_id=str(sc.id),
+            resource_display=sc.name,
+            old_value={
+                "name": sc.name,
+                "address_family": sc.address_family,
+                "subnet_id": str(sc.subnet_id),
+                "purged_with": "dhcp_server_group",
+                "group": g.name,
+            },
+        )
 
     write_audit(
         db,

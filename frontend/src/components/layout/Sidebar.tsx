@@ -21,6 +21,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { useSessionState } from "@/lib/useSessionState";
 import { BrandLogo } from "@/components/BrandLogo";
+import { UpdateCheckError } from "@/components/UpdateCheckError";
 import {
   usePublicSettings,
   DEFAULT_APP_TITLE,
@@ -612,6 +613,7 @@ export function Sidebar({
                   update
                 </a>
               )}
+              {versionInfo && <UpdateCheckError compact info={versionInfo} />}
             </div>
           )}
           {effectiveCollapsed && updateAvailable && latestReleaseUrl && (

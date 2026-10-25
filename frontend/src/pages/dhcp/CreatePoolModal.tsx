@@ -45,6 +45,18 @@ export function CreatePoolModal({
     enabled: !!scope.group_id,
   });
 
+  // #2752 — the class each device policy of this group generates. The API
+  // takes it as a pool's class_restriction (known_class_names), and the Device
+  // Policies tab says a pool binds to that exact string.
+  const { data: devicePolicies = [] } = useQuery({
+    queryKey: ["dhcp-device-policies", scope.group_id],
+    queryFn: () =>
+      scope.group_id
+        ? dhcpApi.listDevicePolicies(scope.group_id)
+        : Promise.resolve([]),
+    enabled: !!scope.group_id,
+  });
+
   const mut = useMutation({
     mutationFn: () => {
       const data: Partial<DHCPPool> = isPd
@@ -178,11 +190,22 @@ export function CreatePoolModal({
                   {c.name}
                 </option>
               ))}
+              {devicePolicies
+                .filter((p) => !classes.some((c) => c.name === p.class_name))
+                .map((p) => (
+                  <option key={p.id} value={p.class_name}>
+                    {p.class_name} (device policy {p.name}
+                    {p.enabled ? "" : ", disabled"})
+                  </option>
+                ))}
               {/* #2481 — the API also takes names that are not a row of this
                   group (Kea's built-in KNOWN, generated PXE / phone /
                   device-policy classes). Show a stored one as itself. */}
               {classRestriction &&
-                !classes.some((c) => c.name === classRestriction) && (
+                !classes.some((c) => c.name === classRestriction) &&
+                !devicePolicies.some(
+                  (p) => p.class_name === classRestriction,
+                ) && (
                   <option value={classRestriction}>
                     {classRestriction} (built-in or generated class)
                   </option>

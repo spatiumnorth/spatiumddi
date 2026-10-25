@@ -1195,6 +1195,25 @@ def _dispatch_after_commit_in_background(**_: object) -> None:
     importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
 
 
+@beat_init.connect
+def _queue_release_check_at_start(**_: object) -> None:
+    """Run the release check once when beat starts.
+
+    The check is otherwise daily, so a fresh install or a restart waited up
+    to a day before the update pill (or a stored error) could appear. This
+    queues the same task the daily schedule fires, onto a worker: the same
+    already-documented connection (docs/PRIVACY.md §3.1) and the same
+    ``github_release_check_enabled`` gate, which the task checks itself.
+    Nothing new is opened here, and a broker that is not up yet never blocks
+    beat from starting."""
+    try:
+        celery_app.send_task("app.tasks.update_check.check_github_release")
+    except Exception:  # noqa: BLE001 - the daily schedule still covers it
+        structlog.get_logger(__name__).warning(
+            "release_check_at_beat_start_not_queued", exc_info=True
+        )
+
+
 @task_failure.connect
 def _capture_task_failure(
     sender: object | None = None,

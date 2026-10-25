@@ -76,6 +76,12 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
     }
 )
 IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED
+# The statuses a NEW address may be created with by hand — over REST and over
+# the operation layer (requests portal, Copilot) alike: the operator-settable
+# set plus ``dhcp`` for the static-reservation conversion path. Integration
+# statuses (proxmox-vm, kubernetes-node, …) belong to their reconcilers; a
+# brand-new row carrying one would be "owned" by no integration.
+IP_STATUSES_CREATE_SETTABLE: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
 
 # Valid IPAddress.role values. Orthogonal to ``status`` — the role
 # describes what the IP *is* (a host vs. a VRRP virtual address),
@@ -732,6 +738,13 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     do_not_probe_reason: Mapped[str] = mapped_column(
         Text, nullable=False, default="", server_default=sa_text("''")
+    )
+
+    # The create-time opt-out from the auto reverse zone (#2735). Stored, because
+    # the zone is also created by the catch-up every address sync runs and by a
+    # resize, and neither can see the request that said "no".
+    skip_reverse_zone: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
     # Presentational (#2137): show the green "N free · click to allocate"

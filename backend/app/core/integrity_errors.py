@@ -74,6 +74,29 @@ def parse_foreign_key_detail(detail: str) -> ForeignKeyViolation | None:
     )
 
 
+# ``Key (name)=(Acme) already exists.`` / ``Key (customer_id, name)=(…, Acme) already exists.``
+_UNIQUE_DETAIL_RE = re.compile(r"Key \((?P<cols>[^)]*)\)=\(.*\) already exists")
+
+
+def unique_violation_message(detail: str) -> str:
+    """The 409 text for a 23505, naming the conflicting field(s) (#2738).
+
+    Only the column names are echoed, never the values: they are the caller's
+    own input at best, and at worst a column the caller should not be reading
+    back. An unparseable DETAIL keeps the generic sentence.
+    """
+    generic = "The request conflicts with existing data."
+    match = _UNIQUE_DETAIL_RE.search(detail or "")
+    if match is None:
+        return generic
+    cols = [c.strip() for c in match.group("cols").split(",") if c.strip()]
+    if not cols:
+        return generic
+    fields = ", ".join(f"'{c}'" for c in cols)
+    noun = "value" if len(cols) == 1 else "combination of values"
+    return f"{generic[:-1]}: the {noun} of {fields} is already in use."
+
+
 def extract_detail(exc: Any) -> str:
     """The Postgres ``DETAIL`` text for a DBAPI error, from wherever it lives.
 

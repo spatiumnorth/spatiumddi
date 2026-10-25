@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Building2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -137,8 +138,17 @@ export function BACnetDevicesPage() {
               <Building2 className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">BACnet/IP devices</h1>
               <span className="text-xs text-muted-foreground">
-                {total} device{total === 1 ? "" : "s"} · {bbmds.length} BBMD
-                {bbmds.length === 1 ? "" : "s"}
+                {devicesQ.error ? (
+                  <ListReadError error={devicesQ.error} what="BACnet devices" />
+                ) : (
+                  `${total} device${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {bbmdsQ.error ? (
+                  <ListReadError error={bbmdsQ.error} what="BBMDs" />
+                ) : (
+                  `${bbmds.length} BBMD${bbmds.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -245,9 +255,13 @@ export function BACnetDevicesPage() {
           <div className="rounded-lg border">
             {devices.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {devicesQ.isLoading
-                  ? "Loading devices…"
-                  : "No BACnet devices recorded."}
+                {devicesQ.isLoading ? (
+                  "Loading devices…"
+                ) : (
+                  <ListEmpty error={devicesQ.error} what="BACnet devices">
+                    No BACnet devices recorded.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">

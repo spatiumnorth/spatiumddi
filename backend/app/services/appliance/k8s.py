@@ -938,6 +938,16 @@ def list_nodes(
     return status, items
 
 
+# #2449: the helpers behind the per-node writes a rolling upgrade retries (the
+# CNPG maintenance window patch, cordon, uncordon) keep the API server's whole
+# answer in their error, so a run that still fails says why. The answer used to
+# be cut at 200 bytes, just before the admission webhook's own reason. A Status
+# for a failed admission call is well under 1 KiB even with its message
+# repeated under details.causes; this bound only keeps a pathological body (an
+# intermediary's HTML error page, say) out of the run's row, its logs and the UI.
+KUBEAPI_ERROR_BODY_MAX = 4096
+
+
 def cordon_node(name: str) -> tuple[bool, str | None]:
     """Mark a Node unschedulable (idempotent — k8s no-ops if already true)."""
     cfg = get_config()
@@ -956,7 +966,7 @@ def cordon_node(name: str) -> tuple[bool, str | None]:
         return False, str(exc)
     if status in (200, 201):
         return True, None
-    return False, f"kubeapi status {status}: {body[:200]!r}"
+    return False, f"kubeapi status {status}: {body[:KUBEAPI_ERROR_BODY_MAX]!r}"
 
 
 def uncordon_node(name: str) -> tuple[bool, str | None]:
@@ -980,7 +990,7 @@ def uncordon_node(name: str) -> tuple[bool, str | None]:
         return False, str(exc)
     if status in (200, 201):
         return True, None
-    return False, f"kubeapi status {status}: {body[:200]!r}"
+    return False, f"kubeapi status {status}: {body[:KUBEAPI_ERROR_BODY_MAX]!r}"
 
 
 def patch_node(name: str, patch: dict[str, Any]) -> tuple[int, str | None]:
@@ -1214,7 +1224,7 @@ def patch_cnpg_maintenance_window(
         return False, str(exc)
     if status in (200, 201):
         return True, None
-    return False, f"kubeapi status {status}: {body[:200]!r}"
+    return False, f"kubeapi status {status}: {body[:KUBEAPI_ERROR_BODY_MAX]!r}"
 
 
 # ── HelmChartConfig + rollout primitives (#296 Phase E) ────────────────

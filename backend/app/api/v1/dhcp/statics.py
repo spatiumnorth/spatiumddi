@@ -16,7 +16,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.dns_names import validate_hostname
+from app.core.dns_names import validate_optional_hostname
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
@@ -39,11 +39,11 @@ def _validate_optional_hostname(v: str | None) -> str | None:
     """Reservation hostname is optional; validate the RFC 1123 form when set.
 
     Operator-entered (not client-supplied), so a malformed value is rejected
-    rather than sanitized (issue #597). ``""`` / ``None`` pass through.
+    rather than sanitized (issue #597). ``None`` passes through; a blank or
+    whitespace-only value becomes ``""`` (no hostname) rather than being kept
+    verbatim, where the IPAM mirror would publish it as a record owner.
     """
-    if v is None or v.strip() == "":
-        return v
-    return validate_hostname(v)
+    return validate_optional_hostname(v)
 
 
 def _no_scope_move(v: uuid.UUID | None) -> uuid.UUID | None:

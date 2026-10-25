@@ -67,6 +67,12 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.legacy_columns import (
+    disabled_since,
+    disabled_warning,
+    fold_dropped_plaintext_columns,
+    selective_readd_sql,
+)
 from app.services.backup.migrations import (
     MigrationOutcome,
     maybe_upgrade_after_restore,
@@ -78,6 +84,7 @@ from app.services.backup.rewrap import (
     RewrapOutcome,
     rewrap_secrets,
 )
+from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -767,6 +774,10 @@ def _selective_prelude(tables: list[str]) -> str:
         + _REFUSE_A_WIDER_CASCADE_SQL.format(tables=array)
         + f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE;\n"
         + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=array)
+        # An archive taken before a contract migration still names the
+        # columns it dropped; put them back so its COPY loads. The restore
+        # folds and drops them again after the migration step.
+        + selective_readd_sql(tables)
     )
 
 
@@ -904,7 +915,44 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    _prune_pre_restore_safety_dumps(keep=out_path)
     return str(out_path)
+
+
+def _prune_pre_restore_safety_dumps(*, keep: Path) -> None:
+    """Keep the newest ``PRE_RESTORE_KEEP_LAST_N`` safety dumps in
+    ``PRE_RESTORE_DIR`` and delete the rest.
+
+    Each dump holds the SECRET_KEY under a passphrase anyone can read in
+    this file, so old copies are not harmless clutter. A target's
+    retention already prunes them when a local-volume target points at
+    this directory; without one they used to accumulate. Runs only after
+    a new dump is written, never removes ``keep`` (the dump just taken),
+    and only touches regular files named like a safety dump. A failure to
+    delete is logged and does not fail the restore.
+    """
+    try:
+        dumps = [
+            p
+            for p in PRE_RESTORE_DIR.iterdir()
+            if p.name.startswith(PRE_RESTORE_PREFIX)
+            and p.name.endswith(".zip")
+            and not p.is_symlink()
+            and p.is_file()
+        ]
+        dumps.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError as exc:
+        logger.warning("pre_restore_safety_prune_failed", path=str(PRE_RESTORE_DIR), error=str(exc))
+        return
+    # The dump just written counts first whatever its mtime says, so a
+    # clock step cannot make the prune delete it.
+    ordered = [keep] + [p for p in dumps if p != keep]
+    for dump in ordered[max(PRE_RESTORE_KEEP_LAST_N, 1) :]:
+        try:
+            dump.unlink()
+            logger.info("pre_restore_safety_dump_pruned", path=str(dump))
+        except OSError as exc:
+            logger.warning("pre_restore_safety_prune_failed", path=str(dump), error=str(exc))
 
 
 async def _collect_post_restore_warnings(db_url: str) -> list[str]:
@@ -1328,6 +1376,37 @@ async def _apply_backup_restore_inner(
             error=f"migration step aborted: {exc}",
         )
 
+    # Phase 6b: a selective restore of an archive taken before a contract
+    # migration re-added the plaintext secret columns that migration dropped
+    # (see ``_selective_prelude``). Encrypt whatever they hold into their
+    # empty ``*_encrypted`` columns and drop them again, leaving each target
+    # written into disabled with an audit row, as the migration does. Before
+    # the rewrap: the values are encrypted under this install's key, which
+    # the rewrap recognises and leaves alone. Non-fatal, like the steps
+    # around it.
+    fold_warning: str | None = None
+    try:
+        fold = await fold_dropped_plaintext_columns(db_url)
+        disabled_names = [t.display for t in fold.disabled]
+        # The upgrade step's migration runs the same fold (a full restore, or
+        # a selective one whose archive sits before the drop) and records it
+        # only in the audit log; name those targets too.
+        try:
+            for name in await disabled_since(db_url, started):
+                if name not in disabled_names:
+                    disabled_names.append(name)
+        except Exception as exc:  # noqa: BLE001 — a report, not the fold
+            logger.warning("backup_restore_disabled_targets_scan_failed", error=str(exc))
+        if disabled_names:
+            fold_warning = disabled_warning(disabled_names)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("backup_restore_legacy_plaintext_fold_failed", error=str(exc))
+        fold_warning = (
+            "Plaintext columns from an older archive could not be folded into "
+            f"their encrypted columns ({exc}). They are not read by the "
+            "application; re-run the restore once the cause is fixed."
+        )
+
     # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and
     # re-encrypts with the destination install's key. No-op when
@@ -1420,6 +1499,8 @@ async def _apply_backup_restore_inner(
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
+    if fold_warning:
+        post_warnings.append(fold_warning)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
