@@ -23,6 +23,10 @@ from typing import Any
 
 import asyncpg
 import pytest
+from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -32,7 +36,7 @@ from app.core.crypto import decrypt_str, encrypt_str
 from app.models.audit_forward import AuditForwardTarget
 from app.models.base import Base
 from app.models.settings import PlatformSettings
-from app.services.backup import restore
+from app.services.backup import migrations, restore
 from app.services.backup.crypto import encrypt_secrets
 from app.services.backup.legacy_columns import (
     DROPPED_PLAINTEXT_SECRET_COLUMNS,
@@ -62,6 +66,27 @@ def _load_migration() -> Any:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _later_revisions() -> list[Any]:
+    """The revisions after ``_HEAD``, newest first. ``scratch_db`` is built
+    from today's models, so it carries their columns too; an archive stamped
+    at or before ``_HEAD`` must not, or replaying them on restore hits
+    "already exists"."""
+    ini = migrations._alembic_ini()  # noqa: SLF001
+    assert ini is not None
+    script = ScriptDirectory.from_config(Config(str(ini)))
+    return [r for r in script.iterate_revisions("heads", _HEAD) if r.revision != _HEAD]
+
+
+def _apply(fn_name: str, revisions: list[Any]):  # noqa: ANN202
+    def _inner(sync_conn) -> None:  # noqa: ANN001
+        ctx = MigrationContext.configure(sync_conn)
+        with Operations.context(ctx):
+            for rev in revisions:
+                getattr(rev.module, fn_name)()
+
+    return _inner
 
 
 def test_the_restore_helper_and_the_migration_agree_on_the_columns() -> None:
@@ -326,6 +351,8 @@ async def _seed_pre_drop_archive(url: str, schema_version: str) -> bytes:
                 ]
             )
             await db.commit()
+        async with engine.begin() as sync:
+            await sync.run_sync(_apply("downgrade", _later_revisions()))
     finally:
         await engine.dispose()
     conn = await asyncpg.connect(_dsn(url))
@@ -354,6 +381,12 @@ async def _seed_pre_drop_archive(url: str, schema_version: str) -> bytes:
 async def _upgrade_in_place(url: str) -> None:
     """The install the archive is restored onto: already past the drop, with
     different data."""
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.begin() as sync:
+            await sync.run_sync(_apply("upgrade", list(reversed(_later_revisions()))))
+    finally:
+        await engine.dispose()
     conn = await asyncpg.connect(_dsn(url))
     try:
         for table, plain, _enc, _type in DROPPED_PLAINTEXT_SECRET_COLUMNS:
