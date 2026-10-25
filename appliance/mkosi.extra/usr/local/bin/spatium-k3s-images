@@ -29,7 +29,7 @@ and DHCP agents' among them, and nothing noticed:
   * k3s records only the tarballs that imported (``.cache.json``) and does
     not retry a failed one until the file changes again.
 
-Two subcommands:
+Three subcommands:
 
   clear-ingests   remove containerd's unfinished content writes. k3s.service
                   runs it as an ExecStartPre: no import can be in flight
@@ -52,6 +52,24 @@ Two subcommands:
                   spatiumddi-firstboot runs it before it commits a trial
                   slot.
 
+  unpack          once k3s's start-up import is over, unpack the imported
+                  images this node's workloads will run into containerd's
+                  snapshotter, one at a time and paced, so that the
+                  kubelet finds them unpacked when it starts them.
+                  spatiumddi-image-unpack.service runs it on every boot.
+                  Best effort: whatever it leaves, the kubelet unpacks.
+
+#2788: k3s's import writes an image into containerd's content store and no
+further. containerd unpacks its layers into the snapshotter when the kubelet
+creates the image's first container. A rolling upgrade keeps every node on
+the old images until the last node is done, then moves the shared image tags
+in one step (#1710), so every node unpacked its new images at once, 1-2 GB
+each, on the /var that etcd writes its WAL to. On a shared disk that held
+etcd's fdatasync for seconds, a kube-scheduler lease ran out, and k3s exited
+in the middle of the node's DNS and DHCP pod swap. Unpacking after the
+node's reboot moves those writes into its own turn, one node at a time, and
+paces them like the upgrade's other writes on /var (#2090).
+
 #2109: "is k3s still importing?" is answered by whether a process holds a
 baked tarball open. k3s opens the file for the whole import and closes it
 when the import is done (containerd.go ``preloadFile``: wharfie's
@@ -67,7 +85,8 @@ which restarted that import and lost the slot its commit.
 
 Paths are env-overridable (``SPATIUM_K3S_IMAGES_DIR``,
 ``SPATIUM_K3S_CONTENT_DIR``, ``SPATIUM_K3S_BIN``, ``SPATIUM_K3S_PROC_DIR``,
-``SPATIUM_K3S_KUBELET_HEALTHZ``) for the tests in appliance/tests/test_k3s_images.py.
+``SPATIUM_K3S_KUBELET_HEALTHZ``) for the tests in
+appliance/tests/test_k3s_images.py.
 """
 
 from __future__ import annotations
@@ -114,6 +133,17 @@ POLL_S = 5.0
 # (watcher.go ``AddAfter``), so this outlasts every gap between two imports.
 SETTLE_S = 15.0
 PREFIX = "spatium-k3s-images:"
+# #2788: the snapshotter the kubelet's containers unpack into. It is k3s's
+# default, as the appliance's k3s config names none (test_k3s_images.py
+# holds it to that).
+SNAPSHOTTER = "overlayfs"
+# The rate the upgrade's other writes on /var keep to since #2090
+# (spatium-upgrade-slot ``_WRITE_RATE_BYTES_PER_SECOND``).
+UNPACK_RATE_MIB_S = 32.0
+# Below this share of /var free, leave the rest to the kubelet: its image GC
+# starts at 95% used and it evicts pods below 5% free (k3s config.yaml).
+MIN_FREE_SHARE = 0.10
+MIB = 1024 * 1024
 
 
 def say(msg: str, *, err: bool = False) -> None:
@@ -338,6 +368,126 @@ def _all_there(report: Report) -> None:
     say(f"all {len(report.tarballs)} baked tarballs imported, {report.images} images present")
 
 
+# ── #2788: the slot's new images, unpacked in this node's own turn ───────────
+
+
+def _ctr(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(
+            [K3S, "ctr", "-n", "k8s.io", *args],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def unpacked_images() -> set[str] | None:
+    """The image names containerd holds whole and unpacked in the
+    snapshotter, or None when it does not answer."""
+    proc = _ctr("images", "check", "-q", "--snapshotter", SNAPSHOTTER)
+    if proc is None or proc.returncode != 0:
+        return None
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _repository(name: str) -> str | None:
+    """An image name without its tag or digest. None for an image ID
+    (``sha256:...``), which names no repository."""
+    name = name.split("@", 1)[0]
+    slash = name.rfind("/")
+    if slash < 0:
+        return None
+    colon = name.rfind(":")
+    return name[:colon] if colon > slash else name
+
+
+def to_unpack() -> list[str] | None:
+    """The images k3s imported from the baked tarballs that are not unpacked
+    yet, of a repository this node has an unpacked image of: the new
+    release of a workload this node runs. The kubelet unpacks only the
+    images it runs, so these are the ones the tag move would have it unpack
+    on this node. None when containerd does not answer."""
+    cache = read_import_cache()
+    names: list[str] = []
+    for t in sorted(IMAGES_DIR.glob(TARBALL_GLOB)):
+        entry = cache.get(t.name)
+        if imported(t, entry):
+            names += [n for n in entry["images"] if isinstance(n, str)]
+    present, ready = present_images(), unpacked_images()
+    if present is None or ready is None:
+        return None
+    ran_here = {_repository(n) for n in ready} - {None}
+    return [n for n in dict.fromkeys(names)
+            if n in present and n not in ready and _repository(n) in ran_here]
+
+
+def disk_usage() -> tuple[int, float] | None:
+    """Bytes in use on containerd's filesystem (/var, where etcd's WAL is
+    too) and the share of it still free, or None when it cannot be read."""
+    try:
+        st = os.statvfs(CONTENT_DIR.parent)
+    except OSError:
+        return None
+    if not st.f_blocks:
+        return None
+    return (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_bavail / st.f_blocks
+
+
+def image_targets() -> dict[str, str] | None:
+    """Each image name's target digest, which is how ``ctr snapshots
+    unpack`` names an image, or None when containerd does not answer.
+    ``ctr images ls`` prints REF, TYPE, DIGEST, then the rest."""
+    proc = _ctr("images", "ls")
+    if proc is None or proc.returncode != 0:
+        return None
+    targets: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        cols = line.split()
+        if len(cols) >= 3 and cols[2].startswith("sha256:"):
+            targets[cols[0]] = cols[2]
+    return targets
+
+
+def unpack_image(ref: str, target: str, deadline: float) -> bool:
+    """Unpack one image into the snapshotter, as the kubelet's first
+    container from it would. ``ctr snapshots unpack`` runs containerd's own
+    image unpack and nothing more: the layers stay unpacked, held by the
+    image, and nothing else is left behind. It leaves the image's labels
+    alone, k3s's ``io.cri-containerd.pinned`` among them, which keeps the
+    kubelet's image GC off the rollback slot's images. Re-importing the
+    tarball would unpack it too, but replaces those labels.
+
+    Not ``ctr images mount``, which unpacks the same way and then mounts
+    the image: on containerd 2.3 the mount is also activated under its
+    target's name, and ``ctr images unmount`` never deactivates it, so the
+    next image mounted there fails "already exists" until containerd's
+    garbage collector has removed the old one. A ctr killed at the
+    deadline leaves its half-unpacked layer under the 24-hour lease
+    containerd's unpack takes, and the garbage collector removes it then."""
+    timeout = max(deadline - time.monotonic(), 1.0)
+    proc = _ctr("snapshots", "unpack", "--sync-fs", "--snapshotter", SNAPSHOTTER,
+                target, timeout=timeout)
+    if proc is not None and proc.returncode == 0:
+        return True
+    if proc is None:
+        why = "containerd did not answer"
+    else:
+        lines = (proc.stderr or proc.stdout).strip().splitlines()
+        why = lines[-1] if lines else f"exit {proc.returncode}"
+    say(f"could not unpack {ref}: {why}", err=True)
+    return False
+
+
+def wait_for_containerd(deadline: float) -> bool:
+    """Wait until containerd answers. k3s's containerd exits with k3s and
+    comes back with the k3s that systemd restarts."""
+    while present_images() is None:
+        if time.monotonic() >= deadline:
+            return False
+        _sleep(POLL_S)
+    return True
+
+
 # ── commands ─────────────────────────────────────────────────────────────────
 
 
@@ -442,6 +592,63 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_unpack(args: argparse.Namespace) -> int:
+    start = time.monotonic()
+    hard = start + max(args.max_time, 0.0)
+    if wait_for_import(min(start + args.wait, hard), hard):
+        say("unpacked nothing: k3s was still importing when the time ran out", err=True)
+        return 1
+    picks = to_unpack()
+    targets = image_targets() if picks else {}
+    if picks is None or targets is None:
+        say("unpacked nothing: containerd did not answer", err=True)
+        return 1
+    if not picks:
+        say("nothing to unpack: every image this node runs is unpacked")
+        return 0
+    rate = args.rate * MIB
+    pace = f"at most {args.rate:g} MiB/s" if rate > 0 else "unpaced"
+    say(f"unpacking {len(picks)} image(s), {pace}: {', '.join(picks)}")
+    began, total, failed = time.monotonic(), 0, []
+    for i, ref in enumerate(picks):
+        now, disk = time.monotonic(), disk_usage()
+        if now >= hard:
+            stop = f"out of time after {now - start:.0f}s"
+        elif disk is not None and disk[1] < MIN_FREE_SHARE:
+            stop = f"/var is {100 - 100 * disk[1]:.0f}% full"
+        else:
+            stop = ""
+        if stop:
+            failed += picks[i:]
+            say(f"{stop}; leaving {len(picks) - i} image(s) to the kubelet", err=True)
+            break
+        target = targets.get(ref)
+        if not target:
+            say(f"could not unpack {ref}: containerd lists no digest for it", err=True)
+            failed.append(ref)
+            continue
+        # Once more if it failed, after containerd answers again: a k3s
+        # restart takes containerd down with it.
+        if not (unpack_image(ref, target, hard)
+                or (wait_for_containerd(hard) and unpack_image(ref, target, hard))):
+            failed.append(ref)
+            continue
+        took, after = time.monotonic() - now, disk_usage()
+        wrote = max(after[0] - disk[0], 0) if disk and after else 0
+        total += wrote
+        say(f"unpacked {ref}: {wrote / MIB:.0f} MiB in {took:.1f}s")
+        # No faster than ``rate`` on average, counting what /var gained.
+        pause = wrote / rate - took if rate > 0 else 0.0
+        if pause > 0 and i + 1 < len(picks):
+            _sleep(min(pause, max(hard - time.monotonic(), 0.0)))
+    if failed:
+        say(f"unpacked {len(picks) - len(failed)} of {len(picks)} image(s); the kubelet unpacks "
+            f"the rest when it starts them: {', '.join(failed)}", err=True)
+        return 1
+    say(f"unpacked {len(picks)} image(s), {total / MIB:.0f} MiB, in {time.monotonic() - began:.0f}s")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="spatium-k3s-images",
@@ -463,6 +670,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds this check may take in all, even while k3s is still "
                              "importing (firstboot passes what is left of its start timeout)")
     verify.set_defaults(fn=cmd_verify)
+    unpack = sub.add_parser("unpack", help="unpack the images this node will run before the "
+                                           "kubelet needs them (#2788)")
+    unpack.add_argument("--wait", type=float, default=120.0,
+                        help="seconds to wait for the kubelet while k3s has no tarball open")
+    unpack.add_argument("--max-time", type=float, default=1200.0,
+                        help="seconds this may take in all, the wait for k3s's import included "
+                             "(the kubelet unpacks whatever is left)")
+    unpack.add_argument("--rate", type=float, default=UNPACK_RATE_MIB_S,
+                        help="MiB/s the unpack writes at on average (default: the upgrade's own "
+                             "rate, #2090; 0: unpaced)")
+    unpack.set_defaults(fn=cmd_unpack)
     args = parser.parse_args(argv)
     return args.fn(args)
 
