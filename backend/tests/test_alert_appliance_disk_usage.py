@@ -412,3 +412,71 @@ async def test_seed_creates_one_enabled_rule_and_never_overrides_the_operator(
     await alerts_svc.seed_appliance_disk_usage_alert_rule()
     await db_session.refresh(rules[0])
     assert rules[0].enabled is False
+
+
+# ── resolve hysteresis (#2778) ─────────────────────────────────────────────
+
+
+async def _tick(db: AsyncSession, node: Appliance, pct: float) -> None:
+    node.cluster_health = {"host_disk_partitions": _parts(_pct_of(40 * GIB, pct))}
+    node.last_seen_at = datetime.now(UTC)
+    await db.commit()
+    await alerts_svc.evaluate_all(db)
+
+
+async def _all_events(db: AsyncSession, rule: AlertRule) -> list[AlertEvent]:
+    return list(
+        (await db.execute(select(AlertEvent).where(AlertEvent.rule_id == rule.id))).scalars().all()
+    )
+
+
+async def test_a_value_hovering_at_the_threshold_opens_one_event(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delivered: list[str] = []
+
+    async def _count(rule, event, targets):  # type: ignore[no-untyped-def]
+        delivered.append(event.severity)
+        return (False, False, False)
+
+    monkeypatch.setattr(alerts_svc, "_deliver", _count)
+    rule = _rule(80)
+    db_session.add(rule)
+    node = await _node(db_session, var=_pct_of(40 * GIB, 30))
+    await db_session.commit()
+
+    for pct in (80.1, 79.9, 80.1, 79.9, 80.1, 77.0):
+        await _tick(db_session, node, pct)
+    events = await _all_events(db_session, rule)
+    assert len(events) == 1 and events[0].resolved_at is None
+    assert len(delivered) == 1
+
+    await _tick(db_session, node, 74.0)
+    events = await _all_events(db_session, rule)
+    assert len(events) == 1 and events[0].resolved_at is not None
+
+
+async def test_the_margin_never_opens_an_event(db_session: AsyncSession) -> None:
+    rule = _rule(80)
+    db_session.add(rule)
+    node = await _node(db_session, var=_pct_of(40 * GIB, 78))
+    await db_session.commit()
+    assert await _match(db_session, rule) == {}
+    await _tick(db_session, node, 78)
+    assert await _all_events(db_session, rule) == []
+
+
+async def test_the_critical_line_does_not_flap(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
+    rule = _rule(80)
+    db_session.add(rule)
+    node = await _node(db_session, var=_pct_of(40 * GIB, 30))
+    await db_session.commit()
+
+    for pct in (87.2, 86.8, 87.2, 86.8):
+        await _tick(db_session, node, pct)
+    events = await _all_events(db_session, rule)
+    assert len(events) == 1 and events[0].severity == "critical"
+    assert events[0].resolved_at is None
