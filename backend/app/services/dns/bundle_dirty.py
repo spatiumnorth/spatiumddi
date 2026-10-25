@@ -141,6 +141,7 @@ _SERVER_GROUP_COLUMNS: tuple[str, ...] = ("group_id", "driver", "host", "is_prim
 # DNSServer columns only the server's OWN bundle reads.
 _SERVER_SELF_COLUMNS: tuple[str, ...] = (
     "is_enabled",
+    "zone_resync_seq",
     "desired_appliance_version",
     "desired_slot_image_url",
     "reboot_requested",

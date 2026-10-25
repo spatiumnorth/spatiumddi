@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Callable
 from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.content_disposition import content_disposition
@@ -18,6 +20,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import PdfResponse
+from app.models.auth import User
 from app.services.ipam.address_set_gate import (
     load_writable_set_ranges,
     user_can_write_ip,
@@ -191,6 +194,37 @@ async def import_preview_json(
     return preview.as_dict()
 
 
+async def _address_import_write_gate(
+    db: AsyncSession, current_user: User, subnet_id: uuid.UUID
+) -> Callable[[str], bool] | None:
+    """Address-set write delegation (#103) for the address import.
+
+    Refuses the whole import if the caller holds neither subnet-wide write nor
+    any address set on this subnet. Returns ``None`` for a subnet-wide writer
+    (no per-row test needed), otherwise a per-IP closure so rows outside the
+    writable ranges are skipped and reported. The gate helpers are imported at
+    module level from the shared module (#12).
+    """
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await load_writable_set_ranges(db, current_user, subnet_id)
+    if not subnet_writable and not set_ranges:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No write permission on subnet or any address set on it.",
+        )
+    if subnet_writable:
+        return None
+
+    def _can_write(addr: str) -> bool:
+        try:
+            ip_int = int(ipaddress.ip_address(addr))
+        except ValueError:
+            return False
+        return user_can_write_ip(current_user, ip_int, subnet_writable, set_ranges)
+
+    return _can_write
+
+
 @router.post("/import/addresses/preview")
 async def import_addresses_preview(
     current_user: CurrentUser,
@@ -208,6 +242,10 @@ async def import_addresses_preview(
     need column renaming.
     """
     _enforce_subnet_token_binding(current_user, subnet_id)
+    # The same write test as the commit (#103), so the preview neither runs
+    # against a subnet the caller cannot write nor shows existing rows outside
+    # the address sets it holds.
+    can_write = await _address_import_write_gate(db, current_user, subnet_id)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     preview = await preview_address_import(
@@ -216,6 +254,7 @@ async def import_addresses_preview(
         subnet_id=subnet_id,
         strategy=strategy,
         current_user=current_user,
+        can_write_ip=can_write,
     )
     logger.info(
         "ipam_address_import_preview",
@@ -242,28 +281,9 @@ async def import_addresses_commit(
     as a non-fatal error in the response, not a rolled-back import.
     """
     _enforce_subnet_token_binding(current_user, subnet_id)
+    can_write = await _address_import_write_gate(db, current_user, subnet_id)
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
-
-    # Address-set write delegation (#103): resolve the caller's writable
-    # ranges once and refuse the whole import if they hold neither subnet-wide
-    # write nor any address set on this subnet. Otherwise pass a per-IP gate
-    # closure so rows outside the writable ranges are skipped + reported. The
-    # gate helpers are imported at module level from the shared module (#12).
-    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
-    set_ranges = await load_writable_set_ranges(db, current_user, subnet_id)
-    if not subnet_writable and not set_ranges:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No write permission on subnet or any address set on it.",
-        )
-
-    def _can_write(addr: str) -> bool:
-        try:
-            ip_int = int(ipaddress.ip_address(addr))
-        except ValueError:
-            return False
-        return user_can_write_ip(current_user, ip_int, subnet_writable, set_ranges)
 
     result = await commit_address_import(
         db,
@@ -271,7 +291,7 @@ async def import_addresses_commit(
         current_user=current_user,
         subnet_id=subnet_id,
         strategy=strategy,
-        can_write_ip=None if subnet_writable else _can_write,
+        can_write_ip=can_write,
     )
     await db.commit()
     return result.as_dict()

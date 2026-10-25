@@ -88,12 +88,15 @@ not the operator's:
   bundle for a group of this size, and the default worker limit (1Gi with
   four prefork processes) is OOM-killed under lease/DDNS churn long before
   the VM runs short. The supervisor therefore sizes both from the node's
-  RAM — api = ½ RAM (1–8 GiB), worker = ¼ RAM (1–4 GiB), two worker
-  processes on nodes of 12 GiB or less — and writes them into the
-  `spatium-control` HelmChartConfig, where they survive k3s restarts and
-  helm re-applies. (`kubectl set resources` on the Deployment does not:
-  k3s re-applies the on-disk HelmChart manifest on every restart.) These
-  limits are keys the supervisor **owns**, so a different value written
+  RAM — api = ½ RAM (1–8 GiB), worker = ⅖ RAM (1–16 GiB, but never more
+  than the api and Postgres leave), two worker processes on nodes of 12 GiB
+  or less — and writes them into the `spatium-control` HelmChartConfig,
+  where they survive k3s restarts and helm re-applies. (`kubectl set
+  resources` on the Deployment does not: k3s re-applies the on-disk
+  HelmChart manifest on every restart.) The api and Postgres CPU limits are
+  sized the same way from the node's CPU count (#2240): the api a quarter
+  of the cores (1–4), Postgres half (1–8), where both were a fixed 1 core.
+  These limits are keys the supervisor **owns**, so a different value written
   into that HelmChartConfig by hand is put back on the next heartbeat; there
   is no supported per-install override for them today (see "Who owns which
   HelmChartConfig key" below).
@@ -170,6 +173,7 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 - **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
 - **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`, and that is all. The frontend mounts the Secret as a directory, so the kubelet updates the certificate files in its running pods (at each pod's next sync, within about 90 s), and the frontend image's `40-tls-reload-watch.sh` reloads nginx in place when they change. A reload keeps the web ports open; until #1173 a certificate change rolled the frontend Deployment, which on a multi-node control plane closed each node's :80/:443 in turn.
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
+- **Log text needs `admin` on `appliance`**. The host log viewer, a pod's logs (one-shot and streamed) and the Cluster live log pane take `admin` on `appliance`, the same permission as the diagnostic bundle, because a log line can carry whatever a process printed. A role with only `read` on `appliance` keeps the pod list, the cluster health view and the self-test, and the console does not draw the log panes for it. A running log stream re-checks the permission, so cutting a role back to `read` ends it. Every line is passed through the same credential sweep as the bundle before it is sent.
 - **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
@@ -559,8 +563,9 @@ state on its heartbeat:
   first heartbeat rewrote them, a second `spatium-control` revision, a second
   migrate Job (which replaces a running one) and a second api / worker
   rollout. firstboot now brings the sizing keys an existing Config already
-  carries (api / worker memory and concurrency, the Postgres requests /
-  limits and `shared_buffers`) to the values this boot's HelmChart renders.
+  carries (api / worker memory and concurrency, the api and Postgres CPU
+  limits, the Postgres requests / limits and `shared_buffers`) to the values
+  this boot's HelmChart renders.
   It computes them while that HelmChart is still held back as `.deferred`
   and writes them as soon as k3s has applied it, so helm-controller's job
   for the new chart is replaced, before it runs, by one carrying the new
@@ -602,7 +607,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 

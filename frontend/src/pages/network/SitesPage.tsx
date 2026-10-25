@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -1009,7 +1010,17 @@ export function SitesPage() {
                       className="px-3 py-6 text-center text-muted-foreground"
                       colSpan={7}
                     >
-                      No sites yet — click "New site" to add one.
+                      <ListEmpty
+                        error={query.error}
+                        what="sites"
+                        filtered={search !== "" || kindFilter !== ""}
+                        onClearFilters={() => {
+                          setSearch("");
+                          setKindFilter("");
+                        }}
+                      >
+                        No sites yet — click "New site" to add one.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}

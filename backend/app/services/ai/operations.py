@@ -31,14 +31,24 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import bind_check_names_error, primary_ns_error, structured_rdata_error
+from app.core.dns_names import (
+    HOSTNAME_TARGET_RECORD_TYPES,
+    bind_check_names_error,
+    contains_control_chars,
+    primary_ns_error,
+    record_value_error,
+    validate_fqdn,
+    validate_optional_hostname,
+    validate_record_owner,
+)
+from app.core.mac import canonicalize_mac
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
@@ -92,6 +102,15 @@ class Operation:
     # (e.g. archiving your own chat session) that gate on ownership
     # inside their own apply rather than on a coarse RBAC permission.
     required_permission: tuple[str, str] | None = None
+    # The gate for operations whose REST equivalent is superadmin-only
+    # (webhooks, DNSSEC sign/unsign, zone update ACL, SNMP/NTP/syslog
+    # settings, the importers, alert rules, temporary access, service
+    # restart). There is no RBAC permission to name for those, so instead of
+    # ``required_permission`` they set this, and ``enforce_operation_permission``
+    # refuses a non-superadmin at apply time. Their ``_apply_*`` still checks
+    # inline too. ``tests/test_operation_permission_declared.py`` fails for any
+    # operation that sets neither.
+    requires_superadmin: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,8 +168,8 @@ class OperationPermissionError(PermissionError):
     alert rows the equivalent REST route would 403.
     """
 
-    def __init__(self, action: str, resource_type: str) -> None:
-        super().__init__(f"Permission denied: need '{action}' on '{resource_type}'")
+    def __init__(self, action: str, resource_type: str, message: str | None = None) -> None:
+        super().__init__(message or f"Permission denied: need '{action}' on '{resource_type}'")
         self.action = action
         self.resource_type = resource_type
 
@@ -160,11 +179,22 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
 
     Called both by ``apply_proposal`` (the authoritative gate) and by
     each ``_apply_*`` (defense in depth, so the gate holds even if the
-    op is ever dispatched outside the apply endpoint). No-op when the
-    operation declares ``required_permission=None`` (self-scoped ops).
+    op is ever dispatched outside the apply endpoint). Refuses a
+    non-superadmin for ``requires_superadmin`` operations. No-op when the
+    operation declares neither gate (self-scoped ops such as
+    ``archive_session``, which check ownership inside their own apply).
     """
-    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        is_effective_superadmin,
+        user_has_permission,
+    )
 
+    if op.requires_superadmin and not is_effective_superadmin(user):
+        raise OperationPermissionError(
+            "superadmin",
+            op.name,
+            f"Permission denied: operation '{op.name}' is restricted to superadmin users",
+        )
     if op.required_permission is None:
         return
     action, resource_type = op.required_permission
@@ -205,6 +235,38 @@ class CreateIPAddressArgs(BaseModel):
     )
     mac_address: str | None = Field(default=None, description="MAC address in any standard format")
     description: str = Field(default="", description="Free-form description")
+
+    # The same field rules as the REST create (``IPAddressCreate``): the
+    # requests portal validates a submission against this model, and an
+    # approved request provisions it, so a value REST refuses must be refused
+    # here too, at submit, where the requester can still correct it.
+    @field_validator("status")
+    @classmethod
+    def _status(cls, v: str) -> str:
+        if v not in IP_STATUSES_CREATE_SETTABLE:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(IP_STATUSES_CREATE_SETTABLE))}"
+            )
+        return v
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return validate_optional_hostname(v) or None
+
+    @field_validator("fqdn")
+    @classmethod
+    def _fqdn(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return validate_fqdn(v, field="fqdn", allow_underscore=False)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        return canonicalize_mac(v)
 
 
 async def _preview_create_ip_address(
@@ -1974,6 +2036,28 @@ class CreateDNSRecordArgs(BaseModel):
         le=65_535,
     )
 
+    # The REST record create's rules (``RecordCreate`` +
+    # ``_validate_address_record_value``), applied when the payload is parsed
+    # so a requests-portal submission is refused at submit. The checks that
+    # need the zone (relative rdata names) run again in preview / apply.
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        return validate_record_owner(v, field="record name")
+
+    # A field validator, not a model one, so the refusal names ``value`` the
+    # way the other field refusals name theirs. ``record_type`` is declared
+    # first, so it is in ``info.data`` here unless it failed its own check.
+    @field_validator("value")
+    @classmethod
+    def _value(cls, v: str, info: ValidationInfo) -> str:
+        rtype = str(info.data.get("record_type") or "").strip().upper()
+        if contains_control_chars(v) or rtype in ({"A", "AAAA"} | HOSTNAME_TARGET_RECORD_TYPES):
+            err = record_value_error(rtype, v)
+            if err is not None:
+                raise ValueError(err)
+        return v
+
 
 async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
@@ -1985,6 +2069,7 @@ async def _preview_create_dns_record(
         find_cname_conflict,
         is_apex,
     )
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2012,6 +2097,10 @@ async def _preview_create_dns_record(
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} not found.")
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
+    # #2653 — the REST create's refusal; the reconciler would revert the row.
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        return PreviewResult(ok=False, detail=synth_err)
 
     name = args.name.strip()
     if not name:
@@ -2023,8 +2112,8 @@ async def _preview_create_dns_record(
     names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
     if names_err is not None:
         return PreviewResult(ok=False, detail=names_err)
-    # #2502 — nor rdata dnspython cannot read.
-    rdata_err = structured_rdata_error(
+    # #2502 — nor rdata dnspython cannot read, nor a value REST refuses.
+    rdata_err = record_value_error(
         rtype,
         args.value,
         priority=args.priority,
@@ -2091,6 +2180,7 @@ async def _apply_create_dns_record(
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.zone_synthesis import synthesised_zone_error
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -2107,6 +2197,13 @@ async def _apply_create_dns_record(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         raise ValueError(f"Zone {args.zone_id} not found.")
+    # #2653 — a zone trashed (or taken over by an integration) between
+    # propose and apply must not receive records.
+    if getattr(zone, "deleted_at", None) is not None:
+        raise ValueError(f"Zone {args.zone_id} is deleted.")
+    synth_err = synthesised_zone_error(zone, "edit")
+    if synth_err is not None:
+        raise ValueError(synth_err)
 
     name = args.name.strip()
     fqdn = (
@@ -2119,8 +2216,8 @@ async def _apply_create_dns_record(
     names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
     if names_err is not None:
         raise ValueError(names_err)
-    # #2502 — the same unreadable-rdata refusal as the REST create path.
-    rdata_err = structured_rdata_error(
+    # #2502 — the same record-value refusal as the REST create path.
+    rdata_err = record_value_error(
         rtype,
         args.value,
         priority=args.priority,
@@ -2529,7 +2626,7 @@ async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
     from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
-    from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
     if not name:
@@ -2575,17 +2672,11 @@ async def _preview_create_dns_zone(
         if refusal is not None:
             return PreviewResult(ok=False, detail=refusal)
 
-    existing = (
-        await db.execute(
-            select(DNSZone).where(
-                DNSZone.group_id == grp.id,
-                DNSZone.view_id.is_(None),
-                DNSZone.name == name,
-                DNSZone.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            return PreviewResult(ok=False, detail=f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
         return PreviewResult(
             ok=False,
             detail=f"A zone named {name!r} already exists in group {grp.name!r}.",
@@ -2619,6 +2710,7 @@ async def _apply_create_dns_zone(
     from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
+    from app.services.dns.zone_guards import soa_field_error, zone_name_taken  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_zone", ...) write gate.
@@ -2651,6 +2743,21 @@ async def _apply_create_dns_zone(
         if refusal is not None:
             raise ValueError(refusal)
 
+    # #2652 — the REST create's checks, re-run at apply. The unique
+    # constraint cannot catch a twin when view_id is NULL.
+    for soa_field in ("primary_ns", "admin_email"):
+        soa_err = soa_field_error(getattr(args, soa_field), soa_field)
+        if soa_err is not None:
+            raise ValueError(f"{soa_field} {soa_err}")
+    if await zone_name_taken(db, grp.id, None, name):
+        raise ValueError(f"A zone named {name!r} already exists in group {grp.name!r}.")
+
+    from app.services.dns.view_collisions import RenderGuard  # noqa: PLC0415
+
+    # #2275 — a zone with no view renders into every view of the group, so it
+    # must not land beside a same-name zone pinned to one of them.
+    render_guard = await RenderGuard.capture(db, grp.id, [name])
+
     zone = DNSZone(
         group_id=grp.id,
         name=name,
@@ -2663,6 +2770,7 @@ async def _apply_create_dns_zone(
     )
     db.add(zone)
     await db.flush()
+    await render_guard.check(db, f"create zone {name!r}", error=ValueError)
 
     # #1932 — push the create to the group's agentless servers before the
     # commit, exactly as the REST create does (#798 lockstep): a provider
@@ -2755,6 +2863,18 @@ class CreateDHCPStaticArgs(BaseModel):
     mac_address: str = Field(description="MAC address (any standard format).")
     hostname: str | None = Field(default=None, description="Optional hostname.")
     description: str = Field(default="", description="Free-form description.")
+
+    # The REST reservation create's rules (``StaticCreate``): a blank hostname
+    # is no hostname, anything else a legal host name; the MAC is canonical.
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return validate_optional_hostname(v)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str) -> str:
+        return canonicalize_mac(v)
 
 
 async def _preview_create_dhcp_static(
@@ -3008,6 +3128,7 @@ register(
         preview=_preview_create_alert_rule,
         apply=_apply_create_alert_rule,
         category="ops",
+        requires_superadmin=True,
     )
 )
 
@@ -4461,6 +4582,7 @@ register(
         preview=_preview_grant_temporary_access,
         apply=_apply_grant_temporary_access,
         category="admin",
+        requires_superadmin=True,
     )
 )
 
@@ -5448,5 +5570,6 @@ register(
         preview=_preview_restart_service,
         apply=_apply_restart_service,
         category="admin",
+        requires_superadmin=True,
     )
 )

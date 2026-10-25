@@ -505,6 +505,17 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # that finishes still behind. NULL while current. The stalled-render
     # alert measures from here.
     bundle_dirty_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2281 — bumped when the server is re-enabled. A disabled server gets no
+    # record ops and no renders while its agent keeps serving the old config,
+    # and in a group without views records are left out of the structural
+    # etag, so the next bundle would carry the current records and the agent
+    # would never re-render them. Folded into the structural fingerprint
+    # (``agent_config``) when non-zero, so a bump forces one full re-render
+    # of every zone on that server. Zero adds nothing, so a server that was
+    # never re-enabled keeps the structural etag it had.
+    zone_resync_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:
@@ -535,7 +546,20 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     # #1232 — the successor lookup (``record_ops._successors``) and the page
     # query both read a server's ops from a point in time onward; the table
     # is never pruned, so without this they scan every op the server ever had.
-    __table_args__ = (Index("ix_dns_record_op_server_created", "server_id", "created_at"),)
+    #
+    # #2289 — every op page looks up the ops still backing off for its RRsets
+    # (``agent_config._backed_off_candidates``); without this it read every
+    # queued op the server had, so its cost grew with the whole backlog.
+    # Partial: only the ops actually waiting out a backoff.
+    __table_args__ = (
+        Index("ix_dns_record_op_server_created", "server_id", "created_at"),
+        Index(
+            "ix_dns_record_op_server_backoff",
+            "server_id",
+            "next_attempt_at",
+            postgresql_where=sa_text("state = 'pending' AND next_attempt_at IS NOT NULL"),
+        ),
+    )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

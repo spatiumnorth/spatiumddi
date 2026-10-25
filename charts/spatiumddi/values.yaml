@@ -776,6 +776,28 @@ postgresql:
       max_connections: "200"
       shared_buffers: "256MB"
       work_mem: "16MB"
+      # #2132 / #2240 — WAL kept for a former primary to come back. After a
+      # partition of the primary's node, CNPG promotes a replica and later
+      # rewinds the old primary onto the new timeline: ``pg_rewind`` needs
+      # the old primary's own WAL back to the last checkpoint before the
+      # point where the two diverged, and the rewound instance then streams
+      # the new primary's WAL from there. The new primary holds no
+      # replication slot for it (CNPG's HA slots cover the standbys the
+      # primary already had), so plain retention, on both, is all that keeps
+      # that WAL. With CNPG's 512MB default a
+      # loaded cluster recycled it within minutes and the old primary looped
+      # for ever ("requested WAL segment ... has already been removed", then
+      # ``pg_rewind`` "could not restore file ... from archive") until it was
+      # re-cloned by hand. 2GB covers that much write traffic during the
+      # partition; a longer or heavier one still needs the re-clone.
+      #
+      # Disk: every instance keeps at least this much WAL in pg_wal on its
+      # own volume (on the appliance, local-path on /var), on top of what
+      # checkpoints keep. A reload, not a restart: CNPG applies a change to a
+      # formed cluster without a rolling restart. The supervisor's
+      # HelmChartConfig sets only ``shared_buffers`` in this map (#1115) and
+      # Helm merges maps key by key, so this default stays beside it.
+      wal_keep_size: "2GB"
     # PodMonitor for Prometheus Operator. Default false because most
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:

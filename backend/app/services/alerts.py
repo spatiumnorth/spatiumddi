@@ -4599,10 +4599,23 @@ async def _evaluate_circuit_status_changed_rule(
         if c.status not in _CIRCUIT_STATUS_CHANGE_DESTS:
             continue
 
-        # Skip if there's an open event for this subject — wait for
-        # the auto-resolve cutoff above.
-        if subject_id in open_by_subject:
-            continue
+        # An open event for this subject describes ONE transition. While
+        # it still matches the circuit's current transition there is
+        # nothing new to say; once the circuit has moved again
+        # (suspended → decom) the open event is superseded: resolve it
+        # and fall through to report the current transition (#2747).
+        open_ev = open_by_subject.get(subject_id)
+        if open_ev is not None:
+            open_latched = (
+                open_ev.last_observed_value.get("changed_at")
+                if isinstance(open_ev.last_observed_value, dict)
+                else None
+            )
+            if open_latched is None or open_latched == c.last_status_change_at.isoformat():
+                continue
+            open_ev.resolved_at = now
+            resolved += 1
+            del open_by_subject[subject_id]
 
         # If the most recent event already latched this exact
         # ``last_status_change_at``, we've already fired for it.

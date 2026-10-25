@@ -1,3 +1,4 @@
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AudioLines, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -129,8 +130,17 @@ export function AVFlowsPage() {
               <AudioLines className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">AV over IP</h1>
               <span className="text-xs text-muted-foreground">
-                {total} flow{total === 1 ? "" : "s"} · {ranges.length} reserved
-                range{ranges.length === 1 ? "" : "s"}
+                {flowsQ.error ? (
+                  <ListReadError error={flowsQ.error} what="AV flows" />
+                ) : (
+                  `${total} flow${total === 1 ? "" : "s"}`
+                )}{" "}
+                ·{" "}
+                {rangesQ.error ? (
+                  <ListReadError error={rangesQ.error} what="reserved ranges" />
+                ) : (
+                  `${ranges.length} reserved range${ranges.length === 1 ? "" : "s"}`
+                )}
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
@@ -227,9 +237,14 @@ export function AVFlowsPage() {
           <div className="rounded-lg border">
             {flows.length === 0 ? (
               <div className="p-8 text-center text-sm text-muted-foreground">
-                {flowsQ.isLoading
-                  ? "Loading AV flows…"
-                  : "No AV flows recorded. Stamp a multicast group as an AV flow to start documenting the plant."}
+                {flowsQ.isLoading ? (
+                  "Loading AV flows…"
+                ) : (
+                  <ListEmpty error={flowsQ.error} what="AV flows">
+                    No AV flows recorded. Stamp a multicast group as an AV flow
+                    to start documenting the plant.
+                  </ListEmpty>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">

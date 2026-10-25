@@ -14,7 +14,9 @@ Drift buckets:
 - **stale**:      A DNSRecord exists with ``auto_generated=True`` and an
                   ``ip_address_id`` that no longer points at a live address in
                   this subnet. Most commonly: the IPAddress was deleted but
-                  the record was left behind by an earlier code path.
+                  the record was left behind by an earlier code path. Such an
+                  orphan is this subnet's only when the address it is for
+                  lies inside the subnet (#2577) — its zone is shared.
 
 The compute function is read-only. Apply happens via ``_sync_dns_record`` in
 the IPAM router (for create/update) or direct row delete (for stale).
@@ -83,6 +85,11 @@ class StaleItem:
     # for ``ip-deleted``). Lets a client mark that row's DNS state as pending
     # cleanup instead of "in sync" (#2101).
     ip_id: uuid.UUID | None = None
+    # The host record (A / AAAA, not an alias) or PTR of a live address whose
+    # name is blank. Such an address publishes nothing, so the scheduled sync
+    # retracts these whatever ``dns_auto_sync_delete_stale`` says; every other
+    # stale record (aliases included) stays under that setting.
+    blank_name_host_record: bool = False
 
 
 @dataclass
@@ -264,6 +271,86 @@ def ptr_address(
             return ipaddress.IPv6Address(":".join(hexstr[i : i + 4] for i in range(0, 32, 4)))
     except ValueError:
         return None
+    return None
+
+
+def _orphan_in_subnet(
+    rec: DNSRecord,
+    rev_zones_by_id: dict[uuid.UUID, DNSZone],
+    subnet_net: ipaddress.IPv4Network | ipaddress.IPv6Network | None,
+    alias_targets: dict[tuple[uuid.UUID, str], list[str]] | None = None,
+    forward_zone: DNSZone | None = None,
+) -> bool:
+    """Whether an auto-generated record with no ``ip_address_id`` is for an
+    address inside ``subnet_net`` (#2577).
+
+    * An A / AAAA is the subnet's when its value is an address inside it.
+    * A PTR in one of the subnet's reverse zones is the subnet's when its
+      owner name is a full reverse pointer to an address inside it. One
+      whose owner name will not parse into an address is the subnet's only
+      when the whole reverse zone lies inside the subnet — then no other
+      subnet can share the zone, so the record cannot be anyone else's.
+    * A CNAME (an IPAM alias, whose value is the host's FQDN) is the subnet's
+      when its target name resolves, in the same zone, to A / AAAA records
+      that are all inside the subnet (``alias_targets``: (zone id, name) →
+      the values of every A / AAAA at that name, linked or orphaned).
+
+    Anything else — another record type, a value or name that is not an
+    address, a CNAME whose target is outside the zone, resolves to nothing,
+    or resolves to anything outside the subnet — cannot be attributed to this
+    subnet and is not reported: offering a record for deletion on the
+    strength of the zone it sits in alone is the over-reach this guards
+    against.
+    """
+    if subnet_net is None:
+        return False
+
+    def _inside(value: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(str(value).strip())
+        except ValueError:
+            return False
+        return addr.version == subnet_net.version and addr in subnet_net
+
+    if rec.record_type in ("A", "AAAA"):
+        return _inside(rec.value)
+    if rec.record_type == "PTR" and rec.zone_id in rev_zones_by_id:
+        zone_name = rev_zones_by_id[rec.zone_id].name
+        addr = ptr_address(rec.name, zone_name)
+        if addr is not None:
+            return addr.version == subnet_net.version and addr in subnet_net
+        zone_net = reverse_zone_network(zone_name)
+        return (
+            zone_net is not None
+            and zone_net.version == subnet_net.version
+            and zone_net.subnet_of(subnet_net)  # type: ignore[arg-type]
+        )
+    if rec.record_type == "CNAME" and alias_targets is not None and forward_zone is not None:
+        if rec.zone_id != forward_zone.id:
+            return False
+        target = cname_target_in_zone(rec.value, forward_zone.name)
+        if target is None:
+            return False
+        values = alias_targets.get((rec.zone_id, target), [])
+        return bool(values) and all(_inside(v) for v in values)
+    return False
+
+
+def cname_target_in_zone(value: str | None, zone_name: str) -> str | None:
+    """The owner name, relative to ``zone_name``, a CNAME's ``value`` points
+    at — ``"@"`` for the apex — or ``None`` when it points outside the zone.
+    A value with no trailing dot is already relative to the zone."""
+    if not value:
+        return None
+    v = value.strip().lower()
+    zone = zone_name.strip().lower().rstrip(".")
+    if not v.endswith("."):
+        return v or None
+    v = v.rstrip(".")
+    if v == zone:
+        return "@"
+    if zone and v.endswith("." + zone):
+        return v[: -len(zone) - 1]
     return None
 
 
@@ -762,7 +849,6 @@ async def compute_subnet_dns_drift(
     candidate_zone_ids = [
         z.id for z in (forward_zone, *subnet_rev_zones) if z is not None and ipam_authors_zone(z)
     ]
-    rev_zone_ids = {z.id for z in subnet_rev_zones}
     if candidate_zone_ids:
         orphan_res = await db.execute(
             select(DNSRecord).where(
@@ -771,7 +857,30 @@ async def compute_subnet_dns_drift(
                 DNSRecord.zone_id.in_(candidate_zone_ids),
             )
         )
-        for r in orphan_res.scalars().all():
+        orphans = list(orphan_res.scalars().all())
+        # #2577 — a CNAME alias carries its host's FQDN, not an address: load
+        # every A / AAAA its target names in the same zone, so it can be
+        # attributed by where that host lives.
+        alias_targets: dict[tuple[uuid.UUID, str], list[str]] = {}
+        if forward_zone is not None:
+            wanted = {
+                t
+                for r in orphans
+                if r.record_type == "CNAME" and r.zone_id == forward_zone.id
+                for t in [cname_target_in_zone(r.value, forward_zone.name)]
+                if t is not None
+            }
+            if wanted:
+                host_res = await db.execute(
+                    select(DNSRecord.name, DNSRecord.value).where(
+                        DNSRecord.zone_id == forward_zone.id,
+                        DNSRecord.record_type.in_(("A", "AAAA")),
+                        func.lower(DNSRecord.name).in_(wanted),
+                    )
+                )
+                for name, value in host_res.all():
+                    alias_targets.setdefault((forward_zone.id, name.lower()), []).append(value)
+        for r in orphans:
             # #1554: records owned by an integration mirror, the DNS
             # pool pipeline, or ACME also carry no ip_address_id, but
             # they are not IPAM sync output — never report them stale
@@ -779,15 +888,16 @@ async def compute_subnet_dns_drift(
             # recreate them on its next pass, flapping the name).
             if dns_record_owned_elsewhere(r):
                 continue
-            if r.record_type == "PTR" and r.zone_id in rev_zone_ids and subnet_net is not None:
-                # A reverse zone is shared by every subnet in its /24 (a /25
-                # pair, spatiumddi#1840): only a PTR for one of THIS subnet's
-                # addresses is this subnet's orphan.
-                addr = ptr_address(r.name, rev_zones_by_id[r.zone_id].name)
-                if addr is not None and (
-                    addr.version != subnet_net.version or addr not in subnet_net
-                ):
-                    continue
+            # A zone is shared: a reverse zone by every subnet in its /24 (a
+            # /25 pair, spatiumddi#1840), a forward zone by every subnet and
+            # every space that names it. An orphan has lost the link that said
+            # whose it was, so the only evidence left is the address it is
+            # for — and it is THIS subnet's stale record only when that
+            # address lies inside this subnet. Reporting the zone's orphans
+            # wholesale offered every other subnet's (and space's) orphans
+            # for deletion here, and the auto-sync deleted them (#2577).
+            if not _orphan_in_subnet(r, rev_zones_by_id, subnet_net, alias_targets, forward_zone):
+                continue
             zone_name = (
                 forward_zone.name
                 if forward_zone and r.zone_id == forward_zone.id
@@ -845,7 +955,15 @@ async def compute_subnet_dns_drift(
         # hostname, and dynamic-pool lease mirrors on a scope that opted out of
         # dynamic-lease DNS tracking — IPAM never publishes DNS for these.
         dns_suppressed = _dns_suppressed(ip)
-        if ip.status in ("network", "broadcast", "orphan") or not ip.hostname or dns_suppressed:
+        blank_name = not (ip.hostname or "").strip()
+        # A blank or whitespace-only name is no name: its records are stale
+        # (offered for deletion), never an update to a blank owner.
+        if (
+            ip.status in ("network", "broadcast", "orphan")
+            or ip.hostname is None
+            or not ip.hostname.strip()
+            or dns_suppressed
+        ):
             reason = (
                 "dynamic-lease-untracked"
                 if dns_suppressed
@@ -866,6 +984,13 @@ async def compute_subnet_dns_drift(
                         value=r.value,
                         reason=reason,
                         ip_id=ip.id,
+                        blank_name_host_record=(
+                            blank_name
+                            and ip.status not in ("network", "broadcast", "orphan")
+                            and not dns_suppressed
+                            and not r.ip_alias
+                            and r.record_type in ("A", "AAAA", "PTR")
+                        ),
                     )
                 )
             continue
