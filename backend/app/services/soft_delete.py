@@ -856,10 +856,19 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         except HTTPException as exc:
             return str(exc.detail)
 
+    # Customers, overlays and services are NOT in the global soft-delete filter
+    # (db.py), so a namesake in the Trash must be excluded explicitly (#2738);
+    # limit(1) so several Trash namesakes can never raise MultipleResultsFound.
     elif isinstance(obj, Customer):
         existing = (
             await db.execute(
-                select(Customer).where(Customer.name == obj.name, Customer.id != obj.id)
+                select(Customer.id)
+                .where(
+                    Customer.name == obj.name,
+                    Customer.id != obj.id,
+                    Customer.deleted_at.is_(None),
+                )
+                .limit(1)
             )
         ).scalar_one_or_none()
         if existing is not None:
@@ -868,9 +877,13 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
     elif isinstance(obj, OverlayNetwork):
         existing = (
             await db.execute(
-                select(OverlayNetwork).where(
-                    OverlayNetwork.name == obj.name, OverlayNetwork.id != obj.id
+                select(OverlayNetwork.id)
+                .where(
+                    OverlayNetwork.name == obj.name,
+                    OverlayNetwork.id != obj.id,
+                    OverlayNetwork.deleted_at.is_(None),
                 )
+                .limit(1)
             )
         ).scalar_one_or_none()
         if existing is not None:
@@ -879,11 +892,14 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
     elif isinstance(obj, NetworkService):
         existing = (
             await db.execute(
-                select(NetworkService).where(
+                select(NetworkService.id)
+                .where(
                     NetworkService.customer_id == obj.customer_id,
                     NetworkService.name == obj.name,
                     NetworkService.id != obj.id,
+                    NetworkService.deleted_at.is_(None),
                 )
+                .limit(1)
             )
         ).scalar_one_or_none()
         if existing is not None:

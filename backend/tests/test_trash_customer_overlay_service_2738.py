@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -334,3 +335,76 @@ async def test_retention_sweep_purges_expired_rows_and_holds_a_customer_with_ser
     ids = {i["id"] for i in await _trash(client, h, "customer")}
     assert ids == {held["id"]}
     assert (await client.get(f"/api/v1/services/{svc['id']}", headers=h)).status_code == 200
+
+
+# --- namesakes sitting in the Trash are not live rows (QA walk of #2744) -----
+
+
+async def _make(c: AsyncClient, h: dict[str, str], kind: str, name: str, cust: str | None):
+    if kind == "customer":
+        return await _mk_customer(c, h, name)
+    if kind == "overlay":
+        return await _mk_overlay(c, h, name)
+    assert cust is not None
+    return await _mk_service(c, h, name, cust)
+
+
+def _path(kind: str, rid: str) -> str:
+    base = {"customer": "customers", "overlay": "overlays", "service": "services"}[kind]
+    return f"/api/v1/{base}/{rid}"
+
+
+async def _setup(c: AsyncClient, h: dict[str, str], kind: str) -> tuple[str, str | None]:
+    name = f"ns-{uuid.uuid4().hex[:6]}"
+    cust = None
+    if kind == "service":
+        cust = (await _mk_customer(c, h, f"own-{uuid.uuid4().hex[:6]}"))["id"]
+    return name, cust
+
+
+_TYPE = {"customer": "customer", "overlay": "overlay_network", "service": "network_service"}
+
+
+@pytest.mark.parametrize("kind", ["customer", "overlay", "service"])
+async def test_restore_ignores_one_namesake_in_the_trash(
+    client: AsyncClient, db_session: AsyncSession, kind: str
+) -> None:
+    h = await _admin(db_session)
+    name, cust = await _setup(client, h, kind)
+    a = await _make(client, h, kind, name, cust)
+    assert (await client.delete(_path(kind, a["id"]), headers=h)).status_code == 204
+    c = await _make(client, h, kind, name, cust)
+    assert (await client.delete(_path(kind, c["id"]), headers=h)).status_code == 204
+    r = await _restore(client, h, _TYPE[kind], a["id"])
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("kind", ["customer", "overlay", "service"])
+async def test_restore_with_two_namesakes_in_the_trash_is_not_a_500(
+    client: AsyncClient, db_session: AsyncSession, kind: str
+) -> None:
+    h = await _admin(db_session)
+    name, cust = await _setup(client, h, kind)
+    ids = []
+    for _ in range(3):
+        row = await _make(client, h, kind, name, cust)
+        ids.append(row["id"])
+        assert (await client.delete(_path(kind, row["id"]), headers=h)).status_code == 204
+    r = await _restore(client, h, _TYPE[kind], ids[0])
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("kind", ["customer", "overlay", "service"])
+async def test_restore_still_409_against_a_live_namesake_among_trash_ones(
+    client: AsyncClient, db_session: AsyncSession, kind: str
+) -> None:
+    h = await _admin(db_session)
+    name, cust = await _setup(client, h, kind)
+    a = await _make(client, h, kind, name, cust)
+    assert (await client.delete(_path(kind, a["id"]), headers=h)).status_code == 204
+    b = await _make(client, h, kind, name, cust)
+    assert (await client.delete(_path(kind, b["id"]), headers=h)).status_code == 204
+    await _make(client, h, kind, name, cust)  # live
+    r = await _restore(client, h, _TYPE[kind], a["id"])
+    assert r.status_code == 409, r.text
+    assert "already exists" in r.text

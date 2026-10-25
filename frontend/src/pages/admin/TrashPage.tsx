@@ -350,10 +350,10 @@ export function TrashPage() {
             Trash
           </h1>
           <p className="text-sm text-muted-foreground">
-            Soft-deleted IPAM / DNS / DHCP rows. Restore by row to bring back
-            every cascaded child in the same batch. The nightly purge sweep
-            permanently removes anything older than the platform retention
-            window (default 30 days).
+            Soft-deleted IPAM, DNS, DHCP, customer, overlay and service rows.
+            Restore by row to bring back every cascaded child in the same batch.
+            The nightly purge sweep permanently removes anything older than the
+            platform retention window (default 30 days).
           </p>
         </div>
 
