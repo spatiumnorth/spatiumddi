@@ -16,6 +16,7 @@ from celery.signals import (
     task_postrun,
     task_prerun,
     worker_init,
+    worker_shutdown,
 )
 from celery.worker.consumer import Consumer
 from redis.backoff import NoBackoff
@@ -1192,6 +1193,13 @@ def _dispatch_after_commit_in_background(**_: object) -> None:
     runs in the prefork master; the loop itself starts lazily per PID, so
     each forked child gets its own."""
     importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
+
+
+@worker_shutdown.connect
+def _close_after_commit_dispatch(**_: object) -> None:
+    """#2782 — drain the background dispatch loop and close the engine it
+    uses, rather than leaving its connections to the server's reaper."""
+    importlib.import_module("app.services.after_commit_dispatch").shutdown_background()
 
 
 @task_failure.connect

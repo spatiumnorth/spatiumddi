@@ -198,7 +198,16 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     health.invalidate_worker_ping_cache()
     # The idle-session timeout is cached the same way.
     session_idle.invalidate_cache()
+    # #2782 — "nothing to deliver to" is cached per process on a monotonic
+    # clock, so a test that ran with no subscription / target would keep the
+    # next test's after-commit publish and forward from running.
+    from app.services import audit_forward, event_publisher
+
+    event_publisher.subscriptions_cache.invalidate()
+    audit_forward.targets_cache.invalidate()
     yield
+    event_publisher.subscriptions_cache.invalidate()
+    audit_forward.targets_cache.invalidate()
     maintenance_mode.invalidate_cache()
     session_idle.invalidate_cache()
     feature_modules.invalidate_cache()
