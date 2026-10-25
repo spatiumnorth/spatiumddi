@@ -42,7 +42,7 @@ from sqlalchemy.orm import aliased
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
@@ -375,6 +375,9 @@ class RestoreResult:
     restored: list[Any] = field(default_factory=list)
     conflicts: list[dict[str, str]] = field(default_factory=list)
     bulk: dict[uuid.UUID, dict[str, int]] = field(default_factory=dict)
+    # IPAM records left in the Trash with their subnet (#2732), one entry per
+    # subnet: shaped like a conflict so the caller can report them the same way.
+    held_back: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -391,6 +394,8 @@ class RestoreResult:
         children = self.bulk.get(getattr(obj, "id", None))  # type: ignore[arg-type]
         if children:
             value["restored"] = dict(children)
+        if self.held_back and isinstance(obj, DNSZone):
+            value["held_back"] = [h["display"] for h in self.held_back]
         return value
 
 
@@ -479,6 +484,69 @@ async def _record_parent_conflicts(
         row_id: (_record_label(fqdn, rtype), _parent_reason("zone", z.name), z)
         for row_id, fqdn, rtype, z in (await db.execute(stmt)).tuples()
     }
+
+
+async def _hold_records_with_trashed_subnet(
+    db: AsyncSession, batch_id: uuid.UUID
+) -> tuple[set[uuid.UUID], list[dict[str, str]]]:
+    """Move the batch's IPAM records whose subnet is in the Trash into the subnet's batch (#2732).
+
+    A zone deleted BEFORE a subnet whose hosts it published takes those
+    auto-generated A / AAAA / PTR records into the ZONE's batch; the subnet's
+    later delete only retracts what is still live (#1906), so they never reach
+    the subnet's batch. Restoring the zone would then publish records for
+    addresses IPAM has in the Trash. They are re-stamped into the subnet's
+    batch instead, which is where the subnet-first order puts them: the subnet's
+    restore brings them back (and re-pushes them), its purge drops them.
+
+    One UPDATE … FROM, so a zone holding a /16's worth of records is still one
+    statement. Returns ``(record ids moved, one held-back entry per subnet)``.
+    """
+    sn = aliased(Subnet)
+    stmt: Any = (
+        update(DNSRecord)
+        .where(
+            DNSRecord.deletion_batch_id == batch_id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_address_id == IPAddress.id,
+            IPAddress.subnet_id == sn.id,
+            sn.deleted_at.is_not(None),
+            sn.deletion_batch_id.is_not(None),
+            sn.deletion_batch_id != batch_id,
+        )
+        .values(
+            deleted_at=sn.deleted_at,
+            deleted_by_user_id=sn.deleted_by_user_id,
+            deletion_batch_id=sn.deletion_batch_id,
+        )
+        .returning(DNSRecord.id, sn.id)
+        .execution_options(include_deleted=True, synchronize_session=False)
+    )
+    moved: set[uuid.UUID] = set()
+    per_subnet: dict[uuid.UUID, int] = {}
+    for record_id, subnet_id in (await db.execute(stmt)).tuples():
+        moved.add(record_id)
+        per_subnet[subnet_id] = per_subnet.get(subnet_id, 0) + 1
+    held: list[dict[str, str]] = []
+    for subnet_id, count in per_subnet.items():
+        subnet_stmt: Any = (
+            select(Subnet).where(Subnet.id == subnet_id).execution_options(include_deleted=True)
+        )
+        subnet = (await db.execute(subnet_stmt)).scalar_one()
+        display = _row_display(subnet)
+        held.append(
+            {
+                "type": "subnet",
+                "id": str(subnet_id),
+                "display": f"{count} IPAM record{'' if count == 1 else 's'} of {display}",
+                "reason": (
+                    f"subnet {display} is in the Trash — its records stay there with it "
+                    "and come back when it is restored"
+                ),
+                **parent_ref(subnet),
+            }
+        )
+    return moved, held
 
 
 def _parent_reason(kind: str, display: str) -> str:
@@ -665,6 +733,16 @@ async def restore_batch(
 
     if result.conflicts and not skip_conflicts:
         return RestoreResult(conflicts=result.conflicts)
+
+    # #2732 — records whose OTHER owner, their address's subnet, is still in
+    # the Trash are not restored with their zone: they move to the subnet's
+    # batch before the zone's UPDATE below, which then no longer matches them.
+    held_ids, result.held_back = await _hold_records_with_trashed_subnet(db, batch_id)
+    if held_ids:
+        for obj in result.restored:
+            if getattr(obj, "id", None) in held_ids:
+                db.expire(obj)  # the UPDATE ran with synchronize_session=False
+        result.restored = [o for o in result.restored if getattr(o, "id", None) not in held_ids]
 
     for zone_id in zone_ids:
         where = [DNSRecord.zone_id == zone_id, DNSRecord.deletion_batch_id == batch_id]

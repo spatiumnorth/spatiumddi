@@ -94,6 +94,11 @@ const CATALOGUE: AlertRuleTypeSpec[] = [
       default: "any",
     }),
   ]),
+  {
+    ...t("cluster_upgrade_failed", []),
+    description: "Seeded by the platform; it has no parameters to set.",
+    system_driven: true,
+  },
   t("compliance_change", [
     sel("classification", "Classification", ["pci_scope", "hipaa_scope"], {
       initial: "pci_scope",
@@ -444,5 +449,27 @@ describe("editing a catalogue-only type (#1997)", () => {
     expect(updateRule).toHaveBeenCalledWith("r1", {
       classification: "pci_scope",
     });
+  });
+});
+
+describe("a platform-driven rule type (#2748)", () => {
+  it("is described, not blamed on a feature module", async () => {
+    mount(rule({ rule_type: "cluster_upgrade_failed", enabled: true }));
+    expect(await screen.findByText(/has no parameters to set/)).toBeTruthy();
+    expect(screen.queryByText(/feature module/)).toBeNull();
+    expect(screen.queryByText(/does not describe rule type/)).toBeNull();
+  });
+
+  it("still explains a type the catalogue lacks as a module that is off", async () => {
+    mount(rule({ rule_type: "some_gated_type" }));
+    expect(await screen.findByText(/feature module/)).toBeTruthy();
+  });
+
+  it("is not offered when creating a rule", async () => {
+    mount(null);
+    await screen.findByRole("option", { name: "subnet_utilization" });
+    expect(
+      screen.queryByRole("option", { name: "cluster_upgrade_failed" }),
+    ).toBeNull();
   });
 });

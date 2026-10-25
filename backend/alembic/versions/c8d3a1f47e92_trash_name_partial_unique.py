@@ -22,7 +22,7 @@ name with a live one (a name reused after this migration); purge or rename the
 deleted row first. The original delete times are not restored.
 
 Revision ID: c8d3a1f47e92
-Revises: c3a8f5e12d94
+Revises: c6d2e84f1a97
 Create Date: 2026-10-24 12:00:00.000000
 """
 
@@ -33,7 +33,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c8d3a1f47e92"
-down_revision = "c3a8f5e12d94"
+down_revision = "c6d2e84f1a97"
 branch_labels = None
 depends_on = None
 
