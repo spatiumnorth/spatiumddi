@@ -1225,6 +1225,7 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_message,
     )
 
     # A unique violation (SQLSTATE 23505) is the data conflicting.
@@ -1306,7 +1307,7 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": "The request conflicts with existing data."},
+            content={"detail": unique_violation_message(extract_detail(exc))},
         )
 
     @app.exception_handler(SADBAPIError)

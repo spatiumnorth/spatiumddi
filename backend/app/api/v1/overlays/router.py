@@ -22,7 +22,7 @@ Endpoints:
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -439,6 +439,12 @@ async def create_overlay(body: OverlayCreate, db: DB, user: CurrentUser) -> Over
         c = await db.get(Customer, body.customer_id)
         if c is None or c.deleted_at is not None:
             raise HTTPException(status_code=422, detail="customer_id not found")
+    if await db.scalar(
+        select(OverlayNetwork.id).where(
+            OverlayNetwork.name == body.name, OverlayNetwork.deleted_at.is_(None)
+        )
+    ):
+        raise HTTPException(status_code=409, detail=f"Overlay named {body.name!r} already exists")
     row = OverlayNetwork(
         name=body.name,
         kind=body.kind,
@@ -513,12 +519,21 @@ async def update_overlay(
     return await _read_overlay(db, row)
 
 
+async def _trash(db: Any, row: Any, user: Any) -> None:
+    """Soft-delete into the Trash (own batch), so it can be restored or purged (#2738)."""
+    from app.services.soft_delete import (
+        apply_soft_delete,
+        collect_soft_delete_batch,
+    )  # noqa: PLC0415
+
+    batch = await collect_soft_delete_batch(db, row)
+    await apply_soft_delete(db, batch, user.id if user is not None else None)
+
+
 @router.delete("/{overlay_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_overlay(overlay_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await _get_overlay(db, overlay_id)
-    row.deleted_at = datetime.now(UTC)
-    if user is not None:
-        row.deleted_by_user_id = user.id
+    await _trash(db, row, user)
     write_audit(
         db,
         user=user,
@@ -550,11 +565,8 @@ async def bulk_delete_overlays(
     )
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
-    now = datetime.now(UTC)
     for r in rows:
-        r.deleted_at = now
-        if user is not None:
-            r.deleted_by_user_id = user.id
+        await _trash(db, r, user)
         write_audit(
             db,
             user=user,

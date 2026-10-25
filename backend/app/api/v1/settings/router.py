@@ -20,13 +20,14 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func, select, text
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import (
@@ -566,6 +567,16 @@ class SNMPV3UserUpdate(BaseModel):
             )
         return s
 
+    @field_validator("auth_pass", "priv_pass")
+    @classmethod
+    def _passphrase_single_line(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # The passphrase is written into a ``createUser`` line of
+        # snmpd.conf, which ends at the first newline. ``None`` (keep) and
+        # ``""`` (clear) pass through.
+        if v:
+            reject_control_chars(v, info.field_name or "value")
+        return v
+
     @field_validator("auth_protocol")
     @classmethod
     def _valid_auth_proto(cls, v: str) -> str:
@@ -606,7 +617,7 @@ class NTPCustomServerUpdate(BaseModel):
         # server directive, so reject whitespace in the hostname here.
         if any(c.isspace() for c in s):
             raise ValueError("host may not contain whitespace")
-        return s
+        return reject_control_chars(s, "host")
 
 
 class SyslogTargetUpdate(BaseModel):
@@ -743,7 +754,9 @@ class AptSourceUpdate(BaseModel):
     def _suites_nonempty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("suites may not be empty")
-        return v.strip()
+        # Rendered into the one-line ``deb`` entry; a newline would end it
+        # and start another entry. Spaces stay legal (several suites).
+        return reject_control_chars(v.strip(), "suites")
 
     @field_validator("signed_by_key_id")
     @classmethod
@@ -1681,6 +1694,32 @@ class SettingsUpdate(BaseModel):
             raise ValueError(f"snmp_version must be one of {sorted(_SNMP_VERSIONS)}")
         return v
 
+    @field_validator("snmp_sys_contact", "snmp_sys_location")
+    @classmethod
+    def _valid_snmp_sys_text(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # Written into a ``sysContact`` / ``sysLocation`` line of
+        # snmpd.conf. That file is line-oriented, so a newline would end the
+        # line and the rest would be read as a directive of its own.
+        if v is None:
+            return None
+        return reject_control_chars(v, info.field_name or "value")
+
+    @field_validator("snmp_community")
+    @classmethod
+    def _valid_snmp_community(cls, v: str | None) -> str | None:
+        # Written unquoted as the community token of ``rocommunity
+        # <community> <source>``: a newline would start a new directive, and
+        # a space would move the next word into the source position. ``""``
+        # clears the stored community.
+        if not v:
+            return v
+        if has_control_chars(v) or any(c.isspace() for c in v):
+            raise ValueError(
+                "snmp_community must not contain whitespace or control characters "
+                "(newline, carriage return, NUL, tab or other non-printing characters)"
+            )
+        return v
+
     @field_validator("snmp_allowed_sources")
     @classmethod
     def _valid_snmp_sources(cls, v: list[str] | None) -> list[str] | None:
@@ -1725,6 +1764,7 @@ class SettingsUpdate(BaseModel):
                 continue
             if any(c.isspace() for c in s):
                 raise ValueError(f"pool hostname may not contain whitespace: {raw!r}")
+            reject_control_chars(s, "ntp_pool_servers")
             out.append(s)
         return out
 
@@ -4027,7 +4067,8 @@ async def create_influxdb_target(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        logger.warning("influxdb_target_create_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="create failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
@@ -4045,12 +4086,18 @@ async def update_influxdb_target(
         raise HTTPException(status_code=404, detail="Target not found")
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
+    # Flush before the try, as create does: a taken name raises its unique
+    # violation here, where the application's IntegrityError handler turns it
+    # into the same 409 Create gives (#2750), instead of the driver's text
+    # (statement and parameters included) becoming the response detail.
+    await db.flush()
     _audit_influx(db, current_user, "update", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        logger.warning("influxdb_target_update_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="update failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
