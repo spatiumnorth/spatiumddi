@@ -28,25 +28,33 @@ PODS_PATH = "/api/v1/namespaces/spatium/pods?labelSelector=" + quote(
 P1, P2, P3 = (f"{CLUSTER}-{n}" for n in (1, 2, 3))
 
 # Lines as the issue's evidence has them (#2132 first, second and fourth
-# occurrences; #2317's standbys).
-REWIND_LOOP = (
+# occurrences; #2317's standbys), each ONE attempt. A real loop repeats them:
+# pg_rewind every 10-20 s, the rest every 1-5 s, so a 90 s window holds many.
+REWIND_ONCE = (
     '{"level":"info","msg":"pg_rewind: servers diverged at WAL location 0/37B77FF8 on timeline 3"}\n'
     '{"level":"info","msg":"pg_rewind: error: could not restore file \\"000000030000000000000039\\" from archive"}\n'
     '{"level":"error","msg":"Failed to execute pg_rewind","logger":"instance-manager"}\n'
 )
-FUTURE_TIMELINE = (
+FUTURE_ONCE = (
     '{"logger":"wal-restore","msg":"Refusing to restore future timeline history file",'
     '"walName":"0000000A.history"}\n'
 )
-WAL_REMOVED = (
+WAL_REMOVED_ONCE = (
     '{"error_severity":"FATAL","message":"could not receive data from WAL stream: ERROR:  '
     'requested WAL segment 0000000C00000003000000DF has already been removed"}\n'
 )
-SLOT_LOST = (
+SLOT_LOST_ONCE = (
     '{"error_severity":"FATAL","message":"could not receive data from WAL stream: ERROR:  '
     'can no longer get changes from replication slot \\"_cnpg_x_2\\""}\n'
 )
 HEALTHY = '{"level":"info","msg":"started streaming WAL from primary at 0/3000000 on timeline 4"}\n'
+REWIND_LOOP = REWIND_ONCE * 6
+FUTURE_TIMELINE = FUTURE_ONCE * 60
+WAL_REMOVED = WAL_REMOVED_ONCE * 18
+SLOT_LOST = SLOT_LOST_ONCE * 18
+# What #2765's walk saw on each joiner of a forming cluster: one refusal a few
+# seconds after its postgres container started, then streaming.
+JOINER = FUTURE_ONCE + '{"level":"info","msg":"consistent recovery state reached"}\n' + HEALTHY
 
 
 def _log_path(pod: str) -> str:
@@ -305,6 +313,39 @@ def test_signatures_ignore_healthy_and_partial_lines():
     # "could not restore file" alone is not the archive loop.
     assert k8s_api.stuck_signature('{"msg":"could not restore file x"}') is None
     assert k8s_api.stuck_signature(REWIND_LOOP) == "pg_rewind_archive"
+    # One attempt, or two, is not a loop.
+    for once in (REWIND_ONCE, FUTURE_ONCE, WAL_REMOVED_ONCE, SLOT_LOST_ONCE):
+        assert k8s_api.stuck_signature(once) is None
+        assert k8s_api.stuck_signature(once * 2) is None
+        assert k8s_api.stuck_signature(once * 3) is not None
+    assert k8s_api.stuck_signature(JOINER) is None
+
+
+def test_a_joining_replica_is_never_counted(monkeypatch):
+    # #2765's walk: each joiner logged one future-timeline refusal 11-24 s
+    # after its container started, then streamed. Even if every tick for an
+    # hour still caught that line in its window, it is not a loop.
+    kube = _Kube(pods=[_pod(P1), _pod(P2), _pod(P3)], logs={P2: JOINER, P3: JOINER})
+    tracker: dict = {}
+    for now in range(0, 3600, 30):
+        out = _run(monkeypatch, kube, tracker, now=now)
+        assert out.stuck == {} and out.marked == []
+    assert kube.patches == [] and tracker == {}
+
+
+def test_a_joining_burst_resets_once_it_stops(monkeypatch):
+    # A slower join that refuses a few times in a row before it streams starts
+    # the clock, and the first tick whose window no longer repeats it resets.
+    kube = _Kube(pods=[_pod(P1), _pod(P2), _pod(P3)], logs={P2: FUTURE_ONCE * 5, P3: HEALTHY})
+    tracker: dict = {}
+    _run(monkeypatch, kube, tracker, now=0)
+    assert P2 in tracker
+    kube.logs[P2] = HEALTHY
+    _run(monkeypatch, kube, tracker, now=90)
+    assert tracker == {}
+    for now in range(120, 2000, 30):
+        assert _run(monkeypatch, kube, tracker, now=now).marked == []
+    assert kube.patches == []
 
 
 class _Log:
@@ -318,16 +359,30 @@ class _Log:
         self.events.append(("info", event, kw))
 
 
-def test_heartbeat_reports_once_and_logs_the_reclone(monkeypatch):
+def _events(log, name):
+    return [e for e in log.events if e[1] == f"supervisor.heartbeat.{name}"]
+
+
+def _fresh_heartbeat_state(monkeypatch):
+    monkeypatch.setattr(heartbeat, "_stuck_postgres", {})
+    monkeypatch.setattr(heartbeat, "_stuck_postgres_reported", {})
+
+
+def test_heartbeat_logs_info_then_warning_once_and_the_reclone(monkeypatch):
     kube = _Kube()
     monkeypatch.setattr(k8s_api, "_request", kube)
-    monkeypatch.setattr(heartbeat, "_stuck_postgres", {})
-    monkeypatch.setattr(heartbeat, "_stuck_postgres_reported", set())
+    _fresh_heartbeat_state(monkeypatch)
     log = _Log()
-    for now in (0, 30, 60):
+    for now in (0, 30, 60, 90):
         heartbeat._reclone_stuck_postgres(log, now=now)
-    stuck = [e for e in log.events if e[1] == "supervisor.heartbeat.postgres_instance_stuck"]
-    assert len(stuck) == 1 and stuck[0][2]["instance"] == P2
+    looping = _events(log, "postgres_instance_looping")
+    assert len(looping) == 1 and looping[0][0] == "info" and looping[0][2]["instance"] == P2
+    assert _events(log, "postgres_instance_stuck") == []  # one loop seen for 90 s
+    for now in (120, 150, 180):
+        heartbeat._reclone_stuck_postgres(log, now=now)
+    stuck = _events(log, "postgres_instance_stuck")
+    assert len(stuck) == 1 and stuck[0][0] == "warning"
+    assert stuck[0][2]["instance"] == P2 and stuck[0][2]["reclone_in_s"] == 480
     assert "cnpg destroy" in stuck[0][2]["manual_fix"]
     heartbeat._reclone_stuck_postgres(log, now=k8s_api.STUCK_INSTANCE_AFTER_S)
     assert (
@@ -336,3 +391,14 @@ def test_heartbeat_reports_once_and_logs_the_reclone(monkeypatch):
         {"instance": P2, "annotation": "alpha.cnpg.io/unrecoverable"},
     ) in log.events
     assert kube.marked == [P2]
+
+
+def test_heartbeat_logs_nothing_for_a_joining_replica(monkeypatch):
+    kube = _Kube(pods=[_pod(P1), _pod(P2), _pod(P3)], logs={P2: JOINER, P3: JOINER})
+    monkeypatch.setattr(k8s_api, "_request", kube)
+    _fresh_heartbeat_state(monkeypatch)
+    log = _Log()
+    for now in range(0, 1200, 30):
+        heartbeat._reclone_stuck_postgres(log, now=now)
+    assert log.events == []
+    assert kube.patches == []

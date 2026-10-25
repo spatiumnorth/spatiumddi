@@ -522,10 +522,14 @@ the reference topologies are in
     those for ever, so the seed supervisor watches each non-primary
     instance's log for the loops that never end on their own (`pg_rewind`
     failing, "Refusing to restore future timeline history file", "requested
-    WAL segment … has already been removed", an invalidated slot). After 10
-    minutes of the same loop under the same primary it logs
-    `supervisor.heartbeat.postgres_instance_stuck` and then annotates the
-    pod `alpha.cnpg.io/unrecoverable`, CNPG's documented request to delete
+    WAL segment … has already been removed", an invalidated slot). A loop
+    counts only while it repeats (at least three lines in the last 90 s),
+    so a replica that logs a refusal or two while it joins and then streams
+    is never counted. A repeating loop is logged once at info
+    (`supervisor.heartbeat.postgres_instance_looping`), at warning once it
+    has held for 2 minutes (`supervisor.heartbeat.postgres_instance_stuck`),
+    and after 10 minutes of the same loop under the same primary the
+    supervisor annotates the pod `alpha.cnpg.io/unrecoverable`, CNPG's documented request to delete
     the instance's pod and PVCs and join a fresh copy from the primary
     (`supervisor.heartbeat.postgres_instance_reclone`). One instance at a
     time, never the primary, never during a failover or switchover, and

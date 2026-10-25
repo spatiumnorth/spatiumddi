@@ -1263,18 +1263,42 @@ _STUCK_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
 # The QA desk's drill gate is 15 minutes; a rewind that is going to work does
 # so within a minute or two of the instance coming back.
 STUCK_INSTANCE_AFTER_S = 600
-# The log window read per instance per tick: longer than the heartbeat
-# interval (30 s) and the slowest loop above (pg_rewind every 10-20 s).
-_STUCK_LOG_WINDOW_S = 120
+# The log window read per instance per tick: three heartbeats (30 s each), and
+# room for the slowest loop above (pg_rewind every 10-20 s) to repeat.
+_STUCK_LOG_WINDOW_S = 90
 _STUCK_LOG_LIMIT_BYTES = 256 * 1024
+# A signature counts only when it REPEATS in the window, i.e. the instance is
+# looping now. A replica joining a forming cluster logs "Refusing to restore
+# future timeline history file" once or twice in its first seconds (the
+# Cluster's recorded timeline lags the history file it was cloned with) and
+# then streams; the walk on #2765 saw exactly one such line per joiner, 11 s
+# and 24 s after start. Every real loop repeats far faster than this needs:
+# pg_rewind fails every 10-20 s (4-9 lines in the window), the future-timeline
+# refusal and the WAL-removed / slot-invalidated walreceiver errors every 1-5 s.
+STUCK_MIN_REPEATS = 3
+# A loop that has held this long across ticks is reported as stuck (a
+# warning). Before that it is only "looping" (info): one tick is not evidence.
+STUCK_REPORT_AFTER_S = 120
 
 
 def stuck_signature(log_text: str) -> str | None:
-    """The first never-heals signature in ``log_text``, or None."""
-    for name, parts in _STUCK_SIGNATURES:
-        if all(part in log_text for part in parts):
-            return name
-    return None
+    """The never-heals signature that repeats at least
+    :data:`STUCK_MIN_REPEATS` times in ``log_text`` (one match per line), or
+    None. When several do, the one with the most lines wins."""
+    counts: dict[str, int] = {}
+    for line in log_text.splitlines():
+        for name, parts in _STUCK_SIGNATURES:
+            if all(part in line for part in parts):
+                counts[name] = counts.get(name, 0) + 1
+                break
+    # Most lines first; on a tie the earlier, more specific signature (a
+    # pg_rewind attempt logs both its archive line and its generic failure).
+    order = [name for name, _ in _STUCK_SIGNATURES]
+    repeating = sorted(
+        (name for name, n in counts.items() if n >= STUCK_MIN_REPEATS),
+        key=lambda name: (-counts[name], order.index(name)),
+    )
+    return repeating[0] if repeating else None
 
 
 @dataclass
@@ -1321,9 +1345,12 @@ def reclone_stuck_postgres_instances(
     re-clone one of them. ``tracker`` is the caller's state across ticks
     (mutated in place); ``now`` is a monotonic clock.
 
-    An instance counts as stuck when one of :data:`_STUCK_SIGNATURES` is in
-    its pod's last ``_STUCK_LOG_WINDOW_S`` of log on every call for
-    ``stuck_after_s``, under the same primary. Readiness is deliberately not
+    An instance counts as stuck when one of :data:`_STUCK_SIGNATURES`
+    repeats (:data:`STUCK_MIN_REPEATS` lines) in its pod's last
+    ``_STUCK_LOG_WINDOW_S`` of log on every call for ``stuck_after_s``, under
+    the same primary. A call where it does not repeat resets the clock, so a
+    replica that logs a line or two while it joins and then streams is never
+    counted (#2765's walk). Readiness is deliberately not
     a condition: a former primary looping on ``pg_rewind`` is not ready, but a
     standby that lost its slot (#2317) runs as a hot standby and reads Ready
     while it streams nothing.

@@ -14,7 +14,9 @@
     whose `pg_rewind` needs WAL that is gone, or a standby whose slot the cap
     invalidated, looped until someone deleted its PVC by hand. The seed
     supervisor now reads each non-primary instance's log; after 10 minutes of
-    the same never-ending loop under the same primary it annotates the pod
+    the same never-ending loop under the same primary, repeating on every
+    read (a replica that logs a line or two while it joins is not counted),
+    it annotates the pod
     `alpha.cnpg.io/unrecoverable`, and CNPG rebuilds that instance from the
     primary. One at a time, never the primary, never during a failover. The
     `supervisor.heartbeat.postgres_instance_stuck` log line names the loop
