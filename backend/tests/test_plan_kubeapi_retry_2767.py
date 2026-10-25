@@ -162,7 +162,7 @@ def test_quorum_read_rides_out_a_refused_connection(monkeypatch: pytest.MonkeyPa
             raise k8s.KubeapiUnavailableError(REFUSED)
         return 200, _nodes_body()
 
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(k8s, "_request", _request)
     res = preflight.check_quorum(retry_budget_s=30.0)
     assert res.level == "ok" and len(calls) == 2
@@ -180,7 +180,7 @@ def test_lease_read_rides_out_a_refused_connection(monkeypatch: pytest.MonkeyPat
             raise k8s.KubeapiUnavailableError(REFUSED)
         return 404, None
 
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(k8s, "get_lease", _get_lease)
     state = mutex.get_state(retry_budget_s=30.0)
     assert state.holder != "<unreachable>" and not state.held and len(calls) == 2
@@ -252,7 +252,7 @@ async def test_plan_with_kubeapi_down_answers_409_inside_the_deadline(
     ):
         monkeypatch.setattr(preflight, name, _async)
     monkeypatch.setattr(preflight, "check_version_path", lambda **_k: ok)
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(k8s, "get_cnpg_cluster", _down)
     monkeypatch.setattr(k8s, "get_lease", _down)
     monkeypatch.setattr(k8s, "_request", _down)
