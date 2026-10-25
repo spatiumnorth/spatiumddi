@@ -186,3 +186,91 @@ def test_lease_read_rides_out_a_refused_connection(monkeypatch: pytest.MonkeyPat
     assert state.holder != "<unreachable>" and not state.held and len(calls) == 2
     calls.clear()
     assert mutex.get_state().holder == "<unreachable>"  # no budget: unchanged
+
+
+# ── One shared deadline per request (PR #2769 review) ────────────────
+
+
+class _FakeClock:
+    """A clock the kubeapi stubs advance by a socket timeout per attempt."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, d: float) -> None:
+        self.now += d
+
+
+def test_the_socket_timeout_the_deadline_assumes_is_the_helpers() -> None:
+    import inspect
+
+    default = inspect.signature(k8s._request).parameters["timeout"].default
+    assert kubeapi_retry.SOCKET_TIMEOUT_S == default
+    # Stays under the console's nginx proxy_read_timeout (60 s), with room.
+    assert kubeapi_retry.PLAN_DEADLINE_S <= 40.0
+
+
+@pytest.mark.asyncio
+async def test_plan_with_kubeapi_down_answers_409_inside_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(kubeapi_retry, "time", clock)
+
+    async def _sleep(d: float) -> None:
+        clock.now += d
+
+    monkeypatch.setattr(kubeapi_retry, "_sleep", _sleep)
+
+    attempts: list[float] = []
+
+    def _down(*_a: Any, **_k: Any) -> Any:
+        attempts.append(clock.now)
+        clock.now += kubeapi_retry.SOCKET_TIMEOUT_S  # every try blocks its full timeout
+        raise k8s.KubeapiUnavailableError(REFUSED)
+
+    ok = preflight.PreflightResult(name="x", level="ok", message="fine", detail={})
+
+    async def _async(*_a: Any, **_k: Any) -> preflight.PreflightResult:
+        return ok
+
+    async def _no_size(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(preflight, "_slot_image_size", _no_size)
+    for name in (
+        "check_replication_lag",
+        "check_node_disk_headroom",
+        "check_mirror_disk_headroom",
+        "check_kea_ha_version_skew",
+        "check_powerdns_lmdb_migration",
+        "check_etcd_snapshot_freshness",
+        "check_pre_upgrade_backup",
+    ):
+        monkeypatch.setattr(preflight, name, _async)
+    monkeypatch.setattr(preflight, "check_version_path", lambda **_k: ok)
+    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_cnpg_cluster", _down)
+    monkeypatch.setattr(k8s, "get_lease", _down)
+    monkeypatch.setattr(k8s, "_request", _down)
+    monkeypatch.setattr(k8s, "list_nodes", _down)
+    monkeypatch.setattr(orchestrator.settings, "database_url", "postgresql+asyncpg://u:p@pg-rw/db")
+
+    start = clock.now
+    db = _build_mock_db_for_plan(appliance_rows=[])
+    with pytest.raises(orchestrator.OrchestratorError):
+        await orchestrator.plan_upgrade(
+            db,
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+        )
+    assert clock.now - start <= kubeapi_retry.PLAN_DEADLINE_S
+    # No attempt began when less than a socket timeout of the deadline remained.
+    assert all(
+        start + kubeapi_retry.PLAN_DEADLINE_S - t >= kubeapi_retry.SOCKET_TIMEOUT_S
+        for t in attempts
+    )
+    assert len(attempts) > 1  # it did retry within the deadline

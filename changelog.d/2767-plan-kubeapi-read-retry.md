@@ -8,7 +8,7 @@
   answered 409 `kubeapi unreachable` with two of three servers up. The node
   read, the CloudNativePG cluster detection, and the quorum and
   upgrade-lease reads of the pre-flight (the Plan's and `GET /upgrades/preflight`)
-  now try again for up to 30 s on a refused or unanswered connection or a
+  now try again, within one 40 s deadline shared by the whole request (the console gateway gives an /api/ request 60 s), on a refused or unanswered connection or a
   408 / 409 / 429 / 5xx, on the same classifier the rolling run's writes use
   (#2449). A kubeapi that is still unreachable after that answers 409 with the
   same message as before; a 403 or other permanent answer is not retried.

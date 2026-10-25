@@ -227,6 +227,32 @@ async def plan_upgrade(
     audit_actor_display: str | None = None,
     audit_actor_source: str | None = None,
 ) -> PlanResult:
+    """Plan a rolling upgrade (see :func:`_plan_upgrade`). Every kubeapi read the
+    plan makes shares one deadline kept under the gateway's 60 s (#2767)."""
+    with kubeapi_retry.request_deadline():
+        return await _plan_upgrade(
+            db,
+            target_version=target_version,
+            slot_image=slot_image,
+            cnpg_cluster_name=cnpg_cluster_name,
+            cnpg_namespace=cnpg_namespace,
+            started_by_user_id=started_by_user_id,
+            audit_actor_display=audit_actor_display,
+            audit_actor_source=audit_actor_source,
+        )
+
+
+async def _plan_upgrade(
+    db: AsyncSession,
+    *,
+    target_version: str,
+    slot_image: SlotImageTarget,
+    cnpg_cluster_name: str = "",
+    cnpg_namespace: str | None = None,
+    started_by_user_id: uuid.UUID | None = None,
+    audit_actor_display: str | None = None,
+    audit_actor_source: str | None = None,
+) -> PlanResult:
     """Plan a rolling upgrade — read-only preflight + node enumeration +
     DB-persisted ``planned`` row. Does NOT acquire the lease yet; that
     happens on ``start_upgrade``.

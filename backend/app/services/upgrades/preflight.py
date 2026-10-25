@@ -986,6 +986,24 @@ async def run_all(
     of checks starts to dominate latency we can parallelise via
     ``asyncio.gather``.
     """
+    with kubeapi_retry.request_deadline():
+        return await _run_all(
+            target_version=target_version,
+            namespace=namespace,
+            own_holder=own_holder,
+            slot_image_id=slot_image_id,
+            disk_nodes=disk_nodes,
+        )
+
+
+async def _run_all(
+    *,
+    target_version: str,
+    namespace: str | None,
+    own_holder: str | None,
+    slot_image_id: uuid.UUID | None,
+    disk_nodes: list[str] | None,
+) -> PreflightReport:
     image_bytes = await _slot_image_size(slot_image_id)
     node_image_bytes = (
         image_bytes * _NODE_NEED_IMAGE_MULTIPLE if image_bytes else _DEFAULT_SLOT_IMAGE_BYTES
