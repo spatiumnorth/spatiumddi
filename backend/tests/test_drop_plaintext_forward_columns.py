@@ -11,10 +11,13 @@ from restoring — fully or selectively.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import re
 import shutil
 import uuid
 import zipfile
@@ -24,8 +27,6 @@ from typing import Any
 import asyncpg
 import pytest
 from alembic.config import Config
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -37,6 +38,7 @@ from app.models.audit_forward import AuditForwardTarget
 from app.models.base import Base
 from app.models.settings import PlatformSettings
 from app.services.backup import migrations, restore
+from app.services.backup.archive import _pg_env_from_url
 from app.services.backup.crypto import encrypt_secrets
 from app.services.backup.legacy_columns import (
     DROPPED_PLAINTEXT_SECRET_COLUMNS,
@@ -50,8 +52,11 @@ _MIGRATION = (
     / "versions"
     / "c2b203844c95_drop_plaintext_forward_webhook_columns.py"
 )
-_PREVIOUS_HEAD = "c8d3a1f47e92"
-_HEAD = "c2b203844c95"
+# The contract migration and the revision it follows. Neither is assumed to be
+# the head: migrations land after this one, and a test that equates "the drop"
+# with "head" fails the moment one does (see ``_local_head``).
+_BEFORE_DROP = "c8d3a1f47e92"
+_DROP = "c2b203844c95"
 
 # Fixtures only; nothing here is ever contacted.
 _OLD_URL = "https://hooks.chat.example/services/T0/B0/oldPlaintextOnly"
@@ -68,27 +73,6 @@ def _load_migration() -> Any:
     return module
 
 
-def _later_revisions() -> list[Any]:
-    """The revisions after ``_HEAD``, newest first. ``scratch_db`` is built
-    from today's models, so it carries their columns too; an archive stamped
-    at or before ``_HEAD`` must not, or replaying them on restore hits
-    "already exists"."""
-    ini = migrations._alembic_ini()  # noqa: SLF001
-    assert ini is not None
-    script = ScriptDirectory.from_config(Config(str(ini)))
-    return [r for r in script.iterate_revisions("heads", _HEAD) if r.revision != _HEAD]
-
-
-def _apply(fn_name: str, revisions: list[Any]):  # noqa: ANN202
-    def _inner(sync_conn) -> None:  # noqa: ANN001
-        ctx = MigrationContext.configure(sync_conn)
-        with Operations.context(ctx):
-            for rev in revisions:
-                getattr(rev.module, fn_name)()
-
-    return _inner
-
-
 def test_the_restore_helper_and_the_migration_agree_on_the_columns() -> None:
     module = _load_migration()
     assert [(t, p, e) for t, p, e, _ in DROPPED_PLAINTEXT_SECRET_COLUMNS] == list(
@@ -96,8 +80,8 @@ def test_the_restore_helper_and_the_migration_agree_on_the_columns() -> None:
     )
 
 
-def test_the_migration_follows_the_current_head() -> None:
-    assert _load_migration().down_revision == _PREVIOUS_HEAD
+def test_the_migration_follows_the_revision_it_was_written_against() -> None:
+    assert _load_migration().down_revision == _BEFORE_DROP
 
 
 async def _columns(db: AsyncSession, table: str) -> set[str]:
@@ -330,6 +314,104 @@ async def scratch_db() -> AsyncIterator[str]:
             await admin.close()
 
 
+def _local_head() -> str:
+    """This build's head, read from the alembic script directory the restore
+    itself reads (``migrations._alembic_ini``), never assumed to be the drop."""
+    head = migrations._local_head()  # noqa: SLF001
+    assert head is not None, "the alembic script directory has no single head"
+    return head
+
+
+def _alembic_env(url: str) -> dict[str, str]:
+    pg_env, _dbname = _pg_env_from_url(url)
+    return {**os.environ, **pg_env, "DATABASE_URL": url}
+
+
+async def _alembic(url: str, *args: str) -> None:
+    """``alembic`` against ``url``, through the ini the restore uses."""
+    proc = await asyncio.create_subprocess_exec(
+        "alembic",
+        "-c",
+        str(migrations._alembic_ini() or "alembic.ini"),  # noqa: SLF001
+        *args,
+        env=_alembic_env(url),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, (err or out).decode(errors="replace")[-3000:]
+
+
+@pytest.fixture
+async def pre_drop_db() -> AsyncIterator[str]:
+    """A database migrated by the REAL migrations to the revision before the
+    drop — the schema an archive taken on that build actually has.
+
+    Not ``Base.metadata.create_all`` relabelled with an older revision: that
+    schema already carries every object a migration after the drop creates,
+    so the post-restore upgrade collides with the first of them and the
+    restore reports ``auto_recovered`` — a fixture artefact, and one that
+    appears only once a migration lands after the drop.
+    """
+    dbname = f"spatiumddi_test_predrop_{uuid.uuid4().hex[:10]}"
+    admin = await _admin()
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+    url = _url_for(dbname)
+    try:
+        await _alembic(url, "upgrade", _BEFORE_DROP)
+        yield url
+    finally:
+        admin = await _admin()
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+async def _seed_migrated_pre_drop_archive(url: str) -> bytes:
+    """The archive of a real install at ``_BEFORE_DROP``: the plaintext
+    columns exist because the migrations put them there, and hold a value
+    that never reached its encrypted column. Raw SQL, because the models
+    describe head, not this schema."""
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == _BEFORE_DROP
+        await conn.execute(
+            "INSERT INTO platform_settings (id, audit_forward_webhook_enabled, "
+            "audit_forward_webhook_url) VALUES (1, true, $1)",
+            _GENERIC,
+        )
+        await conn.execute(
+            "INSERT INTO audit_forward_target (name, kind, enabled, url, auth_header) "
+            "VALUES ('archived', 'webhook', true, $1, $2)",
+            _OLD_URL,
+            _AUTH,
+        )
+        await conn.execute(
+            "INSERT INTO audit_forward_target (name, kind, enabled, url, auth_header, "
+            "url_encrypted, auth_header_encrypted) "
+            "VALUES ('encrypted', 'webhook', true, $1, $2, $3, $4)",
+            _OLD_URL,
+            _AUTH,
+            _ENCRYPTED_URL_CT,
+            _ENCRYPTED_AUTH_CT,
+        )
+    finally:
+        await conn.close()
+    return _archive(await _pg_dump(url), _BEFORE_DROP)
+
+
+async def _schema_version(url: str) -> str | None:
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        return await conn.fetchval("SELECT version_num FROM alembic_version")
+    finally:
+        await conn.close()
+
+
 async def _seed_pre_drop_archive(url: str, schema_version: str) -> bytes:
     """An archive of an install that still had the plaintext columns, with a
     value in each that never reached its encrypted column."""
@@ -351,8 +433,6 @@ async def _seed_pre_drop_archive(url: str, schema_version: str) -> bytes:
                 ]
             )
             await db.commit()
-        async with engine.begin() as sync:
-            await sync.run_sync(_apply("downgrade", _later_revisions()))
     finally:
         await engine.dispose()
     conn = await asyncpg.connect(_dsn(url))
@@ -379,19 +459,18 @@ async def _seed_pre_drop_archive(url: str, schema_version: str) -> bytes:
 
 
 async def _upgrade_in_place(url: str) -> None:
-    """The install the archive is restored onto: already past the drop, with
-    different data."""
-    engine = create_async_engine(url, poolclass=NullPool)
-    try:
-        async with engine.begin() as sync:
-            await sync.run_sync(_apply("upgrade", list(reversed(_later_revisions()))))
-    finally:
-        await engine.dispose()
+    """The install the archive is restored onto: at this build's head (past
+    the drop), with different data."""
     conn = await asyncpg.connect(_dsn(url))
     try:
         for table, plain, _enc, _type in DROPPED_PLAINTEXT_SECRET_COLUMNS:
-            await conn.execute(f"ALTER TABLE {table} DROP COLUMN {plain}")
-        await conn.execute("UPDATE alembic_version SET version_num = $1", _HEAD)
+            await conn.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS {plain}")
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS alembic_version (version_num varchar(32) NOT NULL, "
+            "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+        )
+        await conn.execute("DELETE FROM alembic_version")
+        await conn.execute("INSERT INTO alembic_version VALUES ($1)", _local_head())
         await conn.execute("DELETE FROM audit_forward_target")
         await conn.execute("DELETE FROM platform_settings")
     finally:
@@ -451,7 +530,7 @@ async def _restore(url: str, archive: bytes, monkeypatch, sections=None) -> Any:
 
 
 @pg_tools
-@pytest.mark.parametrize("archive_head", [_PREVIOUS_HEAD, _HEAD])
+@pytest.mark.parametrize("archive_head", [_BEFORE_DROP, _DROP])
 async def test_a_selective_restore_of_a_pre_drop_archive_loads_and_encrypts(
     scratch_db: str, monkeypatch: pytest.MonkeyPatch, archive_head: str
 ) -> None:
@@ -469,15 +548,104 @@ async def test_a_selective_restore_of_a_pre_drop_archive_loads_and_encrypts(
 
 @pg_tools
 async def test_a_full_restore_of_a_pre_drop_archive_migrates_it(
-    scratch_db: str, monkeypatch: pytest.MonkeyPatch
+    pre_drop_db: str, scratch_db: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    archive = await _seed_pre_drop_archive(scratch_db, _PREVIOUS_HEAD)
+    """The upgrade step runs the drop and EVERY migration after it, to this
+    build's head, whatever that is — and the schema it leaves is head's."""
+    archive = await _seed_migrated_pre_drop_archive(pre_drop_db)
+    await _upgrade_in_place(scratch_db)
+    head = _local_head()
+
+    outcome = await _restore(scratch_db, archive, monkeypatch)
+
+    assert outcome.migration is not None
+    assert outcome.migration.state == "upgraded", outcome.migration
+    assert outcome.migration.local_head == head
+    applied = outcome.migration.migrations_applied
+    assert applied[0] == _DROP and applied[-1] == head, applied
+    assert await _schema_version(scratch_db) == head
+    verdict = await migrations._verify_schema_at_head(scratch_db)  # noqa: SLF001
+    assert verdict.ok, verdict
+    assert await _restored(scratch_db) == _EXPECTED
+
+
+_SYNTHETIC = "ffff0000restoreguard"
+_SYNTHETIC_TABLE = "zz_restore_later_migration_guard"
+
+
+def _alembic_tree_ending_after_the_drop(tmp_path: pathlib.Path) -> pathlib.Path:
+    """An alembic tree holding the real chain up to the drop and one synthetic
+    migration after it, which creates a table no model declares. Returns its
+    ini. Built here, not committed, so the drop is never the head of it —
+    whatever ``main`` happens to carry."""
+    backend = pathlib.Path(__file__).resolve().parents[1]
+    real_ini = migrations._alembic_ini()  # noqa: SLF001
+    assert real_ini is not None
+    script = ScriptDirectory.from_config(Config(str(real_ini)))
+    tree = tmp_path / "alembic"
+    versions = tree / "versions"
+    versions.mkdir(parents=True)
+    for name in ("env.py", "script.py.mako"):
+        shutil.copy(backend / "alembic" / name, tree / name)
+    for rev in script.iterate_revisions(_DROP, "base"):
+        shutil.copy(rev.path, versions / pathlib.Path(rev.path).name)
+    (versions / f"{_SYNTHETIC}_guard.py").write_text(
+        f'''"""synthetic: a migration after the drop (test only)
+
+Revision ID: {_SYNTHETIC}
+Revises: {_DROP}
+"""
+import sqlalchemy as sa
+from alembic import op
+
+revision = "{_SYNTHETIC}"
+down_revision = "{_DROP}"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table("{_SYNTHETIC_TABLE}", sa.Column("id", sa.Integer, primary_key=True))
+
+
+def downgrade() -> None:
+    op.drop_table("{_SYNTHETIC_TABLE}")
+'''
+    )
+    ini = tmp_path / "alembic.ini"
+    text_ = real_ini.read_text()
+    text_ = re.sub(r"(?m)^script_location\s*=.*$", f"script_location = {tree}", text_)
+    text_ = re.sub(r"(?m)^prepend_sys_path\s*=.*$", f"prepend_sys_path = {backend}", text_)
+    ini.write_text(text_)
+    return ini
+
+
+@pg_tools
+async def test_a_full_restore_runs_the_migrations_after_the_drop(
+    pre_drop_db: str, scratch_db: str, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """With a migration after the drop, the restore must run the drop AND it
+    and report ``upgraded`` — not stop on a collision and stamp head. Holds
+    even while the drop is ``main``'s head, so the full-restore test above
+    cannot pass only because nothing follows it."""
+    ini = _alembic_tree_ending_after_the_drop(tmp_path)
+    monkeypatch.setattr(migrations, "_alembic_ini", lambda: ini)
+    assert _local_head() == _SYNTHETIC
+
+    archive = await _seed_migrated_pre_drop_archive(pre_drop_db)
     await _upgrade_in_place(scratch_db)
 
     outcome = await _restore(scratch_db, archive, monkeypatch)
 
     assert outcome.migration is not None
     assert outcome.migration.state == "upgraded", outcome.migration
+    assert outcome.migration.migrations_applied == [_DROP, _SYNTHETIC]
+    assert await _schema_version(scratch_db) == _SYNTHETIC
+    conn = await asyncpg.connect(_dsn(scratch_db))
+    try:
+        assert await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", _SYNTHETIC_TABLE)
+    finally:
+        await conn.close()
     assert await _restored(scratch_db) == _EXPECTED
 
 
@@ -513,9 +681,9 @@ async def _enabled_state(url: str) -> dict[str, Any]:
     [
         # The archive's schema is past the drop yet carries the columns, so
         # the upgrade step runs nothing and the restore's own fold does it.
-        (_HEAD, "backup_restore"),
+        (_DROP, "backup_restore"),
         # The upgrade step runs the contract migration over the archive.
-        (_PREVIOUS_HEAD, f"schema upgrade {_HEAD}"),
+        (_BEFORE_DROP, f"schema upgrade {_DROP}"),
     ],
 )
 async def test_a_selective_restore_leaves_a_target_filled_from_plaintext_disabled(
@@ -550,11 +718,11 @@ async def test_a_selective_restore_leaves_a_target_filled_from_plaintext_disable
 
 @pg_tools
 async def test_a_full_restore_of_a_pre_drop_archive_leaves_folded_targets_disabled(
-    scratch_db: str, monkeypatch: pytest.MonkeyPatch
+    pre_drop_db: str, scratch_db: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The full restore's upgrade runs the migration, which records the same
     audit rows."""
-    archive = await _seed_pre_drop_archive(scratch_db, _PREVIOUS_HEAD)
+    archive = await _seed_migrated_pre_drop_archive(pre_drop_db)
     await _upgrade_in_place(scratch_db)
 
     outcome = await _restore(scratch_db, archive, monkeypatch)
@@ -565,6 +733,6 @@ async def test_a_full_restore_of_a_pre_drop_archive_leaves_folded_targets_disabl
     assert state["settings_enabled"] is False
     assert state["targets"]["encrypted"] == (True, _ENCRYPTED_URL_CT, _ENCRYPTED_AUTH_CT)
     assert state["audit"] == [
-        ("audit_forward_target", "archived", f"schema upgrade {_HEAD}"),
-        ("platform_settings", "Settings webhook", f"schema upgrade {_HEAD}"),
+        ("audit_forward_target", "archived", f"schema upgrade {_DROP}"),
+        ("platform_settings", "Settings webhook", f"schema upgrade {_DROP}"),
     ]
