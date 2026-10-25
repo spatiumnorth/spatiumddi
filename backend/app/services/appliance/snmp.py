@@ -36,10 +36,12 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+from ipaddress import ip_network
 from typing import Any
 
 import structlog
 
+from app.core.config_text import has_control_chars
 from app.core.crypto import decrypt_str
 from app.models.settings import PlatformSettings
 
@@ -74,12 +76,30 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     # globally disabled. The runner won't reach this code in that
     # case (it skips activation when ``snmp_enabled`` is false), but
     # the renderer staying pure lets callers test the output shape.
-    sys_contact = (settings.snmp_sys_contact or "").strip()
-    sys_location = (settings.snmp_sys_location or "").strip()
-    if sys_contact:
-        lines.append(f"sysContact     {_quote(sys_contact)}")
-    if sys_location:
-        lines.append(f"sysLocation    {_quote(sys_location)}")
+    #
+    # sysContact / sysLocation are free text, and snmpd.conf ends a
+    # directive at the newline. The settings API rejects control characters
+    # in both; this check covers rows stored before it did. A value that
+    # fails it is left out with a comment rather than failing the whole
+    # render: both lines are informational, so dropping one keeps snmpd
+    # loading with every access line intact, where refusing to render would
+    # take SNMP down over a contact string.
+    for directive, column, raw in (
+        ("sysContact", "snmp_sys_contact", settings.snmp_sys_contact),
+        ("sysLocation", "snmp_sys_location", settings.snmp_sys_location),
+    ):
+        value = (raw or "").strip()
+        if not value:
+            continue
+        if has_control_chars(value):
+            logger.error("snmp_sys_text_omitted_control_chars", field=column)
+            lines.append(
+                f"# {directive} OMITTED — the stored {column} contains a newline or "
+                "other control character, which snmpd.conf cannot hold on one line. "
+                "Re-enter it in the UI."
+            )
+            continue
+        lines.append(f"{directive:<14} {_quote(value)}")
     lines.append(_AGENT_ADDRESS_LINE)
     lines.append("")
 
@@ -104,7 +124,13 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
 def _quote(s: str) -> str:
     """net-snmp doesn't have a formal quoting grammar; whitespace and
     single quotes are the practical breakers. Use double quotes and
-    escape any double quote in the value."""
+    escape any double quote in the value.
+
+    Quoting does not survive a newline: snmpd ends the directive there
+    whatever the quotes say. Every caller checks for control characters
+    first and leaves the value out; dropping them here as well means a
+    caller that forgets can still never emit a second line."""
+    s = "".join(c for c in s if not (ord(c) < 0x20 or ord(c) == 0x7F))
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
@@ -116,6 +142,18 @@ def _render_v2c(settings: PlatformSettings, sources: list[str]) -> list[str]:
     community = _decrypt_or_none(settings.snmp_community_encrypted)
     if not community:
         return ["# SNMP v2c enabled but no community configured — daemon will accept nothing."]
+    # The community is an unquoted token: a newline would start a new
+    # directive and a space would shift the next word into the source
+    # position. The API rejects both; a stored value that has either is not
+    # published at all (the daemon then accepts nothing, the safe side).
+    if has_control_chars(community) or any(c.isspace() for c in community):
+        logger.error("snmp_v2c_community_omitted_illegal_chars")
+        return [
+            "# SNMP v2c community OMITTED — the stored community contains whitespace "
+            "or control characters, which snmpd.conf cannot express. Re-enter it in "
+            "the UI; the daemon will accept nothing until then."
+        ]
+    sources = _valid_sources(sources)
     if not sources:
         return [
             f"# SNMP v2c community {_quote(community)} configured but no allowed",
@@ -130,6 +168,22 @@ def _render_v2c(settings: PlatformSettings, sources: list[str]) -> list[str]:
         # validation in the router already canonicalised the entry.
         directive = "rocommunity6" if ":" in src else "rocommunity"
         out.append(f"{directive} {community} {src}")
+    return out
+
+
+def _valid_sources(sources: list[Any]) -> list[str]:
+    """Canonical CIDR strings for each source that parses as one; anything
+    else is dropped. The settings API canonicalises on write, but each
+    source is written bare into an ``rocommunity`` line, so a stored value
+    is checked again before it gets there."""
+    out: list[str] = []
+    for raw in sources:
+        try:
+            net = ip_network(str(raw).strip(), strict=False)
+        except ValueError:
+            logger.error("snmp_allowed_source_dropped", source=repr(raw))
+            continue
+        out.append(str(net))
     return out
 
 
@@ -187,6 +241,19 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
         priv_proto = u.get("priv_protocol") or "none"
         auth_pass = _decrypt_v3_pass(u.get("auth_pass_enc"))
         priv_pass = _decrypt_v3_pass(u.get("priv_pass_enc"))
+
+        # A passphrase is quoted on the ``createUser`` line, but quoting does
+        # not survive a newline. The API rejects control characters in both
+        # passphrases; a stored one that has them omits the user rather
+        # than publishing it with a different passphrase than configured.
+        if any(p and has_control_chars(p) for p in (auth_pass, priv_pass)):
+            logger.error("snmp_v3_user_skipped_control_chars_in_pass", username=username)
+            out.append(
+                f"# SNMPv3 user {username!r} OMITTED — a stored passphrase contains "
+                "control characters, which snmpd.conf cannot hold on one line. "
+                "Re-enter the passphrase."
+            )
+            continue
 
         # A user configured WITH an auth protocol whose passphrase we
         # cannot decrypt must not be emitted. Falling through to the
