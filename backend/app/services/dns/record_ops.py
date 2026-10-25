@@ -2056,9 +2056,13 @@ async def retract_address_records(
 
     * ``auto_generated`` records only. A record an operator made by hand is
       theirs; it keeps its place with ``ip_address_id`` null, as before.
-    * live records only. One already in the trash — the PTRs of an
-      auto-created reverse zone that went to the trash with its subnet
-      (#1066) — is not being served, and keeps riding its own batch.
+    * live records are withdrawn through the queue. One already in the
+      trash — the PTRs of an auto-created reverse zone that went to the trash
+      with its subnet (#1066), or the records a zone deleted before the subnet
+      took into ITS batch (#2732) — is not being served, so it is only
+      hard-deleted: left behind, the address's delete would null its
+      ``ip_address_id`` and a later restore of its batch would publish a
+      record owned by nothing.
     * records bound to these subnets' addresses only. The caller passes the
       subnets it is about to hard-delete, so every address concerned is
       really going; a sibling subnet's records in a shared zone are untouched.
@@ -2076,6 +2080,18 @@ async def retract_address_records(
     records: list[DNSRecord] = []
     for start in range(0, len(ids), _RETRACT_CHUNK):
         chunk = ids[start : start + _RETRACT_CHUNK]
+        # #2732 — the trashed ones, whatever batch they ride.
+        await db.execute(
+            sa_delete(DNSRecord)
+            .where(
+                DNSRecord.deleted_at.is_not(None),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_address_id.in_(
+                    select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
+                ),
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
         records.extend(
             (
                 await db.execute(
