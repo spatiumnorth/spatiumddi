@@ -27,6 +27,9 @@ from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.network_service import NetworkService
+from app.models.overlay import OverlayNetwork
+from app.models.ownership import Customer
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -123,7 +126,7 @@ def _label_expr(model: type) -> Any:
     from the one shown; ``test_trash_listing_label_matches_row_display``
     pins that.
     """
-    if model is IPSpace:
+    if model in (IPSpace, Customer, OverlayNetwork, NetworkService):
         return model.name
     if model in (IPBlock, Subnet):
         network = cast(model.network, String)
@@ -320,7 +323,9 @@ async def _audit_scopes_under(db: Any, current_user: Any, subnet_ids: list[uuid.
         db.add(_purge_audit(current_user, "dhcp_scope", sc))
 
 
-async def _prepare_subnet_purge(db: Any, subnets: list[Any]) -> tuple[int, set[uuid.UUID]]:
+async def _prepare_subnet_purge(
+    db: Any, subnets: list[Any], current_user: Any
+) -> tuple[int, set[uuid.UUID]]:
     """Withdraw what IPAM published for ``subnets`` before they are hard-deleted.
 
     spatiumddi#1151 — the addresses go with the subnet (FK CASCADE); the
@@ -333,7 +338,14 @@ async def _prepare_subnet_purge(db: Any, subnets: list[Any]) -> tuple[int, set[u
     """
     if not subnets:
         return 0, set()
-    return await retract_address_records(db, [sub.id for sub in subnets])
+    retracted, groups = await retract_address_records(db, [sub.id for sub in subnets])
+    # spatiumddi#2734 — the reverse zones IPAM auto-created for them go too.
+    from app.services.dns.reverse_zone import purge_auto_reverse_zones  # noqa: PLC0415
+
+    groups = groups | await purge_auto_reverse_zones(
+        db, subnets, audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z))
+    )
+    return retracted, groups
 
 
 @router.get("/trash", response_model=TrashListResponse)
@@ -757,6 +769,34 @@ async def permanent_delete_from_trash(
             # first soft-delete normally already cleaned both up).
             await remove_ipam_for_scope_statics(db, target.id)
             await delete_leases_for_scope(db, target.id)
+        elif isinstance(target, Customer):
+            # network_service.customer_id is RESTRICT, so a customer that still
+            # has services (live or in the Trash) cannot go; say which, rather
+            # than answering the generic "something references it" (#2738).
+            held = (
+                (
+                    await db.execute(
+                        select(NetworkService.name, NetworkService.deleted_at)
+                        .where(NetworkService.customer_id == target.id)
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            if held:
+                names = [n if d is None else f"{n} (in the Trash)" for n, d in held]
+                shown = ", ".join(names[:5]) + (
+                    f" and {len(names) - 5} more" if len(names) > 5 else ""
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot permanently delete customer {label}: it still has "
+                        f"services ({shown}). Delete the live ones, then purge them "
+                        "from the Trash first."
+                    ),
+                )
         elif isinstance(target, DNSZone):
             # #1830 — retract from agentless servers first; raises (row + audit
             # untouched) when the provider refuses. Same helper as the 30-day sweep.
@@ -769,7 +809,9 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], [], [])
             if live:
                 _refuse_live_children(label, live)
-            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, [target])
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
+                db, [target], current_user
+            )
             await _audit_scopes_under(db, current_user, [target.id])
         elif isinstance(target, (IPBlock, IPSpace)):
             # #1958 — a block or space is purged WITH the trashed subnets and
@@ -781,7 +823,9 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], blocks, subnets)
             if live:
                 _refuse_live_children(label, live)
-            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, subnets)
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
+                db, subnets, current_user
+            )
             await _audit_scopes_under(db, current_user, [sub.id for sub in subnets])
             for sub in subnets:
                 db.add(_purge_audit(current_user, "subnet", sub))
