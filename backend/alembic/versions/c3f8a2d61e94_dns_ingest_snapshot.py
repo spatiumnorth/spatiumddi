@@ -11,7 +11,7 @@ every report and cascade with their server and zone. No backfill: a server
 with no row is compared against nothing, which only ever adds.
 
 Revision ID: c3f8a2d61e94
-Revises: e7b3d19a4c26
+Revises: c8d3a1f47e92
 Create Date: 2026-10-24 09:00:00.000000
 """
 
@@ -21,7 +21,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "c3f8a2d61e94"
-down_revision = "e7b3d19a4c26"
+down_revision = "c8d3a1f47e92"
 branch_labels = None
 depends_on = None
 
