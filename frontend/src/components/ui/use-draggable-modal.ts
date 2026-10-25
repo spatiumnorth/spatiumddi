@@ -68,6 +68,24 @@ export function useOverlayLayer(active: boolean): void {
   }, [active]);
 }
 
+/** Esc handler for a popup list (suggestions, combobox) inside a dialog:
+ *  while the list is open, Esc closes the list only; the dialog keeps what
+ *  was typed and takes the next Esc (#2720). Call from the input's keydown;
+ *  returns true when the key was consumed. An IME composition's Esc is left
+ *  alone. */
+export function closePopupOnEscape(
+  e: React.KeyboardEvent,
+  isOpen: boolean,
+  close: () => void,
+): boolean {
+  if (e.key !== "Escape" || !isOpen) return false;
+  if (e.nativeEvent.isComposing || e.keyCode === 229) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  close();
+  return true;
+}
+
 /**
  * Drag hook for modal dialogs. Returns a style to apply to the dialog card
  * (``transform: translate(x, y)``) and a set of props to spread on whatever
@@ -122,6 +140,10 @@ export function useDraggableModal(onClose: () => void) {
     const { token, remove } = escStack.push(seq);
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || !escStack.isTop(token)) return;
+      // An Esc that ends an IME composition belongs to the input method, and
+      // one a control inside already handled (an open suggestion list closing
+      // itself, #2720) belongs to that control: the innermost layer owns it.
+      if (e.isComposing || e.keyCode === 229 || e.defaultPrevented) return;
       e.stopImmediatePropagation();
       onCloseRef.current();
     };
@@ -193,6 +215,34 @@ export function useFocusTrap<T extends HTMLElement>() {
     if (!node) return;
     const returnTargets = openerRef.current;
     const { token, remove } = trapStack.push(seq);
+    // A dialog that takes this one's place in the same commit (a loading
+    // phase handing over to its confirm) is opened while focus sits on this
+    // card; it inherits these targets, or its own close would have nowhere
+    // to return to (#2723).
+    if (returnTargets) cardReturnTargets.set(node, returnTargets);
+
+    // Focus follows a dialog's content. A step that replaces the focused
+    // control (Continue → the next step) removes the node focus was on, and
+    // the browser drops focus on <body> while the dialog stays open: nothing
+    // in it is focused and a screen reader announces nothing (#2723). Put it
+    // back on the card, as on open, when exactly that happened.
+    let lastFocused: HTMLElement | null = null;
+    const onFocusIn = (e: FocusEvent) => {
+      if (e.target instanceof HTMLElement) lastFocused = e.target;
+    };
+    node.addEventListener("focusin", onFocusIn);
+    const observer = new MutationObserver(() => {
+      if (!node.isConnected || !trapStack.isTop(token)) return;
+      const active = document.activeElement;
+      if (active && active !== document.body && node.contains(active)) return;
+      if (active && active !== document.body) return;
+      if (lastFocused && !lastFocused.isConnected) {
+        lastFocused = null;
+        node.setAttribute("tabindex", "-1");
+        node.focus();
+      }
+    });
+    observer.observe(node, { childList: true, subtree: true });
 
     const focusables = () =>
       Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
@@ -242,6 +292,8 @@ export function useFocusTrap<T extends HTMLElement>() {
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
+      node.removeEventListener("focusin", onFocusIn);
+      observer.disconnect();
       remove();
       // A dialog still in the document is not closing: this is StrictMode's
       // simulated unmount (dev), whose re-run would then find focus outside
@@ -263,6 +315,9 @@ export function useFocusTrap<T extends HTMLElement>() {
 /** Where focus goes back to when a dialog closes, best first. */
 type FocusReturnTargets = HTMLElement[];
 
+/** The return targets of each open dialog's card (see `useFocusTrap`). */
+const cardReturnTargets = new WeakMap<HTMLElement, FocusReturnTargets>();
+
 /** The focused element, plus — when it is an item in an ARIA menu — the
  *  button that controls that menu. A dialog opened from a menu item outlives
  *  the item (the menu closes as the dialog opens), so the trigger is the
@@ -273,6 +328,10 @@ function captureFocusReturnTargets(): FocusReturnTargets {
   const active = document.activeElement as HTMLElement | null;
   if (!active) return [];
   const targets = [active];
+  // Focus is on a dialog's own card: this dialog replaces that one, so what
+  // that one would have returned to is where this one returns to as well.
+  const inherited = cardReturnTargets.get(active);
+  if (inherited) targets.push(...inherited);
   const menu = active.closest<HTMLElement>('[role="menu"][id]');
   if (menu) {
     const trigger = Array.from(

@@ -17,6 +17,10 @@ from __future__ import annotations
 import uuid
 
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.audit import AuditLog
+from app.models.auth import User
 
 
 class StatusResponse(BaseModel):
@@ -51,3 +55,66 @@ class BulkDeleteResponse(BaseModel):
 
 
 __all__ = ["BulkDeleteResponse", "StatusResponse"]
+
+
+def add_trigger_audit(
+    db: AsyncSession,
+    user: User,
+    *,
+    resource_type: str,
+    resource_id: object,
+    resource_display: str,
+    action: str = "trigger",
+    new_value: dict | None = None,
+) -> None:
+    """Stage the audit row for an operator-triggered background job (#2303).
+
+    The work itself runs on a Celery worker, where the reconcilers can only
+    attribute their own rows to ``system``; this row is what records WHO asked.
+    Caller commits it before enqueueing so it is durable before the response
+    returns (non-negotiable #4).
+    """
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action=action,
+            resource_type=resource_type,
+            resource_id=str(resource_id),
+            resource_display=resource_display,
+            new_value=new_value,
+        )
+    )
+
+
+class WinRMSettings(BaseModel):
+    """The non-secret WinRM connection settings stored for a Windows DNS or
+    Windows DHCP server, as the next WinRM call will use them.
+
+    Returned so an edit dialog can show — and an untouched save keep — what is
+    stored. The username and password are never returned.
+    """
+
+    winrm_port: int
+    transport: str = Field(description="ntlm | credssp | basic")
+    use_tls: bool
+    verify_tls: bool
+
+
+def winrm_settings_from_blob(credentials_encrypted: bytes | None) -> WinRMSettings | None:
+    """Echo the stored WinRM settings, or None when nothing readable is stored.
+
+    Best-effort: an undecryptable blob (key rotation, a restore without
+    rewrap) yields None rather than failing the listing that carries it.
+    """
+    if not credentials_encrypted:
+        return None
+    from app.core.crypto import decrypt_dict  # noqa: PLC0415
+    from app.drivers._winrm import effective_winrm_settings  # noqa: PLC0415
+
+    try:
+        creds = decrypt_dict(credentials_encrypted)
+    except Exception:  # noqa: BLE001 — never break the listing on a bad blob
+        return None
+    return WinRMSettings(**effective_winrm_settings(creds))

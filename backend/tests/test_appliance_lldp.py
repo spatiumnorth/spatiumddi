@@ -49,8 +49,8 @@ def test_renders_core_directives() -> None:
     assert "configure lldp tx-hold 4" in out
     # Interface allowlist always emitted (excludes container vNICs).
     assert f"configure system interface pattern {_DEFAULT_IFACE}" in out
-    assert "configure lldp management-addresses-advertisements enable" in out
-    assert "configure lldp capabilities-advertisements enable" in out
+    assert "configure lldp management-addresses-advertisements" in out.splitlines()
+    assert "configure lldp capabilities-advertisements" in out.splitlines()
     # No mgmt pattern / hostname / description lines when those are empty.
     assert "ip management pattern" not in out
     assert "configure system hostname" not in out
@@ -248,3 +248,16 @@ async def test_settings_lldp_agentx_and_elin_round_trip(
     body = r.json()
     assert body["lldp_snmp_agentx"] is True
     assert body["lldp_med_location"] == {"elin": "911"}
+
+
+def test_no_rendered_line_ends_in_a_bare_enable_or_disable() -> None:
+    """lldpcli takes these toggles with no argument (``unconfigure`` turns
+    them off); a trailing ``enable`` is refused at every lldpd start (#2576)."""
+    s = _bare_settings()
+    s.lldp_sys_name = "core-rtr1"
+    s.lldp_management_pattern = "10.0.0.0/24"
+    s.lldp_med_location = {"elin": "5551234567"}
+    for line in render_lldpd_conf(s).splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        assert line.split()[-1] not in {"enable", "disable"}, line

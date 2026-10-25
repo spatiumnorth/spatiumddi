@@ -16,6 +16,8 @@ produced by `app.services.dns_blocklist`.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import uuid
 from datetime import datetime
@@ -32,7 +34,15 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
+from app.core.safe_fetch import (
+    FetchRefusedError,
+    check_feed_url_shape,
+    guard_url,
+    has_masked_credentials,
+    mask_url_credentials,
+)
 from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import (
@@ -64,11 +74,88 @@ router = APIRouter(dependencies=[Depends(require_resource_permission("dns_blockl
 
 VALID_SOURCE_TYPES = {"manual", "url", "file_upload"}
 VALID_FEED_FORMATS = {"hosts", "domains", "adblock"}
-VALID_BLOCK_MODES = {"nxdomain", "sinkhole", "refused"}
+VALID_BLOCK_MODES = {"nxdomain", "sinkhole"}
 VALID_ENTRY_TYPES = {"block", "redirect", "nxdomain"}
 # update_interval_hours: 0 = manual refresh only; otherwise the hourly sweep
 # refreshes the feed once the interval has passed (#1467). Capped at a year.
 MAX_UPDATE_INTERVAL_HOURS = 8760
+
+
+def _check_block_mode(v: str | None) -> str | None:
+    """``block_mode`` is ``nxdomain`` or ``sinkhole`` (#2124).
+
+    ``refused`` used to be accepted and is now a 422 naming why: BIND's RPZ
+    has no action that answers REFUSED (its actions are NXDOMAIN, NODATA,
+    PASSTHRU, DROP, TCP-only and local data), so the mode was rendered as
+    NXDOMAIN on the agent and as a dropped query by the control-plane
+    renderer — never as what it said.
+    """
+    if v is None:
+        return v
+    if v == "refused":
+        raise ValueError(
+            "block_mode 'refused' is not supported: DNS response-policy zones "
+            "have no action that answers REFUSED. Use 'nxdomain' (fail fast "
+            "with NXDOMAIN) or 'sinkhole' (answer with a sinkhole address)."
+        )
+    if v not in VALID_BLOCK_MODES:
+        raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+    return v
+
+
+def _check_sinkhole_ip(v: str | None) -> str | None:
+    """A sinkhole address is an IPv4 or IPv6 literal (#2124).
+
+    It is rendered into the RPZ zone as A / AAAA rdata, where anything else
+    makes BIND refuse the WHOLE zone (#878). Stored normalised, so
+    ``::0`` and ``::`` are one value. Blank means "the default"
+    (``0.0.0.0`` and ``::``) and is stored as NULL.
+    """
+    if v is None:
+        return None
+    text = v.strip()
+    if not text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        raise ValueError(f"sinkhole_ip must be an IPv4 or IPv6 address, not {v!r}") from None
+
+
+def _check_feed_url(v: str | None) -> str | None:
+    """A feed URL is ``http(s)://host…``; blank is "no feed" (stored as is).
+
+    Shape only. The address the host resolves to is checked when the list
+    is saved (:func:`_guard_feed_target`) and again on every fetch.
+    """
+    if v is None or not v.strip():
+        return v
+    return check_feed_url_shape(v)
+
+
+async def _guard_feed_target(url: str | None) -> None:
+    """Refuse a feed URL whose host resolves to loopback / link-local /
+    metadata — the same check every fetch repeats. Generic 422: the
+    resolved address is logged, not echoed back."""
+    if not url or not url.strip():
+        return
+    try:
+        await asyncio.to_thread(guard_url, url, label="dns_blocklist_feed")
+    except FetchRefusedError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+_MASKED_FEED_URL_DETAIL = (
+    "feed URL credentials are shown masked; re-enter them in full to change the URL"
+)
+
+
+def _reject_masked_feed_url(url: str | None) -> None:
+    """A masked credential (``***``) in a URL being saved is the display form
+    coming back, not a password. Saving it would replace the real credential
+    with the mask, so it is refused rather than stored."""
+    if url and has_masked_credentials(url):
+        raise HTTPException(status_code=422, detail=_MASKED_FEED_URL_DETAIL)
 
 
 def _check_interval(v: int | None) -> int | None:
@@ -103,6 +190,11 @@ class BlockListCreate(BaseModel):
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
         return v
 
+    @field_validator("feed_url")
+    @classmethod
+    def _v_feed_url(cls, v: str | None) -> str | None:
+        return _check_feed_url(v)
+
     @field_validator("update_interval_hours")
     @classmethod
     def _v_interval(cls, v: int) -> int:
@@ -119,9 +211,13 @@ class BlockListCreate(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_mode(cls, v: str) -> str:
-        if v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+        _check_block_mode(v)
         return v
+
+    @field_validator("sinkhole_ip")
+    @classmethod
+    def _v_sinkhole(cls, v: str | None) -> str | None:
+        return _check_sinkhole_ip(v)
 
 
 class BlockListUpdate(BaseModel):
@@ -144,6 +240,11 @@ class BlockListUpdate(BaseModel):
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
         return v
 
+    @field_validator("feed_url")
+    @classmethod
+    def _v_feed_url(cls, v: str | None) -> str | None:
+        return _check_feed_url(v)
+
     @field_validator("update_interval_hours")
     @classmethod
     def _v_interval(cls, v: int | None) -> int | None:
@@ -159,9 +260,21 @@ class BlockListUpdate(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_mode(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
-        return v
+        return _check_block_mode(v)
+
+    @field_validator("sinkhole_ip")
+    @classmethod
+    def _v_sinkhole(cls, v: str | None) -> str | None:
+        return _check_sinkhole_ip(v)
+
+
+class FeedParseSkipped(BaseModel):
+    """Rules the last adblock-format refresh could not enforce (#2123)."""
+
+    regex: int = 0
+    modifier: int = 0
+    badfilter: int = 0
+    malformed: int = 0
 
 
 class BlockListResponse(BaseModel):
@@ -181,6 +294,8 @@ class BlockListResponse(BaseModel):
     last_sync_status: str | None
     last_sync_error: str | None
     entry_count: int
+    # NULL = no adblock refresh has recorded counts (or not an adblock feed).
+    feed_parse_skipped: FeedParseSkipped | None = None
     created_at: datetime
     modified_at: datetime
     applied_group_ids: list[uuid.UUID] = []
@@ -276,6 +391,9 @@ class ExceptionResponse(BaseModel):
     list_id: uuid.UUID
     domain: str
     reason: str
+    # manual | feed — a feed row is the feed's own ``@@`` rule (#2123) and is
+    # re-synced by every refresh.
+    source: str = "manual"
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -336,7 +454,10 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         description=bl.description,
         category=bl.category,
         source_type=bl.source_type,
-        feed_url=bl.feed_url,
+        # Credentials in the feed URL (userinfo, ``?token=``) are masked for
+        # every reader; the stored URL is used only to fetch. An edit that
+        # sends the masked form back unchanged keeps the stored URL.
+        feed_url=mask_url_credentials(bl.feed_url) if bl.feed_url else bl.feed_url,
         feed_format=bl.feed_format,
         update_interval_hours=bl.update_interval_hours,
         block_mode=bl.block_mode,
@@ -347,6 +468,9 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         last_sync_status=bl.last_sync_status,
         last_sync_error=bl.last_sync_error,
         entry_count=bl.entry_count,
+        feed_parse_skipped=(
+            FeedParseSkipped(**bl.feed_parse_skipped) if bl.feed_parse_skipped else None
+        ),
         created_at=bl.created_at,
         modified_at=bl.modified_at,
         applied_group_ids=[g.id for g in bl.server_groups],
@@ -474,6 +598,13 @@ class SubscribeFromCatalogRequest(BaseModel):
     update_interval_hours: int = 24
     block_mode: str = "nxdomain"
     enabled: bool = True
+
+    @field_validator("block_mode")
+    @classmethod
+    def _v_bm(cls, v: str) -> str:
+        # Was unvalidated: any string reached the row and the renderers.
+        _check_block_mode(v)
+        return v
 
 
 @router.get("/blocklists/catalog", response_model=CatalogResponse)
@@ -664,9 +795,7 @@ class FromTemplateRequest(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_bm(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
-        return v
+        return _check_block_mode(v)
 
 
 async def _materialise_template(
@@ -988,6 +1117,8 @@ async def create_blocklist(
     existing = await db.execute(select(DNSBlockList).where(DNSBlockList.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A blocklist with that name already exists")
+    _reject_masked_feed_url(body.feed_url)
+    await _guard_feed_target(body.feed_url)
 
     bl = DNSBlockList(**body.model_dump())
     db.add(bl)
@@ -1036,6 +1167,19 @@ async def update_blocklist(
             "enabled",
         },
     )
+    if (
+        "feed_url" in changes
+        and changes["feed_url"]
+        and bl.feed_url
+        and changes["feed_url"] != bl.feed_url
+        and changes["feed_url"] == mask_url_credentials(bl.feed_url)
+    ):
+        # The masked form the API returned, sent back as is (an edit of
+        # another field): the URL did not change, keep the stored one.
+        del changes["feed_url"]
+    if "feed_url" in changes:
+        _reject_masked_feed_url(changes["feed_url"])
+        await _guard_feed_target(changes["feed_url"])
     wildcard_flipped = (
         "feed_entries_are_wildcard" in changes
         and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard
@@ -1450,16 +1594,26 @@ async def add_exception(
             DNSBlockListException.domain == domain,
         )
     )
-    if existing.scalar_one_or_none():
+    prior = existing.scalar_one_or_none()
+    if prior is not None and prior.source != "feed":
         raise HTTPException(status_code=409, detail="Exception already exists")
 
-    ex = DNSBlockListException(
-        list_id=list_id,
-        domain=domain,
-        reason=body.reason,
-        created_by_user_id=current_user.id,
-    )
-    db.add(ex)
+    if prior is not None:
+        # The feed already excepts this name (#2123). Adding it by hand makes
+        # it the operator's: a feed row is removed by the next refresh that
+        # no longer lists it, which would silently undo what was just asked.
+        ex = prior
+        ex.source = "manual"
+        ex.reason = body.reason
+        ex.created_by_user_id = current_user.id
+    else:
+        ex = DNSBlockListException(
+            list_id=list_id,
+            domain=domain,
+            reason=body.reason,
+            created_by_user_id=current_user.id,
+        )
+        db.add(ex)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         _audit(
@@ -1515,6 +1669,11 @@ async def update_exception(
         changes["domain"] = domain
     for k, v in changes.items():
         setattr(ex, k, v)
+    if changes:
+        # An edited feed row is the operator's from now on (#2123): a refresh
+        # removes any feed row the feed no longer lists, which would drop
+        # an edit — a renamed row always — at the next sync.
+        ex.source = "manual"
     db.add(
         _audit(
             current_user,
@@ -1579,7 +1738,7 @@ async def refresh_blocklist(
 
     task_id: str | None = None
     try:
-        result = refresh_blocklist_feed.delay(str(bl.id))
+        result = await dispatch(refresh_blocklist_feed, str(bl.id))
         task_id = result.id
     except Exception as e:  # noqa: BLE001
         logger.warning("blocklist_refresh_enqueue_failed", list_id=str(bl.id), error=str(e))

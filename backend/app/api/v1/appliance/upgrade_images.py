@@ -68,6 +68,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
@@ -76,20 +77,94 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 from app.core.content_disposition import content_disposition
-from app.core.permissions import is_effective_superadmin, require_permission
+from app.core.permissions import require_permission
 from app.core.responses import OctetStreamResponse
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
+from app.services.appliance import upgrade_image_catalog as catalog
+from app.services.appliance import upgrade_image_space
 from app.services.appliance.architecture import ApplianceArchitecture
+from app.services.appliance.upgrade_image_catalog import FleetArchitectures
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter()
+
+def _request_content_length(request: Request) -> int | None:
+    """The declared body size of an upload, or None when it is absent or
+    unparseable (a chunked transfer, which the upload route refuses)."""
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def _require_spool_headroom(content_length: int | None) -> None:
+    """422 when buffering an upload of ``content_length`` bytes would push
+    THIS api pod's node under the kubelet's eviction margin (#2572).
+
+    #2452's :func:`_require_store_headroom` checks where the bytes are
+    finally written (the mirror's PVC when the mirror is on). But an
+    air-gapped multipart upload is spooled whole onto the receiving pod's
+    node ``/var`` first, which is a different node, so the store check
+    never sees it. This must run before the body is read, and after the
+    caller is authorised: answering it first would tell anyone how close
+    the node is to its eviction line. A missing length is refused by the
+    caller (:class:`_SpoolHeadroomRoute`) before this runs."""
+    if content_length is None:
+        return
+    usage = upgrade_image_space.local_volume_usage()
+    if usage is None:
+        return
+    message = upgrade_image_space.spool_shortfall_message(usage, content_length)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
+class _SpoolHeadroomRoute(PreBodyAuthRoute):
+    """Authorise, then refuse an upgrade-image upload that cannot be
+    buffered on the receiving node, before FastAPI reads its body.
+
+    FastAPI reads the request body (``await request.form()``) before it
+    resolves dependencies or runs the handler, so the node's ``/var`` has
+    already taken the whole upload by the time any in-handler or
+    dependency check could run. Wrapping the route handler is the only
+    hook that runs first. :class:`PreBodyAuthRoute` uses it to run the
+    route's superadmin and permission checks from the headers, so a
+    caller who may not upload is answered 401 / 403 without sending a
+    byte of the image; this subclass then checks the spool headroom
+    (#2572) for the upload route.
+
+    The headroom check needs the size up front, so the upload route
+    refuses a body with no ``Content-Length`` (a chunked transfer) with
+    411 rather than spooling it unchecked. Browsers, curl ``-F`` and the
+    common HTTP client libraries all send one for a multipart form."""
+
+    async def before_body(self, request: Request) -> None:
+        if getattr(self.endpoint, "__name__", "") != "upload_upgrade_image":
+            return
+        content_length = _request_content_length(request)
+        if content_length is None:
+            raise HTTPException(
+                status.HTTP_411_LENGTH_REQUIRED,
+                (
+                    "An upgrade-image upload must declare its size in a "
+                    "Content-Length header, so the receiving node's free "
+                    "space can be checked before the image is buffered."
+                ),
+            )
+        await _require_spool_headroom(content_length)
+
+
+router = APIRouter(route_class=_SpoolHeadroomRoute)
 
 
 # On-disk storage. The api container's docker-compose entry binds
@@ -143,14 +218,6 @@ def _stored_upload_name(raw: str | None, image_id: uuid.UUID) -> str:
     if name in ("", ".", ".."):
         return f"{image_id}.raw.xz"
     return name[:255]
-
-
-def _require_superadmin(user: CurrentUser) -> None:
-    if not is_effective_superadmin(user):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Upgrade-image management is restricted to superadmins.",
-        )
 
 
 def _image_path(image_id: uuid.UUID) -> Path:
@@ -380,6 +447,18 @@ async def _bytes_present_in_active_store(image_id: uuid.UUID) -> bool:
     return True
 
 
+async def _require_store_headroom(image_bytes: int | None) -> None:
+    """422 when storing ``image_bytes`` would push the store's volume under
+    the kubelet's eviction margin (#2400). ``None`` (size unknown) still
+    checks the margin itself, so a volume already in DiskPressure refuses."""
+    usage = await upgrade_image_space.get_store_usage(SLOT_IMAGE_DIR)
+    if usage is None:
+        return
+    message = upgrade_image_space.shortfall_message(usage, image_bytes or 0)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
 async def _delete_from_mirror(image_id: uuid.UUID) -> None:
     """Issue DELETE against the mirror; tolerate 404 (already gone)."""
     headers = {"X-Mirror-Auth": mirror_auth_token("delete", image_id)}
@@ -522,8 +601,41 @@ class UpgradeImageRow(BaseModel):
     notes: str | None
 
 
+class UpgradeImageReleaseInfo(BaseModel):
+    """The GitHub release a staged image came from (#2410)."""
+
+    published_at: datetime
+    is_prerelease: bool
+    html_url: str
+
+
+class UpgradeImageListRow(UpgradeImageRow):
+    # #2410 — null when GitHub has not been reached recently (air-gap) or
+    # no release matches this tag + architecture. Read from the release
+    # cache only: listing must not make an outbound call.
+    release: UpgradeImageReleaseInfo | None = None
+    # ``nightly`` / ``prerelease`` / ``stable``, derived from the tag.
+    channel: str
+    # #2399's verdict, per image: ``matches`` (some approved appliance runs
+    # this architecture), ``no_node`` (the whole fleet has reported and
+    # none does) or ``unknown`` (image unlabelled, or a node has not
+    # reported, or no nodes yet).
+    fleet_architecture: str
+    # Approved appliances running this architecture; null when unknown.
+    fleet_nodes: int | None = None
+    # Hostnames whose installed / slot version equals this image's. Not
+    # "in use": the bytes are already written, so a delete is allowed.
+    installed_on: list[str] = Field(default_factory=list)
+    # Hostnames whose ``desired_slot_image_url`` points at this image —
+    # one is about to fetch it, and a delete is refused.
+    scheduled_for: list[str] = Field(default_factory=list)
+    # An active (planned / running / halted) rolling run naming the image.
+    rolling_run_id: uuid.UUID | None = None
+
+
 class UpgradeImageList(BaseModel):
-    images: list[UpgradeImageRow]
+    images: list[UpgradeImageListRow]
+    fleet: FleetArchitectures
 
 
 class AvailableUpgradeImageRow(BaseModel):
@@ -533,6 +645,9 @@ class AvailableUpgradeImageRow(BaseModel):
     body: str
     html_url: str
     is_prerelease: bool
+    # The CONTROL PLANE's own version equals this tag; says nothing about
+    # the fleet (see ``installed_on`` on the staged rows). Kept for
+    # compatibility.
     is_installed: bool
     image_asset_url: str
     checksum_asset_url: str
@@ -541,6 +656,12 @@ class AvailableUpgradeImageRow(BaseModel):
     # rows, so the picker shows which is which instead of silently
     # offering one of them.
     architecture: str
+    # #2410 — the staged row for this tag + architecture, if any.
+    staged_image_id: uuid.UUID | None = None
+    channel: str = "stable"
+    # #2399's verdict, as on the staged rows.
+    fleet_architecture: str = "unknown"
+    fleet_nodes: int | None = None
 
 
 class AvailableUpgradeImagesResponse(BaseModel):
@@ -549,6 +670,7 @@ class AvailableUpgradeImagesResponse(BaseModel):
     # the pick-from-GitHub tab.
     github_reachable: bool
     available: list[AvailableUpgradeImageRow]
+    fleet: FleetArchitectures
 
 
 class ImportFromGithubRequest(BaseModel):
@@ -590,6 +712,22 @@ def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
 # ── Endpoints ──────────────────────────────────────────────────────
 
 
+def _refuse_unused_architecture(fleet: FleetArchitectures, architecture: str | None) -> None:
+    """422 when ``architecture`` is one no approved appliance runs."""
+    if architecture is None or not fleet.restricted:
+        return
+    if architecture in fleet.architectures:
+        return
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        (
+            f"No approved appliance runs {architecture}; this fleet runs "
+            f"{', '.join(fleet.architectures)}. Refusing to store an image "
+            "no node could boot."
+        ),
+    )
+
+
 @router.post(
     "/upgrade-images",
     response_model=UpgradeImageRow,
@@ -597,7 +735,7 @@ def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
     summary="Upload an upgrade image for an air-gapped appliance upgrade",
 )
 async def upload_upgrade_image(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     file: UploadFile = File(
         ...,
@@ -648,7 +786,13 @@ async def upload_upgrade_image(
         description="Optional operator note shown in the Fleet UI list.",
     ),
 ) -> UpgradeImageRow:
-    _require_superadmin(current_user)
+
+    # #2399 — refuse an architecture no node runs. FastAPI has already
+    # received the multipart body (spooled to a temp file) before this
+    # handler runs, so this saves the hash pass and the store, not the
+    # transfer; the upload dialog only offers the fleet's architectures,
+    # which is what keeps an operator from sending the bytes at all.
+    _refuse_unused_architecture(await catalog.fleet_architectures(db), architecture)
 
     expected_sha = sha256.lower().strip()
     if not all(c in "0123456789abcdef" for c in expected_sha):
@@ -684,6 +828,7 @@ async def upload_upgrade_image(
             # rows may already carry a ``desired_slot_image_url`` built
             # from it, and a fresh id would leave those pointing at
             # nothing while the operator watches a "successful" upload.
+            await _require_store_headroom(file.size)
             repaired = await _store_verified_image(existing.id, _file_iter(), expected_sha)
             db.add(
                 AuditLog(
@@ -716,6 +861,7 @@ async def upload_upgrade_image(
 
     image_id = uuid.uuid4()
 
+    await _require_store_headroom(file.size)
     bytes_written = await _store_verified_image(image_id, _file_iter(), expected_sha)
 
     row = ApplianceUpgradeImage(
@@ -763,8 +909,7 @@ async def upload_upgrade_image(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List uploaded / imported upgrade images",
 )
-async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImageList:
-    _require_superadmin(current_user)
+async def list_upgrade_images(current_user: SuperAdmin, db: DB) -> UpgradeImageList:
     rows = (
         (
             await db.execute(
@@ -774,7 +919,37 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
         .scalars()
         .all()
     )
-    return UpgradeImageList(images=[_row_to_schema(r) for r in rows])
+    fleet = await catalog.fleet_architectures(db)
+    usage = await catalog.image_usage(db, rows)
+    # Cache-only: the staged list must render on an air-gapped control
+    # plane without waiting out a GitHub timeout.
+    cached = releases_service.peek_upgrade_image_releases()
+    out: list[UpgradeImageListRow] = []
+    for r in rows:
+        rel = catalog.release_for_staged(r, cached)
+        verdict, nodes = catalog.fleet_verdict(fleet, r.architecture)
+        u = usage[r.id]
+        out.append(
+            UpgradeImageListRow(
+                **_row_to_schema(r).model_dump(),
+                release=(
+                    UpgradeImageReleaseInfo(
+                        published_at=rel.published_at,
+                        is_prerelease=rel.is_prerelease,
+                        html_url=rel.html_url,
+                    )
+                    if rel
+                    else None
+                ),
+                channel=catalog.staged_channel(r, rel),
+                fleet_architecture=verdict,
+                fleet_nodes=nodes,
+                installed_on=u.installed_on,
+                scheduled_for=u.scheduled_for,
+                rolling_run_id=u.run_id,
+            )
+        )
+    return UpgradeImageList(images=out, fleet=fleet)
 
 
 @router.get(
@@ -784,7 +959,15 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
     summary="List GitHub releases carrying an importable appliance upgrade image",
 )
 async def list_available_upgrade_images(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
+    db: DB,
+    all_architectures: bool = Query(
+        False,
+        description=(
+            "Return every architecture instead of only the fleet's (#2410). "
+            "Importing an architecture no node runs is still refused."
+        ),
+    ),
 ) -> AvailableUpgradeImagesResponse:
     """Connected-install picker source.
 
@@ -794,10 +977,20 @@ async def list_available_upgrade_images(
     any fetch error (rate-limited / offline / air-gapped) so the UI
     can fall back to the upload tab cleanly.
     """
-    _require_superadmin(current_user)
     reachable, releases = await releases_service.list_available_upgrade_images()
+    fleet = await catalog.fleet_architectures(db)
+    staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
+    # Computed on the UNFILTERED listing: which architectures a release
+    # publishes is evidence for an unlabelled staged image (see
+    # ``staged_assignment``), and the fleet filter would hide some.
+    staged_ids = catalog.staged_assignment(staged, releases)
+    if fleet.restricted and not all_architectures:
+        # #2399 — only offer images some node can boot.
+        releases = [r for r in releases if r.architecture in fleet.architectures]
+
     return AvailableUpgradeImagesResponse(
         github_reachable=reachable,
+        fleet=fleet,
         available=[
             AvailableUpgradeImageRow(
                 tag=r.tag,
@@ -811,6 +1004,10 @@ async def list_available_upgrade_images(
                 checksum_asset_url=r.checksum_asset_url,
                 size_bytes=r.size_bytes,
                 architecture=r.architecture,
+                staged_image_id=staged_ids.get((r.tag, r.architecture)),
+                channel=releases_service.release_channel(r.tag, r.is_prerelease),
+                fleet_architecture=catalog.fleet_verdict(fleet, r.architecture)[0],
+                fleet_nodes=catalog.fleet_verdict(fleet, r.architecture)[1],
             )
             for r in releases
         ],
@@ -825,7 +1022,7 @@ async def list_available_upgrade_images(
 )
 async def import_upgrade_image_from_github(
     body: ImportFromGithubRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> UpgradeImageRow:
     """Download + sha256-verify + store a release's appliance upgrade image.
@@ -836,8 +1033,13 @@ async def import_upgrade_image_from_github(
     verified-storage path the upload flow uses. Off-prem call — the
     api reaches out to github.com (or the release asset CDN).
     """
-    _require_superadmin(current_user)
     tag = body.release_tag.strip()
+
+    fleet = await catalog.fleet_architectures(db)
+    # Checked on what the caller asked for before any network call, and
+    # again on what resolved (an unspecified architecture resolves to the
+    # release's only one) before the download.
+    _refuse_unused_architecture(fleet, body.architecture)
 
     choice = await releases_service.resolve_upgrade_image_choice(tag, body.architecture)
     spec = choice.spec
@@ -871,6 +1073,8 @@ async def import_upgrade_image_from_github(
                 "GitHub is unreachable."
             ),
         )
+
+    _refuse_unused_architecture(fleet, spec.architecture)
 
     # 1. Fetch + parse the .sha256 sidecar (``<hash>  <filename>`` or a
     #    bare hash). Small text file — a 30 s timeout is plenty.
@@ -917,6 +1121,13 @@ async def import_upgrade_image_from_github(
                         status.HTTP_502_BAD_GATEWAY,
                         f"GitHub returned {resp.status_code} for the {tag} upgrade image.",
                     )
+                # Refuse before a byte is written: the size comes from the
+                # response, falling back to the release asset's (#2400).
+                try:
+                    declared = int(resp.headers.get("content-length", ""))
+                except ValueError:
+                    declared = spec.size_bytes or 0
+                await _require_store_headroom(declared)
 
                 async def _gh_iter() -> AsyncIterator[bytes]:
                     async for chunk in resp.aiter_bytes(_CHUNK_BYTES):
@@ -987,9 +1198,8 @@ async def import_upgrade_image_from_github(
     summary="Fetch upgrade image metadata",
 )
 async def get_upgrade_image(
-    image_id: uuid.UUID, current_user: CurrentUser, db: DB
+    image_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> UpgradeImageRow:
-    _require_superadmin(current_user)
     row = await db.get(ApplianceUpgradeImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade image not found.")
@@ -1164,11 +1374,38 @@ async def download_upgrade_image(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Delete an uploaded / imported upgrade image",
 )
-async def delete_upgrade_image(image_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    _require_superadmin(current_user)
+async def delete_upgrade_image(
+    image_id: uuid.UUID,
+    current_user: SuperAdmin,
+    db: DB,
+    force: bool = Query(
+        False,
+        description=(
+            "Delete even though an appliance is scheduled to fetch the image or an "
+            "active rolling run names it. For a stale schedule the operator has "
+            "already cancelled on the host. Audited."
+        ),
+    ),
+) -> None:
     row = await db.get(ApplianceUpgradeImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade image not found.")
+    # #2410 — an image an appliance is scheduled to fetch, or an active run
+    # names, would 404 on the node's next fetch. Merely *installed* is not
+    # in use: the bytes are already on the slot.
+    in_use = (await catalog.image_usage(db, [row]))[row.id]
+    forced_over: list[str] = []
+    if in_use.scheduled_for:
+        forced_over.append("scheduled for " + ", ".join(in_use.scheduled_for))
+    if in_use.run_id is not None:
+        forced_over.append(f"named by active upgrade run {in_use.run_id}")
+    if forced_over and not force:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Upgrade image {row.appliance_version} is in use: "
+            + "; ".join(forced_over)
+            + ". Cancel the upgrade first, or retry with force=true.",
+        )
     if settings.slot_image_mirror_url:
         # #296 Phase B — delete from the mirror Deployment. Best-effort:
         # the DB row delete below is the authoritative signal; stale
@@ -1207,6 +1444,7 @@ async def delete_upgrade_image(image_id: uuid.UUID, current_user: CurrentUser, d
             resource_type="appliance_upgrade_image",
             resource_id=str(image_id),
             resource_display=f"{filename} ({version})",
+            new_value=({"force": True, "overrode": forced_over} if force else None),
             result="success",
         )
     )

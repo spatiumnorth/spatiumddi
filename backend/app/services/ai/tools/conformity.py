@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.conformity import ConformityPolicy, ConformityResult
 from app.services.ai.tools.base import register_tool
+from app.services.conformity.current import current_status_counts
 
 
 class ListConformityPoliciesArgs(BaseModel):
@@ -165,13 +166,13 @@ class GetConformitySummaryArgs(BaseModel):
         "Per-framework rollup of policy + result counts. Returns a "
         "list of ``{framework, policy_count, enabled_count, "
         "pass_count, fail_count, warn_count, not_applicable_count}``. "
-        "Counts EVERY ``conformity_result`` row by status — the "
-        "evaluator overwrites results per pass via UPSERT keyed on "
-        "(policy × resource), so the trailing-edge of a given "
-        "eval-interval window is what these counts reflect. Useful "
-        "for 'roughly how do we look against PCI?' rollups. For "
-        "point-in-time precise per-resource status, query "
-        "``find_conformity_results`` directly. Read-only."
+        "Result counts are the CURRENT state: the most recent "
+        "evaluation pass of each ENABLED policy, one result per "
+        "resource — targets deleted or moved out of scope since are "
+        "not in that pass, and disabled policies contribute no "
+        "results. Same numbers as the Conformity dashboard. For "
+        "per-resource history, query ``find_conformity_results``. "
+        "Read-only."
     ),
     args_model=GetConformitySummaryArgs,
     category="compliance",
@@ -194,27 +195,9 @@ async def get_conformity_summary(
         pol_stmt = pol_stmt.where(ConformityPolicy.framework == args.framework)
     pol_rows = (await db.execute(pol_stmt)).all()
 
-    # Latest result per (policy, resource) pair via a windowed
-    # max(evaluated_at) join would be ideal; for the rollup shape we
-    # just count every result-by-status grouped by framework. The
-    # append-only nature of ``conformity_result`` means stale rows
-    # exist, but the periodic eval task overwrites with each new
-    # pass so the per-resource trailing edge dominates within an
-    # eval-interval window.
-    res_stmt = (
-        select(
-            ConformityPolicy.framework.label("framework"),
-            ConformityResult.status.label("status"),
-            # ``.count`` would shadow the Row.count() method; ``n``
-            # keeps mypy + SQLAlchemy Row attribute access clean.
-            func.count(ConformityResult.id).label("n"),
-        )
-        .join(ConformityPolicy, ConformityPolicy.id == ConformityResult.policy_id)
-        .group_by(ConformityPolicy.framework, ConformityResult.status)
-    )
-    if args.framework:
-        res_stmt = res_stmt.where(ConformityPolicy.framework == args.framework)
-    res_rows = (await db.execute(res_stmt)).all()
+    # Current state only (#2278) — counting every history row made a
+    # resource evaluated N times count N times, forever.
+    counts = await current_status_counts(db, framework=args.framework or None)
 
     by_fw: dict[str, dict[str, Any]] = {}
     for row in pol_rows:
@@ -227,11 +210,11 @@ async def get_conformity_summary(
             "warn_count": 0,
             "not_applicable_count": 0,
         }
-    for row in res_rows:
+    for fw, by_status in counts.items():
         bucket = by_fw.setdefault(
-            row.framework,
+            fw,
             {
-                "framework": row.framework,
+                "framework": fw,
                 "policy_count": 0,
                 "enabled_count": 0,
                 "pass_count": 0,
@@ -240,7 +223,8 @@ async def get_conformity_summary(
                 "not_applicable_count": 0,
             },
         )
-        key = f"{row.status}_count"
-        if key in bucket:
-            bucket[key] = int(row.n or 0)
+        for status, n in by_status.items():
+            key = f"{status}_count"
+            if key in bucket:
+                bucket[key] = n
     return sorted(by_fw.values(), key=lambda b: b["framework"])

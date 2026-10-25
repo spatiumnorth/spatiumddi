@@ -79,6 +79,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -88,6 +89,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import appliance_channel, publish_wake
+from app.core.db_transient import is_transient_db_error
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.services.appliance import k8s
@@ -100,6 +102,9 @@ from app.services.appliance.slot_image_target import (
     stamp_desired_slot_image,
 )
 from app.services.upgrades import chart_bump, preflight, safety
+
+# The classifier moved to kubeapi_retry (#2767) so the plan path shares it.
+from app.services.upgrades.kubeapi_retry import _kubeapi_transient
 
 logger = structlog.get_logger(__name__)
 
@@ -167,6 +172,29 @@ DEFAULT_CONTROL_PLANE_READY_TIMEOUT_S = 600.0
 # that 30 min worth of polls is ~600 calls, fast enough that step
 # transitions surface to the UI within a few seconds.
 _POLL_INTERVAL_S = 3.0
+
+# #2177 — a step that loses its database connection is retried in place for
+# this long, from the first such error, before it is recorded as crashed. A
+# CloudNativePG failover of a primary on a node that went NotReady took ~10 s
+# from ``FailingOver`` to ``FailoverTarget`` on the repro rig, and a node
+# loss can take 60-90 s to promote (#1083); the connect timeout (5 s) adds to
+# each attempt. Every step that touches the database is idempotent: it
+# re-reads the appliance row and judges it afresh (see the module docstring).
+DB_FAILOVER_BUDGET_S = 90.0
+_DB_RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
+# Separate outages one step rides out before the next one fails it.
+_DB_MAX_OUTAGES_PER_STEP = 3
+
+# #2449 — a transient kubeapi answer at an idempotent per-node write is retried
+# in place, the way a shared-tag write is (orchestrator._retry_shared_tag_step).
+# The API server behind a rolling control plane can answer a CNPG admission
+# PATCH with a 500 while CloudNativePG's mutating webhook is briefly between
+# endpoints (its operator pod rescheduling off a cordoned node). One 500 used to
+# fail the step and the whole run at cnpg_maintenance_on. Only the writes that
+# are safe to repeat retry, and only a kubeapi helper's own answer.
+KUBEAPI_RETRY_STEPS: frozenset[StepName] = frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})
+KUBEAPI_RETRY_BUDGET_S = 300.0
+_KUBEAPI_RETRY_INTERVAL_S = 15.0
 
 
 @dataclass
@@ -493,19 +521,33 @@ async def _step_cnpg_maintenance_on(cluster_name: str, namespace: str | None) ->
 # ── Step 7: cordon ────────────────────────────────────────────────────
 
 
-async def _step_cordon(node_name: str) -> StepResult:
+async def _step_cordon(
+    node_name: str, *, pre_cordon: dict[str, bool | None] | None = None
+) -> StepResult:
     step = StepResult(name="cordon", started_at=_now_iso(), detail={"node": node_name})
     # Record whether the node was already unschedulable BEFORE this cordon,
     # so a failure's release (#1542) does not uncordon a node an operator
     # had cordoned on purpose. ``None`` = could not tell; the release then
     # uncordons, as it did before this was recorded.
+    #
+    # #2449 — the step is retried in place on a transient kubeapi answer, and
+    # a PATCH whose answer was lost (a socket timeout) may still have landed.
+    # Re-reading the node on the retry would then see this run's own cordon
+    # and record it as the operator's, so the release would leave the node
+    # cordoned after a failed run. ``pre_cordon`` carries the FIRST attempt's
+    # reading across retries; only that one was taken before any cordon.
     was_unschedulable: bool | None = None
-    try:
-        status, node = k8s.get_node(node_name)
-    except k8s.KubeapiUnavailableError:
-        status, node = 0, None
-    if status == 200 and node is not None:
-        was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+    if pre_cordon is not None and "was_unschedulable" in pre_cordon:
+        was_unschedulable = pre_cordon["was_unschedulable"]
+    else:
+        try:
+            status, node = k8s.get_node(node_name)
+        except k8s.KubeapiUnavailableError:
+            status, node = 0, None
+        if status == 200 and node is not None:
+            was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+        if pre_cordon is not None:
+            pre_cordon["was_unschedulable"] = was_unschedulable
     step.detail["was_unschedulable"] = was_unschedulable
     ok, err = k8s.cordon_node(node_name)
     if not ok:
@@ -614,6 +656,8 @@ async def _step_drain(
     deadline = time.monotonic() + timeout_s
     evicted: list[str] = []
     blocked: list[dict[str, Any]] = []
+    # The evictable pods the last poll still found on the node (#1804).
+    remaining: list[str] = []
 
     while time.monotonic() < deadline:
         try:
@@ -683,14 +727,34 @@ async def _step_drain(
             else:
                 cycle_blocked.append({"pod": f"{ns}/{name}", "status": status, "error": err})
         blocked = cycle_blocked
+        remaining = sorted(f"{ns}/{name}" for name, ns in candidates)
         await asyncio.sleep(_POLL_INTERVAL_S)
 
+    # #1804 — count the pods still on the node, not the evictions the last
+    # cycle had refused. A node whose kubelet is down accepts every eviction
+    # and removes nothing, so the old count read "0 pod(s) still present"
+    # while all of them were.
+    refused = {b["pod"] for b in blocked}
+    not_removed = [p for p in remaining if p not in refused]
+    why: list[str] = []
+    if refused:
+        why.append(f"{len(refused)} eviction(s) refused")
+    if not_removed:
+        why.append(
+            f"{len(not_removed)} evicted but never removed from the node, "
+            "whose kubelet may be down"
+        )
+    error = f"drain timed out after {timeout_s:.0f}s — {len(remaining)} pod(s) still present"
+    if why:
+        error += f" ({'; '.join(why)})"
     return step.finish(
         False,
-        error=(f"drain timed out after {timeout_s:.0f}s — " f"{len(blocked)} pod(s) still present"),
+        error=error,
         evicted_count=len(set(evicted)),
         evicted=list(set(evicted)),
         blocked=blocked,
+        remaining=remaining,
+        not_removed=not_removed,
     )
 
 
@@ -1268,6 +1332,9 @@ async def _step_uncordon(
             False,
             error=f"uncordon ok, maintenance-window clear failed: {err}",
             uncordon_ok=True,
+            # #2449 — the helper's own answer, so the retry can classify it:
+            # the step's error is prefixed and no longer starts "kubeapi ".
+            kubeapi_error=err,
         )
     return step.finish(True)
 
@@ -1544,22 +1611,45 @@ async def single_node_upgrade(
                 )
         return _failed(node_name, target_version, step, results)
 
-    async def _run(step: StepName, coro: Any) -> bool:
+    async def _run(step: StepName, make: Callable[[], Awaitable[StepResult]]) -> bool:
         if steps_in_order.index(step) < start_index:
             return True
-        try:
-            r = await coro
-        except Exception as exc:  # noqa: BLE001 — last-resort wrapper
-            logger.exception("single_node_upgrade_step_crashed", step=step, node=node_name)
-            r = StepResult(name=step, started_at=_now_iso()).finish(
-                False, error=f"step crashed: {exc}"
-            )
+        r = await _run_step_riding_db_failover(db, step, node_name, make)
         results.append(r)
         return r.ok
 
+    # When this invocation first sent a fresh stamp's commit (#2177): set before
+    # the commit, so a commit whose acknowledgement was lost still counts.
+    fresh_stamp_sent_at: datetime | None = None
+
+    async def _trigger_and_commit() -> StepResult:
+        # #1445 — the supervisor reads the desired slot image from its
+        # heartbeat, in another session, so it sees the stamp only once it is
+        # committed. The orchestrator commits before and after this whole
+        # chain, never between steps, so without this the health gate waited
+        # out its timeout for a node that had never been told to upgrade. The
+        # commit is part of the step (#2177): a commit lost to a database
+        # failover discards the stamp, so the retry has to stamp again.
+        nonlocal fresh_stamp_sent_at
+        r = await _step_trigger_slot_apply(db, node_name, target_version, slot_image)
+        if not r.ok:
+            return r
+        if r.detail.get("fresh_stamp"):
+            fresh_stamp_sent_at = datetime.now(UTC)
+        elif fresh_stamp_sent_at is not None:
+            # #2177 — the previous attempt's commit landed and only its
+            # acknowledgement was lost, so this attempt found its own stamp
+            # already there. It is still this run's fresh stamp: judged as a
+            # re-driven node's (no ``stamped_at``), a ``failed`` or ``done``
+            # left from an earlier attempt would count as this one's.
+            r.detail["fresh_stamp"] = True
+            r.detail["stamp_commit_ack_lost"] = True
+        await db.commit()
+        return r
+
     if not await _run(
         "preflight",
-        _step_preflight(
+        lambda: _step_preflight(
             target_version,
             lease_holder,
             cnpg_cluster_name=cnpg_cluster_name,
@@ -1569,11 +1659,11 @@ async def single_node_upgrade(
         ),
     ):
         return _failed(node_name, target_version, "preflight", results)
-    if not await _run("etcd_snapshot", _step_etcd_snapshot()):
+    if not await _run("etcd_snapshot", _step_etcd_snapshot):
         return _failed(node_name, target_version, "etcd_snapshot", results)
     if not await _run(
         "mirror_ready",
-        _step_mirror_ready(
+        lambda: _step_mirror_ready(
             db,
             node_name,
             target_version,
@@ -1583,38 +1673,35 @@ async def single_node_upgrade(
         ),
     ):
         return _failed(node_name, target_version, "mirror_ready", results)
-    if not await _run(
-        "trigger_slot_apply",
-        _step_trigger_slot_apply(db, node_name, target_version, slot_image),
-    ):
+    if not await _run("trigger_slot_apply", _trigger_and_commit):
         return _failed(node_name, target_version, "trigger_slot_apply", results)
-    # #1445 — the supervisor reads the desired slot image from its heartbeat,
-    # in another session, so it sees the stamp only once it is committed. The
-    # orchestrator commits before and after this whole chain, never between
-    # steps, so without this the health gate waited out its timeout for a
-    # node that had never been told to upgrade.
     stamped_at: datetime | None = None
     if start_index <= steps_in_order.index("trigger_slot_apply"):
-        await db.commit()
         if results and results[-1].detail.get("fresh_stamp"):
-            stamped_at = datetime.now(UTC)
+            stamped_at = fresh_stamp_sent_at or datetime.now(UTC)
     # #1463 — the host fetches and writes the slot while the node is still in
     # service, before anything below takes the node out of it.
-    if not await _run("stage", _step_stage(db, node_name, target_version, stamped_at=stamped_at)):
+    if not await _run(
+        "stage", lambda: _step_stage(db, node_name, target_version, stamped_at=stamped_at)
+    ):
         return _failed(node_name, target_version, "stage", results)
     # End the stage's read before the node leaves service. Cordoning the node
     # that runs the CNPG primary switches it over, and the switchover closes
     # every connection the old primary held; the reboot after the drain has
-    # to start on a fresh connection, not commit on one of those.
-    await db.commit()
+    # to start on a fresh connection, not commit on one of those. The read
+    # is all it ends, so a connection already lost to a failover (#2177) is
+    # rolled back instead: there is nothing to keep.
+    await _end_read(db)
     if cnpg_cluster_name:
         if not await _run(
             "cnpg_maintenance_on",
-            _step_cnpg_maintenance_on(cnpg_cluster_name, cnpg_namespace),
+            lambda: _step_cnpg_maintenance_on(cnpg_cluster_name, cnpg_namespace),
         ):
             return _failed(node_name, target_version, "cnpg_maintenance_on", results)
         window_set = True
-    if not await _run("cordon", _step_cordon(node_name)):
+    # #2449 — shared across the cordon step's retries; see ``_step_cordon``.
+    pre_cordon: dict[str, bool | None] = {}
+    if not await _run("cordon", lambda: _step_cordon(node_name, pre_cordon=pre_cordon)):
         # The window may already be set — release it (#1542). The node is
         # not uncordoned: this run did not cordon it.
         return await _fail("cordon")
@@ -1624,26 +1711,30 @@ async def single_node_upgrade(
     if cnpg_cluster_name:
         if not await _run(
             "verify_primary_moved",
-            _step_verify_primary_moved(cnpg_cluster_name, node_name, cnpg_namespace),
+            lambda: _step_verify_primary_moved(cnpg_cluster_name, node_name, cnpg_namespace),
         ):
             return await _fail("verify_primary_moved")
-    if not await _run("drain", _step_drain(node_name)):
+    if not await _run("drain", lambda: _step_drain(node_name)):
         return await _fail("drain")
-    if not await _run("reboot", _step_reboot(db, node_name, target_version, stamped_at=stamped_at)):
+    if not await _run(
+        "reboot", lambda: _step_reboot(db, node_name, target_version, stamped_at=stamped_at)
+    ):
         return await _fail("reboot")
     if not await _run(
         "health_gate",
-        _step_health_gate(db, node_name, target_version, stamped_at=stamped_at),
+        lambda: _step_health_gate(db, node_name, target_version, stamped_at=stamped_at),
     ):
         return await _fail("health_gate")
-    if not await _run("convergence", _step_convergence(node_name)):
+    if not await _run("convergence", lambda: _step_convergence(node_name)):
         return await _fail("convergence")
-    if not await _run("uncordon", _step_uncordon(node_name, cnpg_cluster_name, cnpg_namespace)):
+    if not await _run(
+        "uncordon", lambda: _step_uncordon(node_name, cnpg_cluster_name, cnpg_namespace)
+    ):
         return await _fail("uncordon")
     released = True
     if not await _run(
         "cluster_verify",
-        _step_cluster_verify(
+        lambda: _step_cluster_verify(
             target_version,
             cnpg_cluster_name=cnpg_cluster_name,
             cnpg_namespace=cnpg_namespace,
@@ -1663,6 +1754,160 @@ async def single_node_upgrade(
         failed_at=None,
         steps=results,
     )
+
+
+async def _rollback_quietly(db: AsyncSession) -> None:
+    """Discard the session's failed transaction so the next statement checks
+    out a fresh connection (``pool_pre_ping`` replaces the dead one). A
+    rollback on a connection that is already gone can raise too; the retry
+    that follows is what finds out whether the database is back."""
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 — the connection is gone; the retry decides
+        logger.debug("single_node_upgrade_rollback_failed", exc_info=True)
+
+
+async def _end_read(db: AsyncSession) -> None:
+    """End a read-only transaction. A connection lost to a database failover
+    is rolled back instead, since a read has nothing to keep (#2177)."""
+    try:
+        await db.commit()
+    except Exception as exc:
+        if not is_transient_db_error(exc):
+            raise
+        logger.warning("single_node_upgrade_end_read_db_unavailable", error=str(exc))
+        await _rollback_quietly(db)
+
+
+def _db_retry_clock() -> float:
+    return time.monotonic()
+
+
+async def _db_retry_sleep(delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
+
+
+async def _run_step_riding_db_failover(
+    db: AsyncSession,
+    step: StepName,
+    node_name: str,
+    make: Callable[[], Awaitable[StepResult]],
+    *,
+    budget_s: float | None = None,
+) -> StepResult:
+    """Run one step; a step that crashed is a failed step.
+
+    #2177 — a step that lost its database connection is retried in place,
+    after a rollback, for ``DB_FAILOVER_BUDGET_S`` from the first such error:
+    one refused connect during a Postgres failover used to fail the step (or,
+    with the database still down, crash the whole drive). Only a connection
+    error is retried (``is_transient_db_error``); anything else, and a
+    database still unreachable once the budget is spent, is recorded as the
+    step crashing, as before. ``make`` builds a fresh coroutine per attempt.
+
+    #2449 — a step in ``KUBEAPI_RETRY_STEPS`` that *returned* a failed result
+    whose error is a transient kubeapi answer (``_kubeapi_transient``) is tried
+    again in place, for ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer:
+    a CNPG admission PATCH that met a 500 while CloudNativePG's mutating webhook
+    was between endpoints used to fail the run. Only the idempotent writes retry,
+    and a kubeapi error still failing once the budget is spent is returned as it
+    was, as before.
+    """
+    budget = DB_FAILOVER_BUDGET_S if budget_s is None else budget_s
+    first_failure: float | None = None
+    outages = 0
+    attempt = 0
+    kubeapi_first: float | None = None
+    kubeapi_attempt = 0
+    while True:
+        attempt_started = _db_retry_clock()
+        try:
+            result = await make()
+        except Exception as exc:  # noqa: BLE001 — last-resort wrapper
+            if is_transient_db_error(exc):
+                now = _db_retry_clock()
+                # An attempt that ran longer than the budget was served by the
+                # database for a while: this is a second outage, with a budget
+                # of its own. A wait step (stage, health gate) runs for many
+                # minutes and can outlive one failover. Capped, so a step can
+                # not be restarted indefinitely.
+                if (
+                    first_failure is not None
+                    and now - attempt_started >= budget
+                    and outages < _DB_MAX_OUTAGES_PER_STEP
+                ):
+                    first_failure = None
+                    attempt = 0
+                if first_failure is None:
+                    first_failure = now
+                    outages += 1
+                delay = _DB_RETRY_BACKOFF_S[min(attempt, len(_DB_RETRY_BACKOFF_S) - 1)]
+                if now - first_failure + delay <= budget:
+                    attempt += 1
+                    logger.warning(
+                        "single_node_upgrade_step_db_unavailable",
+                        step=step,
+                        node=node_name,
+                        attempt=attempt,
+                        retry_in_s=delay,
+                        exc_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    await _rollback_quietly(db)
+                    await _db_retry_sleep(delay)
+                    continue
+                logger.exception(
+                    "single_node_upgrade_step_crashed",
+                    step=step,
+                    node=node_name,
+                    db_unavailable_s=round(now - first_failure),
+                    db_outages=outages,
+                )
+                lost = (
+                    f"database unreachable for {now - first_failure:.0f}s"
+                    if now - attempt_started < budget
+                    else f"database lost {outages + 1} times in one step"
+                )
+                return StepResult(name=step, started_at=_now_iso()).finish(
+                    False, error=f"step crashed: {lost}: {exc}"
+                )
+            logger.exception("single_node_upgrade_step_crashed", step=step, node=node_name)
+            return StepResult(name=step, started_at=_now_iso()).finish(
+                False, error=f"step crashed: {exc}"
+            )
+        # #2449 — make() returned (no exception). An idempotent write that the
+        # API server answered with a transient kubeapi error (a 5xx, 408, 409,
+        # 429, or a socket error that never reached it) is tried again in place,
+        # within ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer, so a CNPG
+        # admission webhook briefly between endpoints does not fail the run.
+        # A step whose error wraps the helper's answer (uncordon's window clear)
+        # carries the answer itself as ``detail["kubeapi_error"]``.
+        kubeapi_error = result.detail.get("kubeapi_error", result.error)
+        if not result.ok and step in KUBEAPI_RETRY_STEPS and _kubeapi_transient(kubeapi_error):
+            now = _db_retry_clock()
+            if kubeapi_first is None:
+                kubeapi_first = now
+            if now - kubeapi_first + _KUBEAPI_RETRY_INTERVAL_S <= KUBEAPI_RETRY_BUDGET_S:
+                kubeapi_attempt += 1
+                logger.warning(
+                    "single_node_upgrade_step_kubeapi_transient",
+                    step=step,
+                    node=node_name,
+                    attempt=kubeapi_attempt,
+                    retry_in_s=_KUBEAPI_RETRY_INTERVAL_S,
+                    error=result.error,
+                )
+                await _db_retry_sleep(_KUBEAPI_RETRY_INTERVAL_S)
+                continue
+            logger.warning(
+                "single_node_upgrade_step_kubeapi_gave_up",
+                step=step,
+                node=node_name,
+                attempts=kubeapi_attempt,
+                kubeapi_unavailable_s=round(now - kubeapi_first),
+                error=result.error,
+            )
+        return result
 
 
 def _failed(

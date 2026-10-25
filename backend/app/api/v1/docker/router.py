@@ -21,7 +21,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -30,6 +31,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.docker import DockerHost
 from app.models.ipam import IPSpace
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["docker"],
@@ -401,6 +403,11 @@ async def delete_host(host_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if h is None:
         raise HTTPException(status_code=404, detail="Host not found")
     _audit(db, user=user, action="delete", host_id=h.id, host_name=h.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="docker_host_id", target_id=h.id, user=user, target_name=h.name
+    )
     await db.delete(h)
     await db.commit()
 
@@ -409,15 +416,25 @@ async def delete_host(host_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/hosts/{host_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_host(host_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_host(host_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     h = await db.get(DockerHost, host_id)
     if h is None:
         raise HTTPException(status_code=404, detail="Host not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="docker_host",
+        resource_id=h.id,
+        resource_display=str(getattr(h, "name", None) or h.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.docker_sync import sync_host_now  # noqa: PLC0415
 
     try:
-        result = sync_host_now.delay(str(h.id))
+        result = await dispatch(sync_host_now, str(h.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

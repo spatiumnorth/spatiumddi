@@ -27,6 +27,7 @@ from sqlalchemy import func, select
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_any_resource_permission, require_resource_permission
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.services.feature_modules import require_module
 
 router = APIRouter()
 
@@ -140,7 +141,10 @@ def _validate_window(window: str) -> None:
 @router.get(
     "/dns/timeseries",
     response_model=DNSTimeseries,
-    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))],
+    dependencies=[
+        Depends(require_module("core.dns")),
+        Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record")),
+    ],
 )
 async def dns_timeseries(
     db: DB,
@@ -203,7 +207,10 @@ async def dns_timeseries(
 @router.get(
     "/dhcp/timeseries",
     response_model=DHCPTimeseries,
-    dependencies=[Depends(require_resource_permission("dhcp_server"))],
+    dependencies=[
+        Depends(require_module("core.dhcp")),
+        Depends(require_resource_permission("dhcp_server")),
+    ],
 )
 async def dhcp_timeseries(
     db: DB,

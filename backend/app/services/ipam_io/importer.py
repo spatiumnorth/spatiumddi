@@ -734,7 +734,14 @@ async def preview_address_import(
     subnet_id: uuid.UUID,
     strategy: Strategy = "fail",
     current_user: Any = None,
+    can_write_ip: Callable[[str], bool] | None = None,
 ) -> ImportPreview:
+    """Dry-run of :func:`commit_address_import`.
+
+    ``can_write_ip`` is the same #103 per-address gate the commit takes: a row
+    it refuses is reported as an error (the commit skips it as
+    ``skipped_no_perm``) and the existing row at that address is not shown.
+    """
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
 
@@ -854,6 +861,17 @@ async def preview_address_import(
             continue
         seen.add(canonical)
 
+        if can_write_ip is not None and not can_write_ip(canonical):
+            preview.errors.append(
+                DiffRow(
+                    kind="address",
+                    action="error",
+                    network=canonical,
+                    reason="No write permission on this address; commit will skip it",
+                )
+            )
+            continue
+
         row_hostname = fields.get("hostname") or ""
         existing_ip = existing.get(canonical)
         if existing_ip is None:
@@ -941,6 +959,7 @@ async def commit_address_import(
     """
     from app.api.v1.ipam.router import _sync_dns_record
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+    from app.services.dns.sync_check import address_own_forward_zone_id
 
     subnet = await _load_subnet(db, subnet_id)
     result_obj = AddressImportResult(subnet_id=str(subnet.id))
@@ -1060,14 +1079,26 @@ async def commit_address_import(
                 if existing_ip.hostname and not had_hostname:
                     # Hostname was just assigned — publish new DNS record.
                     try:
-                        await _sync_dns_record(db, existing_ip, subnet, action="create")
+                        await _sync_dns_record(
+                            db,
+                            existing_ip,
+                            subnet,
+                            zone_id=await address_own_forward_zone_id(db, existing_ip),
+                            action="create",
+                        )
                         result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
                 elif had_hostname and "hostname" in fields:
                     # Hostname changed — republish (sync handles update via re-create).
                     try:
-                        await _sync_dns_record(db, existing_ip, subnet, action="create")
+                        await _sync_dns_record(
+                            db,
+                            existing_ip,
+                            subnet,
+                            zone_id=await address_own_forward_zone_id(db, existing_ip),
+                            action="create",
+                        )
                         result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")

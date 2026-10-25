@@ -59,9 +59,10 @@ def test_v2c_renders_rocommunity_for_each_source() -> None:
     assert "rocommunity s3cret 192.168.1.0/24" in text
     # IPv6 source uses the v6-specific directive
     assert "rocommunity6 s3cret fd00::/8" in text
-    # sysContact / sysLocation get double-quoted
-    assert 'sysContact     "ops@example.com"' in text
-    assert 'sysLocation    "Datacenter A, Rack 12"' in text
+    # sysContact / sysLocation are written bare: snmpd serves the rest of
+    # the line literally, so quotes would reach the NMS.
+    assert "sysContact     ops@example.com" in text
+    assert "sysLocation    Datacenter A, Rack 12" in text
     # Standard agent listen line
     assert "agentAddress udp:161,udp6:[::1]:161" in text
 
@@ -213,21 +214,45 @@ def test_snmp_bundle_has_stable_keys() -> None:
     assert off_bundle["config_hash"] == ""
 
 
-def test_sys_contact_with_quote_is_escaped() -> None:
-    """Defensive — the quote routine has to escape ``"`` to avoid
-    blowing up snmpd's parser when an operator pastes an awkward
-    contact string."""
+def _sys_text_conf(contact: str, location: str) -> str:
     s = _bare_settings()
     s.snmp_enabled = True
     s.snmp_version = "v2c"
     s.snmp_community_encrypted = encrypt_str("c")
     s.snmp_allowed_sources = ["10.0.0.0/8"]
-    s.snmp_sys_contact = 'someone "with quotes"'
+    s.snmp_sys_contact = contact
+    s.snmp_sys_location = location
+    return render_snmpd_conf(s)
 
-    text = render_snmpd_conf(s)
-    # The quoted form should escape the embedded quotes; snmpd reads
-    # a single double-quoted string.
-    assert r'"someone \"with quotes\""' in text
+
+def test_sys_text_is_written_unquoted_and_verbatim() -> None:
+    """snmpd serves the rest of a sysContact/sysLocation line as-is (#2773),
+    so quoting or escaping would reach the NMS as part of the value."""
+    contact = 'A2 NOC "night shift" O\'Brien <noc@example.test>'
+    text = _sys_text_conf(contact, "a2 lab rack 4")
+    lines = text.splitlines()
+    assert f"sysContact     {contact}" in lines
+    assert "sysLocation    a2 lab rack 4" in lines
+    assert '\\"' not in text
+
+
+def test_sys_text_keeps_backslash_and_mid_value_hash() -> None:
+    text = _sys_text_conf(r"ops\team #1", "rack #4")
+    assert r"sysContact     ops\team #1" in text.splitlines()
+    assert "sysLocation    rack #4" in text.splitlines()
+
+
+def test_sys_text_surrounding_whitespace_is_dropped() -> None:
+    text = _sys_text_conf("  padded  ", "x")
+    assert "sysContact     padded" in text.splitlines()
+
+
+def test_sys_text_starting_with_hash_is_omitted_not_emitted() -> None:
+    """A leading ``#`` makes snmpd read the whole line as a comment."""
+    text = _sys_text_conf("#oncall", "ok")
+    assert "sysContact     #oncall" not in text
+    assert "# sysContact OMITTED" in text
+    assert "sysLocation    ok" in text.splitlines()
 
 
 def test_disabled_master_toggle_renders_no_config() -> None:

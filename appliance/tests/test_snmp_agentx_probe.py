@@ -67,12 +67,18 @@ def _probe_block() -> str:
     """The runner's probe, from the validate-log assignment through the
     background ``snmpd`` launch — the bytes that ship."""
     lines = RUNNER.read_text(encoding="utf-8").splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("SNMP_VALIDATE_LOG="))
-    end = next(i for i in range(start, len(lines)) if lines[i].strip() == "probe_pid=$!")
+    start = next(
+        i for i, ln in enumerate(lines) if ln.strip().startswith("SNMP_VALIDATE_LOG=")
+    )
+    end = next(
+        i for i in range(start, len(lines)) if lines[i].strip() == "probe_pid=$!"
+    )
     return "\n".join(ln.strip() for ln in lines[start : end + 1])
 
 
-def _run(tmp_path: Path, path_prefix: str, rendered: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    tmp_path: Path, path_prefix: str, rendered: str
+) -> subprocess.CompletedProcess[str]:
     body = tmp_path / "staged.conf"
     body.write_text(rendered, encoding="utf-8")
     log = tmp_path / "validate.log"
@@ -102,7 +108,9 @@ def test_probe_is_pointed_at_a_throwaway_agentx_socket(tmp_path: Path) -> None:
     (stub_dir / "snmpd").write_text(
         "#!/bin/bash\n"
         "# stub: copy the -c config the probe was handed, then exit\n"
-        'while [ $# -gt 0 ]; do [ "$1" = -c ] && cp "$2" ' + str(seen) + "; shift; done\n",
+        'while [ $# -gt 0 ]; do [ "$1" = -c ] && cp "$2" '
+        + str(seen)
+        + "; shift; done\n",
         encoding="utf-8",
     )
     (stub_dir / "snmpd").chmod(0o755)
@@ -119,16 +127,23 @@ def test_probe_is_pointed_at_a_throwaway_agentx_socket(tmp_path: Path) -> None:
     # ...but the AgentX directives are still in what gets parsed.
     assert "master agentx" in probed
     assert "agentXPerms 0600 0700" in probed
-    # Everything else is untouched.
+    # The probe also drops every listener line, so it binds nothing the live
+    # snmpd holds (#2376); everything else is parsed as rendered.
+    assert not [ln for ln in probed if ln.lower().startswith("agentaddress")], probed
     other = [ln for ln in probed if not ln.startswith("agentXSocket ")]
-    assert other == [ln for ln in RENDERED.splitlines() if not ln.startswith("agentXSocket ")]
+    assert other == [
+        ln
+        for ln in RENDERED.splitlines()
+        if not ln.startswith("agentXSocket ")
+        and not ln.lower().startswith("agentaddress")
+    ]
 
 
 def test_probe_never_reads_the_staged_file_directly() -> None:
     """Structural: the probe's ``-c`` must be the rewritten copy."""
     block = _probe_block()
     launch = [ln for ln in block.splitlines() if ln.startswith("snmpd ")]
-    assert launch and all('-c "$PROBE_BODY"' in ln for ln in launch), launch
+    assert launch and all('-c "$PROBE_CONF"' in ln for ln in launch), launch
 
 
 @pytest.mark.skipif(shutil.which("snmpd") is None, reason="needs a real net-snmp snmpd")

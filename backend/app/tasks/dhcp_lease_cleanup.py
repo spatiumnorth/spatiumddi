@@ -1,5 +1,9 @@
 """Sweep expired DHCP leases and their mirrored IPAM rows.
 
+Also the backstop the other way round (#2580): an ``available`` IPAM row whose
+address a live lease holds becomes that lease's mirror
+(``_remirror_live_leases``).
+
 Lease events from the agent already mirror active leases into IPAM (status='dhcp',
 auto_from_lease=True) and remove them on explicit expired/released events. But
 agents can miss events (container restart, lease_cmds hook drop), so we also
@@ -18,6 +22,7 @@ from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.db import task_session
+from app.models.audit import AuditLog
 from app.models.dhcp import DHCPLease
 from app.models.ipam import IPAddress
 
@@ -31,6 +36,7 @@ from app.services.dhcp.lease_cleanup import (
 )
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -143,12 +149,78 @@ async def _sweep() -> tuple[int, int]:
         return cleaned, deleted
 
 
+# Cap on rows the re-mirror pass hands over per run, so a backlog (a long run
+# of dropped lease batches) cannot become one long transaction holding row
+# locks on ``ip_address``. The rest go on the next tick; the pass is idempotent.
+REMIRROR_MAX_PER_RUN = 500
+
+
+async def _remirror_live_leases() -> int:
+    """Hand ``available`` rows that a live lease holds to that lease (#2580).
+
+    The backstop for an address left ``available`` beside its live lease: a
+    reservation DELETE that raced the lease report (closed at the source by
+    row locks, but this costs nothing to keep) or a lease batch the agent
+    dropped after a refused POST. Its own transaction, after the expiry pass,
+    so a lease that pass just expired claims nothing here. A healthy install
+    finds nothing and writes nothing, not even an audit row.
+    """
+    from app.services.dhcp.static_ipam import (  # noqa: PLC0415
+        publish_handover_ddns,
+        remirror_available_rows_with_live_leases,
+    )
+
+    async with task_session() as db:
+        if not await is_module_enabled(db, "core.dhcp"):
+            return 0
+        handovers = await remirror_available_rows_with_live_leases(db, limit=REMIRROR_MAX_PER_RUN)
+        if not handovers:
+            await db.rollback()
+            return 0
+        await db.flush()
+        await publish_handover_ddns(db, handovers)
+        # A status change on an address is a mutation, and mutations are
+        # audited (non-negotiable #4). One row per run, naming the addresses.
+        db.add(
+            AuditLog(
+                user_display_name="<system>",
+                auth_source="system",
+                action="dhcp-lease-remirror",
+                resource_type="platform",
+                resource_id="dhcp-lease-remirror",
+                resource_display="available addresses held by a live lease",
+                result="success",
+                new_value={
+                    "rows_remirrored": len(handovers),
+                    "capped": len(handovers) >= REMIRROR_MAX_PER_RUN,
+                    "addresses": [str(h.row.address) for h in handovers[:50]],
+                },
+            )
+        )
+        await db.commit()
+        return len(handovers)
+
+
+async def _run_both() -> tuple[tuple[int, int], int]:
+    return await _sweep(), await _remirror_live_leases()
+
+
 @celery_app.task(name="app.tasks.dhcp_lease_cleanup.sweep_expired_leases")
+@module_gated("core.dhcp")
 def sweep_expired_leases() -> dict[str, int]:
-    cleaned, deleted = asyncio.run(_sweep())
+    (cleaned, deleted), remirrored = asyncio.run(_run_both())
+    if remirrored:
+        # Warning, not info: since the row locks of #2580 only a lease batch
+        # the agent dropped should leave an address here, which wants finding.
+        logger.warning("dhcp_lease_sweep_remirrored_available_rows", rows=remirrored)
     logger.info(
         "dhcp_lease_sweep_complete",
         ipam_rows_removed=cleaned,
         expired_leases_deleted=deleted,
+        ipam_rows_remirrored=remirrored,
     )
-    return {"ipam_rows_removed": cleaned, "expired_leases_deleted": deleted}
+    return {
+        "ipam_rows_removed": cleaned,
+        "expired_leases_deleted": deleted,
+        "ipam_rows_remirrored": remirrored,
+    }

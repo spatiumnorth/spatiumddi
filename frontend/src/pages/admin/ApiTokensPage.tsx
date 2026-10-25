@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Copy,
@@ -597,7 +598,7 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
 // again so we force the operator to copy it, and close the modal only
 // after explicit confirmation.
 
-function RevealTokenModal({
+export function RevealTokenModal({
   token,
   onClose,
 }: {
@@ -639,7 +640,14 @@ function RevealTokenModal({
           </div>
         )}
         <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
-          <code className="flex-1 truncate" title={token.token}>
+          {/* The raw token is carried only by the revealed view (and the copy
+              action). While masked, no attribute — title, aria-* or data-* —
+              names it, so a hover tooltip or an accessibility tree read
+              cannot surface it. */}
+          <code
+            className="flex-1 truncate"
+            title={visible ? token.token : undefined}
+          >
             {visible ? token.token : "•".repeat(40)}
           </code>
           <button
@@ -683,6 +691,90 @@ function RevealTokenModal({
   );
 }
 
+// ── Re-enable Token Modal ──────────────────────────────────────────────────
+
+/** Re-enabling an inactive token is superadmin-only and needs the step-up:
+ *  the token was revoked by someone, and it outlives this session. */
+function ReenableTokenModal({
+  token,
+  onClose,
+}: {
+  token: ApiToken;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const mut = useMutation({
+    mutationFn: () =>
+      apiTokensApi.update(token.id, {
+        is_active: true,
+        stepup_password: stepPassword || null,
+        stepup_totp_code: stepTotp || null,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      onClose();
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setError(
+        typeof detail === "string" ? detail : "Failed to re-enable token.",
+      );
+    },
+  });
+  return (
+    <Modal title="Re-enable API Token" onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          setError(null);
+          mut.mutate();
+        }}
+        className="space-y-3"
+      >
+        <p className="text-sm text-muted-foreground">
+          Re-enable <strong className="text-foreground">{token.name}</strong>
+          {ownerLabel(token) && (
+            <>
+              {" "}
+              (owned by{" "}
+              <strong className="text-foreground">{ownerLabel(token)}</strong>)
+            </>
+          )}
+          ? It starts authenticating again immediately. Confirm it's you.
+        </p>
+        <ReauthFields
+          password={stepPassword}
+          onPassword={setStepPassword}
+          totp={stepTotp}
+          onTotp={setStepTotp}
+          autoFocus
+        />
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={mut.isPending || (!stepPassword && !stepTotp)}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mut.isPending ? "Re-enabling…" : "Re-enable token"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 // ── Main page ──────────────────────────────────────────────────────────────
 
 export function ApiTokensPage() {
@@ -691,13 +783,19 @@ export function ApiTokensPage() {
     queryKey: ["api-tokens"],
     queryFn: apiTokensApi.list,
   });
+  // A superadmin's list spans users (#2443): name the owner once more than
+  // one user's tokens are present.
+  const showOwner = new Set(tokens.map((t) => t.user_id)).size > 1;
   const [showCreate, setShowCreate] = useState(false);
   const [justCreated, setJustCreated] = useState<ApiTokenCreated | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
+  const [reenable, setReenable] = useState<ApiToken | null>(null);
+  // Only a superadmin can re-enable an inactive token; owners mint a new one.
+  const { isSuperadmin } = usePermissions();
 
-  const toggleMut = useMutation({
+  const revokeMut = useMutation({
     mutationFn: (t: ApiToken) =>
-      apiTokensApi.update(t.id, { is_active: !t.is_active }),
+      apiTokensApi.update(t.id, { is_active: false }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
   const deleteMut = useMutation({
@@ -741,6 +839,7 @@ export function ApiTokensPage() {
               <thead className="border-b text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
                 <tr>
                   <th className="px-3 py-2">Name</th>
+                  {showOwner && <th className="px-3 py-2">Owner</th>}
                   <th className="px-3 py-2">Prefix</th>
                   <th className="px-3 py-2">Scopes</th>
                   <th className="px-3 py-2">Expires</th>
@@ -763,6 +862,9 @@ export function ApiTokensPage() {
                         </div>
                       )}
                     </td>
+                    {showOwner && (
+                      <td className="px-3 py-2 text-xs">{ownerLabel(t)}</td>
+                    )}
                     <td className="px-3 py-2 font-mono text-xs">{t.prefix}…</td>
                     <td className="px-3 py-2">
                       <ScopeChips scopes={t.scopes} />
@@ -798,27 +900,39 @@ export function ApiTokensPage() {
                       <span
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
-                          t.is_active
+                          t.is_active && !isExpired(t.expires_at)
                             ? "bg-emerald-500/15 text-emerald-600"
                             : "bg-muted text-muted-foreground",
                         )}
                       >
-                        {t.is_active ? "Active" : "Revoked"}
+                        {!t.is_active
+                          ? "Revoked"
+                          : isExpired(t.expires_at)
+                            ? "Expired"
+                            : "Active"}
                       </span>
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-1">
-                        <button
-                          onClick={() => toggleMut.mutate(t)}
-                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                          title={t.is_active ? "Revoke" : "Re-enable"}
-                        >
-                          {t.is_active ? (
+                        {t.is_active ? (
+                          <button
+                            onClick={() => revokeMut.mutate(t)}
+                            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                            title="Revoke"
+                          >
                             <PowerOff className="h-3.5 w-3.5" />
-                          ) : (
-                            <Power className="h-3.5 w-3.5" />
-                          )}
-                        </button>
+                          </button>
+                        ) : (
+                          isSuperadmin && (
+                            <button
+                              onClick={() => setReenable(t)}
+                              className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                              title="Re-enable"
+                            >
+                              <Power className="h-3.5 w-3.5" />
+                            </button>
+                          )
+                        )}
                         <button
                           onClick={() => setConfirmDelete(t)}
                           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -850,6 +964,12 @@ export function ApiTokensPage() {
             onClose={() => setJustCreated(null)}
           />
         )}
+        {reenable && (
+          <ReenableTokenModal
+            token={reenable}
+            onClose={() => setReenable(null)}
+          />
+        )}
         {confirmDelete && (
           <Modal
             title="Delete API Token"
@@ -861,6 +981,16 @@ export function ApiTokensPage() {
                 <strong className="text-foreground">
                   {confirmDelete.name}
                 </strong>
+                {ownerLabel(confirmDelete) && (
+                  <>
+                    {" "}
+                    (owned by{" "}
+                    <strong className="text-foreground">
+                      {ownerLabel(confirmDelete)}
+                    </strong>
+                    )
+                  </>
+                )}
                 ? Any script still using it will start getting 401 responses.
               </p>
               <div className="flex justify-end gap-2">
@@ -918,18 +1048,34 @@ function ScopeChips({ scopes }: { scopes: ApiTokenScope[] | undefined }) {
   );
 }
 
+/** "Display Name (username)" or the username; "" when the owner is unknown. */
+function ownerLabel(t: ApiToken): string {
+  if (!t.owner_username) return "";
+  return t.owner_display_name && t.owner_display_name !== t.owner_username
+    ? `${t.owner_display_name} (${t.owner_username})`
+    : t.owner_username;
+}
+
+function isExpired(iso: string | null | undefined): boolean {
+  return !!iso && new Date(iso).getTime() <= Date.now();
+}
+
 function ExpiryCell({ iso }: { iso: string }) {
   const expires = new Date(iso);
   const now = Date.now();
   const daysOut = Math.round((expires.getTime() - now) / (24 * 60 * 60 * 1000));
+  const expired = expires.getTime() <= now;
   let cls = "";
-  if (daysOut < 0) cls = "text-destructive";
+  if (expired) cls = "text-destructive";
+  else if (daysOut < 0) cls = "text-destructive";
   else if (daysOut < 7) cls = "text-amber-600 dark:text-amber-400";
   else cls = "text-muted-foreground";
   return (
     <span className={cls} title={expires.toLocaleString()}>
-      {daysOut < 0
-        ? `Expired ${-daysOut}d ago`
+      {expired
+        ? daysOut < 0
+          ? `Expired ${-daysOut}d ago`
+          : "Expired"
         : daysOut === 0
           ? "Expires today"
           : `In ${daysOut}d`}

@@ -76,10 +76,12 @@ import {
   type CustomField,
   type IPAMTemplate,
   type DNSZone,
+  type EffectiveDdns,
   type FreeCidrRange,
   type Router as NetworkRouter,
   type VLAN,
   type DHCPLeaseSyncResult,
+  type DnsSyncCommitResult,
   type MacHistoryEntry,
   type NATMapping,
   type NetworkContextEntry,
@@ -89,7 +91,11 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -98,6 +104,8 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   customFieldChecked,
+  missingRequiredCustomFields,
+  requiredFieldsMessage,
   withCustomFieldDefaults,
 } from "@/lib/customFieldValues";
 import {
@@ -105,6 +113,7 @@ import {
   nameInZoneError,
   parseTtlInput,
   summarizeZoneNames,
+  zoneKindForName,
 } from "@/lib/dnsNames";
 import {
   GATEWAY_FORWARD_SKIPPED_LABEL,
@@ -124,6 +133,7 @@ import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
@@ -173,6 +183,7 @@ import { cidrContains, compareNetwork, isCgnatCidr } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
 import { AggregationCandidatesBadge } from "@/components/ipam/AggregationSuggestions";
+import { toLocalInputValue } from "@/lib/localTime";
 import { FreeSpaceTreemap } from "@/components/ipam/FreeSpaceTreemap";
 import { SubnetUtilizationHistory } from "@/components/ipam/SubnetUtilizationHistory";
 import {
@@ -849,13 +860,23 @@ function CustomFieldsSection({
                     value={String(val)}
                     onChange={(e) => onChange(def.name, e.target.value)}
                   >
-                    {!def.is_required && (
-                      <option value="">
-                        {localUnset && hasInherited
-                          ? `— inherited: ${String(inheritedVal)} —`
+                    {/* Always offer the empty choice: without it the browser
+                        shows the first option for a value that matches none,
+                        and an option nobody chose is what the Save looks like
+                        it sends (#2478). A Required field with nothing to
+                        inherit cannot be left on it, so it is not pickable. */}
+                    <option
+                      value=""
+                      disabled={
+                        def.is_required && !(localUnset && hasInherited)
+                      }
+                    >
+                      {localUnset && hasInherited
+                        ? `— inherited: ${String(inheritedVal)} —`
+                        : def.is_required
+                          ? "— Select —"
                           : "— None —"}
-                      </option>
-                    )}
+                    </option>
                     {def.options.map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
@@ -1241,9 +1262,10 @@ function DnsSettingsSection({
   const allAvailableZones: DNSZone[] = zoneQueries.flatMap(
     (q: { data?: DNSZone[] }) => q.data ?? [],
   );
-  // Exclude reverse-lookup zones (in-addr.arpa, ip6.arpa) from primary/additional pickers
+  // Exclude reverse-lookup zones (under in-addr.arpa / ip6.arpa, by label —
+  // not a name that merely contains "arpa", #2472) from primary/additional pickers
   const availableZones = allAvailableZones.filter(
-    (z) => !z.name.toLowerCase().includes("arpa"),
+    (z) => zoneKindForName(z.name) !== "reverse",
   );
 
   // Displayed values when inheriting
@@ -1426,13 +1448,13 @@ function DhcpSettingsSection({
   const { data: blockDhcp } = useQuery({
     queryKey: ["effective-dhcp-block", parentBlockId],
     queryFn: () => ipamApi.getEffectiveBlockDhcp(parentBlockId!),
-    enabled: !!parentBlockId,
+    enabled: dhcpOn && !!parentBlockId,
     staleTime: 30_000,
   });
   const { data: spaceDhcp } = useQuery({
     queryKey: ["effective-dhcp-space", fallbackSpaceId],
     queryFn: () => ipamApi.getEffectiveSpaceDhcp(fallbackSpaceId!),
-    enabled: !parentBlockId && !!fallbackSpaceId,
+    enabled: dhcpOn && !parentBlockId && !!fallbackSpaceId,
     staleTime: 30_000,
   });
   const effectiveDhcp = blockDhcp ?? spaceDhcp ?? null;
@@ -1979,6 +2001,9 @@ export function DdnsSettingsSection({
   domainOverride,
   ttlText,
   subnetNetwork,
+  inherit,
+  effective,
+  onInheritChange,
   onEnabledChange,
   onPolicyChange,
   onDomainOverrideChange,
@@ -1989,6 +2014,11 @@ export function DdnsSettingsSection({
   domainOverride: string | null;
   ttlText: string;
   subnetNetwork?: string;
+  /** #2475 — a subnet inherits its DDNS unless it opts out. Without
+   *  `onInheritChange` the section is the old subnet-only form. */
+  inherit?: boolean;
+  effective?: EffectiveDdns | null;
+  onInheritChange?: (v: boolean) => void;
   onEnabledChange: (v: boolean) => void;
   onPolicyChange: (v: DdnsPolicy) => void;
   onDomainOverrideChange: (v: string | null) => void;
@@ -2015,7 +2045,30 @@ export function DdnsSettingsSection({
     return `dhcp-${octets[2]}-${octets[3]}`;
   })();
 
-  const disabled = !enabled;
+  // While inheriting, the controls show what the subnet resolves to (the
+  // parent's settings), read-only — never the subnet's own stored values,
+  // which are not the ones in force (#2475).
+  const inheriting = inherit === true && !!onInheritChange;
+  const shown = inheriting && effective ? effective : null;
+  const shownEnabled = inheriting ? (effective?.enabled ?? false) : enabled;
+  const shownPolicy = (shown?.hostname_policy as DdnsPolicy) ?? policy;
+  const shownOverride = inheriting
+    ? (shown?.domain_override ?? null)
+    : domainOverride;
+  const shownTtl = inheriting
+    ? shown?.ttl == null
+      ? ""
+      : String(shown.ttl)
+    : ttlText;
+  const sourceText = !effective
+    ? "the parent block or space"
+    : effective.source === "block"
+      ? `block ${effective.source_name ?? ""}`.trim()
+      : effective.source === "space"
+        ? `space ${effective.source_name ?? ""}`.trim()
+        : "the parent block or space";
+
+  const disabled = inheriting || !shownEnabled;
 
   return (
     <div className="space-y-2">
@@ -2024,30 +2077,51 @@ export function DdnsSettingsSection({
           <Network className="h-3.5 w-3.5 text-muted-foreground" />
           <span className="text-xs font-medium">Dynamic DNS (from DHCP)</span>
         </div>
-        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => onEnabledChange(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          Enabled
-        </label>
+        <div className="flex items-center gap-3">
+          {onInheritChange && (
+            <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={inherit === true}
+                onChange={(e) => onInheritChange(e.target.checked)}
+                className="h-3.5 w-3.5"
+              />
+              Inherit from parent
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={shownEnabled}
+              disabled={inheriting}
+              onChange={(e) => onEnabledChange(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            Enabled
+          </label>
+        </div>
       </div>
-      {!enabled && (
+      {inheriting && (
+        <p className="text-xs text-muted-foreground italic">
+          {effective
+            ? `Inheriting from ${sourceText}: DDNS is ${effective.enabled ? "enabled" : "disabled"}.`
+            : "Inheriting from the parent block or space."}
+        </p>
+      )}
+      {!shownEnabled && !inheriting && (
         <p className="text-xs text-muted-foreground italic">
           When enabled, DHCP leases in this subnet will publish A/AAAA + PTR
           records into the subnet's forward / reverse zones.
         </p>
       )}
-      {enabled && (
+      {shownEnabled && (
         <div className="space-y-2 pl-5 border-l-2 border-muted">
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Hostname policy
             </span>
             <select
-              value={policy}
+              value={shownPolicy}
               onChange={(e) => onPolicyChange(e.target.value as DdnsPolicy)}
               disabled={disabled}
               className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
@@ -2064,19 +2138,21 @@ export function DdnsSettingsSection({
               <option value="disabled">disabled — no DDNS records</option>
             </select>
           </label>
-          {preview && policy !== "client_provided" && policy !== "disabled" && (
-            <p className="text-[11px] text-muted-foreground">
-              Generated names look like{" "}
-              <code className="rounded bg-muted px-1">{preview}</code>.
-            </p>
-          )}
+          {preview &&
+            shownPolicy !== "client_provided" &&
+            shownPolicy !== "disabled" && (
+              <p className="text-[11px] text-muted-foreground">
+                Generated names look like{" "}
+                <code className="rounded bg-muted px-1">{preview}</code>.
+              </p>
+            )}
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Domain override (optional)
             </span>
             <input
               type="text"
-              value={domainOverride ?? ""}
+              value={shownOverride ?? ""}
               onChange={(e) =>
                 onDomainOverrideChange(e.target.value.trim() || null)
               }
@@ -2096,7 +2172,7 @@ export function DdnsSettingsSection({
             <input
               type="text"
               inputMode="numeric"
-              value={ttlText}
+              value={shownTtl}
               onChange={(e) => onTtlTextChange(e.target.value)}
               placeholder="300"
               disabled={disabled}
@@ -2554,7 +2630,14 @@ export function CreateSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
-  // DDNS state — subnet-only, no inheritance for MVP
+  // DDNS state — a new subnet inherits unless the operator opts out (#2475)
+  const [ddnsInherit, setDdnsInherit] = useState(true);
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-block", blockId],
+    queryFn: () => ipamApi.getEffectiveBlockDdns(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     "client_or_generated",
@@ -2621,6 +2704,8 @@ export function CreateSubnetModal({
       setCustomFields((prev) => ({ ...prev, ...v.customFields }));
     }
     if (v.ddns) {
+      // A template's DDNS is this subnet's own, as its DNS group is (#1304).
+      setDdnsInherit(false);
       setDdnsEnabled(v.ddns.enabled);
       setDdnsPolicy(v.ddns.policy);
       setDdnsDomainOverride(v.ddns.domainOverride);
@@ -2669,6 +2754,15 @@ export function CreateSubnetModal({
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
+  // Values the new subnet inherits from its block chain count towards a
+  // Required field (#2478).
+  const { data: parentFields } = useQuery({
+    queryKey: ["block-effective-fields", blockId],
+    queryFn: () => ipamApi.effectiveBlockFields(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
+  const cfInherited = parentFields?.custom_fields ?? {};
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -2731,10 +2825,18 @@ export function CreateSubnetModal({
             }),
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -3013,6 +3115,7 @@ export function CreateSubnetModal({
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
+            inherited={cfInherited}
           />
         </div>
       )}
@@ -3044,6 +3147,9 @@ export function CreateSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -3114,6 +3220,15 @@ export function CreateSubnetModal({
             setError(null);
             if (typeof ddnsTtl === "string") {
               setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              shownCustomFields,
+              cfInherited,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
               return;
             }
             mutation.mutate();
@@ -3359,6 +3474,9 @@ export function AddAddressModal({
   const [reservedUntil, setReservedUntil] = useState<string>("");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  // #2469 — the pre-fill below may re-pick while zones are still arriving;
+  // it stops the moment the operator chooses (None included).
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   // Issue #25 — split-horizon publishing. Extra zone UUIDs to
   // publish beyond the singular primary. Only surfaced when the
   // subnet has ``dns_split_horizon`` on (effective).
@@ -3483,7 +3601,7 @@ export function AddAddressModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
 
   // When the block/subnet has an explicit primary zone and/or additional
   // zones, restrict the picker to just those. Falling back to every zone in
@@ -3498,21 +3616,34 @@ export function AddAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
-  // Pre-select the primary zone (dns_zone_id) or first zone when there's only one
+  // Pre-select the primary zone (dns_zone_id), or the first zone when the
+  // subnet pins no primary. The zones of a subnet can come from several DNS
+  // groups, each its own request, so the primary may arrive after another
+  // group's zones (#2469): wait for it (falling back to the first zone only
+  // once every group has answered) and re-pick when it lands, until the
+  // operator has chosen.
+  const primaryZoneId = effectiveDns?.dns_zone_id;
+  const zonesSettled = zoneQueries.every(
+    (q: { isLoading: boolean }) => !q.isLoading,
+  );
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z: DNSZone) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (dnsZoneTouched || availableZones.length === 0) return;
+    const target =
+      primaryZoneId &&
+      availableZones.some((z: DNSZone) => z.id === primaryZoneId)
+        ? primaryZoneId
+        : !primaryZoneId || zonesSettled
+          ? availableZones[0].id
+          : null;
+    if (target && target !== dnsZoneId) setDnsZoneId(target);
+  }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
-      const zoneParam = dnsZoneId || undefined;
+      // "None (no DNS record)" is sent as "" — an absent / null zone means
+      // "use the subnet's effective zone" to the API (#2466).
+      const zoneParam =
+        dnsZoneId || (availableZones.length > 0 ? "" : undefined);
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
         .filter((a) => a.name.length > 0);
@@ -3795,7 +3926,10 @@ export function AddAddressModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}
@@ -3955,8 +4089,8 @@ export function AddAddressModal({
               <p className="text-[11px] text-muted-foreground -mt-0.5">
                 Extra records pointing to this IP. CNAMEs point to{" "}
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
-                records point to the IP. Deleted automatically when the IP is
-                purged.
+                records point to the IP. Withdrawn while the IP is an orphan and
+                back when it is restored; deleted when the IP is purged.
                 {!dnsZoneId && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
@@ -4170,7 +4304,14 @@ function SyncMenu({
   onSyncAll,
   hasDhcp,
   hasDns,
+  dnsGate,
+  dhcpGate,
 }: {
+  // #2571 — props spread onto the DNS item when the caller may not sync it.
+  dnsGate?: { disabled?: boolean; title?: string };
+  // #2699 — DHCP and All run `POST /dhcp/servers/{id}/sync-leases`, a
+  // superadmin route whatever the caller's grants.
+  dhcpGate?: { disabled?: boolean; title?: string };
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
@@ -4184,7 +4325,15 @@ function SyncMenu({
       title="Sync IPAM with DNS and/or DHCP servers"
       items={[
         ...(hasDns
-          ? [{ key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns }]
+          ? [
+              {
+                key: "dns",
+                label: "DNS",
+                icon: Globe2,
+                onSelect: onSyncDns,
+                ...dnsGate,
+              },
+            ]
           : []),
         ...(hasDhcp
           ? [
@@ -4193,6 +4342,7 @@ function SyncMenu({
                 label: "DHCP",
                 icon: Server,
                 onSelect: onSyncDhcp,
+                ...dhcpGate,
               },
               // "All" is DHCP + the DNS drift: with DNS off it is just DHCP.
               ...(hasDns
@@ -4203,6 +4353,7 @@ function SyncMenu({
                       icon: RefreshCw,
                       separatorBefore: true,
                       onSelect: onSyncAll,
+                      ...dhcpGate,
                     },
                   ]
                 : []),
@@ -4387,6 +4538,9 @@ const NEEDS_ADDRESS_WRITE =
 const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
 const NEEDS_ADDRESS_DELETE =
   "Requires delete permission in IPAM, and write on this subnet or on an address set in it";
+const NEEDS_DNS_SYNC =
+  "Requires read permission in IPAM and write permission on subnets";
+const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_ORPHAN_PURGE =
   "Requires delete permission in IPAM and write permission on subnets";
 
@@ -4884,15 +5038,28 @@ export function SubnetDetail({
   // #1155 — the header's write actions, each on the check the server makes
   // for it, so a read-only operator is not handed a form that ends in
   // "Permission denied":
-  //   * Edit — write on subnets at the type level (PUT /subnets/{id}); the
-  //     reshaping tools (resize / split / merge / clean orphans) change the
-  //     subnet itself and ask for the same;
+  //   * Edit — write on THIS subnet (PUT /subnets/{id} takes a grant scoped
+  //     to it, #2438); the reshaping tools (resize / split / merge / clean
+  //     orphans) change the subnet itself and ask for write on subnets at
+  //     the type level, which is what their routes still want;
   //   * Allocate IP, Bulk allocate, Import addresses — write on this subnet
   //     or on an address set in it (#103), as the allocation routes do;
   //   * Scan with nmap — the nmap scan permission.
   const canWriteSubnets = perms.can("write", "subnet");
+  // Edit asks what ``PUT /subnets/{id}`` asks, and that route takes a grant
+  // scoped to this one subnet (#2438, #2569). The reshaping tools below keep
+  // the type-level ask: the server still refuses them to a scoped holder.
+  const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
+  // #2571 — DNS sync: the drift preview is a read on the IPAM router and the
+  // commit is write on subnets, both at the type level (a grant scoped to one
+  // subnet reaches neither, #2497).
+  const canDnsSync =
+    IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
+  const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
+  // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
+  const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
   // Bulk delete and Clean Orphans are deletes: the router gate wants
   // ``delete``, the handler write on the row's subnet or address set.
   const canDeleteIpam = canDeleteInIpam(
@@ -5570,6 +5737,8 @@ export function SubnetDetail({
             <SyncMenu
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
               hasDns={dnsOn}
+              dnsGate={dnsSyncGate}
+              dhcpGate={dhcpSyncGate}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -5627,7 +5796,7 @@ export function SubnetDetail({
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSubnet(true)}
-              {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+              {...permissionGate(canEditSubnet, NEEDS_SUBNET_WRITE)}
             >
               Edit
             </HeaderButton>
@@ -5807,7 +5976,8 @@ export function SubnetDetail({
               </div>
               <button
                 onClick={() => setShowDnsSync(true)}
-                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 dark:text-amber-200"
+                {...dnsSyncGate}
+                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-200"
               >
                 <Globe2 className="h-3 w-3" />
                 Open Sync DNS
@@ -6597,7 +6767,17 @@ export function SubnetDetail({
                               </td>
                               <td className="px-4 py-2 font-mono font-medium">
                                 <span className="inline-flex items-center gap-0.5">
-                                  {addr.address}
+                                  {/* The keyboard path to the row's detail
+                                      dialog, which a click on the row opens
+                                      (#2724). */}
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingAddress(addr)}
+                                    title="View details"
+                                    className="font-mono font-medium hover:underline focus-visible:underline focus:outline-none"
+                                  >
+                                    {addr.address}
+                                  </button>
                                   <CopyButton text={addr.address} />
                                 </span>
                               </td>
@@ -6866,27 +7046,31 @@ export function SubnetDetail({
                               >
                                 <div className="flex items-center justify-end gap-1">
                                   {addr.status === "orphan" ? (
-                                    <>
-                                      <button
-                                        onClick={() =>
-                                          restoreAddr.mutate(addr.id)
-                                        }
-                                        disabled={restoreAddr.isPending}
-                                        className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                        title="Restore (mark as allocated)"
-                                      >
-                                        <RefreshCw className="h-3.5 w-3.5" />
-                                      </button>
-                                      <button
-                                        onClick={() =>
-                                          setConfirmPurgeAddr(addr)
-                                        }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                        title="Permanently delete"
-                                      >
-                                        <Trash2 className="h-3.5 w-3.5" />
-                                      </button>
-                                    </>
+                                    // #2520 — restore / purge / edit / delete are writes:
+                                    // a row the operator may not write offers none.
+                                    permitsWrite ? (
+                                      <>
+                                        <button
+                                          onClick={() =>
+                                            restoreAddr.mutate(addr.id)
+                                          }
+                                          disabled={restoreAddr.isPending}
+                                          className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                          title="Restore (mark as allocated)"
+                                        >
+                                          <RefreshCw className="h-3.5 w-3.5" />
+                                        </button>
+                                        <button
+                                          onClick={() =>
+                                            setConfirmPurgeAddr(addr)
+                                          }
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          title="Permanently delete"
+                                        >
+                                          <Trash2 className="h-3.5 w-3.5" />
+                                        </button>
+                                      </>
+                                    ) : null
                                   ) : addr.auto_from_lease ? (
                                     // Mirror of a dynamic DHCP lease — the DHCP
                                     // server owns the state; editing or deleting
@@ -6898,7 +7082,8 @@ export function SubnetDetail({
                                     >
                                       <Lock className="h-3.5 w-3.5" />
                                     </span>
-                                  ) : !isReadOnly(addr.status) ? (
+                                  ) : !isReadOnly(addr.status) &&
+                                    permitsWrite ? (
                                     <>
                                       <button
                                         onClick={() => setEditingAddress(addr)}
@@ -7255,7 +7440,7 @@ type DnsSyncScope =
   | { kind: "block"; id: string; label: string }
   | { kind: "space"; id: string; label: string };
 
-function DnsSyncModal({
+export function DnsSyncModal({
   scope,
   onClose,
 }: {
@@ -7273,6 +7458,8 @@ function DnsSyncModal({
     create_for_ip_ids?: string[];
     update_record_ids?: string[];
     delete_stale_record_ids?: string[];
+    // #2471 — missing rows left unticked; the API writes none of them.
+    skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
   }) =>
     scope.kind === "subnet"
       ? ipamApi.dnsSyncCommit(scope.id, body)
@@ -7317,25 +7504,30 @@ function DnsSyncModal({
   const [selMissing, setSelMissing] = useState<Set<string>>(new Set());
   const [selMismatched, setSelMismatched] = useState<Set<string>>(new Set());
   const [selStale, setSelStale] = useState<Set<string>>(new Set());
-  const [result, setResult] = useState<{
-    created: number;
-    updated: number;
-    deleted: number;
-    errors: string[];
-  } | null>(null);
+  const [result, setResult] = useState<DnsSyncCommitResult | null>(null);
 
-  // Default-select everything when the report first arrives so the common
-  // case (user wants to fix all drift) is one click. They can untick
-  // individual rows to skip suspected manual edits.
+  // Missing and mismatched rows start selected, so the common case (publish
+  // what IPAM expects) is one click; the operator can untick a row to skip a
+  // suspected manual edit. Stale rows start UNselected (#2577): each one is a
+  // permanent delete pushed to the DNS server, and a delete must be the
+  // operator's explicit choice, never the default a single Apply carries.
   useEffect(() => {
     if (!data) return;
     setSelMissing(new Set(data.missing.map((m) => missingKey(m))));
     setSelMismatched(new Set(data.mismatched.map((m) => m.record_id)));
-    setSelStale(new Set(data.stale.map((s) => s.record_id)));
+    setSelStale(new Set());
   }, [data]);
 
   const commitMut = useMutation({
-    mutationFn: async () => {
+    // The selection is passed in at click time rather than read from this
+    // render's closure: React Query refreshes ``mutationFn`` in an effect, so
+    // a fast click could otherwise commit an earlier, emptier selection
+    // (#2725). The Apply label reads the same state, so the two always agree.
+    mutationFn: async (sel: {
+      missing: Set<string>;
+      mismatched: Set<string>;
+      stale: Set<string>;
+    }) => {
       if (!data) throw new Error("No preview");
       // #516 — ensure reverse (PTR) zones exist before creating PTRs.
       // Idempotent; runs here (on Apply) rather than on modal open. A
@@ -7350,16 +7542,24 @@ function DnsSyncModal({
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
-      // independently. Backend just needs unique IP IDs to re-sync —
-      // sync_dns_record handles every record.
+      // independently. The API re-syncs each address whole, so the rows
+      // left unticked ride along as ``skip_records`` (#2471) and are not
+      // written.
       const ipIds = new Set<string>();
       for (const m of data.missing) {
-        if (selMissing.has(missingKey(m))) ipIds.add(m.ip_id);
+        if (sel.missing.has(missingKey(m))) ipIds.add(m.ip_id);
       }
       return commitFn({
         create_for_ip_ids: Array.from(ipIds),
-        update_record_ids: Array.from(selMismatched),
-        delete_stale_record_ids: Array.from(selStale),
+        update_record_ids: Array.from(sel.mismatched),
+        delete_stale_record_ids: Array.from(sel.stale),
+        skip_records: data.missing
+          .filter((m) => !sel.missing.has(missingKey(m)))
+          .map((m) => ({
+            ip_id: m.ip_id,
+            record_type: m.record_type,
+            zone_id: m.zone_id,
+          })),
       });
     },
     onSuccess: (res) => {
@@ -7509,6 +7709,16 @@ function DnsSyncModal({
                 <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs">
                   Applied: {result.created} created · {result.updated} updated ·{" "}
                   {result.deleted} deleted
+                  {(result.skipped_stale_record_ids?.length ?? 0) > 0 && (
+                    <div className="mt-1 text-amber-700 dark:text-amber-400">
+                      {result.skipped_stale_record_ids!.length} stale record
+                      {result.skipped_stale_record_ids!.length === 1
+                        ? " was"
+                        : "s were"}{" "}
+                      not deleted: no longer stale in this scope. Re-check to
+                      see the current report.
+                    </div>
+                  )}
                   {result.errors.length > 0 && (
                     <div className="mt-1 text-destructive">
                       {result.errors.length} error
@@ -7605,7 +7815,7 @@ function DnsSyncModal({
               {data.stale.length > 0 && (
                 <DriftSection
                   title="Stale records"
-                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). Selecting will permanently delete them and push the delete to BIND."
+                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). None are selected by default: selecting one will permanently delete it and push the delete to the DNS server."
                   count={data.stale.length}
                   selected={selStale.size}
                   onToggleAll={() =>
@@ -7670,7 +7880,13 @@ function DnsSyncModal({
                   </button>
                   {!closeOnly && data && (
                     <button
-                      onClick={() => commitMut.mutate()}
+                      onClick={() =>
+                        commitMut.mutate({
+                          missing: selMissing,
+                          mismatched: selMismatched,
+                          stale: selStale,
+                        })
+                      }
                       disabled={totalSelected === 0 || commitMut.isPending}
                       className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                     >
@@ -7921,6 +8137,8 @@ export function EditSubnetModal({
   onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
+  const canDeleteSubnet = usePermissions().can("delete", "subnet");
   const [name, setName] = useState(subnet.name ?? "");
   const [description, setDescription] = useState(subnet.description ?? "");
   const [gateway, setGateway] = useState(subnet.gateway ?? "");
@@ -7962,7 +8180,15 @@ export function EditSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     subnet.dhcp_server_group_id ?? null,
   );
-  // DDNS state — initialised from subnet
+  // DDNS state — initialised from subnet (#2475: inheritance is shown and kept)
+  const [ddnsInherit, setDdnsInherit] = useState(
+    subnet.ddns_inherit_settings ?? true,
+  );
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-subnet", subnet.id],
+    queryFn: () => ipamApi.getEffectiveSubnetDdns(subnet.id),
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(subnet.ddns_enabled ?? false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     subnet.ddns_hostname_policy ?? "client_or_generated",
@@ -8137,10 +8363,18 @@ export function EditSubnetModal({
         dns_split_horizon: dnsSplitHorizon,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -8242,7 +8476,8 @@ export function EditSubnetModal({
             <span>
               Any DHCP-leased addresses in this subnet and their auto-published
               DNS (DDNS) records will be revoked and removed. Manually-allocated
-              addresses are unaffected.
+              addresses go to Trash with the subnet, and the DNS records
+              published for them stop resolving until a superadmin restores it.
             </span>
           </div>
           {deleteError && (
@@ -8508,6 +8743,9 @@ export function EditSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -8605,7 +8843,8 @@ export function EditSubnetModal({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this subnet…
           </button>
@@ -8625,6 +8864,16 @@ export function EditSubnetModal({
             setError(null);
             if (typeof ddnsTtl === "string") {
               setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              customFields,
+              cfInheritedValues,
+              subnet.custom_fields,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
               return;
             }
             mutation.mutate();
@@ -8714,7 +8963,9 @@ function useDhcpSync(subnetId: string, enabled: boolean) {
             const next = new Map(prev);
             next.set(serverId, {
               status: "error",
-              error: err?.message ?? String(err),
+              // The server's reason ("Superadmin required"), never the
+              // transport's "Request failed with status code 403" (#2699).
+              error: formatApiError(err, err?.message ?? String(err)),
             });
             return next;
           });
@@ -8857,7 +9108,7 @@ function CounterRow({
   );
 }
 
-function DhcpSyncModal({
+export function DhcpSyncModal({
   subnetId,
   onClose,
 }: {
@@ -9014,19 +9265,6 @@ function withStoredValue(
   return value && !options.includes(value) ? [value, ...options] : options;
 }
 
-// Format a UTC ISO instant as a ``datetime-local`` value (local wall-clock,
-// ``YYYY-MM-DDTHH:MM``, no TZ suffix). Naively slicing ``toISOString()``
-// yields the *UTC* wall-clock, which the local-time input then misreads — so
-// every open→save cycle drifted the reservation by the browser's UTC offset
-// (#500). Shifting by the offset first makes the sliced string local, matching
-// how ``new Date(value)`` re-parses it on save.
-function toLocalDatetimeInput(iso: string): string {
-  const d = new Date(iso);
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
-    .toISOString()
-    .slice(0, 16);
-}
-
 export function EditAddressModal({
   address,
   onClose,
@@ -9042,7 +9280,7 @@ export function EditAddressModal({
   const [role, setRole] = useState<string>(address.role ?? "");
   // datetime-local needs ``YYYY-MM-DDTHH:MM`` in *local* wall-clock (#500).
   const [reservedUntil, setReservedUntil] = useState<string>(
-    address.reserved_until ? toLocalDatetimeInput(address.reserved_until) : "",
+    address.reserved_until ? toLocalInputValue(address.reserved_until) : "",
   );
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (address.custom_fields as Record<string, unknown>) ?? {},
@@ -9147,7 +9385,7 @@ export function EditAddressModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
 
   // When the block/subnet has an explicit primary zone and/or additional
   // zones, restrict the picker to just those. Falling back to every zone in
@@ -9162,6 +9400,43 @@ export function EditAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // #2468 — the zone the record is in need not be one the subnet lists any
+  // more (update_subnet re-syncs no address). Look it up among every group's
+  // zones, so the dialog names where the record really is instead of "None"
+  // or another zone. Only fetched when the stored zone is missing from the
+  // picker, and only once the subnet's own zones have answered.
+  const storedZoneId = address.forward_zone_id;
+  const subnetZonesSettled = zoneQueries.every(
+    (q: { isLoading: boolean }) => !q.isLoading,
+  );
+  const storedZoneMissing =
+    !!storedZoneId &&
+    dnsOn &&
+    subnetZonesSettled &&
+    !availableZones.some((z: DNSZone) => z.id === storedZoneId);
+  const { data: lookupGroups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    enabled: storedZoneMissing,
+    staleTime: 60_000,
+  });
+  const lookupQueries = useQueries({
+    queries: lookupGroups.map((g: { id: string }) => ({
+      queryKey: ["dns-zones", g.id],
+      queryFn: () => dnsApi.listZones(g.id),
+      staleTime: 60_000,
+      enabled: storedZoneMissing,
+    })),
+  });
+  const storedExtraZone: DNSZone | undefined = storedZoneMissing
+    ? lookupQueries
+        .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
+        .find((z: DNSZone) => z.id === storedZoneId)
+    : undefined;
+  const pickerZones: DNSZone[] = storedExtraZone
+    ? [...availableZones, storedExtraZone]
+    : availableZones;
+
   // Pre-select the IP's *current* forward zone — NOT the subnet's primary.
   // Defaulting to the primary meant a no-op (or hostname-only) Save re-homed
   // the A/AAAA record into the primary zone, silently moving it off an
@@ -9169,15 +9444,15 @@ export function EditAddressModal({
   // stays on the "None" option so an unrelated edit doesn't fabricate a
   // record; the operator can still pick a zone explicitly to add one.
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
+    if (!dnsZoneId && pickerZones.length > 0) {
       const current = address.forward_zone_id;
-      if (current && availableZones.some((z: DNSZone) => z.id === current)) {
+      if (current && pickerZones.some((z: DNSZone) => z.id === current)) {
         setDnsZoneId(current);
       }
     }
-  }, [availableZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pickerZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
+  const selectedZone = pickerZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
     hostname && selectedZone
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
@@ -9346,12 +9621,12 @@ export function EditAddressModal({
             availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone — only shown when zones are available */}
-        {availableZones.length > 0 && (
+        {pickerZones.length > 0 && (
           <Field label="DNS Zone">
-            {availableZones.length === 1 ? (
+            {pickerZones.length === 1 ? (
               <p className="text-xs text-muted-foreground py-1">
                 <Globe2 className="inline h-3 w-3 mr-1" />
-                {availableZones[0].name.replace(/\.$/, "")}
+                {pickerZones[0].name.replace(/\.$/, "")}
                 {fqdnPreview && (
                   <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
                     → {fqdnPreview}
@@ -9374,6 +9649,11 @@ export function EditAddressModal({
                     additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
                     noneOption="None (remove DNS record)"
                   />
+                  {storedExtraZone && (
+                    <option value={storedExtraZone.id}>
+                      {`${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
+                    </option>
+                  )}
                 </select>
                 {fqdnPreview && (
                   <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
@@ -9512,8 +9792,9 @@ export function EditAddressModal({
           <Field label="DNS Aliases">
             <div className="space-y-1.5">
               <p className="text-[11px] text-muted-foreground -mt-0.5">
-                Extra records pointing to this IP. Added records are removed
-                automatically when the IP is purged.
+                Extra records pointing to this IP. Added records are withdrawn
+                while the IP is an orphan and come back when it is restored;
+                they are deleted when the IP is purged.
               </p>
               {existingAliases.length === 0 ? (
                 <p className="text-xs text-muted-foreground/60 italic">
@@ -9788,7 +10069,9 @@ function NatRowsTable({
 }
 
 function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
-  const { data, isLoading } = useQuery({
+  // Looking Glass routes take read on 'bgp_lg_peer' (#2704).
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
+  const { data, isLoading, error } = useQuery({
     queryKey: ["bgp-lg-routes-by-subnet", subnetId],
     queryFn: () =>
       lookingGlassApi.searchRoutes({
@@ -9797,8 +10080,20 @@ function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
         limit: 200,
       }),
     staleTime: 15_000,
+    enabled: canRead,
   });
 
+  if (!canRead || error) {
+    return (
+      <p className="px-6 py-4 text-sm text-muted-foreground">
+        {error ? (
+          <ListReadError error={error} what="BGP routes" />
+        ) : (
+          "You don't have permission to see BGP routes."
+        )}
+      </p>
+    );
+  }
   if (isLoading) {
     return <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>;
   }
@@ -10441,7 +10736,7 @@ function BulkEditAddressesModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
   const explicitZoneIds = [
     ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
     ...(effectiveDns?.dns_additional_zone_ids ?? []),
@@ -11222,7 +11517,7 @@ function ConfirmDeleteModal({
  * (amber, reversible; DNS / DHCP cascades still happen but the IPAM row
  * stays so the address can be restored) or permanently delete (red, irreversible).
  * The two colors distinguish the tradeoff at a glance. */
-function DeleteOrOrphanModal({
+export function DeleteOrOrphanModal({
   address,
   onOrphan,
   onPurge,
@@ -11251,8 +11546,9 @@ function DeleteOrOrphanModal({
           <p className="mt-1 text-xs text-muted-foreground">
             The row is kept but marked <code>orphan</code>, greyed out in the
             list, and excluded from next-free allocation. DNS and DHCP cascades
-            still run. You can restore or permanently delete it later from the
-            orphans view.
+            still run: its DNS records and aliases leave the zone. You can
+            restore or permanently delete it later from the orphans view;
+            restoring it publishes its DNS records and aliases again.
           </p>
         </div>
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
@@ -11420,7 +11716,7 @@ export function ConfirmDestroyModal({
  * linked VRF's name + RD + RTs as badges. Falls back to the legacy freeform
  * ``vrf_name`` / ``route_distinguisher`` / ``route_targets`` columns for
  * backward-compat with rows created before issue #86 phase 1. */
-function SpaceVrfBadges({
+export function SpaceVrfBadges({
   space,
   onEdit,
 }: {
@@ -11430,11 +11726,17 @@ function SpaceVrfBadges({
    *  that ends in "Permission denied". */
   onEdit?: () => void;
 }) {
+  // The VRF routes take read on 'vrf'. Without it the list is not asked,
+  // and a space linked to a VRF says so rather than "not configured"
+  // (#2704).
+  const canReadVrf = usePermissions().can("read", "vrf");
   const { data: vrfs } = useQuery({
     queryKey: ["vrfs-picker"],
     queryFn: () => vrfsApi.list(),
     staleTime: 60_000,
+    enabled: canReadVrf,
   });
+  const vrfHidden = !!space.vrf_id && !canReadVrf;
   const linkedVrf = space.vrf_id
     ? (vrfs ?? []).find((v) => v.id === space.vrf_id)
     : null;
@@ -11448,6 +11750,7 @@ function SpaceVrfBadges({
 
   const hasAny =
     vrfName ||
+    vrfHidden ||
     rd ||
     space.asn_id ||
     (importTargets && importTargets.length > 0) ||
@@ -11473,6 +11776,14 @@ function SpaceVrfBadges({
 
   return (
     <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      {vrfHidden && !vrfName && (
+        <span
+          className="rounded border px-1.5 py-0.5"
+          title="This space is linked to a VRF you may not read (vrf)"
+        >
+          VRF: linked, not shown
+        </span>
+      )}
       {vrfName && (
         <span className="rounded border px-1.5 py-0.5 font-mono">
           VRF: {vrfName}
@@ -11503,11 +11814,23 @@ function SpaceVrfBadges({
 }
 
 function SpaceAsnBadge({ asnId }: { asnId: string }) {
+  const canRead = usePermissions().can("read", "manage_asns");
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: canRead,
   });
+  if (!canRead) {
+    return (
+      <span
+        className="rounded border px-1.5 py-0.5"
+        title="This space names an ASN you may not read (manage_asns)"
+      >
+        ASN: linked, not shown
+      </span>
+    );
+  }
   const asn = (data?.items ?? []).find((a) => a.id === asnId);
   if (!asn) return null;
   return (
@@ -12053,6 +12376,15 @@ export function CreateBlockModal({
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
+  // Values inherited from the parent block chain count towards a Required
+  // field (#2478).
+  const { data: parentFields } = useQuery({
+    queryKey: ["block-effective-fields", parentBlockId],
+    queryFn: () => ipamApi.effectiveBlockFields(parentBlockId),
+    enabled: !!parentBlockId,
+    staleTime: 30_000,
+  });
+  const cfInherited = parentFields?.custom_fields ?? {};
 
   const { data: blockTemplates } = useQuery({
     queryKey: ["ipam-templates", "block"],
@@ -12219,6 +12551,7 @@ export function CreateBlockModal({
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
+            inherited={cfInherited}
           />
         </div>
       )}
@@ -12291,6 +12624,15 @@ export function CreateBlockModal({
         <button
           onClick={() => {
             setError(null);
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              shownCustomFields,
+              cfInherited,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={!network || mutation.isPending}
@@ -12637,6 +12979,9 @@ export function EditBlockModal({
           onZoneIdChange={setDnsZoneId}
           onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
           parentBlockId={block.parent_block_id}
+          // A top-level block inherits from its space (#2477), as its DHCP
+          // tab and New IP Block already do.
+          fallbackSpaceId={!block.parent_block_id ? block.space_id : undefined}
         />
       )}
 
@@ -12717,6 +13062,16 @@ export function EditBlockModal({
         <button
           onClick={() => {
             setError(null);
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              customFields,
+              cfInheritedValues,
+              block.custom_fields,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={mutation.isPending}
@@ -13183,6 +13538,9 @@ export function BlockDetailView({
   const [freeRangePreset, setFreeRangePreset] = useState<FreeCidrRange | null>(
     null,
   );
+  // The block a Find Free row names (it can be a child of this block), so
+  // "Create subnet here" files the subnet under it, not under this block (#2417).
+  const [findFreeBlockId, setFindFreeBlockId] = useState<string | null>(null);
 
   const crumbs: BreadcrumbItem[] = [
     { label: spaceName, variant: "space", onClick: onSelectSpace },
@@ -13458,11 +13816,12 @@ export function BlockDetailView({
       {showCreateSubnet && (
         <CreateSubnetModal
           spaceId={block.space_id}
-          defaultBlockId={block.id}
+          defaultBlockId={findFreeBlockId ?? block.id}
           defaultNetwork={freeRangePreset?.network}
           onClose={() => {
             setShowCreateSubnet(false);
             setFreeRangePreset(null);
+            setFindFreeBlockId(null);
           }}
         />
       )}
@@ -13541,8 +13900,10 @@ export function BlockDetailView({
         <FindFreeModal
           space={space}
           defaultBlockId={block.id}
+          defaultBlockLabel={block.network}
           onClose={() => setShowFindFree(false)}
-          onPickCidr={(cidr) => {
+          onPickCidr={(cidr, parentBlockId) => {
+            setFindFreeBlockId(parentBlockId);
             setFreeRangePreset({
               network: cidr,
               first: "",
@@ -13739,7 +14100,7 @@ export function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {hasBlockFilter || hasTagFilter
+                  {hasBlockFilter || hasTagFilter || hasRoleFilter
                     ? "No results match the active filters."
                     : "This block has no child blocks or subnets yet."}
                 </p>
@@ -14263,6 +14624,7 @@ function isMulticastCidr(cidr: string): boolean {
 }
 
 function BgpBlockPanel({ block }: { block: IPBlock }) {
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
   const { data, isLoading } = useQuery({
     queryKey: ["bgp-lg-routes-by-block", block.id],
     queryFn: () =>
@@ -14272,8 +14634,9 @@ function BgpBlockPanel({ block }: { block: IPBlock }) {
         limit: 200,
       }),
     staleTime: 15_000,
+    enabled: canRead,
   });
-  if (isLoading) return null;
+  if (!canRead || isLoading) return null;
   const items = data?.items ?? [];
   if (items.length === 0) return null;
 
@@ -14308,14 +14671,16 @@ function MulticastGroupsPanel({
   space: IPSpace;
   block: IPBlock;
 }) {
+  const canRead = usePermissions().can("read", "multicast");
   const { data, isLoading } = useQuery({
     queryKey: ["multicast-groups", "by-space", space.id],
     queryFn: () =>
       multicastApi.list({ space_id: space.id, limit: 500, offset: 0 }),
     staleTime: 30_000,
+    enabled: canRead,
   });
 
-  if (isLoading) return null;
+  if (!canRead || isLoading) return null;
   const allItems = data?.items ?? [];
   // Filter to addresses that fall inside this block's CIDR. The
   // backend list endpoint doesn't have a "by-CIDR" filter, so we
@@ -16397,13 +16762,17 @@ export function IPAMPage() {
   // (one-shot semantics).
   const highlightTargetSubnetRef = useRef<string | null>(null);
 
-  const { data: spaces, isLoading } = useQuery({
+  const {
+    data: spaces,
+    isLoading,
+    error: spacesError,
+  } = useQuery({
     queryKey: ["spaces"],
     queryFn: ipamApi.listSpaces,
   });
 
   // Fetch ALL blocks so deep-link can look up any block by ID
-  const { data: allBlocks } = useQuery({
+  const { data: allBlocks, error: blocksError } = useQuery({
     queryKey: ["blocks"],
     queryFn: () => ipamApi.listBlocks(),
   });
@@ -16465,6 +16834,28 @@ export function IPAMPage() {
       setPendingHighlightAddress(null);
     }
   }, [selectedSubnet, pendingHighlightAddress]);
+
+  // #2569 — a holder whose grant names one subnet reads that subnet but not
+  // the spaces or blocks above it (both lists answer 403), so the restore
+  // below, which waits for all three lists, never fires and ``?subnet=X`` shows
+  // an empty page. When a parent list is refused, open the URL's subnet from
+  // ``GET /ipam/subnets/X`` itself; the tree may stay empty.
+  const urlSubnetId = searchParams.get("subnet");
+  const parentsRefused = spacesError != null || blocksError != null;
+  const { data: urlSubnet } = useQuery({
+    queryKey: ["subnet", urlSubnetId],
+    queryFn: () => ipamApi.getSubnet(urlSubnetId!),
+    enabled: !!urlSubnetId && parentsRefused,
+    retry: false,
+  });
+  useEffect(() => {
+    if (urlRestored.current || !urlSubnet || !parentsRefused) return;
+    if (urlSubnet.id !== urlSubnetId) return;
+    urlRestored.current = true;
+    setSelectedSubnet(urlSubnet);
+    setSelectedBlock(null);
+    setSelectedSpace(null);
+  }, [urlSubnet, urlSubnetId, parentsRefused]);
 
   // URL-state restore: reopen last-visited space/block/subnet on back-navigation
   // Depends on searchParams so that when `useStickyLocation` navigates from
@@ -16666,6 +17057,12 @@ export function IPAMPage() {
           {isLoading && (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading…</p>
           )}
+          {/* A refused or failed read says so, not an empty tree (#2437). */}
+          {!isLoading && !spaces && spacesError != null && (
+            <p className="px-2 py-3 text-xs">
+              <ListReadError error={spacesError} what="IP spaces" />
+            </p>
+          )}
           {spaces?.length === 0 && !isLoading && (
             <div className="flex flex-col items-center justify-center py-10 text-center">
               <Layers className="mb-2 h-8 w-8 text-muted-foreground/30" />
@@ -16754,7 +17151,11 @@ export function IPAMPage() {
           <div className="flex flex-1 flex-col items-center justify-center text-center">
             <Network className="mb-3 h-12 w-12 text-muted-foreground/20" />
             <p className="text-sm text-muted-foreground">
-              Select a space, block, or subnet from the tree.
+              {spacesError != null && !spaces ? (
+                <ListReadError error={spacesError} what="IP spaces" />
+              ) : (
+                "Select a space, block, or subnet from the tree."
+              )}
             </p>
           </div>
         )}

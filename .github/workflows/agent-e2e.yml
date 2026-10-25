@@ -74,7 +74,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.1
 
       - name: Create kind cluster
         # #983 — kind and the node image are BOTH pinned, and the node image
@@ -83,9 +83,11 @@ jobs:
         # action version was written (v0.22.0, Feb 2024, defaulted to 1.29),
         # so the number was real but written down nowhere.
         #
-        # v1.36.4 matches the k3s the appliance ISO bakes (Makefile
-        # K3S_VERSION, #974), so a chart change that only breaks on the
-        # appliance's Kubernetes minor fails here first. The digest pins the
+        # v1.36 matches the Kubernetes minor of the k3s the appliance ISO
+        # bakes (Makefile K3S_VERSION, #974), so a chart change that only
+        # breaks on the appliance's Kubernetes minor fails here first. The
+        # patch can trail k3s's: kind v0.33.0 publishes no v1.36.5 node image,
+        # so k3s v1.36.5+k3s1 (#2224) runs against v1.36.4 here. The digest pins the
         # exact image kind v0.33.0 publishes for that tag — a floating tag
         # would silently drift the thing being pinned.
         uses: helm/kind-action@v1

@@ -27,23 +27,37 @@ about more than one subnet narrow their own rows with
 ``_token_subnet_scope_uuids`` (or refuse, where the answer is a fact about the
 whole block and cannot be narrowed).
 
+Ids carried in a form field or a JSON body are NOT seen here: the body is
+the handler's to parse. A route that takes its subnet, block or space from
+the body (the IPAM imports) checks the token itself, and a route whose answer
+covers a whole block or space it was handed (an export) refuses a token bound
+to subnets rather than relying on this admit.
+
 Sessions and tokens without resource grants are untouched (one attribute
 read, no query). A token with a wildcard ``subnet`` grant is not checked on
 blocks and spaces. An id that does not parse, or an address that does not
 exist, is left to the handler, which answers 422 / 404 as before. The
 per-handler checks stay; this is the floor beneath them, and it covers routes
 added later without anyone having to remember.
+
+Mount a router with :func:`include_token_scoped`, never by adding the
+dependency by hand: it also marks the router's routes as honouring the
+binding, and a resource-bound token is refused on every unmarked route
+(``app.api.token_binding``).
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
+from typing import Any
 
-from fastapi import HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
+from app.api.token_binding import mark_router_token_scoped
 from app.core.permissions import (
     _token_grants_for,
     token_scope_allows,
@@ -51,7 +65,7 @@ from app.core.permissions import (
 )
 from app.models.ipam import IPAddress, IPBlock, Subnet
 
-__all__ = ["enforce_path_token_scope"]
+__all__ = ["enforce_path_token_scope", "include_token_scoped"]
 
 
 def _uuid(value: object) -> uuid.UUID | None:
@@ -156,3 +170,21 @@ async def enforce_path_token_scope(request: Request, current_user: CurrentUser, 
                 current_user, "ip_space", space_id
             ):
                 raise _deny("IP space")
+
+
+def include_token_scoped(
+    parent: APIRouter,
+    router: APIRouter,
+    *,
+    dependencies: Sequence[Any] = (),
+    **kwargs: Any,
+) -> None:
+    """Include ``router`` behind :func:`enforce_path_token_scope` and mark its
+    routes as honouring a token's resource binding, in one step, so neither
+    can be done without the other."""
+    mark_router_token_scoped(router)
+    parent.include_router(
+        router,
+        dependencies=[*dependencies, Depends(enforce_path_token_scope)],
+        **kwargs,
+    )

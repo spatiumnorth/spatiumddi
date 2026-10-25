@@ -20,7 +20,10 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
-import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import {
+  useApplianceAdminGate,
+  useCanReadApplianceLogs,
+} from "@/hooks/useApplianceAdmin";
 
 /**
  * Phase 4d (rewritten as Phase 11 wave 4) — Pod management tab.
@@ -142,6 +145,9 @@ function ContainerCard({
 }) {
   // #1342 — a pod's Restart / Stop / Start takes `admin` on `appliance`.
   const applianceGate = useApplianceAdminGate();
+  // Pod log text takes `admin` on `appliance`; the button is not drawn
+  // for a role that would be refused.
+  const canReadLogs = useCanReadApplianceLogs();
   const isRunning = container.state === "running";
   const healthTone =
     container.health === "healthy"
@@ -184,15 +190,17 @@ function ContainerCard({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            onClick={onLogs}
-            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
-            title="Stream logs"
-          >
-            <ScrollText className="h-3 w-3" />
-            Logs
-          </button>
+          {canReadLogs && (
+            <button
+              type="button"
+              onClick={onLogs}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+              title="Stream logs"
+            >
+              <ScrollText className="h-3 w-3" />
+              Logs
+            </button>
+          )}
           {container.is_spatium && isRunning && (
             <>
               <ActionButton
@@ -292,19 +300,27 @@ function LogsStreamModal({
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     (async () => {
+      // The server ends a log stream periodically (it re-validates the
+      // session and the token's lifetime); reconnect without re-tailing
+      // so lines aren't repeated.
+      let tail = 200;
       try {
-        for await (const line of streamApplianceContainerLogs(
-          container.name,
-          ctrl.signal,
-          200,
-        )) {
-          setLines((prev) => {
-            // Cap buffer at 2000 lines so a chatty container doesn't
-            // blow up React memory + keep the DOM small.
-            const next = [...prev, line];
-            if (next.length > 2000) next.splice(0, next.length - 2000);
-            return next;
-          });
+        while (!ctrl.signal.aborted) {
+          for await (const line of streamApplianceContainerLogs(
+            container.name,
+            ctrl.signal,
+            tail,
+          )) {
+            setLines((prev) => {
+              // Cap buffer at 2000 lines so a chatty container doesn't
+              // blow up React memory + keep the DOM small.
+              const next = [...prev, line];
+              if (next.length > 2000) next.splice(0, next.length - 2000);
+              return next;
+            });
+          }
+          tail = 0;
+          await new Promise((r) => setTimeout(r, 2000));
         }
       } catch (e) {
         if (!ctrl.signal.aborted) {

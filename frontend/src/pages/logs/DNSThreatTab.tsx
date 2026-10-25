@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -15,11 +16,16 @@ import {
 
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
+  authApi,
   dnsThreatApi,
+  formatApiError,
   type DNSClientWindow,
   type DNSTunnelSignal,
 } from "@/lib/api";
+
+const NEEDS_MUTE = "Requires write permission on servers";
 
 /**
  * Logs → DNS Threat (issue #699).
@@ -176,6 +182,17 @@ export function DNSThreatTab() {
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
   const qc = useQueryClient();
+  // #2531 — the mute routes take ``write`` on ``server`` (muting silences a
+  // critical alert); offer the controls only to a caller the server accepts.
+  const { can } = usePermissions();
+  const canMute = can("write", "server");
+  // Only a superadmin can change feature modules, so only they get the link.
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
+  const isSuperadmin = me?.is_superadmin ?? false;
   const refreshAll = () => {
     void qc.invalidateQueries({ queryKey: ["dns-threat-windows"] });
     void qc.invalidateQueries({ queryKey: ["dns-threat-summary"] });
@@ -234,9 +251,27 @@ export function DNSThreatTab() {
             <p className="mt-1 max-w-2xl text-xs text-muted-foreground">
               Scoring reads the <strong>names your clients look up</strong>, so
               it is disabled by default rather than switched on by an upgrade.
-              Enable the <strong>Security → DNS threat analytics</strong> module
-              in Settings to turn it on. It also needs query logging enabled on
-              at least one DNS server group before there is anything to score.
+              {isSuperadmin ? (
+                <>
+                  Enable <strong>DNS threat analytics</strong> (Security) on the{" "}
+                  <Link
+                    to="/admin/features"
+                    className="text-primary underline underline-offset-2"
+                  >
+                    Features &amp; Integrations
+                  </Link>{" "}
+                  page to turn it on.
+                </>
+              ) : (
+                <>
+                  Ask an administrator to enable{" "}
+                  <strong>DNS threat analytics</strong> (Security) on the
+                  Features &amp; Integrations page.
+                </>
+              )}{" "}
+              It also needs query logging enabled on at least one DNS server
+              group (DNS → Server Groups → the group → Options) before there is
+              anything to score.
             </p>
           </div>
         </div>
@@ -402,6 +437,7 @@ export function DNSThreatTab() {
                   detection={detection}
                   onMute={() => setMuting(w.client_ip)}
                   onUnmute={() => unmute.mutate(w.client_ip)}
+                  canMute={canMute}
                 />
               ))}
             </tbody>
@@ -412,7 +448,8 @@ export function DNSThreatTab() {
       {showMutes && (
         <MutedClientsPanel
           onUnmute={(ip) => unmute.mutate(ip)}
-          error={unmute.error as Error | null}
+          error={unmute.error}
+          canMute={canMute}
         />
       )}
 
@@ -466,6 +503,7 @@ function Row({
   onMute,
   onUnmute,
   detection,
+  canMute,
 }: {
   w: DNSClientWindow;
   open: boolean;
@@ -474,6 +512,7 @@ function Row({
   onInspect: () => void;
   onMute: () => void;
   onUnmute: () => void;
+  canMute: boolean;
 }) {
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
@@ -535,6 +574,7 @@ function Row({
               <button
                 type="button"
                 onClick={onUnmute}
+                {...permissionGate(canMute, NEEDS_MUTE)}
                 className="inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
               >
                 Unmute
@@ -543,6 +583,7 @@ function Row({
               <button
                 type="button"
                 onClick={onMute}
+                {...permissionGate(canMute, NEEDS_MUTE)}
                 className="inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
               >
                 <BellOff className="h-3 w-3" />
@@ -874,7 +915,7 @@ function MuteModal({
 
         {save.isError && (
           <p className="text-xs text-rose-600 dark:text-rose-400">
-            {(save.error as Error).message}
+            {formatApiError(save.error, "Could not mute this client")}
           </p>
         )}
 
@@ -913,9 +954,11 @@ function MuteModal({
 function MutedClientsPanel({
   onUnmute,
   error,
+  canMute,
 }: {
   onUnmute: (ip: string) => void;
-  error: Error | null;
+  error: unknown;
+  canMute: boolean;
 }) {
   const q = useQuery({
     queryKey: ["dns-threat-mutes"],
@@ -934,9 +977,9 @@ function MutedClientsPanel({
           why a client started appearing again.
         </p>
       </div>
-      {error && (
+      {error != null && (
         <p className="border-b px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
-          Could not un-mute: {error.message}
+          Could not un-mute: {formatApiError(error)}
         </p>
       )}
       {q.isLoading ? (
@@ -973,6 +1016,7 @@ function MutedClientsPanel({
                 <button
                   type="button"
                   onClick={() => onUnmute(m.client_ip)}
+                  {...permissionGate(canMute, NEEDS_MUTE)}
                   className="shrink-0 rounded-md border px-2.5 py-1 hover:bg-accent"
                 >
                   Unmute

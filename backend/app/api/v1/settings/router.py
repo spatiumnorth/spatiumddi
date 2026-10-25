@@ -20,16 +20,21 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import func, select, text
-from sqlalchemy import inspect as sa_inspect
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.celery_dispatch import dispatch
+from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
-from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.core.permissions import (
+    is_effective_superadmin,
+    refuse_and_audit,
+    user_has_permission,
+)
 from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
@@ -50,6 +55,7 @@ from app.models.settings import (
     PlatformSettings,
 )
 from app.services import audit_forward as audit_forward_svc
+from app.services import feature_modules as fm_svc
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
     mask_proxy_url,
@@ -164,6 +170,10 @@ class SettingsResponse(BaseModel):
     oui_lookup_enabled: bool
     oui_update_interval_hours: int
     oui_last_updated_at: datetime | None
+    # #2196 / #2197 — all eleven integration switches. Each is the state of
+    # the integration's feature module (``integrations.*``), filled in by
+    # ``_settings_response``; the ``PlatformSettings`` column of the same
+    # name is only a derived copy and is never what this reports.
     integration_kubernetes_enabled: bool
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
@@ -171,6 +181,10 @@ class SettingsResponse(BaseModel):
     integration_unifi_enabled: bool
     integration_cloud_enabled: bool
     integration_opnsense_enabled: bool
+    integration_netbird_enabled: bool
+    integration_panos_enabled: bool
+    integration_fortinet_enabled: bool
+    integration_meraki_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -275,6 +289,15 @@ class SettingsResponse(BaseModel):
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
     ssh_lockdown: bool = False
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Read by the nightly prune tasks; every one is superadmin-only to
+    # change (not in ``SETTINGS_DELEGATE_WRITABLE``).
+    soft_delete_purge_days: int = 30
+    dhcp_lease_history_retention_days: int = 90
+    pcap_retention_days: int = 7
+    appliance_revoked_retention_days: int = 30
+    metric_retention_days: int = 7
+    log_retention_hours: int = 24
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -544,6 +567,16 @@ class SNMPV3UserUpdate(BaseModel):
             )
         return s
 
+    @field_validator("auth_pass", "priv_pass")
+    @classmethod
+    def _passphrase_single_line(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # The passphrase is written into a ``createUser`` line of
+        # snmpd.conf, which ends at the first newline. ``None`` (keep) and
+        # ``""`` (clear) pass through.
+        if v:
+            reject_control_chars(v, info.field_name or "value")
+        return v
+
     @field_validator("auth_protocol")
     @classmethod
     def _valid_auth_proto(cls, v: str) -> str:
@@ -584,7 +617,7 @@ class NTPCustomServerUpdate(BaseModel):
         # server directive, so reject whitespace in the hostname here.
         if any(c.isspace() for c in s):
             raise ValueError("host may not contain whitespace")
-        return s
+        return reject_control_chars(s, "host")
 
 
 class SyslogTargetUpdate(BaseModel):
@@ -721,7 +754,9 @@ class AptSourceUpdate(BaseModel):
     def _suites_nonempty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("suites may not be empty")
-        return v.strip()
+        # Rendered into the one-line ``deb`` entry; a newline would end it
+        # and start another entry. Spaces stay legal (several suites).
+        return reject_control_chars(v.strip(), "suites")
 
     @field_validator("signed_by_key_id")
     @classmethod
@@ -846,6 +881,58 @@ def _merge_apt_auth(
     return out
 
 
+# Fields a delegated ``write:settings`` holder may change through
+# ``PUT /settings``. Every other field is SUPERADMIN-ONLY, which is the
+# default: a field added to ``SettingsUpdate`` is superadmin-only until it is
+# listed here on purpose. These are IPAM / DNS / DHCP working preferences:
+# none changes authentication, what the login page shows, a URL the
+# platform hands to an identity provider, host configuration pushed to
+# appliances, or a connection the platform makes to anything off-prem. The
+# rest is either one of those or points clients and appliances at servers
+# (DHCP default DNS / NTP servers, resolvers), so it stays with superadmins,
+# matching the Settings page, which offers every field to superadmins only.
+# Integration switches are handled separately (only a real flip is gated),
+# and the two acknowledgement flags are not fields.
+SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
+    {
+        "ip_allocation_strategy",
+        "utilization_warn_threshold",
+        "utilization_critical_threshold",
+        "utilization_max_prefix_ipv4",
+        "utilization_max_prefix_ipv6",
+        "subnet_tree_default_expanded_depth",
+        "dns_default_ttl",
+        "dns_default_zone_type",
+        "dns_default_dnssec_validation",
+        "dns_recursive_by_default",
+        "dns_auto_sync_enabled",
+        "dns_auto_sync_interval_minutes",
+        "dns_auto_sync_delete_stale",
+        "dns_pull_from_server_enabled",
+        "dns_pull_from_server_interval_minutes",
+        "dhcp_pull_leases_enabled",
+        "dhcp_pull_leases_interval_seconds",
+        "dhcp_default_lease_time",
+        "dhcp_default_domain_name",
+        "dhcp_default_domain_search",
+        "vrf_strict_rd_validation",
+    }
+)
+
+
+# Data-retention windows (#2273), each read by a nightly prune task. All are
+# superadmin-only (none is in ``SETTINGS_DELEGATE_WRITABLE``): shortening one
+# deletes data on the next sweep.
+RETENTION_FIELDS: tuple[str, ...] = (
+    "soft_delete_purge_days",
+    "dhcp_lease_history_retention_days",
+    "pcap_retention_days",
+    "appliance_revoked_retention_days",
+    "metric_retention_days",
+    "log_retention_hours",
+)
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -897,6 +984,10 @@ class SettingsUpdate(BaseModel):
     dhcp_default_lease_time: int | None = None
     oui_lookup_enabled: bool | None = None
     oui_update_interval_hours: int | None = None
+    # #2196 / #2197 — writing one of these switches the integration's
+    # feature module, exactly as Settings → Features does (superadmin-only,
+    # audited as a ``feature_module`` change). Sending the current value is a
+    # no-op, so a form that echoes the whole object back changes nothing.
     integration_kubernetes_enabled: bool | None = None
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
@@ -904,6 +995,10 @@ class SettingsUpdate(BaseModel):
     integration_unifi_enabled: bool | None = None
     integration_cloud_enabled: bool | None = None
     integration_opnsense_enabled: bool | None = None
+    integration_netbird_enabled: bool | None = None
+    integration_panos_enabled: bool | None = None
+    integration_fortinet_enabled: bool | None = None
+    integration_meraki_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
@@ -1002,6 +1097,19 @@ class SettingsUpdate(BaseModel):
     # smaller tick — an operator may have sent that one for another reason.
     ssh_lockdown_force: bool | None = None
     acknowledge_console_only: bool | None = None
+    # ── Data retention (#2273) ────────────────────────────────────
+    # Superadmin-only. 0 turns the trash purge, lease-history prune and
+    # revoked-appliance hard-delete off (keep forever), as each task
+    # already reads it. pcap / metric / log windows have no "off": a
+    # capture holds plaintext credentials, and the other two are
+    # high-volume tables. ``log_retention_hours`` is capped at 168 until
+    # #2185 replaces the single unbatched DELETE with partition drops.
+    soft_delete_purge_days: int | None = Field(default=None, ge=0, le=365)
+    dhcp_lease_history_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    pcap_retention_days: int | None = Field(default=None, ge=1, le=90)
+    appliance_revoked_retention_days: int | None = Field(default=None, ge=0, le=365)
+    metric_retention_days: int | None = Field(default=None, ge=1, le=365)
+    log_retention_hours: int | None = Field(default=None, ge=1, le=168)
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -1418,11 +1526,13 @@ class SettingsUpdate(BaseModel):
     @classmethod
     def validate_password_min_length(cls, v: int | None) -> int | None:
         # Floor at 6 even when operators relax the policy — anything
-        # shorter is a configuration mistake. Cap at 128 because bcrypt
-        # truncates inputs above 72 bytes; values past that are dead
-        # length the operator might assume is being checked.
-        if v is not None and not (6 <= v <= 128):
-            raise ValueError("Min password length must be between 6 and 128")
+        # shorter is a configuration mistake. Cap at 72: every path that
+        # sets a password refuses one over 72 bytes (bcrypt's limit, see
+        # password_policy.MAX_PASSWORD_BYTES), so a minimum above 72 would
+        # be a policy nobody can meet and would lock every password change
+        # out (#2619).
+        if v is not None and not (6 <= v <= 72):
+            raise ValueError("Min password length must be between 6 and 72")
         return v
 
     @field_validator("password_history_count")
@@ -1451,6 +1561,13 @@ class SettingsUpdate(BaseModel):
     def validate_session_timeout(cls, v: int | None) -> int | None:
         if v is not None and v < 0:
             raise ValueError("Must be >= 0 (0 = no timeout)")
+        return v
+
+    @field_validator("auto_logout_minutes")
+    @classmethod
+    def validate_auto_logout(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Must be >= 0 (0 = no warning)")
         return v
 
     @field_validator(
@@ -1577,6 +1694,32 @@ class SettingsUpdate(BaseModel):
             raise ValueError(f"snmp_version must be one of {sorted(_SNMP_VERSIONS)}")
         return v
 
+    @field_validator("snmp_sys_contact", "snmp_sys_location")
+    @classmethod
+    def _valid_snmp_sys_text(cls, v: str | None, info: ValidationInfo) -> str | None:
+        # Written into a ``sysContact`` / ``sysLocation`` line of
+        # snmpd.conf. That file is line-oriented, so a newline would end the
+        # line and the rest would be read as a directive of its own.
+        if v is None:
+            return None
+        return reject_control_chars(v, info.field_name or "value")
+
+    @field_validator("snmp_community")
+    @classmethod
+    def _valid_snmp_community(cls, v: str | None) -> str | None:
+        # Written unquoted as the community token of ``rocommunity
+        # <community> <source>``: a newline would start a new directive, and
+        # a space would move the next word into the source position. ``""``
+        # clears the stored community.
+        if not v:
+            return v
+        if has_control_chars(v) or any(c.isspace() for c in v):
+            raise ValueError(
+                "snmp_community must not contain whitespace or control characters "
+                "(newline, carriage return, NUL, tab or other non-printing characters)"
+            )
+        return v
+
     @field_validator("snmp_allowed_sources")
     @classmethod
     def _valid_snmp_sources(cls, v: list[str] | None) -> list[str] | None:
@@ -1621,6 +1764,7 @@ class SettingsUpdate(BaseModel):
                 continue
             if any(c.isspace() for c in s):
                 raise ValueError(f"pool hostname may not contain whitespace: {raw!r}")
+            reject_control_chars(s, "ntp_pool_servers")
             out.append(s)
         return out
 
@@ -1809,9 +1953,18 @@ def _column_defaults() -> dict[str, Any]:
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
+async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResponse:
+    """Serialise the settings row, with the integration switches read from
+    their feature modules (#2196) — the module is authoritative, and a
+    column that a module turned on before this row existed never received
+    would otherwise be reported here as off."""
+    resp = SettingsResponse.model_validate(settings)
+    return resp.model_copy(update=await fm_svc.integration_flags(db))
+
+
 @router.get("", response_model=SettingsResponse)
-async def get_settings(current_user: CurrentUser, db: DB) -> PlatformSettings:
-    return await _get_or_create(db)
+async def get_settings(current_user: CurrentUser, db: DB) -> SettingsResponse:
+    return await _settings_response(db, await _get_or_create(db))
 
 
 @router.get("/defaults")
@@ -1822,7 +1975,7 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
     body: SettingsUpdate, request: Request, current_user: CurrentUser, db: DB
-) -> PlatformSettings:
+) -> SettingsResponse:
     forbid_in_demo_mode("Platform settings updates are disabled")
     # Superadmin passes via user_has_permission shortcut; users with an
     # explicit `write`/`admin` grant on `settings` also pass.
@@ -1838,26 +1991,6 @@ async def update_settings(
     # reads ``changes`` as the set of fields to write or to audit.
     changes.pop("ssh_lockdown_force", None)
     changes.pop("acknowledge_console_only", None)
-
-    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
-    # model_validator already rejects override + explicitly-empty servers in
-    # the same request; this also catches the case it can't see — override
-    # selected (or already on) while the RESULTING server list is empty (e.g.
-    # servers omitted and the stored list is empty too). Override routes all
-    # host DNS to the global ``DNS=`` list, so an empty list means zero working
-    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
-    if "resolver_mode" in changes or "resolver_servers" in changes:
-        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
-        _resolver_resulting_servers = (
-            changes["resolver_servers"]
-            if "resolver_servers" in changes
-            else list(settings.resolver_servers or [])
-        )
-        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="resolver override mode requires at least one DNS server",
-            )
 
     # Branding is SUPERADMIN-ONLY (issues #885 / #887). These fields render
     # on the unauthenticated login page, so a delegated ``write:settings``
@@ -1899,6 +2032,70 @@ async def update_settings(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Appliance registration can only be changed by a superadmin",
         )
+
+    # #2196 / #2197 — an integration switch is its feature module. Popped out
+    # of ``changes`` so the generic setattr loop never writes the derived
+    # column on its own; a real change goes through the module below. Only a
+    # value that DIFFERS from the module counts, so echoing the current state
+    # back is a no-op. Superadmin-only, like the Settings → Features toggle it
+    # is equivalent to: a delegated ``write:settings`` editor must not be able
+    # to arm an integration that pulls from (and, for some, writes to) other
+    # infrastructure. Demo mode is already refused for the whole PUT above.
+    _integration_requested = {
+        f: changes.pop(f) for f in list(changes) if f in fm_svc.INTEGRATION_FIELD_TO_MODULE
+    }
+    _integration_flips: dict[str, bool] = {}
+    if _integration_requested:
+        _integration_current = await fm_svc.integration_flags(db)
+        _integration_flips = {
+            f: v for f, v in _integration_requested.items() if _integration_current[f] != v
+        }
+        if _integration_flips and not is_effective_superadmin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Integrations can only be switched on or off by a superadmin",
+            )
+
+    # Everything else outside SETTINGS_DELEGATE_WRITABLE is superadmin-only
+    # too. The checks above keep their own wording; this one covers the rest
+    # (app_base_url, authentication and password policy, appliance host
+    # configuration, outbound connections, ...). Runs before anything is
+    # written, so a refused request changes nothing.
+    _superadmin_only = sorted(f for f in changes if f not in SETTINGS_DELEGATE_WRITABLE)
+    if _superadmin_only and not is_effective_superadmin(current_user):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="update",
+            resource_type="platform_settings",
+            resource_id="1",
+            resource_display="Platform Settings",
+            reason="superadmin_only_settings: " + ", ".join(_superadmin_only),
+            detail=(
+                "These settings can only be changed by a superadmin: " + ", ".join(_superadmin_only)
+            ),
+        )
+
+    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
+    # model_validator already rejects override + explicitly-empty servers in
+    # the same request; this also catches the case it can't see — override
+    # selected (or already on) while the RESULTING server list is empty (e.g.
+    # servers omitted and the stored list is empty too). Override routes all
+    # host DNS to the global ``DNS=`` list, so an empty list means zero working
+    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
+    if "resolver_mode" in changes or "resolver_servers" in changes:
+        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+        _resolver_resulting_servers = (
+            changes["resolver_servers"]
+            if "resolver_servers" in changes
+            else list(settings.resolver_servers or [])
+        )
+        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="resolver override mode requires at least one DNS server",
+            )
 
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
@@ -1966,17 +2163,11 @@ async def update_settings(
     # The legacy webhook's URL + Authorization header (#1502): same
     # encrypt-and-redact shape, so neither reaches the column in clear or the
     # ``platform_settings_updated`` log line below.
-    _legacy_webhook_written: list[str] = []
     for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
         if _field in changes:
             raw = changes.pop(_field)
             setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
             changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
-            _legacy_webhook_written.append(_field)
-    if _legacy_webhook_written:
-        # GHSA-g9gv-9qp2-3qwm: blank the plaintext leftovers too, in the
-        # same transaction, or the pre-upgrade value outlives the change.
-        await _blank_legacy_plaintext(db, "platform_settings", settings.id, _legacy_webhook_written)
 
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
@@ -2249,6 +2440,15 @@ async def update_settings(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
                 ) from exc
 
+    # #2273 — remember the retention windows this request changes, for the
+    # dedicated audit row below (shortening one deletes data on the next
+    # nightly prune, so old and new values are both recorded).
+    _retention_old = {
+        f: getattr(settings, f)
+        for f in RETENTION_FIELDS
+        if f in changes and getattr(settings, f) != changes[f]
+    }
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2263,6 +2463,26 @@ async def update_settings(
         ):
             continue
         setattr(settings, field, value)
+
+    for field, value in _integration_flips.items():
+        module_id = fm_svc.INTEGRATION_FIELD_TO_MODULE[field]
+        await fm_svc.set_module_enabled(db, module_id, value, user_id=current_user.id)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="feature_module",
+                resource_id=module_id,
+                resource_display=fm_svc.MODULES_BY_ID[module_id].label,
+                result="success",
+                new_value={"enabled": value},
+            )
+        )
+    if _integration_flips:
+        await fm_svc.sync_integration_settings_mirror(db)
+        changes.update(_integration_flips)
 
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
@@ -2344,6 +2564,26 @@ async def update_settings(
                     "dnssec": settings.resolver_dnssec,
                     "dns_over_tls": settings.resolver_dns_over_tls,
                 },
+            )
+        )
+
+    # #2273 — dedicated audit row for a data-retention change (non-negotiable
+    # #4; the ``logger.info`` below is not an ``audit_log`` row). Only real
+    # changes are recorded, so echoing the form back writes nothing.
+    if _retention_old:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="retention",
+                resource_display="Data retention",
+                result="success",
+                changed_fields=sorted(_retention_old),
+                old_value=_retention_old,
+                new_value={f: getattr(settings, f) for f in _retention_old},
             )
         )
 
@@ -2526,6 +2766,12 @@ async def update_settings(
 
         _maintenance_mode.invalidate_cache()
 
+    # Same for the idle-session timeout the auth layer enforces.
+    if "session_timeout_minutes" in changes:
+        from app.core import session_idle as _session_idle
+
+        _session_idle.invalidate_cache()
+
     # The settings router has no request-scoped wake collector, so
     # publish directly after the commit. Only fire when a host-config
     # field actually changed so unrelated settings writes don't wake
@@ -2533,8 +2779,11 @@ async def update_settings(
     if _host_config_touched:
         await publish_wake(HOSTCONFIG_ALL)
 
+    if _integration_flips:
+        fm_svc.invalidate_cache()
+
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
-    return settings
+    return await _settings_response(db, settings)
 
 
 # ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
@@ -2559,8 +2808,9 @@ async def update_resolver_settings(
 ) -> ResolverSettingsResponse:
     """Scoped write of just the appliance DNS-resolver config (issue #158).
 
-    Same guardrails as the combined PUT: demo-mode block, ``write`` on
-    ``settings`` permission gate, a dedicated audit row (``resource_id=
+    Same guardrails as the combined PUT: demo-mode block, superadmin only
+    (the resolver_* fields are superadmin-only there too — they set the
+    appliance hosts' own DNS), a dedicated audit row (``resource_id=
     'resolver'``), and a HOSTCONFIG_ALL wake so parked supervisor / DHCP-agent
     long-polls pick the change up. Only the resolver_* columns are touched.
     """
@@ -2569,6 +2819,11 @@ async def update_resolver_settings(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'write' on 'settings'",
+        )
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The appliance DNS resolver can only be changed by a superadmin",
         )
 
     settings = await _get_or_create(db)
@@ -2659,7 +2914,7 @@ async def trigger_reverse_dns_run(current_user: CurrentUser, db: DB) -> ReverseD
     try:
         from app.tasks.reverse_dns import sweep_reverse_dns
 
-        result = sweep_reverse_dns.delay(force=True)
+        result = await dispatch(sweep_reverse_dns, force=True)
         task_id = result.id
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         logger.warning("reverse_dns_trigger_enqueue_failed", error=str(exc))
@@ -2971,7 +3226,7 @@ async def trigger_oui_refresh(current_user: CurrentUser, db: DB) -> OUIRefreshRe
     # into its startup path.
     from app.tasks.oui_update import update_oui_database_now  # noqa: PLC0415
 
-    result = update_oui_database_now.delay()
+    result = await dispatch(update_oui_database_now)
     logger.info("oui_refresh_triggered", user=current_user.username, task_id=result.id)
     return OUIRefreshResponse(status="queued", task_id=result.id)
 
@@ -3202,41 +3457,6 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
-async def _blank_legacy_plaintext(db: DB, table: str, row_id: Any, columns: list[str]) -> None:
-    """Blank the pre-#1506 plaintext leftovers for a written secret.
-
-    GHSA-g9gv-9qp2-3qwm: the ``*_encrypted`` migration kept the old
-    plaintext columns, unmapped and unread, holding the pre-upgrade
-    values. Clearing or replacing a secret changed only the encrypted
-    column, so the old value stayed readable in the DB and in full
-    backups. On any write of that secret, set its leftover column to
-    ``''`` in the same transaction — ``''`` is the column's server
-    default and the value the old application (which maps it as a
-    non-null string) reads as unset, so a rolling upgrade stays safe;
-    the migration's downgrade copies a still-encrypted value back, and
-    a cleared secret has none, so it stays ``''`` there too.
-
-    The columns are unmapped, so this is raw SQL, guarded by inspection:
-    a schema built from the models (tests, a fresh install before the
-    migration) may not have them at all, and the next release drops
-    them. Identifiers come only from the fixed call sites below, never
-    from request data.
-    """
-    if not columns:
-        return
-    conn = await db.connection()
-    existing = await conn.run_sync(
-        lambda c: {col["name"] for col in sa_inspect(c).get_columns(table)}
-    )
-    assignments = [f"{col} = ''" for col in columns if col in existing]
-    if not assignments:
-        return
-    await db.execute(
-        text(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
-        {"id": row_id},
-    )
-
-
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     from app.core.crypto import encrypt_str
 
@@ -3356,9 +3576,7 @@ def _audit_forward_target(
 
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
-async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_audit_targets(current_user: SuperAdmin, db: DB) -> list[AuditTargetResponse]:
     res = await db.execute(select(AuditForwardTarget).order_by(AuditForwardTarget.name))
     return [_target_to_response(t) for t in res.scalars().all()]
 
@@ -3369,25 +3587,14 @@ async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTar
     status_code=status.HTTP_201_CREATED,
 )
 async def create_audit_target(
-    body: AuditTargetBody, current_user: CurrentUser, db: DB
+    body: AuditTargetBody, current_user: SuperAdmin, db: DB
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     _require_webhook_url(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
     await db.flush()
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
@@ -3406,27 +3613,16 @@ async def update_audit_target(
     # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
     target_id: uuid.UUID,
     body: AuditTargetBody,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
     _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
     _apply_body(row, body)
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
@@ -3440,9 +3636,7 @@ async def update_audit_target(
 
 
 @router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
@@ -3453,7 +3647,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
 
 @router.post("/audit-forward-targets/{target_id}/test")
 async def test_audit_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> dict[str, Any]:
     """Send a synthetic event to one target and report success / error.
 
@@ -3461,8 +3655,6 @@ async def test_audit_target(
     filter it out in the collector if they want. Doesn't land in
     ``audit_log`` — this is explicit probe traffic, not an audit.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3792,9 +3984,7 @@ def _audit_influx(
 
 
 @router.get("/influxdb-targets", response_model=list[InfluxDBTargetResponse])
-async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[InfluxDBTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_influxdb_targets(current_user: SuperAdmin, db: DB) -> list[InfluxDBTargetResponse]:
     res = await db.execute(select(InfluxDBTarget).order_by(InfluxDBTarget.name))
     return [_influx_to_response(t) for t in res.scalars().all()]
 
@@ -3805,11 +3995,9 @@ async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[Influ
     status_code=status.HTTP_201_CREATED,
 )
 async def create_influxdb_target(
-    body: InfluxDBTargetBody, current_user: CurrentUser, db: DB
+    body: InfluxDBTargetBody, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = InfluxDBTarget()
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
@@ -3820,7 +4008,8 @@ async def create_influxdb_target(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        logger.warning("influxdb_target_create_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="create failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
@@ -3829,31 +4018,33 @@ async def create_influxdb_target(
 async def update_influxdb_target(
     target_id: uuid.UUID,
     body: InfluxDBTargetBody,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
+    # Flush before the try, as create does: a taken name raises its unique
+    # violation here, where the application's IntegrityError handler turns it
+    # into the same 409 Create gives (#2750), instead of the driver's text
+    # (statement and parameters included) becoming the response detail.
+    await db.flush()
     _audit_influx(db, current_user, "update", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        logger.warning("influxdb_target_update_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="update failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
 
 @router.delete("/influxdb-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_influxdb_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_influxdb_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         return
@@ -3870,7 +4061,7 @@ class InfluxDBTestResponse(BaseModel):
 
 @router.post("/influxdb-targets/{target_id}/test", response_model=InfluxDBTestResponse)
 async def test_influxdb_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTestResponse:
     """Write one synthetic point and report the server's verdict.
 
@@ -3881,8 +4072,6 @@ async def test_influxdb_target(
     contaminates a real series, and the watermarks are untouched — this
     is a probe, not a push.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -4033,7 +4222,7 @@ class BrandingLogoInfo(BaseModel):
 
 @router.put("/branding/logo", response_model=BrandingLogoInfo)
 async def upload_branding_logo(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     file: UploadFile = File(..., description="PNG image, 512 KB maximum."),
 ) -> BrandingLogoInfo:
@@ -4044,11 +4233,6 @@ async def upload_branding_logo(
     into stored XSS against every visitor, including unauthenticated ones.
     """
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     # Read with one byte of headroom so an oversized upload is detected
     # rather than silently truncated to the limit.
@@ -4122,14 +4306,9 @@ async def upload_branding_logo(
 
 
 @router.delete("/branding/logo", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_branding_logo(current_user: CurrentUser, db: DB) -> Response:
+async def delete_branding_logo(current_user: SuperAdmin, db: DB) -> Response:
     """Drop the custom logo; the UI falls back to the bundled asset."""
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     row = (
         await db.execute(

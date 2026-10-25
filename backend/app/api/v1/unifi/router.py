@@ -26,7 +26,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -37,6 +38,7 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["unifi"],
@@ -770,10 +772,23 @@ async def update_controller(
 
 
 @router.delete("/controllers/{controller_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_controller(
+    controller_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     c = await db.get(UnifiController, controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="UniFi controller not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="unifi",
+        target_id=c.id,
+        armed=c.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target (polymorphic
     # target_id, no cascade). Disarm the target first if the controller should
     # stop quarantining the MACs (disarm lifts them; delete does not).
@@ -788,6 +803,11 @@ async def delete_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) 
         )
     )
     _audit(db, user=user, action="delete", controller_id=c.id, controller_name=c.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="unifi_controller_id", target_id=c.id, user=user, target_name=c.name
+    )
     await db.delete(c)
     await db.commit()
 
@@ -796,15 +816,25 @@ async def delete_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) 
     "/controllers/{controller_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_controller(controller_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     c = await db.get(UnifiController, controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="UniFi controller not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="unifi_controller",
+        resource_id=c.id,
+        resource_display=str(getattr(c, "name", None) or c.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.unifi_sync import sync_controller_now  # noqa: PLC0415
 
     try:
-        result = sync_controller_now.delay(str(c.id))
+        result = await dispatch(sync_controller_now, str(c.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

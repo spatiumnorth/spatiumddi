@@ -29,6 +29,7 @@ from fastapi import Depends, HTTPException, status
 
 from app.api.deps import CurrentUser
 from app.config import settings
+from app.core.auth_throttle import incr_with_window
 from app.core.redis_client import make_async_redis
 from app.models.auth import User
 from app.services.nettools.budgets import (
@@ -53,9 +54,7 @@ async def _consume(user_id: str, bucket: str) -> bool:
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            count = await r.incr(key)
-            if count == 1:
-                await r.expire(key, _WINDOW_SECONDS)
+            count = await incr_with_window(r, key, _WINDOW_SECONDS)
             return int(count) > budget
         finally:
             await r.aclose()

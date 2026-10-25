@@ -239,8 +239,45 @@ async def test_step_drain_timeout_reports_blocked(monkeypatch: pytest.MonkeyPatc
     step = await per_node._step_drain("node-1", timeout_s=0.05)
     assert step.ok is False
     assert "timed out" in step.error
+    assert "1 pod(s) still present (1 eviction(s) refused)" in step.error
     assert step.detail["blocked"]
     assert step.detail["blocked"][0]["pod"] == "default/blocked"
+    assert step.detail["remaining"] == ["default/blocked"]
+    assert step.detail["not_removed"] == []
+
+
+@pytest.mark.asyncio
+async def test_step_drain_timeout_counts_pods_whose_eviction_was_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1804 — a node whose kubelet is down accepts every eviction and removes
+    nothing. The pods stay listed on the node until the drain times out, and
+    the message must count them: it used to count only the evictions refused
+    in the last cycle and read "0 pod(s) still present"."""
+    pods = [
+        {
+            "metadata": {
+                "name": name,
+                "namespace": "spatium",
+                "ownerReferences": [{"kind": "ReplicaSet"}],
+            },
+            "status": {"phase": "Running"},
+        }
+        for name in ("api-1", "worker-1")
+    ]
+
+    monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _n: list(pods))
+    monkeypatch.setattr(per_node.k8s, "evict_pod", lambda *_a, **_k: (201, None))
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+
+    step = await per_node._step_drain("node-1", timeout_s=0.05)
+    assert step.ok is False
+    assert "0 pod(s)" not in step.error
+    assert "2 pod(s) still present" in step.error
+    assert "2 evicted but never removed from the node" in step.error
+    assert step.detail["blocked"] == []
+    assert step.detail["remaining"] == ["spatium/api-1", "spatium/worker-1"]
+    assert step.detail["not_removed"] == ["spatium/api-1", "spatium/worker-1"]
 
 
 @pytest.mark.asyncio
@@ -748,7 +785,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     async def _ok(name: per_node.StepName) -> per_node.StepResult:
         return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(True)
 
-    async def _fail_cordon(_node: str) -> per_node.StepResult:
+    async def _fail_cordon(_node: str, **_kw: Any) -> per_node.StepResult:
         return per_node.StepResult(name="cordon", started_at="t", finished_at="t").finish(
             False, error="kubeapi status 403"
         )

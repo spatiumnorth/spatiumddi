@@ -69,12 +69,17 @@ async def insert_ipam_mirror_row(db: Any, row: IPAddress) -> tuple[IPAddress, bo
             await db.flush()
         return row, True
     except IntegrityError:
+        # Locked (#2580): every caller decides what to do with the incumbent
+        # from its status, and that decision has to hold until it commits.
         existing = (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.subnet_id == subnet_id,
                     IPAddress.address == address,
                 )
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if existing is None:
@@ -83,3 +88,33 @@ async def insert_ipam_mirror_row(db: Any, row: IPAddress) -> tuple[IPAddress, bo
             # unrelated integrity error.
             raise
         return existing, False
+
+
+async def lease_hostname_suppressed_subnets(
+    db: Any, *, group_id: Any = None, subnet_ids: Any = None
+) -> set[Any]:
+    """Subnets whose scope says a lease's hostname must NOT reach IPAM (#2269).
+
+    ``DHCPScope.hostname_to_ipam_sync`` is ``on_lease`` (write every lease's
+    hostname onto its IPAM mirror row) or ``disabled`` / ``on_static_only``
+    (the mirror row still exists — status, MAC, last-seen — but the lease's
+    client-supplied hostname stays out of it). A subnet is suppressed when it
+    has at least one scope in view and none of them is ``on_lease``; a subnet
+    with no scope keeps the historical behaviour. ``group_id`` narrows to one
+    server group's scopes (the ingest paths); ``subnet_ids`` narrows to the
+    subnets in play.
+    """
+    from app.models.dhcp import DHCPScope
+
+    stmt = select(DHCPScope.subnet_id, DHCPScope.hostname_to_ipam_sync)
+    if group_id is not None:
+        stmt = stmt.where(DHCPScope.group_id == group_id)
+    if subnet_ids is not None:
+        stmt = stmt.where(DHCPScope.subnet_id.in_(list(subnet_ids)))
+    seen: set[Any] = set()
+    writes: set[Any] = set()
+    for subnet_id, mode in (await db.execute(stmt)).all():
+        seen.add(subnet_id)
+        if mode == "on_lease":
+            writes.add(subnet_id)
+    return seen - writes

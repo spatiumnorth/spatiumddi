@@ -48,10 +48,12 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
     safe_filename,
 )
 
@@ -205,7 +207,7 @@ class FtpDestination(BackupDestination):
                 client.connect(host=host, port=port)
                 client.login(config["username"], config["password"])
         except Exception as exc:  # noqa: BLE001
-            raise BackupDestinationError(f"FTP connect failed: {exc}") from exc
+            raise BackupDestinationError(f"FTP connect failed: {describe_exc(exc)}") from exc
 
         passive = (config.get("passive") or "true").strip().lower() != "false"
         client.set_pasv(passive)
@@ -260,7 +262,7 @@ class FtpDestination(BackupDestination):
                             path=tmp,
                             error=str(cleanup_exc),
                         )
-                raise BackupDestinationError(f"FTP write failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP write failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
 
@@ -321,7 +323,7 @@ class FtpDestination(BackupDestination):
                             )
                         )
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"FTP listing failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP listing failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
             rows.sort(key=lambda r: r.created_at, reverse=True)
@@ -329,7 +331,9 @@ class FtpDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
@@ -337,10 +341,20 @@ class FtpDestination(BackupDestination):
             client = self._connect(config)
             try:
                 buf = io.BytesIO()
-                client.retrbinary(f"RETR {remote}", buf.write)
+
+                def _sink(chunk: bytes) -> None:
+                    buf.write(chunk)
+                    # Raising out of the callback aborts the transfer;
+                    # the connection is closed in ``finally``.
+                    if max_bytes is not None and buf.tell() > max_bytes:
+                        raise ArchiveTooLargeError(safe, max_bytes)
+
+                client.retrbinary(f"RETR {remote}", _sink)
                 return buf.getvalue()
+            except ArchiveTooLargeError:
+                raise
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"FTP read failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP read failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
 
@@ -359,7 +373,7 @@ class FtpDestination(BackupDestination):
                 # 550 = file not found ⇒ idempotent
                 if msg.startswith("550"):
                     return
-                raise BackupDestinationError(f"FTP delete failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP delete failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
 

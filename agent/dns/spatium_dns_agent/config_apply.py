@@ -146,6 +146,12 @@ class ApplyStatus:
     error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        # Nothing applied yet (#2258): the default ``ok`` with no etag is a
+        # placeholder, not a verdict. Report an empty block, which the control
+        # plane reads as "no report" and leaves the stored status (NULL =
+        # unknown, #882) untouched, instead of a fabricated ``ok``.
+        if self.status == STATUS_OK and self.etag is None:
+            return {}
         return {
             "status": self.status,
             "etag": self.etag,
@@ -170,6 +176,13 @@ class Quarantine:
     def __init__(self, state_dir: Path):
         self._path = state_dir / "config" / "quarantine.json"
         self.etag: str | None = None
+        #: ``structural_etag`` of the failed bundle (#2647). The quarantine
+        #: names a STRUCTURE, not one full etag: record CRUD moves the full
+        #: etag but not this, and a record-only change must neither clear the
+        #: quarantine nor restart its backoff ladder. ``None`` for a file
+        #: written by an older agent (full-etag keyed) or a bundle that
+        #: carried none; matching then falls back to the full etag.
+        self.structural: str | None = None
         self.reason: str | None = None
         self.failures: int = 0
         self.retry_at: float = 0.0
@@ -189,6 +202,8 @@ class Quarantine:
         if not isinstance(data, dict):
             return
         self.etag = data.get("etag")
+        structural = data.get("structural")
+        self.structural = structural if isinstance(structural, str) else None
         self.reason = data.get("reason")
         self.failures = int(data.get("failures") or 0)
         # ``retry_at`` is stored as a monotonic-independent wall clock so it
@@ -205,6 +220,7 @@ class Quarantine:
                 json.dumps(
                     {
                         "etag": self.etag,
+                        "structural": self.structural,
                         "reason": self.reason,
                         "failures": self.failures,
                         "retry_at": self.retry_at,
@@ -218,13 +234,27 @@ class Quarantine:
             # problem; failing the apply path over it would be worse.
             log.warning("quarantine_write_failed", path=str(self._path))
 
-    def record(self, etag: str, reason: str) -> None:
+    def same_structure(self, etag: str | None, structural: str | None = None) -> bool:
+        """Is this bundle the quarantined one, as far as applying it goes?
+
+        Compared on ``structural_etag`` when both sides have one (#2647), so a
+        record-only change to a quarantined structure is still that structure.
+        Otherwise (an older agent's file, a bundle without one) on the full etag.
+        """
+        if etag is None or self.etag is None:
+            return False
+        if self.structural is not None and structural is not None:
+            return structural == self.structural
+        return etag == self.etag
+
+    def record(self, etag: str, reason: str, structural: str | None = None) -> None:
         """Mark ``etag`` as failed and schedule its retry."""
-        if etag != self.etag:
-            # A different bundle — restart the backoff ladder rather than
+        if not self.same_structure(etag, structural):
+            # A different structure — restart the backoff ladder rather than
             # inheriting the previous one's.
             self.failures = 0
         self.etag = etag
+        self.structural = structural
         self.reason = reason
         self.failures += 1
         idx = min(self.failures - 1, len(RETRY_BACKOFF_SECONDS) - 1)
@@ -243,6 +273,7 @@ class Quarantine:
             return
         log.info("config_quarantine_cleared", etag=self.etag)
         self.etag = None
+        self.structural = None
         self.reason = None
         self.failures = 0
         self.retry_at = 0.0
@@ -253,9 +284,9 @@ class Quarantine:
             # restart, and the next successful apply rewrites it away.
             log.warning("quarantine_unlink_failed", path=str(self._path))
 
-    def blocks(self, etag: str | None) -> bool:
-        """Should this etag be skipped rather than applied right now?"""
-        if etag is None or self.etag is None or etag != self.etag:
+    def blocks(self, etag: str | None, structural: str | None = None) -> bool:
+        """Should this bundle be skipped rather than applied right now?"""
+        if not self.same_structure(etag, structural):
             return False
         return time.time() < self.retry_at
 

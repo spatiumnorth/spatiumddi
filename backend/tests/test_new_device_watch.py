@@ -18,7 +18,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from app.api.v1.dhcp.agents import _auth_agent
+from app.api.v1.dhcp.agents import _auth_agent, insert_ipam_mirror_row
 from app.core.security import create_access_token, hash_password
 from app.main import app
 from app.models.alerts import AlertRule
@@ -761,3 +761,39 @@ async def test_duplicate_allowlist_returns_409(
         json={"mac_address": "3c:5a:b4:ab:cd:ef", "note": "again"},
     )
     assert dup.status_code == 409, dup.text
+
+
+async def test_mac_sightings_existing_row_matches_without_insert(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2651 — a known IP updates its row in place; no failing INSERT/savepoint."""
+
+    server, subnet = await _seed_dhcp(db_session)
+    await _enable_watch(db_session)
+    row = IPAddress(subnet_id=subnet.id, address="10.41.1.90", status="allocated")
+    db_session.add(row)
+    await db_session.commit()
+    # Drop the identity map so the handler re-reads ``address`` as the
+    # IPv4Address asyncpg decodes (the str we just wrote would mask the bug).
+    db_session.expire(row)
+
+    calls: list[object] = []
+    real = insert_ipam_mirror_row
+
+    async def spy(db, candidate):  # type: ignore[no-untyped-def]
+        calls.append(candidate)
+        return await real(db, candidate)
+
+    monkeypatch.setattr("app.api.v1.dhcp.agents.insert_ipam_mirror_row", spy)
+    app.dependency_overrides[_auth_agent] = lambda: (server, {})
+    try:
+        resp = await client.post(
+            "/api/v1/dhcp/agents/mac-sightings",
+            json={"sightings": [{"mac_address": "3c:5a:b4:5e:e0:09", "ip_address": "10.41.1.90"}]},
+        )
+    finally:
+        app.dependency_overrides.pop(_auth_agent, None)
+    assert resp.status_code == 200, resp.text
+    assert calls == []
+    await db_session.refresh(row)
+    assert row.last_seen_method == "l2_sniff"

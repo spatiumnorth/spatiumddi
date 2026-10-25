@@ -6,7 +6,6 @@ import {
   AlertCircle,
   CheckCircle2,
   FileWarning,
-  ChevronDown,
   Printer,
 } from "lucide-react";
 import {
@@ -16,9 +15,11 @@ import {
   type ImportStrategy,
   type IPSpace,
   type Subnet,
+  formatApiError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { permissionGate } from "@/hooks/usePermissions";
+import { HeaderMenu, type HeaderMenuItem } from "@/components/ui/header-menu";
 import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
@@ -67,11 +68,7 @@ export function ImportModal({
       });
       setPreview(result);
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+      setError(formatApiError(e, "Preview failed"));
     } finally {
       setBusy(false);
     }
@@ -94,11 +91,7 @@ export function ImportModal({
       });
       onCommitted();
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+      setError(formatApiError(e, "Import failed"));
     } finally {
       setBusy(false);
     }
@@ -335,7 +328,6 @@ export function ExportButton({
   scope: { space_id?: string; block_id?: string; subnet_id?: string };
   label?: string;
 }) {
-  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [includeAddrs, setIncludeAddrs] = useState(false);
 
@@ -350,7 +342,8 @@ export function ExportButton({
         format,
         include_addresses: includeAddrs,
       });
-      setOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Export failed");
     } finally {
       setBusy(false);
     }
@@ -369,7 +362,6 @@ export function ExportButton({
         ...scope,
         include_addresses: includeAddrs,
       });
-      setOpen(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "PDF export failed");
     } finally {
@@ -377,51 +369,50 @@ export function ExportButton({
     }
   }
 
+  const items: HeaderMenuItem[] = [
+    {
+      key: "include",
+      label: "Include IP addresses",
+      checked: includeAddrs,
+      onSelect: () => setIncludeAddrs((v) => !v),
+    },
+    ...(["csv", "json", "xlsx"] as const).map((fmt, i) => ({
+      key: fmt,
+      label: `Download .${fmt}`,
+      icon: Download,
+      disabled: busy,
+      separatorBefore: i === 0,
+      title:
+        fmt === "csv" && includeAddrs
+          ? "With Include IP addresses ticked the .csv is the address list only. Use .json, .xlsx or Print / PDF for subnets and addresses together."
+          : undefined,
+      onSelect: () => void run(fmt),
+    })),
+    {
+      key: "pdf",
+      label: "Print / PDF…",
+      icon: Printer,
+      disabled: busy,
+      separatorBefore: true,
+      title: "Print-ready report of this subtree",
+      onSelect: () => void runPdf(),
+    },
+  ];
+
+  // The shared header menu: Esc and an outside click close it, only one
+  // header menu is open at a time, and a dialog opened from an item hands
+  // focus back to its trigger (#2722).
   return (
-    <div className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-        title="Export"
-      >
-        <Download className="h-3.5 w-3.5" /> {label}
-      </button>
-      {open && (
-        <div className="absolute right-0 z-40 mt-1 w-56 rounded-md border bg-background p-2 shadow-lg">
-          <label className="mb-2 flex items-center gap-2 text-xs">
-            <input
-              type="checkbox"
-              checked={includeAddrs}
-              onChange={(e) => setIncludeAddrs(e.target.checked)}
-            />
-            Include IP addresses
-          </label>
-          <div className="space-y-1">
-            {(["csv", "json", "xlsx"] as const).map((fmt) => (
-              <button
-                key={fmt}
-                disabled={busy}
-                onClick={() => run(fmt)}
-                className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
-              >
-                Download .{fmt}
-              </button>
-            ))}
-          </div>
-          <div className="my-1 border-t" />
-          <button
-            disabled={busy}
-            onClick={runPdf}
-            title="Print-ready report of this subtree"
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
-          >
-            <Printer className="h-3.5 w-3.5" />
-            Print / PDF…
-          </button>
-          {error && (
-            <p className="mt-1 px-2 text-[11px] text-destructive">{error}</p>
-          )}
-        </div>
+    <div className="flex items-center gap-2">
+      <HeaderMenu label={label} icon={Download} title="Export" items={items} />
+      {error && (
+        <span
+          role="alert"
+          title={error}
+          className="max-w-48 truncate text-[11px] text-destructive"
+        >
+          {error}
+        </span>
       )}
     </div>
   );
@@ -461,11 +452,7 @@ export function AddressImportModal({
       });
       setPreview(result);
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+      setError(formatApiError(e, "Preview failed"));
     } finally {
       setBusy(false);
     }
@@ -483,11 +470,7 @@ export function AddressImportModal({
       setCommitted(result);
       onCommitted();
     } catch (e) {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+      setError(formatApiError(e, "Import failed"));
     } finally {
       setBusy(false);
     }
@@ -646,7 +629,6 @@ export function SubnetImportExportButton({
   canImport?: boolean;
   onCommitted: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [includeAddrs, setIncludeAddrs] = useState(true);
   const [showImport, setShowImport] = useState(false);
@@ -662,7 +644,8 @@ export function SubnetImportExportButton({
         format,
         include_addresses: includeAddrs,
       });
-      setOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Export failed");
     } finally {
       setBusy(false);
     }
@@ -676,7 +659,6 @@ export function SubnetImportExportButton({
     setError(null);
     try {
       await ipamIoApi.downloadPdf({ subnet_id: subnet.id });
-      setOpen(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "PDF export failed");
     } finally {
@@ -684,71 +666,63 @@ export function SubnetImportExportButton({
     }
   }
 
+  const importGate = permissionGate(
+    canImport,
+    "Requires write permission on this subnet or on an address set in it",
+  );
+  const items: HeaderMenuItem[] = [
+    {
+      key: "import",
+      label: "Import IP addresses…",
+      icon: Upload,
+      disabled: importGate.disabled,
+      title: importGate.title,
+      onSelect: () => setShowImport(true),
+    },
+    {
+      key: "include",
+      label: "Include IP addresses",
+      checked: includeAddrs,
+      separatorBefore: true,
+      onSelect: () => setIncludeAddrs((v) => !v),
+    },
+    ...(["csv", "json", "xlsx"] as const).map((fmt) => ({
+      key: fmt,
+      label: `Export .${fmt}`,
+      icon: Download,
+      disabled: busy,
+      onSelect: () => void download(fmt),
+    })),
+    {
+      key: "pdf",
+      label: "Print / PDF…",
+      icon: Printer,
+      disabled: busy,
+      separatorBefore: true,
+      title: "Print-ready report of this subnet and its addresses",
+      onSelect: () => void downloadPdf(),
+    },
+  ];
+
+  // The shared header menu, like Sync and Tools beside it (#2722): Esc and
+  // an outside click close it, one header menu is open at a time, and the
+  // import dialog hands focus back to this trigger when it closes.
   return (
     <>
-      <div className="relative">
-        <button
-          onClick={() => setOpen((o) => !o)}
-          className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm whitespace-nowrap hover:bg-muted"
-          title="Import or export IP addresses"
+      <HeaderMenu
+        label="Import / Export"
+        title="Import or export IP addresses"
+        items={items}
+      />
+      {error && (
+        <span
+          role="alert"
+          title={error}
+          className="max-w-48 truncate text-[11px] text-destructive"
         >
-          Import / Export
-          <ChevronDown className="h-3.5 w-3.5" />
-        </button>
-        {open && (
-          <div className="absolute right-0 z-40 mt-1 w-64 rounded-md border bg-background p-2 shadow-lg">
-            <button
-              onClick={() => {
-                setShowImport(true);
-                setOpen(false);
-              }}
-              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
-              {...permissionGate(
-                canImport,
-                "Requires write permission on this subnet or on an address set in it",
-              )}
-            >
-              <Upload className="h-3.5 w-3.5" />
-              Import IP addresses…
-            </button>
-            <div className="my-1 border-t" />
-            <label className="mb-1 flex items-center gap-2 px-2 text-xs">
-              <input
-                type="checkbox"
-                checked={includeAddrs}
-                onChange={(e) => setIncludeAddrs(e.target.checked)}
-              />
-              Include IP addresses
-            </label>
-            <div className="space-y-0.5">
-              {(["csv", "json", "xlsx"] as const).map((fmt) => (
-                <button
-                  key={fmt}
-                  disabled={busy}
-                  onClick={() => download(fmt)}
-                  className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  Export .{fmt}
-                </button>
-              ))}
-            </div>
-            <div className="my-1 border-t" />
-            <button
-              disabled={busy}
-              onClick={downloadPdf}
-              title="Print-ready report of this subnet and its addresses"
-              className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
-            >
-              <Printer className="h-3.5 w-3.5" />
-              Print / PDF…
-            </button>
-            {error && (
-              <p className="mt-1 px-2 text-[11px] text-destructive">{error}</p>
-            )}
-          </div>
-        )}
-      </div>
+          {error}
+        </span>
+      )}
       {showImport && (
         <AddressImportModal
           subnet={subnet}

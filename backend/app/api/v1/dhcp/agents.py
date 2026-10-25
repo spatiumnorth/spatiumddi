@@ -21,6 +21,7 @@ from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
@@ -30,6 +31,7 @@ from app.core.agent_wake import (
     dhcp_wake_channels,
     wake_subscription,
 )
+from app.core.celery_dispatch import dispatch
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dhcp.kea import option_defs_for_option_maps
@@ -43,6 +45,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -54,6 +57,7 @@ from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
@@ -65,10 +69,13 @@ from app.services.dhcp.agent_token import (
     verify_agent_token,
 )
 from app.services.dhcp.config_bundle import build_config_bundle
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
+from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -279,6 +286,11 @@ class LeaseEvent(BaseModel):
         return self
 
 
+def _utc(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC so two lease times always compare."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def _lease_identity(
     ip: str, mac: str | None, duid: str | None, iaid: int | None
 ) -> tuple[Any, ...]:
@@ -390,8 +402,8 @@ class DHCPLogAck(IngestAck):
     inserted: int = 0
     dropped: int = 0
     #: Lines older than the control plane's activity-log retention
-    #: (``prune_logs.DEFAULT_RETENTION_HOURS``), skipped rather than inserted
-    #: into a table the nightly prune would empty straight away.
+    #: (``PlatformSettings.log_retention_hours``, #2273), skipped rather than
+    #: inserted into a table the nightly prune would empty straight away.
     expired: int = 0
 
 
@@ -611,9 +623,23 @@ async def agent_config_longpoll(
         # published config change wakes this poll immediately; Redis-down
         # degrades to the old LONGPOLL_POLL_INTERVAL sleep (see the DNS agent).
         while True:
+            # #2040 — this session lives for the whole wait, and the sessionmaker
+            # sets expire_on_commit=False with no commit inside the loop. A
+            # re-query hands back the instances already in the identity map
+            # WITHOUT overwriting their loaded attributes, so on every pass
+            # after the first the bundle was rebuilt from the group, its
+            # member servers, scopes, pools, classes and PlatformSettings as
+            # they were when the poll parked. The wake arrived and changed
+            # nothing; the edit reached the agent only when the long-poll timed
+            # out and the agent reconnected on a fresh session. Expiring
+            # everything makes each pass read committed state — the same thing
+            # the first pass of a fresh request reads. Nothing in the loop
+            # writes before the final commit, so no pending change is lost.
+            db.expire_all()
             # Pick up server-row column changes a wake signals (fleet markers,
-            # group, maintenance) — read off this cached instance, since the
-            # bundle re-queries collections but not the server row.
+            # group, maintenance). The bundle re-queries the group and its
+            # collections, which repopulates them; the server row it is handed
+            # rather than re-selecting, so it is refreshed here.
             await refresh_agent_server(db, server)
             bundle = await build_config_bundle(db, server)
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
@@ -794,6 +820,12 @@ async def agent_config_longpoll(
                                 # [...]}`` so a centralized Kea matches this
                                 # scope on giaddr for relayed remote subnets.
                                 "relay_addresses": list(s.relay_addresses),
+                                # #2731: the classes of the PXE profile bound
+                                # to this scope. The agent has Kea evaluate
+                                # them for this subnet alone; rendered for the
+                                # whole server, one scope's profile booted the
+                                # PXE clients of every scope on it.
+                                "pxe_class_names": list(s.pxe_class_names),
                                 "pools": [
                                     {
                                         "start_ip": p.start_ip,
@@ -836,7 +868,6 @@ async def agent_config_longpoll(
                                     }
                                     for st in s.statics
                                 ],
-                                "ddns_enabled": s.ddns_enabled,
                             }
                             for s in bundle.scopes
                         ],
@@ -1100,7 +1131,26 @@ async def agent_heartbeat(
     # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
     # the same dict, the top-level ``status``; ``daemon`` is the source). Same
     # gap as the DNS side: declared, accepted, never read.
-    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
+    # #2023 — on the appliance the kubelet kills the whole dhcp-kea container
+    # when Kea reaches its memory limit, the agent with it, so the restarted
+    # agent reports ``ok`` over a kill it never saw. The supervisor carries the
+    # kubelet's ``OOMKilled`` on its heartbeat; while that kill is current it is
+    # the daemon state, whatever the agent says (the DNS handler's #2018 rule).
+    now_utc = datetime.now(UTC)
+    appliance = await owning_appliance_for_dhcp_server(db, server)
+    daemon_report, daemon_stamp = effective_daemon_report(
+        body.daemon,
+        fresh_role_health(appliance, now_utc),
+        server.driver,
+        now_utc,
+    )
+    apply_reported_daemon_state(
+        server,
+        daemon_report,
+        agent_kind="dhcp",
+        server_id=str(server.id),
+        now=min(daemon_stamp, now_utc),
+    )
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
@@ -1165,6 +1215,7 @@ async def agent_lease_events(
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    server_id = str(server.id)
     # #1077 — a replay of a batch already committed writes nothing. Claimed
     # before any write so the receipt and the rows share one transaction.
     if not await claim_batch(
@@ -1198,6 +1249,11 @@ async def agent_lease_events(
     # subnet itself is resolved correctly.
     subnets = await _load_subnet_cache(db)
     scope_cache = await _load_scope_cache(db, server.server_group_id)
+    # #2269 — scopes not set to ``on_lease`` keep the lease's hostname out of
+    # IPAM; the mirror row itself is still written.
+    no_hostname_subnets = await lease_hostname_suppressed_subnets(
+        db, group_id=server.server_group_id
+    )
     subnet_for_ip = {
         ip: _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
         for ip in ips
@@ -1237,11 +1293,40 @@ async def agent_lease_events(
         for lease in existing_leases
     }
 
+    def _superseded(ev: Any, key: tuple[Any, ...]) -> bool:
+        """Is this active event older than another client's live lease? (#2391)
+
+        The agent re-sends its whole lease file after a restart, so an old
+        client's grant can arrive after the address went to a new client.
+        Such a grant is history: applying it would resurrect the old lease
+        and re-point the IPAM mirror (MAC, hostname, DDNS) to the old
+        client. Compared on the lease start Kea reports, so a genuine newer
+        grant — a renewal, or a real new client — is never held back. An
+        event with no start time carries no evidence and is applied.
+        """
+        if ev.state != "active" or ev.starts_at is None:
+            return False
+        ev_start = _utc(ev.starts_at)
+        for other_key, other in lease_by_key.items():
+            if other_key == key or other.state != "active" or other.starts_at is None:
+                continue
+            if norm_ip(str(other.ip_address)) != norm_ip(ev.ip_address):
+                continue
+            if other.expires_at is not None and _utc(other.expires_at) <= now:
+                continue
+            if _utc(other.starts_at) > ev_start:
+                return True
+        return False
+
     # Upsert every DHCPLease first, then a single flush so new rows get
     # their ids before we wire dhcp_lease_id on the IPAM mirror.
     upserted = 0
-    for ev in events:
+    stale: set[int] = set()
+    for idx, ev in enumerate(events):
         key = _lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)
+        if _superseded(ev, key):
+            stale.add(idx)
+            continue
         # #428: fall back to ends_at when the agent didn't send a distinct
         # expires_at (Kea ships the same absolute reclaim time as ends_at).
         # Without a non-NULL expires_at the time-based sweep_expired_leases
@@ -1287,13 +1372,66 @@ async def agent_lease_events(
                 # Backfill legacy rows created before scope stamping (#844).
                 lease.scope_id = _scope_for_ip(ev.ip_address)
         upserted += 1
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # #2262 — the lease-identity unique indexes. A unique violation here
+        # means another request for this server inserted the same lease
+        # between our SELECT and this INSERT (a timed-out snapshot page still
+        # running server-side while the tailer posts its next batch). The
+        # global handler would answer 409, which the agent's spool classifies
+        # as REJECTED and drops the whole batch with it. Answer 503 instead:
+        # the agent retries, the retry finds the committed row and updates
+        # it, and the receipt claimed above rolls back with this transaction
+        # so the retry is not mistaken for a duplicate.
+        if str(getattr(exc.orig, "sqlstate", "") or "") != "23505":
+            raise
+        # ``server`` is expired by the failed flush; log the id read up front.
+        await db.rollback()
+        logger.info("dhcp_lease_events_identity_race", server=server_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A concurrent lease report for this server landed first; retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
 
     # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
     # so overlapping ranges across spaces stay disambiguated (subnets were
     # resolved space-aware above).
+    #
+    # #2580 — row-locked, and only AFTER the lease upsert above has flushed.
+    # The mirror pass below decides from the row's status (take over an
+    # ``available`` row, leave a ``static_dhcp`` one alone), and a reservation
+    # DELETE decides that same row's status from the lease table. On plain
+    # reads each could read the other's pre-commit state and both commit
+    # ``available`` beside the live lease. Holding the row lock while deciding
+    # serialises the two: if the DELETE locks first, this read waits for its
+    # commit and sees ``available``; if this locks first, the DELETE waits for
+    # this commit, by which point the lease inserted above is visible to it.
+    # Ordered by id, like ``static_ipam.lock_static_rows``, so concurrent
+    # lockers never wait on each other in a cycle. Narrowed to the subnets
+    # the events resolved to, so another space's row at the same address is
+    # not locked for nothing.
+    mirror_subnet_ids = {sn.id for sn in subnet_for_ip.values() if sn is not None}
     ipam_existing = (
-        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
+        (
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(
+                        IPAddress.address.in_(ips),
+                        IPAddress.subnet_id.in_(mirror_subnet_ids),
+                    )
+                    .order_by(IPAddress.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if mirror_subnet_ids
+        else []
     )
     # Normalised for the same reason as ``lease_by_key`` above (#1110): the
     # stored ``address`` is an ``IPv4Address``, the event's is a string. Raw
@@ -1308,7 +1446,8 @@ async def agent_lease_events(
 
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
         """Stamp lease state onto a mirror row we own (auto/available)."""
-        row.hostname = (ev.hostname or row.hostname or "")[:253]
+        if row.subnet_id not in no_hostname_subnets:
+            row.hostname = (ev.hostname or row.hostname or "")[:253]
         # A DHCPv6 lease usually has no MAC (#1141) — keep what the row has
         # rather than blanking it.
         row.mac_address = ev.mac_address or row.mac_address
@@ -1322,7 +1461,9 @@ async def agent_lease_events(
         row.last_seen_method = "dhcp"
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
-    for ev in events:
+    for idx, ev in enumerate(events):
+        if idx in stale:
+            continue  # replayed grant of a lease another client has superseded (#2391)
         subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
@@ -1330,12 +1471,19 @@ async def agent_lease_events(
         ipam_row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address)))
 
         is_active = ev.state == "active"
+        # A grant whose lease ended later in this same batch (a replayed
+        # grant + release) is history too: re-pointing the row would name a
+        # client that no longer holds the address (#2391).
+        if is_active and lease.state != "active":
+            continue
         if is_active:
             if ipam_row is None:
                 candidate = IPAddress(
                     subnet_id=subnet.id,
                     address=ev.ip_address,
-                    hostname=(ev.hostname or "")[:253],
+                    hostname=(
+                        "" if subnet.id in no_hostname_subnets else (ev.hostname or "")[:253]
+                    ),
                     mac_address=ev.mac_address,
                     status="dhcp",
                     auto_from_lease=True,
@@ -1570,7 +1718,11 @@ async def agent_mac_sightings(
     existing = (
         (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
     )
-    by_key: dict[tuple[Any, str], IPAddress] = {(r.subnet_id, r.address): r for r in existing}
+    # #2651 — ``IPAddress.address`` decodes to IPv4Address/IPv6Address, the
+    # event carries a string; normalise both sides (same as lease-events).
+    by_key: dict[tuple[Any, str], IPAddress] = {
+        (r.subnet_id, norm_ip(str(r.address))): r for r in existing
+    }
 
     # (ipam_row, mac) pairs to classify after the flush assigns new-row ids.
     to_observe: list[tuple[IPAddress, str]] = []
@@ -1580,7 +1732,7 @@ async def agent_mac_sightings(
         )
         if subnet is None:
             continue
-        row = by_key.get((subnet.id, s.ip_address))
+        row = by_key.get((subnet.id, norm_ip(s.ip_address)))
         if row is None:
             # #564 — a concurrent lease-event / Sync-DHCP writer may have
             # already committed this (subnet_id, address). Insert inside a
@@ -1598,7 +1750,7 @@ async def agent_mac_sightings(
                     last_seen_method="l2_sniff",
                 ),
             )
-            by_key[(subnet.id, s.ip_address)] = row
+            by_key[(subnet.id, norm_ip(s.ip_address))] = row
             if not created:
                 # Lost the race — just bump the sighting timestamp on the
                 # incumbent (don't clobber its status/mac; the observation
@@ -1828,7 +1980,7 @@ async def agent_log_entries(
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
-    expired_cutoff = now - timedelta(hours=ACTIVITY_LOG_RETENTION_HOURS)
+    expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     inserted = 0
     expired = 0
     for raw in capped:
@@ -1924,7 +2076,9 @@ async def agent_dhcp_fingerprints(
             from app.tasks.dhcp_fingerprint import lookup_fingerprint_task
 
             for mac in enqueue_macs:
-                lookup_fingerprint_task.delay(mac)
+                # Carry the reporting server so the IP stamp stays in the
+                # spaces it serves (#2577).
+                await dispatch(lookup_fingerprint_task, mac, str(server.id))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",

@@ -47,13 +47,27 @@ Two subcommands:
                   import is writing, and make k3s re-import what it missed
                   by moving the tarball's mtime (the watcher re-imports a
                   file whose mtime moved past its cache entry). Exit 0 when
-                  everything is there, 1 when something is still missing.
+                  everything is there, 1 when something is still missing
+                  or still being imported when ``--max-wait`` runs out.
                   spatiumddi-firstboot runs it before it commits a trial
                   slot.
 
+#2109: "is k3s still importing?" is answered by whether a process holds a
+baked tarball open. k3s opens the file for the whole import and closes it
+when the import is done (containerd.go ``preloadFile``: wharfie's
+``tarfile.GetOpener`` ``os.Open``s it under the zstd reader, closed by a
+``defer`` after the images are labelled), so ``/proc/<pid>/fd`` names the
+tarball exactly while it is being imported. The kubelet is NOT that signal:
+k3s's start-up loop returns once its work queue is EMPTY, which is when the
+last tarball is taken off it, not when that tarball's import ends, so the
+kubelet starts with the last import still running. And on slow storage the
+kubelet does not answer for minutes; judging then counted every tarball
+k3s had not reached yet as missing and touched the one it was importing,
+which restarted that import and lost the slot its commit.
+
 Paths are env-overridable (``SPATIUM_K3S_IMAGES_DIR``,
-``SPATIUM_K3S_CONTENT_DIR``, ``SPATIUM_K3S_BIN``) for the tests in
-appliance/tests/test_k3s_images.py.
+``SPATIUM_K3S_CONTENT_DIR``, ``SPATIUM_K3S_BIN``, ``SPATIUM_K3S_PROC_DIR``,
+``SPATIUM_K3S_KUBELET_HEALTHZ``) for the tests in appliance/tests/test_k3s_images.py.
 """
 
 from __future__ import annotations
@@ -67,7 +81,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -79,15 +93,26 @@ CONTENT_DIR = Path(
     )
 )
 K3S = os.environ.get("SPATIUM_K3S_BIN", "/usr/local/bin/k3s")
+PROC_DIR = Path(os.environ.get("SPATIUM_K3S_PROC_DIR", "/proc"))
 # What k3s bakes and spatium-upgrade-slot copies across a slot upgrade.
 TARBALL_GLOB = "*.tar.zst"
 # The kubelet's healthz: k3s binds it to 127.0.0.1, or ::1 on a node with an
 # IPv6 node IP (k3s pkg/daemons/agent/agent.go), on the kubelet's default port.
-KUBELET_HEALTHZ = ("http://127.0.0.1:10248/healthz", "http://[::1]:10248/healthz")
+KUBELET_HEALTHZ = tuple(
+    os.environ.get(
+        "SPATIUM_K3S_KUBELET_HEALTHZ",
+        "http://127.0.0.1:10248/healthz,http://[::1]:10248/healthz",
+    ).split(",")
+)
 # An ingest none of whose files changed for this long has no import writing
 # it. containerd touches the data file on every write.
 IDLE_INGEST_S = 60.0
 POLL_S = 5.0
+# With the kubelet not answering, k3s counts as idle only once no baked
+# tarball has been open for this long. Its queue moves from one tarball to
+# the next in well under a second, and a file event it queues waits 2 s
+# (watcher.go ``AddAfter``), so this outlasts every gap between two imports.
+SETTLE_S = 15.0
 PREFIX = "spatium-k3s-images:"
 
 
@@ -167,9 +192,12 @@ def _epoch(stamp: object) -> float | None:
 
 def imported(tarball: Path, entry: dict | None) -> bool:
     """Did k3s import this file as it is now? Its entry must carry the
-    file's size, a modTime no older than the file's (k3s stores it to the
-    second), and an image list. watcher.go re-imports when any of those is
-    off, and writes the entry only after an import succeeded."""
+    file's size, a modTime the file's mtime does not pass, and an image
+    list. watcher.go re-imports when any of those is off (``file.ModTime().
+    After(cached.ModTime)``) and writes the entry only after an import
+    succeeded. k3s stores modTime to the second, so a file whose mtime has a
+    fraction is After its own entry and is re-imported on every start: the
+    comparison is exact, with no flooring (#2387)."""
     if not entry or not isinstance(entry.get("images"), list):
         return False
     try:
@@ -179,7 +207,7 @@ def imported(tarball: Path, entry: dict | None) -> bool:
     if entry.get("size") != st.st_size:
         return False
     cached = _epoch(entry.get("modTime"))
-    return cached is not None and math.floor(st.st_mtime) <= cached
+    return cached is not None and st.st_mtime_ns <= round(cached * 1_000_000_000)
 
 
 def present_images() -> set[str] | None:
@@ -208,6 +236,53 @@ def kubelet_up() -> bool:
     return False
 
 
+def importing(tarballs: list[Path]) -> set[Path]:
+    """The tarballs some process holds open right now: the ones k3s is
+    importing (#2109). Reads every ``/proc/<pid>/fd``, which needs root, as
+    firstboot is. An fd that cannot be read counts as not open, so without
+    the access this answers "nothing" and verify judges as it did before.
+
+    An fd is matched by its file's (device, inode), not by the path its link
+    reads: the kernel spells that path through the mount the opener used, so
+    a bind mount or a symlinked directory gives the same file another name.
+    Only links naming a ``*.tar.zst`` are stat'd, which keeps one scan to a
+    readlink per fd on the host (a few thousand, a few milliseconds)."""
+    by_id: dict[tuple[int, int], Path] = {}
+    for t in tarballs:
+        try:
+            st = os.stat(t)
+        except OSError:
+            continue
+        by_id[(st.st_dev, st.st_ino)] = t
+    busy: set[Path] = set()
+    if not by_id:
+        return busy
+    suffix = TARBALL_GLOB.lstrip("*")
+    try:
+        pids = [p for p in PROC_DIR.iterdir() if p.name.isdigit()]
+    except OSError:
+        return busy
+    for pid in pids:
+        try:
+            fds = list(os.scandir(pid / "fd"))
+        except OSError:
+            # the process exited, or its fds are not ours to read
+            continue
+        for fd in fds:
+            try:
+                if not os.readlink(fd.path).endswith(suffix):
+                    continue
+                # stat through the fd: the open file itself, whatever its name
+                st = os.stat(fd.path)
+            except OSError:
+                # the process closed it, or exited, between the two calls
+                continue
+            hit = by_id.get((st.st_dev, st.st_ino))
+            if hit is not None:
+                busy.add(hit)
+    return busy
+
+
 @dataclass
 class Report:
     tarballs: list[Path]
@@ -215,6 +290,7 @@ class Report:
     missing: dict[str, list[str]]   # tarball name -> its images containerd lacks
     images: int                     # images the imported tarballs carry
     store: bool                     # containerd answered
+    busy: set[Path] = field(default_factory=set)  # k3s is importing these now
 
     @property
     def ok(self) -> bool:
@@ -226,7 +302,7 @@ class Report:
         ]
 
 
-def inspect() -> Report:
+def inspect(busy: set[Path] | None = None) -> Report:
     cache = read_import_cache()
     tarballs = sorted(IMAGES_DIR.glob(TARBALL_GLOB))
     unimported = [t for t in tarballs if not imported(t, cache.get(t.name))]
@@ -242,14 +318,17 @@ def inspect() -> Report:
             gone = [n for n in names if n not in store]
             if gone:
                 missing[t.name] = gone
-    return Report(tarballs, unimported, missing, count, store is not None)
+    return Report(tarballs, unimported, missing, count, store is not None, set(busy or ()))
 
 
 def _describe(report: Report) -> None:
     if not report.store:
         say("containerd did not answer `k3s ctr images ls`", err=True)
     for t in report.unimported:
-        say(f"k3s has not imported {t.name}", err=True)
+        if t in report.busy:
+            say(f"k3s is still importing {t.name}; its images are not checked yet", err=True)
+        else:
+            say(f"k3s has not imported {t.name}", err=True)
     for name, imgs in report.missing.items():
         for img in imgs:
             say(f"{img} (from {name}) is not in containerd", err=True)
@@ -268,19 +347,54 @@ def cmd_clear_ingests(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_verify(args: argparse.Namespace) -> int:
-    # k3s imports the whole images dir before it starts the kubelet (k3s
-    # containerd.go Run -> PreloadImages -> importAndWatchImages returns once
-    # its queue is empty), so a kubelet that answers means the start-up
-    # import is over and whatever it missed stays missed.
-    deadline = time.monotonic() + args.wait
-    while not kubelet_up():
-        if time.monotonic() >= deadline:
-            say(f"the kubelet did not answer within {args.wait:g}s; "
-                "judging k3s's import as it stands", err=True)
-            break
+def _names(tarballs: set[Path] | list[Path]) -> str:
+    return ", ".join(sorted(t.name for t in tarballs))
+
+
+def wait_for_import(kubelet_wait: float, hard: float) -> set[Path]:
+    """Wait until k3s's start-up import is over (#2109). Over means no baked
+    tarball is open AND either the kubelet answers (the fast path, no wait at
+    all on a node that finished long ago) or, past ``kubelet_wait`` without
+    one, nothing has been open for ``SETTLE_S``. While a tarball is open,
+    keep waiting, up to the monotonic deadline ``hard``. Returns the
+    tarballs still open when it stopped: empty unless ``hard`` ran out."""
+    tarballs = sorted(IMAGES_DIR.glob(TARBALL_GLOB))
+    started = time.monotonic()
+    quiet_since: float | None = None
+    told: set[Path] = set()
+    while True:
+        busy = importing(tarballs)
+        now = time.monotonic()
+        if busy:
+            quiet_since = None
+            if busy - told:
+                say(f"k3s is importing {_names(busy)}; waiting for it to finish")
+                told |= busy
+        else:
+            if kubelet_up():
+                return set()
+            if quiet_since is None:
+                quiet_since = now
+            if now >= kubelet_wait and now - quiet_since >= SETTLE_S:
+                say(f"the kubelet did not answer within {kubelet_wait - started:g}s and k3s has "
+                    "no image tarball open; judging k3s's import as it stands", err=True)
+                return set()
+        if now >= hard:
+            if busy:
+                say(f"k3s is still importing {_names(busy)} after {now - started:.0f}s; "
+                    "out of time to wait for it", err=True)
+            else:
+                say(f"the kubelet did not answer within {now - started:.0f}s; "
+                    "judging k3s's import as it stands", err=True)
+            return busy
         _sleep(POLL_S)
-    report = inspect()
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    start = time.monotonic()
+    hard = start + max(args.max_wait, 0.0)
+    busy = wait_for_import(min(start + args.wait, hard), hard)
+    report = inspect(busy)
     if report.ok:
         _all_there(report)
         return 0
@@ -290,22 +404,40 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     for ref, size in clear_ingests(min_idle_s=IDLE_INGEST_S):
         say(f"cleared stale containerd ingest {ref} ({size} bytes)")
-    redo = sorted(set(report.unimported) | {IMAGES_DIR / name for name in report.missing})
-    say(f"re-importing {len(redo)} tarball(s) through k3s: {', '.join(t.name for t in redo)}")
-    now = time.time()
+    wanted = set(report.unimported) | {IMAGES_DIR / name for name in report.missing}
+    # #2109 — never touch a tarball k3s has open: moving its mtime mid-import
+    # makes the watcher import it all over again once this import ends.
+    busy = importing(sorted(wanted))
+    if busy:
+        say(f"leaving {_names(busy)} alone: k3s is importing it right now")
+    redo = sorted(wanted - busy)
+    if redo:
+        say(f"re-importing {len(redo)} tarball(s) through k3s: {_names(redo)}")
+    # A whole second: k3s keeps modTime to the second and re-imports a file
+    # whose mtime is After it, so a fractional stamp is re-imported on every
+    # boot, never settling (#2387). The ceiling keeps it past the old entry.
+    now = math.ceil(time.time())
     for t in redo:
-        os.utime(t, (now, now))
+        os.utime(t, ns=(now * 1_000_000_000, now * 1_000_000_000))
 
-    deadline = time.monotonic() + args.repair_wait
+    # Keep waiting past --repair-wait while k3s is importing (it may reach the
+    # touched tarballs only after the ones ahead of them), never past --max-wait.
+    deadline = min(time.monotonic() + args.repair_wait, hard)
     while True:
         _sleep(POLL_S)
-        report = inspect()
-        if report.ok or time.monotonic() >= deadline:
+        busy = importing(sorted(IMAGES_DIR.glob(TARBALL_GLOB)))
+        report = inspect(busy)
+        now = time.monotonic()
+        if report.ok or now >= hard or (now >= deadline and not busy):
             break
     if report.ok:
         _all_there(report)
         return 0
     _describe(report)
+    if report.busy:
+        # Not a verdict that an image is missing: the time ran out first.
+        say(f"k3s had not finished importing {_names(report.busy)} when the time ran out",
+            err=True)
     say(f"still missing after the re-import: {', '.join(report.names()) or 'containerd'}", err=True)
     return 1
 
@@ -324,9 +456,12 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--repair", action="store_true",
                         help="clear idle ingests and have k3s re-import what it missed")
     verify.add_argument("--wait", type=float, default=120.0,
-                        help="seconds to wait for the kubelet, i.e. for k3s's start-up import")
+                        help="seconds to wait for the kubelet while k3s has no tarball open")
     verify.add_argument("--repair-wait", type=float, default=180.0,
-                        help="seconds to wait for k3s to re-import")
+                        help="seconds to wait for k3s to re-import, once it has no tarball open")
+    verify.add_argument("--max-wait", type=float, default=480.0,
+                        help="seconds this check may take in all, even while k3s is still "
+                             "importing (firstboot passes what is left of its start timeout)")
     verify.set_defaults(fn=cmd_verify)
     args = parser.parse_args(argv)
     return args.fn(args)

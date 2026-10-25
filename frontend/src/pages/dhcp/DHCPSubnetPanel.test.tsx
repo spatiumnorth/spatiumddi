@@ -42,6 +42,11 @@ vi.mock("@/lib/api", () => ({
         },
       ]),
     listGroups: () => listGroups(),
+    listStatics: () =>
+      Promise.resolve([
+        { id: "st-1", ip_address: "10.78.21.5" },
+        { id: "st-2", ip_address: "10.78.21.6" },
+      ]),
     listPools: () =>
       Promise.resolve([
         {
@@ -207,5 +212,22 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
     ]) {
       expect(button(name).disabled).toBe(false);
     }
+  });
+});
+
+describe("DHCPSubnetPanel delete scope (#2446)", () => {
+  it("names the reservations and the Trash, not just the pools", async () => {
+    const user = (await import("@testing-library/user-event")).default.setup();
+    await openPanel(grants(["read", "*"], ["delete", "dhcp_scope"]));
+    await user.click(screen.getByTitle(/Delete scope/i));
+    await screen.findByText(/This scope currently has:/);
+    expect(screen.getByText("1 pool")).toBeTruthy();
+    expect(screen.getByText("2 reservations")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /A superadmin can restore them as a set from Administration/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/cannot be undone/)).toBeNull();
   });
 });

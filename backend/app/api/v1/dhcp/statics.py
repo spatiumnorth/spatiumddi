@@ -16,7 +16,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.dns_names import validate_hostname
+from app.core.dns_names import validate_optional_hostname
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
@@ -39,11 +39,11 @@ def _validate_optional_hostname(v: str | None) -> str | None:
     """Reservation hostname is optional; validate the RFC 1123 form when set.
 
     Operator-entered (not client-supplied), so a malformed value is rejected
-    rather than sanitized (issue #597). ``""`` / ``None`` pass through.
+    rather than sanitized (issue #597). ``None`` passes through; a blank or
+    whitespace-only value becomes ``""`` (no hostname) rather than being kept
+    verbatim, where the IPAM mirror would publish it as a record owner.
     """
-    if v is None or v.strip() == "":
-        return v
-    return validate_hostname(v)
+    return validate_optional_hostname(v)
 
 
 def _no_scope_move(v: uuid.UUID | None) -> uuid.UUID | None:
@@ -233,6 +233,27 @@ async def list_statics(
     return list(res.scalars().all())
 
 
+async def _recount_subnet(db: DB, subnet_id: uuid.UUID) -> None:
+    """Refresh the cached allocated counts a static's IPAM mirror changed.
+
+    The mirror row counts toward the subnet's ``allocated_ips`` and its
+    block's rollup; without this they stay stale until the hourly recount
+    (#2533). Flush first so the counts see the mirror write, and again
+    before the block sums the subnet's new count.
+    """
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        _update_block_utilization,
+        _update_utilization,
+    )
+
+    await db.flush()
+    await _update_utilization(db, subnet_id)
+    await db.flush()
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is not None:
+        await _update_block_utilization(db, subnet.block_id)
+
+
 @router.post(
     "/scopes/{scope_id}/statics",
     response_model=StaticResponse,
@@ -263,6 +284,7 @@ async def create_static(
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st)
+    await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
         user=user,
@@ -318,6 +340,7 @@ async def update_static(
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st, action="update")
+    await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
         user=user,
@@ -355,5 +378,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
     # #1274 — a row handed to a live lease gets its DDNS back, but only once
     # the reservation is gone: DDNS lets a reservation's hostname win.
     await db.flush()
+    if scope is not None:
+        await _recount_subnet(db, scope.subnet_id)
     await publish_handover_ddns(db, handovers)
     await db.commit()

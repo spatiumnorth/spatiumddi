@@ -18,6 +18,15 @@
 
 set -eu
 
+# #2109 — seconds since boot, and when this run began. The slot-image check
+# near the end may wait for as long as this unit has left of its start
+# timeout, so it can report its own verdict instead of being killed mid-wait.
+FIRSTBOOT_TIMEOUT_S=600   # TimeoutStartSec=10min in spatiumddi-firstboot.service
+uptime_s() {
+    read -r _up _ </proc/uptime && echo "${_up%.*}"
+}
+FIRSTBOOT_T0=$(uptime_s 2>/dev/null || echo 0)
+
 LOG=/var/log/spatiumddi/firstboot.log
 ENV_FILE=/etc/spatiumddi/.env
 
@@ -490,6 +499,8 @@ fi
 # the shared /var and holds whatever the last boot wrote), so a slot upgrade
 # stamps the new version and a rollback the old one: this bootstrap manifest is
 # re-rendered each boot and helm-controller rolls the pods when the value moves.
+# Except while a cluster Rolling Upgrade holds it with the image tag (#2176):
+# then the pods keep the version they run until the run's flip moves both.
 # Empty (not a made-up "0.1.0") when the file is absent: the api reads "" as
 # unknown.
 APPLIANCE_VERSION_VAL=""
@@ -899,16 +910,32 @@ _render_control_helmchart() {
     _mem_total_mib() {
         awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || true
     }
+    # #2240 — the CPU count the api / Postgres CPU limits are sized from; the
+    # supervisor's node_cpu_count reads the same affinity count.
+    _cpu_count() {
+        nproc 2>/dev/null || true
+    }
     _clamp_mib() {  # total, numerator, denominator, lo, hi
         local v=$(( $1 * $2 / $3 ))
         [ "$v" -lt "$4" ] && v="$4"
         [ "$v" -gt "$5" ] && v="$5"
         printf '%s' "$v"
     }
-    local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_CONCURRENCY
+    _clamp_cores() {  # count, divisor, lo, hi
+        local v=$(( $1 / $2 ))
+        [ "$v" -lt "$3" ] && v="$3"
+        [ "$v" -gt "$4" ] && v="$4"
+        printf '%s' "$v"
+    }
+    _join_lines() {  # $1 then $2 on the next line; $2 alone when $1 is empty
+        if [ -n "$1" ]; then printf '%s\n%s' "$1" "$2"; else printf '%s' "$2"; fi
+    }
+    local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_LEFT_MIB WORKER_CONCURRENCY
     local POSTGRES_MEM_MIB POSTGRES_SHARED_BUFFERS_MB POSTGRES_MEM_REQUEST_MIB
+    local CPU_COUNT API_CPU_CORES POSTGRES_CPU_CORES API_LIMITS_YAML POSTGRES_LIMITS_YAML
     local API_SIZING_YAML WORKER_SIZING_YAML POSTGRES_SIZING_YAML POSTGRES_PARAMETERS_YAML
     MEM_TOTAL_MIB=$(_mem_total_mib)
+    CPU_COUNT=$(_cpu_count)
     API_MEM_MIB=""
     WORKER_MEM_MIB=""
     WORKER_CONCURRENCY=""
@@ -918,17 +945,21 @@ _render_control_helmchart() {
     if [ -n "$MEM_TOTAL_MIB" ] && [ "$MEM_TOTAL_MIB" -gt 0 ] 2>/dev/null; then
         # #1115 — a whole-node budget: _PLATFORM_RESERVE_MIB = 2048 for k3s,
         # the supervisor, the bind9/kea DaemonSets and the CNPG operator, then
-        # the remainder split api 1/2, worker 1/4, Postgres 1/4 as integer
-        # ratios; clamps 1024..8192, 1024..4096 and 1024..4096. Postgres'
-        # floor is the chart's own 1Gi. The Postgres limit is rendered HERE,
-        # not left to the supervisor, because a resources change on a formed
-        # CloudNativePG cluster is a rolling restart: the Cluster must be
-        # created with its final size.
+        # the remainder split api 1/2, Postgres 1/4 as integer ratios, clamps
+        # 1024..8192 and 1024..4096. Postgres' floor is the chart's own 1Gi.
+        # #2240 — the worker 2/5 (1024..16384), but never more than the api
+        # and Postgres leave of the budget, and never below its floor.
+        # The Postgres limit is rendered HERE, not left to the supervisor,
+        # because a resources change on a formed CloudNativePG cluster is a
+        # rolling restart: the Cluster must be created with its final size.
         BUDGET_MIB=$(( MEM_TOTAL_MIB - 2048 ))
         if [ "$BUDGET_MIB" -lt 0 ]; then BUDGET_MIB=0; fi
         API_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 1 2 1024 8192)
-        WORKER_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 1 4 1024 4096)
         POSTGRES_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 1 4 1024 4096)
+        WORKER_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" 2 5 1024 16384)
+        WORKER_LEFT_MIB=$(( BUDGET_MIB - API_MEM_MIB - POSTGRES_MEM_MIB ))
+        if [ "$WORKER_MEM_MIB" -gt "$WORKER_LEFT_MIB" ]; then WORKER_MEM_MIB=$WORKER_LEFT_MIB; fi
+        if [ "$WORKER_MEM_MIB" -lt 1024 ]; then WORKER_MEM_MIB=1024; fi
         # _POSTGRES_SHARED_BUFFERS_SHARE = 1/4 of the Postgres cap (Postgres'
         # guidance; the chart's 256MB-of-1Gi is the same ratio).
         POSTGRES_SHARED_BUFFERS_MB=$(( POSTGRES_MEM_MIB / 4 ))
@@ -954,6 +985,22 @@ _render_control_helmchart() {
     else
         echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
     fi
+    # #2240 — CPU limits from the CPU count: Postgres half the node (1..8
+    # cores), the api a quarter (1..4), in the chart's millicore form so a
+    # node that lands on the chart's own 1000m renders exactly it. Sized
+    # apart from the memory: an unknown count leaves the chart's CPU limits,
+    # an unknown MemTotal does not take these with it. Rendered here for the
+    # same reason as the Postgres memory: a change on a formed cluster is a
+    # CloudNativePG rolling restart.
+    API_CPU_CORES=""
+    POSTGRES_CPU_CORES=""
+    if [ -n "$CPU_COUNT" ] && [ "$CPU_COUNT" -gt 0 ] 2>/dev/null; then
+        POSTGRES_CPU_CORES=$(_clamp_cores "$CPU_COUNT" 2 1 8)
+        API_CPU_CORES=$(_clamp_cores "$CPU_COUNT" 4 1 4)
+        echo "Sizing control-plane CPU for ${CPU_COUNT} CPUs: api=${API_CPU_CORES}000m postgres=${POSTGRES_CPU_CORES}000m" >&2
+    else
+        echo "CPU count unreadable — leaving the chart's default control-plane CPU limits in place" >&2
+    fi
     # Rendered into the values block below. Empty string = emit nothing, so an
     # unreadable MemTotal leaves the chart's defaults untouched rather than
     # emitting a malformed `memory: Mi`.
@@ -961,15 +1008,32 @@ _render_control_helmchart() {
     WORKER_SIZING_YAML=""
     POSTGRES_SIZING_YAML=""
     POSTGRES_PARAMETERS_YAML=""
+    # The limits lines first (memory and / or cpu, each only when sized), then
+    # the blocks around them, so either input alone still renders valid YAML.
+    API_LIMITS_YAML=""
+    POSTGRES_LIMITS_YAML=""
     if [ -n "$API_MEM_MIB" ]; then
-        API_SIZING_YAML=$(printf '      resources:\n        limits:\n          memory: "%sMi"' \
-            "$API_MEM_MIB")
+        API_LIMITS_YAML=$(printf '          memory: "%sMi"' "$API_MEM_MIB")
+        POSTGRES_LIMITS_YAML=$(printf '          memory: "%sMi"' "$POSTGRES_MEM_MIB")
+    fi
+    if [ -n "$API_CPU_CORES" ]; then
+        API_LIMITS_YAML=$(_join_lines "$API_LIMITS_YAML" \
+            "$(printf '          cpu: "%s000m"' "$API_CPU_CORES")")
+        POSTGRES_LIMITS_YAML=$(_join_lines "$POSTGRES_LIMITS_YAML" \
+            "$(printf '          cpu: "%s000m"' "$POSTGRES_CPU_CORES")")
+    fi
+    if [ -n "$API_LIMITS_YAML" ]; then
+        API_SIZING_YAML=$(printf '      resources:\n        limits:\n%s' "$API_LIMITS_YAML")
+    fi
+    if [ -n "$API_MEM_MIB" ]; then
         WORKER_SIZING_YAML=$(printf '      concurrency: %s\n      resources:\n        limits:\n          memory: "%sMi"' \
             "$WORKER_CONCURRENCY" "$WORKER_MEM_MIB")
-        POSTGRES_SIZING_YAML=$(printf '      resources:\n        requests:\n          memory: "%sMi"\n        limits:\n          memory: "%sMi"' \
-            "$POSTGRES_MEM_REQUEST_MIB" "$POSTGRES_MEM_MIB")
+        POSTGRES_SIZING_YAML=$(printf '      resources:\n        requests:\n          memory: "%sMi"\n        limits:\n%s' \
+            "$POSTGRES_MEM_REQUEST_MIB" "$POSTGRES_LIMITS_YAML")
         POSTGRES_PARAMETERS_YAML=$(printf '        parameters:\n          shared_buffers: "%sMB"' \
             "$POSTGRES_SHARED_BUFFERS_MB")
+    elif [ -n "$POSTGRES_LIMITS_YAML" ]; then
+        POSTGRES_SIZING_YAML=$(printf '      resources:\n        limits:\n%s' "$POSTGRES_LIMITS_YAML")
     fi
     # #983 — first of two gates on naming ``spatium-control-plane`` here.
     # This one is cheap and early: no appliance chart tarball means the chart
@@ -1004,8 +1068,8 @@ spec:
   # reinstall deleted the Secret, the install's 'lookup' found nothing, and
   # 'randAlphaNum 64' minted a new SECRET_KEY, orphaning everything
   # encrypted at rest (#1042's consequences, again). 'abort' was rejected in
-  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.7
-  # and klipper-helm v0.13.3, from k3s v1.36.4+k3s1) does not wait: it runs
+  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.9
+  # and klipper-helm v0.13.3, from k3s v1.36.5+k3s1) does not wait: it runs
   # 'helm upgrade' on a failed release, and deletes nothing.
   #
   # A HelmChartConfig's failurePolicy overrides this one, and its CRD
@@ -1016,6 +1080,15 @@ spec:
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # #2004 — the slot's version. The chart appends it to the api, worker and
+    # beat env as APPLIANCE_VERSION; without it settings.appliance_version is ""
+    # in every control-plane pod, so system/info and /version report unknown.
+    # #2176 — a value of its own beside image.tag, not a sharedEnv entry: a
+    # cluster Rolling Upgrade holds it with the tag in the HelmChartConfig,
+    # which can pin a scalar but replaces a list whole. As a sharedEnv entry,
+    # this render on the seed's new slot rolled the control plane mid-run, on
+    # the held image, and the worker that drives the run with it.
+    applianceVersion: "${APPLIANCE_VERSION_VAL:-}"
     # #1448 — SECRET_KEY lives in a Secret this chart does not own
     # (ensure_app_key_secret creates it), so no helm uninstall can delete it.
     # Both lines carry the marker: _strip_control_app_secret removes them if
@@ -1104,10 +1177,7 @@ spec:
     sharedEnv:
       - name: APPLIANCE_MODE
         value: "true"
-      # #2004 — the slot's version. Without it settings.appliance_version is ""
-      # in every control-plane pod, so system/info and /version report unknown.
-      - name: APPLIANCE_VERSION
-        value: "${APPLIANCE_VERSION_VAL:-}"
+      # (APPLIANCE_VERSION is the applianceVersion value above: #2176.)
       # #1003 item 2 — the installer's Time source answer. Seeds the
       # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
       # plane pushes what the operator typed instead of the platform
@@ -1164,6 +1234,19 @@ ${API_SIZING_YAML}
           operator: Exists
           effect: NoExecute
           tolerationSeconds: 20
+      # #1805 — each node's in-cluster callers (the supervisor's heartbeat,
+      # the DNS and DHCP agents, the frontend's /api proxy) use the api pod
+      # on their own node while it is ready, so a lost node's api pod cannot
+      # hold their requests until their timeout. The chart's default is empty
+      # (a BYO-Kubernetes install keeps the spread over every api pod); the
+      # appliance runs one api pod per control-plane node, so it sets the
+      # value here, and the seed supervisor writes the same value into the
+      # spatium-control HelmChartConfig (apply_control_plane_overrides),
+      # which is what a grown or upgraded cluster renders. Stated at one
+      # replica too, where it is inert, so the first heartbeat has nothing
+      # to add (#1005).
+      service:
+        trafficDistribution: PreferSameNode
       autoscaling:
         enabled: false
       env:
@@ -1592,10 +1675,12 @@ import yaml
 
 PATHS = (
     ("api", "resources", "limits", "memory"),
+    ("api", "resources", "limits", "cpu"),
     ("worker", "concurrency"),
     ("worker", "resources", "limits", "memory"),
     ("postgresql", "resources", "requests", "memory"),
     ("postgresql", "resources", "limits", "memory"),
+    ("postgresql", "resources", "limits", "cpu"),
     ("postgresql", "cnpg", "parameters", "shared_buffers"),
 )
 MISSING = object()
@@ -1808,22 +1893,52 @@ fi
 # served no DNS and no DHCP until it was torn down. k3s retries a failed
 # tarball only when the file changes again.
 #
-# ``verify --repair`` waits for k3s's start-up import to finish (the kubelet
-# starts after it). It then checks k3s's own record of what it imported and
-# what containerd holds. Whatever is missing it re-imports through k3s,
-# clearing a stale ingest first. Returns non-zero only when an image is still
-# missing after that. Runs on every boot, and is bounded well inside this
-# unit's start timeout (2 min for the kubelet, 3 for the re-import). The
-# kubelet is up long before this point on any boot that got here.
+# ``verify --repair`` waits for k3s's start-up import to finish, then checks
+# k3s's own record of what it imported and what containerd holds. Whatever is
+# missing it re-imports through k3s, clearing a stale ingest first. Returns
+# non-zero when an image is still missing after that, or when k3s is still
+# importing when the time runs out. Runs on every boot.
+#
+# #2109 — "finished" is that k3s holds no baked tarball open, not that the
+# kubelet answers. The kubelet starts with k3s's last import still running,
+# and on slow storage it did not answer for minutes: the check then judged
+# imports k3s had not finished, touched the tarball it was importing (which
+# restarts that import) and gave up before the second import ended, so a
+# healthy trial slot was not committed and the next reboot reverted it. The
+# check now waits while k3s is importing, for as long as this unit has left
+# of its start timeout, less SLOT_IMAGES_MARGIN_S for the commit after it.
+# The floor is small on purpose: past the budget a short wait still ends in
+# the check's own verdict, where a long one would be cut off by systemd's
+# timeout with the log stopping mid-wait and no reason given.
+SLOT_IMAGES_MARGIN_S=45
+slot_images_budget() {
+    local now budget
+    now=$(uptime_s 2>/dev/null || echo 0)
+    budget=$((FIRSTBOOT_TIMEOUT_S - (now - ${FIRSTBOOT_T0:-0}) - SLOT_IMAGES_MARGIN_S))
+    # a clock that read wrong must not size the wait past the unit's timeout
+    [ "$budget" -le "$FIRSTBOOT_TIMEOUT_S" ] || budget=$FIRSTBOOT_TIMEOUT_S
+    [ "$budget" -ge 10 ] || budget=10
+    echo "$budget"
+}
 check_slot_images() {
     if [ ! -x /usr/local/bin/spatium-k3s-images ]; then
         echo "WARN: /usr/local/bin/spatium-k3s-images is missing — this slot's images were not checked." >&2
         return 0
     fi
-    if /usr/local/bin/spatium-k3s-images verify --repair; then
+    # No budget (it cannot be worked out) leaves the helper's own --max-wait;
+    # an empty one would be an argument error, i.e. a slot never committed.
+    local budget
+    budget=$(slot_images_budget 2>/dev/null) || budget=""
+    if [ -n "$budget" ]; then
+        set -- --max-wait "$budget"
+    else
+        set --
+    fi
+    if /usr/local/bin/spatium-k3s-images verify --repair "$@"; then
         return 0
     fi
-    echo "ERROR: this slot's images are not all in containerd, even after a re-import (above)." >&2
+    echo "ERROR: this slot's images are not all in containerd, even after a re-import, or k3s" >&2
+    echo "       was still importing them when the time ran out (above)." >&2
     return 1
 }
 
@@ -1837,6 +1952,10 @@ slot_images_allow_commit() {
     check_slot_images && return 0
     if is_trial_boot; then
         echo "       trial boot: NOT committing this slot; next reboot reverts." >&2
+        # #2109 — the slot may be healthy and only its import slow. Say how to
+        # keep it once the import is over, before a reboot throws it away.
+        echo "       To keep this slot: once \`spatium-k3s-images verify\` passes, commit it from" >&2
+        echo "       Fleet (Approve trial, on this node's slot) before the next reboot." >&2
         return 1
     fi
     echo "       steady-state boot: nothing to commit; continuing." >&2

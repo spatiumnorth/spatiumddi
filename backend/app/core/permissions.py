@@ -25,7 +25,7 @@ Two entry points are exported:
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import Annotated, NoReturn
 from uuid import UUID
 
 import structlog
@@ -294,9 +294,19 @@ def user_has_permission(
     return True
 
 
-def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str | None) -> bool:
+def _user_rbac_allows(
+    user: User,
+    action: str,
+    resource_type: str,
+    req_rid: str | None,
+    *,
+    include_time_bound: bool = True,
+) -> bool:
     """The owning user's static-role + time-bound-grant verdict (no token
-    narrowing — that's layered on in :func:`user_has_permission`)."""
+    narrowing — that's layered on in :func:`user_has_permission`).
+
+    ``include_time_bound=False`` answers from static roles (and the legacy
+    flag) alone, for :func:`caller_can_grant`."""
     if user.is_superadmin:
         return True
 
@@ -320,6 +330,8 @@ def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str 
     # never removes a static role grant. The same _action_/_resource_type_/
     # _resource_id_ predicates apply so a grant evaluates identically to a
     # role permission with the same triple.
+    if not include_time_bound:
+        return False
     for grant in getattr(user, "_active_time_bound_grants", None) or []:
         if not _action_matches(getattr(grant, "action", ""), action):
             continue
@@ -492,6 +504,10 @@ def caller_can_grant(user: User, perms: object) -> bool:
       :func:`user_has_permission` with the same triple). A caller cannot grant
       a permission they don't possess, so the resulting role can never widen
       the caller's own effective access.
+    * ...and holds through a static role, not only through a live time-bound
+      grant. Granting is durable (a role, a membership, a fresh grant with its
+      own expiry), so a permission held until a deadline must not be turnable
+      into one held after it.
 
     A malformed / unrecognised entry is treated as un-grantable (``False``) so
     a bad shape can't sneak past the ceiling.
@@ -507,8 +523,12 @@ def caller_can_grant(user: User, perms: object) -> bool:
         # grant access beyond what the caller can express via concrete holds.
         if action == "*" or resource_type == "*":
             return False
-        # The caller must already hold this exact (action, resource_type[, id]).
+        # The caller must already hold this exact (action, resource_type[, id]),
+        # and hold it through a static role: a time-bound grant is not a
+        # ceiling to grant from, or it would outlive its own expiry.
         if not user_has_permission(user, action, resource_type, rid):
+            return False
+        if not _user_rbac_allows(user, action, resource_type, rid, include_time_bound=False):
             return False
     return True
 
@@ -541,6 +561,53 @@ async def _record_denial(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — don't let audit failures block the 403
         logger.warning("permission_audit_write_failed", error=str(exc))
+
+
+async def refuse_and_audit(
+    db: AsyncSession,
+    user: User,
+    request: Request | None,
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    resource_display: str,
+    reason: str,
+    status_code: int = status.HTTP_403_FORBIDDEN,
+    detail: str,
+) -> NoReturn:
+    """Write a ``denied`` audit row for a refused mutation, then raise.
+
+    For refusals decided inside a handler (a privilege ceiling, an invariant)
+    rather than by a :func:`require_permission` gate, so they leave the same
+    trail. Call it before anything is written: the row is committed, and so
+    would be any pending change. Best-effort on the audit write, as
+    :func:`_record_denial` is — the refusal never depends on it.
+    """
+    try:
+        db.add(
+            AuditLog(
+                user_id=user.id,
+                user_display_name=user.display_name,
+                auth_source=getattr(user, "auth_source", "local") or "local",
+                source_ip=get_trusted_client_ip(request) if request is not None else None,
+                user_agent=(
+                    clean_user_agent(request.headers.get("user-agent"))
+                    if request is not None
+                    else None
+                ),
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                resource_display=resource_display,
+                result="denied",
+                error_detail=reason,
+            )
+        )
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 — don't let audit failures block the refusal
+        logger.warning("permission_audit_write_failed", error=str(exc))
+    raise HTTPException(status_code=status_code, detail=detail)
 
 
 def require_permission(
@@ -598,6 +665,46 @@ def require_any_permission(*pairs: tuple[str, str]) -> Callable[..., Awaitable[U
         )
 
     _dep.spatium_requires = ("exact", list(pairs))  # type: ignore[attr-defined]
+    return _dep
+
+
+def require_permission_or_scoped(
+    action: str,
+    resource_type: str,
+) -> Callable[..., Awaitable[User]]:
+    """Like :func:`require_permission`, but also admits a caller whose only
+    grant on ``resource_type`` is scoped to particular instances.
+
+    For routes whose handler narrows its own result to the instances the
+    caller may read (the agent-log reads, #2120). The unscoped check in
+    :func:`require_permission` refuses a grant scoped to one instance —
+    ``_resource_id_matches`` cannot match a scoped grant against an unscoped
+    question — so without this such a caller could never reach the handler
+    that would have served them their own instances. The handler is the
+    authoritative per-row gate; a route using this MUST narrow every row it
+    returns.
+
+    A resource-scoped API token (#374) must also carry a grant on the type.
+    """
+
+    async def _dep(
+        request: Request,
+        current_user: CurrentUser,
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        if user_has_permission(current_user, action, resource_type):
+            return current_user
+        if has_any_grant_for(current_user, action, resource_type):
+            token_grants = _token_grants_for(current_user)
+            if not token_grants or _token_grants_allow(token_grants, action, resource_type, None):
+                return current_user
+        await _record_denial(db, current_user, request, action, resource_type, None)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: need '{action}' on '{resource_type}'",
+        )
+
+    _dep.spatium_requires = ("exact", [(action, resource_type)])  # type: ignore[attr-defined]
     return _dep
 
 
@@ -743,24 +850,96 @@ def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
     return False
 
 
+def request_route_key(request: Request) -> str:
+    """``"METHOD /path-template"`` of the matched route, relative to the IPAM
+    router's ``/ipam`` prefix (``"PUT /addresses/{address_id}"``).
+
+    This is the key the route allow-lists of
+    :func:`require_any_resource_or_scoped` are written in. It is built from
+    the route TEMPLATE, never the concrete URL, so a path value cannot steer
+    which entry matches.
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path", "") or ""
+    return f"{request.method.upper()} {template.split('/ipam', 1)[-1]}"
+
+
+def _instance_scoped_admit(
+    request: Request,
+    user: User,
+    action: str,
+    instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]],
+) -> bool:
+    """True when ``user`` holds ``action`` on the ONE resource the route's path
+    names, via a grant scoped to that resource (or an unscoped one).
+
+    ``instance_routes`` maps a path parameter (``subnet_id``) to
+    ``(resource_type, list_route, read_routes, write_routes)``. Every route is
+    a ``"METHOD /path"`` template relative to the router's ``/ipam`` prefix,
+    and the lists are allow-lists: a route added later is NOT reachable by a
+    scoped grant until someone decides it should be (#2438).
+
+    * ``read_routes`` / ``write_routes``: admitted when the caller holds the
+      method's action on the resource the path names.
+    * ``list_route``: the type's collection, admitted for a ``read`` when the
+      caller holds any read grant on the type; its handler must narrow the
+      rows to the granted ones.
+    """
+    key = request_route_key(request)
+    for pname, (rtype, list_route, read_routes, write_routes) in instance_routes.items():
+        raw = request.path_params.get(pname)
+        if raw is None:
+            if action == "read" and key == list_route and _has_any_read_grant(user, rtype):
+                return True
+            continue
+        try:
+            rid = str(UUID(str(raw)))
+        except ValueError:
+            continue
+        allowed = read_routes if action == "read" else write_routes
+        if key in allowed and user_has_permission(user, action, rtype, rid):
+            return True
+    return False
+
+
+def _has_any_read_grant(user: User, resource_type: str) -> bool:
+    """Any read grant on ``resource_type`` (scoped or not) that a resource-scoped
+    API token (#374) does not narrow away, the coarse half of
+    :func:`user_has_permission`."""
+    if not has_any_grant_for(user, "read", resource_type):
+        return False
+    grants = _token_grants_for(user)
+    return not grants or _token_grants_allow(grants, "read", resource_type, None)
+
+
 def require_any_resource_or_scoped(
     unscoped_types: tuple[str, ...],
-    scoped_types: tuple[str, ...],
+    scoped_routes: dict[str, frozenset[str]],
+    instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Coarse router gate that also admits instance-scoped delegates.
 
     Passes if the user has the method-derived action (unscoped) on ANY
     ``unscoped_types`` — the normal :func:`require_any_resource_permission`
     behaviour — OR, for **mutating** methods only (write / delete, never read),
-    holds ANY grant (scoped or unscoped) on ANY ``scoped_types`` via
-    :func:`has_any_grant_for`.
+    holds ANY grant (scoped or unscoped) on a ``scoped_routes`` type via
+    :func:`has_any_grant_for` AND the request's route is on that type's
+    allow-list.
 
-    The scoped admit exists for delegation types (``address_set``, #103) whose
-    real boundary is enforced by a downstream per-row gate, so a delegate with
-    only ``{write, address_set, <id>}`` clears the coarse gate and reaches that
-    gate. It is restricted to write/delete so a scoped *read* grant can never
-    widen read access to the aggregate router's data; read still requires a
-    normal (typically type-level) read grant.
+    ``scoped_routes`` maps a delegation type (``address_set``, #103) to the
+    ``"METHOD /path"`` templates (see :func:`request_route_key`) whose handler
+    enforces that type's real boundary with its own per-row gate. The grant's
+    ``resource_id`` is not consulted here, so the allow-list is the whole
+    boundary of this admit: a delegate with only ``{write, address_set, <id>}``
+    reaches exactly those routes, and a route added later stays closed to it
+    until someone lists it. The admit is restricted to write/delete so a scoped
+    *read* grant can never widen read access to the aggregate router's data;
+    read still requires a normal (typically type-level) read grant.
+
+    ``instance_routes`` (#2438) additionally admits a grant scoped to ONE
+    resource on an allow-list of routes that name that resource in their path
+    (see :func:`_instance_scoped_admit`), and on its collection route, whose
+    handler narrows the rows.
     """
 
     async def _dep(
@@ -772,11 +951,16 @@ def require_any_resource_or_scoped(
         for rt in unscoped_types:
             if user_has_permission(current_user, action, rt):
                 return current_user
-        if action != "read":
-            for rt in scoped_types:
-                if has_any_grant_for(current_user, action, rt):
+        if action != "read" and scoped_routes:
+            key = request_route_key(request)
+            for rt, routes in scoped_routes.items():
+                if key in routes and has_any_grant_for(current_user, action, rt):
                     return current_user
-        all_types = list(unscoped_types) + list(scoped_types)
+        if instance_routes and _instance_scoped_admit(
+            request, current_user, action, instance_routes
+        ):
+            return current_user
+        all_types = list(unscoped_types) + list(scoped_routes)
         first = all_types[0] if all_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
         raise HTTPException(
@@ -818,6 +1002,8 @@ __all__ = [
     "require_any_permission",
     "require_any_resource_permission",
     "require_permission",
+    "require_permission_or_scoped",
+    "request_route_key",
     "require_resource_permission",
     "token_scope_allows",
     "token_scoped_resource_ids",

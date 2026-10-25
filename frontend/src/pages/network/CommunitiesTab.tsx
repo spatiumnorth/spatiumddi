@@ -4,11 +4,13 @@ import { ChevronDown, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
 
 import {
   asnsApi,
+  formatApiError,
   type BGPCommunity,
   type BGPCommunityCreate,
   type BGPCommunityKind,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 const inputCls =
@@ -112,11 +114,7 @@ function CommunityFormModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -272,6 +270,16 @@ function CommunityFormModal({
 
 export function CommunitiesTab({ asnId }: { asnId: string }) {
   const qc = useQueryClient();
+  // #2518 — the router asks write (delete) on 'manage_asns', as the ASN list does.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_asns"),
+    "Requires delete permission on ASNs",
+  );
   const { data: communities = [] } = useQuery({
     queryKey: ["asn-communities", asnId],
     queryFn: () => asnsApi.listCommunities(asnId),
@@ -323,7 +331,8 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
             setPresetKind(undefined);
             setShowAdd(true);
           }}
-          className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+          {...writeGate}
         >
           <Plus className="h-4 w-4" />
           Add Community
@@ -373,8 +382,9 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
                         setPresetKind("standard");
                         setShowAdd(true);
                       }}
-                      className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                      className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-50"
                       title="Add a copy of this community to this ASN with your own notes"
+                      {...writeGate}
                     >
                       Use on this AS
                     </button>
@@ -442,7 +452,8 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
                               setShowAdd(true);
                             }}
                             title="Edit"
-                            className="rounded p-1 hover:bg-accent"
+                            className="rounded p-1 hover:bg-accent disabled:opacity-50"
+                            {...writeGate}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </button>
@@ -460,6 +471,7 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
                             disabled={deleteMut.isPending}
                             title="Delete"
                             className="rounded p-1 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50"
+                            {...deleteGate}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>

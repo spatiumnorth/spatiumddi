@@ -86,6 +86,7 @@ it later crosses into a different geo scope. Keep the pool TTL short.
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -129,6 +130,12 @@ class GeoSteering:
     views: list[GeoView] = field(default_factory=list)
     member_view: dict[str, str] = field(default_factory=dict)
     default_fallback_members: set[str] = field(default_factory=set)
+    # Members that ARE geo-scoped (a Site is linked) but whose scope resolved
+    # to nothing — the site's last subnet was unlinked or deleted (#2292).
+    # They must answer nobody: an empty scope is only a *default* when the
+    # member was never scoped, and collapsing the two would turn "site-A
+    # clients only" into "everyone".
+    unreachable_members: set[str] = field(default_factory=set)
 
     @property
     def active(self) -> bool:
@@ -202,11 +209,16 @@ async def build_geo_steering(db: AsyncSession, group_id) -> GeoSteering:
     # member ids of all-geo pools (no unscoped member) — served as a
     # union fallback into the non-geo views so a name never blackholes.
     fallback_members: set[str] = set()
+    unreachable: set[str] = set()
     for p in pools:
         scoped_ids: list[str] = []
         has_default = False
         for m in p.members or []:
             scope = _member_scope(m, site_cidrs)
+            if not scope and m.site_id is not None:
+                # Scoped to a Site whose subnets are gone: fail closed.
+                unreachable.add(str(m.id))
+                continue
             if not scope:
                 has_default = True  # unscoped → served everywhere already
                 continue
@@ -218,7 +230,9 @@ async def build_geo_steering(db: AsyncSession, group_id) -> GeoSteering:
         if scoped_ids and not has_default:
             fallback_members.update(scoped_ids)
 
-    steering = GeoSteering(default_fallback_members=fallback_members)
+    steering = GeoSteering(
+        default_fallback_members=fallback_members, unreachable_members=unreachable
+    )
     # Deterministic view numbering by sorted scope key.
     for idx, key in enumerate(sorted(scope_to_members.keys()), start=1):
         name = f"spatium-geo-{idx}"
@@ -323,6 +337,26 @@ def view_renders_zone(view_desc: dict[str, Any], operator_target_ids: set[Any]) 
     )
 
 
+def views_rendering_zone(
+    view_descs: list[dict[str, Any]],
+    zone_view_id: Any,
+    record_view_ids: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """The views (in render order) that carry a copy of one zone.
+
+    ``zone_view_id`` is the zone's own pinned view (or None) and
+    ``record_view_ids`` the views its view-scoped records name. The bundle
+    builder renders a zone stanza into exactly these views, and the #2275
+    collision guard counts placements from the same call, so the two cannot
+    disagree about where a zone lands. A group with no views (``view_descs``
+    empty) renders zones flat and is the caller's case to handle.
+    """
+    targets = {v for v in record_view_ids if v is not None}
+    if zone_view_id is not None:
+        targets.add(zone_view_id)
+    return [vd for vd in view_descs if view_renders_zone(vd, targets)]
+
+
 def records_for_view(
     rec_rows: list[DNSRecord], view_desc: dict[str, Any], geo: GeoSteering
 ) -> list[DNSRecord]:
@@ -349,6 +383,8 @@ def records_for_view(
     out: list[DNSRecord] = []
     for r in rec_rows:
         mid = str(r.pool_member_id) if r.pool_member_id else None
+        if mid is not None and mid in geo.unreachable_members:
+            continue  # scoped to a site with no subnets: serve nobody (#2292)
         gview = geo.member_view.get(mid) if mid else None
         if gview is not None:
             if view_desc["name"] == gview:

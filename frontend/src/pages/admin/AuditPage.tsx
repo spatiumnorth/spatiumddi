@@ -42,7 +42,7 @@ const RESOURCE_TYPE_OPTIONS = [
   "ip_block",
   "subnet",
   "ip_address",
-  "dns_group",
+  "dns_server_group",
   "dns_zone",
   "dns_record",
   "dhcp_server_group",
@@ -510,14 +510,13 @@ function AuditDetails({ id }: { id: string }) {
 }
 
 function ChainIntegrityBadge() {
-  // Cap the on-page check at 1000 rows so opening the audit page on a
-  // huge deployment doesn't take seconds. The nightly Celery task
-  // does the full sweep + writes an alert event, so the badge is
-  // primarily here to give operators an at-a-glance "yes, we just
-  // checked" signal.
+  // Verify the NEWEST 1000 rows (where tampering matters) so opening the
+  // audit page on a huge deployment doesn't take seconds. The nightly
+  // Celery task does the full sweep + writes an alert event; the tooltip
+  // says which range this badge covered (#2297).
   const { data } = useQuery({
-    queryKey: ["audit-integrity-1000"],
-    queryFn: () => auditApi.integrity(1000),
+    queryKey: ["audit-integrity-newest-1000"],
+    queryFn: () => auditApi.integrity(1000, true),
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   });
@@ -532,7 +531,11 @@ function ChainIntegrityBadge() {
     return (
       <span
         className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
-        title={`Last ${data.rows_checked.toLocaleString()} rows verified`}
+        title={
+          data.partial
+            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify walks the whole chain.`
+            : `Whole chain verified (${data.rows_checked.toLocaleString()} rows)`
+        }
       >
         <ShieldCheck className="h-3 w-3" />
         Chain verified

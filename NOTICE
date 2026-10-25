@@ -52,6 +52,10 @@ Where the two disagree about a license, THIS file is authoritative.
 - Helm — Apache 2.0 — https://helm.sh
 - MetalLB (L2 load balancer / control-plane VIP) — Apache 2.0 — https://metallb.io
 - FRRouting (BGP daemon, via MetalLB's frr-k8s backend) — GPL v2 — https://frrouting.org
+- frr-k8s (MetalLB's BGP backend; only with BGP mode enabled) — Apache 2.0 —
+  https://github.com/metallb/frr-k8s
+- kube-rbac-proxy (frr-k8s metrics sidecar; only with BGP mode enabled) —
+  Apache 2.0 — https://github.com/brancz/kube-rbac-proxy
 - CloudNativePG (PostgreSQL operator) — Apache 2.0 — https://cloudnative-pg.io
 - Patroni (bare-metal HA Postgres overlay) — MIT — https://github.com/patroni/patroni
 - HAProxy (Patroni HA overlay) — GPL v2 (+ LGPL exception for libs) —

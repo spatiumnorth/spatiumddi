@@ -185,6 +185,12 @@ describe("a delete the approval queue took", () => {
   it("Edit Subnet says it in a status, not its error box", async () => {
     const deleteSubnet = vi.fn(() => QUEUED);
     answers.ipamApi = { deleteSubnet };
+    // #2571 — the Danger-zone Delete is gated on `delete` on `subnet`; this
+    // test is about the 202 the approval queue answers, so sign in as a
+    // superadmin who may press it.
+    answers.authApi = {
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    };
     const onDeleted = vi.fn();
     open(
       <EditSubnetModal
@@ -200,7 +206,17 @@ describe("a delete the approval queue took", () => {
         onDeleted={onDeleted}
       />,
     );
-    await walkDelete(/^Delete this subnet/);
+    // Permissions arrive asynchronously; the button is disabled until then.
+    fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+    const del = screen.getByRole("button", {
+      name: /^Delete this subnet/,
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(del.disabled).toBe(false));
+    fireEvent.click(del);
+    fireEvent.click(
+      within(topDialog()).getByRole("button", { name: "Continue" }),
+    );
+    await confirmMoveToTrash();
     await expectQueuedNotice(deleteSubnet);
     expect(onDeleted).not.toHaveBeenCalled();
   });

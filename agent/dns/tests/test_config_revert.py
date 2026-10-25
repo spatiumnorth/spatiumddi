@@ -192,12 +192,14 @@ class _Driver(DriverBase):
         # What the next validate holds back (#1403), as the BIND9 zone check does.
         self.hold: tuple[HeldZone, ...] = ()
         self.ops: list[str] = []
+        self.validations = 0
 
     def render(self, bundle: dict[str, Any]) -> None:
         if self.fail_on == "render":
             raise RuntimeError("render boom")
 
     def validate(self) -> None:
+        self.validations += 1
         self.held_back = ()
         if self.fail_on == "validate":
             raise RuntimeError("named-checkconf failed: bad acl")
@@ -671,3 +673,59 @@ def test_commit_refuses_when_current_is_not_what_applied(tmp_path: Path) -> None
     # must not promote ``current``.
     commit_config(tmp_path, "good")
     assert load_previous_config(tmp_path) == (_bundle("good"), "good")
+
+
+# ── quarantine is keyed on the structure, not the full etag (#2647) ───────
+
+
+def test_quarantine_record_only_change_keeps_the_ladder(tmp_path: Path, monkeypatch) -> None:
+    ensure_layout(tmp_path)
+    now = [0.0]
+    monkeypatch.setattr("spatium_dns_agent.config_apply.time.time", lambda: now[0])
+    q = Quarantine(tmp_path)
+    q.record("e1", "x", structural="s1")
+    assert q.blocks("e2", "s1"), "same structure, new full etag: still blocked"
+    q.record("e2", "x", structural="s1")
+    assert q.failures == 2, "a record-only change must not restart the backoff"
+    assert not q.blocks("e3", "s2")
+    q.record("e3", "y", structural="s2")
+    assert q.failures == 1
+
+
+def test_quarantine_from_an_older_agent_file_matches_on_full_etag(tmp_path: Path) -> None:
+    ensure_layout(tmp_path)
+    path = tmp_path / "config" / "quarantine.json"
+    path.write_text(
+        json.dumps({"etag": "old", "reason": "r", "failures": 2, "retry_at": 9e12})
+    )
+    q = Quarantine(tmp_path)
+    assert q.structural is None
+    assert q.blocks("old", "s-whatever")
+    assert not q.blocks("other", "s-whatever")
+    assert q.same_structure("old", None)
+
+
+def test_record_only_changes_do_not_reapply_a_quarantined_structure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http(
+        [_flat("e1", "sBAD", []), _flat("e2", "sBAD", ["op-1"]), _flat("e3", "sBAD", ["op-2"])]
+    )
+    loop._client = lambda: http  # type: ignore[method-assign]
+    driver.fail_on = "validate"
+
+    loop._poll_once()
+    assert driver.validations == 1
+    assert loop._quarantine.failures == 1
+
+    loop._poll_once()
+    loop._poll_once()
+
+    assert driver.validations == 1, "record-only bundles must not re-render/validate"
+    assert loop._quarantine.failures == 1
+    assert loop._quarantine.etag == "e1"
+    assert driver.ops == []

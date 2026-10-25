@@ -69,7 +69,7 @@ to their control channels, it does not link against them.
 |---|---|---|---|---|
 | [ISC BIND 9](https://www.isc.org/bind/) | `>= 9.20.29-r0` (Alpine) | MPL 2.0 | DNS agent image | `agent/dns/images/bind9/Dockerfile` |
 | [PowerDNS Authoritative Server](https://www.powerdns.com/) | `>= 5.0.7-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/powerdns/Dockerfile` |
-| [Technitium DNS Server](https://technitium.com/dns/) | 15.4.0 (digest-pinned) | GPL v3 | DNS agent image | `agent/dns/images/technitium/Dockerfile` |
+| [Technitium DNS Server](https://technitium.com/dns/) | 15.6.2 (digest-pinned) | GPL v3 | DNS agent image | `agent/dns/images/technitium/Dockerfile` |
 | [PowerDNS dnsdist](https://dnsdist.org/) | `>= 2.0.8-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
 | [ISC Kea DHCP](https://www.isc.org/kea/) | `>= 3.0.3-r0` (Alpine), v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [radvd](https://radvd.litech.org/) | Alpine `radvd` | BSD-style | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
@@ -92,7 +92,7 @@ Notes worth carrying:
 
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
-| [k3s](https://k3s.io/) | v1.36.4+k3s1 | Apache 2.0 | Appliance OS | `appliance/scripts/fetch-k3s.sh` |
+| [k3s](https://k3s.io/) | v1.36.5+k3s1 | Apache 2.0 | Appliance OS | `appliance/scripts/fetch-k3s.sh` |
 | [containerd](https://containerd.io/) + [runc](https://github.com/opencontainers/runc) | embedded in k3s | Apache 2.0 | Appliance OS | (k3s bundle) |
 | [CoreDNS](https://coredns.io/) | k3s airgap bundle | Apache 2.0 | Appliance OS | (k3s bundle) |
 | [Flannel](https://github.com/flannel-io/flannel) | embedded in k3s, `host-gw` backend | Apache 2.0 | Appliance OS | `appliance/mkosi.extra/etc/rancher/k3s/config.yaml` |
@@ -102,7 +102,9 @@ Notes worth carrying:
 | [Traefik](https://traefik.io/) | in k3s bundle, **disabled** | MIT | Appliance OS | `config.yaml` `disable:` list |
 | [metrics-server](https://github.com/kubernetes-sigs/metrics-server) | in k3s bundle, **disabled** | Apache 2.0 | Appliance OS | `config.yaml` `disable:` list |
 | [MetalLB](https://metallb.io/) | chart + images 0.15.3 | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb/Chart.yaml` |
-| [FRRouting](https://frrouting.org/) | via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
+| [FRRouting](https://frrouting.org/) | 10.4.5, via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
+| [frr-k8s](https://github.com/metallb/frr-k8s) | v0.0.21, MetalLB's BGP backend | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
+| [kube-rbac-proxy](https://github.com/brancz/kube-rbac-proxy) | v0.23.0, frr-k8s metrics sidecar | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
 | [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.1 (operator 1.30.1) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
 | [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Compose HA overlay (non-functional, unsupported in 1.0, #1236) | `k8s/ha/` |
 | [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Compose Patroni overlay (non-functional, #1236) | `k8s/ha/` |
@@ -122,6 +124,11 @@ assume from their presence:
   older binary does not serve.
 - **FRRouting is GPL v2** and only enters the picture when an operator opts into
   BGP-mode MetalLB. Both `bgp.enabled` and `frrk8s.enabled` default to false.
+  FRRouting and kube-rbac-proxy run newer images than the MetalLB 0.15.3 chart
+  ships with, to clear CRITICAL CVEs
+  ([#2239](https://github.com/spatiumnorth/spatiumddi/issues/2239)). frr-k8s
+  stays on the chart's own version, because from v0.0.23 its binary needs
+  templates the 0.15.3 chart does not have.
 
 ## Data services
 
@@ -162,7 +169,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 |---|---|---|
 | [Python](https://www.python.org/) 3.12 | PSF | Runtime |
 | [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) | MIT / BSD 3-Clause | HTTP framework |
-| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.1, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.34.0, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
 | [ReDoc](https://github.com/Redocly/redoc) 2.5.4, vendored | MIT | The reference API docs at `/api/redoc`, served by the api with no CDN |
 | [Uvicorn](https://www.uvicorn.org/) | BSD 3-Clause | ASGI server |
 | [SQLAlchemy](https://www.sqlalchemy.org/) / [Alembic](https://alembic.sqlalchemy.org/) | MIT | ORM + migrations |
@@ -323,7 +330,7 @@ Apache license covers it.
 |---|---|---|---|
 | [Alpine Linux](https://alpinelinux.org/) | 3.24 | MIT (+ GPL v2 kernel) | BIND9 / PowerDNS / dnsdist / Kea / Looking Glass agent images, supervisor — **not** Technitium (see below) |
 | [Debian slim](https://www.debian.org/) | trixie / bookworm | DFSG (mixed) | Appliance builder, Technitium agent build stage |
-| [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.4.0 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
+| [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.6.2 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
 | [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |
 | [nginx](https://nginx.org/) | 1.31.7-alpine | BSD 2-Clause | Frontend runtime |
@@ -345,6 +352,7 @@ because CI gates depend on specific behaviour from several.
 |---|---|---|
 | [mkosi](https://github.com/systemd/mkosi) | LGPL 2.1 | Builds the appliance disk image |
 | [Go](https://go.dev/) | BSD 3-Clause | Builds GoBGP from source in the Looking Glass image |
+| [skopeo](https://github.com/containers/skopeo) | Apache 2.0 | skopeo v1.20.0 in a container: registry-to-archive fallback in the appliance image bake (#2393) |
 | [Trivy](https://trivy.dev/) | Apache 2.0 | Image CVE gate (HIGH/CRITICAL, `--ignore-unfixed`) |
 | [pytest](https://pytest.org/) + pytest-asyncio / cov / xdist / split | MIT | Backend test suite |
 | [ruff](https://docs.astral.sh/ruff/) / [black](https://black.readthedocs.io/) / [mypy](https://mypy-lang.org/) | MIT | Backend lint + typecheck |

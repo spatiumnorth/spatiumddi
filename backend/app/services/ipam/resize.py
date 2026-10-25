@@ -594,6 +594,19 @@ async def _load_boundary_placeholders(
     return default_named, renamed
 
 
+async def _gateway_target_in_use(
+    db: AsyncSession, subnet: Subnet, target: str, old_gateway: str | None
+) -> bool:
+    """True when an address row other than the current gateway already sits
+    on ``target`` — the new gateway cannot be reserved over a host (#2413)."""
+    if old_gateway is not None and str(ipaddress.ip_address(old_gateway)) == target:
+        return False
+    row = await db.scalar(
+        select(IPAddress.id).where(IPAddress.subnet_id == subnet.id, IPAddress.address == target)
+    )
+    return row is not None
+
+
 # ── Preview: subnets ─────────────────────────────────────────────────────────
 
 
@@ -817,6 +830,22 @@ async def preview_subnet_resize(
                 ),
             )
         )
+
+    if move_gateway_to_first_usable:
+        fu_preview = _first_usable(new_net)
+        if fu_preview is not None and await _gateway_target_in_use(
+            db, subnet, fu_preview, str(subnet.gateway) if subnet.gateway else None
+        ):
+            conflicts.append(
+                ResizeConflict(
+                    type="gateway_move_target_in_use",
+                    detail=(
+                        f"Cannot move gateway to {fu_preview}: an address row already "
+                        "exists there. Free or move it, or uncheck 'Move gateway to new "
+                        "first-usable IP'."
+                    ),
+                )
+            )
 
     return SubnetResizePreview(
         old_cidr=canonical_old,
@@ -1055,6 +1084,7 @@ async def commit_subnet_resize(
     """
     # Lazy import to avoid the router → service → router cycle.
     from app.api.v1.ipam.router import (
+        _sync_dns_record,
         _update_block_utilization,
         _update_utilization,
     )
@@ -1080,6 +1110,16 @@ async def commit_subnet_resize(
             "has no usable host range.",
             status_code=422,
         )
+
+    if move_gateway_to_first_usable:
+        fu_commit = _first_usable(new_net)
+        if fu_commit is not None and await _gateway_target_in_use(
+            db, subnet, fu_commit, str(subnet.gateway) if subnet.gateway else None
+        ):
+            raise ResizeError(
+                f"Cannot move gateway to {fu_commit}: an address row already exists there.",
+                status_code=409,
+            )
 
     overlap = await _overlap_conflicts_space_subnets(
         db,
@@ -1180,6 +1220,37 @@ async def commit_subnet_resize(
                 placeholders_created += 1
         await db.flush()
 
+    # 3b. A moved gateway is reserved the way create_subnet reserves a new
+    # subnet's gateway, so Next available never offers it to a host (#2413).
+    # The old default "Gateway" row is retired with the other default rows;
+    # a renamed / DNS-bearing one is the operator's and is kept.
+    gateway_row: IPAddress | None = None
+    if move_gateway_to_first_usable and subnet.gateway and str(subnet.gateway) != old_gateway:
+        new_gateway = str(subnet.gateway)
+        if replace_default_placeholders and old_gateway:
+            old_row = await db.scalar(
+                select(IPAddress).where(
+                    IPAddress.subnet_id == subnet.id,
+                    IPAddress.address == old_gateway,
+                    IPAddress.status == "reserved",
+                    IPAddress.hostname == "gateway",
+                    IPAddress.description == "Gateway",
+                    IPAddress.dns_record_id.is_(None),
+                )
+            )
+            if old_row is not None:
+                await db.delete(old_row)
+        gateway_row = IPAddress(
+            subnet_id=subnet.id,
+            address=new_gateway,
+            status="reserved",
+            description="Gateway",
+            hostname="gateway",
+            created_by_user_id=(current_user.id if current_user is not None else None),
+        )
+        db.add(gateway_row)
+        await db.flush()
+
     # 4. Recompute utilization on this subnet and roll the parent block chain.
     await _update_utilization(db, subnet.id)
     if subnet.block_id:
@@ -1197,6 +1268,9 @@ async def commit_subnet_resize(
     from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
     await ensure_reverse_zones_for_subnet(db, subnet, current_user)
+    if gateway_row is not None:
+        # Same as create_subnet: the gateway placeholder's A / PTR (#2413).
+        await _sync_dns_record(db, gateway_row, subnet, backfill_reverse_zone=False)
 
     # 6. Notify agent-based DHCP servers with a scope on this subnet.
     dhcp_servers_notified = await _bump_dhcp_bundles_for_subnet(db, subnet.id)

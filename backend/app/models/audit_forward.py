@@ -50,10 +50,8 @@ class AuditForwardTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # credential for its channel, and the header is a collector token. The
     # API takes them write-only and returns ``url_set`` / ``url_display`` /
     # ``auth_header_set``; ``app.services.forward_secrets`` has the helpers.
-    #
-    # The pre-#1502 plaintext columns ``url`` and ``auth_header`` are still
-    # in the table, unmapped and unread, for one release, so a rolling
-    # upgrade's old pods keep working (#296). The next release drops them.
+    # The pre-#1502 plaintext ``url`` / ``auth_header`` columns were dropped
+    # by migration ``c2b203844c95``.
     url_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     auth_header_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # webhook_flavor: generic | slack | teams | discord

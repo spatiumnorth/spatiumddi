@@ -62,7 +62,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WAKE_TICK_SECONDS,
@@ -376,15 +376,30 @@ def _client_ip(request: Request) -> str | None:
 # #272 Phase 1 — self-bootstrap path for the control-plane appliance.
 # The local supervisor calls
 # ``POST /api/v1/appliance/self-register-bootstrap`` with its
-# variant; the api gates on the host-mounted ``role-config`` (the
-# api itself has a bind mount of ``/etc/spatiumddi-host/role-
-# config`` per #209) so we can prove the caller is the local
-# supervisor by matching the variant claim against the file the
-# installer wrote. Only the control-plane node self-bootstraps (it IS
-# the control plane); an ``appliance`` pairs against a remote one.
-# Legacy ``full-stack`` / ``frontend-core`` accepted as aliases for a
-# not-yet-reinstalled box.
+# variant and a one-time token. Only the control-plane node
+# self-bootstraps (it IS the control plane); an ``appliance`` pairs
+# against a remote one. Legacy ``full-stack`` / ``frontend-core``
+# accepted as aliases for a not-yet-reinstalled box.
+#
+# The host-mounted ``role-config`` check (the api has a bind mount of
+# ``/etc/spatiumddi-host/role-config`` per #209) only says THIS host is
+# a control-plane node; it proves nothing about the caller, because
+# the role is one of three public strings and the endpoint is
+# reachable from the LAN through the frontend's ``/api/`` proxy. What
+# proves the caller is the local supervisor is the token: the
+# supervisor writes a fresh random value to
+# ``self-bootstrap.token`` in the host release-state directory
+# (``/var/lib/spatiumddi/release-state``, mode 1770 root:2770 — only
+# the supervisor and the api pods, both in group 2770, can reach it)
+# just before the call, presents it in the body, and deletes it after.
+# Nothing on the network can read that file, so nothing on the network
+# can present the value.
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
+_SELF_BOOTSTRAP_TOKEN_FILE = Path("/var/lib/spatiumddi-host/release-state/self-bootstrap.token")
+# A token shorter than this is refused even when it matches, so an
+# empty or truncated file can never make an empty claim succeed.
+_SELF_BOOTSTRAP_TOKEN_MIN_LEN = 32
+_SELF_BOOTSTRAP_TOKEN_MAX_LEN = 256
 _SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
 
 
@@ -420,6 +435,36 @@ def _read_host_role() -> str | None:
             value = line.split("=", 1)[1].strip().strip('"').strip("'")
             return value if value in _SELF_BOOTSTRAP_VARIANTS else None
     return None
+
+
+def _read_self_bootstrap_token() -> str | None:
+    """The token the local supervisor wrote for this attempt, or None.
+
+    None when the file is absent (non-appliance deploys, a supervisor that
+    predates the token, or no attempt in flight), unreadable, or too short
+    to be a real token.
+    """
+    try:
+        with _SELF_BOOTSTRAP_TOKEN_FILE.open("rb") as fh:
+            raw = fh.read(_SELF_BOOTSTRAP_TOKEN_MAX_LEN + 1)
+    except OSError:
+        return None
+    if len(raw) > _SELF_BOOTSTRAP_TOKEN_MAX_LEN:
+        return None
+    token = raw.decode("ascii", errors="replace").strip()
+    if len(token) < _SELF_BOOTSTRAP_TOKEN_MIN_LEN:
+        return None
+    return token
+
+
+def _self_bootstrap_token_matches(presented: str | None) -> bool:
+    """Constant-time comparison of the presented token with the host file."""
+    if not presented:
+        return False
+    expected = _read_self_bootstrap_token()
+    if expected is None:
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _gen_self_bootstrap_code() -> str:
@@ -641,11 +686,17 @@ class SelfRegisterBootstrapRequest(BaseModel):
     variants, where the installer wizard didn't capture a pairing
     code (the control plane IS local).
 
-    The supervisor claims its variant; the api validates against
-    the host-mounted ``role-config:ROLE`` before minting a code.
+    The supervisor claims its variant and presents the one-time token it
+    wrote to the host release-state directory; the api checks the token
+    against that file, then the variant against the host-mounted
+    ``role-config:ROLE``, before minting a code.
     """
 
     appliance_variant: Literal["control-plane", "full-stack", "frontend-core"]
+    # Optional in the schema so an older supervisor's body still parses;
+    # a missing token is refused by the handler with the same 403 as a
+    # wrong one.
+    bootstrap_token: str | None = Field(default=None, max_length=_SELF_BOOTSTRAP_TOKEN_MAX_LEN)
 
 
 class SelfRegisterBootstrapResponse(BaseModel):
@@ -672,32 +723,38 @@ async def self_register_bootstrap(
 
     Gates (all required, in order):
 
-    1. Variant must be ``full-stack`` or ``frontend-core``.
-       ``application`` uses the operator-typed pairing code from
+    1. Variant must be ``control-plane`` (or a legacy alias).
+       ``appliance`` uses the operator-typed pairing code from
        the installer wizard; this endpoint refuses to short-
        circuit that flow.
-    2. The api's host bind mount ``/etc/spatiumddi-host/role-
-       config:ROLE`` must equal the requested variant. Proves the
-       caller has host access AND the host's installer-baked role
-       matches the claim. On non-appliance deploys the file isn't
-       mounted and the endpoint refuses outright.
-    3. No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT
+    2. ``bootstrap_token`` must equal the contents of
+       ``self-bootstrap.token`` in the host release-state directory,
+       which the local supervisor writes just before calling. This is
+       the check that proves the caller is the supervisor on this
+       host: the file is reachable only from the supervisor and api
+       pods, never from the network. It runs BEFORE anything below
+       touches the database, so a caller that cannot present it
+       changes nothing (no orphan-row clearing, no registration-gate
+       flip). On non-appliance deploys the file is never written and
+       the endpoint refuses outright.
+    3. The api's host bind mount ``/etc/spatiumddi-host/role-
+       config:ROLE`` must equal the requested variant — the host's
+       installer-baked role matches the claim.
+    4. No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT
        NULL``). Orphan rows (``last_seen_at IS NULL``) from a
        botched earlier attempt get cleared on each call so the
        endpoint is safe to re-fire when the supervisor lost its
        local state. Multi-node HA (#272 Phase 7) provisions
        additional supervisors through the operator-typed pairing-
        code flow, not this endpoint.
-    4. Module gate (``supervisor_registration_enabled``) — same
-       gate the normal pair-and-register endpoint honours.
 
     Failures collapse into 403 with a constant friction delay so
     the gate decision doesn't leak via response-time delta. Hits
-    one of: variant mismatch / appliances already registered /
-    module disabled / role-config missing.
+    one of: variant mismatch / token missing or wrong / role-config
+    missing. Appliances already registered answers 409.
 
     On success the response carries the cleartext pairing code +
-    the appliance-local control-plane URL (``https://localhost``).
+    the in-cluster api Service URL.
     The supervisor stamps these into its env and proceeds through
     the normal ``/supervisor/register`` flow.
 
@@ -707,8 +764,8 @@ async def self_register_bootstrap(
     supervisor MUST be able to register or the appliance is
     unusable; the operator-controlled module gate gets re-applied
     once they reach the Fleet UI to control remote pairing.
-    Strong gates remain via host role-config + variant + single-
-    shot Appliance-count check below.
+    The token check above is what keeps that exemption from being
+    reachable by anyone but the local supervisor.
     """
     # Variant gate.
     if body.appliance_variant not in _SELF_BOOTSTRAP_VARIANTS:
@@ -716,6 +773,20 @@ async def self_register_bootstrap(
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail="Self-bootstrap is only available for full-stack / frontend-core variants",
+        )
+
+    # Local-caller gate — the one-time token from the host release-state
+    # directory. Checked before anything reads or writes the database.
+    if not _self_bootstrap_token_matches(body.bootstrap_token):
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        logger.warning(
+            "appliance.self_bootstrap.token_refused",
+            token_presented=bool(body.bootstrap_token),
+            source_ip=_client_ip(request),
+        )
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Self-bootstrap unavailable on this host",
         )
 
     # Host role-config gate — read /etc/spatiumddi-host/role-config
@@ -1961,8 +2032,8 @@ _HEARTBEAT_HOLD_CAP_S = 28.0
 
 async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
     """Stamp a current ``OOMKilled`` from ``appliance.role_health`` onto the
-    DNS server row this appliance's container serves (#2018). See
-    ``app.services.agents.container_oom``.
+    DNS and DHCP server rows this appliance's containers serve (#2018, #2023).
+    See ``app.services.agents.container_oom``.
 
     One row per engine: the most recently seen of the rows this appliance
     owns with that driver. A row an earlier registration left behind (a
@@ -1974,7 +2045,10 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
     holds the appliance row, and a DNS server move locks the server row and
     then the appliance; waiting here would be the other half of that cycle.
     A row someone else holds is skipped: its own agent heartbeat applies the
-    same verdict, and the next supervisor heartbeat retries."""
+    same verdict, and the next supervisor heartbeat retries. ``of=model``:
+    DHCPServer eager-loads its group through an outer join, and Postgres
+    refuses ``FOR UPDATE`` on the nullable side of one."""
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
 
     health = appliance.role_health or {}
@@ -1983,43 +2057,49 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
     ):
         return
     now = datetime.now(UTC)
-    owned = (
-        (
-            await db.execute(
-                select(DNSServer).where(await _own_server_condition(db, appliance, DNSServer))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    live: dict[str, Any] = {}
     floor = datetime.min.replace(tzinfo=UTC)
-    for server in owned:
-        best = live.get(server.driver)
-        if best is None or (server.last_seen_at or floor) > (best.last_seen_at or floor):
-            live[server.driver] = server
-    ids = [
-        s.id
-        for s in live.values()
-        if container_oom_report(health, s.driver, now) is not None
-        and not is_oom_reason(s.daemon_reason)
-    ]
-    if not ids:
-        return
-    locked = (
-        (
-            await db.execute(
-                select(DNSServer)
-                .where(DNSServer.id.in_(ids))
-                .with_for_update(skip_locked=True)
-                .execution_options(populate_existing=True)
+    for model in (DNSServer, DHCPServer):
+        owned = (
+            (
+                await db.execute(
+                    select(model).where(await _own_server_condition(db, appliance, model))
+                )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    for server in locked:
-        apply_container_oom(server, health, now=now)
+        # DNSServer calls its heartbeat stamp ``last_seen_at``; DHCPServer
+        # calls it ``agent_last_seen``.
+        seen_attr = "last_seen_at" if model is DNSServer else "agent_last_seen"
+        live: dict[str, Any] = {}
+        for server in owned:
+            best = live.get(server.driver)
+            if best is None or (getattr(server, seen_attr) or floor) > (
+                getattr(best, seen_attr) or floor
+            ):
+                live[server.driver] = server
+        ids = [
+            s.id
+            for s in live.values()
+            if container_oom_report(health, s.driver, now) is not None
+            and not is_oom_reason(s.daemon_reason)
+        ]
+        if not ids:
+            continue
+        locked = (
+            (
+                await db.execute(
+                    select(model)
+                    .where(model.id.in_(ids))
+                    .with_for_update(skip_locked=True, of=model)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for server in locked:
+            apply_container_oom(server, health, now=now)
 
 
 @router.post(
@@ -3567,14 +3647,6 @@ class ApplianceList(BaseModel):
     mtu_fleet: MtuFleet = MtuFleet()
 
 
-def _require_superadmin(user: CurrentUser) -> None:
-    if not is_effective_superadmin(user):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Appliance approval is restricted to superadmins.",
-        )
-
-
 def _storage_findings(row: Appliance) -> list[StorageFinding]:
     """Classified storage findings for one appliance row (#999 Part A)."""
     ch = row.cluster_health if isinstance(row.cluster_health, dict) else {}
@@ -3716,8 +3788,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List registered appliances (superadmin)",
 )
-async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
-    _require_superadmin(current_user)
+async def list_appliances(current_user: SuperAdmin, db: DB) -> ApplianceList:
     rows = (
         (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
     )
@@ -3733,8 +3804,7 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
-    _require_superadmin(current_user)
+async def get_appliance(appliance_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> ApplianceRow:
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -3799,13 +3869,12 @@ _REGISTER_VARIANT_FIXED_ROLES: dict[str, list[str]] = {
     summary="Approve a pending appliance — issues a cert (superadmin)",
 )
 async def approve_appliance(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+    appliance_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> ApplianceRow:
     """Approve + sign in one shot. Idempotent on already-approved rows
     (no fresh cert is issued — use ``/appliances/{id}/rekey`` for
     that). Rejects rows already in ``rejected`` state with 409.
     """
-    _require_superadmin(current_user)
 
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -3858,11 +3927,10 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def reject_appliance(appliance_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -4028,7 +4096,7 @@ async def get_appliance_dependents(
 async def delete_appliance(
     appliance_id: uuid.UUID,
     body: DeleteApplianceRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Soft-delete an appliance (#170 Wave E follow-up).
@@ -4051,7 +4119,6 @@ async def delete_appliance(
     """
     from app.core.security import verify_password  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
@@ -4156,11 +4223,23 @@ async def delete_appliance(
     if dependents.dns or dependents.dhcp:
         from app.models.dhcp import DHCPServer  # noqa: PLC0415
         from app.models.dns import DNSServer  # noqa: PLC0415
+        from app.services.dns.server_move import elect_primary  # noqa: PLC0415
 
+        lost_primary: set[uuid.UUID] = set()
         for d in dependents.dns:
             dns_server = await db.get(DNSServer, d.id)
             if dns_server is not None:
+                if dns_server.is_primary:
+                    lost_primary.add(dns_server.group_id)
                 await db.delete(dns_server)
+        if lost_primary:
+            # #2276 — a group whose primary went with the appliance elects a
+            # successor among its remaining servers, or every later record
+            # write to its zones resolves against no primary. Flushed first so
+            # the election cannot pick a server being deleted here.
+            await db.flush()
+            for group_id in lost_primary:
+                await elect_primary(db, group_id, exclude_id=None)
         for d in dependents.dhcp:
             dhcp_server = await db.get(DHCPServer, d.id)
             if dhcp_server is not None:
@@ -4212,7 +4291,7 @@ async def delete_appliance(
 )
 async def reauthorize_appliance(
     appliance_id: uuid.UUID,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Lift a soft-delete: clear ``revoked_at`` and put the appliance
@@ -4222,7 +4301,6 @@ async def reauthorize_appliance(
     assignment (the supervisor's revoke-teardown ran a ``compose stop``;
     a fresh role-assignment apply re-runs ``up -d``).
     """
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -4265,7 +4343,7 @@ async def reauthorize_appliance(
 async def permanent_delete_appliance(
     appliance_id: uuid.UUID,
     body: DeleteApplianceRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> None:
     """Hard DELETE the appliance row. Same password gate as the soft
@@ -4277,7 +4355,6 @@ async def permanent_delete_appliance(
     """
     from app.core.security import verify_password  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
@@ -4344,7 +4421,7 @@ async def permanent_delete_appliance(
     summary="Re-sign the appliance's cert (rotation, superadmin)",
 )
 async def rekey_appliance(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+    appliance_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> ApplianceRow:
     """Issue a fresh cert against the existing supervisor pubkey.
     Used for routine 60-day renewal + emergency forced rotation
@@ -4352,7 +4429,6 @@ async def rekey_appliance(
     only the serial + validity window change. Older certs against
     the same pubkey remain technically valid in the CA's eye until
     they expire — Wave-D-or-later CRL work plugs that gap."""
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -4469,7 +4545,7 @@ class ApplianceRolesUpdate(BaseModel):
 async def update_appliance_roles(
     appliance_id: uuid.UUID,
     body: ApplianceRolesUpdate,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Validate + persist a role assignment. Refuses to assign a role
@@ -4484,7 +4560,6 @@ async def update_appliance_roles(
     (load image + start / stop / restart) lives on the supervisor —
     this endpoint just records intent.
     """
-    _require_superadmin(current_user)
 
     # #1715 — FOR UPDATE: two Fleet saves on one appliance used to race the
     # server moves below on stale reads (two primaries, a move computed from a
@@ -5055,7 +5130,7 @@ async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None
 )
 async def promote_control_plane(
     body: ControlPlaneMembersRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceList:
     """Batch-promote the given appliances to k3s control-plane members.
@@ -5065,7 +5140,6 @@ async def promote_control_plane(
     via ``cluster_join_state``. Refuses a batch that wouldn't land on an
     odd total member count (etcd quorum hygiene).
     """
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a control-plane promote")
 
@@ -5524,7 +5598,7 @@ async def _set_node_schedulable(hostname: str | None, *, cordon: bool) -> None:
 )
 async def demote_control_plane(
     body: ControlPlaneMembersRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceList:
     """Batch-demote the given control-plane members back to application
@@ -5553,7 +5627,6 @@ async def demote_control_plane(
     #1860 — when the Redis master runs on a leaving member it is moved to a
     node that stays first (:func:`_hand_off_redis_master`), and the demote is
     refused (409) when that cannot be done."""
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")
 
@@ -5664,7 +5737,7 @@ class ControlPlaneReplaceResponse(BaseModel):
 )
 async def replace_control_plane_member(
     appliance_id: uuid.UUID,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ControlPlaneReplaceResponse:
     """Recover a control-plane node that died ungracefully.
@@ -5685,7 +5758,6 @@ async def replace_control_plane_member(
     so the seed removes such a member itself. Until etcd agrees the row
     stays ``evicting``, with the seed's reason.
     """
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a control-plane replace")
 
@@ -5821,7 +5893,7 @@ class ClearClusterStateRequest(BaseModel):
 )
 async def clear_control_plane_state(
     appliance_id: uuid.UUID,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     body: ClearClusterStateRequest | None = None,
 ) -> ApplianceRow:
@@ -5852,7 +5924,6 @@ async def clear_control_plane_state(
     nothing. (The reported-``ready`` settle is self-healing for exactly that
     case, but the operator shouldn't have to rely on it.)
     """
-    _require_superadmin(current_user)
 
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -6044,13 +6115,12 @@ def _etcd_snapshots_response(seed: Appliance | None) -> EtcdSnapshotsResponse:
     summary="List recoverable etcd snapshots from the cluster seed (superadmin)",
 )
 async def list_etcd_snapshots(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> EtcdSnapshotsResponse:
     """Read the seed's reported ``k3s etcd-snapshot list`` + any in-flight
     restore state. Read-only — the seed reports its local snapshots on
     every heartbeat, so this is just the last-reported inventory."""
-    _require_superadmin(current_user)
     return _etcd_snapshots_response(await _find_seed_row(db))
 
 
@@ -6062,7 +6132,7 @@ async def list_etcd_snapshots(
 )
 async def restore_etcd_snapshot(
     body: ClusterRestoreRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> EtcdSnapshotsResponse:
     """Stamp the seed row to perform a guided etcd restore.
@@ -6077,7 +6147,6 @@ async def restore_etcd_snapshot(
     Guardrails: superadmin + the snapshot must exist in the seed's
     last-reported inventory + ``confirm_hostname`` must match the seed's
     hostname exactly. Refuses a second restore while one is in flight."""
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="an etcd snapshot restore")
     seed = await _find_seed_row(db)
@@ -6503,10 +6572,9 @@ async def _get_or_create_settings(db: DB) -> PlatformSettings:
     summary="Read the cluster MetalLB / control-plane-VIP config (superadmin)",
 )
 async def get_metallb_config(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> MetalLBConfigResponse:
-    _require_superadmin(current_user)
     row = await _get_or_create_settings(db)
     return _metallb_response(row)
 
@@ -6519,7 +6587,7 @@ async def get_metallb_config(
 )
 async def put_metallb_config(
     body: MetalLBConfigUpdate,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> MetalLBConfigResponse:
     """Persist the cluster-wide MetalLB pool + control-plane VIP.
@@ -6531,7 +6599,6 @@ async def put_metallb_config(
     then renders the IPAddressPool / L2Advertisement + flips the
     frontend Service to a LoadBalancer on the VIP. Idempotent.
     """
-    _require_superadmin(current_user)
     row = await _get_or_create_settings(db)
     old = {
         "enabled": row.metallb_enabled,
@@ -6632,7 +6699,7 @@ async def schedule_appliance_upgrade(
     appliance_id: uuid.UUID,
     body: ApplianceUpgradeRequest,
     request: Request,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Stamps ``desired_appliance_version`` + ``desired_slot_image_url``
@@ -6653,7 +6720,6 @@ async def schedule_appliance_upgrade(
     ``appliance_slot_image`` row from the upload endpoint) instead of
     ``desired_slot_image_url``. The control plane composes the
     authenticated internal URL the supervisor pulls from."""
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance slot upgrade")
     if (body.desired_slot_image_url is None) == (body.slot_image_id is None):
@@ -6831,7 +6897,7 @@ def host_upgrade_activity(
     summary="Clear a pending OS upgrade stamp",
 )
 async def clear_appliance_upgrade(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+    appliance_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> ApplianceRow:
     """Cancel a pending upgrade and dismiss a failed one.
 
@@ -6859,7 +6925,6 @@ async def clear_appliance_upgrade(
     ``appliance.upgrade_cancel_lost`` and the row shows the running upgrade,
     never a cancelled one.
     """
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -7022,7 +7087,7 @@ def _check_appliance_slot_action_allowed(row: Appliance) -> None:
 async def schedule_appliance_set_next_boot(
     appliance_id: uuid.UUID,
     body: ApplianceSlotActionRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Stamps ``desired_next_boot_slot`` on the appliance row. The
@@ -7038,7 +7103,6 @@ async def schedule_appliance_set_next_boot(
     The actual reboot is NOT triggered by this call. Operator
     either reboots manually (``/reboot`` endpoint) or waits for the
     next planned reboot window."""
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance next-boot slot change")
     row = await db.get(Appliance, appliance_id)
@@ -7087,7 +7151,7 @@ async def schedule_appliance_set_next_boot(
 async def schedule_appliance_set_default_slot(
     appliance_id: uuid.UUID,
     body: ApplianceSlotActionRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Stamps ``desired_default_slot`` on the appliance row. The
@@ -7107,7 +7171,6 @@ async def schedule_appliance_set_default_slot(
     * **Durable revert** — operator wants to go back to the previous
       slot for good (not just one boot). Calls this against the
       previous slot."""
-    _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance default-slot change")
     row = await db.get(Appliance, appliance_id)
@@ -7154,7 +7217,7 @@ async def schedule_appliance_set_default_slot(
     summary="Stamp a reboot request on an Application appliance",
 )
 async def schedule_appliance_reboot(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+    appliance_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> ApplianceRow:
     """Stamps ``reboot_requested=True``. The supervisor's next
     heartbeat returns this; the supervisor writes the host-side
@@ -7164,7 +7227,6 @@ async def schedule_appliance_reboot(
 
     Strict appliance-only — docker / k8s deployments return 409 since
     there's no host to reboot from the supervisor."""
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -7593,7 +7655,7 @@ async def appliance_storage_action(
     body: StorageActionRequest,
     request: Request,
     db: DB,
-    user: CurrentUser,
+    user: SuperAdmin,
 ) -> StorageActionResponse:
     """Superadmin only, audited, and refused rather than confirmed where
     the operator could not inspect the consequence afterwards.
@@ -7611,7 +7673,6 @@ async def appliance_storage_action(
         validate_action,
     )
 
-    _require_superadmin(user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -7818,13 +7879,12 @@ def _removable_response(row: Appliance) -> RemovableResponse:
     response_model=RemovableResponse,
     summary="Removable (USB) disks this appliance can see (#989)",
 )
-async def list_removable(appliance_id: uuid.UUID, db: DB, user: CurrentUser) -> RemovableResponse:
+async def list_removable(appliance_id: uuid.UUID, db: DB, user: SuperAdmin) -> RemovableResponse:
     """Read-only. The listing comes from the node's last heartbeat, so it
     is at most one heartbeat interval old — a disk plugged in a moment
     ago appears on the next tick, and the UI says how long ago the node
     last reported rather than implying the reading is live.
     """
-    _require_superadmin(user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -7841,7 +7901,7 @@ async def mount_removable(
     body: RemovableMountRequest,
     request: Request,
     db: DB,
-    user: CurrentUser,
+    user: SuperAdmin,
 ) -> RemovableResponse:
     """Superadmin only, audited.
 
@@ -7853,7 +7913,6 @@ async def mount_removable(
     unusable — its own root partition, a filesystem we cannot mount, one
     already in use — cannot be mounted by crafting the request by hand.
     """
-    _require_superadmin(user)
     # FOR UPDATE, unlike this file's siblings, and the difference is the
     # operation shape rather than a change of house style: role
     # assignment and firewall are whole-value REPLACEs, where
@@ -7950,7 +8009,7 @@ async def eject_removable(
     name: str,
     request: Request,
     db: DB,
-    user: CurrentUser,
+    user: SuperAdmin,
 ) -> RemovableResponse:
     """Flush and unmount, so the disk is safe to pull when this returns.
 
@@ -7961,7 +8020,6 @@ async def eject_removable(
     the path stops being a mountpoint, the driver refuses, and nothing
     is written to the appliance's own /var.
     """
-    _require_superadmin(user)
     # See ``mount_removable`` — a mount racing an eject would otherwise
     # re-append the just-ejected entry from its stale copy, resurrecting
     # a disk the operator was told was ejected.
@@ -8264,7 +8322,7 @@ class ApplianceWorkloadsResponse(BaseModel):
 )
 async def k8s_list_workloads(
     appliance_id: uuid.UUID,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     namespace: str = "spatium",
 ) -> ApplianceWorkloadsResponse:
@@ -8285,7 +8343,6 @@ async def k8s_list_workloads(
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
     from app.services.service_control import kube as _kube  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8355,7 +8412,7 @@ class ApplianceRestartDeploymentRequest(BaseModel):
 async def k8s_rollout_restart(
     appliance_id: uuid.UUID,
     body: ApplianceRestartDeploymentRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> dict[str, object]:
     """First operator-facing direct-kubeapi action (#183 Phase 4
@@ -8369,7 +8426,6 @@ async def k8s_rollout_restart(
     """
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8624,7 +8680,7 @@ def _validate_cidr(value: str) -> str:
 async def update_appliance_kubeapi_cidrs(
     appliance_id: uuid.UUID,
     body: ApplianceKubeapiCidrsRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> ApplianceRow:
     """Update the operator-controlled CIDR allowlist for direct
@@ -8638,7 +8694,6 @@ async def update_appliance_kubeapi_cidrs(
     access for operators who want sub-millisecond local-network
     ops; the supervisor's mTLS proxy still works alongside.
     """
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8706,7 +8761,7 @@ class K8sPodListResponse(BaseModel):
 )
 async def k8s_list_pods(
     appliance_id: uuid.UUID,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     namespace: str = "spatium",
 ) -> K8sPodListResponse:
@@ -8719,7 +8774,6 @@ async def k8s_list_pods(
     """
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8788,7 +8842,7 @@ async def k8s_list_pods(
 async def k8s_get_pod_logs(
     appliance_id: uuid.UUID,
     pod: str,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     namespace: str = "spatium",
     container: str | None = None,
@@ -8810,7 +8864,6 @@ async def k8s_get_pod_logs(
 
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
-    _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -8826,7 +8879,15 @@ async def k8s_get_pod_logs(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid identifier")
     tail = max(1, min(10_000, tail_lines))
 
-    path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log?tailLines={tail}"
+    # Context before the window, so a key the window starts inside is caught
+    # by its BEGIN line; trimmed to ``tail`` after redacting.
+    from app.services.support_bundle.scrub import (  # noqa: PLC0415
+        LOG_CONTEXT_LINES,
+        redact_log_tail,
+    )
+
+    requested = tail + LOG_CONTEXT_LINES
+    path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log?tailLines={requested}"
     if container:
         path += f"&container={container}"
 
@@ -8844,4 +8905,7 @@ async def k8s_get_pod_logs(
             status.HTTP_502_BAD_GATEWAY,
             f"kubeapi returned {status_code}: {body[:200]!r}",
         )
-    return PlainTextResponse(body.decode("utf-8", errors="replace"))
+    # Pod output can carry whatever the process printed; the same secret
+    # redaction as the appliance's own log views applies.
+    text = body.decode("utf-8", errors="replace")
+    return PlainTextResponse(redact_log_tail(text, tail, requested=requested))

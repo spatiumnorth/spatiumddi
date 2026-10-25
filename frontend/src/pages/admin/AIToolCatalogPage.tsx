@@ -9,9 +9,15 @@ import {
 } from "lucide-react";
 import {
   aiToolCatalogApi,
+  formatApiError,
   type AIToolCatalog,
   type AIToolCatalogEntry,
 } from "@/lib/api";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -63,6 +69,7 @@ const CATALOG_QUERY_KEY = ["ai-tool-catalog-admin"];
  */
 export function AIToolCatalogPage() {
   const qc = useQueryClient();
+  const { isSuperadmin } = usePermissions();
   const [search, setSearch] = useState("");
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
@@ -234,11 +241,21 @@ export function AIToolCatalogPage() {
           disabled={updateMutation.isPending || usingDefaults}
           className={headerCls}
           title="Discard the explicit list and use each tool's registry default."
+          // The write is superadmin-only (#2526), and a Viewer's catalog
+          // read is refused, so `usingDefaults` is unknown for it.
+          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
         >
           <RotateCcw className="h-3.5 w-3.5" />
           Reset to defaults
         </button>
       </div>
+
+      {updateMutation.isError && (
+        <div role="alert" className="px-4 pt-3 text-sm text-destructive">
+          Could not save the tool catalog:{" "}
+          {formatApiError(updateMutation.error, "the request failed")}
+        </div>
+      )}
 
       {isLoading && (
         <div className="p-4 text-sm text-muted-foreground">Loading…</div>

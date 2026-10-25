@@ -12,6 +12,11 @@ import {
 
 import { ReauthFields } from "@/components/ReauthFields";
 import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import {
   agentBootstrapKeysApi,
   type AgentBootstrapKeysReveal,
   formatApiError,
@@ -33,6 +38,10 @@ import {
  * successful reveals emit AuditLog rows.
  */
 export function AgentBootstrapKeysSection() {
+  // The reveal is superadmin-only on the server (and a refusal is audited),
+  // so a non-superadmin is not asked for a password at all (#2527).
+  const { isSuperadmin } = usePermissions();
+  const gate = permissionGate(isSuperadmin, NEEDS_SUPERADMIN);
   const [password, setPassword] = useState("");
   const [totp, setTotp] = useState("");
   const [data, setData] = useState<AgentBootstrapKeysReveal | null>(null);
@@ -90,17 +99,24 @@ export function AgentBootstrapKeysSection() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            reveal.mutate();
+            if (isSuperadmin) reveal.mutate();
           }}
           className="max-w-md space-y-3 rounded-lg border bg-card p-4 shadow-sm"
         >
-          <ReauthFields
-            password={password}
-            onPassword={setPassword}
-            totp={totp}
-            onTotp={setTotp}
-            autoFocus
-          />
+          <fieldset disabled={!isSuperadmin} className="min-w-0 space-y-3">
+            <ReauthFields
+              password={password}
+              onPassword={setPassword}
+              totp={totp}
+              onTotp={setTotp}
+              autoFocus={isSuperadmin}
+            />
+          </fieldset>
+          {!isSuperadmin && (
+            <p className="text-xs text-muted-foreground">
+              Only a superadmin can reveal the agent bootstrap keys.
+            </p>
+          )}
           {reveal.isError && (
             <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -110,6 +126,7 @@ export function AgentBootstrapKeysSection() {
           <button
             type="submit"
             disabled={reveal.isPending || (!password && !totp)}
+            {...gate}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             <Eye className="h-3.5 w-3.5" />

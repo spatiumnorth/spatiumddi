@@ -3,10 +3,12 @@ import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import structlog
 import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -179,6 +181,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "network_service"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Address Set Editor": (
@@ -191,6 +194,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "ownership without subnet write.",
         [
             {"action": "admin", "resource_type": "address_set"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Change Approver": (
@@ -204,6 +208,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "approve", "resource_type": "change_request"},
             {"action": "read", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Requester": (
@@ -218,6 +223,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "write", "resource_type": "provisioning_request"},
             {"action": "read", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DNS Editor": (
@@ -233,6 +239,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
             {"action": "read", "resource_type": "manage_dns_pools"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DHCP Editor": (
@@ -251,6 +258,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dhcp_client_class"},
             {"action": "admin", "resource_type": "dhcp_option_template"},
             {"action": "admin", "resource_type": "dhcp_mac_block"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Network Editor": (
@@ -287,6 +295,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "tls_cert"},
             {"action": "admin", "resource_type": "dnsbl"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Auditor": (
@@ -302,6 +311,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "tls_cert"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Compliance Editor": (
@@ -316,19 +326,24 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface: "
-        "TLS cert upload, release manager, "
-        "container start/stop/restart + live logs, host network + "
-        "firewall config, maintenance mode, diagnostic bundle download. "
-        "Intended for ops staff who manage the appliance lifecycle "
-        "without needing full superadmin over the DDI data plane. "
-        "Granted ``admin`` on resource_type=appliance; superadmin "
-        "always bypasses anyway.",
+        "Runs the SpatiumDDI OS appliance on this node: TLS cert upload "
+        "and ACME, the read-only releases catalogue, node-local slot "
+        "apply and rollback, container start/stop/restart + live logs, "
+        "host network + firewall config, maintenance mode, diagnostic "
+        "bundle download. Fleet management is NOT included and still "
+        "needs a superadmin: the upgrade-image store, every Fleet member "
+        "action (approve, role assignment, OS upgrade, reboot), "
+        "MetalLB, the kube-api CIDRs and pairing codes. Intended for ops "
+        "staff who manage a node's lifecycle without superadmin over the "
+        "DDI data plane. Granted ``admin`` on resource_type=appliance; "
+        "superadmin always bypasses anyway.",
         [
             {"action": "admin", "resource_type": "appliance"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
 }
@@ -599,11 +614,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_record_op_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
+    # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
+    # is inserted once by migration f4c2a8e61b93, so an operator who deletes
+    # it keeps it deleted (the #2138 pattern).
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_disk_usage_alert_rule,
+            seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
             seed_node_pressure_alert_rule,
@@ -614,6 +634,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Storage redundancy (#999 Part A) — cannot fire on an appliance
         # with no arrays, or on a supervisor too old to report them.
         await seed_appliance_storage_alert_rule()
+        # /var filling (#2240): silent below 80%, and on a supervisor that
+        # does not report /var.
+        await seed_appliance_disk_usage_alert_rule()
+        # Silent supervisor (#2259) — cannot fire with no appliances.
+        await seed_appliance_heartbeat_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue
@@ -786,20 +811,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("multicast_blocks_backfilled", created=n)
     except Exception as exc:  # noqa: BLE001
         logger.debug("multicast_block_backfill_skipped", reason=str(exc))
-    # Demo-mode lockdown — force the restricted feature modules off
-    # and mirror the integration toggles into PlatformSettings so the
-    # beat reconcilers stop. Idempotent; failure-tolerant. The PATCH
+    # Demo-mode lockdown — force the restricted feature modules off,
+    # which stops the integration beat reconcilers (they gate on the
+    # module, #2196). Idempotent; failure-tolerant. The PATCH
     # endpoint refuses to re-enable any restricted module while
     # ``DEMO_MODE=1`` is in effect (see app.core.demo_mode).
     if settings.demo_mode:
         try:
-            from sqlalchemy import select  # noqa: PLC0415
-
             from app.core.demo_mode import (  # noqa: PLC0415
                 DEMO_RESTRICTED_MODULES,
             )
             from app.db import AsyncSessionLocal  # noqa: PLC0415
-            from app.models.settings import PlatformSettings  # noqa: PLC0415
             from app.services import feature_modules as fm_svc  # noqa: PLC0415
 
             async with AsyncSessionLocal() as session:
@@ -807,13 +829,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     if not fm_svc.is_known(module_id):
                         continue
                     await fm_svc.set_module_enabled(session, module_id, False, user_id=None)
-                    mirror = fm_svc.INTEGRATION_SETTINGS_MIRROR.get(module_id)
-                    if mirror is not None:
-                        ps = await session.scalar(
-                            select(PlatformSettings).where(PlatformSettings.id == 1)
-                        )
-                        if ps is not None:
-                            setattr(ps, mirror, False)
                 await session.commit()
             fm_svc.invalidate_cache()
             logger.info(
@@ -822,6 +837,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("demo_mode_lockdown_skipped", reason=str(exc))
+
+    # #2196 — bring the derived ``PlatformSettings.integration_*_enabled``
+    # copy in line with the feature modules that own those switches. An
+    # install upgraded from a build where the two drifted (a module turned on
+    # before the settings row existed; Fortinet / Meraki never mirrored) is
+    # corrected here. Nothing in the app reads the columns any more, so this
+    # is housekeeping, not a gate: idempotent, failure-tolerant.
+    try:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services import feature_modules as fm_svc  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as session:
+            if await fm_svc.sync_integration_settings_mirror(session):
+                await session.commit()
+                logger.info("integration_settings_mirror_reconciled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("integration_settings_mirror_reconcile_skipped", reason=str(exc))
 
     # #272 Phase 7c — periodic self-signed cert SAN reconcile. On a
     # multi-node appliance control plane the shared Web UI cert must
@@ -1203,6 +1235,7 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_message,
     )
 
     # A unique violation (SQLSTATE 23505) is the data conflicting.
@@ -1284,7 +1317,7 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": "The request conflicts with existing data."},
+            content={"detail": unique_violation_message(extract_detail(exc))},
         )
 
     @app.exception_handler(SADBAPIError)
@@ -1328,6 +1361,32 @@ def create_app() -> FastAPI:
     # permission / validation errors raise typed HTTPException
     # subclasses that FastAPI's own machinery turns into 4xx
     # responses without ever hitting this path.
+    # FastAPI's stock 422 handler runs ``jsonable_encoder(exc.errors())``, and
+    # for a body that is not valid JSON the error's ``input`` is the raw
+    # ``bytes``, which the encoder decodes strictly as UTF-8 - so a body that
+    # is not UTF-8 (sent with a non-JSON or empty Content-Type) raised
+    # UnicodeDecodeError inside the handler: a 500 and a Diagnostics row for
+    # what is a client error (#2677). Same response as the stock handler;
+    # only ``bytes`` are decoded leniently (identical for valid UTF-8).
+    def _safe_errors(value: Any) -> Any:
+        if isinstance(value, bytes | bytearray):
+            return bytes(value).decode("utf-8", errors="backslashreplace")
+        if isinstance(value, dict):
+            return {k: _safe_errors(v) for k, v in value.items()}
+        if isinstance(value, list | tuple):
+            return [_safe_errors(v) for v in value]
+        return value
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_422(request: Request, exc: RequestValidationError) -> Response:
+        from fastapi.encoders import jsonable_encoder  # noqa: PLC0415
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(_safe_errors(exc.errors()))},
+        )
+
     @app.exception_handler(Exception)
     async def _capture_unhandled(request: Request, exc: Exception) -> Response:
         # Lazy imports — keep app boot-time import graph small + avoid
