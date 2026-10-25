@@ -38,6 +38,7 @@ async def _noop_publish(_channel: str) -> None:
 
 def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, body: str) -> None:
     class _Resp:
+        is_redirect = False  # the guarded fetch follows redirects by hand
         text = body
 
         def raise_for_status(self) -> None:

@@ -42,6 +42,58 @@ SpatiumDDI's auth stack has three layers:
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
+### Sign-in throttles
+
+`POST /auth/login` checks three budgets, all kept in Redis, before it looks
+at the password. Each refusal is a `429` with the same message, so a refusal
+says nothing about whether the account exists.
+
+| Budget | Limit | Keyed by |
+|---|---|---|
+| Per source | 30 attempts / 60 s (`_LOGIN_RL_MAX` in `app/core/auth_throttle.py`). Shared with `/auth/login/mfa` and the approvals break-glass | The client address: an IPv4 address as itself, an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as its IPv4 address, any other IPv6 address as its **/64**. A single host is routinely handed a whole /64, so counting each /128 separately gave it a fresh budget per address |
+| Per username | 20 failed passwords / 15 min (`LOGIN_FAIL_MAX_PER_USERNAME`) | The submitted name, lower-cased, **whether or not an account has it** |
+| Install-wide | 500 failed passwords / 15 min (`LOGIN_FAIL_MAX_GLOBAL`) | Nothing: one counter for the install |
+
+The per-username and install-wide budgets count failures only. The attempt
+is spent before the password is checked, so concurrent guesses cannot all
+read an under-budget count, and a right password gives it back. A name
+already over its own budget is not charged to the install-wide one, so
+hammering a single name cannot spend everyone's budget on its own. A
+refusal answers `Retry-After` with the seconds left in the window that
+refused it, and writes a `login` / `failure` audit row with reason
+`login_throttled` and no `user_id`. Set either variable to `0` to turn
+that budget off.
+
+These budgets fail **open**: with Redis unreachable every attempt is
+allowed, and account lockout plus the second factor are the bounds that
+remain. Account lockout (`lockout_threshold`, Settings → Account Lockout) is a
+separate, per-account setting kept on the user row, and is off by default.
+
+**The trade-off: these ceilings are a bounded denial of service.** Anyone
+who can reach the sign-in page can spend them on purpose.
+
+- Twenty wrong passwords for a name refuse that name's sign-ins, the right
+  password included, for up to 15 minutes. Nothing else is affected.
+- Spreading 500 wrong passwords over enough names and addresses refuses
+  **every** password sign-in on the install for up to 15 minutes, a
+  superadmin's included.
+
+What it buys is a bound on password guessing that no number of source
+addresses or invented names escapes. Without it, guessing spread across
+many /64s and many names was limited only by how many addresses the
+guesser held. The denial is bounded: it ends when the window does, it
+does not touch existing sessions, API tokens, or OIDC / SAML sign-in, and
+it locks no account. An install that would rather not carry it raises
+`LOGIN_FAIL_MAX_GLOBAL` or sets it to `0`. To end a refusal early, delete
+the counter in Redis: `login_fail:global`, or `login_fail:user:` followed
+by the first 32 hex characters of the SHA-256 of the lower-cased name.
+
+The source address is the one `TrustedProxyMiddleware` resolves (#1221):
+`X-Real-IP` when the TCP peer is in `TRUSTED_PROXY_CIDRS`, otherwise the
+peer itself. Behind your own reverse proxy, set
+`FRONTEND_TRUSTED_PROXY_CIDRS` ([REVERSE_PROXY.md](../deployment/REVERSE_PROXY.md)),
+or every client is counted as the proxy and shares one per-source budget.
+
 ## TOTP MFA (issue #69)
 
 Local-user 2FA stacks on top of the password flow. As of #408, TOTP
@@ -119,6 +171,33 @@ session alone doesn't prove and an SSO account has no local password.
   exchanges the pre-token via `POST /auth/login/mfa` for the
   real `{access_token, refresh_token}` pair. Backup codes are
   invalidated on use.
+- **MFA attempt limits**: `POST /auth/login/mfa` checks three bounds
+  before it looks at the code, and a TOTP code and a backup code are
+  treated the same by all three.
+  - **Account lockout (#71).** A locked account gets the same 403 as at
+    `/auth/login`, so a correct code cannot finish the sign-in or clear
+    the lock. Wrong codes count towards the lockout counter like wrong
+    passwords.
+  - **Per-account MFA budget**, on whether or not lockout is enabled:
+    5 wrong codes within 15 minutes (`MFA_FAIL_MAX` /
+    `MFA_FAIL_WINDOW_MINUTES` in `app/services/account_lockout.py`) and
+    the MFA step answers 429 with `Retry-After` until 15 minutes after
+    the last counted failure. Refused attempts are not counted, so
+    waiting is enough. It is stored on the user row
+    (`mfa_failed_count`, `mfa_last_failed_at`), read under a row lock,
+    and so holds when Redis is unavailable. A successful sign-in or an
+    admin unlock (`POST /users/{id}/unlock`) resets it.
+  - **Per-challenge budget.** One pre-token accepts at most 3 wrong
+    codes (`MFA_CHALLENGE_FAIL_MAX` in `app/core/auth_throttle.py`) and
+    is single-use on success; after either, sign-in starts again at the
+    password. This one is kept in Redis and is skipped when Redis is
+    down; the per-account budget is the bound that still applies.
+
+  Refusals are audited as `login` / `failure` rows with reason
+  `account_locked`, `mfa_attempts_exhausted` or `mfa_challenge_spent`,
+  and the wrong code that uses up the per-account budget also writes an
+  `account.mfa_attempts_exhausted` row. No code, recovery code or
+  pre-token is ever written to the audit log or the logs.
 - **Disable**: a user clears their own MFA via `POST /auth/mfa/disable`
   (local users supply their password AND a current TOTP code;
   password-less external-auth users supply just the current TOTP code).
@@ -543,12 +622,18 @@ rejected with `422` rather than silently locking the operator out:
 
 - `read` — restricts the token to safe-method requests
   (`GET` / `HEAD` / `OPTIONS`); any mutation `401`s.
-- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans*`,
-  `/vrfs*`, `/network-devices*`.
-- `dns:write` — allows mutations under `/api/v1/dns/*`, `/dns-pools*`.
+- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans/*`,
+  `/vrfs/*`, `/network-devices/*`.
+- `dns:write` — allows mutations under `/api/v1/dns/*` (zones, records,
+  groups, views, RPZ blocklists, pools). It does not cover `/api/v1/dnsbl/*`
+  (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
+  that writes there needs an empty scope set, with RBAC as the gate.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
 - `agent` — allows only the agent push surface
   (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+Prefixes match on a whole path segment, so `/api/v1/dns` covers
+`/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
 
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still
@@ -574,6 +659,22 @@ Free-space queries over a block or space are refused to a token bound to
 subnets, since free space is a fact about every subnet in the container.
 `backend/tests/test_token_path_scope_sweep.py` walks the route table for
 each of these rules, so a route added later is covered without an edit.
+
+Outside those routers a resource-scoped token is refused with `403`.
+A report, dashboard or metrics series mounted elsewhere answers about
+every subnet, zone or server it aggregates over, and its permission gate
+sees only the resource type, so it cannot serve a token bound to one
+instance. The only exceptions are routes that narrow their own answer to
+the token's grants or return nothing about the estate: `GET /auth/me`,
+`GET /auth/me/permissions`, global search (`GET /search`,
+`GET /search/types`), the MCP endpoint (`/ai/mcp`, which applies the
+per-tool rule below), and the DNS tools that query public resolvers
+(`/dns/tools/*`). A route joins that list by being mounted with
+`include_token_scoped` (`app/api/token_path_scope.py`) or by declaring
+`@honours_token_binding` (`app/api/token_binding.py`); a route added
+anywhere else refuses such a token until it does. The same rule covers
+`/metrics` when it is read with an API token. Sessions and tokens without
+`resource_grants` are not affected.
 
 A resource-scoped token is held to its grants beyond the URL path too. An
 IPAM write that names a DNS zone in its body (`dns_zone_id`,
@@ -692,6 +793,14 @@ invalid JWT to avoid confirming token existence to an attacker.
 - Revoke softly via `PATCH /api/v1/api-tokens/{id}` with
   `{is_active: false}` — the row stays so `last_used_at` is still
   visible for incident forensics.
+- Re-enable an inactive token with `{is_active: true}`: superadmin only,
+  with the operator step-up (`stepup_password` / `stepup_totp_code`). An
+  owner who needs access back creates a new token. A non-superadmin gets
+  `403` and the refusal is audited (`reenable_requires_superadmin`).
+- Change `scopes` with the same `PATCH`. Narrowing (dropping a scope, or
+  restricting an unrestricted token) needs nothing more; widening (adding
+  a scope, or sending `[]` so the token is unrestricted) needs the step-up.
+  Renaming and revoking need neither.
 - Delete hard via `DELETE /api/v1/api-tokens/{id}` — same outward
   behaviour (401 on next use), audit row written on both paths.
 
@@ -775,6 +884,12 @@ rather than swallowing the failure. Permission-related rejections
   its sessions is refused with `403` and is not recorded as activity
   (`last_seen_at` stays), and a refresh returns `401`.
   `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
+- **Open streams re-check their caller.** A streaming response (cluster
+  health, pod logs, nmap progress, AI chat) re-runs the same session,
+  account, API-token and permission checks every 15 seconds while it is
+  open, and ends once any of them fails, or once the access token it was
+  opened with expires. The UI reconnects with its current token.
+  `backend/app/api/stream_auth.py`.
 
 ### Password management
 

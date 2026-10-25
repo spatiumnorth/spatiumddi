@@ -587,12 +587,25 @@ def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
     parent's record cannot be served from this daemon, and writing it is
     destructive.
 
-    The child's APEX is not shadowed: at that node Technitium keeps the
-    parent's side apart (``_parentSideZone`` beside ``_apexZone``), which is
-    where a delegation's NS lives, so the parent's records at the cut are
-    written as before. ``hosted`` is the zone names this daemon serves
-    (lower-case, no trailing dot); returns the deepest one that is a strict
-    descendant of ``zone`` and strictly contains ``domain``.
+    The child's APEX is not shadowed when the child is ONE label below the
+    parent: at that node Technitium keeps the parent's side apart
+    (``_parentSideZone`` beside ``_apexZone``), which is where a delegation's
+    NS lives, so the parent's records at the cut are written as before.
+
+    From 15.6.2 the daemon refuses the parent's record outright instead of
+    misfiling it ("The domain name '<d>' does not belong to the zone: <z>",
+    ``AuthZoneManager.GetOrAddSubDomainZone``) — and that check also refuses
+    the apex of a child TWO or more labels below the parent (``a.b.p2`` in
+    ``p2`` while ``a.b.p2`` is hosted), because it tests whether the name
+    relative to the parent has a dot. Verified live against 15.6.2 (#2238);
+    15.4.0 accepted the same write. The child still answers that name on
+    this daemon, so such a record is skipped like any other shadowed one
+    rather than refused on every render.
+
+    ``hosted`` is the zone names this daemon serves (lower-case, no trailing
+    dot); returns the deepest one that is a strict descendant of ``zone`` and
+    strictly contains ``domain``, or is ``domain`` itself at two or more
+    labels below ``zone``.
     """
     zone = zone.rstrip(".").lower()
     domain = domain.rstrip(".").lower()
@@ -601,7 +614,9 @@ def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
         cand = str(cand).rstrip(".").lower()
         if cand == zone or not cand.endswith("." + zone):
             continue
-        if domain.endswith("." + cand) and (best is None or len(cand) > len(best)):
+        inside = domain.endswith("." + cand)
+        deep_apex = domain == cand and "." in cand[: -len(zone) - 1]
+        if (inside or deep_apex) and (best is None or len(cand) > len(best)):
             best = cand
     return best
 
@@ -1358,11 +1373,21 @@ _UNAPPLIED_ACL_MESSAGES = {
         "express (localnets, an undefined ACL name or a key), so query "
         "access was left as the daemon has it on {zones} zone(s)"
     ),
+    "zone_allow_query": (
+        "allow_query: the zone's own list has an element Technitium cannot "
+        "express (localnets, an undefined ACL name or a key), so query "
+        "access was left as the daemon has it on {zones} zone(s)"
+    ),
     "allow_transfer": (
         "allow_transfer: the list has an element Technitium cannot express "
         "(localnets, a key beside an address, a negated key or ACL, an "
         "undefined ACL name), so zone transfer was left as the daemon has it "
         "on {zones} zone(s)"
+    ),
+    "also_notify": (
+        "also_notify: an entry is not a plain IP address (Technitium's notify "
+        "list takes addresses only, no port, key or hostname), so it was not "
+        "notified on {zones} zone(s)"
     ),
     "allow_transfer_key": (
         "allow_transfer: the list names a TSIG key the daemon does not hold "
@@ -1676,6 +1701,102 @@ def _transfer_access(
     return "UseSpecifiedNetworkACL", acl, names, missing
 
 
+#: Zone types whose NOTIFY the group / zone settings govern (#2267). Technitium
+#: accepts ``notify`` on Primary and Secondary zones; a Stub or Forwarder zone
+#: has nothing to notify (BIND renders no notify for them either).
+_NOTIFY_ZONE_TYPES = frozenset({"Primary", "Secondary"})
+
+#: BIND's ``notify`` choices that notify from Primary zones only.
+_NOTIFY_PRIMARY_ONLY = frozenset({"master-only", "primary-only"})
+
+
+def _notify_options(
+    ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Translate the group's / zone's BIND ``notify`` + ``also-notify`` into
+    Technitium's per-zone ``notify`` + ``notifyNameServers`` (#2267).
+
+    Technitium defaults every zone to ``ZoneNameServers``, so without this a
+    stealth primary (``notify no``) still notified its NS hosts and
+    also-notify targets were never notified. The mapping mirrors BIND:
+
+    * ``yes``: the NS set, plus the also-notify list when there is one
+      (``BothZoneAndSpecifiedNameServers``);
+    * ``explicit``: only the also-notify list (``SpecifiedNameServers``);
+    * ``no``: ``None``;
+    * ``master-only`` / ``primary-only``: as ``yes`` on a Primary, ``None``
+      on a Secondary.
+
+    The zone's own value shadows the group's; ``None`` inherits, and so does
+    an empty also-notify list (the BIND9 agent renders nothing for one).
+    ``explicit`` with no targets is ``None``: BIND notifies nobody then.
+    Always sent, ``notifyNameServers`` included (empty clears), so switching
+    back to ``yes`` does not strand an old target list on the zone.
+    Technitium's list takes bare addresses; any other entry is skipped and
+    reported rather than guessed at.
+    """
+    opts = bundle.get("options") or {}
+    z = zone or {}
+    mode = str(z.get("notify_enabled") or opts.get("notify_enabled") or "yes").strip().lower()
+    own = z.get("also_notify")
+    raw = own if own else opts.get("also_notify")
+    targets: list[str] = []
+    bad = False
+    for entry in raw or []:
+        text = str(entry).strip()
+        if not text:
+            continue
+        try:
+            targets.append(str(ipaddress.ip_address(text)))
+        except ValueError:
+            bad = True
+    unapplied = (
+        [{"kind": "also_notify", "reason": "also_notify has an entry that is not an IP address"}]
+        if bad
+        else []
+    )
+    if mode in _NOTIFY_PRIMARY_ONLY:
+        mode = "yes" if ztype == "Primary" else "no"
+    if mode == "no":
+        notify = "None"
+    elif mode == "explicit":
+        notify = "SpecifiedNameServers" if targets else "None"
+    else:
+        notify = "BothZoneAndSpecifiedNameServers" if targets else "ZoneNameServers"
+    if notify in ("None", "ZoneNameServers"):
+        targets = []
+    return {"notify": notify, "notifyNameServers": targets}, unapplied
+
+
+#: Zone types whose OWN ``allow_query`` overrides the group's (#2263). BIND
+#: accepts a zone-level ``allow-query`` on master / slave / stub zones only,
+#: and the BIND9 agent renders it there and nowhere else, so a Forwarder zone
+#: keeps the group's list here too.
+_ZONE_QUERY_OVERRIDE_TYPES = frozenset({"Primary", "Secondary", "Stub"})
+
+
+def _effective_allow_query(
+    ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None
+) -> tuple[Any, bool]:
+    """The ``allow_query`` list in force for one zone, and whether it is the
+    zone's own (#2263).
+
+    The zone's value shadows the group's, as a zone-level ``allow-query``
+    does in BIND. ``None`` inherits; so does an empty list, because the
+    BIND9 agent renders nothing for one and the zone then falls back to the
+    options-level list. Reading ``[]`` as ``Allow`` here would open a zone
+    the group restricts.
+    """
+    own = (zone or {}).get("allow_query")
+    if (
+        ztype in _ZONE_QUERY_OVERRIDE_TYPES
+        and own is not None
+        and any(str(e).strip() for e in own)
+    ):
+        return own, True
+    return (bundle.get("options") or {}).get("allow_query"), False
+
+
 def _zone_options_payload(
     ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1716,20 +1837,37 @@ def _zone_options_payload(
     unapplied: list[dict[str, str]] = []
     acls = _bundle_acls(bundle)
     if ztype in _QUERY_ACCESS_ZONE_TYPES:
-        # The group's ``allow_query`` (#1763). Always sent, ``Allow`` included,
-        # so widening the list back to ``any`` un-restricts a zone an earlier
-        # bundle restricted; an empty ACL clears the stored one.
-        qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+        # The group's ``allow_query`` (#1763), or the zone's own (#2263).
+        # Always sent, ``Allow`` included, so widening the list back to
+        # ``any`` un-restricts a zone an earlier bundle restricted; an empty
+        # ACL clears the stored one.
+        source, own = _effective_allow_query(ztype, bundle, zone)
+        qa = _query_access(source, acls)
         if qa is None:
             unapplied.append(
                 {
-                    "kind": "allow_query",
+                    "kind": "zone_allow_query" if own else "allow_query",
                     "reason": "allow_query has an element Technitium cannot express",
                 }
             )
+            if own:
+                # A Primary this pass creates is held at ``Deny`` and then
+                # released (#1758); with no query access to release it to,
+                # the release falls back to ``Allow``. For a zone whose own
+                # list is meant to restrict it, that is wider than the group's
+                # list, which a zone without the override would have got. So
+                # the release uses the group's list when it is expressible
+                # (#2263). An existing zone is still left as the daemon has it.
+                group_qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+                if group_qa is not None:
+                    payload["_release_query_access"] = group_qa
         else:
             payload["queryAccess"] = qa[0]
             payload["queryAccessNetworkACL"] = qa[1]
+    if ztype in _NOTIFY_ZONE_TYPES:
+        notify, notify_unapplied = _notify_options(ztype, bundle, zone)
+        payload.update(notify)
+        unapplied.extend(notify_unapplied)
     if ztype != "Primary":
         if unapplied:
             payload["_unapplied"] = unapplied
@@ -1830,6 +1968,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     allowed: set[str] = set()
     modes: set[str] = set()
     custom_addresses: set[str] = set()
+    invalid_addresses: set[str] = set()
     skipped_redirects: set[str] = set()
 
     for bl in bundle.get("blocklists") or []:
@@ -1860,8 +1999,20 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
             mapped = _BLOCK_MODE_TYPES.get(mode)
             if mapped:
                 modes.add(mapped)
-            if mode in ("sinkhole", "redirect") and entry.get("target"):
-                custom_addresses.add(str(entry["target"]))
+            if mode in ("sinkhole", "redirect"):
+                # The list's ``sinkhole_ip`` is what a sinkhole answers with
+                # (#2124); it used to be ignored here, so a sinkhole list
+                # with no per-entry target fell back to NxDomain. A value
+                # that is not an IP address is left out rather than handed
+                # to Technitium, which would refuse the whole settings call.
+                for candidate in (entry.get("sinkhole_ip"), entry.get("target")):
+                    if candidate:
+                        try:
+                            custom_addresses.add(
+                                str(ipaddress.ip_address(str(candidate).strip()))
+                            )
+                        except ValueError:
+                            invalid_addresses.add(str(candidate))
 
     if skipped_redirects:
         log.warning(
@@ -1876,11 +2027,38 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
+    if invalid_addresses:
+        log.warning(
+            "technitium_sinkhole_address_unusable",
+            sample=sorted(invalid_addresses)[:5],
+            detail=(
+                "A sinkhole address is not an IP address and was left out; "
+                "blocked names answer with the unspecified address instead."
+            ),
+        )
+
     # One server-wide blocking type has to cover every entry. If the lists
     # disagree, prefer the address-answering mode: it is the more specific
     # intent (an operator asked for a sinkhole), and NxDomain would drop
     # the sinkhole silently.
-    blocking_type = "CustomAddress" if "CustomAddress" in modes else "NxDomain"
+    #
+    # Same answer the BIND9 renderer gives (#2124): both families, the
+    # list's address replacing the unspecified address of its own family.
+    # A sinkhole with no address at all is AnyAddress — Technitium's name
+    # for exactly 0.0.0.0 / :: — rather than a CustomAddress with nothing
+    # in it, which the apply step would turn into NxDomain.
+    if "CustomAddress" in modes:
+        if custom_addresses:
+            blocking_type = "CustomAddress"
+            families = {ipaddress.ip_address(a).version for a in custom_addresses}
+            if 4 not in families:
+                custom_addresses.add("0.0.0.0")
+            if 6 not in families:
+                custom_addresses.add("::")
+        else:
+            blocking_type = "AnyAddress"
+    else:
+        blocking_type = "NxDomain"
 
     return {
         "enabled": bool(blocked),
@@ -3814,14 +3992,19 @@ class TechnitiumDriver(DriverBase):
         No query access in the bundle (an ``allow_query`` Technitium cannot
         express, which a normal pass leaves as the daemon has it) means
         ``Allow``: what the zone had before the hold (``ApexZone`` ctor,
-        15.4.0), not a translation of the operator's list. If the options
+        15.4.0), not a translation of the operator's list. The exception is
+        a zone whose OWN list cannot be expressed (#2263): it is released
+        to the group's list (``_release_query_access``) when that one can
+        be, so it is never opened wider than a zone without the override.
+        If the options
         call is refused or not sent (a bad ``zoneTransfer`` is never sent),
         the query access still goes out on its own: a zone left at ``Deny``
         is not served at all.
         """
         params = dict(options)
         if "queryAccess" not in params:
-            params.update(queryAccess="Allow", queryAccessNetworkACL=[])
+            access, acl = params.get("_release_query_access") or ("Allow", [])
+            params.update(queryAccess=access, queryAccessNetworkACL=list(acl))
         try:
             if self._apply_zone_options(token, zone, params):
                 return True
@@ -4567,6 +4750,8 @@ class TechnitiumDriver(DriverBase):
         True when there was nothing to send or the daemon took it.
         """
         options = dict(options)
+        # Only the hold release reads it (#2263); never a daemon parameter.
+        options.pop("_release_query_access", None)
         for item in options.pop("_unapplied", None) or []:
             # Left as the daemon has it rather than guessed at (see
             # ``_query_access`` / ``_transfer_access``); the API refuses to

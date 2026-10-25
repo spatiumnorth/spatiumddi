@@ -65,6 +65,10 @@ COPY 15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.envsh
 # Renders FRONTEND_TRUSTED_PROXY_CIDRS into nginx's set_real_ip_from lines + the
 # X-Forwarded-Proto trust map (#1868). Unset = trust no proxy.
 COPY 16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.envsh
+# Reloads nginx in place when the mounted TLS certificate changes, so a new
+# Web UI certificate never needs the frontend pods replaced (#1173). Without a
+# mounted certificate (Docker Compose) it exits and watches nothing.
+COPY 40-tls-reload-watch.sh /docker-entrypoint.d/40-tls-reload-watch.sh
 
 # Sensible defaults that keep Docker Compose working without operator
 # config — Compose's service-discovery puts the api at ``api:8000``.

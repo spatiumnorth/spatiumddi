@@ -247,7 +247,7 @@ def _render(bundle: dict) -> tuple[Path, Path]:
     # the file render() just wrote. Assert that rather than rewriting it — a
     # hardcoded path here would send named to a DIFFERENT install's key file,
     # which passes named-checkconf and then fails every transfer BADKEY.
-    expected_include = f'include "{state / "tsig" / "ddns.key"}";'
+    expected_include = f'include "{state / "rendered" / "tsig" / "ddns.key"}";'
     check(
         "key include points at this render's own state dir",
         expected_include in text,

@@ -1,0 +1,3 @@
+### Fixed
+
+- **A Required custom field is enforced on blocks and subnets (#2478).** `is_required` only drew a star: New IP Block / New Subnet and `POST /ipam/blocks` / `POST /ipam/subnets` stored a row without it. Create (and allocate-subnet) now refuse a missing Required field with 422, counting a value inherited from the block chain. An update is checked only when it sends `custom_fields`, and only for a field it sends or the row already holds, so existing rows that lack a newly Required field stay editable. The dialogs apply the same rule, and a select always shows an empty choice instead of silently showing its first option for a value that is not stored.

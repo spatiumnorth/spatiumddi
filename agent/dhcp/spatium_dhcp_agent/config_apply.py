@@ -139,6 +139,12 @@ class ApplyStatus:
     error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        # Nothing applied yet (#2258): the default ``ok`` with no etag is a
+        # placeholder, not a verdict. Report an empty block, which the control
+        # plane reads as "no report" and leaves the stored status (NULL =
+        # unknown, #882) untouched, instead of a fabricated ``ok``.
+        if self.status == STATUS_OK and self.etag is None:
+            return {}
         return {
             "status": self.status,
             "etag": self.etag,

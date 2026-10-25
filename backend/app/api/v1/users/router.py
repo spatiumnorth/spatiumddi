@@ -157,7 +157,7 @@ class CreateUserRequest(BaseModel):
         # whose detail is an error ARRAY, a shape the change-password screen
         # did not parse, so a 7-character password was reported as "check
         # your current password". A floor of 1 cannot collide with a policy
-        # minimum (settings clamp it to 6..128), so the two can never
+        # minimum (settings clamp it to 6..72), so the two can never
         # disagree again.
         if v is not None and not v:
             raise ValueError("Password cannot be empty")
@@ -233,7 +233,7 @@ class ResetPasswordRequest(BaseModel):
         # whose detail is an error ARRAY, a shape the change-password screen
         # did not parse, so a 7-character password was reported as "check
         # your current password". A floor of 1 cannot collide with a policy
-        # minimum (settings clamp it to 6..128), so the two can never
+        # minimum (settings clamp it to 6..72), so the two can never
         # disagree again.
         if not v:
             raise ValueError("Password cannot be empty")
@@ -301,7 +301,9 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
     existing = await db.execute(
         select(User).where((User.username == body.username) | (User.email == body.email))
     )
-    if existing.scalar_one_or_none():
+    # .first(), not scalar_one_or_none(): the username can belong to one row and
+    # the email to another, and two matches must still be a 409, not a 500.
+    if existing.scalars().first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username or email already in use",

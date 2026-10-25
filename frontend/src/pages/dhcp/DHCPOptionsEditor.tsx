@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
 import { dhcpApi, type DHCPOption, type DHCPOptionCodeDef } from "@/lib/api";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { Field, inputCls } from "./_shared";
 
 /**
@@ -22,7 +23,6 @@ interface StandardDef {
   label: string;
   hint?: string;
   kind: "ip-list" | "string" | "ip";
-  max?: number;
 }
 
 const STANDARD_OPTIONS: StandardDef[] = [
@@ -43,8 +43,9 @@ const STANDARD_OPTIONS: StandardDef[] = [
     name: "dns-servers",
     label: "DNS Servers (option 6)",
     kind: "ip-list",
-    max: 3,
-    hint: "Up to 3 DNS resolver IPs.",
+    // #2482 — no cap: the cut on blur dropped a stored 4th server while the
+    // input still showed it. The API stores the whole list, and so do we.
+    hint: "DNS resolver IPs; clients commonly use the first 3.",
   },
   {
     code: 15,
@@ -205,6 +206,12 @@ function CustomOptionRow({
             onFocus={() => setOpen(true)}
             onBlur={commitTyped}
             onKeyDown={(e) => {
+              if (
+                closePopupOnEscape(e, open && matches.length > 0, () =>
+                  setOpen(false),
+                )
+              )
+                return;
               // Enter commits the typed code instead of submitting the
               // surrounding form with the row still on its old code.
               if (e.key === "Enter") {
@@ -305,7 +312,6 @@ export function DHCPOptionsEditor({
       next.push({ code: def.code, name: def.name, value: clean });
     } else if (def.kind === "ip" || def.kind === "ip-list") {
       const list = splitList(clean);
-      if (def.max) list.splice(def.max);
       next.push({ code: def.code, name: def.name, value: list });
     }
     onChange(next);

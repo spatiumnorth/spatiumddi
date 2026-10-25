@@ -13,6 +13,7 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
+from app.api.v1._common import WinRMSettings, winrm_settings_from_blob
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._leases import LeaseResponse, apply_lease_filters, enrich_leases
 from app.core.agent_wake import (
@@ -26,7 +27,7 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.drivers._winrm import validate_transport
+from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.fortigate import test_fortigate_credentials
@@ -67,8 +68,9 @@ class WindowsCredentialsInput(BaseModel):
     """Windows DHCP admin credentials (for driver='windows_dhcp').
 
     Stored Fernet-encrypted on ``DHCPServer.credentials_encrypted``.
-    Server never returns the password back — responses only expose
-    ``has_credentials``.
+    The username and password are never returned — responses expose
+    ``has_credentials`` and the non-secret ``winrm_settings`` (port,
+    transport, TLS, certificate validation) only.
 
     All fields are optional to support **partial updates** on edit: if the
     server already has stored credentials, sending just ``{"transport":
@@ -193,6 +195,8 @@ class ServerResponse(BaseModel):
     server_group_id: uuid.UUID | None
     status: str
     last_sync_at: datetime | None
+    last_sync_error: str | None = None
+    last_sync_error_at: datetime | None = None
     last_health_check_at: datetime | None
     agent_registered: bool
     agent_approved: bool
@@ -213,6 +217,10 @@ class ServerResponse(BaseModel):
     # hard-coded default (which would silently re-disable verification on any
     # unrelated edit). Null for non-cloud drivers.
     verify_tls: bool | None = None
+    # The stored non-secret WinRM settings (windows_dhcp with credentials;
+    # null otherwise). Lets the edit dialog show what is stored, so an
+    # untouched save sends nothing and keeps it. Never carries the secrets.
+    winrm_settings: WinRMSettings | None = None
     # Kea HA listener URL this server exposes to its partner.
     ha_peer_url: str = ""
     # Kea HA state — latest value reported by the agent's periodic
@@ -285,6 +293,8 @@ class ServerResponse(BaseModel):
             server_group_id=s.server_group_id,
             status=s.status,
             last_sync_at=s.last_sync_at,
+            last_sync_error=s.last_sync_error,
+            last_sync_error_at=s.last_sync_error_at,
             last_health_check_at=s.last_health_check_at,
             agent_registered=s.agent_registered,
             # Agentless drivers have no agent to approve, so "approval" is
@@ -303,6 +313,11 @@ class ServerResponse(BaseModel):
             is_read_only=is_read_only(s.driver),
             vdom=vdom,
             verify_tls=verify_tls,
+            winrm_settings=(
+                winrm_settings_from_blob(s.credentials_encrypted)
+                if s.driver == "windows_dhcp"
+                else None
+            ),
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
@@ -696,6 +711,7 @@ async def update_server(
     #   * dict with any subset of fields → decrypt-merge-reencrypt (so the
     #     UI can change just the transport/port/tls without re-typing the
     #     password).
+    winrm_diff: dict[str, dict[str, Any]] = {}
     if body.windows_credentials is not None:
         if isinstance(body.windows_credentials, WindowsCredentialsInput):
             patch = body.windows_credentials.model_dump(exclude_none=True)
@@ -705,10 +721,15 @@ async def update_server(
             elif s.credentials_encrypted:
                 from app.core.crypto import decrypt_dict  # noqa: PLC0415
 
+                # Merge: a key the request does not carry keeps its stored
+                # value, so an edit that omits the TLS settings never resets
+                # them to the create defaults.
                 existing = decrypt_dict(s.credentials_encrypted)
+                before_creds = dict(existing)
                 existing.update(patch)
                 s.credentials_encrypted = encrypt_dict(existing)
                 changes["windows_credentials_updated"] = sorted(patch.keys())
+                winrm_diff = winrm_settings_diff(before_creds, existing)
             else:
                 # No stored creds — require a full username/password on first set.
                 if not patch.get("username") or not patch.get("password"):
@@ -726,6 +747,7 @@ async def update_server(
                 patch.setdefault("winrm_port", 5986 if patch.get("use_tls") else 5985)
                 s.credentials_encrypted = encrypt_dict(patch)
                 changes["windows_credentials_set"] = True
+                winrm_diff = winrm_settings_diff(None, patch)
         elif body.windows_credentials == {}:
             s.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
@@ -766,6 +788,10 @@ async def update_server(
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:
         audit_payload["windows_credentials_cleared"] = True
+    if "windows_credentials_updated" in changes:
+        audit_payload["windows_credentials_updated"] = changes["windows_credentials_updated"]
+    if winrm_diff:
+        audit_payload["winrm_settings_changed"] = winrm_diff
     if "cloud_credentials_set" in changes:
         audit_payload["cloud_credentials_set"] = True
     if "cloud_credentials_updated" in changes:
@@ -804,6 +830,11 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     # #430 — capture the group before delete; removing a member can drop a
     # group out of HA, re-rendering the survivors' failover block. Wake it.
     gid = s.server_group_id
+    # #2290 — leases cascade with the server, so tear their IPAM mirrors and
+    # DDNS down first (sparing any an HA peer still holds).
+    from app.services.dhcp.lease_cleanup import delete_leases_for_server  # noqa: PLC0415
+
+    await delete_leases_for_server(db, s.id)
     await db.delete(s)
     if gid is not None:
         collect_wake(dhcp_group_channel(gid))
@@ -1168,6 +1199,13 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             ),
         )
     result = await pull_leases_from_server(db, s, apply=True)
+    if result.busy:
+        # #2262 — the scheduled pull (or another Sync) is reconciling this
+        # server right now; two at once used to insert the same lease twice.
+        raise HTTPException(
+            status_code=409,
+            detail="A lease pull for this server is already running; try again shortly.",
+        )
 
     # Reconcile the server's MAC deny-filter list against the group's
     # active blocks while we're already holding the WinRM session up.

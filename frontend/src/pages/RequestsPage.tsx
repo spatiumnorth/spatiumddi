@@ -35,6 +35,7 @@ import {
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
@@ -254,6 +255,7 @@ function ResourcePicker({
         }}
         onFocus={() => setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
+        onKeyDown={(e) => closePopupOnEscape(e, open, () => setOpen(false))}
       />
       {open ? (
         <div className="absolute z-50 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-background shadow-lg">

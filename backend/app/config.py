@@ -164,6 +164,16 @@ class Settings(BaseSettings):
     # proxy's address. Validated at boot: a bad entry fails it.
     trusted_proxy_cidrs: str = DEFAULT_TRUSTED_PROXY_CIDRS
 
+    # Password sign-in failure ceilings on ``POST /auth/login``, per 15-minute
+    # window, kept in Redis (``app.core.auth_throttle``). One per submitted
+    # username (lower-cased, counted whether or not the account exists) and
+    # one across the whole install. Reaching the install-wide one refuses
+    # every password sign-in until its window ends: a bounded denial of
+    # service, traded for a bound on guessing spread over many addresses and
+    # names (docs/features/AUTH.md). 0 or less turns a ceiling off.
+    login_fail_max_per_username: int = 20
+    login_fail_max_global: int = 500
+
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
     # encrypted with the Fernet helper in app.core.crypto using
@@ -216,6 +226,12 @@ class Settings(BaseSettings):
     # ``finally``) frees both within one lease, instead of holding every
     # server's render for as long as a render may take.
     dns_agent_bundle_render_lease_seconds: int = 60
+    # How many bundle renders run at once fleet-wide (#2227). A render's
+    # memory is bounded since #2227 (about 4 kB per zone, a batch of records
+    # and the compressed body), so the limit now protects the database, which
+    # each render reads the whole group from; one at a time made a 7-server
+    # group of 2M records wait for seven serial whole-group renders.
+    dns_agent_bundle_render_slots: int = 2
     # The long-poll serves stored bundles only. While this is on — the
     # migration release, whose worker may still be one release behind — a
     # missing or stale bundle is built inline in the request exactly as

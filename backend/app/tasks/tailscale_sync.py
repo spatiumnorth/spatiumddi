@@ -2,7 +2,7 @@
 
 Mirrors ``proxmox_sync`` — 30 s beat tick, per-tenant interval
 gating, platform-wide kill switch via
-``PlatformSettings.integration_tailscale_enabled``. Plus a
+the ``integrations.tailscale`` feature module (#2196). Plus a
 ``sync_tenant_now`` task for the UI's "Sync Now" button, and a daily
 ``refresh_tailscale_token_expiry`` that re-reads each tenant's API token
 expiry (#2138).
@@ -21,12 +21,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
-from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
+from app.services.feature_modules import is_module_enabled
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
-
-_PLATFORM_SINGLETON_ID = 1
 
 
 async def _run_sweep() -> dict[str, Any]:
@@ -38,8 +38,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_tailscale_enabled:
+            if not await is_module_enabled(db, "integrations.tailscale"):
                 return {"status": "disabled"}
 
             rows = (
@@ -75,7 +74,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # A crash leaves the shared session in a failed
                     # transaction; roll back so the next tenant still syncs.
                     await db.rollback()
-                    errors.append(f"{tenant_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        TailscaleTenant,
+                        tenant_id,
+                        resource_type="tailscale_tenant",
+                        action="tailscale.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{tenant_name}: {crash}")
                     logger.warning(
                         "tailscale_reconcile_crash",
                         tenant=str(tenant_id),
@@ -116,10 +123,26 @@ async def _run_one(tenant_id: str) -> dict[str, Any]:
             tenant = await db.get(TailscaleTenant, _uuid.UUID(tenant_id))
             if tenant is None:
                 return {"status": "not_found"}
-            summary = await reconcile_tenant(db, tenant)
+            row_id = tenant.id
+            try:
+                summary = await reconcile_tenant(db, tenant)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    TailscaleTenant,
+                    row_id,
+                    resource_type="tailscale_tenant",
+                    action="tailscale.reconcile",
+                    exc=exc,
+                )
+                logger.warning("tailscale_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "tailnet_domain": summary.tailnet_domain,
                 "device_count": summary.device_count,
                 "blocks_created": summary.blocks_created,
@@ -149,8 +172,7 @@ async def refresh_token_expiry(db: Any) -> dict[str, Any]:
         fetch_token_expiry,
     )
 
-    ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-    if ps is None or not ps.integration_tailscale_enabled:
+    if not await is_module_enabled(db, "integrations.tailscale"):
         return {"status": "disabled"}
 
     rows = (
@@ -198,6 +220,7 @@ async def _run_token_expiry_refresh() -> dict[str, Any]:
     name="app.tasks.tailscale_sync.refresh_tailscale_token_expiry",
     bind=True,
 )
+@module_gated("integrations.tailscale")
 def refresh_tailscale_token_expiry(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_token_expiry_refresh())
 
@@ -206,6 +229,7 @@ def refresh_tailscale_token_expiry(self: Any) -> dict[str, Any]:  # noqa: ARG001
     name="app.tasks.tailscale_sync.sweep_tailscale_tenants",
     bind=True,
 )
+@module_gated("integrations.tailscale")
 def sweep_tailscale_tenants(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

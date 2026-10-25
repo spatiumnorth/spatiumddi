@@ -50,7 +50,10 @@ from app.core.mac import canonicalize_mac
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import _resolve_lease_subnet_id
 
 logger = structlog.get_logger(__name__)
@@ -186,7 +189,10 @@ async def upsert_ipam_for_static(
     # below), and the ``or`` made an empty one unrepresentable — clearing a
     # reservation's name left the mirror on the old name and re-published the
     # stale A record off it, with no number of polls able to converge them.
-    row.hostname = st.hostname
+    # Stripped: a whitespace-only name (a row stored before the request
+    # validator folded it to "", or one written by an importer) is no name,
+    # and the DNS sync below retracts what an earlier name published.
+    row.hostname = (st.hostname or "").strip()
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
@@ -209,11 +215,23 @@ async def upsert_ipam_for_static(
     st.ip_address_id = row.id
     # Fire DNS sync so forward/reverse records follow the static.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+    from app.services.dns.sync_check import address_own_forward_zone_id  # noqa: PLC0415
 
     subnet_row = await db.get(Subnet, scope.subnet_id)
-    if subnet_row is not None and row.hostname:
+    # Run even when the reservation carries no name: the sync then retracts
+    # the A / PTR an earlier name published, rather than leaving them served
+    # for a name the row no longer carries.
+    if subnet_row is not None:
         try:
-            await _sync_dns_record(db, row, subnet_row, action=action)
+            # #2104 — keep the row in the zone it was put in (#493): with no
+            # zone the sync resolves the subnet's and re-homes the host.
+            await _sync_dns_record(
+                db,
+                row,
+                subnet_row,
+                zone_id=await address_own_forward_zone_id(db, row),
+                action=action,
+            )
         except Exception:  # noqa: BLE001 — DNS sync is best-effort
             pass
     # Last, with the reservation already at its new address: DDNS lets a
@@ -250,15 +268,19 @@ async def _release_moved_row(
     # The delete has to reach the database before the insert:
     # (subnet_id, address) is unique (uq_ip_address_subnet_address).
     await db.flush()
+    # #2269 — a scope not set to ``on_lease`` keeps the lease hostname out.
+    write_hostname = subnet_id not in await lease_hostname_suppressed_subnets(
+        db, subnet_ids=[subnet_id]
+    )
     candidate = IPAddress(subnet_id=subnet_id, address=str(address))
-    _mirror_lease_onto(candidate, lease)
+    _mirror_lease_onto(candidate, lease, write_hostname=write_hostname)
     mirror, created = await insert_ipam_mirror_row(db, candidate)
     if not created:
         # A concurrent writer's row won the insert. Take it over only when
         # the ingest would: a free row, or one a lease already owns.
         if not (mirror.status == "available" or mirror.auto_from_lease):
             return None
-        _mirror_lease_onto(mirror, lease)
+        _mirror_lease_onto(mirror, lease, write_hostname=write_hostname)
     subnet_row = await db.get(Subnet, subnet_id)
     if subnet_row is None:
         return None
@@ -308,7 +330,10 @@ async def detach_ipam_for_static(
     handovers: list[LeaseHandover] = []
 
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    for row in res.scalars().all():
+    rows = list(res.scalars().all())
+    # #2269 — one scope lookup for every row, not one per row.
+    suppressed = await lease_hostname_suppressed_subnets(db, subnet_ids={r.subnet_id for r in rows})
+    for row in rows:
         subnet_row = await db.get(Subnet, row.subnet_id)
         if subnet_row is not None:
             try:
@@ -319,7 +344,11 @@ async def detach_ipam_for_static(
         if row.status == "static_dhcp":
             lease = await _live_lease_at(db, row) if to_status == "available" else None
             if lease is not None:
-                _mirror_lease_onto(row, lease)
+                _mirror_lease_onto(
+                    row,
+                    lease,
+                    write_hostname=row.subnet_id not in suppressed,
+                )
                 if subnet_row is not None:
                     handovers.append(LeaseHandover(subnet_row, row, lease))
             else:
@@ -403,7 +432,7 @@ async def _live_lease_at(
     return None
 
 
-def _mirror_lease_onto(row: IPAddress, lease: DHCPLease) -> None:
+def _mirror_lease_onto(row: IPAddress, lease: DHCPLease, *, write_hostname: bool = True) -> None:
     """Make ``row`` the IPAM mirror of ``lease``.
 
     The fields the lease-event ingest stamps on a row it takes over
@@ -411,7 +440,8 @@ def _mirror_lease_onto(row: IPAddress, lease: DHCPLease) -> None:
     stored lease rather than an event. The sighting is the lease's own report;
     a later sighting already on the row (a discovery sweep) is kept.
     """
-    row.hostname = (lease.hostname or row.hostname or "")[:253]
+    if write_hostname:
+        row.hostname = (lease.hostname or row.hostname or "")[:253]
     row.mac_address = lease.mac_address or row.mac_address
     row.status = "dhcp"
     row.auto_from_lease = True
@@ -901,7 +931,7 @@ async def sync_static_for_ipam_row(
         changed = (
             prev_mac != mac
             or prev_ip != str(row.address)
-            or prev_hostname != (row.hostname or "")
+            or prev_hostname != (row.hostname or "").strip()
             or prev_description != effective_description
         )
         if not changed and row.static_assignment_id == str(linked.id):
@@ -914,7 +944,7 @@ async def sync_static_for_ipam_row(
             changed_fields.append("ip_address")
         if prev_mac != mac:
             changed_fields.append("mac_address")
-        if prev_hostname != (row.hostname or ""):
+        if prev_hostname != (row.hostname or "").strip():
             changed_fields.append("hostname")
         if prev_description != effective_description:
             changed_fields.append("description")
@@ -931,7 +961,7 @@ async def sync_static_for_ipam_row(
         }
         linked.ip_address = str(row.address)
         linked.mac_address = mac
-        linked.hostname = row.hostname or ""
+        linked.hostname = (row.hostname or "").strip()
         linked.description = effective_description
         await db.flush()
         if changed:
@@ -1027,7 +1057,7 @@ async def sync_static_for_ipam_row(
         scope_id=scope.id,
         ip_address=str(row.address),
         mac_address=mac,
-        hostname=row.hostname or "",
+        hostname=(row.hostname or "").strip(),
         description=row.description or "",
         ip_address_id=row.id,
         created_by_user_id=created_by_user_id,

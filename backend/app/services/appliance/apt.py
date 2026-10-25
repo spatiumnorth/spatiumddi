@@ -39,8 +39,13 @@ import hashlib
 import json
 from typing import Any
 
+import structlog
+
+from app.core.config_text import has_control_chars
 from app.core.crypto import decrypt_str
 from app.models.settings import PlatformSettings
+
+logger = structlog.get_logger(__name__)
 
 # Where the per-key armoured files land on the host. The ``signed-by``
 # option on each sources.list entry points here.
@@ -84,6 +89,20 @@ def render_sources_list(settings: PlatformSettings) -> str:
         if key_id:
             opts = f"[signed-by={_keyring_path(key_id)}] "
         name = str(src.get("name") or "").strip()
+        # Each source is one ``deb`` line, and apt ends an entry at the
+        # newline. The settings API rejects control characters in every
+        # field of a source; a stored source that still has one (written
+        # before that check, or restored from elsewhere) is left out rather
+        # than allowed to add an entry of its own.
+        if any(has_control_chars(v) for v in (uri, suites, components, key_id, name)) or any(
+            c.isspace() for c in uri + key_id
+        ):
+            logger.error("apt_source_omitted_illegal_chars")
+            lines.append(
+                "# A source was OMITTED — a stored field contains a newline or other "
+                "control character. Re-enter it in the UI."
+            )
+            continue
         if name:
             lines.append(f"# {name}")
         lines.append(f"deb {opts}{uri} {suites} {components}".rstrip())
@@ -161,6 +180,18 @@ def render_proxy_conf(settings: PlatformSettings) -> str:
     http = (settings.apt_proxy_http or "").strip()
     https = (settings.apt_proxy_https or "").strip()
     no_proxy = (settings.apt_proxy_no_proxy or "").strip()
+    # Each value sits inside a quoted apt.conf string; a quote or a control
+    # character would end it. The settings API rejects both; a stored value
+    # that has one is not rendered.
+    if _breaks_apt_string(http):
+        logger.error("apt_proxy_omitted_illegal_chars", scheme="http")
+        http = ""
+    if _breaks_apt_string(https):
+        logger.error("apt_proxy_omitted_illegal_chars", scheme="https")
+        https = ""
+    if _breaks_apt_string(no_proxy):
+        logger.error("apt_no_proxy_omitted_illegal_chars")
+        no_proxy = ""
     if not http and not https:
         return ""
     lines = [
@@ -181,6 +212,10 @@ def render_proxy_conf(settings: PlatformSettings) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _breaks_apt_string(value: str) -> bool:
+    return '"' in value or has_control_chars(value)
+
+
 def render_auth_conf(settings: PlatformSettings) -> str:
     """Render ``/etc/apt/auth.conf.d/spatiumddi.conf`` (netrc-style) from
     the decrypted private-mirror credentials. Empty when none set; the
@@ -194,6 +229,13 @@ def render_auth_conf(settings: PlatformSettings) -> str:
         login = str(entry.get("login") or "").strip()
         password = _decrypt(entry.get("password_enc"))
         if not machine or not login or password is None:
+            continue
+        # One netrc-style line per entry; a newline in any part would add a
+        # line of its own. The settings API rejects these on write.
+        if has_control_chars(machine + login + password) or any(
+            c.isspace() for c in machine + login
+        ):
+            logger.error("apt_auth_entry_omitted_illegal_chars")
             continue
         out.append(f"machine {machine} login {login} password {password}")
         any_entry = True

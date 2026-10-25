@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission
 from app.models.acme_client import (
@@ -226,18 +227,12 @@ async def upsert_account(
     action = "update" if row is not None else "create"
 
     if row is None:
-        # Generate a fresh EC-P256 account key. Done lazily here (not in
-        # the engine) so the encrypted key is durable before any CA
+        # Generate a fresh EC-P256 account key. Done here (not in the
+        # orchestrator) so the encrypted key is durable before any CA
         # round-trip — a re-run of the order reuses the same account.
-        from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
-        from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+        from app.services.acme_client.engine import generate_account_key_pem  # noqa: PLC0415
 
-        account_key = ec.generate_private_key(ec.SECP256R1())
-        account_key_pem = account_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        ).decode("utf-8")
+        account_key_pem = generate_account_key_pem()
         row = ACMEClientAccount(
             directory_url=directory_url,
             email=body.email,
@@ -476,7 +471,7 @@ async def issue_certificate(
     # include list and task_routes so this dispatch can't silently fail).
     from app.tasks.acme import run_acme_order  # noqa: PLC0415
 
-    run_acme_order.delay(str(order.id))
+    await dispatch(run_acme_order, str(order.id))
     logger.info(
         "acme_client_order_enqueued",
         order_id=str(order.id),

@@ -30,13 +30,18 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
@@ -86,6 +91,10 @@ from app.services.upgrades.alerts import (
     RULE_TYPE_CLUSTER_UPGRADE_FAILED as _CLUSTER_UPGRADE_FAILED,
 )
 from app.services.wol_scheduler.verify import seen_since
+
+# Stamped into ``AlertEvent.last_observed_value["resolved_by"]`` by the
+# resolve endpoint (#2498); ``evaluate_all`` honours it.
+MANUAL_RESOLVED_BY = "manual"
 
 logger = structlog.get_logger(__name__)
 
@@ -282,6 +291,19 @@ _AGENT_BUNDLE_STALL = timedelta(minutes=10)
 RULE_TYPE_DNS_RECORD_OP_FAILED = "dns_record_op_failed"
 _DNS_OP_FAILED_WINDOW = timedelta(hours=24)
 
+# Issue #2044 — two live DNS agent processes on ONE server identity (a cloned
+# VM that kept its ``agent_id``, two containers sharing a state dir). The
+# control plane serves only the most recent process and refuses the other's
+# polls with 409 (``services.dns.agent_instance``); without that the two took
+# each record op back from each other until its retries ran out. Refusing
+# stops the damage but not the cause, and the refused agent serves a frozen
+# config forever while heartbeating normally, so it needs an alarm. Subject =
+# the dns_server row (same prefixed id as the other agent rules). Fires while
+# ``agent_instance.duplicate_active`` holds — refusals for over two minutes,
+# the latest in the last ten — and auto-resolves ten minutes after the other
+# process stops polling.
+RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE = "dns_agent_duplicate_instance"
+
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
 # row for a cluster node).
@@ -350,6 +372,33 @@ RULE_TYPE_CLUSTER_DNS_DEGRADED = "cluster_dns_degraded"
 # not a clean bill of health.
 RULE_TYPE_APPLIANCE_STORAGE_DEGRADED = "appliance_storage_degraded"
 
+# Issue #2240: an appliance's ``/var`` data partition filling. Subject =
+# appliance.
+#
+# ``/var`` holds Postgres, the container images and the logs, and every
+# supervisor already reports it (``host_disk_partitions`` inside
+# ``cluster_health``, #402) for the Cluster overview's node cards and the
+# upgrade pre-flight. Nothing alarmed on it: a seven-node cluster loaded
+# towards a million devices filled ``/var`` (23 GiB of a 40 GiB disk) to
+# 88-91% on every node with every alert quiet, a few points short of the
+# kubelet's eviction line.
+#
+# Two levels that deliberately do NOT share a knob, as in ``node_pressure``:
+#   * WARNING at the rule's ``threshold_percent`` (default 80): free space or
+#     grow the data disk while the node is still healthy.
+#   * CRITICAL at a fixed 87%, whatever the threshold says: a few points
+#     BEFORE the kubelet's eviction line, not on it. ``/var`` is ext4 with
+#     the default 5% reserved for root, and the supervisor's ``used`` counts
+#     that reserve as free (``blocks - bfree``), so in those terms the
+#     kubelet's ``nodefs.available<5%`` (``eviction-hard`` in the appliance's
+#     k3s config) and its ``image-gc-high-threshold=95`` both begin at about
+#     89.8% used (the reserve is about 5.2% of the blocks ``statvfs``
+#     counts). The evaluator runs every 60 s on 30 s heartbeats, so a
+#     critical on that line would arrive after the first evictions; at 87% it
+#     pages while there is still room to act. That line is not a tuning
+#     question, so a threshold set above it does not silence it.
+RULE_TYPE_APPLIANCE_DISK_USAGE = "appliance_disk_usage"
+
 
 class AlertDataUnavailable(Exception):
     """A rule could not be evaluated because its input is temporarily gone.
@@ -373,6 +422,28 @@ _NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
 _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
 _APPLIANCE_STORAGE_RULE_NAME = "Appliance storage redundancy degraded"
+_APPLIANCE_DISK_RULE_NAME = "Appliance data partition (/var) filling"
+# The warning threshold when the rule leaves ``threshold_percent`` NULL.
+_APPLIANCE_DISK_USAGE_DEFAULT_PCT = 80
+# Fixed, like ``_NODE_PRESSURE_FULL_CRITICAL_PCT``: a few points before the
+# kubelet's ``nodefs.available<5%``, which begins at about 89.8% of the
+# appliance's ext4 ``/var`` counted the way the supervisor reports ``used``
+# (see ``RULE_TYPE_APPLIANCE_DISK_USAGE``).
+_APPLIANCE_DISK_CRITICAL_PCT = 87
+# A ``/var`` reading older than this says nothing about now. The upgrade
+# pre-flight's own bound (``_NODE_DISK_REPORT_MAX_AGE_SECONDS``, #1234); the
+# supervisor heartbeats every ~30 s.
+_APPLIANCE_DISK_REPORT_MAX_AGE = timedelta(minutes=10)
+
+# Appliance heartbeat silence (#2259). Subject = the appliance. The
+# supervisor heartbeats every ~30 s; the Fleet UI greys its reported-state
+# chips after ~3 missed beats (90 s), but an ALERT waits longer so a normal
+# reboot / slot upgrade (30-120 s of silence) does not page anyone. Fixed
+# rather than operator-tunable, same as the other infrastructure rules.
+RULE_TYPE_APPLIANCE_HEARTBEAT_STALE = "appliance_heartbeat_stale"
+_APPLIANCE_HEARTBEAT_STALE_AFTER = timedelta(minutes=5)
+_APPLIANCE_HEARTBEAT_CRITICAL_AFTER = timedelta(minutes=30)
+_APPLIANCE_HEARTBEAT_RULE_NAME = "Appliance heartbeat lost"
 
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
@@ -647,11 +718,14 @@ RULE_TYPES = frozenset(
         RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
         RULE_TYPE_DNS_RECORD_OP_FAILED,
+        RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+        RULE_TYPE_APPLIANCE_DISK_USAGE,
+        RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -870,6 +944,45 @@ def _include_subnet(subnet: Subnet, settings: PlatformSettings | None) -> bool:
     return prefix <= max_prefix
 
 
+# ── Resolve hysteresis for percentage-threshold rules (#2778) ───────────────
+#
+# A rule that opens at ``pct >= threshold`` and, in the same pass, resolves
+# the moment ``pct < threshold`` re-fires and re-delivers on every crossing of
+# a value that merely hovers at the line (a node GC trimming around 80%).
+# ``evaluate_all`` closes every open event whose subject a pass leaves out,
+# so hysteresis lives in the matcher: a subject that ALREADY has an open
+# event keeps matching until it falls ``_PCT_RESOLVE_MARGIN`` points below
+# the threshold. Opening is unchanged (still at the threshold), and a
+# subject with no open event never gets the margin, so existing rules and
+# existing open events behave as before apart from resolving a little later.
+# Severity needs no hysteresis of its own: ``evaluate_all`` only ever raises
+# an open event's severity, so an open critical stays critical until the event
+# resolves, which happens only below the WARNING threshold minus the margin.
+# A critical that dips under its own line therefore neither de-escalates nor
+# re-delivers.
+_PCT_RESOLVE_MARGIN = 5.0
+
+
+def _pct_resolve_floor(threshold: float) -> float:
+    """The value an open event must fall below to resolve."""
+    return threshold - _PCT_RESOLVE_MARGIN
+
+
+async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
+    """``subject_id`` of every unresolved event of ``rule`` (conformity
+    events excluded, as ``evaluate_all`` ignores them)."""
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+
+    rows = await db.execute(
+        select(AlertEvent.subject_id).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+            AlertEvent.subject_type != "conformity",
+        )
+    )
+    return {r[0] for r in rows.all()}
+
+
 # ── Subject evaluation ─────────────────────────────────────────────────────
 
 
@@ -880,13 +993,17 @@ async def _matching_subnet_subjects(
 ) -> list[tuple[str, str, str]]:
     """Return [(subject_id, display, message), ...] for a subnet_utilization rule."""
     threshold = rule.threshold_percent if rule.threshold_percent is not None else 90
-    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= threshold))
+    open_ids = await _open_subject_ids(db, rule)
+    floor = _pct_resolve_floor(float(threshold))
+    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= floor))
     subnets = list(res.scalars().all())
     matches: list[tuple[str, str, str]] = []
     for s in subnets:
         if not _include_subnet(s, settings):
             continue
         pct = float(s.utilization_percent)
+        if pct < threshold and str(s.id) not in open_ids:
+            continue  # inside the resolve margin, but nothing open to hold (#2778)
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
             f"Subnet {display} utilisation {pct:.1f}% (threshold {threshold}%) — "
@@ -983,13 +1100,18 @@ async def _matching_dhcp_pool_exhaustion_subjects(
 
     # One batched lease query for all pools rather than one per pool (N+1).
     occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+    open_ids = await _open_subject_ids(db, rule)
 
     matches: list[tuple[str, str, str]] = []
     for pool in pools:
         occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
-        over_pct = pct_threshold is not None and occ.percent >= pct_threshold
+        over_pct = pct_threshold is not None and (
+            occ.percent >= pct_threshold
+            # Open event: hold until the margin below the threshold (#2778).
+            or (str(pool.id) in open_ids and occ.percent >= _pct_resolve_floor(pct_threshold))
+        )
         under_free = min_free is not None and occ.free < min_free
         if not (over_pct or under_free):
             continue
@@ -2894,7 +3016,7 @@ async def _evaluate_tls_cert_transition_rule(
         )
         db.add(event)
         await db.flush()
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -3050,7 +3172,7 @@ async def _evaluate_domain_transition_rule(
         )
         db.add(event)
         await db.flush()  # populate event.id for delivery payload
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -3110,8 +3232,11 @@ async def _matching_circuit_term_expiring_subjects(
             threshold_days=threshold_days,
             days_to_expiry=days_to_expiry,
         )
-        if days_to_expiry <= 0:
+        # The end date is inclusive: the term is still running on it.
+        if days_to_expiry < 0:
             descriptor = "term has expired"
+        elif days_to_expiry == 0:
+            descriptor = "term expires today"
         elif days_to_expiry == 1:
             descriptor = "term expires tomorrow"
         else:
@@ -3368,8 +3493,10 @@ async def _tailscale_token_subjects(
     from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
     from app.services.tailscale.client import is_auth_rejected  # noqa: PLC0415
 
-    ps = await db.get(PlatformSettings, 1)
-    if ps is None or not ps.integration_tailscale_enabled:
+    # The module is the integration's switch (#2196), not the derived
+    # ``PlatformSettings`` column — which a module turned on before the
+    # settings row existed never received.
+    if not await feature_modules.is_module_enabled(db, "integrations.tailscale"):
         return []
 
     cutoff = now + timedelta(days=threshold_days)
@@ -3902,6 +4029,48 @@ async def _matching_dns_record_op_failed_subjects(
     return matches
 
 
+async def _matching_dns_agent_duplicate_instance_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_agent_duplicate_instance`` — every DNS server a second live agent
+    process is polling as (#2044). Reads the episode columns the config
+    long-poll writes when it refuses one; no probing."""
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.dns.agent_instance import (  # noqa: PLC0415
+        DUPLICATE_WINDOW,
+        duplicate_active,
+    )
+
+    now = now or datetime.now(UTC)
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(DNSServer.duplicate_agent_last_at >= now - DUPLICATE_WINDOW)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for row in rows:
+        if not duplicate_active(row, now):
+            continue
+        where = f" from {row.duplicate_agent_ip}" if row.duplicate_agent_ip else ""
+        message = (
+            f"Two DNS agent processes are polling as server '{row.name}' at once. "
+            f"Only the most recent one is served; the other{where} is refused and "
+            "keeps answering from its last cached configuration, so record changes "
+            "never reach it. Usually a cloned VM or a copied agent state directory "
+            "that kept the same agent_id: stop the extra agent, or clear its state "
+            "directory so it registers as a server of its own. Auto-resolves ten "
+            "minutes after the other agent stops polling."
+        )
+        matches.append((f"dns_server:{row.id}", f"{row.name} (DNS)", message, None))
+    return matches
+
+
 async def _matching_dnssec_multi_signer_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -4124,6 +4293,71 @@ async def _matching_agent_bundle_render_failed_subjects(
     return matches
 
 
+async def _matching_appliance_heartbeat_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for approved
+    appliances whose supervisor has stopped heartbeating (#2259).
+
+    Every other appliance rule reads the LAST reported state, so a node
+    whose supervisor died keeps looking healthy on every one of them. The
+    only signal that is not itself a last-reported value is the age of
+    ``last_seen_at``. DNS / DHCP roles were covered indirectly by
+    ``server_unreachable``; a control-plane member or observer-only node
+    raised nothing at all.
+
+    Skipped: revoked rows, rows that are not ``approved`` (a pending node
+    has never been expected to heartbeat) and rows with ``last_seen_at IS
+    NULL`` (never heartbeated — an orphan from an aborted pairing, not a
+    node that went silent). The subject id is the appliance UUID (36
+    chars, inside ``alert_event.subject_id``'s VARCHAR(64)). Resolves on
+    its own: the next heartbeat moves ``last_seen_at`` and the node drops
+    out of the match set.
+    """
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+
+    cutoff = now - _APPLIANCE_HEARTBEAT_STALE_AFTER
+    rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.revoked_at.is_(None),
+                    Appliance.last_seen_at.is_not(None),
+                    Appliance.last_seen_at < cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        seen = a.last_seen_at
+        assert seen is not None  # noqa: S101 - filtered above
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        silent = now - seen
+        minutes = int(silent.total_seconds() // 60)
+        sev = "critical" if silent >= _APPLIANCE_HEARTBEAT_CRITICAL_AFTER else "warning"
+        out.append(
+            (
+                str(a.id),
+                a.hostname,
+                f"Appliance {a.hostname} has not heartbeated for {minutes} min "
+                f"(last seen {seen.isoformat()}). Its role and service health "
+                "shown in Fleet is the last report, not current state.",
+                sev,
+            )
+        )
+    return out
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4318,6 +4552,192 @@ async def _matching_appliance_storage_subjects(
     return matches
 
 
+def _var_usage(cluster_health: Any) -> tuple[int, int] | None:
+    """``(used_bytes, total_bytes)`` of a node's ``/var`` from its reported
+    ``host_disk_partitions``, or None when there is no usable reading.
+
+    None means UNKNOWN (key absent, no ``/var`` entry, a non-integer, a
+    boolean, a zero total, a used figure outside ``0..total``), never empty
+    and never full. The upgrade pre-flight's ``_node_var_free_bytes`` reads
+    the same entry with the same type checks, and parts from this only on
+    readings a supervisor never sends (``read_host_disk_partitions`` reports
+    one ``/var``, ``used = blocks - bfree`` of ``total = blocks``): it takes a
+    used figure outside ``0..total`` (one above the total as no free space),
+    and it reads on past a malformed ``/var`` entry to a later one. On every
+    reading a supervisor can send, the two agree about one node.
+    """
+    if not isinstance(cluster_health, dict):
+        return None
+    parts = cluster_health.get("host_disk_partitions")
+    if not isinstance(parts, list):
+        return None
+    for p in parts:
+        if not isinstance(p, dict) or p.get("mount") != "/var":
+            continue
+        total, used = p.get("total_bytes"), p.get("used_bytes")
+        if (
+            isinstance(total, int)
+            and isinstance(used, int)
+            and not isinstance(total, bool)
+            and not isinstance(used, bool)
+            and total > 0
+            and 0 <= used <= total
+        ):
+            return used, total
+        return None
+    return None
+
+
+async def _matching_appliance_disk_usage_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for appliances
+    whose ``/var`` data partition is filling (#2240).
+
+    Reads the ``host_disk_partitions`` the supervisor folds into its
+    ``cluster_health`` (#402), the reading behind the Cluster overview's node
+    cards and the upgrade pre-flight's headroom check. Warning at the rule's
+    ``threshold_percent`` (default :data:`_APPLIANCE_DISK_USAGE_DEFAULT_PCT`),
+    critical at :data:`_APPLIANCE_DISK_CRITICAL_PCT` whatever the threshold
+    (see ``RULE_TYPE_APPLIANCE_DISK_USAGE``).
+
+    Silent where there is no reading: revoked and unapproved rows, and a
+    supervisor that reports no usable ``/var``. A reading that DISAPPEARS, or
+    one older than :data:`_APPLIANCE_DISK_REPORT_MAX_AGE` (the node stopped
+    heartbeating, and its last ``cluster_health`` is all that is left), opens
+    nothing new. If it already has an OPEN event, the appliance is re-matched
+    at that event's severity, which ``evaluate_all`` treats as a no-op (it
+    never downgrades and never re-delivers an unchanged severity), so the
+    event stands until a fresh reading decides: ``evaluate_all`` resolves
+    every subject a pass leaves out, and unknown is not recovered. The same
+    hold ``appliance_storage_degraded`` applies; ``appliance_heartbeat_stale``
+    reports the silence itself.
+    """
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+
+    # ``is not None``, not ``or``: 0 is a legitimate (if loud) threshold that
+    # matches every node reporting ``/var``, and ``or`` would rewrite it to 80.
+    threshold = float(
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _APPLIANCE_DISK_USAGE_DEFAULT_PCT
+    )
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.revoked_at.is_(None),
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    open_severity_by_subject: dict[str, str] = {
+        ev.subject_id: ev.severity
+        for ev in (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+
+    cutoff = now - _APPLIANCE_DISK_REPORT_MAX_AGE
+    matches: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        subject_id = str(a.id)
+        seen = a.last_seen_at
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        fresh = seen is not None and seen >= cutoff
+        usage = _var_usage(a.cluster_health) if fresh else None
+        if usage is None:
+            held = open_severity_by_subject.get(subject_id)
+            if held is None:
+                continue  # no reading: UNKNOWN, not healthy, not an alarm
+            if not fresh:
+                since = seen.isoformat() if seen is not None else "never"
+                why = (
+                    f"The supervisor on {a.hostname} has not reported /var for over "
+                    f"{int(_APPLIANCE_DISK_REPORT_MAX_AGE.total_seconds() // 60)} min "
+                    f"(last heartbeat: {since}), so its last reading says nothing "
+                    "about now."
+                )
+            else:
+                why = (
+                    f"/var on {a.hostname} can no longer be read: the supervisor has "
+                    "stopped reporting its partitions (it may have been rolled back "
+                    "to a slot that predates them)."
+                )
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"{why} The open alert is left standing because unknown is not " "recovered.",
+                    held,
+                )
+            )
+            continue
+        used, total = usage
+        pct = used * 100 / total
+        size = f"{_fmt_bytes(used)} of {_fmt_bytes(total)}"
+        held_sev = open_severity_by_subject.get(subject_id)
+        if pct >= _APPLIANCE_DISK_CRITICAL_PCT:
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or near "
+                    "the kubelet's eviction line: from about 90% used the kubelet "
+                    "is down to its last 5% of free space (ext4 keeps another 5% "
+                    "for root) and evicts pods, the control plane's among them, "
+                    "until space is freed. Free space or grow the data disk now.",
+                    "critical",
+                )
+            )
+        elif pct >= threshold:
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or above "
+                    f"the rule's {threshold:.0f}% threshold. The alert turns critical "
+                    f"at {_APPLIANCE_DISK_CRITICAL_PCT}% used, a few points before the "
+                    "kubelet starts evicting pods (at about 90%); free space or grow "
+                    "the data disk before then.",
+                    "warning",
+                )
+            )
+        elif held_sev is not None and pct >= _pct_resolve_floor(threshold):
+            # Below the line but inside the resolve margin: an open event
+            # stands (at its own severity, which evaluate_all never lowers)
+            # instead of resolving and re-opening as /var hovers (#2778).
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), below the "
+                    f"rule's {threshold:.0f}% threshold but not yet under "
+                    f"{_pct_resolve_floor(threshold):.0f}%; the alert resolves "
+                    "below that.",
+                    held_sev,
+                )
+            )
+    return matches
+
+
 async def _evaluate_circuit_status_changed_rule(
     db: AsyncSession,
     rule: AlertRule,
@@ -4386,10 +4806,23 @@ async def _evaluate_circuit_status_changed_rule(
         if c.status not in _CIRCUIT_STATUS_CHANGE_DESTS:
             continue
 
-        # Skip if there's an open event for this subject — wait for
-        # the auto-resolve cutoff above.
-        if subject_id in open_by_subject:
-            continue
+        # An open event for this subject describes ONE transition. While
+        # it still matches the circuit's current transition there is
+        # nothing new to say; once the circuit has moved again
+        # (suspended → decom) the open event is superseded: resolve it
+        # and fall through to report the current transition (#2747).
+        open_ev = open_by_subject.get(subject_id)
+        if open_ev is not None:
+            open_latched = (
+                open_ev.last_observed_value.get("changed_at")
+                if isinstance(open_ev.last_observed_value, dict)
+                else None
+            )
+            if open_latched is None or open_latched == c.last_status_change_at.isoformat():
+                continue
+            open_ev.resolved_at = now
+            resolved += 1
+            del open_by_subject[subject_id]
 
         # If the most recent event already latched this exact
         # ``last_status_change_at``, we've already fired for it.
@@ -4419,7 +4852,7 @@ async def _evaluate_circuit_status_changed_rule(
         )
         db.add(event)
         await db.flush()
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -4475,8 +4908,11 @@ async def _matching_service_term_expiring_subjects(
             threshold_days=threshold_days,
             days_to_expiry=days_to_expiry,
         )
-        if days_to_expiry <= 0:
+        # The end date is inclusive: the term is still running on it.
+        if days_to_expiry < 0:
             descriptor = "term has expired"
+        elif days_to_expiry == 0:
+            descriptor = "term expires today"
         elif days_to_expiry == 1:
             descriptor = "term expires tomorrow"
         else:
@@ -4826,7 +5262,7 @@ async def _evaluate_compliance_change_rule(
         )
         db.add(event)
         await db.flush()
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -5217,6 +5653,87 @@ async def seed_appliance_storage_alert_rule() -> None:
                     "state. Auto-resolves when redundancy is restored."
                 ),
                 rule_type=RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+                severity="warning",
+                enabled=True,
+            )
+        )
+        await session.commit()
+
+
+async def seed_appliance_disk_usage_alert_rule() -> None:
+    """Seed the #2240 rule, ENABLED by default, warning at 80%.
+
+    Safe on everywhere: it needs no configuration, cannot fire where the
+    reading does not exist (a supervisor that reports no ``/var`` is
+    skipped), and is silent on every node below 80%. Severity is decided by
+    the matcher per node, so the rule's own severity is only the floor.
+
+    Keyed on ``name``, like the other startup-seeded infrastructure rules: an
+    operator who disables or retunes it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _APPLIANCE_DISK_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_APPLIANCE_DISK_RULE_NAME,
+                description=(
+                    "Fires when an appliance's /var data partition (Postgres, "
+                    "container images, logs) fills. Warning at the threshold "
+                    f"({_APPLIANCE_DISK_USAGE_DEFAULT_PCT}% by default); critical at "
+                    f"{_APPLIANCE_DISK_CRITICAL_PCT}% used whatever the threshold, a "
+                    "few points before the kubelet's eviction line: from about 90% "
+                    "used the kubelet is down to its last 5% of free space (ext4 "
+                    "keeps another 5% for root) and evicts pods, the control "
+                    "plane's among them. Silent on supervisors that do not report "
+                    "/var; a reading that stops arriving holds an open alert rather "
+                    "than resolving it. Auto-resolves when usage drops below the "
+                    "threshold."
+                ),
+                rule_type=RULE_TYPE_APPLIANCE_DISK_USAGE,
+                severity="warning",
+                enabled=True,
+                threshold_percent=_APPLIANCE_DISK_USAGE_DEFAULT_PCT,
+            )
+        )
+        await session.commit()
+
+
+async def seed_appliance_heartbeat_alert_rule() -> None:
+    """Seed the #2259 rule, ENABLED by default.
+
+    Needs no configuration and cannot false-fire on an install with no
+    appliances (Compose / plain k8s have none). Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _APPLIANCE_HEARTBEAT_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_APPLIANCE_HEARTBEAT_RULE_NAME,
+                description=(
+                    "Fires when an approved appliance's supervisor has not "
+                    "heartbeated for 5 minutes (critical after 30). Fleet shows "
+                    "each node's LAST reported role and service health, so a "
+                    "node whose supervisor died keeps looking healthy; this is "
+                    "the alarm for the silence itself, and covers control-plane "
+                    "and observer-only nodes that no DNS/DHCP reachability rule "
+                    "watches. Auto-resolves when heartbeats resume."
+                ),
+                rule_type=RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
                 severity="warning",
                 enabled=True,
             )
@@ -6230,6 +6747,211 @@ async def _deliver(
     return delivered_syslog, delivered_webhook, delivered_smtp
 
 
+# ── Deferred delivery (#2261) ──────────────────────────────────────────────
+#
+# A page that goes out for an event the database never stored is the worst
+# outcome this module can produce: the operator is paged for something that
+# does not exist under /alerts, and because nothing was stored the next pass
+# finds no open event and pages again — every 60 s, and up to four times per
+# tick once Celery's autoretry joins in. So inside an evaluator pass an event
+# is never delivered before the transaction that opened it has COMMITTED.
+#
+# The openers below (``evaluate_all`` and its transition-rule helpers, the
+# conformity engine) call :func:`_deliver_or_defer`. Under
+# :func:`defer_deliveries` that only queues the event; the caller commits, then
+# hands the queue to :func:`deliver_deferred`. Called outside that context it
+# delivers immediately, which is what a direct caller of a helper gets.
+#
+# Queuing stamps ``delivery_pending_since`` on the event, so the stamp is
+# committed with it. A sender CLAIMS the event before sending — a conditional
+# UPDATE clearing the stamp, committed — so exactly one sender ever sends a
+# given queued delivery. A worker killed between the pass's commit and the
+# claim leaves the stamp set; :func:`redeliver_stranded`, run at the end of
+# every pass, claims and sends any stamp older than
+# ``_REDELIVER_AFTER``. The result is effectively-once: the only window that
+# loses a page is between a claim's commit and the send it precedes (no I/O in
+# between), and nothing ever sends the same queued delivery twice.
+
+_DEFERRED_DELIVERIES: ContextVar[list[tuple[AlertRule, AlertEvent]] | None] = ContextVar(
+    "alert_deferred_deliveries", default=None
+)
+
+
+@contextmanager
+def defer_deliveries() -> Iterator[list[tuple[AlertRule, AlertEvent]]]:
+    """Queue every delivery made inside the block instead of sending it.
+
+    Yields the queue. The caller commits the events, then passes the queue
+    to :func:`deliver_deferred`. Nested blocks each get their own queue, so a
+    caller can drop the queue of a unit of work it rolled back.
+    """
+    pending: list[tuple[AlertRule, AlertEvent]] = []
+    token = _DEFERRED_DELIVERIES.set(pending)
+    try:
+        yield pending
+    finally:
+        _DEFERRED_DELIVERIES.reset(token)
+
+
+async def _deliver_or_defer(
+    rule: AlertRule,
+    event: AlertEvent,
+    targets: list[dict[str, Any]],
+) -> tuple[bool, bool, bool]:
+    """:func:`_deliver`, or queue it when inside :func:`defer_deliveries`.
+
+    A queued event reports no receipts yet; :func:`deliver_deferred` ORs the
+    real ones in after the commit. Queuing stamps ``delivery_pending_since``
+    (committed with the event) so a delivery the worker never got to is found
+    by :func:`redeliver_stranded`.
+    """
+    pending = _DEFERRED_DELIVERIES.get()
+    if pending is None:
+        return await _deliver(rule, event, targets)
+    event.delivery_pending_since = datetime.now(UTC)
+    pending.append((rule, event))
+    return False, False, False
+
+
+# A queued delivery still unclaimed this long after it was queued is taken to
+# be stranded. Far longer than any pass's own delivery loop should take, so a
+# slow pass is not raced by the next one's sweep; and the claim makes that
+# race harmless anyway — only one of them can send.
+_REDELIVER_AFTER = timedelta(minutes=10)
+# Upper bound on stranded events re-sent per pass.
+_REDELIVER_BATCH = 200
+
+
+async def _claim_delivery(db: AsyncSession, event_id: uuid.UUID) -> bool:
+    """Atomically take the right to send a queued delivery, and commit it.
+
+    True when this caller cleared ``delivery_pending_since``; False when it
+    was already NULL (another sender claimed it). Committing BEFORE the send
+    is what makes a delivery at-most-once per queuing.
+    """
+    claimed = (
+        await db.execute(
+            update(AlertEvent)
+            .where(AlertEvent.id == event_id, AlertEvent.delivery_pending_since.is_not(None))
+            .values(delivery_pending_since=None)
+            .returning(AlertEvent.id)
+            .execution_options(synchronize_session=False)
+        )
+    ).scalar_one_or_none()
+    await db.commit()
+    return claimed is not None
+
+
+async def _send_claimed(
+    db: AsyncSession,
+    pending: list[tuple[AlertRule, AlertEvent]],
+    targets: list[dict[str, Any]],
+) -> tuple[int, int, int]:
+    """Claim, send and record each event in turn; one commit per step.
+
+    Per-event commits keep the window in which a concurrent sweep could see an
+    unclaimed stamp down to one event, and keep a failed commit from losing
+    the receipts of events already sent. A failed commit stops the loop: a
+    rollback expires every loaded object, and the events not yet claimed keep
+    their stamp, so the sweep sends them later.
+    """
+    syslog = webhook = smtp = 0
+    for rule, event in pending:
+        try:
+            if not sa_inspect(event).persistent:
+                continue
+            set_committed_value(event, "delivery_pending_since", None)
+            if not await _claim_delivery(db, event.id):
+                continue
+            ds, dw, dm = await _deliver(rule, event, targets)
+            # OR-in: an escalation re-delivery must not clear a receipt the
+            # opening delivery set.
+            event.delivered_syslog = event.delivered_syslog or ds
+            event.delivered_webhook = event.delivered_webhook or dw
+            event.delivered_smtp = event.delivered_smtp or dm
+            syslog += int(ds)
+            webhook += int(dw)
+            smtp += int(dm)
+            await db.commit()
+        except SQLAlchemyError as exc:
+            logger.warning("alert_delivery_receipts_not_stored", error=str(exc))
+            await db.rollback()
+            break
+    return syslog, webhook, smtp
+
+
+async def deliver_deferred(
+    db: AsyncSession,
+    pending: list[tuple[AlertRule, AlertEvent]],
+    targets: list[dict[str, Any]] | None = None,
+) -> tuple[int, int, int]:
+    """Deliver queued events that are now stored, and commit their receipts.
+
+    Call only after the transaction that opened the events has committed.
+    An event that is not persistent (its insert was rolled back) is skipped:
+    delivering it is exactly the page-for-nothing this exists to prevent. Each
+    event is claimed before it is sent, so an event a stranded-delivery sweep
+    already took is not sent twice.
+
+    Returns ``(syslog, webhook, smtp)`` delivery counts. A failed commit is
+    logged, not raised: the events are already stored, the unsent ones keep
+    their stamp for :func:`redeliver_stranded`, and raising would only hand
+    the pass to Celery's autoretry for nothing.
+    """
+    if not pending:
+        return 0, 0, 0
+    if targets is None:
+        targets = await audit_forward._load_targets()  # noqa: SLF001
+    return await _send_claimed(db, pending, targets)
+
+
+async def redeliver_stranded(
+    db: AsyncSession,
+    targets: list[dict[str, Any]] | None = None,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, int, int]:
+    """Send queued deliveries a dead worker never got to (#2261).
+
+    Picks events whose ``delivery_pending_since`` is older than
+    ``_REDELIVER_AFTER`` and sends each through the same claim as
+    :func:`deliver_deferred`, so it can never double-send with a pass that is
+    merely slow. An event that has since resolved, or whose rule is now
+    disabled, is claimed and dropped rather than paged: the condition it
+    reported is over, or the operator turned the rule off. Idempotent — a
+    second call finds nothing left to claim.
+    """
+    cutoff = (now or datetime.now(UTC)) - _REDELIVER_AFTER
+    rows = (
+        await db.execute(
+            select(AlertEvent, AlertRule)
+            .join(AlertRule, AlertRule.id == AlertEvent.rule_id)
+            .where(
+                AlertEvent.delivery_pending_since.is_not(None),
+                AlertEvent.delivery_pending_since < cutoff,
+            )
+            .order_by(AlertEvent.delivery_pending_since)
+            .limit(_REDELIVER_BATCH)
+        )
+    ).all()
+    if not rows:
+        await db.commit()
+        return 0, 0, 0
+    send: list[tuple[AlertRule, AlertEvent]] = []
+    for event, rule in rows:
+        if event.resolved_at is not None or not rule.enabled:
+            await _claim_delivery(db, event.id)
+            set_committed_value(event, "delivery_pending_since", None)
+            continue
+        send.append((rule, event))
+    logger.warning("alert_redelivering_stranded", count=len(send), dropped=len(rows) - len(send))
+    if not send:
+        return 0, 0, 0
+    if targets is None:
+        targets = await audit_forward._load_targets()  # noqa: SLF001
+    return await _send_claimed(db, send, targets)
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 
@@ -6693,6 +7415,12 @@ _RULE_TYPE_MODULE: dict[str, str] = {
 }
 
 
+# #2261 — ``pg_try_advisory_xact_lock`` key serialising evaluator passes
+# across beat ticks, autoretries, worker replicas and the API's "evaluate
+# now". Transaction-scoped, so a killed pass cannot strand it.
+_EVALUATE_LOCK_KEY = 0x53504D414C52  # "SPMALR"
+
+
 def rule_type_module(rule_type: str) -> str | None:
     """The feature module a rule type is gated on, or None when un-gated."""
     return _RULE_TYPE_MODULE.get(rule_type)
@@ -6705,7 +7433,37 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     resolved, delivered_syslog, delivered_webhook. Per-rule failures are
     logged but don't abort the pass — one broken rule shouldn't silence
     the rest.
+
+    #2261 — three properties make a pass safe to fail, retry and overlap:
+
+    * Each rule runs in its own SAVEPOINT. A matcher that raises a DB error
+      (or hits ``command_timeout``) rolls back only its own rule; without the
+      savepoint the PostgreSQL transaction was aborted, every later rule
+      failed too, and the final commit discarded the whole pass.
+    * Nothing is delivered until the events are committed (see
+      :func:`deliver_deferred`). A pass that fails before its commit has sent
+      nothing, so Celery's autoretry cannot re-page; a pass that fails after
+      it left the events stored and open, so the retry finds them and does not
+      re-open them.
+    * Passes are serialised by a transaction-scoped advisory lock. A pass that
+      cannot take it returns immediately with zero counts — the pass holding
+      it is doing the same work. The lock ends at the commit, before delivery,
+      which is safe: by then the events are stored, so a pass starting during
+      delivery sees them as already open.
     """
+    got_lock = (
+        await db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _EVALUATE_LOCK_KEY})
+    ).scalar()
+    if not got_lock:
+        logger.info("alert_evaluate_skipped_locked")
+        return {
+            "opened": 0,
+            "resolved": 0,
+            "delivered_syslog": 0,
+            "delivered_webhook": 0,
+            "delivered_smtp": 0,
+        }
+
     settings = await db.get(PlatformSettings, 1)
     targets = await audit_forward._load_targets()  # noqa: SLF001
 
@@ -6726,7 +7484,24 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     # #1068 — resolved once per pass, not per rule (it is a cached read, but
     # the loop can be long and the answer cannot change mid-pass).
     enabled_modules = await feature_modules.get_enabled_modules(db)
+    # Deliveries queued by rules whose savepoint was released. A rule that
+    # failed drops its queue: its events were rolled back with it.
+    pending: list[tuple[AlertRule, AlertEvent]] = []
     for rule in rules:
+        # #2261 — one SAVEPOINT and one delivery queue per rule. Managed by
+        # hand rather than with ``async with`` because the dispatch below
+        # ``continue``s out of several branches; the ``finally`` sees every
+        # exit, a clean one included.
+        rule_failed = False
+        counts_before = (opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp)
+        rule_queue: list[tuple[AlertRule, AlertEvent]] = []
+        # Read before the savepoint, for the failure logs: a flush that fails
+        # rolls the savepoint back and expires whatever it touched, the rule
+        # included, and an expired attribute cannot be lazy-loaded while the
+        # session still needs that rollback.
+        rule_ref, rule_type = str(rule.id), rule.rule_type
+        queue_token = _DEFERRED_DELIVERIES.set(rule_queue)
+        savepoint = await db.begin_nested()
         try:
             # Each match tuple is (subject_id, display, message,
             # severity_override). Threshold-style rules pass
@@ -6948,6 +7723,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in op_failed]
                 # Same prefixed subject as the other agent rules.
                 subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE:
+                duplicates = await _matching_dns_agent_duplicate_instance_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in duplicates]
+                # Same prefixed subject as the other agent rules.
+                subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED:
                 unrendered = await _matching_agent_bundle_render_failed_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in unrendered]
@@ -6957,6 +7737,14 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in storage_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_DISK_USAGE:
+                disk_hits = await _matching_appliance_disk_usage_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in disk_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_HEARTBEAT_STALE:
+                silent_nodes = await _matching_appliance_heartbeat_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in silent_nodes]
                 subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
@@ -7092,9 +7880,41 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             match_ids = {sid for sid, _, _, _ in matches}
 
+            # #2498 — a manually resolved event for a subject that still
+            # matches stays resolved, like the conformity engine's. The
+            # suppression ends when the subject next stops matching (marked
+            # here), so a later re-match opens a fresh event.
+            manually_resolved = list(
+                (
+                    await db.execute(
+                        select(AlertEvent).where(
+                            AlertEvent.rule_id == rule.id,
+                            AlertEvent.resolved_at.is_not(None),
+                            AlertEvent.last_observed_value["resolved_by"].astext
+                            == MANUAL_RESOLVED_BY,
+                            AlertEvent.last_observed_value["manual_cleared"].astext.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            suppressed_ids: set[str] = set()
+            for mev in manually_resolved:
+                if mev.subject_id in match_ids:
+                    suppressed_ids.add(mev.subject_id)
+                else:
+                    # Reassign, not mutate: JSONB isn't change-tracked in place.
+                    mev.last_observed_value = {
+                        **(mev.last_observed_value or {}),
+                        "manual_cleared": True,
+                    }
+
             # Open new events for unseen matches; escalate existing ones.
             for subject_id, display, message, severity_override in matches:
                 existing = open_by_subject.get(subject_id)
+                if existing is None and subject_id in suppressed_ids:
+                    continue
                 if existing is not None:
                     # Subject is already open. For the *_expiring rule
                     # family the matcher recomputes a per-row severity
@@ -7110,7 +7930,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         existing.message = message
-                        ds, dw, dm = await _deliver(rule, existing, targets)
+                        ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
                         # stay flagged even if a later escalation skips it.
                         existing.delivered_syslog = existing.delivered_syslog or ds
@@ -7134,7 +7954,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 )
                 db.add(event)
                 await db.flush()  # populate event.id for delivery payload
-                ds, dw, dm = await _deliver(rule, event, targets)
+                ds, dw, dm = await _deliver_or_defer(rule, event, targets)
                 event.delivered_syslog = ds
                 event.delivered_webhook = dw
                 event.delivered_smtp = dm
@@ -7145,6 +7965,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     delivered_webhook += 1
                 if dm:
                     delivered_smtp += 1
+                # A matcher that lists one subject twice must not open it
+                # twice — the open-event index is unique (#2261), so the
+                # second insert would fail the whole rule.
+                open_by_subject[subject_id] = event
 
             # Resolve open events whose subject no longer matches.
             for subject_id, event in open_by_subject.items():
@@ -7157,25 +7981,70 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             # "no matches": open events stay open, nothing new opens, and the
             # next tick with real data decides. Logged at info because during
             # a genuine outage this fires every 60 s.
+            rule_failed = True
             logger.info(
                 "alert_rule_eval_skipped_no_data",
-                rule=str(rule.id),
-                rule_type=rule.rule_type,
+                rule=rule_ref,
+                rule_type=rule_type,
                 reason=str(exc),
             )
         except Exception as exc:  # noqa: BLE001
+            rule_failed = True
             logger.exception(
                 "alert_rule_eval_failed",
-                rule=str(rule.id),
-                rule_type=rule.rule_type,
+                rule=rule_ref,
+                rule_type=rule_type,
                 error=str(exc),
             )
+        finally:
+            _DEFERRED_DELIVERIES.reset(queue_token)
+            if not rule_failed:
+                try:
+                    # Flushes whatever the rule left pending (resolves,
+                    # escalations), so a flush error lands here, on this
+                    # rule, rather than on the commit for the whole pass.
+                    await savepoint.commit()
+                except Exception as exc:  # noqa: BLE001
+                    rule_failed = True
+                    logger.exception(
+                        "alert_rule_eval_failed",
+                        rule=rule_ref,
+                        rule_type=rule_type,
+                        error=str(exc),
+                    )
+                else:
+                    pending.extend(rule_queue)
+            if rule_failed:
+                # Its opens / resolves were rolled back; so are its counts.
+                opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp = (
+                    counts_before
+                )
+                # Unconditionally, not ``if savepoint.is_active``: a flush that
+                # fails inside ``savepoint.commit()`` has already rolled back
+                # to the SAVEPOINT and left the transaction DEACTIVE
+                # (``is_active`` False) but still the session's current one.
+                # Only ``rollback()`` closes it; skipping it left the session
+                # needing a rollback, so the next rule's ``begin_nested()``
+                # raised PendingRollbackError out of the pass.
+                await savepoint.rollback()
 
     await db.commit()
+    # Only now, with every event stored, does anything leave the building.
+    ds_n, dw_n, dm_n = await deliver_deferred(db, pending, targets)
+    # Then whatever an earlier pass queued and died before sending. After
+    # this pass's own deliveries, so a delivery it just made is never stale.
+    try:
+        rs, rw, rm = await redeliver_stranded(db, targets, now=now)
+    except SQLAlchemyError as exc:
+        # The pass itself is committed; the stamps survive for the next one.
+        logger.warning("alert_redeliver_stranded_failed", error=str(exc))
+        await db.rollback()
+        rs = rw = rm = 0
+    ds_n, dw_n, dm_n = ds_n + rs, dw_n + rw, dm_n + rm
     return {
         "opened": opened,
         "resolved": resolved,
-        "delivered_syslog": delivered_syslog,
-        "delivered_webhook": delivered_webhook,
-        "delivered_smtp": delivered_smtp,
+        "delivered_syslog": delivered_syslog + ds_n,
+        "delivered_webhook": delivered_webhook + dw_n,
+        "delivered_smtp": delivered_smtp + dm_n,
     }

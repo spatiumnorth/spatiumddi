@@ -17,7 +17,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -29,6 +30,7 @@ from app.models.fortinet import FortinetFirewall
 from app.models.ipam import IPSpace, Subnet
 from app.models.panos import FirewallObject
 from app.services.fortinet.client import FortinetClient, FortinetClientError
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["fortinet"],
@@ -347,6 +349,11 @@ async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     if f is None:
         raise HTTPException(status_code=404, detail="Fortinet firewall not found")
     _audit(db, user=user, action="delete", firewall_id=f.id, firewall_name=f.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="fortinet_firewall_id", target_id=f.id, user=user, target_name=f.name
+    )
     await db.delete(f)
     await db.commit()
 
@@ -356,15 +363,25 @@ async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     status_code=status.HTTP_202_ACCEPTED,
     response_model=StatusResponse,
 )
-async def sync_firewall(firewall_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     f = await db.get(FortinetFirewall, firewall_id)
     if f is None:
         raise HTTPException(status_code=404, detail="Fortinet firewall not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="fortinet_firewall",
+        resource_id=f.id,
+        resource_display=str(getattr(f, "name", None) or f.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.fortinet_sync import sync_firewall_now  # noqa: PLC0415
 
     try:
-        result = sync_firewall_now.delay(str(f.id))
+        result = await dispatch(sync_firewall_now, str(f.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

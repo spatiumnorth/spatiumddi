@@ -90,8 +90,11 @@ rules:
     # #590/#272 Phase 9 — the dead-node evict reclaims Redis PVCs the
     # deleted node stranded (node-affine local-path PVs), then deletes
     # the Pending consumer pod so the StatefulSet recreates both on a
-    # live node (k8s_api.reclaim_stranded_redis_storage, run from the
-    # seed's heartbeat right after delete_node). Without the reclaim the
+    # live node (k8s_api.reclaim_stranded_redis_storage, run from every
+    # seed heartbeat since #2404: the names delete_node just evicted at
+    # once, and any claim pinned to a node that is no longer a Node while
+    # a Redis pod is Pending, found with the pod list above, the node
+    # list and the PV read granted below). Without the reclaim the
     # missing replica's sentinel silently halves the failover quorum and
     # the next node loss strands the Redis master for good. delete on
     # pods+PVCs (and create on PVCs, #1541) — everything else in this
@@ -105,6 +108,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
+    # #2190/#2403 — the role-label gate reads each role DaemonSet's pod
+    # template (k8s_api.daemonset_template_env) to hold a node's role label
+    # until the template carries the node's assigned group. Without this a
+    # read is a 403, which the gate (by design) does not treat as a hold, so
+    # an engine+group switch briefly ran an old-template pod in the old group.
+    # Read-only.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -142,6 +154,15 @@ metadata:
 rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]
+    verbs: ["get", "patch"]
+    # #2240, ensure_cnpg_operator_spread: from three nodes the seed's
+    # heartbeat makes the operator's hostname anti-affinity REQUIRED, so its
+    # two replicas (Postgres failover itself) never share a node; firstboot
+    # starts both on the seed while it is alone. resourceNames-pinned to the
+    # operator Deployment the spatium-bootstrap release renders.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["spatium-bootstrap-cloudnative-pg"]
     verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -205,9 +226,10 @@ rules:
     verbs: ["get", "list", "watch"]
     # #590 / #750 — ensure_coredns_ha: the seed's heartbeat matches the
     # k3s-bundled CoreDNS to the cluster's node count. Two or more nodes get
-    # 2 replicas + fast-evict tolerations + required anti-affinity (k3s resets
-    # it to a single 300s-toleration replica on every restart; a single
-    # replica deterministically sits on the seed, so a hard seed kill silences
+    # one replica per node (#1718; it was 2) + required anti-affinity, with
+    # k3s's own tolerations (#1753; k3s resets it to a single 300s-toleration
+    # replica on every restart; a single replica deterministically sits on
+    # the seed, so a hard seed kill silences
     # all Service/pod-FQDN resolution — api readiness's Postgres + Redis
     # lookups included — for 5 minutes). A single-node box is held at the
     # stock shape instead, because the HA pod template cannot schedule there
@@ -217,6 +239,15 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["coredns"]
+    verbs: ["get", "patch"]
+    # #1718 — ensure_kube_dns_node_local: on two or more nodes the seed's
+    # heartbeat sets the kube-dns Service's trafficDistribution to
+    # PreferSameNode, so every node resolves through its own CoreDNS replica
+    # and a lost node's replica stalls no one else's lookups. resourceNames-
+    # pinned to kube-dns.
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["kube-dns"]
     verbs: ["get", "patch"]
     # #1058 — the dead-node evict reclaims the CloudNativePG instance claim
     # the deleted node stranded (k8s_api.reclaim_stranded_postgres_storage,

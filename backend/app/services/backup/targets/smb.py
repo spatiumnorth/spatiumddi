@@ -45,10 +45,13 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
+    read_capped,
     safe_filename,
 )
 
@@ -169,7 +172,7 @@ class SmbDestination(BackupDestination):
         try:
             register_session(server, **kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise BackupDestinationError(f"SMB connect failed: {exc}") from exc
+            raise BackupDestinationError(f"SMB connect failed: {describe_exc(exc)}") from exc
         return server
 
     async def write(
@@ -209,7 +212,7 @@ class SmbDestination(BackupDestination):
                         path=tmp,
                         error=str(cleanup_exc),
                     )
-                raise BackupDestinationError(f"SMB write failed: {exc}") from exc
+                raise BackupDestinationError(f"SMB write failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 
@@ -236,13 +239,15 @@ class SmbDestination(BackupDestination):
             except FileNotFoundError as exc:
                 raise BackupDestinationError(f"SMB path {root!r} not found") from exc
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"SMB scandir failed: {exc}") from exc
+                raise BackupDestinationError(f"SMB scandir failed: {describe_exc(exc)}") from exc
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         target = _unc(config, filename)
 
         def _do() -> bytes:
@@ -251,13 +256,17 @@ class SmbDestination(BackupDestination):
             self._register(config)
             try:
                 with open_file(target, mode="rb") as fh:
-                    return fh.read()
+                    return read_capped(
+                        fh.read, filename=safe_filename(filename), max_bytes=max_bytes
+                    )
+            except ArchiveTooLargeError:
+                raise
             except FileNotFoundError as exc:
                 raise BackupDestinationError(
                     f"archive {safe_filename(filename)!r} not found at {target}"
                 ) from exc
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"SMB read failed: {exc}") from exc
+                raise BackupDestinationError(f"SMB read failed: {describe_exc(exc)}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -273,7 +282,7 @@ class SmbDestination(BackupDestination):
             except FileNotFoundError:
                 return  # idempotent
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"SMB delete failed: {exc}") from exc
+                raise BackupDestinationError(f"SMB delete failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 

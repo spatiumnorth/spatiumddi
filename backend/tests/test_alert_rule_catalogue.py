@@ -21,7 +21,8 @@ from app.services.alert_rule_catalogue import (
 
 
 def test_catalogue_covers_every_rule_type_and_nothing_else() -> None:
-    names = [s.rule_type for s in build_catalogue()]
+    # System-driven types (#2748) are described but not creatable.
+    names = [s.rule_type for s in build_catalogue() if not s.system_driven]
     assert len(names) == len(set(names)), "a rule type is listed twice"
     assert sorted(alerts.RULE_TYPES - set(names)) == []
     assert sorted(set(names) - alerts.RULE_TYPES) == []
@@ -153,7 +154,7 @@ def test_declared_params_match_what_each_evaluator_reads() -> None:
     for spec in build_catalogue():
         declared = {p.name for p in spec.params}
         assert declared <= set(PARAM_COLUMNS), spec.rule_type
-        if spec.rule_type in _EXTERNALLY_DRIVEN:
+        if spec.rule_type in _EXTERNALLY_DRIVEN or spec.system_driven:
             continue  # no dispatch branch; covered by the test above
         if declared != reads[spec.rule_type]:
             problems.append(
@@ -181,7 +182,7 @@ async def test_endpoint_serves_the_catalogue_to_any_signed_in_user(client, db_se
     import uuid
 
     from app.core.security import create_access_token, hash_password
-    from app.models.auth import User
+    from app.models.auth import Group, Role, User
 
     u = User(
         username=f"u-{uuid.uuid4().hex[:6]}",
@@ -191,6 +192,19 @@ async def test_endpoint_serves_the_catalogue_to_any_signed_in_user(client, db_se
         is_superadmin=False,
     )
     db_session.add(u)
+    await db_session.flush()
+    # The alert routes are gated on ``read:alert`` now.
+    role = Role(
+        name=f"r-{uuid.uuid4().hex[:6]}",
+        description="",
+        permissions=[{"action": "read", "resource_type": "alert"}],
+    )
+    db_session.add(role)
+    await db_session.flush()
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    group.users = [u]
+    db_session.add(group)
     await db_session.commit()
     tok = create_access_token(str(u.id))
 
@@ -198,7 +212,7 @@ async def test_endpoint_serves_the_catalogue_to_any_signed_in_user(client, db_se
     resp = await client.get("/api/v1/alerts/rule-types", headers={"Authorization": f"Bearer {tok}"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert {r["rule_type"] for r in body} == set(alerts.RULE_TYPES)
+    assert {r["rule_type"] for r in body if not r["system_driven"]} == set(alerts.RULE_TYPES)
     row = next(r for r in body if r["rule_type"] == "ip_free_but_responding")
     assert row["params"][0]["name"] == "threshold_days"
     assert row["params"][0]["default"] == 1

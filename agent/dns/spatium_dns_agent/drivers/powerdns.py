@@ -33,6 +33,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -390,6 +391,31 @@ DNSDIST_STATE_MOUNT = os.environ.get("DNSDIST_STATE_MOUNT", "/agent-state")
 TLS_DIR_NAME = "tls"
 TLS_CERT_FILENAME = "listener.crt"
 TLS_KEY_FILENAME = "listener.key"
+
+
+def _ipv6_available() -> bool:
+    """True when this host/container can open an AF_INET6 socket.
+
+    Distinct from "has an IPv6 address": ``net.ipv6.conf.*.disable_ipv6=1``
+    still lets pdns bind ``::`` (verified), but a kernel booted with
+    ``ipv6.disable=1`` has no AF_INET6 at all, and pdns then dies with
+    ``Unable to acquire TCP socket`` on a ``::`` entry. BIND skips such a
+    listener and carries on; this is the same tolerance.
+    """
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
+    except OSError:
+        return False
+    return True
+
+
+def _pdns_local_address() -> str:
+    """``local-address`` for pdns.conf: both families where the host has IPv6.
+
+    Setting the option replaces pdns's own default (which includes ``::``),
+    so IPv4 only has to be undone explicitly (#2307).
+    """
+    return "0.0.0.0, ::" if _ipv6_available() else "0.0.0.0"
 
 
 def _dnsdist_cert_paths() -> tuple[str, str]:
@@ -1284,6 +1310,20 @@ class PowerDNSDriver(DriverBase):
                     "PowerDNS authoritative cannot restrict which clients "
                     "may query it; the server allow-query is not applied "
                     "on this group."
+                ),
+            )
+
+        # Group blackhole (#2263): BIND9-only. The API refuses to set it on a
+        # group with a PowerDNS server; a value stored before that (or a
+        # server joining a group that holds one) is said out loud here.
+        blackhole = [str(a).strip() for a in (opts.get("blackhole") or []) if str(a).strip()]
+        if blackhole:
+            log.warning(
+                "powerdns_blackhole_unsupported",
+                blackhole=blackhole,
+                hint=(
+                    "PowerDNS authoritative cannot drop queries by client "
+                    "address; the group blackhole is not applied on this group."
                 ),
             )
 
@@ -2334,7 +2374,7 @@ class PowerDNSDriver(DriverBase):
                 # is a SEPARATE container that forwards to this :53 over the
                 # network — pdns never moves port, so there's no restart race
                 # and toggling the front is decoupled from pdns's lifecycle.
-                "local-address=0.0.0.0",
+                f"local-address={_pdns_local_address()}",
                 "local-port=53",
                 "",
                 "api=yes",

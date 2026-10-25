@@ -25,7 +25,6 @@ from tests.test_builtin_roles_match_routes import _dependency_calls, _iter_route
 _AGENT = "agent endpoint, authenticated by the agent's own JWT and mounted outside the user gates"
 _PUBLIC = "reachable before sign-in by design"
 _SELF = "returns only the caller's own rows"
-_INLINE_SUPERADMIN = "handler checks superadmin itself"
 
 NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── public / pre-sign-in ────────────────────────────────────────────
@@ -88,7 +87,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/dhcp/option-codes": "static RFC option-code catalogue, no install data",
     "/api/v1/dhcp/voip-options": "static VoIP vendor option catalogue, no install data",
     "/api/v1/webhooks/event-types": "static event-type catalogue",
-    "/api/v1/alerts/rule-types": "static rule-type catalogue",
     "/api/v1/search/types": "the searchable type list; filtered to the caller's grants",
     # ── platform-wide reads open to every signed-in user by design ──────
     "/api/v1/settings": "platform settings the UI shell reads on every screen",
@@ -96,9 +94,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/settings/resolver": "slice of GET /settings",
     "/api/v1/settings/oui/status": "OUI database status, no install data",
     "/api/v1/settings/oui/refresh/{task_id}": "status of an OUI refresh task",
-    "/api/v1/alerts/rules": "alert rules are readable by every signed-in user; writes are superadmin",
-    "/api/v1/alerts/rules/{rule_id}": "as /alerts/rules",
-    "/api/v1/alerts/events": "alert events are readable by every signed-in user, as the bell icon",
     "/api/v1/groups": "group pickers (auth providers, groups page); writes need admin on group",
     "/api/v1/groups/{group_id}": "as /groups",
     "/api/v1/roles": "role picker on the groups page; writes need admin on role",
@@ -129,24 +124,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/appliance/firewall/policies": "checked in the handler (_require_read)",
     "/api/v1/appliance/firewall/policies/{policy_id}": "checked in the handler (_require_read)",
     "/api/v1/appliance/firewall/web-ui-access": "checked in the handler (_require_read)",
-    "/api/v1/appliance/appliances/{appliance_id}/removable": _INLINE_SUPERADMIN,
-    "/api/v1/backup/drills": _INLINE_SUPERADMIN,
-    "/api/v1/backup/drills/readiness": _INLINE_SUPERADMIN,
-    "/api/v1/backup/drills/{drill_id}": _INLINE_SUPERADMIN,
-    "/api/v1/backup/sections": _INLINE_SUPERADMIN,
-    "/api/v1/backup/targets": _INLINE_SUPERADMIN,
-    "/api/v1/backup/targets/kinds": _INLINE_SUPERADMIN,
-    "/api/v1/backup/targets/{target_id}": _INLINE_SUPERADMIN,
-    "/api/v1/backup/targets/{target_id}/archives": _INLINE_SUPERADMIN,
-    "/api/v1/backup/targets/{target_id}/archives/latest/download": _INLINE_SUPERADMIN,
-    "/api/v1/backup/targets/{target_id}/archives/{filename}/download": _INLINE_SUPERADMIN,
-    "/api/v1/diagnostics/errors": _INLINE_SUPERADMIN,
-    "/api/v1/diagnostics/errors/stats": _INLINE_SUPERADMIN,
-    "/api/v1/diagnostics/errors/{error_id}": _INLINE_SUPERADMIN,
-    "/api/v1/diagnostics/name-conformance": _INLINE_SUPERADMIN,
-    "/api/v1/settings/audit-forward-targets": _INLINE_SUPERADMIN,
-    "/api/v1/settings/influxdb-targets": _INLINE_SUPERADMIN,
-    "/api/v1/system/factory-reset/sections": _INLINE_SUPERADMIN,
 }
 
 

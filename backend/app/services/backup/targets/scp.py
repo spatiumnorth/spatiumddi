@@ -59,10 +59,14 @@ import structlog
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveTooLargeError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    check_size,
+    describe_exc,
+    read_capped,
     safe_filename,
 )
 
@@ -136,6 +140,7 @@ class ScpDestination(BackupDestination):
             name="private_key",
             label="Private key (PEM)",
             type="password",
+            multiline=True,
             required=False,
             secret=True,
             description=(
@@ -166,6 +171,7 @@ class ScpDestination(BackupDestination):
             name="known_hosts",
             label="known_hosts content",
             type="text",
+            multiline=True,
             required=False,
             description=(
                 "OpenSSH known_hosts file content. Required when "
@@ -191,6 +197,18 @@ class ScpDestination(BackupDestination):
                 raise DestinationConfigError("'port' must be 1..65535")
         if not config.get("password") and not config.get("private_key"):
             raise DestinationConfigError("set ONE of 'password' or 'private_key'")
+        private_key = config.get("private_key")
+        if isinstance(private_key, str) and _pem_lost_its_line_breaks(private_key):
+            # paramiko answers a one-line key with "not a valid OPENSSH
+            # private key file", which reads as a wrong key rather than a
+            # mangled one. A one-line input folds every line break into a
+            # space, so say that, here (#2199).
+            raise DestinationConfigError(
+                "'private_key' has lost its line breaks: a PEM key's BEGIN line, "
+                "base64 body and END line must each be on their own line. Paste "
+                "the key into a multi-line field, or send it with real '\\n' "
+                "characters"
+            )
         remote_path = config["remote_path"]
         if not remote_path.startswith("/"):
             raise DestinationConfigError("'remote_path' must be absolute")
@@ -255,7 +273,7 @@ class ScpDestination(BackupDestination):
             client.connect(**connect_kwargs)
         except Exception as exc:  # noqa: BLE001
             client.close()
-            raise BackupDestinationError(f"SSH connect failed: {exc}") from exc
+            raise BackupDestinationError(f"SSH connect failed: {describe_exc(exc)}") from exc
         return client
 
     async def write(
@@ -275,7 +293,7 @@ class ScpDestination(BackupDestination):
                 try:
                     sftp = _open_sftp(client)
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP write failed: {describe_exc(exc)}") from exc
                 try:
                     # Atomic rename: write to .tmp then rename so a
                     # crashed transfer doesn't leave a half-archive
@@ -302,7 +320,7 @@ class ScpDestination(BackupDestination):
                             path=tmp,
                             error=str(cleanup_exc),
                         )
-                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP write failed: {describe_exc(exc)}") from exc
                 finally:
                     sftp.close()
             finally:
@@ -324,7 +342,9 @@ class ScpDestination(BackupDestination):
                         f"remote_path {remote_path!r} not found on host"
                     ) from exc
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP listdir failed: {exc}") from exc
+                    raise BackupDestinationError(
+                        f"SFTP listdir failed: {describe_exc(exc)}"
+                    ) from exc
                 finally:
                     sftp.close()
             finally:
@@ -349,7 +369,9 @@ class ScpDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
@@ -359,11 +381,14 @@ class ScpDestination(BackupDestination):
                 sftp = _open_sftp(client)
                 try:
                     with sftp.file(remote, "rb") as fh:
-                        return fh.read()
+                        check_size(safe, fh.stat().st_size or 0, max_bytes)
+                        return read_capped(fh.read, filename=safe, max_bytes=max_bytes)
+                except ArchiveTooLargeError:
+                    raise
                 except FileNotFoundError as exc:
                     raise BackupDestinationError(f"archive {safe!r} not found at {remote}") from exc
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP read failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP read failed: {describe_exc(exc)}") from exc
                 finally:
                     sftp.close()
             finally:
@@ -384,7 +409,9 @@ class ScpDestination(BackupDestination):
                 except FileNotFoundError:
                     return  # idempotent
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP delete failed: {exc}") from exc
+                    raise BackupDestinationError(
+                        f"SFTP delete failed: {describe_exc(exc)}"
+                    ) from exc
                 finally:
                     sftp.close()
             finally:
@@ -542,6 +569,19 @@ def _key_identities(keytype: str, key_b64: str) -> set[bytes]:
         except Exception:  # noqa: BLE001 — the raw blob above still counts
             pass
     return out
+
+
+def _pem_lost_its_line_breaks(pem: str) -> bool:
+    """True for a PEM block whose BEGIN and END markers sit on ONE line.
+
+    A Fernet-wrapped value (``__enc__:…``, the PATCH carry-over) and a
+    non-PEM value never match, so only a key that was actually pasted
+    flattened is refused.
+    """
+    text = pem.strip()
+    if not text.startswith("-----BEGIN ") or "-----END " not in text:
+        return False
+    return "\n" not in text and "\r" not in text
 
 
 def _load_private_key(pem: str, passphrase: str | None):

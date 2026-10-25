@@ -29,10 +29,10 @@ import structlog
 
 import dataclasses
 
-from . import appliance_state, approval_state, cp_tls
+from . import appliance_state, approval_state, cp_tls, self_bootstrap_token
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import _effective_control_plane_url, heartbeat_once
+from .heartbeat import _effective_control_plane_url, heartbeat_once, next_heartbeat_delay
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -65,10 +65,13 @@ def _self_bootstrap_or_skip(
 
     Only fires on the control-plane appliance where the
     installer wizard didn't capture a pairing code (the control plane
-    IS local). The api gates the endpoint on (1) the host bind-mounted
-    ``role-config:ROLE`` matching this claim and (2) no existing
-    Appliance rows, so calling it from anywhere other than the local
-    supervisor on a fresh install fails 403/409.
+    IS local). The api gates the endpoint on (1) a one-time token this
+    function writes to the host release-state directory and presents in
+    the body — the proof that the caller is on this host, since the
+    endpoint is also reachable through the frontend's ``/api/`` proxy —
+    (2) the host bind-mounted ``role-config:ROLE`` matching this claim
+    and (3) no live Appliance rows. The token file is removed again once
+    the call returns, whatever its outcome.
 
     On success we return a frozen copy of ``cfg`` with the new code +
     control-plane URL stamped in. On any failure (api not reachable,
@@ -94,11 +97,20 @@ def _self_bootstrap_or_skip(
     # makes the name absolute and skips the search list entirely.
     api_url = "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local.:8000"
     log.info("supervisor.self_bootstrap.attempting", variant=variant, api_url=api_url)
+    token = self_bootstrap_token.write()
+    if token is None:
+        # The api refuses a call without the token, so there is no point
+        # sending one; the next register-loop tick tries again.
+        log.warning(
+            "supervisor.self_bootstrap.skipped",
+            reason="could not write the self-bootstrap token",
+        )
+        return cfg
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.post(
                 f"{api_url}/api/v1/appliance/self-register-bootstrap",
-                json={"appliance_variant": variant},
+                json={"appliance_variant": variant, "bootstrap_token": token},
             )
     except httpx.HTTPError as exc:
         log.warning(
@@ -107,6 +119,8 @@ def _self_bootstrap_or_skip(
             hint="will retry on next register-loop tick",
         )
         return cfg
+    finally:
+        self_bootstrap_token.remove()
     if resp.status_code == 409:
         log.info("supervisor.self_bootstrap.already_registered")
         return cfg
@@ -191,11 +205,29 @@ def _maybe_register(
         if approval_state.read_state(cfg.state_dir) == "revoked" and (
             cfg.bootstrap_pairing_code or can_self_bootstrap
         ):
+            via_self_bootstrap = can_self_bootstrap and not cfg.bootstrap_pairing_code
+            if via_self_bootstrap:
+                # #2696: mint the new code BEFORE clearing anything. The
+                # self-bootstrap mints only while no live appliance row
+                # exists (409 otherwise). This node's own row can still be
+                # there: its heartbeats 404 while registration is switched
+                # off, and a revoked row stays until it is deleted. Clearing
+                # first would then leave the node with no identity and no
+                # code, and nothing could bring it back. Kept, it is approved
+                # again on its own row as soon as its heartbeats are accepted.
+                minted = _self_bootstrap_or_skip(cfg, "control-plane", log)
+                if not minted.bootstrap_pairing_code:
+                    log.info(
+                        "supervisor.register.revoked_reregister_deferred",
+                        appliance_id=str(cached_appliance_id),
+                        reason="no fresh pairing code; keeping this identity",
+                    )
+                    return cfg
+                cfg = minted
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
-                via_self_bootstrap=can_self_bootstrap
-                and not cfg.bootstrap_pairing_code,
+                via_self_bootstrap=via_self_bootstrap,
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -404,6 +436,9 @@ def main() -> int:
     # (~heartbeat_interval server-side); this only bounds the re-post rate
     # if a server ever returns held=True fast in a loop.
     held_rearm_floor_s = 2.0
+    # #1805 — heartbeats in a row that never reached the control plane; the
+    # next one goes sooner than the interval (``next_heartbeat_delay``).
+    failures = 0
 
     while not stop:
         try:
@@ -421,6 +456,24 @@ def main() -> int:
         if appliance_id is None:
             cfg = _maybe_register(cfg, log)
             appliance_id = load_appliance_id(cfg.state_dir)
+        elif (
+            approval_state.read_state(cfg.state_dir) == "revoked"
+            and appliance_state.detect_appliance_variant() == "control-plane"
+        ):
+            # #2696: the revoke recovery runs while the supervisor runs, not
+            # only at start-up. A Fleet row that went away leaves the cached
+            # appliance id in place, so the branch above never ran it, and
+            # the node stayed revoked (role services torn down) until its pod
+            # restarted. Control-plane nodes only: they re-register through
+            # the self-bootstrap, which mints a code only once no live row is
+            # left. A data-plane appliance keeps its identity, so Re-authorize
+            # on the Fleet page restores it on the same row. A code this
+            # process registered with earlier is spent, so the recovery asks
+            # for a fresh one instead of presenting it again.
+            cfg = _maybe_register(
+                dataclasses.replace(cfg, bootstrap_pairing_code=""), log
+            )
+            appliance_id = load_appliance_id(cfg.state_dir)
         # #272 — cluster members heartbeat the in-cluster api Service
         # (resolved here so the skip-gate matches what heartbeat_once
         # will actually POST to). A control-plane member always has a
@@ -428,8 +481,9 @@ def main() -> int:
         # agent only proceeds when its configured URL is present.
         effective_url = _effective_control_plane_url(cfg)
         # #358 Phase 1b — True when the control plane long-poll-held this
-        # heartbeat (and thus already paced us ~heartbeat_interval).
-        held = False
+        # heartbeat (and thus already paced us ~heartbeat_interval); None when
+        # it never reached the control plane (#1805).
+        held: bool | None = False
         if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
@@ -468,9 +522,17 @@ def main() -> int:
         # heartbeat it already blocked ~heartbeat_interval server-side, so
         # re-arm the hold after a short floor instead of sleeping the full
         # interval again (which would roughly halve hold coverage). Old
-        # control planes / errors (held=False) keep the full interval.
-        sleep_budget = (
-            held_rearm_floor_s if held else float(cfg.heartbeat_interval_seconds)
+        # control planes and crashes (held=False) keep the full interval.
+        # #1805 — a heartbeat that never reached the control plane (None) is
+        # re-sent after 5 s, doubling while they keep failing, up to the
+        # interval: a node loss's few seconds of unreachable api no longer cost
+        # a whole interval each.
+        failures = failures + 1 if held is None else 0
+        sleep_budget = next_heartbeat_delay(
+            held,
+            failures,
+            float(cfg.heartbeat_interval_seconds),
+            held_rearm_floor_s,
         )
         waited = 0.0
         while waited < sleep_budget:

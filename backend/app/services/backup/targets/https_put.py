@@ -69,6 +69,7 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     UnsupportedOperationError,
+    describe_exc,
     safe_filename,
     safe_url,
     scrub_url,
@@ -274,6 +275,7 @@ class HttpsPutDestination(BackupDestination):
             name="extra_headers",
             label="Extra headers",
             type="text",
+            multiline=True,
             required=False,
             description="Optional, one 'Name: value' per line.",
         ),
@@ -395,7 +397,7 @@ class HttpsPutDestination(BackupDestination):
                 # ``in_progress``, which the schedule sweep skips forever:
                 # that target's backups stop permanently and silently.
                 raise BackupDestinationError(
-                    f"{method} to {safe_url(url)} failed: {scrub_url(str(exc), url)}"
+                    f"{method} to {safe_url(url)} failed: {scrub_url(describe_exc(exc), url)}"
                 ) from exc
 
     # ── operations ────────────────────────────────────────────────────
@@ -420,7 +422,10 @@ class HttpsPutDestination(BackupDestination):
             )
         if resp.status_code // 100 != 2:
             raise BackupDestinationError(
-                f"{_method(config)} to {safe_url(url)} returned {resp.status_code}: {resp.text[:300]}"
+                f"{_method(config)} to {safe_url(url)} returned {resp.status_code}: "
+                # A receiver can echo the request URL, credential included,
+                # in its error body.
+                f"{scrub_url(resp.text, url)[:300]}"
             )
 
     async def list_archives(self, *, config: dict[str, Any]) -> list[ArchiveListing]:
@@ -436,7 +441,9 @@ class HttpsPutDestination(BackupDestination):
         """
         return []
 
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         raise UnsupportedOperationError(
             "the https_put destination is one-way: it can send an archive to the "
             "receiver but cannot read one back. Restore from the receiver's own "

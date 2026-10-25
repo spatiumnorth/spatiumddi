@@ -48,7 +48,7 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # Stated in the PAST tense on purpose: Dependabot bumps the ``FROM`` line but
 # cannot touch this comment, so any wording that names the CURRENT pin goes
 # stale on the very next bump — which is exactly what happened at 1.26.6.
-FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS gobgp-build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH

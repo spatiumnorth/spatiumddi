@@ -136,9 +136,11 @@ async def _resolve_failover(
     # Kea's listener cannot accept TLS and plaintext at once, so switching one
     # peer before its partner's agent understands the fields would stop the
     # pair talking for the length of the upgrade (ha_peer_auth module doc).
-    # Read fresh from the database, not off ``group`` / ``kea_peers``: in a
-    # parked long-poll those are identity-map objects that a wake does not
-    # refresh (``current_peer_credential`` says why that matters).
+    # Read fresh from the database, not off ``group`` / ``kea_peers``: a caller
+    # holding a long-lived session gets identity-map objects a re-query does
+    # not overwrite (``current_peer_credential`` says why that matters). The
+    # agent long-poll expires its session on every pass since #2040, so this is
+    # now belt-and-braces for any other caller.
     tls = await current_peer_credential(db, group, kea_peers)
     return FailoverConfig(
         tls_ca_pem=tls["ca_pem"] if tls else None,
@@ -309,6 +311,10 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
             # worth risking the lease service for.
             log.warning("dhcp_bundle_e911_lookup_failed", error=str(exc))
 
+    # #2731: assembled ahead of the scopes, because each v4 scope lists the
+    # classes of its own profile and Kea evaluates them for that scope alone.
+    pxe_classes, pxe_class_names = await _assemble_pxe_classes(db, scope_rows)
+
     scopes: list[ScopeDef] = []
     for sc in scope_rows:
         subnet = subnet_map.get(sc.subnet_id)
@@ -360,8 +366,6 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 ),
                 pools=pools,
                 statics=statics,
-                ddns_enabled=sc.ddns_enabled,
-                ddns_hostname_policy=sc.ddns_hostname_policy,
                 is_active=sc.is_active,
                 address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                 v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",
@@ -371,6 +375,13 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 # real value (caching explicitly off) and must not be coalesced.
                 lease_cache_threshold=getattr(sc, "lease_cache_threshold", None),
                 lease_cache_max_age=getattr(sc, "lease_cache_max_age", None),
+                # #2731: PXE classes are Dhcp4-only, so a v6 scope lists none.
+                pxe_class_names=(
+                    pxe_class_names.get(sc.pxe_profile_id, ())
+                    if sc.pxe_profile_id is not None
+                    and (getattr(sc, "address_family", "ipv4") or "ipv4") != "ipv6"
+                    else ()
+                ),
             )
         )
 
@@ -385,7 +396,6 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         for m in mb_rows
     )
 
-    pxe_classes = await _assemble_pxe_classes(db, scope_rows)
     phone_classes = await _assemble_phone_classes(db, scope_rows)
     device_policy_classes = await _assemble_device_policy_classes(db, group.id if group else None)
 
@@ -517,7 +527,7 @@ def _build_pxe_match_expression(
 
 async def _assemble_pxe_classes(
     db: AsyncSession, scope_rows: list[DHCPScope]
-) -> tuple[PXEClassDef, ...]:
+) -> tuple[tuple[PXEClassDef, ...], dict[uuid.UUID, tuple[str, ...]]]:
     """Walk every scope with a bound PXE profile and emit one class
     per arch-match. Disabled profiles render no classes.
 
@@ -528,10 +538,14 @@ async def _assemble_pxe_classes(
     Sorted by (priority ASC, profile_id ASC, match_id ASC) so Kea's
     declared-order evaluation puts most-specific matches first when
     the operator orders priorities right.
+
+    Also returns each profile's class names, in that same order (#2731).
+    The scopes bound to a profile list them, and Kea evaluates them for
+    those scopes' clients only.
     """
     profile_ids = {sc.pxe_profile_id for sc in scope_rows if sc.pxe_profile_id is not None}
     if not profile_ids:
-        return ()
+        return (), {}
 
     matches = (
         (
@@ -551,6 +565,7 @@ async def _assemble_pxe_classes(
     )
 
     out: list[PXEClassDef] = []
+    names: dict[uuid.UUID, list[str]] = {}
     seen_names: set[str] = set()
     for m in matches:
         prof = m.profile
@@ -583,7 +598,8 @@ async def _assemble_pxe_classes(
                 is_ipxe_chain=(m.match_kind == "ipxe_chain"),
             )
         )
-    return tuple(out)
+        names.setdefault(prof.id, []).append(name)
+    return tuple(out), {pid: tuple(n) for pid, n in names.items()}
 
 
 async def _assemble_phone_classes(

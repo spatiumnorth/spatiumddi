@@ -24,6 +24,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 from collections.abc import Callable, Iterable
@@ -520,11 +521,66 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+@dataclass
+class RedisReclaim:
+    """What one Redis sweep did (#2404). ``reclaimed``: the claims whose
+    DELETE landed this sweep; ``terminating``: claims an earlier sweep
+    deleted that pvc-protection still holds (their pod DELETE is retried,
+    they are not counted again); ``nodes``: the hostnames the reclaimed
+    claims were pinned to; ``sources``: per reclaimed claim, whether the
+    bound PV's node affinity (``pv``) or the scheduler's selected-node
+    annotation (``annotation``) decided it was stranded; ``error``: why the
+    sweep stopped, quoting the start of the answer's body when it was
+    refused; ``error_kind``: the same without the body (the request, and
+    its status when the sweep has it), set wherever ``error`` can quote
+    one. The heartbeat logs a failure once per kind, and an apiserver can
+    answer every tick with another body (review of #2433)."""
+
+    reclaimed: list[str] = field(default_factory=list)
+    error: str | None = None
+    terminating: list[str] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
+    error_kind: str = ""
+
+    def __iter__(self):
+        # ``reclaimed, err = ...``, the shape #590's callers unpack.
+        yield self.reclaimed
+        yield self.error
+
+
+_REDIS_CLAIM_MARK = "-redis-"
+_PENDING_PODS_QUERY = f"?fieldSelector={quote('status.phase=Pending')}"
+
+
+def _waits_on_redis_claim(pod: dict) -> bool:
+    """A Pending pod that mounts a ``-redis-`` claim. A stranded claim's
+    replica always is one: the scheduler cannot place it."""
+    if ((pod or {}).get("status") or {}).get("phase") != "Pending":
+        return False
+    for volume in ((pod or {}).get("spec") or {}).get("volumes") or []:
+        claim = ((volume or {}).get("persistentVolumeClaim") or {}).get("claimName")
+        if _REDIS_CLAIM_MARK in str(claim or ""):
+            return True
+    return False
+
+
+def _k3s_node_names(names: str | Iterable[str]) -> set[str]:
+    """PURE: the names as k3s registers its Nodes, lowercased with no trailing
+    dot (#1757), as delete_node sends them. A bare string is one name."""
+    given = [names] if isinstance(names, str) else names
+    return {str(n).strip().rstrip(".").lower() for n in given if n} - {""}
+
+
 def reclaim_stranded_redis_storage(
-    node: str, namespace: str = "spatium"
-) -> tuple[list[str], str | None]:
+    evicted_nodes: str | Iterable[str] = (),
+    namespace: str = "spatium",
+    *,
+    owed_nodes: str | Iterable[str] = (),
+) -> RedisReclaim:
     """Delete Redis PVCs (and their Pending consumer pods) stranded on a
-    just-deleted node — returns (reclaimed_pvc_names, error).
+    node that no longer exists. Returns a :class:`RedisReclaim`, which
+    unpacks as ``(reclaimed_pvc_names, error)``.
 
     #590 — local-path PVs are node-affine, so evicting a dead node
     permanently strands every ReadWriteOnce PVC provisioned on it: the
@@ -547,46 +603,139 @@ def reclaim_stranded_redis_storage(
     :func:`reclaim_stranded_postgres_storage` (#1058). The PVC goes first
     (pvc-protection holds it until its pod is gone), then the pod — the
     StatefulSet then recreates both and the provisioner lands the new PV
-    on a live node."""
+    on a live node.
+
+    #2404: level-triggered, like the Postgres reclaim (#1058). #590 ran
+    this once, on the tick whose Node DELETE succeeded, keyed on the name
+    it was given, and nothing looked again: the eviction loop skips a name
+    it has handled for as long as the backend lists it, and the backend
+    stops listing it once etcd drops the member. An error answer on that
+    tick, a Node removed any other way, or a name sent in another form than
+    the claim's annotation left the claim stranded for good (on a fresh
+    three-node cluster, Redis still ran two of three 37 minutes after a
+    replace). The seed calls it on every tick now:
+
+    * ``evicted_nodes``: the names the caller deleted this tick (a bare
+      name is one node). They are authoritative, as for Postgres: their
+      claims go at once, with no Node read (the DELETE is milliseconds old
+      and the Node can still be listed).
+    * ``owed_nodes``: the names a failed sweep left owed. They were evicted
+      on an earlier tick, and a run of failed sweeps can keep them owed
+      while the node rejoins under the same hostname, its replica running
+      on the claim again (review of #2433). So one Node read decides: a
+      name the list no longer has goes as if evicted now, and one it lists
+      again keeps its claim and pod. A Node list that cannot be read is an
+      error, and nothing is freed.
+    * otherwise one read, the namespace's Pending pods. Only while a pod
+      that mounts a ``-redis-`` claim is Pending does the sweep read the
+      Node list, and it reclaims each claim whose every pinned hostname
+      the list no longer carries. NotReady is not gone: a claim whose node
+      is still a Node is left alone, because that node can come back with
+      its data.
+
+    Where a claim lives is read as for Postgres and the mirror
+    (:func:`_pvc_pinned_hostnames`): the bound PV's node affinity, the
+    selected-node annotation only when there is no PV, and a PV read that
+    fails is an error, never a guess. A claim an earlier sweep deleted is
+    reported ``terminating``, not reclaimed again, and its pod DELETE is
+    retried."""
+    forced = _k3s_node_names(evicted_nodes)
+    owed = _k3s_node_names(owed_nodes) - forced
     base = f"/api/v1/namespaces/{quote(namespace)}"
+    if owed:
+        # Owed, not evicted this tick: only while the Node list lacks the name.
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
+        forced |= owed - set(listed)
+    live: set[str] | None = None
+    if not forced:
+        try:
+            status, resp = _request("GET", f"{base}/pods{_PENDING_PODS_QUERY}")
+        except (RuntimeError, OSError) as exc:
+            return RedisReclaim(error=str(exc))
+        if status != 200:
+            return RedisReclaim(
+                error=f"kubeapi status {status}: {resp[:200]!r}",
+                error_kind=f"list Pending pods: status {status}",
+            )
+        try:
+            pending = json.loads(resp).get("items") or []
+        except (ValueError, AttributeError):
+            return RedisReclaim(error="unparseable pod list")
+        if not any(_waits_on_redis_claim(pod) for pod in pending):
+            return RedisReclaim()
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
+        live = set(listed)
+
     try:
         status, resp = _request("GET", f"{base}/persistentvolumeclaims")
-    except RuntimeError as exc:
-        return [], str(exc)
+    except (RuntimeError, OSError) as exc:
+        return RedisReclaim(error=str(exc))
     if status != 200:
-        return [], f"kubeapi status {status}: {resp[:200]!r}"
+        return RedisReclaim(
+            error=f"kubeapi status {status}: {resp[:200]!r}",
+            error_kind=f"list claims: status {status}",
+        )
     try:
         items = json.loads(resp).get("items", [])
-    except ValueError:
-        return [], "unparseable PVC list"
-    reclaimed: list[str] = []
+    except (ValueError, AttributeError):
+        return RedisReclaim(error="unparseable PVC list")
+    out = RedisReclaim()
+    gone: set[str] = set()
     for pvc in items:
         meta = pvc.get("metadata") or {}
         name = str(meta.get("name") or "")
-        anns = meta.get("annotations") or {}
-        if "-redis-" not in name:
+        if _REDIS_CLAIM_MARK not in name:
             continue
-        if anns.get("volume.kubernetes.io/selected-node") != node:
+        pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
+        if pin_err:
+            out.error, out.error_kind = f"{name}: {pin_err}", f"read the volume of {name}"
+            break
+        # Stranded: every hostname the volume is pinned to is gone, i.e. one
+        # the caller evicted, or (on a sweep) one the Node list no longer has.
+        if not pinned or not all(
+            host in forced or (live is not None and host not in live) for host in pinned
+        ):
             continue
-        try:
-            status, resp = _request(
-                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
-            )
-        except RuntimeError as exc:
-            return reclaimed, str(exc)
-        if status not in (200, 202, 404):
-            return reclaimed, f"kubeapi status {status}: {resp[:200]!r}"
+        if meta.get("deletionTimestamp"):
+            out.terminating.append(name)
+        else:
+            try:
+                status, resp = _request(
+                    "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
+                )
+            except (RuntimeError, OSError) as exc:
+                out.error = str(exc)
+                break
+            if status not in (200, 202, 404):
+                out.error = f"kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete claim {name}: status {status}"
+                break
+            if status != 404:  # 404: gone between the list and the delete
+                out.reclaimed.append(name)
+                out.sources[name] = source
+                gone |= pinned
         # volumeClaimTemplate name is the prefix: data-<pod-name>. Delete
         # the Pending pod so the StatefulSet recreates it against a fresh
-        # claim (an existing pod keeps referencing the deleted PVC).
+        # claim (an existing pod keeps referencing the deleted PVC). A
+        # refusal is reported, so the heartbeat keeps the node owed and the
+        # next tick retries it; a pod that is already gone (404) is the goal.
         pod = name.partition("-")[2]
         if pod:
             try:
-                _request("DELETE", f"{base}/pods/{quote(pod)}")
-            except RuntimeError:
-                pass  # pod may not exist; the PVC reclaim is what matters
-        reclaimed.append(name)
-    return reclaimed, None
+                status, resp = _request("DELETE", f"{base}/pods/{quote(pod)}")
+            except (RuntimeError, OSError) as exc:
+                out.error = f"pod {pod}: {exc}"
+                break
+            if status not in (200, 202, 404):
+                out.error = f"pod {pod}: kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete pod {pod}: status {status}"
+                break
+    out.nodes = sorted(gone)
+    return out
 
 
 # #1541 — the slot-image mirror's claim, stranded on an evicted node.
@@ -1244,11 +1393,11 @@ def _merge_owned_overrides(
 
 
 # Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
-# worker). Deliberately a separate constant from ``_FAST_EVICT_TOLERATIONS``,
-# which coredns uses: the two are the same 20 s today but answer different
-# questions (how fast must a control-plane replica leave a dead node, vs how
-# fast must cluster DNS), and collapsing them would make a future retune of
-# one silently retune the other.
+# worker). CoreDNS carried its own copy until #1753: with one CoreDNS replica
+# per node an evicted DNS pod has nowhere to go, and the copy was the one
+# template field k3s's manifest re-apply fought over. This one answers a
+# different question (how fast must a control-plane replica leave a dead
+# node) and is unchanged.
 _CONTROL_PLANE_FAST_EVICT = [
     {
         "key": "node.kubernetes.io/unreachable",
@@ -1263,6 +1412,24 @@ _CONTROL_PLANE_FAST_EVICT = [
         "tolerationSeconds": 20,
     },
 ]
+
+
+#: #1805 — the api Service's ``trafficDistribution`` on the appliance. The
+#: supervisor's heartbeat, the DNS and DHCP agents and the frontend's ``/api``
+#: proxy reach the api through that Service, and kube-proxy spread their
+#: connections over every api pod, so after a node's hard loss its api pod,
+#: still listed until the node reads NotReady, held a share of every other
+#: node's requests until their own timeout. ``PreferSameNode`` keeps a node's
+#: callers on its own api pod while that pod is ready.
+#:
+#: The appliance's and not the umbrella chart's (whose default is ``""``):
+#: here every control-plane node runs one api pod (``replicas`` = the
+#: control-plane size, hard anti-affinity), while on a BYO-Kubernetes cluster
+#: the field would pin each node's callers to whichever api pod shares their
+#: node. Written at every size, because a merge cannot remove a key and one
+#: api pod makes it inert. firstboot renders the same value, or the first
+#: heartbeat of every install would add a helm revision (#1005).
+_NODE_LOCAL_API = "PreferSameNode"
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -1501,13 +1668,22 @@ def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
 # a maintainer retunes them here and in firstboot's mirror
 # (``_render_control_helmchart``), and ``tests/test_control_plane_sizing.py``
 # holds the two copies together.
+#
+# #2240 — the worker's share is 0.40 of the budget, capped at 16 GiB, but
+# never more than what the api and Postgres leave of it: one
+# ``render_dns_bundle`` for a server at ~2M records peaked at 5.1-5.5 GiB and
+# was OOM-killed at the old 4 GiB cap on every worker of a 7-node, 24 GiB
+# lab. "What the others leave" keeps #1115's whole-node fit: below ~22 GiB the
+# api's half and Postgres' quarter leave the worker its old quarter (an 8 GiB
+# node is unchanged, 1536Mi), and from there the 0.40 share applies (a 24 GiB
+# node gets ~8.8 GiB, a 32 GiB node 12 GiB, a 48 GiB node and up the 16 GiB cap).
 _PLATFORM_RESERVE_MIB = 2048
 _API_MEM_SHARE = 0.5
 _API_MEM_MIN_MIB = 1024
 _API_MEM_MAX_MIB = 8192
-_WORKER_MEM_SHARE = 0.25
+_WORKER_MEM_SHARE = 0.40
 _WORKER_MEM_MIN_MIB = 1024
-_WORKER_MEM_MAX_MIB = 4096
+_WORKER_MEM_MAX_MIB = 16384
 _POSTGRES_MEM_SHARE = 0.25
 _POSTGRES_MEM_MIN_MIB = 1024
 _POSTGRES_MEM_MAX_MIB = 4096
@@ -1521,9 +1697,37 @@ _POSTGRES_MEM_REQUEST_MIN_MIB = 256
 # throughput-bound on an appliance.
 _WORKER_SMALL_NODE_MIB = 12288
 
+# #2240 — CPU limits sized from the node's CPU count. The chart ships
+# Postgres at ``1000m`` and the api at ``1000m`` whatever the node has; at 1M
+# devices on 8-vCPU nodes the CloudNativePG primary used 0.98 cores and was
+# throttled in 89% of CFS periods, and the whole cluster wrote ~20 records/s.
+# At 4 cores it used 2.8 (9% throttled) and wrote ~80/s. Postgres gets half
+# the node's CPUs (floor 1, cap 8), the api a quarter (floor 1, cap 4), as
+# whole cores written in the chart's millicore form ("4000m"), so a node whose
+# sizing lands on the chart's own 1000m renders exactly the chart's string
+# and the #1005 guard writes nothing for it. The worker keeps the chart's
+# 2000m: its renders are memory-bound, not CPU-bound. Limits only: requests
+# stay the chart's, so scheduling is unchanged. firstboot mirrors these with
+# ``nproc`` (the same affinity count ``node_cpu_count`` reads).
+_POSTGRES_CPU_DIVISOR = 2
+_POSTGRES_CPU_MIN = 1
+_POSTGRES_CPU_MAX = 8
+_API_CPU_DIVISOR = 4
+_API_CPU_MIN = 1
+_API_CPU_MAX = 4
+
 
 def _clamp_mib(total_mib: int, fraction: float, lo: int, hi: int) -> int:
     return int(min(max(total_mib * fraction, lo), hi))
+
+
+def _clamp_cores(cpu_count: int, divisor: int, lo: int, hi: int) -> int:
+    return min(max(cpu_count // divisor, lo), hi)
+
+
+def _millicores(cores: int) -> str:
+    """Whole cores in the chart's own notation (``1000m``, ``2000m``)."""
+    return f"{cores * 1000}m"
 
 
 def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
@@ -1535,15 +1739,23 @@ def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
     it in bash so a fresh install's first render already carries these
     numbers."""
     budget = max(mem_total_mib - _PLATFORM_RESERVE_MIB, 0)
+    api_mib = _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB)
     postgres_mib = _clamp_mib(
         budget, _POSTGRES_MEM_SHARE, _POSTGRES_MEM_MIN_MIB, _POSTGRES_MEM_MAX_MIB
     )
+    # #2240 — the worker's share, but never more than the api and Postgres
+    # leave of the budget (and never below its floor).
+    worker_mib = max(
+        min(
+            _clamp_mib(budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB),
+            budget - api_mib - postgres_mib,
+        ),
+        _WORKER_MEM_MIN_MIB,
+    )
     shared_buffers_mb = int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE)
     return {
-        "api": _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB),
-        "worker": _clamp_mib(
-            budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB
-        ),
+        "api": api_mib,
+        "worker": worker_mib,
         "postgres": postgres_mib,
         "shared_buffers": shared_buffers_mb,
         # CloudNativePG refuses a Cluster whose memory request is below
@@ -1553,40 +1765,70 @@ def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
     }
 
 
-def control_plane_resources(mem_total_mib: int | None) -> dict[str, Any]:
-    """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
-    a node with ``mem_total_mib`` of RAM — ``{}`` when the size is unknown
-    (the chart's defaults then stand, exactly as before).
+def control_plane_cpu_sizing(cpu_count: int) -> dict[str, int]:
+    """PURE: the ``postgres`` and ``api`` CPU limits, in whole cores, for a
+    node with ``cpu_count`` CPUs (#2240): half the node for Postgres (1-8),
+    a quarter for the api (1-4). An 8-vCPU node gets 4 and 2; a 4-vCPU node
+    2 and 1. firstboot mirrors it in bash from ``nproc``."""
+    return {
+        "postgres": _clamp_cores(
+            cpu_count, _POSTGRES_CPU_DIVISOR, _POSTGRES_CPU_MIN, _POSTGRES_CPU_MAX
+        ),
+        "api": _clamp_cores(cpu_count, _API_CPU_DIVISOR, _API_CPU_MIN, _API_CPU_MAX),
+    }
 
-    The ``postgresql`` block carries the CloudNativePG instance limit, the
-    matching ``shared_buffers`` and the memory request CloudNativePG's
-    admission webhook demands at or above ``shared_buffers`` (with the
-    chart's 256Mi request alone the Cluster is refused as soon as the sizing
-    moves off 256MB); the chart renders them straight into the Cluster CR
-    (``templates/cnpg-cluster.yaml``), and a change to any of them on a
-    formed cluster is a CNPG rolling restart — replicas first, then a
+
+def control_plane_resources(
+    mem_total_mib: int | None, cpu_count: int | None = None
+) -> dict[str, Any]:
+    """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
+    a node with ``mem_total_mib`` of RAM and ``cpu_count`` CPUs. Each input
+    sizes its own keys and an unknown one sizes nothing: ``{}`` when both are
+    unknown (the chart's defaults then stand, exactly as before), only the
+    memory keys when the CPU count is unknown, only the CPU limits
+    (``api`` / ``postgresql`` ``resources.limits.cpu``, #2240) when the RAM is.
+
+    The ``postgresql`` block carries the CloudNativePG instance limits (memory
+    and, #2240, CPU), the matching ``shared_buffers`` and the memory request
+    CloudNativePG's admission webhook demands at or above ``shared_buffers``
+    (with the chart's 256Mi request alone the Cluster is refused as soon as
+    the sizing moves off 256MB); the chart renders them straight into the
+    Cluster CR (``templates/cnpg-cluster.yaml``), and a change to any of them
+    on a formed cluster is a CNPG rolling restart — replicas first, then a
     switchover of the primary. On a fresh install firstboot renders the same
     numbers into the HelmChart, so the Cluster is created with them and
-    nothing rolls; an appliance that upgrades into this sizing takes that one
-    rolling restart on its first heartbeat, and the #1005 guard keeps every
-    later heartbeat quiet."""
-    if not mem_total_mib or mem_total_mib <= 0:
-        return {}
-    sized = control_plane_sizing(mem_total_mib)
-    return {
-        "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
-        "worker": {
-            "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
-            "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
-        },
-        "postgresql": {
-            "resources": {
-                "requests": {"memory": f"{sized['postgres_request']}Mi"},
-                "limits": {"memory": f"{sized['postgres']}Mi"},
+    nothing rolls; an appliance that upgrades into this sizing (#2240's CPU
+    limits and worker memory included) takes that one rolling restart on its
+    first heartbeat, and the #1005 guard keeps every later heartbeat quiet."""
+    out: dict[str, Any] = {}
+    if mem_total_mib and mem_total_mib > 0:
+        sized = control_plane_sizing(mem_total_mib)
+        out = {
+            "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
+            "worker": {
+                "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
+                "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
             },
-            "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
-        },
-    }
+            "postgresql": {
+                "resources": {
+                    "requests": {"memory": f"{sized['postgres_request']}Mi"},
+                    "limits": {"memory": f"{sized['postgres']}Mi"},
+                },
+                "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
+            },
+        }
+    if cpu_count and cpu_count > 0:
+        cores = control_plane_cpu_sizing(cpu_count)
+        out = _deep_merge(
+            out,
+            {
+                "api": {"resources": {"limits": {"cpu": _millicores(cores["api"])}}},
+                "postgresql": {
+                    "resources": {"limits": {"cpu": _millicores(cores["postgres"])}}
+                },
+            },
+        )
+    return out
 
 
 def node_memory_mib() -> int | None:
@@ -1599,6 +1841,23 @@ def node_memory_mib() -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def node_cpu_count() -> int | None:
+    """The CPUs this node schedules on (#2240), the count ``nproc`` prints:
+    the process's CPU affinity, else ``os.cpu_count()``; ``None`` when
+    unknown. In the supervisor's pod this is the node's vCPU count (a
+    container's CPU limit is a CFS quota, not an affinity mask)."""
+    # getattr: sched_getaffinity is Linux-only (and so absent to a type check
+    # on a developer mac).
+    affinity = getattr(os, "sched_getaffinity", None)
+    try:
+        count = len(affinity(0)) if affinity is not None else 0
+    except OSError:
+        count = 0
+    if count <= 0:
+        count = os.cpu_count() or 0
+    return count if count > 0 else None
 
 
 # #1585 — the size the control plane is budgeted from. A virtio balloon
@@ -1645,20 +1904,132 @@ def sizing_memory_mib(state_dir: Path | None = None) -> int | None:
     return current
 
 
+# #2223 — the dns-bind9 memory limit, sized from node RAM. named holds every
+# zone and RPZ in memory, so a fixed limit that fits a lab is OOM-killed at
+# scale: ddi-pg's lab hit the old fixed 2Gi at about 2M records. A quarter of
+# the node, floor 2Gi (the old fixed value, so no node gets less than it did),
+# cap 8Gi (the rest of the node is the control plane's and the kernel's). The
+# request keeps the chart's old ratio, an eighth of the limit (256Mi at 2Gi).
+# Rounded to whole GiB so the value moves only when the node really changes
+# size: a MiB-resolution limit would change with every few MiB of MemTotal,
+# and every change is a rollout of named on every DNS node.
+_DNS_BIND9_MEM_SHARE = 0.25
+_DNS_BIND9_MEM_MIN_GIB = 2
+_DNS_BIND9_MEM_MAX_GIB = 8
+_DNS_BIND9_REQUEST_DIVISOR = 8
+
+
+def dns_bind9_memory(mem_total_mib: int | None) -> dict[str, str]:
+    """PURE: the ``dnsBind9.memory`` values (``limit`` / ``request``) for a
+    node with ``mem_total_mib`` of RAM; ``{}`` when the size is unknown, so
+    the chart's own default (2Gi / 256Mi) stands.
+
+    The chart applies these only where ``dnsBind9.resources`` does not set
+    the memory limit or request itself, so an operator's explicit override
+    always wins (``templates/dns-bind9.yaml``)."""
+    if not mem_total_mib or mem_total_mib <= 0:
+        return {}
+    quarter_gib = int(mem_total_mib * _DNS_BIND9_MEM_SHARE / 1024 + 0.5)
+    limit_gib = min(max(quarter_gib, _DNS_BIND9_MEM_MIN_GIB), _DNS_BIND9_MEM_MAX_GIB)
+    return {
+        "limit": f"{limit_gib}Gi",
+        "request": f"{limit_gib * 1024 // _DNS_BIND9_REQUEST_DIVISOR}Mi",
+    }
+
+
+_QUANTITY_UNITS = {
+    "": 1, "k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12,
+    "Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40,
+}  # fmt: skip
+
+
+def quantity_mib(value: Any) -> int | None:
+    """PURE: a Kubernetes memory quantity (``"16374512Ki"``) in MiB; ``None``
+    when it does not parse."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]*)", str(value or "").strip())
+    if not m or m.group(2) not in _QUANTITY_UNITS:
+        return None
+    return int(float(m.group(1)) * _QUANTITY_UNITS[m.group(2)]) >> 20
+
+
+_DNS_BIND9_ROLE_LABEL = "spatium.io/role-dns-bind9"
+
+
+def dns_sizing_memory_of(nodes_doc: Any) -> int | None:
+    """PURE — #2223: the RAM (MiB) to size dns-bind9 from, out of a
+    ``/api/v1/nodes`` list: the SMALLEST ``status.capacity.memory`` among the
+    nodes labelled for dns-bind9, or among every node when none is yet.
+
+    One value for the cluster, not this node's own: the role chart is ONE
+    HelmChart every member applies whole, and a value two nodes render
+    differently restarts named on every DNS node each time the other applies
+    (#1137). The DaemonSet also takes one limit for all its pods, so the
+    smallest node it runs on decides — a limit sized for a bigger node would
+    let named take a small one down. The kubelet reads the capacity once at
+    start, so a virtio balloon does not move it (#1585). ``None`` when no node
+    reports a capacity."""
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    labelled: list[int] = []
+    every: list[int] = []
+    for node in items or []:
+        node = node or {}
+        mib = quantity_mib(((node.get("status") or {}).get("capacity") or {}).get("memory"))
+        if mib is None or mib <= 0:
+            continue
+        every.append(mib)
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        if labels.get(_DNS_BIND9_ROLE_LABEL) == "true":
+            labelled.append(mib)
+    pool = labelled or every
+    return min(pool) if pool else None
+
+
+def dns_sizing_memory_mib(timeout: float = 5.0) -> tuple[int | None, str | None]:
+    """``(mib, error)``: :func:`dns_sizing_memory_of` over ``GET /api/v1/nodes``.
+
+    ``None`` with an error means unknown, never "unsized": the role apply then
+    writes nothing rather than dropping the sizing, which would put every DNS
+    node back on the chart's 2Gi default and restart named cluster-wide."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    mib = dns_sizing_memory_of(doc)
+    if mib is None:
+        return None, "no node reports a memory capacity"
+    return mib, None
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
     web_ui_allowed_cidrs: list[str] | None = None,
     *,
     mem_total_mib: int | None = None,
+    cpu_count: int | None = None,
     cnpg_instances: int | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
     plus the frontend control-plane VIP, plus the api / worker / Postgres
     memory limits, Postgres' shared_buffers and the worker concurrency,
-    sized from ``mem_total_mib`` (see ``control_plane_resources``). Written to the spatium-control
-    HelmChartConfig so it survives a k3s restart (#272).
+    sized from ``mem_total_mib``, and the api / Postgres CPU limits, sized
+    from ``cpu_count`` (#2240; see ``control_plane_resources``), plus the api
+    Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``).
+    Written to the spatium-control HelmChartConfig so it survives a k3s
+    restart (#272).
+
+    #2240 — a sizing change on a formed cluster (an appliance upgrading into
+    the CPU limits or the larger worker cap) is one CloudNativePG rolling
+    restart and one api / worker rollout, on the first heartbeat that writes
+    it; the #1005 guard in ``_merge_owned_overrides`` keeps every later
+    heartbeat quiet.
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
     ``patch_cnpg_instances`` left on the Cluster this tick
@@ -1689,7 +2060,11 @@ def apply_control_plane_overrides(
     # and evict them from a dead node in seconds rather than the k8s default
     # 300 s. ``replicas`` here IS the node count, so hard
     # (requiredDuringScheduling) anti-affinity is exactly right, and the
-    # chart no-ops it below 2 replicas.
+    # chart no-ops it below 2 replicas, except the frontend's on the host
+    # network, which it renders at one replica too (#2450). The first promote
+    # then changes the frontend's replicas and nothing in its pod template, so
+    # the seed's frontend pod is scaled beside, never rolled off ports 80 and
+    # 443 (test_frontend_promotion_overrides.py pins this side of it).
     #
     # Written on every promote/demote rather than relying on the
     # firstboot-rendered HelmChart values, because firstboot only runs on a
@@ -1708,13 +2083,15 @@ def apply_control_plane_overrides(
         "podAntiAffinity": "hard",
         "tolerations": _CONTROL_PLANE_FAST_EVICT,
     }
-    sized = control_plane_resources(mem_total_mib)
+    sized = control_plane_resources(mem_total_mib, cpu_count)
 
     def owned(current_doc: dict) -> dict[str, Any]:
         # The slot-image mirror latch (#787) reads the live document, so
         # the owned keys are computed from the same read the merge uses.
         return {
-            "api": dict(scaled) | sized.get("api", {}),
+            "api": dict(scaled)
+            | sized.get("api", {})
+            | {"service": {"trafficDistribution": _NODE_LOCAL_API}},
             "frontend": dict(scaled)
             | {
                 "controlPlaneVIP": vip,
@@ -1918,6 +2295,44 @@ def patch_node_labels(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def daemonset_template_env(
+    name: str,
+    *,
+    env_name: str,
+    namespace: str = "spatium",
+    timeout: float = 5.0,
+) -> tuple[bool | None, str | None, str | None]:
+    """``(exists, value, error)``: the literal ``env_name`` of a DaemonSet's pod
+    TEMPLATE, i.e. what a pod scheduled onto a node right now would start with.
+
+    #2190 — the role apply reads this before it labels a node for a role, so a
+    label flip cannot start a pod from the previous chart revision's values.
+    ``exists`` is ``False`` on a 404 (nothing to schedule from) and ``None``
+    when the read failed (``error`` says why). ``value`` is the first literal
+    ``value`` any container sets for ``env_name``, ``None`` when none does."""
+    path = f"/apis/apps/v1/namespaces/{quote(namespace)}/daemonsets/{quote(name)}"
+    try:
+        status, body = _request("GET", path, timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, None, str(exc)
+    if status == 404:
+        return False, None, None
+    if status != 200:
+        return None, None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, None, "unparseable daemonset"
+    if not isinstance(doc, dict):
+        return None, None, "unparseable daemonset"
+    pod_spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+    for container in pod_spec.get("containers") or []:
+        for env in (container or {}).get("env") or []:
+            if (env or {}).get("name") == env_name and "value" in env:
+                return True, str(env.get("value") or ""), None
+    return True, None, None
+
+
 def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
     """``(registered, ready_and_schedulable, error)`` over ``/api/v1/nodes``.
 
@@ -2042,21 +2457,13 @@ def cluster_node_names(timeout: float = 5.0) -> tuple[list[str] | None, str | No
 
 
 _COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
+_KUBE_DNS_PATH = "/api/v1/namespaces/kube-system/services/kube-dns"
+#: #1718 — the kube-dns Service's ``trafficDistribution`` on a real cluster:
+#: a node's lookups go to the CoreDNS pod on that node while it is ready.
+_NODE_LOCAL_DNS = "PreferSameNode"
+#: The fast-evict tolerations earlier builds added (20 s on both keys). The
+#: reconciler now removes them wherever it finds them (#1753, below).
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
-_FAST_EVICT_TOLERATIONS = [
-    {
-        "key": "node.kubernetes.io/unreachable",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-    {
-        "key": "node.kubernetes.io/not-ready",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-]
 _COREDNS_SPREAD = {
     "podAntiAffinity": {
         "requiredDuringSchedulingIgnoredDuringExecution": [
@@ -2089,7 +2496,7 @@ def _merge_patch(target: Any, patch: Any) -> Any:
     return merged
 
 
-def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
+def ensure_coredns_ha() -> tuple[bool, str | None]:
     """Match the k3s-bundled CoreDNS to the cluster's NODE COUNT — returns
     (changed, error); ``(False, None)`` means converged or deferred.
 
@@ -2122,11 +2529,33 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
       REMOVED, pod anti-affinity REMOVED. Both buy exactly nothing with one
       hostname domain — worse, a 20 s unreachable toleration means a kubelet
       blip evicts the only DNS pod with nowhere to put it.
-    * **≥2 registered nodes → HA.** ``min(registered, max_replicas)``
-      replicas + fast-evict + required spread. The cap is 2 by default
-      because required anti-affinity places at most one pod per node, and
-      two is what surviving a node loss needs — a third on a 3-node cluster
-      costs memory for no extra failure tolerance.
+    * **≥2 registered nodes → HA.** One replica per registered node +
+      required spread, so every node runs its own CoreDNS.
+      This used to be capped at 2, on the reasoning that two survive a node
+      loss and a third buys no failure tolerance. #1718 showed what the
+      third buys. Until a lost node reads NotReady (about 40 s), its CoreDNS
+      pod stays a ready kube-dns endpoint, and kube-proxy keeps sending it
+      about half of every other node's lookups. Each one stalls for the
+      resolver's whole timeout. Redis Sentinel resolves its peers inside
+      its event loop, so the stalls put every surviving sentinel in TILT,
+      and the Redis failover took 77 s instead of seconds. With a replica
+      on every node and the kube-dns Service set to ``PreferSameNode``
+      (``ensure_kube_dns_node_local``), a pod's lookups stay on its own
+      node. A lost node then takes only its own pods' DNS with it.
+
+    #1753 — the HA shape no longer carries the fast-evict tolerations (20 s
+    on ``unreachable``/``not-ready``) that #590 added. ``tolerations`` is the
+    one pod-template field both this reconciler and k3s's bundled manifest
+    set. k3s force re-applies that manifest at every server start, which put
+    the list back to its own two entries: rollout one. The next seed
+    heartbeat patched the fast-evict pair back in: rollout two. So every
+    node's return replaced every CoreDNS pod twice, and lookups in flight to
+    the replaced pods stalled and put Redis Sentinel into TILT again. With one
+    replica per node, the eviction those tolerations hasten has nowhere to
+    go: the required spread leaves no node free for the evicted pod's
+    replacement. So the template now keeps k3s's own tolerations, and its
+    re-apply is a no-op. Any fast-evict entry found is removed, in both
+    shapes.
 
     The count is *registered* Node objects, deliberately, and deliberately
     NOT the ``control_plane_size`` that sizes every other appliance workload
@@ -2172,7 +2601,7 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         return False, "kubeapi reported no nodes"
 
     want_ha = registered >= 2
-    desired = min(registered, max_replicas) if want_ha else 1
+    desired = registered if want_ha else 1
 
     try:
         status, resp = _request("GET", _COREDNS_PATH)
@@ -2215,7 +2644,7 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         # above. Nulling the whole ``affinity`` here would take the operator's
         # other scheduling constraints with it.
         affinity_patch = {"podAntiAffinity": None}
-    want_tolerations = (keep + _FAST_EVICT_TOLERATIONS) if want_ha else keep
+    want_tolerations = keep
 
     # Whether the PATCH would actually rewrite the pod template, computed from
     # the body we are about to send rather than from ``template_ok``. The two
@@ -2278,6 +2707,205 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
             registered_nodes=registered,
             replicas=desired,
             shape="ha" if want_ha else "stock",
+        )
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+def ensure_kube_dns_node_local() -> tuple[bool, str | None]:
+    """Keep each pod's cluster-DNS lookups on its own node once the cluster has
+    a second node (#1718). Returns (changed, error), like ``ensure_coredns_ha``;
+    ``(False, None)`` means converged.
+
+    The kube-dns Service gets ``trafficDistribution: PreferSameNode``. With it,
+    kube-proxy sends a node's lookups to the CoreDNS pod on that node while that
+    pod is ready, and to every pod only while it is not. ``ensure_coredns_ha``
+    runs one replica per node, so a lost node's CoreDNS pod answers nobody
+    else's lookups. Without this, it stays a ready endpoint until the node reads
+    NotReady, and about half of every other node's lookups stall on it for the
+    resolver's whole timeout: Redis Sentinel's blocking peer lookups went into
+    TILT for over a minute, and the supervisor's own lookups failed with
+    EAI_AGAIN. On a single node the field is removed again: there every endpoint
+    is local, and stock is the target there (#750).
+
+    k3s's bundled ``coredns.yaml`` does not set the field, so k3s's re-apply at
+    every server start leaves it in place. It is still reconciled on every seed
+    heartbeat, like the Deployment.
+    """
+    registered, _schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        return False, "kubeapi reported no nodes"
+    want = _NODE_LOCAL_DNS if registered >= 2 else None
+    try:
+        status, resp = _request("GET", _KUBE_DNS_PATH)
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        svc = json.loads(resp)
+    except ValueError:
+        return False, "unparseable kube-dns service"
+    if not isinstance(svc, dict):
+        return False, "unparseable kube-dns service"
+    if (svc.get("spec") or {}).get("trafficDistribution") == want:
+        return False, None
+    # ``null`` deletes the key under a JSON merge-patch: stock again.
+    payload = json.dumps({"spec": {"trafficDistribution": want}}).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            _KUBE_DNS_PATH,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.kube_dns_traffic_reconciled",
+            registered_nodes=registered,
+            traffic_distribution=want,
+        )
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+#: #2240: the CNPG operator's Deployment as the spatium-bootstrap release
+#: renders it (the cloudnative-pg subchart under its ``cloudnative-pg``
+#: nameOverride, #277).
+_CNPG_OPERATOR_PATH = (
+    "/apis/apps/v1/namespaces/spatium/deployments/spatium-bootstrap-cloudnative-pg"
+)
+#: The term the chart's own PREFERRED rule carries (values.yaml ``cnpg.affinity``),
+#: made REQUIRED once the cluster can honour it.
+_CNPG_OPERATOR_SPREAD_TERM = {
+    "topologyKey": "kubernetes.io/hostname",
+    "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "cloudnative-pg"}},
+}
+#: Two replicas plus the surge pod a pod-template rollout adds while the old
+#: pods still hold their nodes.
+_CNPG_OPERATOR_REQUIRED_MIN_NODES = 3
+
+
+def ensure_cnpg_operator_spread() -> tuple[bool, str | None]:
+    """Keep the CloudNativePG operator's two replicas on different nodes once
+    the cluster has three. Returns (changed, error), like ``ensure_coredns_ha``;
+    ``(False, None)`` means converged, deferred or no operator.
+
+    #2240: the operator IS Postgres failover. While it is gone, nothing
+    promotes a new primary. #590 gave it two replicas, 20 s fast-evict
+    tolerations and a PREFERRED hostname anti-affinity (charts/
+    spatiumddi-appliance values.yaml ``cnpg``). But firstboot installs it on
+    the seed while the seed is the only node, so both replicas start there,
+    and preferred anti-affinity is IgnoredDuringExecution: Kubernetes never
+    rebalances running pods, so they stay on the seed as members join. A
+    seven-node cluster lost both at once when its seed was killed, and the
+    failover waited for their rescheduling. ``ensure_coredns_ha`` (#633)
+    records the same lesson for CoreDNS.
+
+    A REQUIRED rule cannot be the chart's default, for the reason the chart
+    gives: on one node the second replica could never schedule. It also
+    needs more than two nodes to be APPLIED. Changing the pod template starts
+    a rollout, and with two replicas the rollout surges one new pod and keeps
+    both old ones until it is Ready. The new pod must land on a node with no
+    operator pod, while the old pods still hold up to two: on two nodes that
+    is the #750 deadlock. So:
+
+    * **3 or more registered nodes**: the required term is added. The
+      rollout it starts moves the replicas apart, and the scheduler keeps
+      them apart from then on: a lost node's replica is replaced on a node
+      without one. While fewer than three nodes are Ready and uncordoned the
+      change is deferred to a later heartbeat, as ``ensure_coredns_ha``
+      defers its own.
+    * **fewer**: the term is removed, which is the chart's own template.
+      Never deferred: a preferred-only rollout can always place its surge
+      pod.
+
+    Registered Node objects, not ``control_plane_size``, for the reasons
+    ``ensure_coredns_ha`` gives: they are the hostname domains that exist, and
+    a node OUTAGE does not drop the count and undo the spread at the moment
+    it matters.
+
+    The patch is a JSON merge-patch that carries only
+    ``requiredDuringSchedulingIgnoredDuringExecution``. The chart's preferred
+    term and every other field stay exactly as Helm rendered them, so a later
+    helm upgrade of spatium-bootstrap (a slot upgrade) has nothing of its own
+    to revert: a three-way merge leaves a field the chart has never set. If a
+    reinstall drops the term anyway, the next heartbeat adds it again. A 404
+    means this appliance's bootstrap chart runs no operator: nothing to do.
+    """
+    registered, schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        # Same guard as ensure_coredns_ha: zero is a bad read, never a
+        # nodeless cluster, and acting on it would turn it into a rollout.
+        return False, "kubeapi reported no nodes"
+    want_required = registered >= _CNPG_OPERATOR_REQUIRED_MIN_NODES
+
+    try:
+        status, resp = _request("GET", _CNPG_OPERATOR_PATH)
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status == 404:
+        return False, None
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        dep = json.loads(resp)
+    except ValueError:
+        return False, "unparseable cnpg operator deployment"
+    if not isinstance(dep, dict):
+        return False, "unparseable cnpg operator deployment"
+    tmpl_spec = ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+    anti = (tmpl_spec.get("affinity") or {}).get("podAntiAffinity") or {}
+    current = anti.get("requiredDuringSchedulingIgnoredDuringExecution")
+
+    desired = [_CNPG_OPERATOR_SPREAD_TERM] if want_required else None
+    if (current or None) == desired:
+        return False, None
+    if want_required and schedulable < _CNPG_OPERATOR_REQUIRED_MIN_NODES:
+        log.info(
+            "supervisor.k8s_api.cnpg_operator_spread_deferred",
+            registered_nodes=registered,
+            schedulable_nodes=schedulable,
+        )
+        return False, None
+
+    # ``null`` deletes the key under a JSON merge-patch, restoring the chart's
+    # template; a list replaces the key whole.
+    payload = json.dumps(
+        {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "affinity": {
+                            "podAntiAffinity": {
+                                "requiredDuringSchedulingIgnoredDuringExecution": desired
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            _CNPG_OPERATOR_PATH,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.cnpg_operator_spread_reconciled",
+            registered_nodes=registered,
+            shape="required" if want_required else "chart",
         )
         return True, None
     return False, f"kubeapi status {status}: {resp[:200]!r}"

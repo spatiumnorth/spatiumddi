@@ -23,6 +23,12 @@ import {
   type AITestConnectionResult,
 } from "@/lib/api";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -34,6 +40,8 @@ interface ProviderForm {
   // null = leave existing key untouched on update; "" = explicitly clear;
   // any other value = set / replace.
   api_key: string | null;
+  // Whether the stored provider has a key (always false on create).
+  has_api_key: boolean;
   default_model: string;
   is_enabled: boolean;
   priority: string;
@@ -50,6 +58,7 @@ const EMPTY: ProviderForm = {
   kind: "openai_compat",
   base_url: "http://host.docker.internal:11434/v1",
   api_key: "",
+  has_api_key: false,
   default_model: "",
   is_enabled: true,
   priority: "100",
@@ -66,8 +75,9 @@ function formFromProvider(p: AIProvider): ProviderForm {
     base_url: p.base_url,
     // Edit modal starts with api_key=null so an unchanged save leaves
     // the stored ciphertext alone. Operator can paste a new value
-    // (replaces) or click "clear" (sets to "").
+    // (replaces) or tick "Remove the stored key" (sets to "").
     api_key: null,
+    has_api_key: p.has_api_key,
     default_model: p.default_model,
     is_enabled: p.is_enabled,
     priority: String(p.priority),
@@ -271,24 +281,43 @@ function ProviderEditor({
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
                 API key{" "}
                 <span className="text-muted-foreground/60">
-                  (leave blank to keep unchanged
                   {mode === "edit"
-                    ? ` — currently ${initial.api_key === null ? "stored" : "—"}`
-                    : ""}
-                  )
+                    ? initial.has_api_key
+                      ? "(a key is stored — leave blank to keep it)"
+                      : "(no key stored)"
+                    : "(optional)"}
                 </span>
               </label>
               <input
                 type="password"
                 value={form.api_key ?? ""}
-                onChange={(e) => set("api_key", e.target.value)}
+                // Blank = leave the stored key alone; removing it is the
+                // explicit checkbox below, which sends api_key "" (#2622).
+                onChange={(e) =>
+                  set("api_key", e.target.value === "" ? null : e.target.value)
+                }
+                disabled={form.api_key === ""}
                 placeholder={
                   mode === "edit"
-                    ? "Type to replace, or clear to remove"
+                    ? initial.has_api_key
+                      ? "Type to replace the stored key"
+                      : "Type to set a key"
                     : "Optional — local providers (Ollama, LM Studio) don't need one"
                 }
                 className={`${inputCls} font-mono text-xs`}
               />
+              {mode === "edit" && initial.has_api_key && (
+                <label className="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={form.api_key === ""}
+                    onChange={(e) =>
+                      set("api_key", e.target.checked ? "" : null)
+                    }
+                  />
+                  Remove the stored key
+                </label>
+              )}
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
@@ -591,6 +620,8 @@ function ModelPickerModal({
 
 export function AIProvidersPage() {
   const qc = useQueryClient();
+  // #2525 — the provider routes are superadmin-only whatever the grants.
+  const { isSuperadmin } = usePermissions();
   const providersQ = useQuery({
     queryKey: ["ai-providers"],
     queryFn: aiApi.listProviders,
@@ -741,7 +772,8 @@ export function AIProvidersPage() {
               setTestResult(null);
               setEditor({ mode: "create", initial: { ...EMPTY } });
             }}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             <Plus className="h-4 w-4" /> New provider
           </button>
@@ -778,8 +810,11 @@ export function AIProvidersPage() {
                       colSpan={7}
                       className="px-3 py-8 text-center text-muted-foreground"
                     >
-                      No providers configured. Click{" "}
-                      <strong>New provider</strong> to add one.
+                      {/* A refused read is not an empty list (#2525). */}
+                      <ListEmpty error={providersQ.error} what="AI providers">
+                        No providers configured. Click{" "}
+                        <strong>New provider</strong> to add one.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}

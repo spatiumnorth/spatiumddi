@@ -36,7 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
 from app.services._mirror_hostname import normalize_desired_hostname
-from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
+from app.services.integration_ownership import (
+    INTEGRATION_OWNERSHIP_FKS,
+    SpaceRelease,
+    owned_addresses_in_space,
+)
+from app.services.ipam.utilization import counts_toward_utilization
 
 _BIGINT_MAX = 2**63 - 1
 
@@ -142,6 +147,9 @@ class MirrorSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Parse helpers ────────────────────────────────────────────────────
@@ -381,7 +389,7 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
             select(func.count())
             .select_from(IPAddress)
             .where(IPAddress.subnet_id == subnet_id)
-            .where(IPAddress.status != "available")
+            .where(counts_toward_utilization())
         )
         or 0
     )
@@ -560,10 +568,10 @@ async def apply_addresses(
     subnets = list(
         (await db.execute(select(Subnet).where(Subnet.space_id == space_id))).scalars().all()
     )
-    current_rows = (
-        (await db.execute(select(IPAddress).where(getattr(IPAddress, owner.fk_attr) == target_id)))
-        .scalars()
-        .all()
+    # #2577 — only rows inside the target's space are ours to update or
+    # absence-delete; one carrying our FK elsewhere is released first.
+    current_rows = await owned_addresses_in_space(
+        db, owner.fk_attr, target_id, space_id, summary=summary
     )
     current = {str(a.address): a for a in current_rows}
     desired: dict[str, MirrorAddress] = {}

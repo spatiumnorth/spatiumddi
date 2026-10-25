@@ -12,7 +12,9 @@ Scope per run:
     row using the existing ``_sync_dns_record`` helper (so the auto-sync
     path and the manual commit path stay bit-identical);
   * optionally deletes auto-generated "stale" records when
-    ``dns_auto_sync_delete_stale`` is on;
+    ``dns_auto_sync_delete_stale`` is on — except a live address's own host
+    record and PTR when its name is blank, which are always retracted (the
+    address publishes nothing);
   * writes a single audit row per run with a per-subnet tally.
 """
 
@@ -34,6 +36,8 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -180,14 +184,9 @@ async def _run_auto_sync() -> dict[str, Any]:
 
             now = datetime.now(UTC)
             interval = timedelta(minutes=max(1, ps.dns_auto_sync_interval_minutes))
-            if ps.dns_auto_sync_last_run_at is not None:
-                elapsed = now - ps.dns_auto_sync_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(now, ps.dns_auto_sync_last_run_at, interval)
+            if skip is not None:
+                return skip
 
             # Only subnets with some DNS/DDNS binding do work (issue #522) —
             # skip the drift computation for the (common) no-binding majority.
@@ -237,23 +236,35 @@ async def _run_auto_sync() -> dict[str, Any]:
                         total_created += fired
                         touched_subnet_ids.add(subnet_id)
 
-                if (
-                    not report.missing
-                    and not report.mismatched
-                    and not (ps.dns_auto_sync_delete_stale and report.stale)
-                ):
+                # A live address with no name publishes nothing, so its own
+                # host record and PTR are retracted whatever
+                # ``dns_auto_sync_delete_stale`` says: that setting governs
+                # records left behind by deleted or orphaned addresses, not
+                # the withdrawal an address's own blank name asks for (the
+                # edit path does the same when a name is cleared).
+                stale_to_delete = [
+                    s.record_id
+                    for s in report.stale
+                    if ps.dns_auto_sync_delete_stale or s.blank_name_host_record
+                ]
+                if not report.missing and not report.mismatched and not stale_to_delete:
                     continue
 
                 body = DnsSyncCommitRequest(
                     create_for_ip_ids=[m.ip_id for m in report.missing],
                     update_record_ids=[m.record_id for m in report.mismatched],
-                    delete_stale_record_ids=(
-                        [s.record_id for s in report.stale] if ps.dns_auto_sync_delete_stale else []
-                    ),
+                    delete_stale_record_ids=stale_to_delete,
                 )
                 try:
+                    # #2577 — the report is this subnet's own, so its stale set
+                    # is both what is requested and what may be deleted: an
+                    # orphan in a zone the subnet shares is in it only when its
+                    # address lies inside the subnet.
                     created, updated, deleted, subnet_errors = await _apply_dns_sync(
-                        db, body, restrict_subnet_id=subnet_id
+                        db,
+                        body,
+                        allowed_stale_ids=[s.record_id for s in report.stale],
+                        restrict_subnet_id=subnet_id,
                     )
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"apply({subnet_id}): {exc}")
@@ -332,6 +343,7 @@ async def _run_auto_sync() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.ipam_dns_sync.auto_sync_ipam_dns", bind=True)
+@module_gated("core.dns")
 def auto_sync_ipam_dns(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval."""

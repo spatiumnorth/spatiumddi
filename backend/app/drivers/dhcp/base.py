@@ -194,8 +194,6 @@ class ScopeDef:
     options: dict[str, Any] = field(default_factory=dict)
     pools: tuple[PoolDef, ...] = ()
     statics: tuple[StaticAssignmentDef, ...] = ()
-    ddns_enabled: bool = False
-    ddns_hostname_policy: str = "client"
     is_active: bool = True
     # "ipv4" → Dhcp4 rendering, "ipv6" → Dhcp6 rendering. Defaults to "ipv4"
     # so legacy bundles (before address_family existed) keep working.
@@ -217,6 +215,13 @@ class ScopeDef:
     # must test ``is not None`` rather than truthiness.
     lease_cache_threshold: float | None = None
     lease_cache_max_age: int | None = None
+    # #2731: the names (in ``ConfigBundle.pxe_classes``) of the classes of the
+    # PXE profile bound to this scope, in evaluation order. Kea evaluates them
+    # for this subnet's clients only. Rendered for the whole server instead, a
+    # profile bound to one scope booted the PXE clients of every scope on it.
+    # Empty (the default) = no PXE class answers this scope. v4 scopes only,
+    # like the classes themselves.
+    pxe_class_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

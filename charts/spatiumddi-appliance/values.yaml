@@ -126,18 +126,29 @@ dnsBind9:
   # (the kernel kills named inside its cgroup) instead of the node's. It is
   # ONE value for the whole cluster, not sized per node: the role chart is
   # shared and must render the same on every node (#1137), and a DaemonSet
-  # takes one limit for all its pods. 2Gi holds the common lists; a list in
-  # the hundreds of thousands of entries needs more, see the sizing table in
-  # docs/features/DNS.md (8.x). Raise it with a HelmChartConfig on this chart
-  # (docs/deployment/APPLIANCE.md). The agent also derives named's
-  # ``max-cache-size`` from this limit (a quarter of it) so the resolver
-  # cache cannot eat the RPZ's share.
+  # takes one limit for all its pods. The memory limit and request are
+  # ``memory`` below, NOT ``resources``: the supervisor sizes them from node
+  # RAM (#2223) — a quarter of the SMALLEST node labelled for dns-bind9,
+  # rounded to whole GiB, floor 2Gi, cap 8Gi, with the request an eighth of
+  # the limit — because a fixed 2Gi was OOM-killed at about 2M records in
+  # ddi-pg's scale lab. The values here are the floor, which a render with no
+  # supervisor (``helm template``, a node whose RAM could not be read) gets.
+  # Zone data (#2223), measured at 20,000 zones and 1,000,000 records: named
+  # 868 MB resident, the agent at most 480 MB while it takes a bundle (~110
+  # MB between polls). A catalog blocklist in the hundreds of thousands of
+  # entries needs more, see the sizing table in docs/features/DNS.md (8.x).
+  # To pin a value, set ``resources.limits.memory`` (and/or
+  # ``resources.requests.memory``) with a HelmChartConfig on this chart
+  # (docs/deployment/APPLIANCE.md): an explicit ``resources`` memory always
+  # wins over ``memory``. The agent also derives named's ``max-cache-size``
+  # from the limit (a quarter of it) so the resolver cache cannot eat the
+  # RPZ's share.
   resources:
     requests:
       cpu: 250m
-      memory: 256Mi
-    limits:
-      memory: 2Gi
+  memory:
+    limit: 2Gi
+    request: 256Mi
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
   # controlPlaneUrl is the EXTERNAL operator-facing URL. #409 — the
@@ -365,6 +376,17 @@ dns:
   useMetalLBVIP: false
   vip: ""
   vipPool: spatium-control-plane
+  # #2223 — how long a DNS serving container (bind9 / powerdns / technitium)
+  # may take to start listening on :53 before it is restarted. The liveness
+  # probe (:53, 3 x 30 s) only starts once this has passed. A cold start
+  # renders and checks every zone before the daemon starts: measured with
+  # BIND 9.20, named-checkzone costs ~70 ms a zone, so 20,000 zones take
+  # ~23 minutes on a release without #2180's batched checks, and the agent
+  # first waits up to a long-poll for its bundle. 10 s x 360 = 60 minutes.
+  # Raise failureThreshold for a group much larger than that.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
 
 # Observer — placeholder for future metrics / log shipper role. No
 # service container in Phase 2; this just lets the supervisor pre-
@@ -581,6 +603,12 @@ cnpg:
   #  * fast-evict tolerations: even a co-located replica leaves a dead
   #    node in ~20 s instead of 300 s (suppresses DefaultTolerationSeconds,
   #    exactly like api/frontend/worker/postgresql/redis).
+  #
+  # #2240: preferred alone never moves the replicas once both run on the
+  # seed, which is where firstboot starts them. From three nodes the seed
+  # supervisor adds the REQUIRED form of this term to the Deployment itself
+  # (k8s_api.ensure_cnpg_operator_spread) and removes it below three; keep
+  # this term's selector in step with it.
   replicaCount: 2
   affinity:
     podAntiAffinity:

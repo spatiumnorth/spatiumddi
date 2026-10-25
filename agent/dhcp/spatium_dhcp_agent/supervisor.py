@@ -26,6 +26,7 @@ from .leases import LeaseWatcher
 from .log_shipper import LogShipper
 from .mac_sighting import MacSightingShipper
 from .metrics import MetricsPoller
+from .oom_watch import OomWatch, cgroup_memory_limit_bytes
 from .peer_resolve import PeerResolveWatcher
 from .ra_sniffer import RASnifferShipper
 from .spool import SpoolManager
@@ -89,6 +90,11 @@ def run(cfg: AgentConfig) -> int:
 
     spools = build_spool_manager(cfg)
     heartbeat = HeartbeatClient(cfg, token_ref, spool_manager=spools)
+    # #2023 — the OOM-kill baseline is read before anything else runs, and the
+    # record a previous run left in the state dir is reported from the first
+    # heartbeat on, so a crash loop does not read ``ok`` between restarts.
+    oom = OomWatch(cfg.state_dir, limit_bytes=cgroup_memory_limit_bytes())
+    heartbeat.oom_watch = oom
     ha_poller = HAStatusPoller(cfg, token_ref)
     # Construct the watcher first (SyncLoop needs the reference in its
     # ``__init__``), then arm it once the SyncLoop exists. Issue #265 —
@@ -229,6 +235,13 @@ def run(cfg: AgentConfig) -> int:
 
     while not stopping.is_set():
         time.sleep(1.0)
+        # #2023 — Kea is not our child (the entrypoint supervises it), so the
+        # cgroup's OOM counter is the only way to see it die to the limit.
+        # Telemetry must never cost the supervisor loop.
+        try:
+            oom.poll()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("dhcp_oom_poll_failed", error=str(exc))
         # If any critical thread died, bubble up so the container restarts.
         dead = [t.name for t in threads if not t.is_alive()]
         if dead:

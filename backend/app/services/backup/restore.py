@@ -67,6 +67,12 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.legacy_columns import (
+    disabled_since,
+    disabled_warning,
+    fold_dropped_plaintext_columns,
+    selective_readd_sql,
+)
 from app.services.backup.migrations import (
     MigrationOutcome,
     maybe_upgrade_after_restore,
@@ -78,6 +84,7 @@ from app.services.backup.rewrap import (
     RewrapOutcome,
     rewrap_secrets,
 )
+from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
 
 logger = structlog.get_logger(__name__)
 
@@ -124,6 +131,9 @@ class RestoreOutcome:
     # destination agent and produces *new* DS records the operator
     # must re-publish to the parent registrar.
     warnings: list[str] = field(default_factory=list)
+    # Backup targets whose ``in_progress`` claim came back inside the
+    # archive and was settled (#2097). Empty when none.
+    reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -764,6 +774,10 @@ def _selective_prelude(tables: list[str]) -> str:
         + _REFUSE_A_WIDER_CASCADE_SQL.format(tables=array)
         + f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE;\n"
         + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=array)
+        # An archive taken before a contract migration still names the
+        # columns it dropped; put them back so its COPY loads. The restore
+        # folds and drops them again after the migration step.
+        + selective_readd_sql(tables)
     )
 
 
@@ -901,7 +915,44 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    _prune_pre_restore_safety_dumps(keep=out_path)
     return str(out_path)
+
+
+def _prune_pre_restore_safety_dumps(*, keep: Path) -> None:
+    """Keep the newest ``PRE_RESTORE_KEEP_LAST_N`` safety dumps in
+    ``PRE_RESTORE_DIR`` and delete the rest.
+
+    Each dump holds the SECRET_KEY under a passphrase anyone can read in
+    this file, so old copies are not harmless clutter. A target's
+    retention already prunes them when a local-volume target points at
+    this directory; without one they used to accumulate. Runs only after
+    a new dump is written, never removes ``keep`` (the dump just taken),
+    and only touches regular files named like a safety dump. A failure to
+    delete is logged and does not fail the restore.
+    """
+    try:
+        dumps = [
+            p
+            for p in PRE_RESTORE_DIR.iterdir()
+            if p.name.startswith(PRE_RESTORE_PREFIX)
+            and p.name.endswith(".zip")
+            and not p.is_symlink()
+            and p.is_file()
+        ]
+        dumps.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError as exc:
+        logger.warning("pre_restore_safety_prune_failed", path=str(PRE_RESTORE_DIR), error=str(exc))
+        return
+    # The dump just written counts first whatever its mtime says, so a
+    # clock step cannot make the prune delete it.
+    ordered = [keep] + [p for p in dumps if p != keep]
+    for dump in ordered[max(PRE_RESTORE_KEEP_LAST_N, 1) :]:
+        try:
+            dump.unlink()
+            logger.info("pre_restore_safety_dump_pruned", path=str(dump))
+        except OSError as exc:
+            logger.warning("pre_restore_safety_prune_failed", path=str(dump), error=str(exc))
 
 
 async def _collect_post_restore_warnings(db_url: str) -> list[str]:
@@ -982,6 +1033,24 @@ _RESTORE_LOCK_HOLDERS_SQL = (
     f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
     "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
 )
+
+
+async def restore_lock_held(db) -> bool:
+    """True while a restore holds the install-wide restore lock (#2097).
+
+    A read of ``pg_locks``, not a ``pg_try_advisory_lock``: taking the lock,
+    even for an instant, would refuse a restore that started in that instant
+    as "already in progress". Nothing here blocks or changes state.
+
+    The lock is held from before the replay until after the restore has
+    settled the run claims its archive carried, so a caller that sees it
+    free has either run before the replay or after the settle — never in the
+    window between the replay's commit and the settle, where a restored
+    claim reads as two hours old with nothing behind it.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    return bool(await db.scalar(text(f"SELECT EXISTS ({_RESTORE_LOCK_HOLDERS_SQL})")))
 
 
 async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
@@ -1307,6 +1376,37 @@ async def _apply_backup_restore_inner(
             error=f"migration step aborted: {exc}",
         )
 
+    # Phase 6b: a selective restore of an archive taken before a contract
+    # migration re-added the plaintext secret columns that migration dropped
+    # (see ``_selective_prelude``). Encrypt whatever they hold into their
+    # empty ``*_encrypted`` columns and drop them again, leaving each target
+    # written into disabled with an audit row, as the migration does. Before
+    # the rewrap: the values are encrypted under this install's key, which
+    # the rewrap recognises and leaves alone. Non-fatal, like the steps
+    # around it.
+    fold_warning: str | None = None
+    try:
+        fold = await fold_dropped_plaintext_columns(db_url)
+        disabled_names = [t.display for t in fold.disabled]
+        # The upgrade step's migration runs the same fold (a full restore, or
+        # a selective one whose archive sits before the drop) and records it
+        # only in the audit log; name those targets too.
+        try:
+            for name in await disabled_since(db_url, started):
+                if name not in disabled_names:
+                    disabled_names.append(name)
+        except Exception as exc:  # noqa: BLE001 — a report, not the fold
+            logger.warning("backup_restore_disabled_targets_scan_failed", error=str(exc))
+        if disabled_names:
+            fold_warning = disabled_warning(disabled_names)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("backup_restore_legacy_plaintext_fold_failed", error=str(exc))
+        fold_warning = (
+            "Plaintext columns from an older archive could not be folded into "
+            f"their encrypted columns ({exc}). They are not read by the "
+            "application; re-run the restore once the cause is fixed."
+        )
+
     # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and
     # re-encrypts with the destination install's key. No-op when
@@ -1317,31 +1417,36 @@ async def _apply_backup_restore_inner(
     # been renamed across migrations).
     from app.config import settings as _settings  # noqa: PLC0415
 
-    try:
-        rewrap_outcome = await rewrap_secrets(
-            db_url=db_url,
-            source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
-            source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
-            or "",
-            dest_secret_key=_settings.secret_key,
-            dest_credential_key=_settings.credential_encryption_key or "",
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Rewrap failure shouldn't blow away the whole restore —
-        # the data is in. Log loudly + surface in the response so
-        # the operator knows to apply the recovered SECRET_KEY
-        # manually.
-        #
-        # ``rewrap_secrets`` now absorbs walk failures itself and returns
-        # a partial outcome with ``aborted=True``, precisely so the
-        # counters survive; this branch is the backstop for something
-        # raised before it could (a bad key pair, say). A fresh
-        # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
-        # was NOT honest when it also swallowed a mid-walk abort (#781).
-        logger.error("backup_restore_rewrap_failed", error=str(exc))
+    if "platform_secret_key" not in secrets_payload:
+        # An exclude-secrets archive carries no key, and every value it
+        # would have decrypted was scrubbed from the dump: nothing to rewrap.
         rewrap_outcome = RewrapOutcome()
-        rewrap_outcome.aborted = True
-        rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
+    else:
+        try:
+            rewrap_outcome = await rewrap_secrets(
+                db_url=db_url,
+                source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
+                source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
+                or "",
+                dest_secret_key=_settings.secret_key,
+                dest_credential_key=_settings.credential_encryption_key or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Rewrap failure shouldn't blow away the whole restore —
+            # the data is in. Log loudly + surface in the response so
+            # the operator knows to apply the recovered SECRET_KEY
+            # manually.
+            #
+            # ``rewrap_secrets`` now absorbs walk failures itself and returns
+            # a partial outcome with ``aborted=True``, precisely so the
+            # counters survive; this branch is the backstop for something
+            # raised before it could (a bad key pair, say). A fresh
+            # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
+            # was NOT honest when it also swallowed a mid-walk abort (#781).
+            logger.error("backup_restore_rewrap_failed", error=str(exc))
+            rewrap_outcome = RewrapOutcome()
+            rewrap_outcome.aborted = True
+            rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish
@@ -1352,9 +1457,50 @@ async def _apply_backup_restore_inner(
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
 
+    # #2097 — the archive holds its own run's ``in_progress`` claim. Settle
+    # it now, or the target refuses Run now and sits off its schedule until
+    # the 2 h reap marks a run that succeeded as failed. Needs the
+    # backup-target table to have been restored.
+    reconciled: list[dict[str, Any]] = []
+    if restored_tables is None or "backup_target" in restored_tables:
+        try:
+            from sqlalchemy.ext.asyncio import (  # noqa: PLC0415
+                async_sessionmaker,
+                create_async_engine,
+            )
+            from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+            from app.db import _json_serializer, task_connect_args  # noqa: PLC0415
+            from app.services.backup.runner import (  # noqa: PLC0415
+                reconcile_restored_run_claims,
+            )
+
+            # The database the restore just wrote (``db_url``), as every
+            # other phase uses — not the app's pooled engine, which Phase 4
+            # disposed and which need not point at the same database.
+            reconcile_engine = create_async_engine(
+                db_url,
+                poolclass=NullPool,
+                json_serializer=_json_serializer,
+                connect_args=task_connect_args(),
+            )
+            try:
+                async with async_sessionmaker(reconcile_engine, expire_on_commit=False)() as rdb:
+                    reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+            finally:
+                await reconcile_engine.dispose()
+        except Exception as exc:  # noqa: BLE001 — the data is in; the 2 h reap still backstops
+            logger.warning("backup_restore_reconcile_failed", error=str(exc))
+            post_warnings.append(
+                "Could not settle backup targets left 'in progress' by the restored "
+                f"archive ({exc}); they free themselves after 2 hours."
+            )
+
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
+    if fold_warning:
+        post_warnings.append(fold_warning)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
@@ -1418,4 +1564,5 @@ async def _apply_backup_restore_inner(
         migration=migration_outcome,
         rewrap=rewrap_outcome,
         warnings=post_warnings,
+        reconciled_backup_targets=reconciled,
     )

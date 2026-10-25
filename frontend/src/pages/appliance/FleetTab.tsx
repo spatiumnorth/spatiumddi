@@ -8,7 +8,6 @@ import {
   AlertCircle,
   Ban,
   CheckCircle2,
-  DownloadCloud,
   FileText,
   HardDrive,
   KeyRound,
@@ -21,7 +20,6 @@ import {
   ShieldCheck,
   ShieldQuestion,
   Trash2,
-  Upload,
   XCircle,
 } from "lucide-react";
 
@@ -43,7 +41,6 @@ import {
   type StorageActionRequest,
   type StorageActionResult,
   type SupervisorCapabilities,
-  type AvailableUpgradeImage,
   type UpgradeImage,
   type SchemaRollbackCheck,
   formatApiError,
@@ -59,6 +56,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { isHeartbeatStale, silenceLabel } from "@/lib/heartbeat";
 import { releaseVerdict, upgradeDirection } from "@/lib/versions";
 import {
   formatEta,
@@ -78,6 +76,7 @@ import { SNMPTab } from "./SNMPTab";
 import { SSHTab } from "./SSHTab";
 import { SyslogTab } from "./SyslogTab";
 import { UpgradeDirectionNotice } from "./UpgradeDirectionNotice";
+import { UpgradeImagesTable } from "./UpgradeImagesTable";
 // #404 — these three moved out of the top-level tab bar into this sidebar.
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
@@ -186,13 +185,17 @@ function capabilityChips(caps: SupervisorCapabilities): {
 function serviceChips(row: ApplianceRow): {
   key: string;
   label: string;
-  status: "ready" | "failed" | "pending" | "neutral";
+  status: "ready" | "failed" | "pending" | "neutral" | "stale";
 }[] {
   const roles = row.assigned_roles ?? [];
   if (roles.length === 0) return [];
   const lifecycle = row.role_switch_state;
-  const serviceStatus: "ready" | "failed" | "pending" =
-    lifecycle === "ready"
+  // #2259 — a silent supervisor's last report is history, not state:
+  // every chip (observer included) renders as "stale" instead.
+  const stale = row.state === "approved" && isHeartbeatStale(row.last_seen_at);
+  const serviceStatus: "ready" | "failed" | "pending" | "stale" = stale
+    ? "stale"
+    : lifecycle === "ready"
       ? "ready"
       : lifecycle === "failed"
         ? "failed"
@@ -200,7 +203,7 @@ function serviceChips(row: ApplianceRow): {
   const out: {
     key: string;
     label: string;
-    status: "ready" | "failed" | "pending" | "neutral";
+    status: "ready" | "failed" | "pending" | "neutral" | "stale";
   }[] = [];
   if (roles.includes("dns-bind9"))
     out.push({ key: "dns-bind9", label: "DNS · BIND9", status: serviceStatus });
@@ -225,14 +228,20 @@ function serviceChips(row: ApplianceRow): {
       status: serviceStatus,
     });
   if (roles.includes("observer"))
-    out.push({ key: "observer", label: "Observer", status: "neutral" });
+    out.push({
+      key: "observer",
+      label: "Observer",
+      status: stale ? "stale" : "neutral",
+    });
   return out;
 }
 
 const SERVICE_CHIP_STYLES: Record<
-  "ready" | "failed" | "pending" | "neutral",
+  "ready" | "failed" | "pending" | "neutral" | "stale",
   string
 > = {
+  stale:
+    "bg-muted text-muted-foreground border-dashed border-border opacity-70",
   ready:
     "bg-emerald-500/15 text-emerald-700 border-emerald-500/40 dark:text-emerald-300",
   failed: "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
@@ -1231,12 +1240,14 @@ export function FleetTab({
       <main className="flex-1 overflow-y-auto">
         {/* The appliances list is a wide multi-column table — let it use
             the full pane width (like the IPAM table) instead of the
-            max-w-5xl cap the narrower config forms (pairing / upgrade-images
-            / NTP / SNMP) read better at. */}
+            max-w-5xl cap the narrower config forms (pairing / NTP / SNMP)
+            read better at. Upgrade images is a wide table too (#2410). */}
         <div
           className={cn(
             "mx-auto p-6",
-            view === "appliances" ? "max-w-none" : "max-w-5xl",
+            view === "appliances" || view === "upgrade-images"
+              ? "max-w-none"
+              : "max-w-5xl",
           )}
         >
           {view === "pairing" && (
@@ -1271,15 +1282,7 @@ export function FleetTab({
                   Refresh
                 </button>
               </div>
-              <p className="mb-4 text-xs text-muted-foreground">
-                Stage an appliance OS upgrade image. Connected installs can
-                import directly from a GitHub release; air-gapped installs
-                upload the <code>.raw.xz</code> out-of-band. Either way the
-                supervisor downloads through the control plane via an
-                authenticated internal URL once an OS upgrade points at the
-                stored row.
-              </p>
-              <UpgradeImageManager />
+              <UpgradeImagesTable />
             </div>
           )}
 
@@ -1954,13 +1957,15 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
             SERVICE_CHIP_STYLES[s.status],
           )}
           title={
-            s.status === "ready"
-              ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
-              : s.status === "failed"
-                ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
-                : s.status === "pending"
-                  ? `Assigned, supervisor hasn't reported ready yet`
-                  : `Assigned (no service container — supervisor is the runtime)`
+            s.status === "stale"
+              ? `Last reported state — no heartbeat for ${silenceLabel(row.last_seen_at!)}, so this may no longer be true`
+              : s.status === "ready"
+                ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
+                : s.status === "failed"
+                  ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
+                  : s.status === "pending"
+                    ? `Assigned, supervisor hasn't reported ready yet`
+                    : `Assigned (no service container — supervisor is the runtime)`
           }
         >
           {s.status === "ready" && <CheckCircle2 className="h-2.5 w-2.5" />}
@@ -2374,6 +2379,15 @@ function ApplianceTableRow({
       </td>
       <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.last_seen_at)}
+        {row.state === "approved" && isHeartbeatStale(row.last_seen_at) && (
+          <div
+            className="mt-0.5 inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300"
+            title="The supervisor has stopped heartbeating; role and service state shown for this node is its last report."
+          >
+            <AlertCircle className="h-2.5 w-2.5" />
+            no heartbeat for {silenceLabel(row.last_seen_at!)}
+          </div>
+        )}
       </td>
       <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
         <div className="inline-flex items-center gap-1">
@@ -3011,6 +3025,7 @@ const WATCHDOG_STATUS_STYLES: Record<
 };
 
 function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
+  const stale = isHeartbeatStale(row.last_seen_at);
   const entries = Object.entries(row.role_health ?? {});
   // Show services in a stable order — alphabetical by service name.
   entries.sort(([a], [b]) => a.localeCompare(b));
@@ -3025,7 +3040,22 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         didn&apos;t bring the container back; SSH in and check{" "}
         <code>docker logs &lt;service&gt;</code>.
       </p>
-      <div className="mt-2 overflow-hidden rounded-md border">
+      {stale && (
+        <div
+          role="alert"
+          className="mt-2 flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          No heartbeat for {silenceLabel(row.last_seen_at!)} — this is the last
+          snapshot the supervisor reported, not current state.
+        </div>
+      )}
+      <div
+        className={cn(
+          "mt-2 overflow-hidden rounded-md border",
+          stale && "opacity-60 grayscale",
+        )}
+      >
         <table className="w-full text-xs">
           <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
             <tr>
@@ -6214,410 +6244,6 @@ function ApplianceOsUpgradeSection({
           }}
           onClose={() => setSchemaRefusal(null)}
           requireCheckboxLabel="I will restore a pre-upgrade copy of the database"
-        />
-      )}
-    </div>
-  );
-}
-
-// #1026 — a release that publishes an image for both architectures is
-// TWO importable rows sharing one tag, so the picker's value has to
-// carry the architecture as well. Keyed on both rather than on an array
-// index, which would silently re-point at a different release the
-// moment the list refreshed underneath the operator.
-function availableKey(r: AvailableUpgradeImage): string {
-  return `${r.tag}\u0000${r.architecture}`;
-}
-
-function splitAvailableKey(key: string): [string, string | undefined] {
-  const [tag, arch] = key.split("\u0000");
-  return [tag, arch || undefined];
-}
-
-// ── UpgradeImageManager (#170 follow-up; GitHub import + air-gap
-// upload — #199) ──────────────────────────────────────────────────
-
-type UpgradeSourceMode = "github" | "upload";
-
-function UpgradeImageManager() {
-  const qc = useQueryClient();
-  const [file, setFile] = useState<File | null>(null);
-  const [sha256, setSha256] = useState("");
-  const [applianceVersion, setApplianceVersion] = useState("");
-  // #1026 — declared, like the version beside it. Empty means UNKNOWN
-  // and is a legitimate answer: the control-plane gate then does not
-  // block, and ``spatium-upgrade-slot`` still re-checks the real
-  // decompressed image against the node's own uname before it writes.
-  const [architecture, setArchitecture] = useState("");
-  const [notes, setNotes] = useState("");
-  const [progress, setProgress] = useState<{
-    loaded: number;
-    total: number;
-  } | null>(null);
-  // GitHub-import picker state.
-  const [selectedTag, setSelectedTag] = useState("");
-  // ``null`` = auto-detect once the ``available`` query resolves:
-  // GitHub if reachable + has matching releases, else air-gap upload.
-  const [mode, setMode] = useState<UpgradeSourceMode | null>(null);
-  // Upgrade images are heavy (typically ~700 MiB raw.xz) and a misclick
-  // wipes the only on-server copy of an air-gap-cached release — gate
-  // the delete behind a typed-confirm modal.
-  const [deleteTarget, setDeleteTarget] = useState<UpgradeImage | null>(null);
-
-  const imagesQuery = useQuery({
-    queryKey: ["appliance", "upgrade-images"],
-    queryFn: applianceUpgradeImagesApi.list,
-    staleTime: 30_000,
-  });
-
-  // Connected-install picker source. Empty / unreachable ⇒ the UI
-  // auto-defaults to the air-gap upload tab.
-  const availableQuery = useQuery({
-    queryKey: ["appliance", "upgrade-images", "available"],
-    queryFn: applianceUpgradeImagesApi.listAvailable,
-    staleTime: 60_000,
-  });
-  const available = availableQuery.data?.available ?? [];
-  const githubReachable = availableQuery.data?.github_reachable ?? false;
-  const effectiveMode: UpgradeSourceMode =
-    mode ?? (githubReachable && available.length > 0 ? "github" : "upload");
-
-  // Default-select the newest available tag once the list lands.
-  useEffect(() => {
-    if (!selectedTag && available.length > 0)
-      setSelectedTag(availableKey(available[0]));
-  }, [available, selectedTag]);
-
-  const upload = useMutation({
-    mutationFn: () =>
-      applianceUpgradeImagesApi.upload(
-        file!,
-        sha256.trim().toLowerCase(),
-        applianceVersion.trim(),
-        notes.trim() || undefined,
-        (loaded, total) => setProgress({ loaded, total }),
-        architecture || undefined,
-      ),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
-      setFile(null);
-      setSha256("");
-      setApplianceVersion("");
-      setArchitecture("");
-      setNotes("");
-      setProgress(null);
-    },
-    onError: () => setProgress(null),
-  });
-
-  const importGithub = useMutation({
-    mutationFn: () => {
-      const [tag, arch] = splitAvailableKey(selectedTag);
-      return applianceUpgradeImagesApi.importFromGithub(tag, arch);
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
-    },
-  });
-
-  const remove = useMutation({
-    mutationFn: (id: string) => applianceUpgradeImagesApi.remove(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
-      setDeleteTarget(null);
-    },
-  });
-
-  return (
-    <div className="space-y-3 text-xs">
-      <p className="text-muted-foreground">
-        Connected installs import the upgrade image straight from a GitHub
-        release — the control plane downloads + verifies it for you. Air-gapped
-        installs download the <code>.raw.xz</code> + its <code>.sha256</code>{" "}
-        sidecar out-of-band and upload it here. Either way the backend verifies
-        the SHA-256 before storing, and the appliance pulls through the control
-        plane via an authenticated internal URL when an OS upgrade is scheduled.
-      </p>
-
-      {/* Source toggle — auto-defaults to GitHub when reachable. */}
-      <div className="inline-flex rounded-md border p-0.5">
-        <button
-          type="button"
-          onClick={() => setMode("github")}
-          className={cn(
-            "rounded px-3 py-1",
-            effectiveMode === "github"
-              ? "bg-primary/10 font-medium text-primary"
-              : "text-muted-foreground hover:bg-muted",
-          )}
-        >
-          Pick from GitHub Releases
-        </button>
-        <button
-          type="button"
-          onClick={() => setMode("upload")}
-          className={cn(
-            "rounded px-3 py-1",
-            effectiveMode === "upload"
-              ? "bg-primary/10 font-medium text-primary"
-              : "text-muted-foreground hover:bg-muted",
-          )}
-        >
-          Upload (air-gap)
-        </button>
-      </div>
-
-      {effectiveMode === "github" ? (
-        <div className="rounded-md border p-3">
-          {availableQuery.isLoading ? (
-            <div className="flex items-center gap-2 text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking GitHub
-              releases…
-            </div>
-          ) : !githubReachable ? (
-            <p className="text-muted-foreground">
-              GitHub isn&apos;t reachable from the control plane. Use the{" "}
-              <strong>Upload (air-gap)</strong> tab instead.
-            </p>
-          ) : available.length === 0 ? (
-            <p className="text-muted-foreground">
-              No recent GitHub release carries an importable appliance upgrade
-              image yet.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              <div>
-                <label className="text-muted-foreground">Release</label>
-                <select
-                  value={selectedTag}
-                  onChange={(e) => setSelectedTag(e.target.value)}
-                  className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-                >
-                  {available.map((r) => (
-                    <option key={availableKey(r)} value={availableKey(r)}>
-                      {r.tag}
-                      {` · ${r.architecture}`}
-                      {r.is_prerelease ? " (pre-release)" : ""}
-                      {r.is_installed ? " · installed" : ""}
-                      {r.size_bytes
-                        ? ` · ${(r.size_bytes / (1024 * 1024)).toFixed(0)} MiB`
-                        : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => importGithub.mutate()}
-                  disabled={!selectedTag || importGithub.isPending}
-                  className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {importGithub.isPending ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <DownloadCloud className="h-3.5 w-3.5" />
-                  )}
-                  Import
-                </button>
-                {importGithub.isPending && (
-                  <span className="text-[11px] text-muted-foreground">
-                    Downloading + verifying on the control plane — this can take
-                    a few minutes for a ~700 MiB image.
-                  </span>
-                )}
-                {importGithub.error && (
-                  <span className="text-rose-700 dark:text-rose-300">
-                    {formatApiError(importGithub.error)}
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="rounded-md border p-3">
-          <div className="grid gap-2 sm:grid-cols-2">
-            <div>
-              <label className="text-muted-foreground">.raw.xz file</label>
-              <input
-                type="file"
-                accept=".xz,.raw.xz,application/octet-stream"
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                className="mt-1 block w-full text-xs"
-              />
-              {file && (
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MiB
-                </p>
-              )}
-            </div>
-            <div>
-              <label className="text-muted-foreground">Appliance version</label>
-              <input
-                value={applianceVersion}
-                onChange={(e) => setApplianceVersion(e.target.value)}
-                placeholder="e.g. 2026.06.01-1"
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-              />
-            </div>
-            <div>
-              <label className="text-muted-foreground">Architecture</label>
-              <select
-                value={architecture}
-                onChange={(e) => setArchitecture(e.target.value)}
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-              >
-                <option value="">Unknown (don't check)</option>
-                <option value="amd64">amd64 (x86-64)</option>
-                <option value="arm64">arm64 (AArch64)</option>
-              </select>
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                From the asset name you downloaded. Lets the control plane
-                refuse this image for a node of the other architecture before
-                scheduling; the appliance re-checks the real image either way.
-              </p>
-            </div>
-            <div className="sm:col-span-2">
-              <label className="text-muted-foreground">SHA-256 (hex)</label>
-              <input
-                value={sha256}
-                onChange={(e) => setSha256(e.target.value)}
-                placeholder="paste from the .sha256 sidecar (64 lowercase hex chars)"
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono"
-              />
-            </div>
-            <div className="sm:col-span-2">
-              <label className="text-muted-foreground">Notes (optional)</label>
-              <input
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                placeholder="e.g. RC1 — verified by ops on 2026-06-01"
-                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-              />
-            </div>
-          </div>
-          <div className="mt-3 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => upload.mutate()}
-              disabled={
-                !file ||
-                sha256.trim().length !== 64 ||
-                !applianceVersion.trim() ||
-                upload.isPending
-              }
-              className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {upload.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Upload className="h-3.5 w-3.5" />
-              )}
-              Upload
-            </button>
-            {progress && progress.total > 0 && (
-              <span className="text-[11px] text-muted-foreground">
-                {((progress.loaded / progress.total) * 100).toFixed(0)}% ·{" "}
-                {(progress.loaded / (1024 * 1024)).toFixed(1)} /{" "}
-                {(progress.total / (1024 * 1024)).toFixed(1)} MiB
-              </span>
-            )}
-            {upload.error && (
-              <span className="text-rose-700 dark:text-rose-300">
-                {formatApiError(upload.error)}
-              </span>
-            )}
-          </div>
-        </div>
-      )}
-
-      {imagesQuery.isLoading ? (
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
-        </div>
-      ) : (imagesQuery.data ?? []).length === 0 ? (
-        <p className="text-muted-foreground">No uploaded upgrade images yet.</p>
-      ) : (
-        <table className="w-full">
-          <thead className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            <tr>
-              <th className="px-2 py-1 text-left">Filename</th>
-              <th className="px-2 py-1 text-left">Version</th>
-              <th className="px-2 py-1 text-left">Size</th>
-              <th className="px-2 py-1 text-left">SHA-256</th>
-              <th className="px-2 py-1 text-left">Uploaded</th>
-              <th className="px-2 py-1 text-right"></th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {(imagesQuery.data ?? []).map((img: UpgradeImage) => (
-              <tr key={img.id}>
-                <td className="px-2 py-1">
-                  <div className="font-medium">{img.filename}</div>
-                  {img.notes && (
-                    <div className="text-[11px] text-muted-foreground">
-                      {img.notes}
-                    </div>
-                  )}
-                </td>
-                <td className="px-2 py-1 font-mono">{img.appliance_version}</td>
-                <td className="px-2 py-1 font-mono">
-                  {(img.size_bytes / (1024 * 1024)).toFixed(0)} MiB
-                </td>
-                <td className="px-2 py-1 font-mono">
-                  {img.sha256.slice(0, 12)}…{img.sha256.slice(-6)}
-                </td>
-                <td className="px-2 py-1">{relativeTime(img.uploaded_at)}</td>
-                <td className="px-2 py-1 text-right">
-                  <button
-                    type="button"
-                    onClick={() => setDeleteTarget(img)}
-                    className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-0.5 hover:bg-muted"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                    Delete
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {deleteTarget && (
-        <ConfirmModal
-          open
-          title="Delete upgrade image?"
-          message={
-            <>
-              <p className="text-sm">
-                Delete the staged <code>.raw.xz</code> for{" "}
-                <strong>{deleteTarget.appliance_version}</strong>? The on-server
-                copy is removed and any in-flight OS upgrade pointing at it will
-                fail with a 404 on the next fetch. Re-staging it (upload or
-                GitHub import) is operator-effort — typically a few hundred MiB.
-              </p>
-              {deleteTarget.notes && (
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Notes:{" "}
-                  <span className="text-foreground">{deleteTarget.notes}</span>
-                </p>
-              )}
-              <p className="mt-2 text-xs text-muted-foreground">
-                SHA-256:{" "}
-                <code className="text-foreground">
-                  {deleteTarget.sha256.slice(0, 12)}…
-                  {deleteTarget.sha256.slice(-6)}
-                </code>
-              </p>
-            </>
-          }
-          confirmLabel="Delete"
-          tone="destructive"
-          loading={remove.isPending}
-          onConfirm={() => remove.mutate(deleteTarget.id)}
-          onClose={() => setDeleteTarget(null)}
         />
       )}
     </div>

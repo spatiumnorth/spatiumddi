@@ -81,7 +81,9 @@ def test_parse_feed_adblock() -> None:
 ||bad.example.org/
 """
     domains = parse_feed(text, "adblock")
-    assert set(domains) == {"ads.example.com", "tracker.example.net", "bad.example.org"}
+    # #2123 — a ``$third-party`` rule narrows the block, and ``||host/`` is a
+    # path rule: neither is widened into an unconditional block any more.
+    assert domains == ["ads.example.com"]
 
 
 def test_parse_feed_domains() -> None:
@@ -351,6 +353,7 @@ async def test_feed_sync_counts_and_wildcards(
     body = "a.example.com\nb.example.com\n*.wild.example.com\n"
 
     class _Resp:
+        is_redirect = False  # the guarded fetch follows redirects by hand
         text = body
 
         def raise_for_status(self) -> None:
@@ -450,6 +453,7 @@ async def test_feed_wildcard_flag_defaults_on_and_drives_new_rows(
 
     async def _run(bl_id: str, body: str) -> None:
         class _Resp:
+            is_redirect = False  # the guarded fetch follows redirects by hand
             text = body
 
             def raise_for_status(self) -> None:

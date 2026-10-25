@@ -1,3 +1,4 @@
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -785,17 +786,34 @@ export function SitesPage() {
     [items, selectedIds],
   );
 
+  // A delete can be refused (409) while an E911 site-default binding
+  // points at the site (#2298); show the server's reason, don't swallow it.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const onDeleteError = (e: unknown) => {
+    const err = e as {
+      response?: { data?: { detail?: string } };
+      message?: string;
+    };
+    setDeleteError(
+      err?.response?.data?.detail ?? err?.message ?? "Delete failed",
+    );
+  };
+
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => sitesApi.bulkDelete(ids),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["sites"] });
     },
+    onError: onDeleteError,
   });
 
   const removeOne = useMutation({
     mutationFn: (id: string) => sitesApi.remove(id),
+    onMutate: () => setDeleteError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["sites"] }),
+    onError: onDeleteError,
   });
 
   function toggle(id: string) {
@@ -818,7 +836,7 @@ export function SitesPage() {
   function askDelete(s: SiteRead) {
     setConfirm({
       title: "Delete site",
-      message: `Delete site "${s.name}"?`,
+      message: `Delete site "${s.name}"? A site that still has an E911 site-default binding cannot be deleted until that binding is removed.`,
       confirmLabel: "Delete",
       onConfirm: () => removeOne.mutate(s.id),
     });
@@ -827,6 +845,11 @@ export function SitesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Sites</h1>
@@ -987,7 +1010,17 @@ export function SitesPage() {
                       className="px-3 py-6 text-center text-muted-foreground"
                       colSpan={7}
                     >
-                      No sites yet — click "New site" to add one.
+                      <ListEmpty
+                        error={query.error}
+                        what="sites"
+                        filtered={search !== "" || kindFilter !== ""}
+                        onClearFilters={() => {
+                          setSearch("");
+                          setKindFilter("");
+                        }}
+                      >
+                        No sites yet — click "New site" to add one.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}

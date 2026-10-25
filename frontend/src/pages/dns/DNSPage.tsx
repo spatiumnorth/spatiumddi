@@ -1,8 +1,14 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
+import {
+  WINRM_FORM_DEFAULTS,
+  winrmFormFrom,
+  winrmSettingsPayload,
+} from "@/lib/winrm";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -49,6 +55,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -1326,7 +1333,7 @@ function GroupModal({
 
 // ── Server Modal (add / edit) ─────────────────────────────────────────────────
 
-function ServerModal({
+export function ServerModal({
   groupId,
   server,
   onClose,
@@ -1364,16 +1371,24 @@ function ServerModal({
   });
 
   // Windows credential state — same contract as the DHCP modal:
-  //   * On edit with creds: leave blank to keep, type to replace.
-  //   * Always send the creds block on windows_dns so transport / port /
-  //     TLS toggles reach the backend (backend merges with stored blob).
+  //   * On edit with creds: username/password blank to keep, type to replace.
+  //   * The connection settings are seeded from what is stored, and only the
+  //     ones the operator changes are sent (the backend merges a partial
+  //     block over the stored one), so an untouched save keeps them.
+  const [winSeed] = useState(() =>
+    server?.driver === "windows_dns" && server.has_credentials
+      ? winrmFormFrom(server.winrm_settings)
+      : undefined,
+  );
+  const winInitial = winSeed ?? WINRM_FORM_DEFAULTS;
   const [winUsername, setWinUsername] = useState("");
   const [winPassword, setWinPassword] = useState("");
-  const [winPort, setWinPort] = useState("5985");
-  const [winTransport, setWinTransport] =
-    useState<WindowsDNSCredentials["transport"]>("ntlm");
-  const [winUseTLS, setWinUseTLS] = useState(false);
-  const [winVerifyTLS, setWinVerifyTLS] = useState(false);
+  const [winPort, setWinPort] = useState(winInitial.port);
+  const [winTransport, setWinTransport] = useState<
+    WindowsDNSCredentials["transport"]
+  >(winInitial.transport);
+  const [winUseTLS, setWinUseTLS] = useState(winInitial.useTls);
+  const [winVerifyTLS, setWinVerifyTLS] = useState(winInitial.verifyTls);
   const [winClearCreds, setWinClearCreds] = useState(false);
   const [testResult, setTestResult] = useState<{
     ok: boolean;
@@ -1557,12 +1572,17 @@ function ServerModal({
         // Path B is opt-in: only send a creds block if the user entered
         // something, or if we're editing a server that may already have
         // creds (lets them flip transport / port without re-typing).
-        const creds: Partial<WindowsDNSCredentials> = {
-          winrm_port: parseInt(winPort, 10) || 5985,
-          transport: winTransport,
-          use_tls: winUseTLS,
-          verify_tls: winVerifyTLS,
-        };
+        // With stored credentials only the changed settings are sent, so an
+        // untouched setting keeps its stored value.
+        const creds: Partial<WindowsDNSCredentials> = winrmSettingsPayload(
+          {
+            port: winPort,
+            transport: winTransport ?? "ntlm",
+            useTls: winUseTLS,
+            verifyTls: winVerifyTLS,
+          },
+          winSeed,
+        );
         if (winUsername) creds.username = winUsername;
         if (winPassword) creds.password = winPassword;
         // First-time set requires both. Edit path is merge — backend
@@ -1577,7 +1597,10 @@ function ServerModal({
           );
           return;
         }
-        if (winUsername || winPassword || (editing && hasExistingCreds)) {
+        if (
+          (winUsername || winPassword || (editing && hasExistingCreds)) &&
+          Object.keys(creds).length > 0
+        ) {
           payload.windows_credentials = creds;
         }
       }
@@ -1830,8 +1853,8 @@ function ServerModal({
                 <span className="block text-xs text-muted-foreground">
                   The server DDNS and record writes are applied at. Exactly one
                   per group &mdash; ticking this demotes whichever server holds
-                  it now. A group with no primary silently drops every record
-                  write to its zones, so it can only be moved, not cleared.
+                  it now. A group left without one has a primary re-elected
+                  automatically, so the flag can only be moved, not cleared.
                 </span>
               </span>
             </label>
@@ -2570,6 +2593,17 @@ export function ZoneModal({
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
+  // Sub-zone opens with ".<parent>" pre-filled so the operator types the
+  // leading label first; a focused input puts the caret at the END of a
+  // pre-fill, which made "xp" read ".parentxp" (#2464). Park it at the start.
+  const nameRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!zone && initialName?.startsWith(".")) {
+      nameRef.current?.setSelectionRange(0, 0);
+    }
+    // Once, on open: later renders must not move a caret the operator placed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
@@ -2770,6 +2804,7 @@ export function ZoneModal({
         <Field label="Zone Name (FQDN)">
           <input
             className={inputCls}
+            ref={nameRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="example.com"
@@ -3436,7 +3471,8 @@ function RecordModal({
 // ── Zone Detail View (records panel) ─────────────────────────────────────────
 
 /**
- * Per-server serial-drift pill. Three display states:
+ * Per-server serial-drift pill (#2316: a non-active server is never counted
+ * as in sync, a paused one is excluded and listed as "paused"). Display states:
  *  - All servers on the target serial → emerald "N/N synced · serial X"
  *  - Some servers behind / ahead      → amber "1/3 drift · target X"
  *  - No server has reported yet       → muted "— not reported"
@@ -3445,29 +3481,42 @@ function RecordModal({
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
 function ZoneSyncPill({ state }: { state: ZoneServerState }) {
-  const total = state.servers.length;
-  if (total === 0) return null;
-  const reported = state.servers.filter((s) => s.current_serial !== null);
+  if (state.servers.length === 0) return null;
+  // #2316 — a paused (maintenance) server is shown separately and left out
+  // of the count; a server that is not active is counted, but never as in
+  // sync, whatever serial it reported before it went away.
+  const paused = state.servers.filter((s) => s.freshness === "paused");
+  const down = state.servers.filter((s) => s.freshness === "unreachable");
+  const counted = state.servers.filter((s) => s.freshness !== "paused");
+  const total = counted.length;
+  const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
   // even when the serial it reported matches.
-  const inSync = state.servers.filter(
-    (s) => s.current_serial === state.target_serial && !s.pending_ops,
+  const inSync = counted.filter(
+    (s) =>
+      s.counted && s.current_serial === state.target_serial && !s.pending_ops,
   );
   const tooltip = state.servers
     .map((s) =>
-      s.current_serial === null
-        ? `${s.server_name}: not reported`
-        : `${s.server_name}: serial ${s.current_serial}` +
-          (s.current_serial !== state.target_serial ? " (drift)" : "") +
-          (s.pending_ops
-            ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
-            : ""),
+      s.freshness === "paused"
+        ? `${s.server_name}: paused (maintenance), not counted`
+        : s.freshness === "unreachable"
+          ? `${s.server_name}: ${s.server_status}, not counted as in sync`
+          : s.current_serial === null
+            ? `${s.server_name}: not reported`
+            : `${s.server_name}: serial ${s.current_serial}` +
+              (s.current_serial !== state.target_serial ? " (drift)" : "") +
+              (s.pending_ops
+                ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+                : ""),
     )
     .join("\n");
 
   let cls = "bg-muted/40 text-muted-foreground";
   let label = "not reported";
-  if (reported.length === 0) {
+  if (total === 0) {
+    label = `${paused.length} paused`;
+  } else if (reported.length === 0 && down.length === 0) {
     // noop — keep muted
   } else if (state.in_sync) {
     cls =
@@ -3477,7 +3526,9 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
     cls =
       "bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400";
     label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
+    if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
+  if (total > 0 && paused.length > 0) label += ` · ${paused.length} paused`;
   return (
     <span
       className={cn(
@@ -3565,7 +3616,8 @@ function MoveZoneModal({
       preview.key_names_lost.length > 0 ||
       !!preview.technitium_api_refusal ||
       !!preview.tsig_algorithm_refusal ||
-      !!preview.forward_transport_refusal);
+      !!preview.forward_transport_refusal ||
+      !!preview.technitium_acl_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3634,6 +3686,11 @@ function MoveZoneModal({
             {preview.forward_transport_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.forward_transport_refusal}
+              </div>
+            )}
+            {preview.technitium_acl_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.technitium_acl_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -3915,10 +3972,17 @@ function ZoneDetailView({
   // feature module so disabling it stops the extra query entirely.
   const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
   const tlsCertsOn = moduleEnabled("security.tls_certs");
-  const { data: tlsCerts, isLoading: tlsCertsLoading } = useQuery({
+  // The route takes read on 'tls_cert': a user without it is not asked, and
+  // the tab says so instead of "Certificates (0)" (#2704).
+  const canReadCerts = usePermissions().can("read", "tls_cert");
+  const {
+    data: tlsCerts,
+    isLoading: tlsCertsLoading,
+    error: tlsCertsError,
+  } = useQuery({
     queryKey: ["tls-certs", "dns-zone", zone.id],
     queryFn: () => tlsCertsApi.list({ dns_zone_id: zone.id, limit: 200 }),
-    enabled: modulesReady && tlsCertsOn,
+    enabled: modulesReady && tlsCertsOn && canReadCerts,
   });
   // #118 — toggle auto-discovery of cert probe targets for this zone's
   // A/AAAA records. The discovery reconciler picks the change up on its
@@ -4057,7 +4121,8 @@ function ZoneDetailView({
   // reintroduce a local one). The explicit ``showAddRecord`` check still
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
-    if (isForward || zone.tailscale_tenant_id) return;
+    // #2529 — the keyboard path must honour the same grant as the button.
+    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4068,7 +4133,7 @@ function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord]);
+  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
@@ -4571,7 +4636,10 @@ function ZoneDetailView({
                   : "border-transparent text-muted-foreground hover:text-foreground")
               }
             >
-              Certificates ({tlsCerts?.items.length ?? 0})
+              Certificates
+              {canReadCerts && !tlsCertsError
+                ? ` (${tlsCerts?.items.length ?? 0})`
+                : ""}
             </button>
           )}
           {/* No count — the drift report AXFRs every server in the group, so
@@ -4626,11 +4694,27 @@ function ZoneDetailView({
                   Auto-discover &amp; probe every A/AAAA record in this zone
                 </span>
               </label>
-              <CertsCompactTable
-                targets={tlsCerts?.items ?? []}
-                isLoading={tlsCertsLoading}
-                emptyLabel="No TLS certificates linked to records in this zone."
-              />
+              {tlsCertsError || !canReadCerts ? (
+                <p className="text-sm">
+                  {tlsCertsError ? (
+                    <ListReadError
+                      error={tlsCertsError}
+                      what="this zone's TLS certificates"
+                    />
+                  ) : (
+                    <span className="text-muted-foreground">
+                      You don't have permission to see this zone's TLS
+                      certificates.
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <CertsCompactTable
+                  targets={tlsCerts?.items ?? []}
+                  isLoading={tlsCertsLoading}
+                  emptyLabel="No TLS certificates linked to records in this zone."
+                />
+              )}
             </>
           )}
         </div>
@@ -5294,6 +5378,7 @@ type SyncResultPayload =
       pushed: number;
       pushed_records: SyncRecord[];
       push_errors: string[];
+      queued_for_agent?: boolean;
     }
   | { ok: false; error: string };
 
@@ -5341,6 +5426,7 @@ function SyncResultModal({
     pushed,
     pushed_records,
     push_errors,
+    queued_for_agent,
   } = result;
   const somethingHappened =
     imported > 0 || pushed > 0 || push_errors.length > 0;
@@ -5387,7 +5473,7 @@ function SyncResultModal({
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Stat
-              label="Pushed"
+              label={queued_for_agent ? "Queued for agent" : "Pushed"}
               value={pushed}
               highlight={
                 pushed > 0 && push_errors.length === 0 ? "good" : undefined
@@ -5403,7 +5489,11 @@ function SyncResultModal({
           {pushed > 0 && (
             <RecordTable
               records={pushed_records}
-              heading="Records applied to the server"
+              heading={
+                queued_for_agent
+                  ? "Records queued for the server's agent"
+                  : "Records applied to the server"
+              }
             />
           )}
           {push_errors.length > 0 && (
@@ -5700,6 +5790,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <ConfigApplyChip server={s} />
                   <SpoolChip server={s} />
                   <DaemonStateChip server={s} />
+                  <DuplicateAgentChip server={s} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
@@ -5715,7 +5806,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   {s.last_sync_at &&
                     ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}
                   {s.last_health_check_at &&
-                    ` · health ${new Date(s.last_health_check_at).toLocaleTimeString()}`}
+                    ` · health ${humanTime(s.last_health_check_at)}`}
                 </p>
               </div>
             </div>
@@ -5922,7 +6013,14 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
   const hasBind = servers.some((s) => s.driver === "bind9");
 
   const delMut = useMutation({
-    mutationFn: (id: string) => dnsApi.deleteView(group.id, id),
+    // The modal lists the blocking lists scoped to the view, so confirming
+    // it is the acknowledgement the API asks for (#2275).
+    mutationFn: (id: string) =>
+      dnsApi.deleteView(group.id, id, {
+        acknowledgeBlocklistDetach: blocklists.some((b) =>
+          b.applied_view_ids?.includes(id),
+        ),
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-views", group.id] });
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
@@ -6098,13 +6196,25 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           message={
             <div className="space-y-2 text-sm">
               <p>
-                Zones assigned to this view are not deleted — they fall back to
-                being served from every remaining view.
+                A view that still scopes zones or records cannot be deleted:
+                they would otherwise be served from every remaining view. Move
+                them to another view or delete them first, including any in the
+                Trash.
               </p>
-              <p>
-                Any blocking list scoped only to this view stops being applied
-                anywhere.
-              </p>
+              {(() => {
+                const scoped = blocklists.filter((b) =>
+                  b.applied_view_ids?.includes(confirmDelete.id),
+                );
+                if (scoped.length === 0) return null;
+                return (
+                  <p className="text-amber-700 dark:text-amber-400">
+                    Blocking lists scoped to this view lose that scope, so the
+                    clients it matches stop being filtered by them:{" "}
+                    {scoped.map((b) => b.name).join(", ")}. A list scoped to
+                    nothing else stops being applied anywhere.
+                  </p>
+                );
+              })()}
               {views.length === 1 && (
                 <p className="text-amber-700 dark:text-amber-400">
                   This is the last view in the group. Removing it returns the
@@ -6432,7 +6542,7 @@ function SubnetPickerModal({
 
 // ── ACLs Tab ──────────────────────────────────────────────────────────────────
 
-function AclsTab({ groupId }: { groupId: string }) {
+export function AclsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const { can } = useDnsGrants();
   const [showCreate, setShowCreate] = useState(false);
@@ -6445,6 +6555,9 @@ function AclsTab({ groupId }: { groupId: string }) {
   const [newDesc, setNewDesc] = useState("");
   const [newEntries, setNewEntries] = useState("");
   const [error, setError] = useState("");
+  // #2444 — the server refuses a delete of an ACL that another ACL or a zone
+  // cites (409); the reason is shown in the dialog, which stays open.
+  const [deleteError, setDeleteError] = useState("");
 
   const { data: acls = [] } = useQuery({
     queryKey: ["dns-acls", groupId],
@@ -6464,7 +6577,12 @@ function AclsTab({ groupId }: { groupId: string }) {
   });
   const delMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteAcl(groupId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-acls", groupId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-acls", groupId] });
+      setConfirmDelete(null);
+    },
+    onError: (e: ApiError) =>
+      setDeleteError(formatApiError(e, "Failed to delete the ACL")),
   });
 
   function createAcl(e: React.FormEvent) {
@@ -6571,7 +6689,10 @@ function AclsTab({ groupId }: { groupId: string }) {
               </div>
               <button
                 className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive disabled:opacity-0"
-                onClick={() => setConfirmDelete(acl)}
+                onClick={() => {
+                  setDeleteError("");
+                  setConfirmDelete(acl);
+                }}
                 title="Delete ACL"
                 {...permissionGate(
                   can("delete", "dns_group"),
@@ -6604,17 +6725,27 @@ function AclsTab({ groupId }: { groupId: string }) {
           confirmLabel="Delete ACL"
           tone="destructive"
           onClose={() => setConfirmDelete(null)}
+          loading={delMut.isPending}
           onConfirm={() => {
+            setDeleteError("");
             delMut.mutate(confirmDelete.id);
-            setConfirmDelete(null);
           }}
           message={
-            <p className="text-sm">
-              Any view or zone referencing{" "}
-              <span className="font-mono">{confirmDelete.name}</span> by name
-              will stop resolving it — check the Views tab before removing an
-              ACL that is in use.
-            </p>
+            <div className="space-y-2">
+              <p className="text-sm">
+                An ACL that another ACL, a view or a zone still cites by name
+                cannot be deleted — the server refuses it, and the reason is
+                shown here. Remove the references first.
+              </p>
+              {deleteError && (
+                <p
+                  role="alert"
+                  className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-sm text-destructive"
+                >
+                  {deleteError}
+                </p>
+              )}
+            </div>
           }
         />
       )}
@@ -6624,7 +6755,7 @@ function AclsTab({ groupId }: { groupId: string }) {
 
 // ── TSIG Keys Tab ─────────────────────────────────────────────────────────────
 
-function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
+export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const { data: keys = [], isFetching } = useQuery({
@@ -6644,12 +6775,17 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
     action: "created" | "rotated";
   } | null>(null);
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteTSIGKey(group.id, id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-tsig-keys", group.id] });
       setConfirmDelete(null);
     },
+    // The server refuses a key something still cites (409, #2282) and says
+    // what cites it; the dialog stays open, so show that reason in it.
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete the TSIG key")),
   });
   const rotateMut = useMutation({
     mutationFn: (id: string) => dnsApi.rotateTSIGKey(group.id, id),
@@ -6758,7 +6894,10 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                       <Pencil className="h-3 w-3" />
                     </button>
                     <button
-                      onClick={() => setConfirmDelete(k)}
+                      onClick={() => {
+                        setDeleteError(null);
+                        setConfirmDelete(k);
+                      }}
                       className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                       title="Delete key"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
@@ -6793,9 +6932,13 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       {confirmDelete && (
         <ConfirmDestroyModal
           title="Delete TSIG Key"
-          description={`Permanently delete "${confirmDelete.name}"? Any zones referencing this key in their allow-update / allow-transfer fields will start failing auth on the next BIND reload.`}
+          description={`Permanently delete "${confirmDelete.name}"? A key that an ACL, a view, a server option or a zone (allow-query, allow-transfer, also-notify) still cites cannot be deleted: the server refuses, names what cites it, and the key stays until those references are removed. Dynamic-update grants for the key are removed with it.`}
+          error={deleteError}
           checkLabel={`I understand "${confirmDelete.name}" will be deleted from every BIND9 server in this group on the next config push.`}
-          onConfirm={() => deleteMut.mutate(confirmDelete.id)}
+          onConfirm={() => {
+            setDeleteError(null);
+            deleteMut.mutate(confirmDelete.id);
+          }}
           onClose={() => setConfirmDelete(null)}
           isPending={deleteMut.isPending}
         />
@@ -7677,11 +7820,19 @@ function OptionsTab({ groupId }: { groupId: string }) {
               auto — validate using built-in managed keys (recommended)
             </option>
             <option value="yes">
-              yes — validate; trust anchors must be configured manually
+              yes — validate; only against trust anchors added via the API
+              (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
+          <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {opts?.dnssec_warnings?.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className={card}>
@@ -8330,39 +8481,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </span>
               </span>
             </label>
-            <Field label="Log channel">
-              <select
-                className={selCls}
-                value={queryLogChannel}
-                onChange={(e) => {
-                  setQueryLogChannel(e.target.value);
-                  setDirty(true);
-                }}
-              >
-                <option value="file">
-                  file — write to a log file (rotated by BIND)
-                </option>
-                <option value="syslog">
-                  syslog — send to local syslog (daemon facility)
-                </option>
-                <option value="stderr">
-                  stderr — write to container stderr (visible via docker logs)
-                </option>
-              </select>
-            </Field>
-            {queryLogChannel === "file" && (
-              <Field label="Log file path (inside container)">
-                <input
-                  className={inputCls}
-                  value={queryLogFile}
-                  onChange={(e) => {
-                    setQueryLogFile(e.target.value);
-                    setDirty(true);
-                  }}
-                  placeholder="/var/log/named/queries.log"
-                />
-              </Field>
-            )}
             <Field label="Severity">
               <select
                 className={selCls}
@@ -8378,19 +8496,20 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
-                <option value="notice">notice — only notable events</option>
-                <option value="warning">warning — warnings and above</option>
-                <option value="error">error — errors only</option>
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
               Logs the <code>queries</code> and <code>query-errors</code>{" "}
-              categories. View with{" "}
-              <code className="font-mono">docker logs</code> (stderr) or{" "}
+              categories to <code className="font-mono">{queryLogFile}</code>{" "}
+              inside the DNS container, which is the file the Logs page&apos;s
+              DNS Queries tab reads. The channel and path are fixed for that
+              reason, and so is the severity floor: named logs queries at{" "}
+              <code>info</code>, so anything quieter would empty the tab. View
+              raw with{" "}
               <code className="font-mono">
                 docker exec &lt;dns-container&gt; tail -f {queryLogFile}
-              </code>{" "}
-              (file).
+              </code>
+              .
             </p>
           </>
         )}
@@ -9402,7 +9521,20 @@ function ZonesTab({
       )}
       {zones.length === 0 && !isFetching && (
         <p className="text-sm text-muted-foreground italic">
-          No zones yet. Click "Add Zone" to create one.
+          {tagFilters.length > 0 ? (
+            <>
+              No zones match the selected tags.{" "}
+              <button
+                type="button"
+                onClick={() => setTagFilters([])}
+                className="not-italic text-primary underline hover:no-underline"
+              >
+                Clear filters
+              </button>
+            </>
+          ) : (
+            'No zones yet. Click "Add Zone" to create one.'
+          )}
         </p>
       )}
       {hasZoneFilter && filteredZones.length === 0 && zones.length > 0 && (
@@ -9497,6 +9629,24 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
+/** Rules the last adblock refresh could not enforce (#2123); 0 when the
+ *  counts were never recorded. */
+function feedSkippedTotal(l: DNSBlockList): number {
+  const s = l.feed_parse_skipped;
+  return s ? s.regex + s.modifier + s.badfilter + s.malformed : 0;
+}
+
+function feedSkippedTitle(l: DNSBlockList): string {
+  const s = l.feed_parse_skipped;
+  if (!s) return "";
+  return (
+    `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +
+    `enforce: ${s.regex} regex, ${s.modifier} with unsupported modifiers ` +
+    `($domain=, $third-party, …), ${s.badfilter} $badfilter, ` +
+    `${s.malformed} not a plain ||name^ rule.`
+  );
+}
+
 function BlocklistScopeModal({
   list,
   group,
@@ -10127,6 +10277,14 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         view: {viewName.get(id)}
                       </span>
                     ))}
+                    {feedSkippedTotal(l) > 0 && (
+                      <span
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        title={feedSkippedTitle(l)}
+                      >
+                        {feedSkippedTotal(l)} rules not enforced
+                      </span>
+                    )}
                     <span className="ml-auto text-xs text-muted-foreground">
                       {l.entry_count} entries
                     </span>
@@ -10350,7 +10508,6 @@ function BlocklistModal({
             >
               <option value="nxdomain">nxdomain</option>
               <option value="sinkhole">sinkhole</option>
-              <option value="refused">refused</option>
             </select>
           </Field>
         </div>
@@ -10362,6 +10519,10 @@ function BlocklistModal({
               onChange={(e) => setSinkholeIp(e.target.value)}
               placeholder="0.0.0.0"
             />
+            <p className="mt-1 text-xs text-muted-foreground">
+              Blocked names answer with this address. Blank answers 0.0.0.0 and
+              ::; an IPv4 address replaces 0.0.0.0 and an IPv6 one replaces ::.
+            </p>
           </Field>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -10613,6 +10774,9 @@ function BlocklistDetail({
             <span className="text-destructive"> ({list.last_sync_error})</span>
           )}
         </p>
+      )}
+      {feedSkippedTotal(list) > 0 && (
+        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
       )}
 
       {/* Blocked domains (the list itself) */}
@@ -11061,6 +11225,13 @@ function GroupDetailView({
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const [syncing, setSyncing] = useState(false);
+  // Shares the cache the Servers tab fills; only the enabled count is read,
+  // for the in-flight line of the sync modal (#2426).
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dns-servers", group.id],
+    queryFn: () => dnsApi.listServers(group.id),
+  });
+  const enabledServerCount = groupServers.filter((s) => s.is_enabled).length;
   const [groupSyncResult, setGroupSyncResult] = useState<{
     result: DNSGroupSyncResult | null;
     error: string | null;
@@ -11250,6 +11421,8 @@ function GroupDetailView({
           group={group}
           result={groupSyncResult.result}
           error={groupSyncResult.error}
+          syncing={syncing}
+          serverCount={enabledServerCount}
           onClose={() => setGroupSyncResult(null)}
         />
       )}
@@ -11257,20 +11430,43 @@ function GroupDetailView({
   );
 }
 
-function SyncWithServersResultModal({
+export function SyncWithServersResultModal({
   group,
   result,
   error,
+  syncing = false,
+  serverCount = 0,
   onClose,
 }: {
   group: DNSServerGroup;
   result: DNSGroupSyncResult | null;
   error: string | null;
+  syncing?: boolean;
+  serverCount?: number;
   onClose: () => void;
 }) {
   return (
     <Modal title={`Sync result — ${group.name}`} onClose={onClose} wide>
       <div className="space-y-3 text-sm">
+        {!result && !error && syncing && (
+          <div
+            role="status"
+            className="flex items-start gap-2 text-sm text-muted-foreground"
+          >
+            <RefreshCw className="mt-0.5 h-4 w-4 flex-shrink-0 animate-spin" />
+            <div>
+              <p>
+                Syncing with {serverCount}{" "}
+                {serverCount === 1 ? "server" : "servers"}… a Windows server can
+                take a minute.
+              </p>
+              <p className="text-xs">
+                You can close this window; the sync keeps running and the result
+                reopens here when it finishes.
+              </p>
+            </div>
+          </div>
+        )}
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
@@ -11742,6 +11938,23 @@ export function DNSPage() {
     queryFn: () => dnsApi.listGroups(),
   });
 
+  // The selection stores the group / zone object as it was when the tree was
+  // clicked. Edit Group / Edit Zone save and invalidate these two queries, so
+  // the page, and the dialogs seeded from it, read the live row from them and
+  // fall back to the clicked copy only until they resolve (#2462). Without
+  // this the next Save wrote the old values back.
+  const selectedGroupId = selection ? selection.group.id : null;
+  const selectedZoneId = selection?.type === "zone" ? selection.zone.id : null;
+  const { data: selectedGroupZones } = useQuery({
+    queryKey: ["dns-zones", selectedGroupId],
+    queryFn: () => dnsApi.listZones(selectedGroupId!),
+    enabled: !!selectedGroupId && !!selectedZoneId,
+  });
+  const liveGroup =
+    groups.find((g: DNSServerGroup) => g.id === selectedGroupId) ?? null;
+  const liveZone =
+    selectedGroupZones?.find((z: DNSZone) => z.id === selectedZoneId) ?? null;
+
   // Deep-link from global search: navigate("/dns", { state: { selectGroup, selectZone, highlightRecord? } })
   useEffect(() => {
     const state = location.state as {
@@ -11998,18 +12211,22 @@ export function DNSPage() {
         )}
         {selection?.type === "group" && (
           <GroupDetailView
-            group={selection.group}
+            group={liveGroup ?? selection.group}
             onSelectZone={(z) =>
-              setSelection({ type: "zone", group: selection.group, zone: z })
+              setSelection({
+                type: "zone",
+                group: liveGroup ?? selection.group,
+                zone: z,
+              })
             }
-            onEdit={() => setEditGroup(selection.group)}
-            onDelete={() => setConfirmDeleteGroup(selection.group)}
+            onEdit={() => setEditGroup(liveGroup ?? selection.group)}
+            onDelete={() => setConfirmDeleteGroup(liveGroup ?? selection.group)}
           />
         )}
         {selection?.type === "zone" && (
           <ZoneDetailView
-            group={selection.group}
-            zone={selection.zone}
+            group={liveGroup ?? selection.group}
+            zone={liveZone ?? selection.zone}
             highlightRecordId={pendingHighlightRecord}
             onDeleted={() =>
               setSelection({ type: "group", group: selection.group })

@@ -17,7 +17,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -27,6 +28,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.proxmox import ProxmoxNode
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["proxmox"],
@@ -447,6 +449,11 @@ async def delete_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if n is None:
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
     _audit(db, user=user, action="delete", node_id=n.id, node_name=n.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="proxmox_node_id", target_id=n.id, user=user, target_name=n.name
+    )
     await db.delete(n)
     await db.commit()
 
@@ -455,15 +462,25 @@ async def delete_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/nodes/{node_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_node(node_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_node(node_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     n = await db.get(ProxmoxNode, node_id)
     if n is None:
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
 
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="proxmox_node",
+        resource_id=n.id,
+        resource_display=str(getattr(n, "name", None) or n.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.proxmox_sync import sync_node_now  # noqa: PLC0415
 
     try:
-        result = sync_node_now.delay(str(n.id))
+        result = await dispatch(sync_node_now, str(n.id))
         return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         return StatusResponse(status="broker_unavailable", task_id="")

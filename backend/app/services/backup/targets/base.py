@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -146,6 +147,58 @@ class UnsupportedOperationError(BackupDestinationError):
     """
 
 
+class ArchiveTooLargeError(BackupDestinationError):
+    """The archive is larger than the ``max_bytes`` its caller allowed.
+
+    Raised by a driver's ``download`` as soon as it knows — from a stat
+    before reading where the destination offers one, otherwise as the
+    running total passes the cap — so an oversized archive is never read
+    into memory whole. A subclass so every existing ``except
+    BackupDestinationError`` still catches it; the API layer catches it
+    first and answers 413.
+    """
+
+    def __init__(self, filename: str, max_bytes: int, size_bytes: int | None = None) -> None:
+        self.filename = filename
+        self.max_bytes = max_bytes
+        self.size_bytes = size_bytes
+        size = f"{size_bytes} bytes" if size_bytes is not None else f"more than {max_bytes} bytes"
+        super().__init__(
+            f"archive {filename!r} is {size}, which exceeds the "
+            f"{max_bytes}-byte cap for destination downloads"
+        )
+
+
+#: Chunk size for :func:`read_capped`. Large enough that a multi-GB read
+#: is not dominated by call overhead, small enough that overshooting the
+#: cap by one chunk costs nothing.
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def check_size(filename: str, size_bytes: int, max_bytes: int | None) -> None:
+    """Raise :class:`ArchiveTooLargeError` when ``size_bytes`` passes the cap."""
+    if max_bytes is not None and size_bytes > max_bytes:
+        raise ArchiveTooLargeError(filename, max_bytes, size_bytes)
+
+
+def read_capped(read: Callable[[int], bytes], *, filename: str, max_bytes: int | None) -> bytes:
+    """Read a file-like object to EOF through ``read(n)``, stopping with
+    :class:`ArchiveTooLargeError` once more than ``max_bytes`` arrived.
+
+    ``max_bytes=None`` reads to EOF uncapped. A ``bytearray`` collects the
+    chunks so the peak is one copy plus one chunk, not two copies.
+    """
+    out = bytearray()
+    while True:
+        chunk = read(DOWNLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        out += chunk
+        if max_bytes is not None and len(out) > max_bytes:
+            raise ArchiveTooLargeError(filename, max_bytes)
+    return bytes(out)
+
+
 @dataclass(frozen=True)
 class ArchiveListing:
     """One archive present at a destination."""
@@ -187,6 +240,13 @@ class ConfigFieldSpec:
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+    #: The value is made of LINES (a PEM key, a known_hosts file, one
+    #: header per line). The form renders a multi-line control for it,
+    #: masked when ``secret`` is also set. A one-line input cannot hold a
+    #: line break at all — the browser folds each one into a space — so a
+    #: field whose meaning depends on its lines and is rendered as an input
+    #: silently becomes a different value (#2199).
+    multiline: bool = False
 
 
 def safe_url(url: str) -> str:
@@ -221,6 +281,24 @@ def scrub_url(text: str, *urls: str) -> str:
             if url.endswith("/"):
                 text = text.replace(url.rstrip("/"), safe_url(url).rstrip("/"))
     return text
+
+
+def describe_exc(exc: BaseException) -> str:
+    """A non-empty, operator-readable reason for ``exc``.
+
+    Many library exceptions carry no text at all — ``httpx.ReadTimeout``,
+    ``asyncio.TimeoutError``, a bare ``TimeoutError`` — so ``f"...: {exc}"``
+    stored ``"WebDAV PUT failed: "`` and told the operator nothing (#2402).
+    Falls back to the exception's type, and says plainly when it was a
+    timeout. Callers still run :func:`scrub_url` over the result.
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError) or "timeout" in name.lower():
+        return f"{name} (the destination timed out)"
+    return name
 
 
 def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:
@@ -296,12 +374,19 @@ class BackupDestination(ABC):
         """
 
     @abstractmethod
-    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+    async def download(
+        self, *, config: dict[str, Any], filename: str, max_bytes: int | None = None
+    ) -> bytes:
         """Fetch + return the archive bytes for ``filename``. The
         restore-from-destination flow streams these straight into
         :func:`app.services.backup.restore.apply_backup_restore`
         without ever materialising the file on the api / worker
         container's local disk.
+
+        ``max_bytes`` bounds what the driver will hold in memory: past it
+        the driver raises :class:`ArchiveTooLargeError` instead of
+        returning. Every caller passes ``MAX_ARCHIVE_BYTES``; ``None``
+        (uncapped) exists only for the driver-level tests.
         """
 
     @abstractmethod
@@ -354,6 +439,7 @@ def list_destination_kinds() -> list[dict[str, Any]]:
                         "required": f.required,
                         "description": f.description,
                         "secret": f.secret,
+                        "multiline": f.multiline,
                     }
                     for f in d.config_fields
                 ],

@@ -15,17 +15,24 @@ automatically.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from celery import shared_task
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import task_session
 from app.models.alerts import AlertEvent, AlertRule
-from app.services.audit_chain import verify_chain
+from app.models.audit import AuditChainCheckpoint
+from app.services.audit_chain import (
+    FULL_PASS_INTERVAL,
+    ChainVerifyResult,
+    checkpoint_still_valid,
+    verify_chain,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -33,9 +40,99 @@ logger = structlog.get_logger(__name__)
 _RULE_NAME = "audit-chain-broken"
 
 
+#: How far in the future ``full_pass_done_at`` may sit before it is treated
+#: as forged rather than as clock skew between workers.
+_FUTURE_SKEW = timedelta(hours=1)
+
+
+def _full_pass_reason(done_at: datetime | None, now: datetime) -> str | None:
+    """Why the stored checkpoint must not be resumed from, or None.
+
+    The checkpoint lives in the database it vouches for, so anyone able to
+    rewrite ``audit_log`` can rewrite it too. A ``full_pass_done_at`` set into
+    the future would otherwise never age past ``FULL_PASS_INTERVAL`` and
+    would switch the weekly full pass off for good; a date this worker did
+    not write is treated as no full pass at all. (``None`` with a nonzero
+    ``verified_seq`` is a full pass still in progress, which is resumed.)
+    """
+    if done_at is None:
+        return None
+    age = now - done_at
+    if age < -_FUTURE_SKEW:
+        return "future"
+    if age > FULL_PASS_INTERVAL:
+        return "stale"
+    return None
+
+
+async def _walk_with_checkpoint(db: AsyncSession) -> ChainVerifyResult:
+    """Verify the chain, resuming from the stored checkpoint (#2286).
+
+    Walks only rows added since the last clean run, unless there is no
+    usable checkpoint, the last full pass is older than
+    ``FULL_PASS_INTERVAL`` or dated in the future, in which case it starts
+    from the first row.
+    The checkpoint is advanced after every page while the walk is clean, so
+    a run cut short keeps its progress and the next one carries on; it is
+    never advanced past a break, so a break is found again (and deduped)
+    rather than skipped. A failure raises: nothing here turns a walk that
+    did not finish into a result.
+    """
+    now = datetime.now(UTC)
+    cp = await db.get(AuditChainCheckpoint, 1)
+    start: tuple[int, str] | None = None
+    if cp is not None and cp.verified_seq > 0 and cp.verified_hash:
+        reason = _full_pass_reason(cp.full_pass_done_at, now)
+        if reason is None and not await checkpoint_still_valid(
+            db, cp.verified_seq, cp.verified_hash
+        ):
+            reason = "mismatch"
+        if reason is None:
+            start = (cp.verified_seq, cp.verified_hash)
+        elif reason == "future":
+            # This worker never writes a future date: the row was edited,
+            # or a clock is badly wrong. Either way it is worth a look.
+            logger.warning(
+                "audit_chain_verify_full_pass",
+                reason=reason,
+                full_pass_done_at=str(cp.full_pass_done_at),
+            )
+        else:
+            logger.info("audit_chain_verify_full_pass", reason=reason)
+    if cp is None:
+        cp = AuditChainCheckpoint(id=1, verified_seq=0)
+        db.add(cp)
+    if start is None:
+        cp.verified_seq = 0
+        cp.verified_hash = None
+        cp.full_pass_done_at = None
+    await db.commit()
+
+    async def _save(last_seq: int, last_hash: str, _rows: int, breaks: int) -> None:
+        if breaks:
+            return
+        cp.verified_seq = last_seq
+        cp.verified_hash = last_hash
+        cp.updated_at = datetime.now(UTC)
+        await db.commit()
+
+    result = await verify_chain(db, start_after=start, on_chunk=_save)
+    if result.ok and result.complete and cp.full_pass_done_at is None:
+        cp.full_pass_done_at = datetime.now(UTC)
+        await db.commit()
+    return result
+
+
 async def _async_verify_and_alert() -> dict:
     async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
-        result = await verify_chain(db)
+        try:
+            result = await _walk_with_checkpoint(db)
+        except Exception:
+            # A walk that dies (timeout, lost connection) verified nothing
+            # past its checkpoint; say so loudly and fail the task rather
+            # than return anything that reads as "verified".
+            logger.exception("audit_chain_verify_failed")
+            raise
         rule = (
             await db.execute(select(AlertRule).where(AlertRule.name == _RULE_NAME))
         ).scalar_one_or_none()
@@ -58,7 +155,11 @@ async def _async_verify_and_alert() -> dict:
                 if open_evt is not None:
                     open_evt.resolved_at = datetime.now(UTC)
                     await db.commit()
-            return {"ok": True, "rows_checked": result.rows_checked}
+            return {
+                "ok": True,
+                "rows_checked": result.rows_checked,
+                "verified_through_seq": result.last_seq,
+            }
 
         if rule is None:
             # Seeder ran late or operator deleted the rule. Log loudly
@@ -139,7 +240,10 @@ async def _async_verify_and_alert() -> dict:
             },
         )
         db.add(evt)
-        await db.flush()
+        # #2261 — commit the event BEFORE delivering it. Delivering first
+        # meant a failed commit (and this task's autoretry) re-paged for an
+        # event that was never stored; now a retry finds it open and dedupes.
+        await db.commit()
         # #1576 — deliver to forward targets like every other alert;
         # the generic evaluator skips externally-driven rule types,
         # so without this the event only ever showed in-app.

@@ -85,6 +85,15 @@ auth:
 # APPLIANCE_MODE / hostname / host IPs live here. Same shape as ``api.env``.
 sharedEnv: []
 
+# #2004 / #2176 — the appliance's version, appended to the api, worker and beat
+# env as APPLIANCE_VERSION (``settings.appliance_version``: what system/info and
+# /version report). A value of its own rather than a ``sharedEnv`` entry, so a
+# cluster Rolling Upgrade can hold it with ``image.tag`` in the HelmChartConfig
+# until every node runs the target: a HelmChartConfig pins a scalar, but
+# replaces a list whole. Empty (the default, and every install that is not an
+# appliance) renders no APPLIANCE_VERSION, which the api reads as unknown.
+applianceVersion: ""
+
 api:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
@@ -103,6 +112,22 @@ api:
   service:
     type: ClusterIP
     port: 8000
+    # #1805 — "" (the default) renders no field: kube-proxy spreads every
+    # caller's connections over every api pod, as before #1805.
+    # PreferSameNode sends a node's connections to the api pod on that node
+    # while it is ready, and to all api pods only while it is not; a node
+    # with no api pod of its own keeps the spread. The appliance sets it in
+    # its own values (firstboot's spatium-control HelmChart and the seed
+    # supervisor's HelmChartConfig): it runs one api pod per control-plane
+    # node, and a node lost hard keeps its api pod listed until the node
+    # reads NotReady (about 40 s), so without it a share of every other
+    # node's requests (the supervisor's heartbeat, the DNS and DHCP agents,
+    # the frontend's /api proxy) hung there until the caller's own timeout.
+    # On other clusters it pins every caller on a node that runs an api pod
+    # to that one pod, which can leave the other api pods idle and the HPA
+    # reacting late. Rendered on Kubernetes 1.34+, where the PreferSameNode
+    # feature is on by default; older API servers refuse the value.
+    trafficDistribution: ""
   autoscaling:
     enabled: true
     minReplicas: 2
@@ -542,6 +567,14 @@ worker:
   # #1111 — ``bundles`` carries the DNS agent bundle renders; give it its
   # own worker (concurrency 1, its own memory cap) on large-record estates.
   queues: "ipam,dns,dhcp,default,bundles"
+  # Memory (#2227, measured): each of the ``concurrency`` processes is about
+  # 130 MB at rest. A bundle render adds about 4 kB per zone in the group,
+  # ~15 MB for one batch of records and twice the compressed body, whatever
+  # the record count: ~100 MB for 20k zones at 1M or 2M records (it was
+  # ~850 MB per million records before #2227). Under split-horizon views add
+  # ~1 - 1.5 kB per record of the group's largest zone. At most
+  # ``DNS_AGENT_BUNDLE_RENDER_SLOTS`` (2) renders run at once fleet-wide. See
+  # docs/features/DNS.md, "Control-plane memory for large groups".
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 2000m, memory: 1Gi }
@@ -743,6 +776,55 @@ postgresql:
       max_connections: "200"
       shared_buffers: "256MB"
       work_mem: "16MB"
+      # #2132 / #2240 — WAL kept for a former primary to come back. After a
+      # partition of the primary's node, CNPG promotes a replica and later
+      # rewinds the old primary onto the new timeline: ``pg_rewind`` needs
+      # the old primary's own WAL back to the last checkpoint before the
+      # point where the two diverged, and the rewound instance then streams
+      # the new primary's WAL from there. The new primary holds no
+      # replication slot for it (CNPG's HA slots cover the standbys the
+      # primary already had), so plain retention, on both, is all that keeps
+      # that WAL. With CNPG's 512MB default a
+      # loaded cluster recycled it within minutes and the old primary looped
+      # for ever ("requested WAL segment ... has already been removed", then
+      # ``pg_rewind`` "could not restore file ... from archive") until it was
+      # re-cloned by hand. 2GB covers that much write traffic during the
+      # partition; a longer or heavier one still needs the re-clone.
+      #
+      # Disk: every instance keeps at least this much WAL in pg_wal on its
+      # own volume (on the appliance, local-path on /var), on top of what
+      # checkpoints keep. A reload, not a restart: CNPG applies a change to a
+      # formed cluster without a rolling restart. The supervisor's
+      # HelmChartConfig sets only ``shared_buffers`` in this map (#1115) and
+      # Helm merges maps key by key, so this default stays beside it.
+      wal_keep_size: "2GB"
+      # #2317 — the most WAL a replication slot may hold back. CNPG keeps an
+      # HA slot per standby on the primary and synchronises them to every
+      # standby, so after a failover the new primary holds slots for standbys
+      # that may never follow it. PostgreSQL's default (-1) lets such a slot
+      # keep WAL without limit: a lab primary's pg_wal reached 26 GB on its
+      # node's /var while CNPG read healthy 7/7. Past this cap PostgreSQL
+      # invalidates the slot at the next checkpoint (``wal_status = lost``),
+      # the WAL goes, and that standby can never rejoin by streaming: it needs
+      # a re-clone. Until the automatic one lands (#2132) that is manual:
+      # delete the instance's PVC, then its pod, and CNPG joins a fresh copy
+      # (docs/TROUBLESHOOTING.md).
+      #
+      # Sizing. PostgreSQL keeps the LARGER of this cap and ``wal_keep_size``
+      # (the two do not add), plus up to ``max_wal_size`` (PostgreSQL's 1GB
+      # default, unset here) since the last checkpoint. So pg_wal is bounded
+      # near max(2GB, 3GB) + 1GB = 4GB, half of ``persistence.size`` (8Gi),
+      # leaving the other half for the data. ``charts-render-check.sh``
+      # (chart-cnpg-recovery.py) fails a render where that bound is over half
+      # the instance volume or the cap is unset. 3GB is also above
+      # ``wal_keep_size`` on purpose: a cap at or below it would let a slot
+      # protect nothing that plain retention does not.
+      #
+      # Raise ``persistence.size`` before raising this. On the appliance the
+      # volume is local-path, which does not enforce its size, so an
+      # unbounded pg_wal fills the node's /var and everything else on it.
+      # A reload, like ``wal_keep_size``.
+      max_slot_wal_keep_size: "3GB"
     # PodMonitor for Prometheus Operator. Default false because most
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:
@@ -914,6 +996,15 @@ dnsAgents:
   agentKey:
     existingSecret: ""           # external secret with key DNS_AGENT_KEY
     value: ""
+  # #2223 — how long a server may take to start listening on :53 before it
+  # is restarted; the liveness probe (:53, 3 x 30 s) only starts after it.
+  # A cold start renders and checks every zone before the daemon starts:
+  # measured with BIND 9.20, named-checkzone costs ~70 ms a zone, so 20,000
+  # zones take ~23 minutes on a release without #2180's batched checks.
+  # 10 s x 360 = 60 minutes. Per server: servers[].startupProbe.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
   servers: []
     # - name: ns1
     #   flavor: bind9            # bind9 (default) | powerdns | technitium
@@ -940,7 +1031,11 @@ dnsAgents:
     #   # 512Mi is for a group with NO blocklists. One catalog feed (AdGuard DNS
     #   # filter, ~186k entries) needs roughly 1 GB while an apply is in flight
     #   # (estimate): size the limit from docs/features/DNS.md section 8.0
-    #   # before subscribing.
+    #   # before subscribing. Zone data needs it too (#2223, measured): about
+    #   # 1.5 kB per record for named and the agent while it takes a bundle,
+    #   # so 512Mi is a few hundred thousand records at most, and a million
+    #   # records in 20,000 zones peaked at ~1.35 GB. With no `resources` set
+    #   # the server gets the 2Gi default limit.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }

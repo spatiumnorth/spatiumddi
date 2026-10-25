@@ -26,15 +26,14 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
-    status,
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.config import settings
 from app.core.content_disposition import content_disposition
-from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.services.backup import (
@@ -47,21 +46,16 @@ from app.services.backup import (
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
 from app.services.backup.sections import SECTIONS
 
-router = APIRouter()
+# nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
+# so every body here is authorised from its headers before it is read
+# (app.api.pre_body_auth).
+router = APIRouter(route_class=PreBodyAuthRoute)
 logger = structlog.get_logger(__name__)
 
 # Hard ceiling on uploaded backup archives. SpatiumDDI installs are
 # single-digit-GB at most (see Phase 1a scope notes); anything past
 # 2 GB is almost certainly an accident or a malicious payload.
 _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
-
-
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Backup + restore is restricted to superadmin",
-        )
 
 
 # ── /backup/create-and-download ──────────────────────────────────────
@@ -87,16 +81,11 @@ class BackupSectionCatalog(BaseModel):
 
 
 @router.get("/sections", response_model=BackupSectionCatalog)
-async def list_backup_sections(current_user: CurrentUser) -> BackupSectionCatalog:
+async def list_backup_sections(current_user: SuperAdmin) -> BackupSectionCatalog:
     """Catalog of backup sections (issue #117 Phase 2a). Drives
     the upcoming selective-backup + selective-restore checkboxes —
     operators tick which sections to include / apply.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Backup is restricted to superadmin",
-        )
     return BackupSectionCatalog(
         sections=[
             BackupSection(
@@ -122,7 +111,7 @@ async def list_backup_sections(current_user: CurrentUser) -> BackupSectionCatalo
 )
 async def create_and_download_backup(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     passphrase: str = Form(..., min_length=8, max_length=512),
     passphrase_hint: str = Form(default="", max_length=200),
     exclude_secrets: bool = Form(default=False),
@@ -141,7 +130,6 @@ async def create_and_download_backup(
     archive yields an install with empty credential fields; the
     operator re-enters them by hand.
     """
-    _require_superadmin(current_user)
     if hint_reveals_passphrase(passphrase, passphrase_hint):
         raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
     # #296 Phase H — refuse if a rolling upgrade is in flight. The
@@ -271,7 +259,7 @@ class RestoreOutcomeResponse(BaseModel):
 @router.post("/restore", response_model=RestoreOutcomeResponse)
 async def restore_backup(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     archive: UploadFile = File(...),
     passphrase: str = Form(..., min_length=8, max_length=512),
     confirmation_phrase: str = Form(...),
@@ -304,7 +292,6 @@ async def restore_backup(
     override is audited, and the response warns that the api's
     schema-head readiness gate may now fail.
     """
-    _require_superadmin(current_user)
     # #296 Phase H — restoring a backup mid-upgrade would rip the
     # schema + data state out from under the orchestrator. Refuse.
     from app.services.upgrades.safety import (  # noqa: PLC0415
@@ -407,6 +394,7 @@ async def restore_backup(
                     # the widening restored tables outside the selection.
                     "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
+                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
                 },
             )
         )
@@ -529,7 +517,7 @@ async def restore_backup(
 
 @router.post("/manifest-preview")
 async def preview_archive_manifest(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     archive: UploadFile = File(...),
 ) -> dict[str, Any]:
     """Pull just ``manifest.json`` from an uploaded archive without
@@ -537,7 +525,6 @@ async def preview_archive_manifest(
     "you're about to restore from <hostname> @ <created_at>" before
     they commit to the typed-confirmation step.
     """
-    _require_superadmin(current_user)
     archive_bytes = await archive.read()
     if not archive_bytes:
         raise HTTPException(status_code=422, detail="archive is empty")
@@ -547,15 +534,22 @@ async def preview_archive_manifest(
             detail=f"archive exceeds {_MAX_UPLOAD_BYTES} bytes",
         )
     from app.services.backup.archive import (  # noqa: PLC0415
-        read_backup_manifest,
+        preview_backup_archive,
     )
 
     try:
-        manifest = read_backup_manifest(archive_bytes)
+        manifest, dump_format = preview_backup_archive(archive_bytes)
     except BackupArchiveError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "manifest": manifest,
         "archive_bytes": len(archive_bytes),
         "format_recognised": manifest.get("format") == "spatiumddi-backup",
+        # The dump format the restore will act on, resolved by the same
+        # helper the restore uses (#2201). A selective restore needs
+        # ``custom``; the console reads ``selective_restore_supported``
+        # rather than inferring it from ``format_version``, which is 2 for
+        # an Exclude-secrets archive whose dump is plain SQL.
+        "dump_format": dump_format,
+        "selective_restore_supported": dump_format == "custom",
     }

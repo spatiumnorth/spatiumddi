@@ -345,6 +345,21 @@ _stranded_pending: set[str] = set()
 # upgrade of the control-plane release, which re-creates absent objects.
 _mirror_claims_owed: dict[str, dict] = {}
 
+# #2404: what the Redis reclaim (_reclaim_stranded_redis) keeps between seed
+# ticks. The hostnames a failed sweep still owes, handed back next tick (as
+# ``_stranded_pending`` is for Postgres) and freed there while the Node list
+# still lacks them, so an outage drops no eviction and a node that rejoined
+# under the name keeps its replica; and the kinds of failure logged since the
+# last clean sweep (the request and its status, never the answer's body), so
+# one that repeats tick after tick is logged once. A restart forgets both, and
+# the sweep needs neither to converge: it finds a stranded claim from the Node
+# list.
+_redis_stranded_pending: set[str] = set()
+_redis_failures_logged: set[str] = set()
+# Review of #2433: the most kinds kept between clean sweeps. One more starts
+# them over, so the set cannot grow with an outage, however long.
+_REDIS_FAILURE_KINDS_KEPT = 8
+
 
 class _ReplaceHold:
     """#1059 — the CloudNativePG size hold a dead-node replace arms (and,
@@ -498,6 +513,57 @@ def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[
     if outcome.error is not None:
         return set(previous) | {str(n) for n in evicted_now}
     return set(outcome.pending_nodes)
+
+
+def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundLogger) -> None:
+    """#590 / #2404: one seed tick of the Redis reclaim.
+
+    The names evicted this tick go in as authoritative, and any a failed
+    sweep left owed go in apart, to be freed only while the Node list still
+    lacks them (review of #2433); on any other tick the sweep looks for a
+    claim pinned to a node that is no longer a Node
+    (``k8s_api.reclaim_stranded_redis_storage``). A claim is logged as
+    reclaimed once, on the tick its DELETE lands; a failure is logged once
+    per kind (the request and its status, never the answer's body), until a
+    sweep comes back clean."""
+    from . import k8s_api  # noqa: PLC0415
+
+    out = k8s_api.reclaim_stranded_redis_storage(
+        evicted_now, owed_nodes=set(_redis_stranded_pending)
+    )
+    # Mutated in place, like _stranded_pending. As _carry_stranded does for
+    # Postgres: a failed sweep keeps everything owed plus this tick's
+    # evictions; a clean one owes nothing (a Redis claim is never deferred).
+    if out.error is None:
+        _redis_stranded_pending.clear()
+        _redis_failures_logged.clear()
+    else:
+        _redis_stranded_pending.update(str(n) for n in evicted_now)
+    if out.reclaimed:
+        log.info(
+            "supervisor.heartbeat.redis_storage_reclaimed",
+            pvcs=out.reclaimed,
+            nodes=out.nodes,
+            evicted=list(evicted_now),
+            # which read decided each claim was stranded: the PV's node
+            # affinity ("pv") or the selected-node annotation ("annotation",
+            # only when the PV is gone)
+            affinity_source=dict(out.sources),
+        )
+    # Review of #2433: keyed on the kind, not the error text, which quotes the
+    # answer's body; an error that quotes none is its own kind.
+    kind = out.error_kind or out.error
+    if kind is not None and kind not in _redis_failures_logged:
+        if len(_redis_failures_logged) >= _REDIS_FAILURE_KINDS_KEPT:
+            _redis_failures_logged.clear()
+        _redis_failures_logged.add(kind)
+        log.warning(
+            "supervisor.heartbeat.redis_storage_reclaim_failed",
+            error=out.error,
+            # what this line stands for until a sweep comes back clean
+            kind=kind,
+            owed=sorted(_redis_stranded_pending),
+        )
 
 
 def _watchdog_check_due() -> bool:
@@ -696,6 +762,65 @@ def _maybe_apply_firewall(
         log.warning("supervisor.firewall.trigger_write_failed", error=str(exc))
 
 
+def _dispatch_firewall(
+    fw_settings: object,
+    role_assignment: dict[str, Any] | None,
+    log: structlog.stdlib.BoundLogger,
+    cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
+) -> None:
+    """#285 Phase 2a bundle-first / renderer-fallback dispatch, one tick.
+
+    Extracted from ``heartbeat_once`` (#2774) so the guard and its fallback are
+    tested as the single decision they are: a refused server body must still
+    leave the node converging on the in-pod render.
+    """
+    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
+
+    if use_bundle:
+        if appliance_state.maybe_fire_firewall_reload(fw_settings):
+            log.info(
+                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
+            )
+    else:
+        # #5 fallback — control plane too old to render, firewall_enabled
+        # still off, or its body refused by the #593 guard; render in-pod from
+        # the same derived inputs. The in-pod render carries NO fleet-policy
+        # rules (those are server-only), so a refusal costs enforcement on this
+        # node until the server body is acceptable — which is why the guard
+        # must refuse only a body that would really partition (#2774).
+        #
+        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
+        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
+        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
+        # rendered drop-in is now the SOLE source of that accept, so it must be
+        # present on EVERY appliance node — including idle / non-CP nodes that
+        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
+        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
+        # runner short-circuits on an unchanged body hash, so an unconditional
+        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
+        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
+        # a separate file the glob pulls in, so even a total drop-in failure
+        # still leaves the node SSH-recoverable.
+        _maybe_apply_firewall(
+            role_assignment,
+            log,
+            cluster_peer_cidrs,
+            pod_cidrs=pod_cidrs,
+            service_cidrs=service_cidrs,
+            cp_member_count=cp_member_count,
+            vip_configured=vip_configured,
+            web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+            ssh_scope_cidrs=ssh_scope_cidrs,
+        )
+
+
 def _server_firewall_body_is_usable(
     fw_settings: object, log: structlog.stdlib.BoundLogger
 ) -> bool:
@@ -715,14 +840,38 @@ def _server_firewall_body_is_usable(
 
     The structural test runs first, so a body that already opens 2380 — every
     healthy control-plane node — costs no apiserver read.
+
+    #2774 — the decision is the SAME predicate the in-pod path uses
+    (``would_self_partition`` over the live peer set), so the two paths cannot
+    disagree about a node. A readable sole etcd member (a one-node install) has
+    no raft peer to be cut off from, so the server's correct body has no peer
+    rule and must be used: refusing it sent every one-node install down the
+    in-pod renderer, which carries no fleet-policy rules, so an enforced fleet
+    rule never reached the host and the Firewall view reported drift forever.
+    The in-pod path got this exemption in #610; this path never did.
     """
     if not isinstance(fw_settings, dict) or not fw_settings.get("config_hash"):
         return False
 
     conf = str(fw_settings.get("firewall_conf") or "")
     if firewall_peer_audit.body_opens_etcd_peers(conf):
+        # A body we are willing to pipe is, by construction, one that keeps
+        # this node in raft — drop any earlier refusal marker, or a node that
+        # healed keeps reporting a divergence it no longer has. The in-pod
+        # path clears it the same way when it writes.
+        appliance_state.clear_firewall_refusal()
         return True
-    if firewall_peer_audit.local_node_is_etcd_member() is not True:
+
+    is_etcd_member = firewall_peer_audit.local_node_is_etcd_member()
+    live_peers = None
+    if is_etcd_member is True:
+        live_peers = firewall_peer_audit.observed_peer_cidrs(
+            appliance_state.read_node_ips() or []
+        )
+    if not firewall_peer_audit.would_self_partition(
+        conf, is_etcd_member=is_etcd_member, live_peers=live_peers
+    ):
+        appliance_state.clear_firewall_refusal()
         return True
 
     reason = (
@@ -757,6 +906,37 @@ def _strip_nul(value: Any, path: str, hits: list[str]) -> Any:
     return value
 
 
+#: #1805 — the first re-send after a heartbeat that never reached the control
+#: plane, doubled for each further one in a row up to the interval. A node
+#: loss makes such failures for a few seconds to a minute: a lookup routed to
+#: the lost node's DNS, a connection to its api pod, the api Service empty while
+#: the api waits for Redis. Each used to cost the whole interval (30 s) on top,
+#: so two in a row put a healthy node's heartbeat past the 90 s after which
+#: the demote guard and every other reader call it unhealthy.
+FAILED_RETRY_FIRST_S = 5.0
+
+
+def next_heartbeat_delay(
+    held: bool | None,
+    consecutive_failures: int,
+    interval_s: float,
+    rearm_floor_s: float,
+) -> float:
+    """Seconds to wait before the next heartbeat.
+
+    ``held`` is what ``heartbeat_once`` returned. A held heartbeat already
+    paced the loop server-side, so the next goes after ``rearm_floor_s``. One
+    answered without a hold (an old control plane) waits the interval. One that
+    never reached the control plane (``None``) is re-sent after
+    ``FAILED_RETRY_FIRST_S``, doubled for each further failure in a row
+    (``consecutive_failures`` counts this one), never beyond the interval.
+    """
+    if held is None:
+        step = FAILED_RETRY_FIRST_S * (2 ** max(0, consecutive_failures - 1))
+        return min(float(interval_s), step)
+    return rearm_floor_s if held else float(interval_s)
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -764,11 +944,16 @@ def heartbeat_once(
     identity: Identity,
     client: httpx.Client,
     log: structlog.stdlib.BoundLogger,
-) -> bool:
+) -> bool | None:
     """One heartbeat round-trip + trigger-file follow-up.
 
     Never raises. Logs every error path so a real outage shows up in
     journalctl without taking down the supervisor process.
+
+    Returns True when the control plane long-poll-held the heartbeat, False
+    when it answered without holding, and None when it never answered (a
+    transport error: DNS, connect, timeout). The loop re-sends a None sooner
+    than the interval (``next_heartbeat_delay``, #1805).
     """
     state = appliance_state.collect()
     # #358 Phase 1b — ask the control plane to long-poll-hold this
@@ -913,7 +1098,7 @@ def heartbeat_once(
         # refuse if not (an interception). The next heartbeat uses the result.
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
-        return False
+        return None
     if resp.status_code == 403 or resp.status_code == 404:
         # 403 = approval revoked or cert no longer valid for any
         # known appliance row. 404 = appliance row deleted, or the
@@ -1273,6 +1458,11 @@ def heartbeat_once(
         # sized from this node's RAM (k8s_api.control_plane_resources) — the
         # chart's BYO-cluster defaults gave way before the VM did on the
         # appliance, and a kubectl patch never survived a k3s restart.
+        # #2240 — and the api / Postgres CPU limits, sized from this node's
+        # CPU count (none when it is unknown: the chart's stand). An
+        # appliance upgrading into a new sizing takes one CNPG rolling
+        # restart (and an api / worker rollout) on the first heartbeat that
+        # writes it; the #1005 guard keeps every later heartbeat quiet.
         #
         # #1313 — CNPG's instance count is the one the patch above left on
         # the Cluster, not cp_size. While #1059's hold keeps the Cluster at
@@ -1302,6 +1492,7 @@ def heartbeat_once(
                 str(ml_vip),
                 web_ui_allowed_cidrs=list(web_ui_cidrs),
                 mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir),
+                cpu_count=k8s_api.node_cpu_count(),
                 cnpg_instances=cnpg_instances,
             )
             if cp_changed:
@@ -1381,29 +1572,8 @@ def heartbeat_once(
                 _nodes_deleted.add(name)
                 evicted_now.append(name)
                 log.info("supervisor.heartbeat.node_deleted", node=name)
-                # #590 — the deleted node strands any local-path Redis PVC
-                # provisioned on it (node-affine PV): the replacement
-                # replica sits Pending forever and its missing sentinel
-                # silently halves the failover quorum, so the NEXT node
-                # loss takes the whole API down. Reclaim now — the
-                # StatefulSet recreates pod + claim on a live node and the
-                # replica resyncs from the master (cache/broker data;
-                # Postgres is the store of record).
-                pvcs, pvc_err = k8s_api.reclaim_stranded_redis_storage(str(name))
-                if pvcs:
-                    log.info(
-                        "supervisor.heartbeat.redis_storage_reclaimed",
-                        node=name,
-                        pvcs=pvcs,
-                    )
-                elif pvc_err:
-                    log.warning(
-                        "supervisor.heartbeat.redis_storage_reclaim_failed",
-                        node=name,
-                        error=pvc_err,
-                    )
                 # #1541 — the slot-image mirror's local-path claim is
-                # stranded the same way (its pod sits Pending on the dead
+                # stranded like Redis's (its pod sits Pending on the dead
                 # node's PV affinity), and only this re-creates it.
                 owed, mirror_err = k8s_api.reclaim_stranded_mirror_storage(str(name))
                 if owed:
@@ -1457,6 +1627,22 @@ def heartbeat_once(
         _evict_reasons.update(reasons)
         _evicted_pending.intersection_update(set(evict_names))
         _nodes_deleted.intersection_update(set(evict_names))
+
+        # #590: the deleted Node strands any local-path Redis claim on it
+        # (node-affine PV): the re-created replica sits Pending and its
+        # missing sentinel silently halves the failover quorum, so the NEXT
+        # node loss takes the whole API down. The StatefulSet recreates pod
+        # and claim on a live node once the claim is gone, and the replica
+        # resyncs from the master (cache/broker data; Postgres is the store
+        # of record). #2404: every seed tick, not only the eviction one. The
+        # names evicted THIS tick go at once (and any a failed sweep left
+        # owed, while the Node list still lacks them), and on any other tick
+        # a claim pinned to a node that is no longer a Node is found and
+        # freed while a Redis pod is Pending. So a failed answer, a Node
+        # removed another way, and an eviction a restarted supervisor never
+        # saw all converge; one read of the Pending pods per tick while
+        # Redis is whole.
+        _reclaim_stranded_redis(evicted_now, log)
 
         # #1058 — the deleted Node strands the CloudNativePG instance claim
         # provisioned on it exactly as it strands Redis's, and the operator
@@ -1523,6 +1709,22 @@ def heartbeat_once(
         _dns_changed, dns_err = k8s_api.ensure_coredns_ha()
         if dns_err:
             log.warning("supervisor.heartbeat.coredns_ha_failed", error=dns_err)
+        # #1718 — with a CoreDNS replica on every node, keep each node's
+        # lookups on its own: a lost node's CoreDNS pod, still a ready
+        # endpoint until the node reads NotReady, otherwise stalls half of
+        # every other node's lookups (Redis Sentinel into TILT, the
+        # supervisor's own heartbeat into EAI_AGAIN).
+        _local_changed, local_err = k8s_api.ensure_kube_dns_node_local()
+        if local_err:
+            log.warning("supervisor.heartbeat.kube_dns_node_local_failed", error=local_err)
+        # #2240: the CNPG operator IS Postgres failover, and firstboot starts
+        # both its replicas on the seed while the seed is alone; preferred
+        # anti-affinity never moves them. From three nodes the reconciler
+        # makes the spread required (a two-replica rollout needs a third node
+        # for its surge pod), and removes it again below three.
+        _op_changed, op_err = k8s_api.ensure_cnpg_operator_spread()
+        if op_err:
+            log.warning("supervisor.heartbeat.cnpg_operator_spread_failed", error=op_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
@@ -1573,41 +1775,18 @@ def heartbeat_once(
     # the BYTE-IDENTICAL body, so applied state is the same whichever ran —
     # this is what makes the rolling upgrade (supervisor/control-plane skew in
     # either direction) safe.
-    fw_settings = body_out.get("firewall_settings")
-    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
-
-    if use_bundle:
-        if appliance_state.maybe_fire_firewall_reload(fw_settings):
-            log.info(
-                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
-            )
-    else:
-        # #5 fallback — control plane too old to render, or firewall_enabled
-        # still off; render in-pod from the same derived inputs.
-        #
-        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
-        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
-        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
-        # rendered drop-in is now the SOLE source of that accept, so it must be
-        # present on EVERY appliance node — including idle / non-CP nodes that
-        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
-        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
-        # runner short-circuits on an unchanged body hash, so an unconditional
-        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
-        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
-        # a separate file the glob pulls in, so even a total drop-in failure
-        # still leaves the node SSH-recoverable.
-        _maybe_apply_firewall(
-            role_assignment,
-            log,
-            cluster_peer_cidrs,
-            pod_cidrs=fw_pod_cidrs,
-            service_cidrs=fw_service_cidrs,
-            cp_member_count=fw_cp_member_count,
-            vip_configured=fw_vip_configured,
-            web_ui_allowed_cidrs=fw_web_ui_cidrs,
-            ssh_scope_cidrs=fw_ssh_scope_cidrs,
-        )
+    _dispatch_firewall(
+        body_out.get("firewall_settings"),
+        role_assignment,
+        log,
+        cluster_peer_cidrs,
+        pod_cidrs=fw_pod_cidrs,
+        service_cidrs=fw_service_cidrs,
+        cp_member_count=fw_cp_member_count,
+        vip_configured=fw_vip_configured,
+        web_ui_allowed_cidrs=fw_web_ui_cidrs,
+        ssh_scope_cidrs=fw_ssh_scope_cidrs,
+    )
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
@@ -1684,54 +1863,7 @@ def heartbeat_once(
         return False
 
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        # Phase 10 wave 2 — reconcile node labels every heartbeat
-        # regardless of the env-hash skip below. patch_node_labels is
-        # idempotent (same-value = no-op), so the cost is one PATCH
-        # per minute; the win is catching drift from out-of-band
-        # ``kubectl label node`` runs or manual unlabeling without
-        # waiting for the operator to flip a role.
-        try:
-            label_ok, label_err = reconcile_node_labels(target.profiles)
-            if not label_ok:
-                log.warning(
-                    "supervisor.heartbeat.labels_reconcile_failed",
-                    error=label_err,
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
-
-        apply_due, env_hash = _role_apply_due(cfg.state_dir, rendered, env_path)
-        if not apply_due:
-            log.info(
-                "supervisor.heartbeat.lifecycle_skipped",
-                reason="env_unchanged",
-                env_hash=env_hash[:12],
-            )
-        else:
-            lifecycle = apply_role_assignment(target.profiles, env_path)
-            log.info(
-                "supervisor.heartbeat.lifecycle_applied",
-                state=lifecycle.state,
-                reason=lifecycle.reason,
-                started=list(lifecycle.started),
-                stopped=list(lifecycle.stopped),
-            )
-            # The state + reason are returned on the NEXT heartbeat (not
-            # this one — we've already POSTed). Cache them on disk so a
-            # supervisor restart doesn't lose them.
-            _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
-            # The runtime set just changed (or attempted to) — invalidate
-            # the watchdog cache so the next heartbeat re-probes
-            # immediately rather than rendering 5-min-stale health.
-            # ``_last_watchdog_at`` is already declared global at the
-            # top of this function (one declaration per scope rule).
-            _last_watchdog_at = 0.0
-            # Only stamp the hash on success — a failed apply should
-            # re-attempt on the next heartbeat (the failure may have
-            # been transient: image pull glitch, transient port
-            # conflict, etc).
-            if _apply_settled(lifecycle):
-                _write_last_apply_hash(cfg.state_dir, env_hash)
+        _run_role_lifecycle(cfg.state_dir, target.profiles, rendered, env_path)
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
@@ -1739,6 +1871,71 @@ def heartbeat_once(
     _ = identity
 
     return held
+
+
+def _run_role_lifecycle(
+    state_dir: Path, profiles: list[str], rendered: str, env_path: Path
+) -> None:
+    """Write the role chart (when due), THEN reconcile the node labels (#2190).
+
+    The order is the fix. The labels used to be reconciled first, on every
+    tick, so a role swap that also moved the DNS group (BIND9 in A → PowerDNS
+    in B, one save) labelled the node for PowerDNS while the dns-powerdns
+    DaemonSet still carried the previous chart's ``AGENT_GROUP=A``: the pod it
+    started registered a new server row in A, and the agent's cached token
+    kept it there after helm-controller rolled the template to B a second
+    later. Now the values are written first, ``apply_role_assignment`` labels
+    only what its new template can serve, and the reconcile after it — which
+    still runs on every tick, to catch an out-of-band ``kubectl label`` — gates
+    the same way.
+    """
+    global _last_watchdog_at
+    apply_due, env_hash = _role_apply_due(state_dir, rendered, env_path)
+    if not apply_due:
+        log.info(
+            "supervisor.heartbeat.lifecycle_skipped",
+            reason="env_unchanged",
+            env_hash=env_hash[:12],
+        )
+    else:
+        lifecycle = apply_role_assignment(profiles, env_path)
+        log.info(
+            "supervisor.heartbeat.lifecycle_applied",
+            state=lifecycle.state,
+            reason=lifecycle.reason,
+            started=list(lifecycle.started),
+            stopped=list(lifecycle.stopped),
+        )
+        # The state + reason are returned on the NEXT heartbeat (not
+        # this one — we've already POSTed). Cache them on disk so a
+        # supervisor restart doesn't lose them.
+        _persist_lifecycle_state(state_dir, lifecycle.state, lifecycle.reason)
+        # The runtime set just changed (or attempted to) — invalidate
+        # the watchdog cache so the next heartbeat re-probes
+        # immediately rather than rendering 5-min-stale health.
+        _last_watchdog_at = 0.0
+        # Only stamp the hash on success — a failed apply should
+        # re-attempt on the next heartbeat (the failure may have
+        # been transient: image pull glitch, transient port
+        # conflict, etc).
+        if _apply_settled(lifecycle):
+            _write_last_apply_hash(state_dir, env_hash)
+
+    # Phase 10 wave 2 — reconcile node labels every heartbeat
+    # regardless of the env-hash skip above. patch_node_labels is
+    # idempotent (same-value = no-op), so the cost is one PATCH
+    # per minute; the win is catching drift from out-of-band
+    # ``kubectl label node`` runs or manual unlabeling without
+    # waiting for the operator to flip a role.
+    try:
+        label_ok, label_err = reconcile_node_labels(profiles, env_path)
+        if not label_ok:
+            log.warning(
+                "supervisor.heartbeat.labels_reconcile_failed",
+                error=label_err,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
 
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"
