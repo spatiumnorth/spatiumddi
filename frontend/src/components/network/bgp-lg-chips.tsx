@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { lookingGlassApi, type BGPLGRoute } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 // Issue #566 Phase 3 — per-space-scoped shared route fetch backing the
@@ -72,7 +73,8 @@ function worstRpki(routes: BGPLGRoute[]): string {
 /** Small "BGP" chip for a subnet or block row in the IPAM tree — shows
  *  when the row has at least one active advertised route, colour-coded
  *  by the worst RPKI status among its matched routes. Renders null when
- *  the network.looking_glass module is off or nothing matches. */
+ *  the network.looking_glass module is off, the user may not read the
+ *  Looking Glass, or nothing matches. */
 export function BgpAdvertisedChip({
   spaceId,
   subnetId,
@@ -83,7 +85,11 @@ export function BgpAdvertisedChip({
   blockId?: string;
 }) {
   const { enabled } = useFeatureModules();
-  const lgEnabled = enabled("network.looking_glass");
+  // The route search takes read on 'bgp_lg_peer'. Without it the search is
+  // not asked, so opening a space no longer costs a 403 and a denied audit
+  // row per space (#2745, the class of #2704).
+  const canRead = usePermissions().can("read", "bgp_lg_peer");
+  const lgEnabled = enabled("network.looking_glass") && canRead;
   const { bySubnet, byBlock } = useBgpLgSpaceRoutes(spaceId, lgEnabled);
   if (!lgEnabled) return null;
   const routes = subnetId
