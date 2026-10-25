@@ -35,7 +35,8 @@ async def test_block_delete_trashes_the_reverse_zone_and_restore_brings_it_back(
     ids = await _fixture(db_session)
     space_id, block_id, gid, _zid = ids
     sid = await _bound_subnet(client, headers, ids, "10.67.1.0/24")
-    assert (await _zone_row(db_session, gid, ZONE)) is not None
+    zone_before = await _zone_row(db_session, gid, ZONE)
+    assert zone_before is not None
 
     resp = await client.delete(f"/api/v1/ipam/blocks/{block_id}", headers=headers)
     assert resp.status_code == 204, resp.text
@@ -65,9 +66,8 @@ async def test_block_purge_removes_the_reverse_zone_for_good(
     _space_id, block_id, gid, _zid = ids
     await _bound_subnet(client, headers, ids, "10.67.1.0/24")
 
-    assert (
-        await client.delete(f"/api/v1/ipam/blocks/{block_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/ipam/blocks/{block_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
     resp = await client.delete(f"/api/v1/admin/trash/ip_block/{block_id}", headers=headers)
     assert resp.status_code == 204, resp.text
     assert await _zone_row(db_session, gid, ZONE) is None
@@ -82,9 +82,8 @@ async def test_space_delete_then_purge_leaves_no_reverse_zone(
     space_id, _block_id, gid, _zid = ids
     await _bound_subnet(client, headers, ids, "10.67.1.0/24")
 
-    assert (
-        await client.delete(f"/api/v1/ipam/spaces/{space_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/ipam/spaces/{space_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
     zone = await _zone_row(db_session, gid, ZONE)
     assert zone is not None and zone.deleted_at is not None
     resp = await client.delete(f"/api/v1/admin/trash/ip_space/{space_id}", headers=headers)
@@ -101,7 +100,8 @@ async def test_lone_subnet_purge_takes_the_trashed_reverse_zone(
     gid = ids[2]
     sid = await _bound_subnet(client, headers, ids, "10.67.1.0/24")
 
-    assert (await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)).status_code == 204
+    deleted = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
     zone = await _zone_row(db_session, gid, ZONE)
     assert zone is not None and zone.deleted_at is not None
     resp = await client.delete(f"/api/v1/admin/trash/subnet/{sid}", headers=headers)
@@ -120,9 +120,8 @@ async def test_purge_retires_a_live_zone_left_by_an_earlier_block_delete(
     ids = await _fixture(db_session)
     _space_id, block_id, gid, _zid = ids
     await _bound_subnet(client, headers, ids, "10.67.1.0/24")
-    assert (
-        await client.delete(f"/api/v1/ipam/blocks/{block_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/ipam/blocks/{block_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
     zone = await _zone_row(db_session, gid, ZONE)
     assert zone is not None
     zone.deleted_at = None
@@ -167,9 +166,8 @@ async def test_block_delete_keeps_a_zone_shared_with_a_subnet_outside_it(
     assert first.status_code == 201, first.text
     second = await _bound_subnet(client, headers, ids, "10.67.2.128/25")
 
-    assert (
-        await client.delete(f"/api/v1/ipam/blocks/{child.id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/ipam/blocks/{child.id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
     zone = await _zone_row(db_session, gid, "2.67.10.in-addr.arpa.")
     assert zone is not None and zone.deleted_at is None
     assert str(zone.linked_subnet_id) == second
@@ -221,7 +219,7 @@ async def test_a_subnet_without_the_opt_out_still_gets_its_zone_from_the_catch_u
     ids = await _fixture(db_session)
     gid = ids[2]
     sid = await _bound_subnet(client, headers, ids, "10.67.1.0/24")
-    assert (await _zone_row(db_session, gid, ZONE)) is not None
-    assert (await client.get(f"/api/v1/ipam/subnets/{sid}", headers=headers)).json()[
-        "skip_reverse_zone"
-    ] is False
+    zone_before = await _zone_row(db_session, gid, ZONE)
+    assert zone_before is not None
+    got = await client.get(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert got.json()["skip_reverse_zone"] is False
