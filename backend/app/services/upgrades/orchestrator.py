@@ -284,7 +284,12 @@ async def _plan_upgrade(
     )
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
-        raise OrchestratorError(f"preflight failed; refusing to plan: {', '.join(fails)}")
+        msg = f"preflight failed; refusing to plan: {', '.join(fails)}"
+        # #2779 — an unreadable lease is the API, not another run: say so.
+        if "kubeapi_unreachable" in fails:
+            why = next(r.message for r in report.results if r.name == "kubeapi_unreachable")
+            msg += f" ({why})"
+        raise OrchestratorError(msg)
 
     # Refuse if a non-terminal run already exists. The unique partial
     # index would catch this too but the operator-facing error is

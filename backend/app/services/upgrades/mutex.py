@@ -130,6 +130,10 @@ def _parse_lease(body: dict[str, Any] | None) -> LeaseState:
     )
 
 
+# The holder label of a lease read the kubeapi did not answer (#1713, #2779).
+UNREACHABLE_HOLDER = "<unreachable>"
+
+
 def get_state(*, namespace: str | None = None, retry_budget_s: float = 0.0) -> LeaseState:
     """Read the lease's current state without trying to claim it.
 
@@ -164,7 +168,11 @@ def _read(
             logger.warning("upgrade_lease_read_unanswered", error=str(exc))
             return (
                 LeaseState(
-                    held=True, holder="<unreachable>", renew_time=None, transitions=0, expired=False
+                    held=True,
+                    holder=UNREACHABLE_HOLDER,
+                    renew_time=None,
+                    transitions=0,
+                    expired=False,
                 ),
                 None,
             )
@@ -186,7 +194,7 @@ def _read(
         holder_hint = (
             "<rbac-missing>"
             if status == 403
-            else "<forbidden>" if status == 401 else "<unreachable>"
+            else "<forbidden>" if status == 401 else UNREACHABLE_HOLDER
         )
         logger.warning("upgrade_lease_read_failed", status=status, holder=holder_hint)
         return (
