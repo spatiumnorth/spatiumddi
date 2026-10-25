@@ -73,7 +73,8 @@ async def test_customer_delete_lists_restores_and_purges(
     h = await _admin(db_session)
     name = f"acme-{uuid.uuid4().hex[:6]}"
     cust = await _mk_customer(client, h, name)
-    assert (await client.delete(f"/api/v1/customers/{cust['id']}", headers=h)).status_code == 204
+    got = await client.delete(f"/api/v1/customers/{cust['id']}", headers=h)
+    assert got.status_code == 204
 
     items = await _trash(client, h, "customer")
     assert [i["id"] for i in items] == [cust["id"]]
@@ -82,13 +83,17 @@ async def test_customer_delete_lists_restores_and_purges(
 
     r = await _restore(client, h, "customer", cust["id"])
     assert r.status_code == 200, r.text
-    assert (await client.get(f"/api/v1/customers/{cust['id']}", headers=h)).status_code == 200
-    assert await _trash(client, h, "customer") == []
+    got = await client.get(f"/api/v1/customers/{cust['id']}", headers=h)
+    assert got.status_code == 200
+    got = await _trash(client, h, "customer")
+    assert got == []
 
     # Purge: delete again, then remove for good.
     await client.delete(f"/api/v1/customers/{cust['id']}", headers=h)
-    assert (await _purge(client, h, "customer", cust["id"])).status_code == 204
-    assert await _trash(client, h, "customer") == []
+    got = await _purge(client, h, "customer", cust["id"])
+    assert got.status_code == 204
+    got = await _trash(client, h, "customer")
+    assert got == []
     db_session.expire_all()
     left = (
         await db_session.execute(
@@ -110,10 +115,13 @@ async def test_deleted_name_is_free_to_reuse(client: AsyncClient, db_session: As
     await client.delete(f"/api/v1/overlays/{ov['id']}", headers=h)
 
     # Same name again, while the deleted ones sit in the Trash.
-    assert (await _mk_overlay(client, h, name))["id"] != ov["id"]
-    assert (await _mk_service(client, h, "hq", cust["id"]))["id"] != svc["id"]
+    got = await _mk_overlay(client, h, name)
+    assert got["id"] != ov["id"]
+    got = await _mk_service(client, h, "hq", cust["id"])
+    assert got["id"] != svc["id"]
     await client.delete(f"/api/v1/customers/{cust['id']}", headers=h)
-    assert (await _mk_customer(client, h, name))["id"] != cust["id"]
+    got = await _mk_customer(client, h, name)
+    assert got["id"] != cust["id"]
 
 
 async def test_restore_collides_with_live_same_name_is_409_with_reason(
@@ -135,7 +143,8 @@ async def test_restore_collides_with_live_same_name_is_409_with_reason(
         assert conflict["type"] == typ
         assert name in conflict["reason"]
         # Still in the Trash.
-        assert [i["id"] for i in await _trash(client, h, typ)] == [rid]
+        got = await _trash(client, h, typ)
+        assert [i["id"] for i in got] == [rid]
 
     # Service: same customer + name.
     svc = await _mk_service(client, h, "web", live_c["id"])
@@ -161,8 +170,10 @@ async def test_service_restore_refused_while_its_customer_is_in_the_trash(
     assert conflict["parent_type"] == "customer"
     assert conflict["parent_id"] == cust["id"]
 
-    assert (await _restore(client, h, "customer", cust["id"])).status_code == 200
-    assert (await _restore(client, h, "network_service", svc["id"])).status_code == 200
+    got = await _restore(client, h, "customer", cust["id"])
+    assert got.status_code == 200
+    got = await _restore(client, h, "network_service", svc["id"])
+    assert got.status_code == 200
 
 
 async def test_customer_purge_refused_while_services_hold_it(
@@ -178,8 +189,10 @@ async def test_customer_purge_refused_while_services_hold_it(
     assert "mpls" in r.json()["detail"]
 
     await client.delete(f"/api/v1/services/{svc['id']}", headers=h)
-    assert (await _purge(client, h, "network_service", svc["id"])).status_code == 204
-    assert (await _purge(client, h, "customer", cust["id"])).status_code == 204
+    got = await _purge(client, h, "network_service", svc["id"])
+    assert got.status_code == 204
+    got = await _purge(client, h, "customer", cust["id"])
+    assert got.status_code == 204
 
 
 async def test_bulk_delete_goes_to_the_trash_one_batch_each(
@@ -195,8 +208,10 @@ async def test_bulk_delete_goes_to_the_trash_one_batch_each(
     items = await _trash(client, h, "overlay_network")
     assert {i["id"] for i in items} == {a["id"], b["id"]}
     assert len({i["deletion_batch_id"] for i in items}) == 2
-    assert (await _restore(client, h, "overlay_network", a["id"])).status_code == 200
-    assert [i["id"] for i in await _trash(client, h, "overlay_network")] == [b["id"]]
+    got = await _restore(client, h, "overlay_network", a["id"])
+    assert got.status_code == 200
+    got = await _trash(client, h, "overlay_network")
+    assert [i["id"] for i in got] == [b["id"]]
 
 
 async def test_create_conflict_names_the_field(
@@ -291,8 +306,10 @@ async def test_rows_deleted_before_the_upgrade_are_listed_restorable_and_get_a_f
     items = await _trash(client, h, "overlay_network")
     assert [i["id"] for i in items] == [ov["id"]]
     assert items[0]["deletion_batch_id"] is None and items[0]["batch_size"] == 1
-    assert (await _restore(client, h, "overlay_network", ov["id"])).status_code == 200
-    assert (await client.get(f"/api/v1/overlays/{ov['id']}", headers=h)).status_code == 200
+    got = await _restore(client, h, "overlay_network", ov["id"])
+    assert got.status_code == 200
+    got = await client.get(f"/api/v1/overlays/{ov['id']}", headers=h)
+    assert got.status_code == 200
 
 
 async def test_retention_sweep_purges_expired_rows_and_holds_a_customer_with_services(
@@ -334,7 +351,8 @@ async def test_retention_sweep_purges_expired_rows_and_holds_a_customer_with_ser
     assert result["held_back_live_children"].get("customer") == 1, result
     ids = {i["id"] for i in await _trash(client, h, "customer")}
     assert ids == {held["id"]}
-    assert (await client.get(f"/api/v1/services/{svc['id']}", headers=h)).status_code == 200
+    got = await client.get(f"/api/v1/services/{svc['id']}", headers=h)
+    assert got.status_code == 200
 
 
 # --- namesakes sitting in the Trash are not live rows (QA walk of #2744) -----
@@ -372,9 +390,11 @@ async def test_restore_ignores_one_namesake_in_the_trash(
     h = await _admin(db_session)
     name, cust = await _setup(client, h, kind)
     a = await _make(client, h, kind, name, cust)
-    assert (await client.delete(_path(kind, a["id"]), headers=h)).status_code == 204
+    got = await client.delete(_path(kind, a["id"]), headers=h)
+    assert got.status_code == 204
     c = await _make(client, h, kind, name, cust)
-    assert (await client.delete(_path(kind, c["id"]), headers=h)).status_code == 204
+    got = await client.delete(_path(kind, c["id"]), headers=h)
+    assert got.status_code == 204
     r = await _restore(client, h, _TYPE[kind], a["id"])
     assert r.status_code == 200, r.text
 
@@ -389,7 +409,8 @@ async def test_restore_with_two_namesakes_in_the_trash_is_not_a_500(
     for _ in range(3):
         row = await _make(client, h, kind, name, cust)
         ids.append(row["id"])
-        assert (await client.delete(_path(kind, row["id"]), headers=h)).status_code == 204
+        got = await client.delete(_path(kind, row["id"]), headers=h)
+        assert got.status_code == 204
     r = await _restore(client, h, _TYPE[kind], ids[0])
     assert r.status_code == 200, r.text
 
@@ -401,9 +422,11 @@ async def test_restore_still_409_against_a_live_namesake_among_trash_ones(
     h = await _admin(db_session)
     name, cust = await _setup(client, h, kind)
     a = await _make(client, h, kind, name, cust)
-    assert (await client.delete(_path(kind, a["id"]), headers=h)).status_code == 204
+    got = await client.delete(_path(kind, a["id"]), headers=h)
+    assert got.status_code == 204
     b = await _make(client, h, kind, name, cust)
-    assert (await client.delete(_path(kind, b["id"]), headers=h)).status_code == 204
+    got = await client.delete(_path(kind, b["id"]), headers=h)
+    assert got.status_code == 204
     await _make(client, h, kind, name, cust)  # live
     r = await _restore(client, h, _TYPE[kind], a["id"])
     assert r.status_code == 409, r.text
