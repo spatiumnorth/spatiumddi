@@ -68,6 +68,45 @@ _SYNTH_TLD = "invalid"
 
 
 _REDACTED = "[REDACTED]"
+_PEM_REDACTED = f"{_REDACTED}:pem"
+
+# The BEGIN / END markers of a private key: PKCS#8 (``PRIVATE KEY``), the
+# typed forms (``RSA`` / ``EC`` / ``DSA`` / ``OPENSSH`` / ``ENCRYPTED``) and
+# an OpenPGP ``PRIVATE KEY BLOCK``.
+_PEM_LABEL = r"(?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----"
+_PEM_BEGIN = r"-----BEGIN " + _PEM_LABEL
+_PEM_END = r"-----END " + _PEM_LABEL
+
+
+_KEYWORD_CREDENTIAL_RE = re.compile(
+    r"(?<![\w-])"
+    # The key: any prefix (``PG``, ``POSTGRES_``, ``client_``, ``db.``),
+    # ending in a credential word.
+    r"(?P<key>[\w.-]*?(?:password|passwd|passphrase|pwd|secret|"
+    r"(?:secret|api|access|private)[_-]?key|(?:auth|access|refresh)[_-]?token))"
+    # Separator, with the closing quote of a JSON key (escaped or not).
+    r"(?P<sep>\\?[\"']?[ \t]*[:=][ \t]*)"
+    # Not a value already redacted (a second pass must not count it again),
+    # and not a flag: ``ALLOW_INSECURE_SECRET_KEY=true`` names a setting,
+    # it does not carry one.
+    r"(?!\\?[\"']?\[REDACTED)"
+    r"(?!\\?[\"']?(?:true|false|none|null)\b)"
+    r"(?P<value>\"(?:[^\"\\\n]|\\.)+\"|'[^'\n]+'|\\\"[^\"\\\n]+\\\""
+    r"|[^\s,;&\"'}\]\[)<>\\]+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_keyword_value(match: re.Match[str]) -> str:
+    """Keep the key, the separator and the value's quoting; drop the value."""
+    value = match.group("value")
+    if value.startswith('\\"'):
+        replaced = f'\\"{_REDACTED}\\"'
+    elif value[0] in "\"'":
+        replaced = f"{value[0]}{_REDACTED}{value[0]}"
+    else:
+        replaced = _REDACTED
+    return f"{match.group('key')}{match.group('sep')}{replaced}"
 
 
 # ── Hard-exclude: secret shapes ─────────────────────────────────────────
@@ -75,7 +114,9 @@ _REDACTED = "[REDACTED]"
 # Matched on VALUE shape, not on the key name, so a secret that lands in
 # an unexpected field is still caught. These are all high-signal prefixes
 # with no plausible benign meaning in a diagnostics dump.
-_SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
+_SECRET_VALUE_PATTERNS: tuple[
+    tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
+] = (
     # Fernet token — every encrypted column in this codebase.
     ("fernet", re.compile(r"\bgAAAAA[A-Za-z0-9_\-=]{16,}"), f"{_REDACTED}:fernet"),
     # bcrypt / argon2 password hashes.
@@ -89,17 +130,17 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         re.compile(r"\$argon2[a-z]{1,2}\$[^\s\"']{16,}"),
         f"{_REDACTED}:password-hash",
     ),
-    # PEM private keys (and certificates' private halves). The whole block,
-    # through its END line: the base64 body IS the key, so dropping only the
-    # BEGIN line would leave it in the output. A block with no END (truncated
-    # text) still loses its BEGIN line, as before.
+    # PEM private keys (and certificates' private halves), and OpenPGP
+    # private key blocks. The whole block, through its END line: the base64
+    # body IS the key, so dropping only the BEGIN line would leave it in the
+    # output. A block missing its END (text cut after the BEGIN) or its
+    # BEGIN (text that starts mid-key, such as a log tail) is handled by
+    # ``_redact_pem_fragments`` after this pass, which removes the body
+    # lines around the marker that is present.
     (
         "pem",
-        re.compile(
-            r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"
-            r"(?:[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----)?"
-        ),
-        f"{_REDACTED}:pem",
+        re.compile(_PEM_BEGIN + r"[\s\S]*?" + _PEM_END),
+        _PEM_REDACTED,
     ),
     # JWTs — session tokens, agent tokens, supervisor tokens.
     (
@@ -175,6 +216,16 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
     # An Azure storage connection string carries the account key inline.
     ("azure-account-key", re.compile(r"(?i)(?<=AccountKey=)[A-Za-z0-9+/=]+"), _REDACTED),
+    # A credential written as ``key=value`` / ``key: value`` / ``"key":
+    # "value"``: a libpq keyword DSN (``host=db password=…``), an ADO-style
+    # connection string (``Server=…;Pwd=…;``), ``PGPASSWORD=…`` /
+    # ``POSTGRES_PASSWORD=…`` on a command line, or a JSON / YAML field a
+    # process printed. Matched on the KEY, since the value has no shape:
+    # only the value is replaced, so the line still says which credential
+    # was there. The key must END in the credential word, so
+    # ``password_min_length: 12`` is left alone. A value already redacted
+    # is skipped, so a second pass does not count it again.
+    ("keyword-credential", _KEYWORD_CREDENTIAL_RE, _redact_keyword_value),
 )
 
 # Matched on KEY name, for structured data (env dumps, settings rows,
@@ -388,7 +439,205 @@ def redact_secrets(text: str) -> tuple[str, list[str]]:
         out, n = pattern.subn(replacement, out)
         if n:
             hits.append(kind)
+    out, n = _redact_pem_fragments(out)
+    if n and "pem" not in hits:
+        hits.append("pem")
     return out, hits
+
+
+# ── Private keys split across lines ─────────────────────────────────────
+#
+# The block pattern above needs both markers. Log text often has only one:
+# a tail that starts in the middle of a key has its END but not its BEGIN,
+# and a tail cut after a BEGIN has no END. In both cases the body lines
+# next to the marker that IS present are the key, so they go too.
+
+_PEM_BEGIN_RE = re.compile(_PEM_BEGIN)
+_PEM_END_RE = re.compile(_PEM_END)
+# A key body line: base64, optionally after a log prefix (a syslog or
+# container-runtime timestamp), so the TOKEN is tested, not the line. A
+# body line is 64 (PEM) or 70 (OpenSSH) characters; 16 keeps an ordinary
+# log word from passing for one.
+_PEM_BODY_TOKEN_RE = re.compile(r"=?[A-Za-z0-9+/]{16,}={0,2}")
+# The last body line of a key is usually shorter.
+_PEM_LAST_TOKEN_RE = re.compile(r"=?[A-Za-z0-9+/]+={0,2}")
+# Encryption headers inside a legacy PEM key, and OpenPGP armour headers.
+_PEM_HEADER_RE = re.compile(r"(?:^|\s)(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset):")
+# How many lines one key may span. An RSA-4096 PEM key is ~50 lines and an
+# OpenPGP private key block rarely passes 150; the cap stops a stray marker
+# from swallowing the rest of a log.
+_PEM_MAX_LINES = 256
+
+
+def _pem_body_like(line: str, *, last: bool = False) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _PEM_HEADER_RE.search(stripped):
+        return True
+    token = stripped.split()[-1]
+    pattern = _PEM_LAST_TOKEN_RE if last else _PEM_BODY_TOKEN_RE
+    return bool(pattern.fullmatch(token))
+
+
+def _pem_line_tail(rest: str) -> str:
+    """What may stay of a line after an unterminated BEGIN marker: nothing
+    when it carries key material (a body token, or an escaped newline that
+    puts the key on this same line, as inside a JSON string)."""
+    if "\\n" in rest or any(_PEM_BODY_TOKEN_RE.fullmatch(t) for t in rest.split()):
+        return ""
+    return rest
+
+
+def _redact_pem_fragments(text: str) -> tuple[str, int]:
+    """Remove a private key that has only one of its two markers.
+
+    Runs after the block pattern, so every complete block is already gone
+    and any marker left is unpaired: a BEGIN takes the body lines after it,
+    an END the body lines before it.
+    """
+    if "PRIVATE KEY" not in text:
+        return text, 0
+    lines = text.split("\n")
+    out: list[str] = []
+    hits = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        begin = _PEM_BEGIN_RE.search(line)
+        end = _PEM_END_RE.search(line)
+        if begin and (end is None or begin.start() < end.start()):
+            out.append(line[: begin.start()] + _PEM_REDACTED + _pem_line_tail(line[begin.end() :]))
+            hits += 1
+            i += 1
+            taken = 0
+            while (
+                i < len(lines)
+                and taken < _PEM_MAX_LINES
+                and not _PEM_BEGIN_RE.search(lines[i])
+                and not _PEM_END_RE.search(lines[i])
+                and _pem_body_like(lines[i])
+            ):
+                i += 1
+                taken += 1
+            continue
+        if end:
+            taken = 0
+            while (
+                out
+                and taken < _PEM_MAX_LINES
+                and _PEM_REDACTED not in out[-1]
+                and _pem_body_like(out[-1], last=taken == 0)
+            ):
+                out.pop()
+                taken += 1
+            out.append(line[: end.start()] + _PEM_REDACTED + line[end.end() :])
+            hits += 1
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out), hits
+
+
+# Extra lines a one-shot log view reads before its window. A window that
+# falls inside a private key holds body lines and neither marker, so it
+# cannot be recognised on its own; reading back far enough to reach the
+# BEGIN (a key spans at most ``_PEM_MAX_LINES``) lets the fragment pass see it.
+LOG_CONTEXT_LINES = _PEM_MAX_LINES
+
+
+def redact_log_tail(text: str, lines: int, *, requested: int) -> str:
+    """Redact a log tail read with :data:`LOG_CONTEXT_LINES` of context,
+    then trim it to its last ``lines`` lines.
+
+    ``text`` is the last ``requested`` lines of the log (``lines`` plus the
+    context). When it holds fewer, it is the whole log; otherwise it starts
+    mid-log, and a leading run of key-body lines is dropped too, since its
+    BEGIN lies even further back.
+    """
+    trailing = text.endswith("\n")
+    out = redact_secrets(text)[0].split("\n")
+    if trailing and out and out[-1] == "":
+        out.pop()
+    if len(text.splitlines()) >= requested:
+        skip = 0
+        while skip < len(out) and skip < _PEM_MAX_LINES and out[skip].strip():
+            if _PEM_REDACTED in out[skip] or not _pem_body_like(out[skip]):
+                break
+            skip += 1
+        out = out[skip:]
+    if lines > 0:
+        out = out[-lines:]
+    return "\n".join(out) + ("\n" if trailing and out else "")
+
+
+class LogStreamRedactor:
+    """:func:`redact_secrets` for text that arrives one line at a time.
+
+    A log stream hands over a private key one line per chunk, so no single
+    chunk holds both markers and the block pattern never matches. This
+    keeps the state between chunks instead: after a BEGIN, every line is
+    withheld until the END (or :data:`_PEM_MAX_LINES`, so a stray marker
+    cannot silence the stream for good). Lines that look like a key body
+    with no BEGIN before them are held back until the next line shows what
+    they were: an END means they were a key and they are dropped, anything
+    else releases them. Every line that is sent goes through
+    :func:`redact_secrets` as well.
+    """
+
+    def __init__(self) -> None:
+        self._in_key = False
+        self._key_lines = 0
+        self._held: list[str] = []
+
+    def feed(self, chunk: str) -> list[str]:
+        """The lines of ``chunk`` that may be sent, redacted, in order."""
+        out: list[str] = []
+        for line in chunk.splitlines():
+            out.extend(self._feed_line(line))
+        return out
+
+    def flush(self) -> list[str]:
+        """Release lines still held back; call when the stream ends."""
+        held, self._held = self._held, []
+        return [redact_secrets(line)[0] for line in held]
+
+    def _feed_line(self, line: str) -> list[str]:
+        if self._in_key:
+            self._key_lines += 1
+            end = _PEM_END_RE.search(line)
+            if end:
+                self._in_key = False
+                rest = line[end.end() :]
+                return self._feed_line(rest) if rest.strip() else []
+            if self._key_lines >= _PEM_MAX_LINES:
+                self._in_key = False
+            return []
+        begin = _PEM_BEGIN_RE.search(line)
+        end = _PEM_END_RE.search(line, begin.end()) if begin else _PEM_END_RE.search(line)
+        if begin and end is None:
+            out = self.flush()
+            self._in_key = True
+            self._key_lines = 0
+            head = redact_secrets(line[: begin.start()])[0]
+            tail = redact_secrets(_pem_line_tail(line[begin.end() :]))[0]
+            out.append(head + _PEM_REDACTED + tail)
+            return out
+        if end and not begin:
+            # The held lines were the body of a key whose BEGIN was not seen.
+            self._held = []
+            head = redact_secrets(line[: end.start()])[0]
+            return [head + _PEM_REDACTED + redact_secrets(line[end.end() :])[0]]
+        stripped = line.strip()
+        if stripped and len(self._held) < _PEM_MAX_LINES:
+            pattern = _PEM_LAST_TOKEN_RE if self._held else _PEM_BODY_TOKEN_RE
+            if pattern.fullmatch(stripped):
+                self._held.append(line)
+                return []
+        out = self.flush()
+        out.append(redact_secrets(line)[0])
+        return out
 
 
 # ── Pseudonymisation ────────────────────────────────────────────────────

@@ -18,3 +18,15 @@ export function useApplianceAdminGate(): {
     NEEDS_APPLIANCE_ADMIN,
   );
 }
+
+/** Raw appliance log text — host log files and pod logs, one-shot or
+ *  streamed — takes `admin` on `appliance` (diagnostics.py,
+ *  containers.py), because a log line can carry whatever a process
+ *  printed. The log panes are hidden rather than drawn and left to 403. */
+export function useCanReadApplianceLogs(): boolean {
+  return usePermissions().can("admin", "appliance");
+}
+
+/** Shown in place of a hidden log pane. */
+export const NEEDS_APPLIANCE_ADMIN_FOR_LOGS =
+  "Log text requires admin permission on the appliance";

@@ -69,7 +69,10 @@ import {
   useClusterHealthStream,
   type HistPoint,
 } from "./clusterShared";
-import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import {
+  useApplianceAdminGate,
+  useCanReadApplianceLogs,
+} from "@/hooks/useApplianceAdmin";
 
 /**
  * Cluster → Overview (#402 / #416) — one cohesive, near-real-time dashboard
@@ -1264,6 +1267,9 @@ export function ClusterOverview({
 }: { onViewPods?: () => void } = {}) {
   // #1342 — every appliance action takes `admin` on `appliance`.
   const applianceGate = useApplianceAdminGate();
+  // The live log pane streams pod log text, which takes `admin` on
+  // `appliance`; it is not drawn for a read-only role.
+  const canReadLogs = useCanReadApplianceLogs();
   const { snapshot, history, connected } = useClusterHealthStream();
 
   // Identity + lifecycle for the header / reboot action (folds in the former
@@ -1598,36 +1604,41 @@ export function ClusterOverview({
       </div>
 
       {/* Live log pane */}
-      <div className="rounded-xl border bg-card p-4 shadow-sm">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="flex items-center gap-1.5 text-sm font-semibold">
-            <ScrollText className="h-4 w-4 text-muted-foreground" />
-            Live log
-          </h3>
-          {workloadNames.length > 0 && (
-            <select
-              value={effectiveWorkload}
-              onChange={(e) => setSelectedWorkload(e.target.value)}
-              className="rounded-md border bg-background px-2 py-1 text-xs"
-            >
-              {workloadNames.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          )}
+      {canReadLogs && (
+        <div className="rounded-xl border bg-card p-4 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="flex items-center gap-1.5 text-sm font-semibold">
+              <ScrollText className="h-4 w-4 text-muted-foreground" />
+              Live log
+            </h3>
+            {workloadNames.length > 0 && (
+              <select
+                value={effectiveWorkload}
+                onChange={(e) => setSelectedWorkload(e.target.value)}
+                className="rounded-md border bg-background px-2 py-1 text-xs"
+              >
+                {workloadNames.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+          <div className="mt-3">
+            {effectiveWorkload ? (
+              <LiveLogPane
+                key={effectiveWorkload}
+                workload={effectiveWorkload}
+              />
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                No workloads to tail yet.
+              </p>
+            )}
+          </div>
         </div>
-        <div className="mt-3">
-          {effectiveWorkload ? (
-            <LiveLogPane key={effectiveWorkload} workload={effectiveWorkload} />
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              No workloads to tail yet.
-            </p>
-          )}
-        </div>
-      </div>
+      )}
 
       {/* Action bar */}
       <div className="flex flex-wrap items-center gap-2">
