@@ -805,7 +805,7 @@ async def test_last_success_survives_a_later_failure(db_session: AsyncSession) -
         org="acme",
         bucket="ddi",
         token_encrypted=encrypt_str("tok"),
-        push_dns_metrics=False,
+        push_dns_metrics=True,
         push_dhcp_metrics=False,
         push_subnet_utilization=False,
         push_dhcp_scope_leases=False,
@@ -814,6 +814,9 @@ async def test_last_success_survives_a_later_failure(db_session: AsyncSession) -
     await db_session.flush()
     assert row.last_success_at is None
 
+    async def _one_dns_point(db: object, since: object) -> tuple[list[Point], None]:
+        return [Point("dns_q", {}, {"n": 1}, 1_700_000_000_000_000_000)], None
+
     async def _boom(cfg: object, body: str) -> None:
         raise InfluxDBWriteError("HTTP 500")
 
@@ -821,20 +824,74 @@ async def test_last_success_survives_a_later_failure(db_session: AsyncSession) -
         return None
 
     t1 = datetime.now(UTC) - timedelta(minutes=10)
-    with patch("app.services.influxdb.push.write_lines", new=_boom):
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_boom),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
         await push_target(db_session, row, now=t1)
     # Never delivered: an attempt, but no success.
     assert row.last_push_at == t1
     assert row.last_success_at is None
 
     t2 = t1 + timedelta(minutes=5)
-    with patch("app.services.influxdb.push.write_lines", new=_ok):
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_ok),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
         await push_target(db_session, row, now=t2)
     assert row.last_success_at == t2
 
     t3 = t2 + timedelta(minutes=5)
-    with patch("app.services.influxdb.push.write_lines", new=_boom):
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_boom),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
         await push_target(db_session, row, now=t3)
     assert row.last_push_at == t3
     assert row.last_success_at == t2
     assert row.last_push_error == "HTTP 500"
+
+
+# ── #2749: a push that sent nothing is not a push the destination accepted ──
+
+
+@pytest.mark.asyncio
+async def test_empty_push_is_not_recorded_as_accepted(db_session: AsyncSession) -> None:
+    row = InfluxDBTarget(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        version="v2",
+        url="http://192.0.2.10:8086",
+        org="acme",
+        bucket="ddi",
+        token_encrypted=encrypt_str("tok"),
+        push_dns_metrics=True,
+        push_dhcp_metrics=False,
+        push_subnet_utilization=False,
+        push_dhcp_scope_leases=False,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    async def _boom(cfg: object, body: str) -> None:
+        raise InfluxDBWriteError("ConnectTimeout")
+
+    async def _one_dns_point(db: object, since: object) -> tuple[list[Point], None]:
+        return [Point("dns_q", {}, {"n": 1}, 1_700_000_000_000_000_000)], None
+
+    t1 = datetime.now(UTC) - timedelta(minutes=10)
+    with (
+        patch("app.services.influxdb.push.write_lines", new=_boom),
+        patch("app.services.influxdb.push.collect.collect_dns_points", new=_one_dns_point),
+    ):
+        await push_target(db_session, row, now=t1)
+    assert row.last_push_error == "ConnectTimeout"
+
+    # The operator unticks everything: nothing to send, nobody contacted.
+    row.push_dns_metrics = False
+    t2 = t1 + timedelta(minutes=5)
+    res = await push_target(db_session, row, now=t2)
+    assert res.points == 0
+    assert row.last_success_at is None  # never accepted
+    assert row.last_push_error == "ConnectTimeout"  # failure not erased
+    assert row.last_push_at == t2  # interval gating still advances
+    assert row.last_push_points == 0
