@@ -3280,6 +3280,14 @@ on top of the image.
    >
    > Upload works normally once the appliance is on `2026.07.30-1` or
    > later. See [#787](https://github.com/spatiumnorth/spatiumddi/issues/787).
+
+   A scripted upload must send a `Content-Length` header, as browsers,
+   `curl -F` and the common HTTP client libraries do; one without it is
+   answered **411**, because the receiving node's free space is checked
+   against that size before the image is buffered. The caller's
+   credentials are checked from the request headers first, so a missing
+   or insufficient one is answered 401 / 403 before any of the image is
+   read.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
