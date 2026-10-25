@@ -450,6 +450,11 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
     # Dhcp4 (``subnet4``) and Dhcp6 (``subnet6``) blocks.
     if scope.relay_addresses:
         out["relay"] = {"ip-addresses": list(scope.relay_addresses)}
+    # #2731: the classes of the scope's own PXE profile. They are
+    # ``only-in-additional-list``, so Kea evaluates them for the subnets that
+    # list them and no other. Dhcp4 only, like the classes.
+    if scope.pxe_class_names and af != "ipv6":
+        out["evaluate-additional-classes"] = list(scope.pxe_class_names)
     # Prefix-delegation pools (issue #368) — drop malformed rows rather than
     # failing the whole render.
     if pd_pools:
@@ -524,11 +529,17 @@ def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
     composed from the operator's ``vendor_class_match`` substring +
     ``arch_codes`` enumeration. An empty test means "always match"
     — typically a low-priority fallthrough.
+
+    #2731: ``only-in-additional-list``, so Kea evaluates the class only
+    for the subnets that list it in ``evaluate-additional-classes``, which
+    are the scopes bound to its profile (``_render_scope``). As a global
+    class it answered the PXE clients of every scope on the server.
     """
     d: dict[str, Any] = {
         "name": p.name,
         "next-server": p.next_server,
         "boot-file-name": p.boot_file_name,
+        "only-in-additional-list": True,
     }
     if p.match_expression:
         d["test"] = p.match_expression
