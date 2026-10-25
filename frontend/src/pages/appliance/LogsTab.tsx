@@ -17,6 +17,10 @@ import {
   type ApplianceSelfTestReport,
   formatApiError,
 } from "@/lib/api";
+import {
+  NEEDS_APPLIANCE_ADMIN_FOR_LOGS,
+  useCanReadApplianceLogs,
+} from "@/hooks/useApplianceAdmin";
 
 /**
  * Logs & Diagnostics (Phase 4e, rewritten as Phase 11 wave 4).
@@ -33,6 +37,9 @@ import {
  *    redacted env.
  */
 export function LogsTab() {
+  // Host log text and the diagnostic bundle both take `admin` on
+  // `appliance`; a read-only role keeps the self-test only.
+  const canReadLogs = useCanReadApplianceLogs();
   return (
     <div className="mx-auto max-w-4xl space-y-4">
       <div>
@@ -47,8 +54,16 @@ export function LogsTab() {
       </div>
 
       <SelfTestCard />
-      <LogViewerCard />
-      <DiagnosticBundleCard />
+      {canReadLogs ? (
+        <>
+          <LogViewerCard />
+          <DiagnosticBundleCard />
+        </>
+      ) : (
+        <p className="rounded-lg border border-dashed bg-muted/30 px-4 py-3 text-xs text-muted-foreground">
+          {NEEDS_APPLIANCE_ADMIN_FOR_LOGS}.
+        </p>
+      )}
     </div>
   );
 }
