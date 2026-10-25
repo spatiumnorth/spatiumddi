@@ -207,3 +207,18 @@ describe("Last push column", () => {
     expect(screen.getByText(/last attempt failed 1m ago/)).toBeTruthy();
   });
 });
+
+// #2751: an empty stored prefix writes unprefixed names; the field must not
+// offer the default "spatiumddi_" as if that were what the target writes.
+describe("measurement prefix", () => {
+  it("says an empty prefix writes unprefixed names", async () => {
+    await openEdit({ ...BASE, measurement_prefix: "" });
+    expect(screen.queryByPlaceholderText("spatiumddi_")).toBeNull();
+    expect(screen.getByText(/no prefix/i)).toBeTruthy();
+  });
+
+  it("shows no empty-prefix note when a prefix is stored", async () => {
+    await openEdit(BASE);
+    expect(screen.queryByText(/no prefix/i)).toBeNull();
+  });
+});
