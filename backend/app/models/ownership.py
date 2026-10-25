@@ -60,7 +60,14 @@ class Customer(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     __tablename__ = "customer"
     __table_args__ = (
-        UniqueConstraint("name", name="uq_customer_name"),
+        # Partial, so a soft-deleted customer stops holding its name (#2738);
+        # same pattern as ix_ip_space_name (#491).
+        Index(
+            "uq_customer_name",
+            "name",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index("ix_customer_status", "status"),
     )
 
