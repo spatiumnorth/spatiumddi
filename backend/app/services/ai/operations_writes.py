@@ -32,13 +32,15 @@ returns a file stream rather than an apply-shaped mutation. The backup
 from __future__ import annotations
 
 import uuid
+from ipaddress import ip_network
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dhcp._audit import write_audit
+from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.operations import (
@@ -1357,6 +1359,45 @@ class UpdateSNMPSettingsArgs(BaseModel):
     sys_contact: str | None = None
     sys_location: str | None = None
 
+    # The same checks ``PUT /settings`` applies: every one of these values is
+    # written into a line of snmpd.conf, which ends a directive at the
+    # newline.
+    @field_validator("sys_contact", "sys_location")
+    @classmethod
+    def _valid_sys_text(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is None:
+            return None
+        return reject_control_chars(v, info.field_name or "value")
+
+    @field_validator("community")
+    @classmethod
+    def _valid_community(cls, v: str | None) -> str | None:
+        if v and (has_control_chars(v) or any(c.isspace() for c in v)):
+            raise ValueError("community must not contain whitespace or control characters")
+        return v
+
+    @field_validator("allowed_sources")
+    @classmethod
+    def _valid_sources(cls, v: list[str] | None) -> list[str] | None:
+        return _canonical_networks(v)
+
+
+def _canonical_networks(v: list[str] | None) -> list[str] | None:
+    """Canonical network strings for a source list; ``ValueError`` on an
+    entry that is not a network. Empty entries are dropped."""
+    if v is None:
+        return None
+    out: list[str] = []
+    for raw in v:
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            out.append(str(ip_network(s, strict=False)))
+        except ValueError as exc:
+            raise ValueError(f"invalid CIDR or host: {raw!r} ({exc})") from exc
+    return out
+
 
 async def _preview_update_snmp_settings(
     db: AsyncSession, user: User, args: UpdateSNMPSettingsArgs
@@ -1421,6 +1462,30 @@ class UpdateNTPSettingsArgs(BaseModel):
     pool_servers: list[str] | None = None
     allow_clients: bool | None = None
     allow_client_networks: list[str] | None = None
+
+    # The same checks ``PUT /settings`` applies: each value is written into
+    # a line of chrony.conf.
+    @field_validator("pool_servers")
+    @classmethod
+    def _valid_pool_servers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = str(raw).strip()
+            if not s:
+                continue
+            if has_control_chars(s) or any(c.isspace() for c in s):
+                raise ValueError(
+                    f"pool hostname may not contain whitespace or control characters: {raw!r}"
+                )
+            out.append(s)
+        return out
+
+    @field_validator("allow_client_networks")
+    @classmethod
+    def _valid_allow_networks(cls, v: list[str] | None) -> list[str] | None:
+        return _canonical_networks(v)
 
 
 async def _preview_update_ntp_settings(

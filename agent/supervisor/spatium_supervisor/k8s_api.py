@@ -2892,6 +2892,144 @@ def ensure_kube_dns_node_local() -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+#: #2240: the CNPG operator's Deployment as the spatium-bootstrap release
+#: renders it (the cloudnative-pg subchart under its ``cloudnative-pg``
+#: nameOverride, #277).
+_CNPG_OPERATOR_PATH = (
+    "/apis/apps/v1/namespaces/spatium/deployments/spatium-bootstrap-cloudnative-pg"
+)
+#: The term the chart's own PREFERRED rule carries (values.yaml ``cnpg.affinity``),
+#: made REQUIRED once the cluster can honour it.
+_CNPG_OPERATOR_SPREAD_TERM = {
+    "topologyKey": "kubernetes.io/hostname",
+    "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "cloudnative-pg"}},
+}
+#: Two replicas plus the surge pod a pod-template rollout adds while the old
+#: pods still hold their nodes.
+_CNPG_OPERATOR_REQUIRED_MIN_NODES = 3
+
+
+def ensure_cnpg_operator_spread() -> tuple[bool, str | None]:
+    """Keep the CloudNativePG operator's two replicas on different nodes once
+    the cluster has three. Returns (changed, error), like ``ensure_coredns_ha``;
+    ``(False, None)`` means converged, deferred or no operator.
+
+    #2240: the operator IS Postgres failover. While it is gone, nothing
+    promotes a new primary. #590 gave it two replicas, 20 s fast-evict
+    tolerations and a PREFERRED hostname anti-affinity (charts/
+    spatiumddi-appliance values.yaml ``cnpg``). But firstboot installs it on
+    the seed while the seed is the only node, so both replicas start there,
+    and preferred anti-affinity is IgnoredDuringExecution: Kubernetes never
+    rebalances running pods, so they stay on the seed as members join. A
+    seven-node cluster lost both at once when its seed was killed, and the
+    failover waited for their rescheduling. ``ensure_coredns_ha`` (#633)
+    records the same lesson for CoreDNS.
+
+    A REQUIRED rule cannot be the chart's default, for the reason the chart
+    gives: on one node the second replica could never schedule. It also
+    needs more than two nodes to be APPLIED. Changing the pod template starts
+    a rollout, and with two replicas the rollout surges one new pod and keeps
+    both old ones until it is Ready. The new pod must land on a node with no
+    operator pod, while the old pods still hold up to two: on two nodes that
+    is the #750 deadlock. So:
+
+    * **3 or more registered nodes**: the required term is added. The
+      rollout it starts moves the replicas apart, and the scheduler keeps
+      them apart from then on: a lost node's replica is replaced on a node
+      without one. While fewer than three nodes are Ready and uncordoned the
+      change is deferred to a later heartbeat, as ``ensure_coredns_ha``
+      defers its own.
+    * **fewer**: the term is removed, which is the chart's own template.
+      Never deferred: a preferred-only rollout can always place its surge
+      pod.
+
+    Registered Node objects, not ``control_plane_size``, for the reasons
+    ``ensure_coredns_ha`` gives: they are the hostname domains that exist, and
+    a node OUTAGE does not drop the count and undo the spread at the moment
+    it matters.
+
+    The patch is a JSON merge-patch that carries only
+    ``requiredDuringSchedulingIgnoredDuringExecution``. The chart's preferred
+    term and every other field stay exactly as Helm rendered them, so a later
+    helm upgrade of spatium-bootstrap (a slot upgrade) has nothing of its own
+    to revert: a three-way merge leaves a field the chart has never set. If a
+    reinstall drops the term anyway, the next heartbeat adds it again. A 404
+    means this appliance's bootstrap chart runs no operator: nothing to do.
+    """
+    registered, schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        # Same guard as ensure_coredns_ha: zero is a bad read, never a
+        # nodeless cluster, and acting on it would turn it into a rollout.
+        return False, "kubeapi reported no nodes"
+    want_required = registered >= _CNPG_OPERATOR_REQUIRED_MIN_NODES
+
+    try:
+        status, resp = _request("GET", _CNPG_OPERATOR_PATH)
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status == 404:
+        return False, None
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        dep = json.loads(resp)
+    except ValueError:
+        return False, "unparseable cnpg operator deployment"
+    if not isinstance(dep, dict):
+        return False, "unparseable cnpg operator deployment"
+    tmpl_spec = ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+    anti = (tmpl_spec.get("affinity") or {}).get("podAntiAffinity") or {}
+    current = anti.get("requiredDuringSchedulingIgnoredDuringExecution")
+
+    desired = [_CNPG_OPERATOR_SPREAD_TERM] if want_required else None
+    if (current or None) == desired:
+        return False, None
+    if want_required and schedulable < _CNPG_OPERATOR_REQUIRED_MIN_NODES:
+        log.info(
+            "supervisor.k8s_api.cnpg_operator_spread_deferred",
+            registered_nodes=registered,
+            schedulable_nodes=schedulable,
+        )
+        return False, None
+
+    # ``null`` deletes the key under a JSON merge-patch, restoring the chart's
+    # template; a list replaces the key whole.
+    payload = json.dumps(
+        {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "affinity": {
+                            "podAntiAffinity": {
+                                "requiredDuringSchedulingIgnoredDuringExecution": desired
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            _CNPG_OPERATOR_PATH,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except (RuntimeError, OSError) as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.cnpg_operator_spread_reconciled",
+            registered_nodes=registered,
+            shape="required" if want_required else "chart",
+        )
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
 @dataclass
 class CnpgScale:
     """What one ``patch_cnpg_instances`` call did. ``changed`` is any PATCH

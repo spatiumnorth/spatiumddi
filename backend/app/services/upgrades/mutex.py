@@ -34,6 +34,7 @@ from typing import Any
 import structlog
 
 from app.services.appliance import k8s
+from app.services.upgrades import kubeapi_retry
 
 logger = structlog.get_logger(__name__)
 
@@ -129,22 +130,32 @@ def _parse_lease(body: dict[str, Any] | None) -> LeaseState:
     )
 
 
-def get_state(*, namespace: str | None = None) -> LeaseState:
+def get_state(*, namespace: str | None = None, retry_budget_s: float = 0.0) -> LeaseState:
     """Read the lease's current state without trying to claim it.
 
     Used by the preflight endpoint to surface "another upgrade is in
     flight" cleanly. Returns the all-false state if the lease doesn't
     exist yet (no upgrade has ever run on this cluster).
     """
-    return _read(namespace=namespace)[0]
+    return _read(namespace=namespace, retry_budget_s=retry_budget_s)[0]
 
 
-def _read(*, namespace: str | None = None) -> tuple[LeaseState, str | None]:
+def _read(
+    *, namespace: str | None = None, retry_budget_s: float = 0.0
+) -> tuple[LeaseState, str | None]:
     """The lease's state and the ``metadata.resourceVersion`` it was read at,
     which a following write passes back as its compare-and-swap precondition
-    (#1512). The version is None whenever there is no lease body to hold."""
+    (#1512). The version is None whenever there is no lease body to hold.
+
+    ``retry_budget_s`` > 0 (#2767) tries a read the kubeapi refused or answered
+    5xx again for that long, from a worker thread (it sleeps); the drive's own
+    reads keep 0 and their own cadence (#1713)."""
     try:
-        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+        status, body = kubeapi_retry.read_with_retry_blocking(
+            lambda: k8s.get_lease(LEASE_NAME, namespace=namespace),
+            what="get_lease",
+            budget_s=retry_budget_s,
+        )
     except k8s.KubeapiUnavailableError as exc:
         if k8s.get_config() is not None:
             # The kubeapi is configured but did not answer (#1713): the Lease
