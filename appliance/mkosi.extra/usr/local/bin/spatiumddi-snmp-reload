@@ -13,12 +13,14 @@
 #
 # Apply flow when enabled:
 #   1. Extract body, write to /tmp staging
-#   2. ``snmpd -t -C -c <tmp>`` (config syntax check); abort on fail
-#   3. systemctl stop snmpd (if running)
+#   2. Probe-parse a listener-free copy in a throwaway snmpd; abort on a
+#      logged "line N: Error" or a parser crash (see the probe below)
+#   3. Keep copies of the live config + USM state, then stop snmpd
 #   4. rm /var/lib/snmp/snmpd.conf so createUser lines re-run fresh
 #   5. Atomically swap /etc/snmp/snmpd.conf
 #   6. systemctl enable --now snmpd
-#   7. Verify it's up; write the hash sidecar + status sidecar
+#   7. Verify it's up; write the hash sidecar + status sidecar. If it is
+#      not, restore step 3's copies and snmpd's previous state
 #
 # Apply flow when disabled:
 #   1. systemctl disable --now snmpd (idempotent)
@@ -45,10 +47,20 @@
 #                                     idempotency + ack sidecars)
 #
 # So a slot upgrade or rollback preserves operator SNMP config + the
-# firewall hole + snmpd's enable state automatically — no reapply is
-# needed after the reboot. The agent's hash sidecar matches the
-# control plane bundle's config_hash on the first long-poll after
-# reboot and short-circuits the trigger write.
+# firewall hole + snmpd's enable link ON DISK. The agent's hash sidecar
+# matches the control plane bundle's config_hash on the first long-poll
+# after reboot and short-circuits the trigger write, so the plane does
+# not re-fire.
+#
+# On disk is not at boot, though (#2376 case 7). /etc is an overlay that
+# etc.mount puts up AFTER systemd has loaded its units, and systemd reads
+# a ``.wants/`` directory only when it loads units. The image (lower
+# layer) ships snmpd DISABLED, so the operator's enable link exists only
+# in the upper layer, which PID 1 has not seen: nothing wants snmpd and
+# it is never started. Hence ``--boot`` below, run once per boot by
+# spatiumddi-optin-services-boot.service (ordered after etc.mount): it
+# starts snmpd when the operator has it on, and makes the status sidecar
+# say what is actually running.
 #
 # Rollback caveat: if an operator rolls back to a slot built BEFORE
 # the SNMP work, the persisted snmpd.conf + nftables drop-in are
@@ -89,6 +101,87 @@ nft_reload() {
         systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
     fi
 }
+# A staged config that passed the probe but would not START: put back
+# what was live before this apply (#2376 case 5) — the config file, the
+# USM state, the enable state, and snmpd itself if it was running — so a
+# failed apply changes nothing. The status sidecar then says what is
+# actually true afterwards, not what the failed apply hoped for.
+restore_previous() {
+    echo "  ↺ restoring the previous snmpd config"
+    systemctl stop snmpd >/dev/null 2>&1 || true
+    if [ -n "$PREV_CONF" ]; then
+        install -o root -g root -m 0640 "$PREV_CONF" "$ETC_CONF"
+    else
+        rm -f "$ETC_CONF"
+    fi
+    if [ -n "$PREV_USM" ]; then
+        cp -p "$PREV_USM" "$USM_STATE"
+    else
+        rm -f "$USM_STATE"
+    fi
+    if [ "$was_enabled" = 0 ]; then
+        systemctl disable snmpd >/dev/null 2>&1 || true
+    fi
+    if [ "$was_active" = 1 ]; then
+        systemctl start snmpd >/dev/null 2>&1 || true
+        sleep 2
+        if systemctl is-active --quiet snmpd; then
+            echo "  ✓ snmpd is back up on the previous config"
+            echo "running" > "$STATUS_SIDECAR"
+            return 0
+        fi
+        echo "  ✗ snmpd did not come back up on the previous config"
+    fi
+    echo "stopped" > "$STATUS_SIDECAR"
+}
+
+# ── --boot: start what the operator enabled, once the overlay is up ──
+#
+# "Enabled" is read from the hash sidecar, not from ``is-enabled`` alone:
+# the sidecar is non-empty only after a successful enabled apply and is
+# truncated by a disabled one, so it is this plane's own record of what
+# the operator asked for. That matters on an upgrade from a build whose
+# IMAGE enabled snmpd: there the runner's ``enable`` was a no-op (the
+# link already existed, in the lower layer), so the new image's lower
+# layer drops the only link and ``is-enabled`` reads disabled although
+# SNMP is on. The link is re-created in that case.
+if [ "${1:-}" = "--boot" ]; then
+    echo
+    echo "[$(date -Iseconds)] === snmp boot re-arm ==="
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        echo "  an apply is in progress; it owns snmpd's state"
+        exit 0
+    fi
+    want=""
+    [ -f "$HASH_SIDECAR" ] && want=$(tr -d '[:space:]' < "$HASH_SIDECAR")
+    if [ -z "$want" ]; then
+        echo "  SNMP is not configured on; nothing to start"
+        # Never leave a stale "running" behind for a daemon nobody wants.
+        if [ -f "$STATUS_SIDECAR" ] && ! systemctl is-active --quiet snmpd; then
+            echo "stopped" > "$STATUS_SIDECAR"
+        fi
+        exit 0
+    fi
+    if ! systemctl is-enabled --quiet snmpd 2>/dev/null; then
+        echo "  SNMP is on but snmpd is not enabled; re-enabling"
+        systemctl enable snmpd >/dev/null 2>&1 || echo "  ! systemctl enable snmpd failed"
+    fi
+    if ! systemctl is-active --quiet snmpd; then
+        systemctl start snmpd >/dev/null 2>&1 || echo "  ! systemctl start snmpd failed"
+        sleep 2
+    fi
+    if systemctl is-active --quiet snmpd; then
+        echo "  ✓ snmpd is active"
+        echo "running" > "$STATUS_SIDECAR"
+    else
+        echo "  ✗ snmpd is not running"
+        systemctl status snmpd --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+        echo "stopped" > "$STATUS_SIDECAR"
+    fi
+    exit 0
+fi
+
 echo
 echo "[$(date -Iseconds)] === spatiumddi-snmp-reload fired ==="
 
@@ -108,7 +201,9 @@ fi
 MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
 HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
 TMP_BODY=$(mktemp /tmp/spatium-snmpd.conf.XXXXXX)
-trap 'rm -f "$TMP_BODY"' EXIT
+PREV_CONF=""
+PREV_USM=""
+trap 'rm -f "$TMP_BODY" "$PREV_CONF" "$PREV_USM"' EXIT
 tail -n +3 "$TRIGGER" > "$TMP_BODY"
 
 echo "  marker:    $MARKER"
@@ -127,40 +222,103 @@ case "$MARKER" in
         # *timeout* argument, not a "test" flag — it prints "invalid
         # option -- 't'" and exits 1 unconditionally, which is why
         # every SNMP apply silently failed (#550). Validate instead by
-        # starting snmpd in the foreground against ONLY the staged file
-        # (``-C -c``), bound to a throwaway loopback transport so it
-        # can't collide with the live instance's :161, then killing it.
-        # A config parse/read error makes snmpd exit before it settles;
-        # a clean parse keeps it alive until we kill it.
+        # starting snmpd in the foreground against ONLY a copy of the
+        # staged file (``-C -c``), then killing it. A config parse/read
+        # error makes snmpd exit before it settles; a clean parse keeps
+        # it alive until we kill it.
+        #
+        # The probe must bind NOTHING the live snmpd (or anything else)
+        # could hold (#2376). The staged body carries its own
+        # ``agentAddress udp:161,...`` and snmpd opens it IN ADDITION to
+        # the command-line transport, so a throwaway port alone never
+        # kept the probe off :161 — it died on "Error opening specified
+        # endpoint udp:161" and the apply called that a rejected config.
+        # So the probe copy drops every listener directive and the
+        # AgentX socket (``master agentx`` would otherwise claim
+        # /var/agentx/master) and gets private ones instead. Parsing of
+        # every other line is untouched.
         SNMP_VALIDATE_LOG=/tmp/spatium-snmpd-validate.log
-        snmpd -f -C -c "$TMP_BODY" -Lf "$SNMP_VALIDATE_LOG" \
+        PROBE_DIR=$(mktemp -d /tmp/spatium-snmpd-probe.XXXXXX)
+        PROBE_CONF="$PROBE_DIR/snmpd.conf"
+        grep -viE '^[[:space:]]*(agentaddress|agentxsocket)([[:space:]]|$)' \
+            "$TMP_BODY" > "$PROBE_CONF" || true
+        echo "agentXSocket unix:$PROBE_DIR/agentx" >> "$PROBE_CONF"
+        snmpd -f -C -c "$PROBE_CONF" -Lf "$SNMP_VALIDATE_LOG" \
             udp:127.0.0.1:16199 >"$SNMP_VALIDATE_LOG" 2>&1 &
         probe_pid=$!
         sleep 1
+        probe_rc=0
         if kill -0 "$probe_pid" 2>/dev/null; then
-            # Still running → config parsed OK. Reap it.
+            probe_alive=1
             kill "$probe_pid" 2>/dev/null || true
             wait "$probe_pid" 2>/dev/null || true
+        else
+            probe_alive=0
+            wait "$probe_pid" 2>/dev/null || probe_rc=$?
+        fi
+        rm -rf "$PROBE_DIR"
+        # Read the verdict from what snmpd LOGGED, whether or not the probe
+        # is still alive (#2376 case 5). net-snmp 5.9.4 reports a bad config
+        # line as "<file>: line N: Error: ..." and then KEEPS RUNNING (it
+        # skips the line), so "still alive after 1 s" was never "parse OK":
+        # ``view x included`` (missing SUBTREE), a blank ``rouser``,
+        # ``access`` without a LEVEL, an unresolvable ``rocommunity``
+        # source — all logged an Error and left the probe up, and the old
+        # check installed them. A "line N: Error" is always the config's
+        # own fault, even when a bind failure is logged beside it, so it is
+        # tested first and unconditionally. "line N: Warning: Unknown
+        # token" is NOT fatal: snmpd ignores the line and serves the rest.
+        if grep -qE ': line [0-9]+: Error' "$SNMP_VALIDATE_LOG" 2>/dev/null; then
+            reject_reason="snmpd reported a config-line error"
+        elif [ "$probe_alive" = 0 ] && [ "$probe_rc" -gt 128 ]; then
+            # Killed by a signal (e.g. ``createUser bob SHA`` with no
+            # passphrase segfaults net-snmp 5.9.4 while parsing). The probe
+            # binds nothing a live snmpd holds, so a crash is the config.
+            reject_reason="snmpd crashed parsing the config (exit $probe_rc)"
+        elif [ "$probe_alive" = 0 ] \
+                && grep -qiE 'error|cannot|unknown|parse|read_config|line [0-9]' \
+                    "$SNMP_VALIDATE_LOG" 2>/dev/null \
+                && ! grep -qiE 'address already in use|bind|opening specified endpoint' \
+                    "$SNMP_VALIDATE_LOG" 2>/dev/null; then
+            # The probe exited early and complained, and not about a
+            # port. A bind failure alone is an infrastructure hiccup, not
+            # a verdict on the config: the real start below arbitrates it.
+            reject_reason="snmpd exited reading the config"
+        else
+            reject_reason=""
+        fi
+        if [ -n "$reject_reason" ]; then
+            echo "  ✗ snmpd rejected the staged config ($reject_reason):"
+            grep -E ': line [0-9]+: (Error|Warning)|endpoint|Exiting' \
+                "$SNMP_VALIDATE_LOG" 2>/dev/null | sed 's/^/      /' || true
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        if [ "$probe_alive" = 1 ]; then
             echo "  ✓ snmpd config parse OK"
         else
-            wait "$probe_pid" 2>/dev/null || true
-            # The probe exited early. Distinguish a genuine config
-            # rejection from an infrastructure hiccup (e.g. the
-            # throwaway port was already bound): only hard-fail when
-            # snmpd actually complained about reading/parsing the
-            # config. Otherwise let the real ``systemctl`` start below
-            # be the arbiter so we don't false-reject a valid config.
-            if grep -qiE 'error|cannot|unknown|parse|read_config|line [0-9]' \
-                    "$SNMP_VALIDATE_LOG" 2>/dev/null \
-                    && ! grep -qiE 'address already in use|bind' \
-                    "$SNMP_VALIDATE_LOG" 2>/dev/null; then
-                echo "  ✗ snmpd rejected the staged config:"
-                sed 's/^/      /' "$SNMP_VALIDATE_LOG"
-                echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-                mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
-                exit 1
-            fi
             echo "  ⚠ config probe inconclusive — relying on the real start"
+        fi
+
+        # Keep what is live now, so an apply that passes the probe but
+        # fails the REAL start puts it back instead of leaving the box on
+        # a config nothing can run (#2376 case 5). The probe catches
+        # config-line errors; it cannot catch everything that only fails
+        # at a full start (a listener the real agentAddress cannot open,
+        # say). Copies go to mktemp files — 0600, and the conf carries
+        # community strings / USM passphrases.
+        was_enabled=0
+        was_active=0
+        systemctl is-enabled --quiet snmpd 2>/dev/null && was_enabled=1
+        systemctl is-active --quiet snmpd 2>/dev/null && was_active=1
+        if [ -f "$ETC_CONF" ]; then
+            PREV_CONF=$(mktemp /tmp/spatium-snmpd.prev.XXXXXX)
+            cp -p "$ETC_CONF" "$PREV_CONF"
+        fi
+        if [ -f "$USM_STATE" ]; then
+            PREV_USM=$(mktemp /tmp/spatium-snmpd.prev-usm.XXXXXX)
+            cp -p "$USM_STATE" "$PREV_USM"
         fi
 
         # Stop snmpd cleanly so the createUser lines we're about to
@@ -180,7 +338,7 @@ case "$MARKER" in
 
         if ! systemctl enable --now snmpd; then
             echo "  ✗ systemctl enable --now snmpd failed"
-            echo "stopped" > "$STATUS_SIDECAR"
+            restore_previous
             echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
             mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
@@ -220,7 +378,7 @@ EOF
         else
             echo "  ✗ snmpd not active after start"
             systemctl status snmpd --no-pager | sed 's/^/      /' || true
-            echo "stopped" > "$STATUS_SIDECAR"
+            restore_previous
             echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
             mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
