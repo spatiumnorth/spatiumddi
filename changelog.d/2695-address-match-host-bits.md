@@ -11,8 +11,9 @@
   address (`10.0.0.5`). A mask written where the length goes
   (`10.0.0.0/255.255.255.0`), which BIND refuses the same way ("expected
   prefix length"), is refused too, naming `10.0.0.0/24`. A value of
-  either kind saved before this fix is left out of a BIND9 server's
-  bundle with a warning, so the group converges again; an access list it
-  empties ships as `none`, never opened up. Bundles for Technitium and
-  PowerDNS servers are unchanged: their agents apply such a value as its
-  network.
+  either kind saved before this fix now reaches BIND9 servers as the
+  network it stands for (`10.0.0.5/24` as `10.0.0.0/24`, `!10.0.0.5/24`
+  as `!10.0.0.0/24`), the network a Technitium server already applies
+  for it, so the group converges again, and a warning names each such
+  value so it can be re-saved. Bundles for Technitium and PowerDNS
+  servers are unchanged.

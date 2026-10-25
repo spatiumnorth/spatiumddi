@@ -202,10 +202,10 @@ def test_a_prefix_bind_reads_is_accepted(element: str):
 
 
 def test_the_bundle_builder_can_ask_about_syntax_alone():
-    """Whether a prefix BIND 9 refuses renders depends on the driver (BIND 9
-    refuses it, the Technitium and PowerDNS agents apply the network), so the
-    bundle builder, deciding per server, asks the syntax question without
-    that one."""
+    """How a prefix BIND 9 refuses ships depends on the driver (a BIND9
+    server gets the network it stands for, the Technitium and PowerDNS agents
+    apply that network themselves), so the bundle builder, deciding per
+    server, asks the syntax question without that one."""
     lenient = ["10.0.0.5/24", "10.0.0.0/255.255.255.0"]
     assert (
         validate_address_match_list(

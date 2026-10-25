@@ -308,8 +308,9 @@ def validate_address_match_list(
     ``allow_bind9_refused_prefixes`` accepts a prefix BIND 9 refuses, one
     with host bits set (10.0.0.5/24) or a mask where the length goes
     (10.0.0.0/255.255.255.0), which is otherwise refused (#2695). The bundle
-    builder passes it too: BIND 9 refuses such a prefix while the Technitium
-    and PowerDNS agents apply its network, so whether one renders is a
+    builder passes it too: it ships such a prefix to a BIND 9 server as the
+    network it stands for, and as stored to the Technitium and PowerDNS
+    agents, which apply that network themselves, so how one renders is a
     per-server question it answers itself.
 
     ``known_keys`` is the set of TSIG key names the group ships to its

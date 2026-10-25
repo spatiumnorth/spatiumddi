@@ -16,10 +16,15 @@ What the tests pin:
   with a 422 that names the entry and the network it would mean, and saves
   nothing; the network itself is accepted;
 * a value saved before the fix stops blocking the group: a BIND9 server's
-  bundle drops it, loudly, and an access list it empties (or that loses a
-  negation) fails closed as ``none``, never open;
-* a Technitium server's bundle keeps it: Technitium's translator applies
-  the network, so a server that serves the value today keeps serving it.
+  bundle carries the network it stands for, in its place, with its ``!``,
+  and a warning names the stored value so it can be found and re-saved.
+  Leaving it out instead would turn a list it was the only entry of into
+  ``none``: ``allow_query: ["10.0.0.5/24"]`` would REFUSE every query with
+  the apply reported ``ok``. ``also-notify``, which takes addresses only,
+  still leaves it out;
+* a Technitium or PowerDNS server's bundle carries the stored value: their
+  agents apply the network themselves, so a server that serves the value
+  today keeps serving it.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
@@ -200,6 +206,18 @@ async def test_zone_clauses_refuse_a_host_bits_prefix(
 # ── rows saved before the fix ─────────────────────────────────────────
 
 
+def _zone(group: DNSServerGroup, name: str, **clauses: list[str]) -> DNSZone:
+    return DNSZone(
+        group_id=group.id,
+        name=name,
+        zone_type="primary",
+        kind="forward",
+        primary_ns=f"ns1.{name}",
+        admin_email=f"hostmaster.{name}",
+        **clauses,
+    )
+
+
 async def _rows_saved_before_the_fix(db: AsyncSession, group: DNSServerGroup) -> None:
     """Written straight to the tables, as a save before the fix left them."""
     acl = DNSAcl(group_id=group.id, name="office", description="")
@@ -216,13 +234,9 @@ async def _rows_saved_before_the_fix(db: AsyncSession, group: DNSServerGroup) ->
         )
     )
     db.add(
-        DNSZone(
-            group_id=group.id,
-            name="example.test.",
-            zone_type="primary",
-            kind="forward",
-            primary_ns="ns1.example.test.",
-            admin_email="hostmaster.example.test.",
+        _zone(
+            group,
+            "example.test.",
             allow_query=[HOST_BITS, "10.2.0.0/16"],
             allow_transfer=[f"!{HOST_BITS}", "10.3.0.0/16"],
         )
@@ -238,12 +252,24 @@ async def _bundle_for(db: AsyncSession, group: DNSServerGroup, driver: str) -> d
     return await build_config_bundle(db, loaded)
 
 
+def _view(bundle: dict, name: str = "inside") -> dict:
+    (view,) = [v for v in bundle["views"] if v["name"] == name]
+    return view
+
+
+def _zones(bundle: dict, name: str) -> list[dict]:
+    zones = [z for z in bundle["zones"] if z["name"] == name]
+    assert zones
+    return zones
+
+
 @pytest.mark.asyncio
-async def test_a_bind9_bundle_drops_a_host_bits_prefix_saved_before_the_fix(db_session):
-    """BIND refuses the element, so shipping it stops the whole group
-    converging. It is dropped under the #2282 rule that a drop never widens
-    access: an access list it empties, or one that loses a negation, ships
-    ``none``. A host route (``/32``) and every clean prefix stay."""
+async def test_a_bind9_bundle_ships_a_prefix_saved_before_the_fix_as_its_network(db_session):
+    """BIND refuses the element, so shipping it as stored stops the whole
+    group converging, and leaving it out can turn an access list into
+    ``none``. A BIND9 server gets the network it stands for, in its place,
+    with its ``!``: what the Technitium and PowerDNS agents apply for the
+    same value. A host route (``/32``) and every clean prefix stay as stored."""
     group = await _group(db_session)
     await _rows_saved_before_the_fix(db_session, group)
     bundle = await _bundle_for(db_session, group, "bind9")
@@ -251,21 +277,119 @@ async def test_a_bind9_bundle_drops_a_host_bits_prefix_saved_before_the_fix(db_s
     assert HOST_BITS not in str(bundle)
     assert MASK_FORM not in str(bundle)
     (acl,) = bundle["acls"]
-    assert acl["entries"] == [{"value": "10.0.0.0/8", "negate": False}]
-    (view,) = [v for v in bundle["views"] if v["name"] == "inside"]
-    assert view["match_clients"] == ["10.1.0.0/16"]
-    assert bundle["options"]["allow_query"] == ["192.0.2.0/24", "10.9.9.9/32"]
-    assert bundle["options"]["allow_transfer"] == ["none"]
-    zones = [z for z in bundle["zones"] if z["name"] == "example.test."]
-    assert zones
-    assert all(z["allow_query"] == ["10.2.0.0/16"] for z in zones)
-    assert all(z["allow_transfer"] == ["none"] for z in zones)
+    assert acl["entries"] == [
+        {"value": "10.0.0.0/8", "negate": False},
+        {"value": NETWORK, "negate": False},
+    ]
+    assert _view(bundle)["match_clients"] == [NETWORK, "10.1.0.0/16"]
+    assert bundle["options"]["allow_query"] == [NETWORK, "192.0.2.0/24", "10.9.9.9/32", NETWORK]
+    assert bundle["options"]["allow_transfer"] == [NETWORK]
+    for zone in _zones(bundle, "example.test."):
+        assert zone["allow_query"] == [NETWORK, "10.2.0.0/16"]
+        assert zone["allow_transfer"] == [f"!{NETWORK}", "10.3.0.0/16"]
 
 
 @pytest.mark.asyncio
-async def test_the_streamed_render_drops_it_too(db_session):
+@pytest.mark.parametrize("field", ADDRESS_MATCH_LIST_OPTIONS)
+async def test_an_option_whose_only_entry_is_one_ships_its_network_not_none(db_session, field: str):
+    """The review's case: ``allow_query: ["10.0.0.5/24"]``. As stored, BIND
+    refuses the config and keeps serving its previous one; left out, the
+    list would ship ``none`` and REFUSE every query with the apply reported
+    ``ok``. Every address-match option ships the network, ``allow_recursion``
+    and ``blackhole`` among them."""
+    group = await _group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, **{field: [HOST_BITS]}))
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert bundle["options"][field] == [NETWORK]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "shipped"),
+    [
+        (f"!{HOST_BITS}", f"!{NETWORK}"),
+        ("2001:db8::1/64", "2001:db8::/64"),
+        ("!2001:db8::1/64", "!2001:db8::/64"),
+        (MASK_FORM, NETWORK),
+        ("10.0.0.5/255.255.255.0", NETWORK),
+        ("10.0.0.0/0.0.0.255", NETWORK),
+        (f"!{MASK_FORM}", f"!{NETWORK}"),
+        ("fe80::1%lo/64", "fe80::/64"),
+    ],
+)
+async def test_each_form_ships_as_its_network_in_its_place_with_its_negation(
+    db_session, stored: str, shipped: str
+):
+    """Host bits set or a mask where the length goes, IPv4 or IPv6, negated
+    or not: the network the 422 names for new input, where the element was.
+    A scope (``%lo``) is not carried, as in that network and in the one the
+    Technitium agent applies."""
+    group = await _group(db_session)
+    db_session.add(
+        DNSServerOptions(group_id=group.id, allow_query=["192.0.2.0/24", stored, "198.51.100.0/24"])
+    )
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert bundle["options"]["allow_query"] == ["192.0.2.0/24", shipped, "198.51.100.0/24"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["match_clients", "match_destinations", "allow_query", "allow_query_cache"]
+)
+async def test_a_view_list_whose_only_entry_is_one_ships_its_network(db_session, field: str):
+    group = await _group(db_session)
+    db_session.add(DNSView(group_id=group.id, name="inside", **{field: [HOST_BITS]}))
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert _view(bundle)[field] == [NETWORK]
+
+
+@pytest.mark.asyncio
+async def test_an_acl_whose_only_entry_is_one_ships_its_network_with_its_negation(db_session):
+    """The ACL loop filters entries, so it must carry the rewritten value too.
+    A negation travels as the entry's ``negate`` or, on an older row, as a
+    leading ``!`` in its value; the BIND9 agent reads both."""
+    group = await _group(db_session)
+    for name, value, negate in [
+        ("office", HOST_BITS, False),
+        ("not-office", HOST_BITS, True),
+        ("older", f"!{MASK_FORM}", False),
+    ]:
+        acl = DNSAcl(group_id=group.id, name=name, description="")
+        db_session.add(acl)
+        await db_session.flush()
+        db_session.add(DNSAclEntry(acl_id=acl.id, value=value, negate=negate, order=0))
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert {a["name"]: a["entries"] for a in bundle["acls"]} == {
+        "office": [{"value": NETWORK, "negate": False}],
+        "not-office": [{"value": NETWORK, "negate": True}],
+        "older": [{"value": f"!{NETWORK}", "negate": False}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_zone_clause_whose_only_entry_is_one_ships_its_network(db_session):
+    group = await _group(db_session)
+    db_session.add(_zone(group, "only.test.", allow_query=[HOST_BITS], allow_transfer=[MASK_FORM]))
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    for zone in _zones(bundle, "only.test."):
+        assert zone["allow_query"] == [NETWORK]
+        assert zone["allow_transfer"] == [NETWORK]
+
+
+@pytest.mark.asyncio
+async def test_the_streamed_render_ships_the_network_too(db_session):
     """The worker stores the streamed render (#1662, #2227), which builds its
-    zones apart from the whole render; it must drop the element the same way."""
+    zones apart from the whole render; it must carry the network the same way."""
     group = await _group(db_session)
     await _rows_saved_before_the_fix(db_session, group)
     server = DNSServer(group_id=group.id, name="s1", driver="bind9", host="127.0.0.1", port=53)
@@ -279,23 +403,111 @@ async def test_the_streamed_render_drops_it_too(db_session):
 
     assert HOST_BITS not in json.dumps(body)
     assert MASK_FORM not in json.dumps(body)
-    assert body["options"]["allow_query"] == ["192.0.2.0/24", "10.9.9.9/32"]
-    assert body["options"]["allow_transfer"] == ["none"]
-    zones = [z for z in body["zones"] if z["name"] == "example.test."]
-    assert zones
-    assert all(z["allow_transfer"] == ["none"] for z in zones)
+    (acl,) = body["acls"]
+    assert acl["entries"] == [
+        {"value": "10.0.0.0/8", "negate": False},
+        {"value": NETWORK, "negate": False},
+    ]
+    assert _view(body)["match_clients"] == [NETWORK, "10.1.0.0/16"]
+    assert body["options"]["allow_query"] == [NETWORK, "192.0.2.0/24", "10.9.9.9/32", NETWORK]
+    assert body["options"]["allow_transfer"] == [NETWORK]
+    for zone in _zones(body, "example.test."):
+        assert zone["allow_query"] == [NETWORK, "10.2.0.0/16"]
+        assert zone["allow_transfer"] == [f"!{NETWORK}", "10.3.0.0/16"]
 
 
 @pytest.mark.asyncio
-async def test_a_technitium_bundle_keeps_it_because_technitium_applies_the_network(
-    db_session,
-):
-    """Technitium's translator masks a prefix to its network, so a server it
-    runs applies ``10.0.0.0/24`` today. Dropping the element there would
-    change what a working server applies; the API refusing it is enough."""
+async def test_each_rewrite_is_logged_with_the_stored_value_and_what_shipped(db_session):
+    """At warning, so a value saved before the fix can be found and re-saved."""
     group = await _group(db_session)
     await _rows_saved_before_the_fix(db_session, group)
-    bundle = await _bundle_for(db_session, group, "technitium")
+    with capture_logs() as logs:
+        await _bundle_for(db_session, group, "bind9")
+
+    rewrites = [e for e in logs if e["event"] == "dns_bundle_entry_normalised_bind9_refused_prefix"]
+    assert {e["log_level"] for e in rewrites} == {"warning"}
+    assert {(e["where"], e["value"], e["rendered"]) for e in rewrites} == {
+        ("acl:office", HOST_BITS, NETWORK),
+        ("view:inside.match_clients", HOST_BITS, NETWORK),
+        ("options.allow_query", HOST_BITS, NETWORK),
+        ("options.allow_query", MASK_FORM, NETWORK),
+        ("options.allow_transfer", HOST_BITS, NETWORK),
+        ("zone:example.test..allow_query", HOST_BITS, NETWORK),
+        ("zone:example.test..allow_transfer", f"!{HOST_BITS}", f"!{NETWORK}"),
+    }
+    assert not [e for e in logs if e["event"] == "dns_bundle_entry_dropped_bind9_refused_prefix"]
+
+
+@pytest.mark.asyncio
+async def test_beside_an_undefined_key_or_acl_the_prefix_still_ships_its_network(db_session):
+    """Only the prefix is rewritten: an undefined ``key`` or ACL reference
+    beside it is still dropped (#2282), and the list keeps the network."""
+    group = await _group(db_session)
+    db_session.add(
+        DNSView(group_id=group.id, name="inside", match_clients=["no-such-acl", HOST_BITS])
+    )
+    db_session.add(DNSServerOptions(group_id=group.id, allow_query=["key no-such-key", HOST_BITS]))
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert bundle["options"]["allow_query"] == [NETWORK]
+    assert _view(bundle)["match_clients"] == [NETWORK]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_negation_or_an_emptied_list_still_ships_none(db_session):
+    """#2282's rules hold beside a rewritten prefix: a list that loses a
+    negated reference, or that a drop empties, ships ``none``, never wider."""
+    group = await _group(db_session)
+    db_session.add(
+        DNSView(
+            group_id=group.id,
+            name="inside",
+            match_destinations=["!no-such-acl", f"!{HOST_BITS}"],
+        )
+    )
+    db_session.add(
+        DNSServerOptions(
+            group_id=group.id,
+            allow_transfer=["!key no-such-key", HOST_BITS],
+            allow_notify=["key no-such-key"],
+        )
+    )
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert bundle["options"]["allow_transfer"] == ["none"]
+    assert bundle["options"]["allow_notify"] == ["none"]
+    assert _view(bundle)["match_destinations"] == ["none"]
+
+
+@pytest.mark.asyncio
+async def test_also_notify_takes_addresses_so_a_bind9_bundle_leaves_one_out(db_session):
+    """``also-notify`` names the servers to send NOTIFY to, and the API takes
+    an address there, never a prefix (#1316). Neither the stored value nor its
+    network loads in ``also-notify``, so a BIND9 bundle leaves it out, and
+    never puts ``none`` there, which is not legal there either."""
+    group = await _group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, also_notify=[HOST_BITS, "192.0.2.53"]))
+    db_session.add(_zone(group, "notify.test.", also_notify=[HOST_BITS]))
+    await db_session.flush()
+    bundle = await _bundle_for(db_session, group, "bind9")
+
+    assert bundle["options"]["also_notify"] == ["192.0.2.53"]
+    for zone in _zones(bundle, "notify.test."):
+        assert zone["also_notify"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["technitium", "powerdns"])
+async def test_a_technitium_or_powerdns_bundle_ships_it_as_stored(db_session, driver: str):
+    """Their agents mask a prefix to its network themselves (Technitium in
+    each address-match list it applies, PowerDNS in ``allow-transfer``, the
+    one it applies), so a server that serves the value today keeps serving
+    it, and its bundle carries the value as stored."""
+    group = await _group(db_session)
+    await _rows_saved_before_the_fix(db_session, group)
+    bundle = await _bundle_for(db_session, group, driver)
 
     (acl,) = bundle["acls"]
     assert [e["value"] for e in acl["entries"]] == ["10.0.0.0/8", HOST_BITS]
@@ -306,3 +518,5 @@ async def test_a_technitium_bundle_keeps_it_because_technitium_applies_the_netwo
         MASK_FORM,
     ]
     assert bundle["options"]["allow_transfer"] == [HOST_BITS]
+    for zone in _zones(bundle, "example.test."):
+        assert zone["allow_transfer"] == [f"!{HOST_BITS}", "10.3.0.0/16"]
