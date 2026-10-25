@@ -195,6 +195,28 @@ function KpiCard({
   return to ? <Link to={to}>{inner}</Link> : inner;
 }
 
+/**
+ * The one definition of "needs attention" for a DNS / DHCP agent (#2755).
+ * The KPI tile, the panel of the same name and the header all count from
+ * this, so they cannot disagree about which agents are in the set.
+ *
+ * Unreachable or error; any config-apply verdict other than ok (a partial
+ * apply, zones refused, included); or a daemon the agent reports as not
+ * serving. NULL verdicts are UNKNOWN and are not failures.
+ */
+function agentNeedsAttention(s: {
+  status?: string | null;
+  config_apply_status?: string | null;
+  daemon_not_serving?: boolean | null;
+}): boolean {
+  return (
+    s.status === "unreachable" ||
+    s.status === "error" ||
+    (s.config_apply_status != null && s.config_apply_status !== "ok") ||
+    s.daemon_not_serving === true
+  );
+}
+
 function UtilColor(percent: number): string {
   if (percent >= 95) return "bg-red-500";
   if (percent >= 85) return "bg-red-400";
@@ -319,7 +341,25 @@ function UtilizationBar({
  * end. Cells stay square at every breakpoint via aspect-square +
  * grid-cols-autofill.
  */
-function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
+function SubnetHeatmap({
+  subnets,
+  unreadable = null,
+}: {
+  subnets: Subnet[];
+  /** Set when the subnet read failed or was refused (#2754): the heatmap
+   *  says so rather than "No subnets yet". */
+  unreadable?: string | null;
+}) {
+  if (unreadable) {
+    return (
+      <div className="rounded-lg border border-dashed p-8 text-center">
+        <Network className="mx-auto mb-2 h-8 w-8 text-muted-foreground/30" />
+        <p className="text-xs text-muted-foreground">
+          Subnet utilization is not shown: {unreadable}.
+        </p>
+      </div>
+    );
+  }
   if (subnets.length === 0) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center">
@@ -1445,11 +1485,11 @@ export function DashboardPage() {
   }, [tab, enabled, ready]);
 
   // IPAM
-  const { data: spaces } = useQuery({
+  const { data: spaces, error: spacesError } = useQuery({
     queryKey: ["spaces"],
     queryFn: ipamApi.listSpaces,
   });
-  const { data: subnets } = useQuery({
+  const { data: subnets, error: subnetsError } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
   });
@@ -1487,7 +1527,7 @@ export function DashboardPage() {
   // their list comes from a query that stays empty.
   const dnsOn = ready && enabled("core.dns");
   const dhcpOn = ready && enabled("core.dhcp");
-  const { data: dnsGroups = [] } = useQuery({
+  const { data: dnsGroups = [], error: dnsGroupsError } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     staleTime: 30_000,
@@ -1514,7 +1554,9 @@ export function DashboardPage() {
   const allDnsServers: DNSServer[] = serverQueries.flatMap((q) => q.data ?? []);
 
   // DHCP
-  const { data: dhcpServers = [] } = useQuery<DHCPServer[]>({
+  const { data: dhcpServers = [], error: dhcpServersError } = useQuery<
+    DHCPServer[]
+  >({
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
     refetchInterval: 30_000,
@@ -1767,25 +1809,40 @@ export function DashboardPage() {
   // honest, because the set spans DNS and DHCP servers across different
   // groups. So the Overview names them and each row deep-links to the
   // group whose server list contains it.
-  const attentionServers = supervisedServers.filter(
-    (s) =>
-      s.status === "unreachable" ||
-      s.status === "error" ||
-      (s.config_apply_status != null && s.config_apply_status !== "ok") ||
-      s.daemon_not_serving === true,
-  );
+  const attentionServers = supervisedServers.filter(agentNeedsAttention);
+  // The tile's "healthy" line is everything the panel does NOT list, not
+  // everything whose status reads "active" (#2755).
+  const healthyServers = supervisedServers.length - attentionServers.length;
+
+  // A read the server refused (or that failed) is not an empty estate
+  // (#2754): the header, tiles, strip and heatmap say they cannot be read
+  // instead of counting zero and calling it healthy.
+  const ipamUnreadable = !!spacesError || !!subnetsError;
+  const fleetUnreadable = !!dnsGroupsError || !!dhcpServersError;
+  const unreadableWhy = (err: unknown) =>
+    isRefused(err) ? "you may not read this" : "couldn't load this";
 
   const degraded =
     unhealthyServers > 0 ||
     configFailedServers > 0 ||
+    zonesRefusedServers > 0 ||
     daemonDegradedServers > 0 ||
     critical > 0;
-  const healthTone: Tone = degraded ? "bad" : warning > 0 ? "warn" : "good";
+  const healthUnknown = ipamUnreadable || fleetUnreadable;
+  const healthTone: Tone = degraded
+    ? "bad"
+    : warning > 0
+      ? "warn"
+      : healthUnknown
+        ? "default"
+        : "good";
   const healthLabel = degraded
     ? "degraded"
     : warning > 0
       ? "near capacity"
-      : "healthy";
+      : healthUnknown
+        ? "status unknown"
+        : "healthy";
   // The label is a rollup of five unrelated things; without this the
   // operator sees "degraded" and has no idea which one to chase. Every
   // input to ``degraded`` above needs its line here, or the header can read
@@ -1804,8 +1861,14 @@ export function DashboardPage() {
       configFailedServers > 0
         ? `${configFailedServers} agent${configFailedServers === 1 ? "" : "s"} failed to apply config`
         : null,
+      zonesRefusedServers > 0
+        ? `${zonesRefusedServers} agent${zonesRefusedServers === 1 ? "" : "s"} with zones refused`
+        : null,
       daemonDegradedServers > 0
         ? `${daemonDegradedServers} daemon${daemonDegradedServers === 1 ? "" : "s"} not serving`
+        : null,
+      healthUnknown
+        ? `${[ipamUnreadable ? "subnets" : null, fleetUnreadable ? "servers" : null].filter(Boolean).join(" and ")} could not be read (${unreadableWhy(subnetsError ?? spacesError ?? dnsGroupsError ?? dhcpServersError)}), so health is unknown`
         : null,
     ]
       .filter(Boolean)
@@ -1820,12 +1883,18 @@ export function DashboardPage() {
             <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
             <p className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
               <span className="font-mono">//</span>
-              <span>
-                {spaces?.length ?? 0} space{spaces?.length === 1 ? "" : "s"}
+              <span
+                title={spacesError ? unreadableWhy(spacesError) : undefined}
+              >
+                {spacesError ? "—" : (spaces?.length ?? 0)} space
+                {!spacesError && spaces?.length === 1 ? "" : "s"}
               </span>
               <span>·</span>
-              <span>
-                {subnets?.length ?? 0} subnet{subnets?.length === 1 ? "" : "s"}
+              <span
+                title={subnetsError ? unreadableWhy(subnetsError) : undefined}
+              >
+                {subnetsError ? "—" : (subnets?.length ?? 0)} subnet
+                {!subnetsError && subnets?.length === 1 ? "" : "s"}
               </span>
               <span>·</span>
               <span
@@ -1960,29 +2029,44 @@ export function DashboardPage() {
           <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
             <KpiCard
               label="Agents needing attention"
-              value={unhealthyServers + configFailedServers}
+              value={
+                fleetUnreadable && attentionServers.length === 0
+                  ? "—"
+                  : attentionServers.length
+              }
               sub={
-                unhealthyServers + configFailedServers + zonesRefusedServers >
-                0 ? (
+                attentionServers.length > 0 ? (
                   <span className="text-red-600 dark:text-red-400">
                     {unhealthyServers} unreachable
                     {configFailedServers > 0 &&
                       ` · ${configFailedServers} config failed`}
                     {zonesRefusedServers > 0 &&
                       ` · ${zonesRefusedServers} with zones refused`}
+                    {daemonDegradedServers > 0 &&
+                      ` · ${daemonDegradedServers} daemon not serving`}
                   </span>
+                ) : fleetUnreadable ? (
+                  `${unreadableWhy(dnsGroupsError ?? dhcpServersError)} (servers)`
                 ) : (
-                  `${activeServers} healthy · paused and maintenance excluded`
+                  `${healthyServers} healthy · paused and maintenance excluded`
                 )
               }
               icon={Cpu}
-              tone={unhealthyServers + configFailedServers > 0 ? "bad" : "good"}
+              tone={
+                attentionServers.length > 0
+                  ? "bad"
+                  : fleetUnreadable
+                    ? "default"
+                    : "good"
+              }
             />
             <KpiCard
               label="Capacity pressure"
-              value={critical + warning}
+              value={ipamUnreadable ? "—" : critical + warning}
               sub={
-                critical + warning > 0 ? (
+                ipamUnreadable ? (
+                  `${unreadableWhy(subnetsError ?? spacesError)} (subnets)`
+                ) : critical + warning > 0 ? (
                   <span
                     className={
                       critical > 0
@@ -1997,7 +2081,15 @@ export function DashboardPage() {
                 )
               }
               icon={Network}
-              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              tone={
+                ipamUnreadable
+                  ? "default"
+                  : critical > 0
+                    ? "bad"
+                    : warning > 0
+                      ? "warn"
+                      : "good"
+              }
               to="/ipam"
             />
             <WidgetErrorBoundary title="Certificates expiring">
@@ -2127,47 +2219,59 @@ export function DashboardPage() {
               a reference lookup rather than a thing to monitor. ─────── */}
         {tab === "overview" && (
           <div className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
-            <InventoryStat
-              value={spaces?.length ?? 0}
-              label="spaces"
-              to="/ipam"
-            />
-            <InventoryStat
-              value={subnetsScoped.length}
-              label="subnets"
-              to="/ipam"
-            />
-            <InventoryStat
-              value={allocatedIPs.toLocaleString()}
-              label="allocated IPv4"
-              title={`${freeIPs.toLocaleString()} free of ${totalIPs.toLocaleString()}`}
-              to="/ipam"
-            />
-            <InventoryStat
-              value={`${overallUtil.toFixed(1)}%`}
-              label="utilization"
-              tone={
-                overallUtil >= 95
-                  ? "bad"
-                  : overallUtil >= 80
-                    ? "warn"
-                    : undefined
-              }
-              title={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()} IPv4 addresses`}
-              to="/ipam"
-            />
-            <InventoryStat
-              value={totalZones}
-              label="DNS zones"
-              title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
-              to="/dns"
-            />
-            <InventoryStat
-              value={allServers.length}
-              label="servers"
-              title={`${activeServers} active`}
-              to="/dns"
-            />
+            {!spacesError && (
+              <InventoryStat
+                value={spaces?.length ?? 0}
+                label="spaces"
+                to="/ipam"
+              />
+            )}
+            {!subnetsError && (
+              <InventoryStat
+                value={subnetsScoped.length}
+                label="subnets"
+                to="/ipam"
+              />
+            )}
+            {!ipamUnreadable && (
+              <InventoryStat
+                value={allocatedIPs.toLocaleString()}
+                label="allocated IPv4"
+                title={`${freeIPs.toLocaleString()} free of ${totalIPs.toLocaleString()}`}
+                to="/ipam"
+              />
+            )}
+            {!ipamUnreadable && (
+              <InventoryStat
+                value={`${overallUtil.toFixed(1)}%`}
+                label="utilization"
+                tone={
+                  overallUtil >= 95
+                    ? "bad"
+                    : overallUtil >= 80
+                      ? "warn"
+                      : undefined
+                }
+                title={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()} IPv4 addresses`}
+                to="/ipam"
+              />
+            )}
+            {!dnsGroupsError && (
+              <InventoryStat
+                value={totalZones}
+                label="DNS zones"
+                title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
+                to="/dns"
+              />
+            )}
+            {!fleetUnreadable && (
+              <InventoryStat
+                value={allServers.length}
+                label="servers"
+                title={`${activeServers} active`}
+                to="/dns"
+              />
+            )}
           </div>
         )}
 
@@ -2221,7 +2325,14 @@ export function DashboardPage() {
         {/* ── Heatmap (Overview + IPAM) ──────────────────────────────── */}
         {(tab === "overview" || tab === "ipam") && (
           <WidgetErrorBoundary title="Subnet heatmap">
-            <SubnetHeatmap subnets={reporting} />
+            <SubnetHeatmap
+              subnets={reporting}
+              unreadable={
+                ipamUnreadable
+                  ? unreadableWhy(subnetsError ?? spacesError)
+                  : null
+              }
+            />
           </WidgetErrorBoundary>
         )}
 
