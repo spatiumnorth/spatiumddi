@@ -70,6 +70,7 @@ _NOT_SECRETS: dict[tuple[str, str], str] = {
     ("audit_log", "prev_hash"): "audit chain digest",
     ("cutover_checklist_item", "key"): "checklist item identifier",
     ("dhcp_server_scope_state", "config_hash"): "config digest",
+    ("dns_ingest_snapshot", "record_keys"): "record name, type and value as served in DNS",
     ("dns_server_group", "tsig_key_name"): "key name, not the secret",
     ("dns_server_group", "tsig_key_algorithm"): "algorithm name",
     ("dns_server_options", "gss_tsig_keytab_path"): "filesystem path",
