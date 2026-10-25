@@ -838,3 +838,36 @@ async def test_last_success_survives_a_later_failure(db_session: AsyncSession) -
     assert row.last_push_at == t3
     assert row.last_success_at == t2
     assert row.last_push_error == "HTTP 500"
+
+
+# ── #2750: a rename onto a taken name is refused in words ──
+
+
+@pytest.mark.asyncio
+async def test_rename_onto_a_taken_name_is_a_clean_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    a = (
+        await client.post(
+            "/api/v1/settings/influxdb-targets", headers=h, json=_v2_body(name="rn-a")
+        )
+    ).json()
+    b = (
+        await client.post(
+            "/api/v1/settings/influxdb-targets", headers=h, json=_v2_body(name="rn-b")
+        )
+    ).json()
+    r = await client.put(
+        f"/api/v1/settings/influxdb-targets/{b['id']}",
+        headers=h,
+        json=_v2_body(name=a["name"]),
+    )
+    assert r.status_code == 409, r.text
+    for needle in ("SQL", "sqlalchemy", "IntegrityError", "sqlalche.me", "parameters"):
+        assert needle not in r.text
+    # The test client shares one session across requests; production closes
+    # it per request, so clear the failed flush here.
+    await db_session.rollback()
+    got = await client.get("/api/v1/settings/influxdb-targets", headers=h)
+    assert sorted(t["name"] for t in got.json()) == ["rn-a", "rn-b"]
