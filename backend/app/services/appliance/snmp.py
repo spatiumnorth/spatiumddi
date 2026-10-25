@@ -76,10 +76,26 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     # the renderer staying pure lets callers test the output shape.
     sys_contact = (settings.snmp_sys_contact or "").strip()
     sys_location = (settings.snmp_sys_location or "").strip()
-    if sys_contact:
-        lines.append(f"sysContact     {_quote(sys_contact)}")
-    if sys_location:
-        lines.append(f"sysLocation    {_quote(sys_location)}")
+    # snmpd reads the rest of a sysContact / sysLocation line LITERALLY
+    # (verified against net-snmp 5.9.4, the Debian 13 package the appliance
+    # ships): there is no quoting or escaping, so quotes and backslashes
+    # become part of the served value and the value is written bare, not
+    # via _quote(). Whitespace between the keyword and the value and at the
+    # end of the line is dropped by the parser (hence the strip above, which
+    # loses nothing). A "#" in the middle of the value is kept; one at the
+    # START makes the whole line a comment and snmpd logs "Blank line
+    # following ... token" and serves its default, so that value is left out
+    # with a note instead of emitting a line that never takes effect.
+    for directive, raw in (("sysContact", sys_contact), ("sysLocation", sys_location)):
+        if not raw:
+            continue
+        if raw.startswith("#"):
+            lines.append(
+                f"# {directive} OMITTED — a value starting with '#' is read by "
+                "snmpd as a comment and cannot be expressed."
+            )
+            continue
+        lines.append(f"{directive:<14} {raw}")
     lines.append(_AGENT_ADDRESS_LINE)
     lines.append("")
 
