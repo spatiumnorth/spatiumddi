@@ -23,6 +23,12 @@ bodies, the same ``denied`` audit row), because they are the same
 functions. The dependencies still run again in the normal way afterwards;
 the early pass only decides whether the body is read at all.
 
+The importers and the branding logo (#2780) use
+:class:`PreBodyAuthUploadRoute`, which does the same for a router's
+multipart / form routes only: their routers also serve JSON routes, and a
+JSON body is bounded by the app-wide body cap (``app.core.body_limit``)
+rather than checked first.
+
 A route that takes a body on a router using this class and declares none
 of those dependencies is refused when the router is built: the class
 exists to authorise first, and a body route with nothing to authorise
@@ -35,7 +41,9 @@ import inspect
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+import fastapi.routing as _fastapi_routing
 from fastapi import Request
+from fastapi import params as fastapi_params
 from fastapi.routing import APIRoute
 from starlette.responses import Response
 
@@ -48,6 +56,16 @@ _KNOWN_PARAMS = frozenset({"request", "current_user", "db"})
 
 AuthCheck = Callable[..., Awaitable[Any]]
 
+# FastAPI serves a route included through ``include_router`` from an
+# "effective" route that carries the router-level dependencies as well as
+# the route's own, and names the one ``get_route_handler`` is building in
+# this context variable (``APIRoute.get_route_handler`` reads it the same
+# way). Used so a router-level permission gate (the IPAM router's) runs
+# before the body too. It is private to FastAPI: without it the route's own
+# dependencies are used, which still includes the login check, and
+# ``tests/test_pre_body_auth.py`` fails loudly so the loss is noticed.
+EFFECTIVE_CONTEXT_VAR = getattr(_fastapi_routing, "_effective_route_context_var", None)
+
 
 def _is_auth_check(call: Any) -> bool:
     return (
@@ -57,12 +75,30 @@ def _is_auth_check(call: Any) -> bool:
     )
 
 
+def _route_dependant(route: APIRoute) -> Any:
+    """The dependant FastAPI will serve ``route`` with: the effective one,
+    router-level dependencies included, when one is being built."""
+    if EFFECTIVE_CONTEXT_VAR is not None:
+        context = EFFECTIVE_CONTEXT_VAR.get()
+        if context is not None and getattr(context, "original_route", None) is route:
+            dependant = getattr(context, "dependant", None)
+            if dependant is not None:
+                return dependant
+    return route.dependant
+
+
 def _auth_checks(route: APIRoute) -> list[AuthCheck]:
-    """The route's top-level authorisation dependencies, in resolution order."""
+    """The route's top-level authorisation dependencies, router-level ones
+    included, in resolution order."""
     checks: list[AuthCheck] = []
-    for dep in route.dependant.dependencies:
+    for dep in _route_dependant(route).dependencies:
         call = dep.call
         if call is None or not _is_auth_check(call):
+            continue
+        if call is get_current_user:
+            # Resolved by ``authorise_from_headers`` itself (a route that
+            # declares ``CurrentUser`` directly lists it here).
+            checks.append(call)
             continue
         params = set(inspect.signature(call).parameters)
         unknown = params - _KNOWN_PARAMS
@@ -126,3 +162,24 @@ class PreBodyAuthRoute(APIRoute):
             return await original(request)
 
         return authorised
+
+
+def takes_upload(route: APIRoute) -> bool:
+    """True when ``route`` takes a multipart / form body (a file upload)."""
+    return any(
+        isinstance(field.field_info, (fastapi_params.Form, fastapi_params.File))
+        for field in route.dependant.body_params
+    )
+
+
+class PreBodyAuthUploadRoute(PreBodyAuthRoute):
+    """:class:`PreBodyAuthRoute` for the upload routes of a router that also
+    serves JSON routes: only a route taking a multipart / form body (a file
+    upload) is checked before its body is read (#2780). Every other route on
+    the router is served exactly as by ``APIRoute``; the app-wide body cap
+    (``app.core.body_limit``) bounds those."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        if not takes_upload(self):
+            return APIRoute.get_route_handler(self)
+        return super().get_route_handler()

@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.e911.router import log_resolution
 from app.config import settings
 from app.core.auth_throttle import e911_self_query_rate_limited
+from app.core.body_limit import read_body_capped
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
@@ -46,6 +47,7 @@ from app.services.e911.held import (
     ERROR_LOCATION_UNKNOWN,
     ERROR_NOT_LOCATABLE,
     ERROR_REQUEST_ERROR,
+    MAX_REQUEST_BYTES,
     HeldError,
     HeldRequest,
     parse_location_request,
@@ -58,6 +60,25 @@ from app.services.e911.resolver import resolve_location
 router = APIRouter(tags=["e911"])
 
 HELD_MEDIA_TYPE = "application/held+xml"
+
+
+async def _read_document(request: Request) -> bytes:
+    """The request body, read no further than ``MAX_REQUEST_BYTES``.
+
+    The self-query route has no login to check first (it is unauthenticated
+    by design, and off unless ``E911_SELF_QUERY_ENABLED``), so the size is
+    the only bound on what an unauthenticated sender can make the api read.
+    ``parse_location_request`` refuses an oversized document too, but only
+    after reading it whole. A body over the limit gets the same HELD error,
+    without reading past the limit (#2780)."""
+    try:
+        return await read_body_capped(request, MAX_REQUEST_BYTES)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_413_CONTENT_TOO_LARGE:
+            raise
+        raise HeldError(
+            ERROR_REQUEST_ERROR, f"request larger than {MAX_REQUEST_BYTES} bytes"
+        ) from exc
 
 
 def _error(code: str, message: str, http_status: int) -> Response:
@@ -165,7 +186,7 @@ async def _answer(
 async def held_third_party(request: Request, db: DB, user: CurrentUser) -> Response:
     """Third-party HELD: the caller names the device (RFC 6155 identity)."""
     try:
-        held = parse_location_request(await request.body())
+        held = parse_location_request(await _read_document(request))
     except HeldError as exc:
         return _error(exc.code, exc.message, status.HTTP_400_BAD_REQUEST)
 
@@ -243,7 +264,7 @@ async def held_self_query(request: Request, db: DB) -> Response:
         )
 
     try:
-        parsed = parse_location_request(await request.body())
+        parsed = parse_location_request(await _read_document(request))
     except HeldError as exc:
         return _error(exc.code, exc.message, status.HTTP_400_BAD_REQUEST)
 
