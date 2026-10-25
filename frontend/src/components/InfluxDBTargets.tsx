@@ -652,8 +652,13 @@ function InfluxTargetModal({
               onChange={(e) =>
                 setForm({ ...form, measurement_prefix: e.target.value })
               }
-              placeholder="spatiumddi_"
+              placeholder="none: unprefixed names"
             />
+            {form.measurement_prefix === "" && (
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                Empty: measurements are written with no prefix.
+              </div>
+            )}
           </label>
           <label className="block">
             <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">

@@ -95,12 +95,12 @@ def _count(
     hint: str,
     *,
     min_: int = 0,
-    max_: int | None = 100,
+    max_: int | None = None,
     initial: int | None = None,
     name: str = "threshold_percent",
 ) -> ParamSpec:
-    # ``threshold_percent`` is reused as a raw count by several rules; the
-    # API validator still bounds it to 0..100.
+    # ``threshold_percent`` is reused as a raw count by several rules; a
+    # count has no upper bound of its own (#2746), unlike ``_pct``.
     return ParamSpec(
         name=name,
         label=label,

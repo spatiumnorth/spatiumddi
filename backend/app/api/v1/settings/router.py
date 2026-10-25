@@ -4027,7 +4027,8 @@ async def create_influxdb_target(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        logger.warning("influxdb_target_create_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="create failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 
@@ -4045,12 +4046,18 @@ async def update_influxdb_target(
         raise HTTPException(status_code=404, detail="Target not found")
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
+    # Flush before the try, as create does: a taken name raises its unique
+    # violation here, where the application's IntegrityError handler turns it
+    # into the same 409 Create gives (#2750), instead of the driver's text
+    # (statement and parameters included) becoming the response detail.
+    await db.flush()
     _audit_influx(db, current_user, "update", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        logger.warning("influxdb_target_update_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="update failed") from exc
     await db.refresh(row)
     return _influx_to_response(row)
 

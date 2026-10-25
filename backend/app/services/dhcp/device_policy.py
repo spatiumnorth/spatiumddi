@@ -441,10 +441,20 @@ async def compile_device_policy(
     if override:
         result.expression = override
         result.source = "override"
-        result.warnings.append(
-            "A manual match expression is in force; the compiled expression below "
-            "is shown for comparison and is not rendered."
-        )
+        # The bundle renders only enabled policies, so "in force" is false for
+        # a disabled one (#2753).
+        if policy.enabled:
+            result.warnings.append(
+                "A manual match expression is in force; the compiled expression below "
+                "is shown for comparison and is not rendered."
+            )
+        else:
+            result.warnings.append(
+                "This policy is disabled, so its manual match expression is not "
+                "applied: nothing is rendered to Kea until it is enabled. When "
+                "enabled, the manual expression is used and the compiled expression "
+                "below is shown for comparison only."
+            )
     elif compiled:
         result.expression = compiled
         result.source = "compiled"
