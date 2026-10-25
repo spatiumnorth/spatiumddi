@@ -50,6 +50,7 @@ What we **don't** check here that Phases C/D will own:
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -71,7 +72,7 @@ from app.models.appliance import (
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer
 from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
-from app.services.upgrades import mutex
+from app.services.upgrades import kubeapi_retry, mutex
 
 logger = structlog.get_logger(__name__)
 
@@ -115,7 +116,10 @@ _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 
 
 def check_inflight_conflict(
-    *, namespace: str | None = None, own_holder: str | None = None
+    *,
+    namespace: str | None = None,
+    own_holder: str | None = None,
+    retry_budget_s: float = 0.0,
 ) -> PreflightResult:
     """Refuses if another upgrade is already in flight cluster-wide.
 
@@ -129,7 +133,7 @@ def check_inflight_conflict(
     node, so without it each run failed its own first node on the lease
     it had just taken (#1445).
     """
-    state = mutex.get_state(namespace=namespace)
+    state = mutex.get_state(namespace=namespace, retry_budget_s=retry_budget_s)
     if state.held and not state.expired and own_holder and state.holder == own_holder:
         return PreflightResult(
             name="inflight_conflict",
@@ -779,7 +783,7 @@ def check_version_path(
     )
 
 
-def check_quorum() -> PreflightResult:
+def check_quorum(retry_budget_s: float = 0.0) -> PreflightResult:
     """Cluster size is odd + ≥ 3 + every node Ready.
 
     Reads the kubeapi via the existing SA mount. On docker-compose
@@ -811,7 +815,12 @@ def check_quorum() -> PreflightResult:
     label = "spatium.io/role=appliance"
     path = f"/api/v1/nodes?labelSelector={quote(label)}"
     try:
-        status, body = k8s._request("GET", path)  # noqa: SLF001
+        # #2767 — a refused connection while one API server restarts is retried.
+        status, body = kubeapi_retry.read_with_retry_blocking(
+            lambda: k8s._request("GET", path),  # noqa: SLF001
+            what="quorum_node_list",
+            budget_s=retry_budget_s,
+        )
     except k8s.KubeapiUnavailableError as exc:
         return PreflightResult(
             name="quorum",
@@ -982,7 +991,14 @@ async def run_all(
         image_bytes * _NODE_NEED_IMAGE_MULTIPLE if image_bytes else _DEFAULT_SLOT_IMAGE_BYTES
     )
     results: list[PreflightResult] = [
-        check_inflight_conflict(namespace=namespace, own_holder=own_holder),
+        # #2767 — both kubeapi reads here ride out a refused connection while
+        # one API server restarts; off the event loop, since they sleep.
+        await asyncio.to_thread(
+            check_inflight_conflict,
+            namespace=namespace,
+            own_holder=own_holder,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        ),
         await check_replication_lag(),
         await check_node_disk_headroom(
             nodes=disk_nodes,
@@ -994,7 +1010,7 @@ async def run_all(
             slot_image_size_bytes=image_bytes or _DEFAULT_SLOT_IMAGE_BYTES,
         ),
         check_version_path(target_version=target_version),
-        check_quorum(),
+        await asyncio.to_thread(check_quorum, retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S),
         await check_kea_ha_version_skew(),
         await check_powerdns_lmdb_migration(),
         await check_etcd_snapshot_freshness(),
