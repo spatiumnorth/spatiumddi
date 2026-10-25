@@ -21,3 +21,8 @@
   node keeps serving its last applied roles. A revoked or deleted appliance
   still stops, and a control-plane node whose row was deleted still
   re-registers (#2696).
+
+  A heartbeat held by the long-poll while its appliance was revoked or
+  deleted answered 500 instead of the revocation (#2807), so a Fleet revoke
+  landed one heartbeat late. After the hold the row is re-read and refused
+  exactly as a fresh heartbeat would be: 403 `revoked` or 403 `unknown`.

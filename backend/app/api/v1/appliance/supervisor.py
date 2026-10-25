@@ -692,6 +692,29 @@ REVOCATION_REVOKED = "revoked"
 REVOCATION_UNKNOWN = "unknown"
 
 
+def _heartbeat_refusal(row: Appliance | None) -> HTTPException | None:
+    """The revocation refusal a heartbeat for ``row`` answers, or None.
+
+    ``None`` row (no row the credential opens: deleted, or a token that is
+    not this row's) → 403 ``unknown``; a revoked row → 403 ``revoked``.
+    Used before the long-poll hold AND after it (#2807), so a heartbeat
+    whose row was revoked or deleted while it was held answers exactly what
+    a fresh heartbeat would, instead of 500ing on the response model."""
+    if row is None:
+        return HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Invalid appliance or session.",
+            headers={REVOCATION_HEADER: REVOCATION_UNKNOWN},
+        )
+    if row.state == APPLIANCE_STATE_REVOKED:
+        return HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
+            headers={REVOCATION_HEADER: REVOCATION_REVOKED},
+        )
+    return None
+
+
 async def _module_enabled(db: DB) -> bool:
     """Read the registration flag. Cached settings row is fine — operator
     flipping the toggle takes effect on the next API call without a
@@ -2237,11 +2260,9 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Invalid appliance or session.",
-                headers={REVOCATION_HEADER: REVOCATION_UNKNOWN},
-            )
+            refusal = _heartbeat_refusal(None)
+            assert refusal is not None
+            raise refusal
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -2250,12 +2271,9 @@ async def supervisor_heartbeat(
     # ``revoked`` state + tears down service containers. Keeps the
     # cert-auth path simple (still trust the cert) while honouring
     # the operator's soft-delete intent at the API boundary.
-    if row.state == APPLIANCE_STATE_REVOKED:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
-            headers={REVOCATION_HEADER: REVOCATION_REVOKED},
-        )
+    refusal = _heartbeat_refusal(row)
+    if refusal is not None:
+        raise refusal
 
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
@@ -2985,6 +3003,9 @@ async def supervisor_heartbeat(
         )
         if not has_pending_command:
             long_poll = True
+            # #2807 — captured before the hold: after it the instance may be
+            # expired (row deleted) and any attribute load would raise.
+            held_appliance_id = row.id
             hold_for = min(float(body.wait_seconds), _HEARTBEAT_HOLD_CAP_S)
             deadline = asyncio.get_running_loop().time() + hold_for
             async with wake_subscription([*appliance_wake_channels(row), HOSTCONFIG_ALL]) as wake:
@@ -2996,17 +3017,23 @@ async def supervisor_heartbeat(
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
-            # building the desired-state response below. Guarded: if the row
-            # was hard-deleted during the hold, refresh raises — serve one
-            # last response from the in-memory row (the next heartbeat
-            # 403/404s cleanly) instead of 500ing.
-            try:
-                await db.refresh(row)
-            except Exception:  # noqa: BLE001
+            # building the desired-state response below, and answer what a
+            # fresh heartbeat would for the row's NEW state (#2807): revoked
+            # during the hold → 403 ``revoked``; deleted (or revoked then
+            # permanently deleted) → 403 ``unknown``. Previously a revoked
+            # row failed the response model and a deleted one failed its
+            # refresh — both 500s, so the revoke landed a heartbeat late.
+            fresh = await db.get(Appliance, held_appliance_id, populate_existing=True)
+            refusal = _heartbeat_refusal(fresh)
+            if refusal is not None:
                 logger.info(
-                    "supervisor_heartbeat_refresh_after_hold_failed",
-                    appliance_id=str(row.id),
+                    "supervisor_heartbeat_refused_after_hold",
+                    appliance_id=str(held_appliance_id),
+                    revocation=(refusal.headers or {}).get(REVOCATION_HEADER),
                 )
+                raise refusal
+            assert fresh is not None
+            row = fresh
 
     # Resolve assigned role config so the supervisor can bring up
     # service containers. DNS / DHCP group lookups are best-effort —
