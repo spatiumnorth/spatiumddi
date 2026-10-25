@@ -819,6 +819,12 @@ async def agent_config_longpoll(
                                 # [...]}`` so a centralized Kea matches this
                                 # scope on giaddr for relayed remote subnets.
                                 "relay_addresses": list(s.relay_addresses),
+                                # #2731: the classes of the PXE profile bound
+                                # to this scope. The agent has Kea evaluate
+                                # them for this subnet alone; rendered for the
+                                # whole server, one scope's profile booted the
+                                # PXE clients of every scope on it.
+                                "pxe_class_names": list(s.pxe_class_names),
                                 "pools": [
                                     {
                                         "start_ip": p.start_ip,

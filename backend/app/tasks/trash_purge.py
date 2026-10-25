@@ -29,6 +29,9 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.network_service import NetworkService
+from app.models.overlay import OverlayNetwork
+from app.models.ownership import Customer
 from app.models.settings import PlatformSettings
 from app.services.dhcp.static_ipam import remove_ipam_for_static
 
@@ -53,6 +56,10 @@ _PURGE_MODELS_LEAF_FIRST: tuple[type, ...] = (
     Subnet,
     IPBlock,
     IPSpace,
+    # #2738 — leaves, but a customer goes after its services (RESTRICT).
+    NetworkService,
+    OverlayNetwork,
+    Customer,
 )
 
 
@@ -328,6 +335,12 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
         ]
     elif model is DHCPScope:
         where.append(DHCPScope.id.not_in(_scopes_with_live_children()))
+    elif model is Customer:
+        # network_service.customer_id is RESTRICT: a customer with any service
+        # (live, or trashed but not yet expired) waits for it (#2738).
+        where.append(
+            ~exists().where(NetworkService.customer_id == model.id)  # type: ignore[attr-defined]
+        )
     return where
 
 

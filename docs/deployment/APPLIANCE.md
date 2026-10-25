@@ -156,6 +156,8 @@ Postgres / Redis replicas. Measured on `main` (2026-09-03): three 6.5 GiB /
 server up through the same 250k-record / 20k-device load and a kill-leader
 drill (0 k3s restarts, at most one api restart).
 
+**Data disk for large installs (#2240).** Everything that grows with the data lives on `/var`: the Postgres volumes, etcd, the container images and the logs. `/var` is what the disk has left after about 17 GiB of fixed partitions (`spatium-install`: the boot partitions, a 256 MiB state partition and two 8 GiB root slots), so a 40 GiB disk gives 23 GiB of `/var` and a 64 GiB disk 47 GiB. On a seven-node test cluster with 40 GiB disks and every node serving DNS, `/var` reached 88 to 91% on every node at about 1.5M records (about 770,000 devices, an A record and its PTR each), growing about 2 GB an hour per node while records were added at 80 to 190 a second. With the disks grown online to 64 GiB, `/var` read 43 to 45%, and the cluster went on to store 1M devices (2M records). So **for about 1M devices, give every control-plane node a disk of 64 GiB or more**: the 40 GiB above goes with the load the floors were measured at (250k A records and their PTRs). Leave room beyond that for Postgres WAL. After a failover, a primary that still holds replication slots for standbys that cannot follow keeps every WAL segment, and on 64 GiB disks one node's `/var` reached 87% with 26 GB of WAL against 3.3 GB of data (#2317). The default-on `appliance_disk_usage` alert watches `/var` on every node: a warning at 80% and critical at 87%, a few points before the kubelet starts evicting pods at about 90%. Those figures count the 5% that ext4 keeps for root as free, so `df` shows a few points more (see [`OBSERVABILITY.md`](../OBSERVABILITY.md)).
+
 **Control-plane HA is not serving HA.** The DNS and DHCP roles are assigned
 per appliance, and only the nodes that carry a role run the `dns-bind9` /
 `dhcp-kea` pods. In that drill the roles sat on the seed alone, so for the
@@ -3280,6 +3282,14 @@ on top of the image.
    >
    > Upload works normally once the appliance is on `2026.07.30-1` or
    > later. See [#787](https://github.com/spatiumnorth/spatiumddi/issues/787).
+
+   A scripted upload must send a `Content-Length` header, as browsers,
+   `curl -F` and the common HTTP client libraries do; one without it is
+   answered **411**, because the receiving node's free space is checked
+   against that size before the image is buffered. The caller's
+   credentials are checked from the request headers first, so a missing
+   or insufficient one is answered 401 / 403 before any of the image is
+   read.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
@@ -3316,7 +3326,8 @@ so a first-time operator never gets stuck looking for the upload.
    unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
-   `inflight_conflict`, `replication_lag`, `disk_headroom` (each
+   `inflight_conflict` (or `kubeapi_unreachable` when the API did not answer the
+   lease read, #2779), `replication_lag`, `disk_headroom` (each
    node's reported `/var`; a missing or stale report warns; a node
    already on the target stages nothing and is named instead of
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not

@@ -612,6 +612,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_disk_usage_alert_rule,
             seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
@@ -623,6 +624,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Storage redundancy (#999 Part A) — cannot fire on an appliance
         # with no arrays, or on a supervisor too old to report them.
         await seed_appliance_storage_alert_rule()
+        # /var filling (#2240): silent below 80%, and on a supervisor that
+        # does not report /var.
+        await seed_appliance_disk_usage_alert_rule()
         # Silent supervisor (#2259) — cannot fire with no appliances.
         await seed_appliance_heartbeat_alert_rule()
     except Exception as exc:  # noqa: BLE001
@@ -1221,6 +1225,7 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_message,
     )
 
     # A unique violation (SQLSTATE 23505) is the data conflicting.
@@ -1302,7 +1307,7 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": "The request conflicts with existing data."},
+            content={"detail": unique_violation_message(extract_detail(exc))},
         )
 
     @app.exception_handler(SADBAPIError)
