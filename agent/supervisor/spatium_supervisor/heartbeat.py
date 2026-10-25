@@ -1717,6 +1717,14 @@ def heartbeat_once(
         _local_changed, local_err = k8s_api.ensure_kube_dns_node_local()
         if local_err:
             log.warning("supervisor.heartbeat.kube_dns_node_local_failed", error=local_err)
+        # #2240: the CNPG operator IS Postgres failover, and firstboot starts
+        # both its replicas on the seed while the seed is alone; preferred
+        # anti-affinity never moves them. From three nodes the reconciler
+        # makes the spread required (a two-replica rollout needs a third node
+        # for its surge pod), and removes it again below three.
+        _op_changed, op_err = k8s_api.ensure_cnpg_operator_spread()
+        if op_err:
+            log.warning("supervisor.heartbeat.cnpg_operator_spread_failed", error=op_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
