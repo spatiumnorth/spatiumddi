@@ -65,6 +65,7 @@ from app.services.dns.named_conf_validation import (
     UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
     ViewValidationError,
+    bind9_refused_prefix,
     is_name_reference,
     key_reference,
     order_acls_for_render,
@@ -283,9 +284,16 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for e in sorted(acl.entries, key=lambda e: (e.order, e.value)):
             try:
-                # Syntax only — whether a bare name actually resolves is
-                # decided by the known-set sweep below.
-                validate_address_match_list([e.value], field="entries", allow_unknown_names=True)
+                # Syntax only: whether a bare name actually resolves is
+                # decided by the known-set sweep below, and whether a prefix
+                # BIND 9 refuses renders by the server's driver (#2695,
+                # ``_drop_undefined_key_refs``).
+                validate_address_match_list(
+                    [e.value],
+                    field="entries",
+                    allow_unknown_names=True,
+                    allow_bind9_refused_prefixes=True,
+                )
             except ViewValidationError as exc:
                 logger.warning(
                     "dns_acl_entry_dropped_unrenderable",
@@ -335,6 +343,7 @@ def _drop_undefined_key_refs(
     where: str,
     known_acls: frozenset[str] | None = None,
     deny_if_emptied: bool = False,
+    drop_bind9_refused_prefixes: bool = False,
 ) -> Any:
     """``elements`` without any citation the bundle does not define (#2282, #2283).
 
@@ -363,6 +372,14 @@ def _drop_undefined_key_refs(
     ``also-notify`` is not an access list and ``none`` is not legal there;
     ACL entries are not either, since an entry-less ACL already renders
     ``{ none; }``.
+
+    ``drop_bind9_refused_prefixes`` (a BIND9 server's bundle, #2695) also
+    drops a prefix BIND 9 refuses, one with host bits set (``10.0.0.5/24``)
+    or a mask where the length goes (``10.0.0.0/255.255.255.0``), under the
+    same rules. The API refuses both now, but a row saved before that may
+    hold one, and BIND refuses the element, so shipping it would keep the
+    whole group from loading new config. The Technitium and PowerDNS agents
+    apply the prefix's network, so their bundles keep the value.
     """
     if not isinstance(elements, list):
         return elements
@@ -372,10 +389,18 @@ def _drop_undefined_key_refs(
         text = str(el)
         name = key_reference(text)
         acl = is_name_reference(text) if known_acls is not None else None
+        network = bind9_refused_prefix(text) if drop_bind9_refused_prefixes else None
         if name is not None and _key_name_norm(name) not in known_keys:
             logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
         elif acl is not None and known_acls is not None and acl not in known_acls:
             logger.warning("dns_bundle_entry_dropped_undefined_acl", where=where, acl=acl)
+        elif network is not None:
+            logger.warning(
+                "dns_bundle_entry_dropped_bind9_refused_prefix",
+                where=where,
+                value=text,
+                network=str(network),
+            )
         else:
             kept.append(el)
             continue
@@ -1690,13 +1715,20 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
 
     # #2282 / #2283 — never ship a ``key <name>`` or ACL name the bundle does
     # not define. Access lists that empty out become ``none``, not "inherit".
+    # #2695: nor, to a BIND9 server, a prefix BIND 9 refuses.
     known_key_names = frozenset(_key_name_norm(k["name"]) for k in tsig_keys)
     known_acl_names = frozenset(a["name"] for a in acls_block)
+    bind9 = server.driver == "bind9"
     for a in acls_block:
         a["entries"] = [
             e
             for e in a["entries"]
-            if _drop_undefined_key_refs([e["value"]], known_key_names, where=f"acl:{a['name']}")
+            if _drop_undefined_key_refs(
+                [e["value"]],
+                known_key_names,
+                where=f"acl:{a['name']}",
+                drop_bind9_refused_prefixes=bind9,
+            )
         ]
     for ve in views_block:
         for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
@@ -1706,6 +1738,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 where=f"view:{ve['name']}.{f}",
                 known_acls=known_acl_names,
                 deny_if_emptied=True,
+                drop_bind9_refused_prefixes=bind9,
             )
     for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
         if f in options_block:
@@ -1715,6 +1748,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 where=f"options.{f}",
                 known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
+                drop_bind9_refused_prefixes=bind9,
             )
 
     def _drop_zone_refs(zp: dict[str, Any]) -> dict[str, Any]:
@@ -1725,6 +1759,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 where=f"zone:{zp['name']}.{f}",
                 known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
+                drop_bind9_refused_prefixes=bind9,
             )
         return zp
 
