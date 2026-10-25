@@ -151,9 +151,8 @@ def check(docs: list[Any]) -> tuple[list[str], int, int]:
     for doc in docs:
         if not isinstance(doc, dict):
             continue
-        if doc.get("kind") == "Cluster" and str(doc.get("apiVersion", "")).startswith(
-            "postgresql.cnpg.io/"
-        ):
+        group = str(doc.get("apiVersion", "")).partition("/")[0]
+        if doc.get("kind") == "Cluster" and group == "postgresql.cnpg.io":
             clusters += 1
             problems += check_cluster(doc)
         elif doc.get("kind") == "Role" and (doc.get("metadata") or {}).get(
