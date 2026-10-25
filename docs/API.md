@@ -42,7 +42,7 @@ infrastructure rather than application surface:
 | Path | Purpose | Auth |
 |---|---|---|
 | `/health/live` | Liveness probe — 200 if the process is up | none |
-| `/health/ready` | Readiness probe — DB connectivity + **schema-at-head** + Redis | none |
+| `/health/ready` | Readiness probe — DB connectivity + **schema-at-head** + Redis; a pod already ready stays ready on a schema a newer release migrated (#2777) | none |
 | `/health/startup` | Same logic as `/health/ready`, for slow-start k8s containers | none |
 | `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard | none |
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |

@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, cast
@@ -12,7 +13,7 @@ from sqlalchemy import text
 from starlette import status
 from starlette.responses import JSONResponse
 
-from app.core.schema_check import schema_at_head
+from app.core.schema_check import SchemaCheck, schema_at_head
 from app.db import AsyncSessionLocal
 
 logger = structlog.get_logger(__name__)
@@ -34,16 +35,82 @@ router = APIRouter(tags=["health"])
 # The comparison itself lives in the framework-agnostic
 # ``app.core.schema_check`` module (extracted in #565 so the Celery
 # worker/beat startup + periodic checks share one implementation);
-# this wrapper keeps the ``("ok"|"error", detail)`` shape the
-# readiness verdict folds in alongside DB + Redis.
+# this wrapper keeps the ``(verdict, detail)`` shape the readiness
+# verdict folds in alongside DB + Redis.
+#
+# #2777 — a DB *ahead* of the image is the mixed-version window of a
+# rolling upgrade: the new release's migration commits while the old
+# release's pods still serve (expand/contract keeps the old code safe on
+# the new schema, docs/DEVELOPMENT.md). Refusing it took EVERY old api
+# pod out of the Service at once, before any new pod was ready: ~80 s of
+# 502 on a three-node roll. So a process that has already been ready at
+# its own head keeps serving there. One that never was (a new pod, a
+# restarted container, an older release rolled back onto a newer
+# database) still refuses it, as wait-for-migrate and #1227's guard do.
+# Behind, unstamped and failed checks stay 503 whatever the history.
+@dataclass(slots=True)
+class _SchemaReadiness:
+    """This process's schema history across probes (#2777).
+
+    ``seen_head`` latches the first time the check finds the DB at this
+    image's own head, which is also the first moment the pod could have
+    been Ready (one uvicorn worker per api container, so the process is
+    the pod). ``logged`` is the last (verdict, detail) logged, so a
+    mismatch logs once per change, not once per probe.
+    """
+
+    seen_head: bool = False
+    logged: tuple[str, str] | None = None
+
+
+_schema_readiness = _SchemaReadiness()
+
+
+def _log_schema_change(verdict: str, result: SchemaCheck) -> None:
+    """Log a schema mismatch at warning once per change (#2777)."""
+    key = (verdict, result.detail)
+    previous = _schema_readiness.logged
+    if key == previous:
+        return
+    _schema_readiness.logged = key
+    if verdict == "ok":
+        if previous is not None:
+            logger.info("readiness_schema_at_head", expected=result.expected, previous=previous[1])
+        return
+    logger.warning(
+        "readiness_schema_mismatch",
+        expected=result.expected,
+        actual=result.actual,
+        ahead=result.ahead,
+        serving=verdict == "newer",
+        detail=result.detail,
+    )
+
+
 async def _check_schema_ready() -> tuple[str, str]:
     """Verify the DB schema is at the head this api image expects.
 
-    Returns ``("ok", "<detail>")`` if the schema matches, else
-    ``("error", "<detail>")`` with an operator-actionable message.
+    Returns ``("ok", "<detail>")`` if the schema matches;
+    ``("newer", "<detail>")`` when a newer release migrated the DB and
+    this process has already been ready at its own head, so it keeps
+    serving (#2777); else ``("error", "<detail>")`` with an
+    operator-actionable message.
     """
     result = await schema_at_head()
-    return ("ok" if result.ok else "error"), result.detail
+    if result.ok:
+        _schema_readiness.seen_head = True
+        verdict, detail = "ok", result.detail
+    elif result.ahead and _schema_readiness.seen_head:
+        verdict = "newer"
+        detail = (
+            f"schema at {result.actual} is newer than this image's head "
+            f"{result.expected}: a newer release migrated the database, and "
+            "this pod keeps serving until it is replaced"
+        )
+    else:
+        verdict, detail = "error", result.detail
+    _log_schema_change(verdict, result)
+    return verdict, detail
 
 
 @router.get("/health/live", status_code=status.HTTP_200_OK)
@@ -67,6 +134,10 @@ async def readiness() -> JSONResponse:
     the Service endpoint set, and serves 500s on every actual route
     handler until migrations finish — which the operator sees as
     bare nginx 502s through the frontend proxy (issue #299).
+
+    A schema AHEAD of this image (a newer release migrated it) keeps a
+    process that has already been ready at its own head in service:
+    ``checks.schema`` reads ``ok: …`` naming both revisions (#2777).
     """
     checks: dict[str, str] = {}
     healthy = True
@@ -114,8 +185,13 @@ async def readiness() -> JSONResponse:
                 verdict, detail = await _check_schema_ready()
         except TimeoutError:
             verdict, detail = "error", "timed out after 4s"
-        checks["schema"] = "ok" if verdict == "ok" else f"error: {detail}"
-        if verdict != "ok":
+            _log_schema_change(verdict, SchemaCheck(False, None, None, detail))
+        if verdict == "ok":
+            checks["schema"] = "ok"
+        elif verdict == "newer":
+            checks["schema"] = f"ok: {detail}"
+        else:
+            checks["schema"] = f"error: {detail}"
             healthy = False
 
     # Redis check

@@ -13,8 +13,14 @@ Covers:
   is 503 with the schema-specific detail.
 * ``alembic_version`` row missing → "alembic_version row missing"
   detail, 503.
-* ``version_num`` doesn't match the bundled head → "schema at X,
-  image expects Y" detail, 503.
+* ``version_num`` behind the bundled head → "schema at X, image
+  expects Y" detail, 503.
+* ``version_num`` a revision this image does not know, i.e. a NEWER
+  release migrated the database (#2777): ``ahead``; readiness keeps a
+  process that has already been ready at its own head in service
+  (the mixed-version window of a rolling upgrade) and refuses it on a
+  process that never was; behind and unstamped stay 503 either way; a
+  mismatch is logged once per change.
 
 The cached ``_EXPECTED_HEAD`` module global is reset around each test
 so a previous test's view of the head doesn't bleed into the next.
@@ -29,10 +35,41 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
+from structlog.testing import capture_logs
 
 from app.api import health as health_module
 from app.core import schema_check as schema_module
 from app.db import AsyncSessionLocal
+
+# A revision no release has: what a NEWER release's migration leaves in
+# ``alembic_version`` as far as this image can tell (#2777).
+NEWER = "f00dfeed2777"
+
+
+def _parent_of_head() -> str:
+    """The revision just before the bundled head: a schema BEHIND this image."""
+    from alembic.config import Config  # noqa: PLC0415
+    from alembic.script import ScriptDirectory  # noqa: PLC0415
+
+    ini = schema_module._locate_alembic_ini()
+    assert ini is not None
+    script = ScriptDirectory.from_config(Config(str(ini)))
+    head = script.get_revision(script.get_current_head())
+    assert head is not None
+    parent = head.down_revision
+    if isinstance(parent, tuple):  # a merge revision: each parent is behind it
+        parent = parent[0]
+    assert isinstance(parent, str), "the bundled head has no parent revision"
+    return parent
+
+
+async def _stamp(revision: str) -> None:
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            text("UPDATE alembic_version SET version_num = :rev"),
+            {"rev": revision},
+        )
+        await s.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -104,20 +141,21 @@ async def test_schema_check_ok_when_at_head() -> None:
 
 @pytest.mark.asyncio
 async def test_schema_check_reports_mismatch() -> None:
-    """When alembic_version says a non-head revision, the check
+    """When alembic_version says a revision behind the head, the check
     returns error + names both versions."""
     expected, _ = schema_module.expected_alembic_head()
     assert expected is not None
 
-    # Mutate alembic_version to a fake revision and assert the helper
-    # surfaces both sides of the diff.
-    async with AsyncSessionLocal() as s:
-        await s.execute(text("UPDATE alembic_version SET version_num = 'fake_old_revision'"))
-        await s.commit()
+    # Mutate alembic_version to the head's parent and assert the helper
+    # surfaces both sides of the diff. A real older revision, not a
+    # made-up one: since #2777 a revision the image does not know means
+    # a NEWER schema, which the tests further down cover.
+    old_revision = _parent_of_head()
+    await _stamp(old_revision)
     try:
         verdict, detail = await health_module._check_schema_ready()
         assert verdict == "error"
-        assert "fake_old_revision" in detail
+        assert old_revision in detail
         assert expected in detail
     finally:
         # Restore so subsequent tests see a clean schema head.
@@ -263,9 +301,8 @@ async def test_readiness_endpoint_503_on_schema_mismatch(client: AsyncClient) ->
     expected, _ = schema_module.expected_alembic_head()
     assert expected is not None
 
-    async with AsyncSessionLocal() as s:
-        await s.execute(text("UPDATE alembic_version SET version_num = 'fake_pre_migrate'"))
-        await s.commit()
+    pre_migrate = _parent_of_head()
+    await _stamp(pre_migrate)
     try:
         response = await client.get("/health/ready")
         assert response.status_code == 503
@@ -273,7 +310,7 @@ async def test_readiness_endpoint_503_on_schema_mismatch(client: AsyncClient) ->
         assert body["status"] == "degraded"
         # DB connect still ok — only the schema check fails.
         assert body["checks"]["database"] == "ok"
-        assert "fake_pre_migrate" in body["checks"]["schema"]
+        assert pre_migrate in body["checks"]["schema"]
         assert expected in body["checks"]["schema"]
     finally:
         async with AsyncSessionLocal() as s:
@@ -294,3 +331,162 @@ async def test_readiness_endpoint_200_at_head(client: AsyncClient) -> None:
     # the schema check passes (which is what #299 phase 1 changed).
     if body["checks"].get("database") == "ok":
         assert body["checks"].get("schema", "").startswith("ok")
+
+
+# ── #2777 — a NEWER schema under a pod already in service ───────────
+#
+# On a rolling upgrade the new release's migration commits while the
+# previous release's api pods still serve. Each of them then finds
+# ``alembic_version`` at a revision its image does not know. Answering
+# 503 for that took every old pod out of the Service before the first
+# new pod was ready (~80 s of 502 on a three-node roll).
+
+
+class _RedisUp:
+    async def ping(self) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture
+def redis_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readiness's Redis check answers, so its verdict turns on the schema."""
+    from app.core import redis_client  # noqa: PLC0415
+
+    monkeypatch.setattr(redis_client, "make_async_redis", lambda *_a, **_k: _RedisUp())
+
+
+@pytest.fixture
+def fresh_api_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This process has not been ready at its own head yet: a new pod, a
+    restarted container, or an older release rolled back onto a newer
+    database."""
+    monkeypatch.setattr(health_module, "_schema_readiness", health_module._SchemaReadiness())
+
+
+@pytest.mark.asyncio
+async def test_schema_check_marks_an_unknown_revision_ahead() -> None:
+    """A revision this image's migrations do not contain was written by a
+    newer release: ``ahead``, still not ``ok``, the detail unchanged."""
+    expected, _ = schema_module.expected_alembic_head()
+    await _stamp(NEWER)
+
+    result = await schema_module.schema_at_head()
+
+    assert result.ok is False
+    assert result.ahead is True
+    assert result.actual == NEWER
+    assert result.detail == f"schema at {NEWER}, image expects {expected}"
+
+
+@pytest.mark.asyncio
+async def test_schema_check_marks_a_known_older_revision_behind() -> None:
+    """A revision the image knows that is not its head is BEHIND it: with
+    one head, every other revision in the tree is an ancestor of it."""
+    expected, _ = schema_module.expected_alembic_head()
+    parent = _parent_of_head()
+    await _stamp(parent)
+
+    result = await schema_module.schema_at_head()
+
+    assert result.ok is False
+    assert result.ahead is False
+    assert result.detail == f"schema at {parent}, image expects {expected}"
+
+
+@pytest.mark.asyncio
+async def test_ready_pod_keeps_serving_when_a_newer_release_migrates(
+    client: AsyncClient, redis_up: None
+) -> None:
+    """The issue's contract: a pod already ready at its own head stays
+    ready when a newer release's migration moves the schema past it."""
+    expected, _ = schema_module.expected_alembic_head()
+    response = await client.get("/health/ready")
+    assert response.status_code == 200, response.json()
+
+    await _stamp(NEWER)
+    response = await client.get("/health/ready")
+
+    body = response.json()
+    assert response.status_code == 200, body
+    assert body["status"] == "ok"
+    assert body["checks"]["schema"].startswith("ok: ")
+    assert NEWER in body["checks"]["schema"]
+    assert expected in body["checks"]["schema"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_process_on_a_newer_schema_stays_unready(
+    client: AsyncClient, redis_up: None, fresh_api_process: None
+) -> None:
+    """A process that was never ready at its own head must not enter
+    service on a schema it does not know (#1227's guard): 503, every time."""
+    expected, _ = schema_module.expected_alembic_head()
+    await _stamp(NEWER)
+
+    for _ in range(2):
+        response = await client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["schema"] == (
+            f"error: schema at {NEWER}, image expects {expected}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ready_pod_still_refuses_a_schema_behind_its_head(
+    client: AsyncClient, redis_up: None
+) -> None:
+    """#299 holds after the pod has been ready: behind is 503."""
+    expected, _ = schema_module.expected_alembic_head()
+    assert (await client.get("/health/ready")).status_code == 200
+    parent = _parent_of_head()
+    await _stamp(parent)
+
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["schema"] == (
+        f"error: schema at {parent}, image expects {expected}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ready_pod_still_refuses_an_unstamped_schema(
+    client: AsyncClient, redis_up: None
+) -> None:
+    """An emptied ``alembic_version`` is 503 after the pod has been ready."""
+    assert (await client.get("/health/ready")).status_code == 200
+    async with AsyncSessionLocal() as s:
+        await s.execute(text("DELETE FROM alembic_version"))
+        await s.commit()
+
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert "alembic_version row missing" in response.json()["checks"]["schema"]
+
+
+@pytest.mark.asyncio
+async def test_schema_mismatch_is_logged_once_per_change() -> None:
+    """A mismatch logs a warning once per change, never once per probe,
+    and the way back to head logs once at info."""
+    expected, _ = schema_module.expected_alembic_head()
+    parent = _parent_of_head()
+    verdict, detail = await health_module._check_schema_ready()  # in service at head
+    assert verdict == "ok", detail
+
+    with capture_logs() as logs:
+        for revision in (NEWER, parent, expected):
+            await _stamp(revision)
+            await health_module._check_schema_ready()
+            await health_module._check_schema_ready()
+
+    mismatches = [e for e in logs if e["event"] == "readiness_schema_mismatch"]
+    assert [(e["log_level"], e["actual"], e["ahead"], e["serving"]) for e in mismatches] == [
+        ("warning", NEWER, True, True),
+        ("warning", parent, False, False),
+    ]
+    back = [e for e in logs if e["event"] == "readiness_schema_at_head"]
+    assert [(e["log_level"], e["expected"]) for e in back] == [("info", expected)]

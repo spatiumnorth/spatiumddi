@@ -680,6 +680,13 @@ The contract: **every migration must be safe against both N-1 and N
 code** — expand in release N (add the new column/table/dual-write), drop
 the old one in release N+1.
 
+The old pods really do serve through that window. Once the new release's
+migration commits, each old api pod finds `alembic_version` at a revision
+its image does not know, and `/health/ready` keeps a pod that has already
+been ready at its own head in service there (#2777). A pod that never was
+(a new pod of an older release, a restarted container), a schema behind
+the image and an unstamped one still answer 503.
+
 `scripts/lint_migrations.py` (stdlib-only, runs in the `backend-lint` CI
 job) flags destructive ops (`drop_column` / `drop_table` in downgrades,
 etc.) so they get the two-release treatment. Historical violations are

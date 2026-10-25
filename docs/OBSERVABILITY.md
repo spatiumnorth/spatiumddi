@@ -946,9 +946,17 @@ All services expose:
 - Returns `503` only if the process should be restarted
 
 **`GET /health/ready`** — Readiness probe
-- Checks: DB connectivity, Redis connectivity, required config present
+- Checks: DB connectivity, the schema at the head the image expects, Redis connectivity
 - Returns `200 {"status": "ok", "checks": {...}}` if ready to serve traffic
 - Returns `503` with failed check details if not ready
+- A schema a newer release migrated (the mixed-version window of a rolling
+  upgrade) keeps a pod that has already been ready at its own head in service:
+  `checks.schema` reads `ok: …` naming both revisions (#2777). A schema behind
+  the image, an unstamped one, or a newer one on a pod that was never ready
+  answers `503`.
+- Logs `readiness_schema_mismatch` (warning) once per change of schema state,
+  with `expected`, `actual`, `ahead` and `serving`, and
+  `readiness_schema_at_head` (info) on the way back
 
 **`GET /health/startup`** — Startup probe (for Kubernetes slow-start containers)
 - Same as readiness but used only during initial startup

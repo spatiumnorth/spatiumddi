@@ -17,6 +17,15 @@ migrate ran" footgun:
   DHCP config long-poll hammers ``db.get(PlatformSettings, 1)`` while
   the DB was still on the old schema.
 
+The opposite mismatch, the DB *ahead* of the code, is normal for a
+while (#2777): on a rolling upgrade the new release's migration commits
+while the previous release's pods still serve, and each of them then
+finds a revision its image does not know. ``SchemaCheck.ahead`` tells
+the two apart. With a single head, every revision in this image's tree
+is the head or an ancestor of it, so a known revision that is not the
+head is behind; one the tree does not contain was written by a newer
+release. ``ok`` still means "exactly at head" for every caller.
+
 This module holds the framework-agnostic core so ``app/api/health.py``
 and the Celery startup / periodic checks share one implementation. It
 does pure DB + bundled-migration-file introspection — **no docker /
@@ -58,12 +67,19 @@ class SchemaCheck(NamedTuple):
     * ``detail`` — an operator-actionable one-liner describing the
       state ("schema at head …", "migrate not run", "schema at X,
       image expects Y", …).
+    * ``ahead`` — ``True`` only when ``actual`` is a revision this
+      image's migrations do not contain: a NEWER release migrated the
+      database (the mixed-version window of a rolling upgrade, or a
+      rollback onto a newer database, #1227). ``False`` at head, when
+      the DB is behind, and whenever that cannot be told, so a caller
+      keying on it fails closed (#2777).
     """
 
     ok: bool
     expected: str | None
     actual: str | None
     detail: str
+    ahead: bool = False
 
 
 # ── Bundled-head cache ─────────────────────────────────────────────
@@ -78,6 +94,8 @@ class SchemaCheck(NamedTuple):
 class _SchemaHeadCache:
     head: str | None = None
     error: str | None = None
+    # Every revision id in the bundled tree, read with the head (#2777).
+    revisions: frozenset[str] = frozenset()
 
 
 _head_cache = _SchemaHeadCache()
@@ -136,6 +154,7 @@ def expected_alembic_head() -> tuple[str | None, str | None]:
         if head is None:
             _head_cache.error = "no head revision in script directory"
             return None, _head_cache.error
+        _head_cache.revisions = frozenset(rev.revision for rev in script.walk_revisions())
         _head_cache.head = head
         logger.info("schema_head_cached", expected_head=head, ini_path=str(ini_path))
         return head, None
@@ -166,7 +185,8 @@ async def schema_at_head(session_factory=None) -> SchemaCheck:
       into thinking migrations need to run.
     * ``alembic_version`` row missing — stamp/upgrade interrupted →
       ``alembic_version row missing — migrate not stamped``.
-    * ``version_num != head`` — schema behind → reports both revisions.
+    * ``version_num != head`` — reports both revisions; ``ahead`` says
+      whether a newer release wrote it (#2777) or the schema is behind.
     * Any other exception → ``schema check failed: …``.
     """
     if session_factory is None:
@@ -200,7 +220,17 @@ async def schema_at_head(session_factory=None) -> SchemaCheck:
         )
     actual = row[0]
     if actual != expected:
-        return SchemaCheck(False, expected, actual, f"schema at {actual}, image expects {expected}")
+        # #2777 — a revision this image's tree knows is behind its head; one
+        # it does not know was written by a newer release. An empty set (the
+        # tree never read) says neither, so ``ahead`` stays False.
+        known = _head_cache.revisions
+        return SchemaCheck(
+            False,
+            expected,
+            actual,
+            f"schema at {actual}, image expects {expected}",
+            ahead=bool(known) and actual not in known,
+        )
     return SchemaCheck(True, expected, actual, f"schema at head {expected}")
 
 
