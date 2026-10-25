@@ -798,6 +798,33 @@ postgresql:
       # HelmChartConfig sets only ``shared_buffers`` in this map (#1115) and
       # Helm merges maps key by key, so this default stays beside it.
       wal_keep_size: "2GB"
+      # #2317 — the most WAL a replication slot may hold back. CNPG keeps an
+      # HA slot per standby on the primary and synchronises them to every
+      # standby, so after a failover the new primary holds slots for standbys
+      # that may never follow it. PostgreSQL's default (-1) lets such a slot
+      # keep WAL without limit: a lab primary's pg_wal reached 26 GB on its
+      # node's /var while CNPG read healthy 7/7. Past this cap PostgreSQL
+      # invalidates the slot at the next checkpoint (``wal_status = lost``),
+      # the WAL goes, and that standby can never rejoin by streaming: it needs
+      # a re-clone. Until the automatic one lands (#2132) that is manual:
+      # delete the instance's PVC, then its pod, and CNPG joins a fresh copy
+      # (docs/TROUBLESHOOTING.md).
+      #
+      # Sizing. PostgreSQL keeps the LARGER of this cap and ``wal_keep_size``
+      # (the two do not add), plus up to ``max_wal_size`` (PostgreSQL's 1GB
+      # default, unset here) since the last checkpoint. So pg_wal is bounded
+      # near max(2GB, 3GB) + 1GB = 4GB, half of ``persistence.size`` (8Gi),
+      # leaving the other half for the data. ``charts-render-check.sh``
+      # (chart-cnpg-recovery.py) fails a render where that bound is over half
+      # the instance volume or the cap is unset. 3GB is also above
+      # ``wal_keep_size`` on purpose: a cap at or below it would let a slot
+      # protect nothing that plain retention does not.
+      #
+      # Raise ``persistence.size`` before raising this. On the appliance the
+      # volume is local-path, which does not enforce its size, so an
+      # unbounded pg_wal fills the node's /var and everything else on it.
+      # A reload, like ``wal_keep_size``.
+      max_slot_wal_keep_size: "3GB"
     # PodMonitor for Prometheus Operator. Default false because most
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:

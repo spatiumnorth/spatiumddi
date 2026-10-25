@@ -48,6 +48,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -147,7 +148,13 @@ class OverlayNetwork(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base)
 
     __tablename__ = "overlay_network"
     __table_args__ = (
-        UniqueConstraint("name", name="uq_overlay_network_name"),
+        # Partial, so a soft-deleted overlay stops holding its name (#2738).
+        Index(
+            "uq_overlay_network_name",
+            "name",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index("ix_overlay_network_customer_id", "customer_id"),
         Index("ix_overlay_network_kind", "kind"),
         Index("ix_overlay_network_status", "status"),

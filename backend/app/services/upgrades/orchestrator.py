@@ -63,6 +63,7 @@ from app.services.upgrades import (
 )
 from app.services.upgrades import (
     chart_bump,
+    kubeapi_retry,
     mutex,
     node_order,
     per_node,
@@ -79,7 +80,9 @@ logger = structlog.get_logger(__name__)
 SYSTEM_ACTOR = per_node.SYSTEM_ACTOR
 
 
-def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
+def detect_cnpg_cluster_name(
+    namespace: str | None = None, *, raise_unavailable: bool = False
+) -> str:
     """The CNPG Cluster this control plane's database runs on, or ``""``.
 
     The chart points ``DATABASE_URL`` at the ``<cluster>-rw`` Service CNPG
@@ -102,7 +105,12 @@ def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
     try:
         status, _ = k8s.get_cnpg_cluster(candidate, namespace=namespace)
     except k8s.KubeapiUnavailableError:
+        if raise_unavailable:
+            raise
         return ""
+    if raise_unavailable and kubeapi_retry._status_transient(status):  # noqa: SLF001
+        # #2767 — a 5xx is the API server not ready, not "no such cluster".
+        raise k8s.KubeapiUnavailableError(f"kubeapi status {status}: CNPG Cluster read")
     return candidate if status == 200 else ""
 
 
@@ -219,6 +227,32 @@ async def plan_upgrade(
     audit_actor_display: str | None = None,
     audit_actor_source: str | None = None,
 ) -> PlanResult:
+    """Plan a rolling upgrade (see :func:`_plan_upgrade`). Every kubeapi read the
+    plan makes shares one deadline kept under the gateway's 60 s (#2767)."""
+    with kubeapi_retry.request_deadline():
+        return await _plan_upgrade(
+            db,
+            target_version=target_version,
+            slot_image=slot_image,
+            cnpg_cluster_name=cnpg_cluster_name,
+            cnpg_namespace=cnpg_namespace,
+            started_by_user_id=started_by_user_id,
+            audit_actor_display=audit_actor_display,
+            audit_actor_source=audit_actor_source,
+        )
+
+
+async def _plan_upgrade(
+    db: AsyncSession,
+    *,
+    target_version: str,
+    slot_image: SlotImageTarget,
+    cnpg_cluster_name: str = "",
+    cnpg_namespace: str | None = None,
+    started_by_user_id: uuid.UUID | None = None,
+    audit_actor_display: str | None = None,
+    audit_actor_source: str | None = None,
+) -> PlanResult:
     """Plan a rolling upgrade — read-only preflight + node enumeration +
     DB-persisted ``planned`` row. Does NOT acquire the lease yet; that
     happens on ``start_upgrade``.
@@ -230,7 +264,16 @@ async def plan_upgrade(
         409 cleanly first).
     """
     if not cnpg_cluster_name:
-        cnpg_cluster_name = detect_cnpg_cluster_name(cnpg_namespace)
+        # #2767 — retried like the node read below: a read refused for a
+        # moment must not silently drop the CNPG maintenance window from the plan.
+        try:
+            cnpg_cluster_name = await kubeapi_retry.read_with_retry(
+                lambda: (0, detect_cnpg_cluster_name(cnpg_namespace, raise_unavailable=True)),
+                what="detect_cnpg_cluster",
+            )
+            cnpg_cluster_name = cnpg_cluster_name[1]
+        except k8s.KubeapiUnavailableError:
+            cnpg_cluster_name = ""
         if cnpg_cluster_name:
             logger.info("upgrade_plan_cnpg_cluster_detected", cluster=cnpg_cluster_name)
 
@@ -241,7 +284,12 @@ async def plan_upgrade(
     )
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
-        raise OrchestratorError(f"preflight failed; refusing to plan: {', '.join(fails)}")
+        msg = f"preflight failed; refusing to plan: {', '.join(fails)}"
+        # #2779 — an unreadable lease is the API, not another run: say so.
+        if "kubeapi_unreachable" in fails:
+            why = next(r.message for r in report.results if r.name == "kubeapi_unreachable")
+            msg += f" ({why})"
+        raise OrchestratorError(msg)
 
     # Refuse if a non-terminal run already exists. The unique partial
     # index would catch this too but the operator-facing error is
@@ -261,7 +309,10 @@ async def plan_upgrade(
 
     # Enumerate appliance nodes for the upgrade order.
     try:
-        status, items = k8s.list_nodes(label_selector="spatium.io/role=appliance")
+        status, items = await kubeapi_retry.read_with_retry(
+            lambda: k8s.list_nodes(label_selector="spatium.io/role=appliance"),
+            what="list_nodes",
+        )
     except k8s.KubeapiUnavailableError as exc:
         raise OrchestratorError(f"kubeapi unreachable: {exc}") from exc
     if status != 200:

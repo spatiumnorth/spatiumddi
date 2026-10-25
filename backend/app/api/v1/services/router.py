@@ -19,7 +19,7 @@ rest are counted in ``withheld``. Each mutation writes an
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -435,6 +435,17 @@ async def list_services(
 @router.post("", response_model=ServiceRead, status_code=status.HTTP_201_CREATED)
 async def create_service(body: ServiceCreate, db: DB, user: CurrentUser) -> ServiceRead:
     await _check_customer(db, body.customer_id)
+    if await db.scalar(
+        select(NetworkService.id).where(
+            NetworkService.customer_id == body.customer_id,
+            NetworkService.name == body.name,
+            NetworkService.deleted_at.is_(None),
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Service named {body.name!r} already exists for this customer",
+        )
 
     row = NetworkService(
         name=body.name,
@@ -523,6 +534,17 @@ async def update_service(
     return _to_read(row, resources)
 
 
+async def _trash(db: Any, row: Any, user: Any) -> None:
+    """Soft-delete into the Trash (own batch), so it can be restored or purged (#2738)."""
+    from app.services.soft_delete import (
+        apply_soft_delete,
+        collect_soft_delete_batch,
+    )  # noqa: PLC0415
+
+    batch = await collect_soft_delete_batch(db, row)
+    await apply_soft_delete(db, batch, user.id if user is not None else None)
+
+
 @router.delete("/{service_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_service(service_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     """Soft-delete the service. Join rows stay attached so a restore
@@ -533,9 +555,7 @@ async def delete_service(service_id: uuid.UUID, db: DB, user: CurrentUser) -> No
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    row.deleted_at = datetime.now(UTC)
-    if user is not None:
-        row.deleted_by_user_id = user.id
+    await _trash(db, row, user)
 
     write_audit(
         db,
@@ -570,11 +590,8 @@ async def bulk_delete_services(
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
 
-    now = datetime.now(UTC)
     for r in rows:
-        r.deleted_at = now
-        if user is not None:
-            r.deleted_by_user_id = user.id
+        await _trash(db, r, user)
         write_audit(
             db,
             user=user,
