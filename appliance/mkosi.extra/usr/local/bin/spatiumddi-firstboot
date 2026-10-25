@@ -932,7 +932,7 @@ _render_control_helmchart() {
     }
     local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_LEFT_MIB WORKER_CONCURRENCY
     local POSTGRES_MEM_MIB POSTGRES_SHARED_BUFFERS_MB POSTGRES_MEM_REQUEST_MIB
-    local PG_CONNECTIONS PG_BACKEND_MIB PG_NEED_MIB
+    local PG_CONNECTIONS PG_BACKEND_MIB PG_NEED_MIB PG_MAX_CONNECTIONS
     local CPU_COUNT API_CPU_CORES POSTGRES_CPU_CORES API_LIMITS_YAML POSTGRES_LIMITS_YAML
     local API_SIZING_YAML WORKER_SIZING_YAML POSTGRES_SIZING_YAML POSTGRES_PARAMETERS_YAML
     MEM_TOTAL_MIB=$(_mem_total_mib)
@@ -974,16 +974,21 @@ _render_control_helmchart() {
         if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
         # #2156 — the Postgres limit holds the connections the cluster can open
         # (k8s_api.postgres_connection_budget). A fresh install is one node:
-        # the api pod's whole pool (10 + 20), the worker's processes plus one,
-        # no WAL sender, and the reserve of 10. One backend costs 14 MiB plus
-        # the page tables mapping shared_buffers (shared_buffers / 512,
-        # rounded up); the limit is never below shared_buffers + 256 MiB + the
-        # connections x that. Only ever raises the share above (a node under
-        # ~6 GiB), so shared_buffers, the request and the worker stay as sized.
-        PG_CONNECTIONS=$(( 1 * (10 + 20 + WORKER_CONCURRENCY + 1) + 0 + 10 ))
+        # the api pod's whole pool (10 + 20) and its #2782 after-commit hooks
+        # (2), each worker process with its hooks (1 + 2) plus one, no WAL
+        # sender, the reserve of 10 and celery-beat's hooks (2). One backend
+        # costs 14 MiB plus the page tables mapping shared_buffers
+        # (shared_buffers / 512, rounded up); the limit is never below
+        # shared_buffers + 256 MiB + the connections x that. Only ever raises
+        # the share above (a node under ~6 GiB), so shared_buffers, the
+        # request and the worker stay as sized.
+        PG_CONNECTIONS=$(( 1 * (10 + 20 + 2 + WORKER_CONCURRENCY * (1 + 2) + 1) + 0 + 10 + 2 ))
         PG_BACKEND_MIB=$(( 14 + (POSTGRES_SHARED_BUFFERS_MB + 511) / 512 ))
         PG_NEED_MIB=$(( POSTGRES_SHARED_BUFFERS_MB + 256 + PG_CONNECTIONS * PG_BACKEND_MIB ))
         if [ "$POSTGRES_MEM_MIB" -lt "$PG_NEED_MIB" ]; then POSTGRES_MEM_MIB=$PG_NEED_MIB; fi
+        # max_connections: the chart's 200 until the budget passes it.
+        PG_MAX_CONNECTIONS=200
+        if [ "$PG_CONNECTIONS" -gt "$PG_MAX_CONNECTIONS" ]; then PG_MAX_CONNECTIONS=$PG_CONNECTIONS; fi
         # >&2, NOT bare echo. THIS FUNCTION'S STDOUT IS THE MANIFEST: the
         # caller runs it inside `{ ... } > "$tmp"`, so anything printed here
         # is captured into spatium-control.yaml. The first line happens to
@@ -994,7 +999,7 @@ _render_control_helmchart() {
         # up, with a parse error in the k3s log as the only symptom.
         # firstboot does `exec >>"$LOG" 2>&1` and the caller redirects only
         # stdout, so stderr is still the log.
-        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB (budget ${BUDGET_MIB} MiB after the platform reserve): api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY} postgres=${POSTGRES_MEM_MIB}Mi shared_buffers=${POSTGRES_SHARED_BUFFERS_MB}MB request=${POSTGRES_MEM_REQUEST_MIB}Mi connections=${PG_CONNECTIONS}" >&2
+        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB (budget ${BUDGET_MIB} MiB after the platform reserve): api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY} postgres=${POSTGRES_MEM_MIB}Mi shared_buffers=${POSTGRES_SHARED_BUFFERS_MB}MB request=${POSTGRES_MEM_REQUEST_MIB}Mi connections=${PG_CONNECTIONS} max_connections=${PG_MAX_CONNECTIONS}" >&2
     else
         echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
     fi
@@ -1043,8 +1048,8 @@ _render_control_helmchart() {
             "$WORKER_CONCURRENCY" "$WORKER_MEM_MIB")
         POSTGRES_SIZING_YAML=$(printf '      resources:\n        requests:\n          memory: "%sMi"\n        limits:\n%s' \
             "$POSTGRES_MEM_REQUEST_MIB" "$POSTGRES_LIMITS_YAML")
-        POSTGRES_PARAMETERS_YAML=$(printf '        parameters:\n          shared_buffers: "%sMB"' \
-            "$POSTGRES_SHARED_BUFFERS_MB")
+        POSTGRES_PARAMETERS_YAML=$(printf '        parameters:\n          shared_buffers: "%sMB"\n          max_connections: "%s"' \
+            "$POSTGRES_SHARED_BUFFERS_MB" "$PG_MAX_CONNECTIONS")
     elif [ -n "$POSTGRES_LIMITS_YAML" ]; then
         POSTGRES_SIZING_YAML=$(printf '      resources:\n        limits:\n%s' "$POSTGRES_LIMITS_YAML")
     fi
@@ -1678,7 +1683,8 @@ _strip_control_priority_class() {
 #     heartbeat back up, two CloudNativePG rolling restarts per reboot. An
 #     upgrade that changes the formula is one Postgres rolling restart either
 #     way, written by the supervisor a heartbeat after the release. The same
-#     goes for ``api.databasePool``, which was never in the list.
+#     goes for ``max_connections`` and ``api.databasePool``, which were never
+#     in the list.
 # The numbers come from the rendered manifest, not from a second copy of the
 # formula, so this cannot drift from _render_control_helmchart. The keys are
 # the ones the supervisor rewrites on every heartbeat anyway, so an operator

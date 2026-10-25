@@ -783,8 +783,10 @@ postgresql:
     # the prototype at ``k8s/ha/postgres-cluster.yaml``.
     parameters:
       # #2156 — every api pod's pool (api.databasePool) and every worker
-      # process connects here; replicas x pool has to stay under this. The
-      # appliance sizes the pools so it does up to ten control-plane nodes.
+      # process connects here, plus two per api / worker / beat process for
+      # the after-commit hooks (#2782); replicas x pool has to stay under
+      # this. The appliance's supervisor raises it past 200 when its
+      # connection budget does (from five control-plane nodes).
       max_connections: "200"
       shared_buffers: "256MB"
       work_mem: "16MB"

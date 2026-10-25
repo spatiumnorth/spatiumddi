@@ -1738,15 +1738,22 @@ _API_CPU_MAX = 4
 #   ~14 MiB of private memory (with THP) plus its page tables for mapping
 #   shared_buffers in 4 KiB pages (8 bytes per page, so shared_buffers / 512).
 #
-# ``max_connections`` is left to the chart (200, an operator may raise it):
-# with the smaller pools the budget stays under it up to ten nodes, so a pool
-# is never refused a connection it was sized for
-# (``tests/test_postgres_connection_budget_2156.py`` holds that).
+# #2782 — the after-commit event publisher and audit forwarder share one
+# small engine per PROCESS (``pool_size=2, max_overflow=0``), outside the
+# api's own pool: two more connections per api pod, per worker process and
+# for the one celery-beat.
+#
+# ``max_connections`` is the chart's 200 until the budget passes it (from
+# five nodes with four worker processes, eight with two), then the budget, so a pool is never refused a connection it was sized for
+# (``tests/test_postgres_connection_budget_2156.py`` holds that). It moves
+# with the memory limit, so it costs no restart of its own.
 _API_DB_POOL_SIZE = 10
 _API_DB_CONN_PER_POD_MAX = 30
 _API_DB_CONN_PER_POD_MIN = 12
 _API_DB_CONN_CLUSTER = 120
 _WORKER_DB_CONN_SLACK = 1
+# #2782 — the after-commit hooks' engine, per api / worker / beat process.
+_HOOK_DB_CONN_PER_PROCESS = 2
 _PG_CONN_RESERVE = 10
 _PG_BACKEND_BASE_MIB = 14
 _PG_FIXED_MIB = 256
@@ -1772,13 +1779,22 @@ def api_db_pool(cp_size: int) -> dict[str, int]:
 def postgres_connection_budget(cp_size: int, worker_concurrency: int) -> int:
     """PURE (#2156): the backends the cluster can hold open on the primary —
     every api pod's whole pool, every worker's processes plus one, the
-    WAL senders (one per replica) and a fixed reserve (CloudNativePG's own
-    and superuser connections, celery-beat, a migrate Job, an operator's
-    psql)."""
+    #2782 after-commit hooks' two per api pod, per worker process and for
+    celery-beat, the WAL senders (one per replica) and a fixed reserve
+    (CloudNativePG's own and superuser connections, celery-beat's own, a
+    migrate Job, an operator's psql)."""
     cp = max(cp_size, 1)
     pool = api_db_pool(cp)
-    per_node = pool["size"] + pool["maxOverflow"] + worker_concurrency + _WORKER_DB_CONN_SLACK
-    return cp * per_node + (cp - 1) + _PG_CONN_RESERVE
+    hooks = _HOOK_DB_CONN_PER_PROCESS
+    per_node = (
+        pool["size"]
+        + pool["maxOverflow"]
+        + hooks  # the api pod's hooks (#2782)
+        + worker_concurrency * (1 + hooks)  # each worker process, and its hooks
+        + _WORKER_DB_CONN_SLACK
+    )
+    beat_hooks = hooks  # the one celery-beat's hooks (#2782)
+    return cp * per_node + (cp - 1) + _PG_CONN_RESERVE + beat_hooks
 
 
 def postgres_backend_mib(shared_buffers_mb: int) -> int:
@@ -1843,6 +1859,8 @@ def control_plane_sizing(mem_total_mib: int, cp_size: int = 1) -> dict[str, int]
         "shared_buffers": shared_buffers_mb,
         "concurrency": concurrency,
         "postgres_connections": connections,
+        # The chart's 200 until the budget passes it (#2156, #2782).
+        "max_connections": max(_PG_CHART_MAX_CONNECTIONS, connections),
         # CloudNativePG refuses a Cluster whose memory request is below
         # shared_buffers (Postgres reads MB as MiB, so the two compare one
         # to one); the chart's own 256Mi is the floor.
@@ -1899,7 +1917,12 @@ def control_plane_resources(
                     "requests": {"memory": f"{sized['postgres_request']}Mi"},
                     "limits": {"memory": f"{sized['postgres']}Mi"},
                 },
-                "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
+                "cnpg": {
+                    "parameters": {
+                        "shared_buffers": f"{sized['shared_buffers']}MB",
+                        "max_connections": str(sized["max_connections"]),
+                    }
+                },
             },
         }
     if cpu_count and cpu_count > 0:

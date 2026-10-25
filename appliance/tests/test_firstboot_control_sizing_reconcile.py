@@ -286,13 +286,13 @@ def test_a_seed_reboot_leaves_the_supervisors_cluster_sized_postgres_limit_2156(
     """#2156 — the supervisor sizes the Postgres limit for the cluster's node
     count, and this script renders one node. firstboot re-renders the HelmChart
     on every boot, so reconciling the limit would bring a nine-node cluster's
-    3467Mi down to the one-node 2479Mi on each seed reboot, and the next
+    4363Mi down to the one-node 2479Mi on each seed reboot, and the next
     heartbeat back up: two CloudNativePG rolling restarts per reboot."""
     chart = yaml.safe_load(CHART_VALUES)
     chart["postgresql"]["resources"]["limits"]["memory"] = "2479Mi"
     cfg = yaml.safe_load(CHART_VALUES)
     cfg.pop("image")
-    cfg["postgresql"]["resources"]["limits"]["memory"] = "3467Mi"
+    cfg["postgresql"]["resources"]["limits"]["memory"] = "4363Mi"
     _, patched, _ = _run(tmp_path / "a", cfg, manifest=_manifest(yaml.safe_dump(chart)))
     assert patched is None
 
@@ -303,4 +303,4 @@ def test_a_seed_reboot_leaves_the_supervisors_cluster_sized_postgres_limit_2156(
     assert proc.returncode == 0, proc.stderr
     assert patched is not None
     assert new["api"]["resources"]["limits"]["memory"] == "3072Mi"
-    assert new["postgresql"]["resources"]["limits"]["memory"] == "3467Mi"
+    assert new["postgresql"]["resources"]["limits"]["memory"] == "4363Mi"

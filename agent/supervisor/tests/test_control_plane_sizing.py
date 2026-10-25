@@ -141,11 +141,11 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
     thr = re.search(r'\[ "\$MEM_TOTAL_MIB" -le (\d+) \]; then WORKER_CONCURRENCY=(\d+); else WORKER_CONCURRENCY=(\d+)', src)
     assert thr, "could not find firstboot's concurrency threshold"
     # #2156 — the connection budget and the limit it raises, taken whole: the
-    # lines from PG_CONNECTIONS to the raise ARE the copy.
+    # lines from PG_CONNECTIONS to the max_connections clamp ARE the copy.
     conns = re.search(
         r"^[ \t]*PG_CONNECTIONS=\$\(\(.*?\)\)\n.*?"
-        r'^[ \t]*if \[ "\$POSTGRES_MEM_MIB" -lt "\$PG_NEED_MIB" \]; '
-        r"then POSTGRES_MEM_MIB=\$PG_NEED_MIB; fi$",
+        r'^[ \t]*if \[ "\$PG_CONNECTIONS" -gt "\$PG_MAX_CONNECTIONS" \]; '
+        r"then PG_MAX_CONNECTIONS=\$PG_CONNECTIONS; fi$",
         src,
         re.DOTALL | re.MULTILINE,
     )
@@ -168,7 +168,7 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
         if [ "$POSTGRES_MEM_REQUEST_MIB" -lt {req.group(1)} ]; then POSTGRES_MEM_REQUEST_MIB={req.group(2)}; fi
         if [ "$MEM_TOTAL_MIB" -le {thr.group(1)} ]; then WORKER_CONCURRENCY={thr.group(2)}; else WORKER_CONCURRENCY={thr.group(3)}; fi
 {textwrap.indent(textwrap.dedent(conns.group(0)), "        ")}
-        echo "$API_MEM_MIB $WORKER_MEM_MIB $POSTGRES_MEM_MIB $POSTGRES_SHARED_BUFFERS_MB $WORKER_CONCURRENCY $POSTGRES_MEM_REQUEST_MIB $PG_CONNECTIONS"
+        echo "$API_MEM_MIB $WORKER_MEM_MIB $POSTGRES_MEM_MIB $POSTGRES_SHARED_BUFFERS_MB $WORKER_CONCURRENCY $POSTGRES_MEM_REQUEST_MIB $PG_CONNECTIONS $PG_MAX_CONNECTIONS"
     """
     out = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=True
@@ -181,6 +181,7 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
         "concurrency": int(out[4]),
         "postgres_request": int(out[5]),
         "postgres_connections": int(out[6]),
+        "max_connections": int(out[7]),
     }
 
 
@@ -235,6 +236,9 @@ def test_bash_and_python_agree(mem_mib: int) -> None:
     # #2156 — at one node, the only size firstboot renders.
     assert k8s_api.control_plane_sizing(mem_mib, 1)["postgres_connections"] == (
         sh["postgres_connections"]
+    )
+    assert py["postgresql"]["cnpg"]["parameters"]["max_connections"] == str(
+        sh["max_connections"]
     )
 
 
