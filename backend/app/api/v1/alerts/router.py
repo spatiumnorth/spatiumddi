@@ -32,6 +32,52 @@ from app.services.alert_rule_catalogue import RuleTypeSpec, build_catalogue
 router = APIRouter()
 
 
+# #2746 — the shared parameter columns (``threshold_percent``,
+# ``classification``, ...) mean different things per rule type, so each
+# value is checked against the parameter the rule type's OWN catalogue
+# entry declares for it (range for an integer, options for a select).
+# A column the type does not declare is unused by its evaluator and is
+# only held to a sanity bound.
+_SANITY_MAX = 1_000_000
+
+
+def check_rule_params(rule_type: str, values: dict[str, Any]) -> None:
+    """Raise ``ValueError`` naming the field when a value is outside what
+    ``rule_type``'s catalogue entry offers for it."""
+    spec = next((s for s in build_catalogue() if s.rule_type == rule_type), None)
+    declared = {p.name: p for p in spec.params} if spec else {}
+    for name, value in values.items():
+        if value is None or name not in _CATALOGUE_PARAM_FIELDS:
+            continue
+        param = declared.get(name)
+        if param is None:
+            if isinstance(value, int) and not (0 <= value <= _SANITY_MAX):
+                raise ValueError(f"{name} must be 0..{_SANITY_MAX}")
+            continue
+        if param.kind == "select":
+            allowed = [o.value for o in param.options]
+            if value not in allowed:
+                raise ValueError(
+                    f"{param.label} ({name}) must be one of: "
+                    f"{', '.join(repr(v) for v in allowed)}"
+                )
+            continue
+        lo = param.min
+        hi = param.max if param.max is not None else _SANITY_MAX
+        if (lo is not None and value < lo) or value > hi:
+            rng = f"at least {lo}" if param.max is None else f"between {lo} and {hi}"
+            raise ValueError(f"{param.label} ({name}) must be {rng}")
+
+
+_CATALOGUE_PARAM_FIELDS = (
+    "threshold_percent",
+    "threshold_days",
+    "min_free_addresses",
+    "classification",
+    "change_scope",
+)
+
+
 # ── Schemas ────────────────────────────────────────────────────────────────
 
 
@@ -82,15 +128,6 @@ class AlertRuleCreate(BaseModel):
             raise ValueError(f"server_type must be one of: {', '.join(sorted(_SERVER_TYPES))}")
         return v
 
-    @field_validator("threshold_percent")
-    @classmethod
-    def _v_thr(cls, v: int | None) -> int | None:
-        if v is None:
-            return None
-        if not (0 <= v <= 100):
-            raise ValueError("threshold_percent must be 0..100")
-        return v
-
     @field_validator("threshold_days")
     @classmethod
     def _v_thr_days(cls, v: int | None) -> int | None:
@@ -113,18 +150,6 @@ class AlertRuleCreate(BaseModel):
             raise ValueError("min_free_addresses must be ≥ 1")
         return v
 
-    @field_validator("classification")
-    @classmethod
-    def _v_classification(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        if v not in alert_service.COMPLIANCE_CLASSIFICATIONS:
-            raise ValueError(
-                "classification must be one of: "
-                f"{', '.join(sorted(alert_service.COMPLIANCE_CLASSIFICATIONS))}"
-            )
-        return v
-
     @field_validator("change_scope")
     @classmethod
     def _v_change_scope(cls, v: str | None) -> str | None:
@@ -143,6 +168,10 @@ class AlertRuleCreate(BaseModel):
         # can never fire; the evaluator just warned every tick.
         if self.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not self.classification:
             raise ValueError("classification is required for compliance_change rules")
+        check_rule_params(
+            self.rule_type,
+            {f: getattr(self, f) for f in _CATALOGUE_PARAM_FIELDS},
+        )
         return self
 
 
@@ -200,15 +229,6 @@ class AlertRuleUpdate(BaseModel):
             raise ValueError(f"server_type must be one of: {', '.join(sorted(_SERVER_TYPES))}")
         return v
 
-    @field_validator("threshold_percent")
-    @classmethod
-    def _v_thr(cls, v: int | None) -> int | None:
-        if v is None:
-            return None
-        if not (0 <= v <= 100):
-            raise ValueError("threshold_percent must be 0..100")
-        return v
-
     @field_validator("threshold_days")
     @classmethod
     def _v_thr_days(cls, v: int | None) -> int | None:
@@ -225,18 +245,6 @@ class AlertRuleUpdate(BaseModel):
             return None
         if v < 1:
             raise ValueError("min_free_addresses must be ≥ 1")
-        return v
-
-    @field_validator("classification")
-    @classmethod
-    def _v_classification(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        if v not in alert_service.COMPLIANCE_CLASSIFICATIONS:
-            raise ValueError(
-                "classification must be one of: "
-                f"{', '.join(sorted(alert_service.COMPLIANCE_CLASSIFICATIONS))}"
-            )
         return v
 
     @field_validator("change_scope")
@@ -394,6 +402,10 @@ async def update_rule(
         clearable=_RULE_CLEARABLE_FIELDS,
         non_nullable=_RULE_NON_NULLABLE_FIELDS,
     )
+    try:
+        check_rule_params(rule.rule_type, changes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     changed: dict[str, Any] = {}
     for field, value in changes.items():
         old = getattr(rule, field)
