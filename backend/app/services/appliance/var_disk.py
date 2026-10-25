@@ -9,9 +9,15 @@ free (:data:`upgrade_image_space.EVICTION_HEADROOM_PCT`). On a single-node
 appliance the evicted pods are the api, worker and supervisor, and nothing
 said so until they died.
 
-One reader and one evaluator, shared by the ``appliance_disk_low`` alert
-rule, the Fleet row, and the slot-upgrade scheduling pre-flight, so no two
-surfaces can disagree about whether a node is short of disk.
+One reader and one evaluator, shared by the Fleet row, the Cluster node
+card, the copilot's fleet tools and the slot-upgrade scheduling pre-flight.
+The alert is NOT a second implementation: it is the default-on
+``appliance_disk_usage`` rule (#2240), and this evaluator's warning and
+critical lines are the same two numbers it uses (80 % / 87 % used, counted
+the way the supervisor reports ``used``), pinned equal by a test, so the
+Fleet warning and the alert cannot disagree about a node. What this adds is
+the kubelet's ``DiskPressure`` condition, which the Fleet and Cluster views
+have (the alert evaluates in the worker, which does not).
 
 The reading is the supervisor's ``host_disk_partitions`` entry for ``/var``
 (folded into ``cluster_health`` on every heartbeat, #402). ``available_bytes``
@@ -37,9 +43,12 @@ EVICTION_HARD_PCT = 5
 EVICTION_MINIMUM_RECLAIM_PCT = 10
 EVICTION_HEADROOM_PCT = EVICTION_HARD_PCT + EVICTION_MINIMUM_RECLAIM_PCT
 
-# Warn below this much of /var free. Above the 15 % eviction headroom on
-# purpose: the point is to say so while there is still room to act.
-LOW_FREE_PCT = 20
+# The ``appliance_disk_usage`` alert's lines (``alerts._APPLIANCE_DISK_USAGE
+# _DEFAULT_PCT`` / ``_APPLIANCE_DISK_CRITICAL_PCT``), in the same terms: percent
+# of /var USED, counted as the supervisor reports it (``blocks - bfree``, so
+# ext4's 5 % root reserve counts as free). A test asserts they are equal.
+WARN_USED_PCT = 80
+CRITICAL_USED_PCT = 87
 
 # A reading older than this says nothing about now (the supervisor heartbeats
 # every ~30 s). Matches the rolling pre-flight's freshness window (#1234).
@@ -55,10 +64,20 @@ class VarDiskReading:
     # True when ``free_bytes`` is the kubelet's own measure (f_bavail);
     # False when it fell back to ``total - used`` from an older supervisor.
     exact: bool
+    # ``used_bytes`` as reported (``blocks - bfree``), the alert's own
+    # measure; None when the supervisor sent no such figure.
+    used_bytes: int | None = None
 
     @property
     def free_pct(self) -> float:
         return 100.0 * self.free_bytes / self.total_bytes
+
+    @property
+    def alert_used_pct(self) -> float:
+        """Percent used in the ``appliance_disk_usage`` alert's terms."""
+        if self.used_bytes is not None:
+            return 100.0 * self.used_bytes / self.total_bytes
+        return 100.0 - self.free_pct
 
 
 @dataclass(frozen=True)
@@ -92,12 +111,17 @@ def var_disk_reading(cluster_health: Any) -> VarDiskReading | None:
         if total is None or total <= 0:
             return None
         avail = _int(p.get("available_bytes"))
-        if avail is not None:
-            return VarDiskReading(total, max(min(avail, total), 0), exact=True)
         used = _int(p.get("used_bytes"))
+        if avail is not None:
+            return VarDiskReading(
+                total,
+                max(min(avail, total), 0),
+                exact=True,
+                used_bytes=min(used, total) if used is not None and used >= 0 else None,
+            )
         if used is None:
             return None
-        return VarDiskReading(total, max(total - used, 0), exact=False)
+        return VarDiskReading(total, max(total - used, 0), exact=False, used_bytes=min(used, total))
     return None
 
 
@@ -114,18 +138,19 @@ def evaluate_var_disk(
     reading: VarDiskReading | None,
     *,
     disk_pressure: bool | None = None,
-    low_free_pct: float = LOW_FREE_PCT,
+    warn_used_pct: float = WARN_USED_PCT,
 ) -> VarDiskFinding | None:
     """``None`` when ``/var`` is fine (or unknown), else a finding.
 
     * The kubelet reporting ``DiskPressure`` is **critical**: it is
       evicting pods now, and keeps doing so until 15 % is free.
-    * Under :data:`EVICTION_HEADROOM_PCT` free is **critical**: one large
-      write (an upgrade image, an image pull) from eviction, and once
-      evicting the node needs 15 % back before it stops.
-    * Under ``low_free_pct`` is a **warning**.
+    * At :data:`CRITICAL_USED_PCT` used is **critical**, the
+      ``appliance_disk_usage`` alert's own line: a few points before the
+      kubelet starts evicting, and once it does it holds until 15 % is free.
+    * At ``warn_used_pct`` used is a **warning**.
     """
     pct = reading.free_pct if reading is not None else None
+    used_pct = reading.alert_used_pct if reading is not None else None
     numbers = ""
     if reading is not None:
         numbers = (
@@ -143,27 +168,29 @@ def evaluate_var_disk(
                 "Delete unused upgrade images in Fleet to free space."
             ),
         )
-    if reading is None or pct is None:
+    if reading is None or pct is None or used_pct is None:
         return None
-    if pct < EVICTION_HEADROOM_PCT:
+    if used_pct >= CRITICAL_USED_PCT:
         return VarDiskFinding(
             severity="critical",
             free_pct=pct,
             detail=(
-                f"{numbers}. Under {EVICTION_HEADROOM_PCT}%: one large write (an upgrade "
-                "image, an image pull) can push the node into kubelet eviction, which "
-                f"then holds until {EVICTION_HEADROOM_PCT}% is free again. "
+                f"{numbers}; {used_pct:.0f}% used, at or past the {CRITICAL_USED_PCT}% "
+                "critical line: one large write (an upgrade image, an image pull) can "
+                "push the node into kubelet eviction, which then holds until "
+                f"{EVICTION_HEADROOM_PCT}% is free again. "
                 "Delete unused upgrade images in Fleet to free space."
             ),
         )
-    if pct < low_free_pct:
+    if used_pct >= warn_used_pct:
         return VarDiskFinding(
             severity="warning",
             free_pct=pct,
             detail=(
-                f"{numbers}, under the {low_free_pct:.0f}% warning level. The kubelet "
-                f"starts evicting at 5% and does not stop until {EVICTION_HEADROOM_PCT}% "
-                "is free; an upgrade image needs room on top of that."
+                f"{numbers}; {used_pct:.0f}% used, at or past the {warn_used_pct:.0f}% "
+                f"warning level. The kubelet starts evicting at 5% free and does not "
+                f"stop until {EVICTION_HEADROOM_PCT}% is free; an upgrade image needs "
+                "room on top of that."
             ),
         )
     return None

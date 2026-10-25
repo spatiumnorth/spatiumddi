@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
  * #2400 — a node whose /var is low, or whose kubelet reports DiskPressure.
  *
  * Renders the server's verdict only (the evaluator behind the
- * `appliance_disk_low` alert), so this panel and the alert cannot disagree.
+ * `appliance_disk_usage` alert), so this panel and the alert cannot disagree.
  * Renders nothing when there is no finding.
  */
 export function VarDiskWarning({

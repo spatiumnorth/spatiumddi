@@ -50,6 +50,7 @@ What we **don't** check here that Phases C/D will own:
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -72,7 +73,7 @@ from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer
 from app.services.appliance import var_disk
 from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
-from app.services.upgrades import mutex
+from app.services.upgrades import kubeapi_retry, mutex
 
 logger = structlog.get_logger(__name__)
 
@@ -116,7 +117,10 @@ _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 
 
 def check_inflight_conflict(
-    *, namespace: str | None = None, own_holder: str | None = None
+    *,
+    namespace: str | None = None,
+    own_holder: str | None = None,
+    retry_budget_s: float = 0.0,
 ) -> PreflightResult:
     """Refuses if another upgrade is already in flight cluster-wide.
 
@@ -130,7 +134,7 @@ def check_inflight_conflict(
     node, so without it each run failed its own first node on the lease
     it had just taken (#1445).
     """
-    state = mutex.get_state(namespace=namespace)
+    state = mutex.get_state(namespace=namespace, retry_budget_s=retry_budget_s)
     if state.held and not state.expired and own_holder and state.holder == own_holder:
         return PreflightResult(
             name="inflight_conflict",
@@ -138,7 +142,7 @@ def check_inflight_conflict(
             message="the upgrade lease is held by this run",
             detail={"holder": state.holder, "transitions": state.transitions},
         )
-    if own_holder and state.holder == "<unreachable>":
+    if own_holder and state.holder == mutex.UNREACHABLE_HOLDER:
         # #1713 — the kubeapi did not answer the read. The run asking holds
         # the Lease by its own renewals, which stop the drive if it is lost;
         # failing its node on a read nobody answered would fail the run on
@@ -148,6 +152,21 @@ def check_inflight_conflict(
             level="warn",
             message="the upgrade lease could not be read; this run's renewals hold it",
             detail={"holder": state.holder},
+        )
+    if state.holder == mutex.UNREACHABLE_HOLDER:
+        # #2779 — the kubeapi did not answer the lease read (after the read's
+        # own retries). That is not another run holding the lease: say the API
+        # could not be reached, so the operator checks it instead of hunting a
+        # run that does not exist.
+        return PreflightResult(
+            name="kubeapi_unreachable",
+            level="fail",
+            message=(
+                "the Kubernetes API did not answer the read of the upgrade lease "
+                f"({mutex.LEASE_NAME}), so whether another upgrade is in flight is "
+                "unknown; check the control-plane nodes and retry"
+            ),
+            detail={"read": "get_lease", "lease": mutex.LEASE_NAME, "holder": state.holder},
         )
     if state.held and not state.expired:
         return PreflightResult(
@@ -767,7 +786,7 @@ def check_version_path(
     )
 
 
-def check_quorum() -> PreflightResult:
+def check_quorum(retry_budget_s: float = 0.0) -> PreflightResult:
     """Cluster size is odd + ≥ 3 + every node Ready.
 
     Reads the kubeapi via the existing SA mount. On docker-compose
@@ -799,7 +818,12 @@ def check_quorum() -> PreflightResult:
     label = "spatium.io/role=appliance"
     path = f"/api/v1/nodes?labelSelector={quote(label)}"
     try:
-        status, body = k8s._request("GET", path)  # noqa: SLF001
+        # #2767 — a refused connection while one API server restarts is retried.
+        status, body = kubeapi_retry.read_with_retry_blocking(
+            lambda: k8s._request("GET", path),  # noqa: SLF001
+            what="quorum_node_list",
+            budget_s=retry_budget_s,
+        )
     except k8s.KubeapiUnavailableError as exc:
         return PreflightResult(
             name="quorum",
@@ -965,12 +989,37 @@ async def run_all(
     of checks starts to dominate latency we can parallelise via
     ``asyncio.gather``.
     """
+    with kubeapi_retry.request_deadline():
+        return await _run_all(
+            target_version=target_version,
+            namespace=namespace,
+            own_holder=own_holder,
+            slot_image_id=slot_image_id,
+            disk_nodes=disk_nodes,
+        )
+
+
+async def _run_all(
+    *,
+    target_version: str,
+    namespace: str | None,
+    own_holder: str | None,
+    slot_image_id: uuid.UUID | None,
+    disk_nodes: list[str] | None,
+) -> PreflightReport:
     image_bytes = await _slot_image_size(slot_image_id)
     node_image_bytes = (
         image_bytes * _NODE_NEED_IMAGE_MULTIPLE if image_bytes else _DEFAULT_SLOT_IMAGE_BYTES
     )
     results: list[PreflightResult] = [
-        check_inflight_conflict(namespace=namespace, own_holder=own_holder),
+        # #2767 — both kubeapi reads here ride out a refused connection while
+        # one API server restarts; off the event loop, since they sleep.
+        await asyncio.to_thread(
+            check_inflight_conflict,
+            namespace=namespace,
+            own_holder=own_holder,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        ),
         await check_replication_lag(),
         await check_node_disk_headroom(
             nodes=disk_nodes,
@@ -982,7 +1031,7 @@ async def run_all(
             slot_image_size_bytes=image_bytes or _DEFAULT_SLOT_IMAGE_BYTES,
         ),
         check_version_path(target_version=target_version),
-        check_quorum(),
+        await asyncio.to_thread(check_quorum, retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S),
         await check_kea_ha_version_skew(),
         await check_powerdns_lmdb_migration(),
         await check_etcd_snapshot_freshness(),

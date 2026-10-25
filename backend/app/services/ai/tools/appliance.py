@@ -127,7 +127,7 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         # bare value.
         **mtu_fields(row.cluster_health),
         # #2400 — /var headroom against kubelet eviction, judged by the
-        # evaluator behind the appliance_disk_low alert and the Fleet row.
+        # evaluator behind the appliance_disk_usage alert and the Fleet row.
         **var_disk_fields(row.cluster_health, row.last_seen_at),
         "last_seen_ip": row.last_seen_ip,
         "cert_serial": row.cert_serial,

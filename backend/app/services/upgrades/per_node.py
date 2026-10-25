@@ -77,7 +77,6 @@ resume; Phase D will add the read-from-row-and-continue logic.
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -103,6 +102,9 @@ from app.services.appliance.slot_image_target import (
     stamp_desired_slot_image,
 )
 from app.services.upgrades import chart_bump, preflight, safety
+
+# The classifier moved to kubeapi_retry (#2767) so the plan path shares it.
+from app.services.upgrades.kubeapi_retry import _kubeapi_transient
 
 logger = structlog.get_logger(__name__)
 
@@ -193,29 +195,6 @@ _DB_MAX_OUTAGES_PER_STEP = 3
 KUBEAPI_RETRY_STEPS: frozenset[StepName] = frozenset({"cnpg_maintenance_on", "cordon", "uncordon"})
 KUBEAPI_RETRY_BUDGET_S = 300.0
 _KUBEAPI_RETRY_INTERVAL_S = 15.0
-_KUBEAPI_TRANSIENT_STATUSES = frozenset({408, 409, 429})
-_KUBEAPI_STATUS_RE = re.compile(r"\bkubeapi status (\d{3})\b")
-
-
-def _kubeapi_transient(error: str | None) -> bool:
-    """Is a per-node write's error a kubeapi answer a retry might clear? Like
-    ``shared_tags._transient``, but gated to a kubeapi helper's own error: the
-    helpers (``k8s.py``) return one that starts ``kubeapi `` for every answer
-    but a missing ServiceAccount. A missing ServiceAccount is a permanent
-    misconfiguration; a status under 500 (403, 404, 422) is the server's
-    considered no; a kubeapi error with no HTTP status is a socket error that
-    never reached the server, so it is transient; anything that is not a kubeapi
-    error at all (a crash message, a synthetic test error) is left to fail as
-    before."""
-    if not error or not error.startswith("kubeapi "):
-        return False
-    if "ServiceAccount not mounted" in error:
-        return False
-    match = _KUBEAPI_STATUS_RE.search(error)
-    if match is None:
-        return True
-    status = int(match.group(1))
-    return status >= 500 or status in _KUBEAPI_TRANSIENT_STATUSES
 
 
 @dataclass

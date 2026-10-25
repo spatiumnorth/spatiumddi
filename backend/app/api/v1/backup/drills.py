@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from sqlalchemy import desc, select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.demo_mode import forbid_in_demo_mode
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.backup.drill import (
@@ -30,7 +31,10 @@ from app.services.backup.drill import (
     run_drill_for_target,
 )
 
-router = APIRouter()
+# nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
+# so every body here is authorised from its headers before it is read
+# (app.api.pre_body_auth).
+router = APIRouter(route_class=PreBodyAuthRoute)
 
 
 class RestoreDrillResponse(BaseModel):

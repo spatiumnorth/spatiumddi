@@ -64,7 +64,7 @@ class HostPartition(BaseModel):
 
 class VarDiskFinding(BaseModel):
     """#2400 — /var against kubelet eviction, from ``services/appliance/
-    var_disk`` (the ``appliance_disk_low`` alert's own evaluator)."""
+    var_disk`` (the ``appliance_disk_usage`` alert's own evaluator)."""
 
     severity: str
     free_pct: float | None = None
@@ -400,7 +400,7 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
     smap: dict[str, dict[str, Any]] = {}
     # #2400 — whose partition reading is fresh enough to JUDGE. The bars still
     # show the last report; the /var finding follows the same freshness rule
-    # as the Fleet row and the appliance_disk_low alert.
+    # as the Fleet row and the appliance_disk_usage alert.
     fresh: set[str] = set()
     for hostname, ch, last_seen_at in rows:
         if not hostname or not isinstance(ch, dict):

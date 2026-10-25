@@ -155,6 +155,15 @@ rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]
     verbs: ["get", "patch"]
+    # #2240, ensure_cnpg_operator_spread: from three nodes the seed's
+    # heartbeat makes the operator's hostname anti-affinity REQUIRED, so its
+    # two replicas (Postgres failover itself) never share a node; firstboot
+    # starts both on the seed while it is alone. resourceNames-pinned to the
+    # operator Deployment the spatium-bootstrap release renders.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["spatium-bootstrap-cloudnative-pg"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

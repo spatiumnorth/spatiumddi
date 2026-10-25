@@ -6,8 +6,9 @@ worker and supervisor until 15 % was free, and nothing had warned. These
 pin the three things that now look at /var before that happens:
 
 * the slot-upgrade scheduling pre-flight (422 naming the numbers);
-* the default-on ``appliance_disk_low`` alert rule, and the Fleet row's
-  finding, both judged by ``services/appliance/var_disk``;
+* the Fleet row's
+  finding, judged by ``services/appliance/var_disk`` with the same lines as
+  the existing ``appliance_disk_usage`` alert (which it must agree with);
 * the reclaim of a stored upgrade image every node has already written.
 """
 
@@ -141,12 +142,20 @@ def test_eviction_headroom_is_hard_plus_minimum_reclaim() -> None:
 
 
 @pytest.mark.parametrize(
-    ("free_pct", "severity"),
-    [(50, None), (21, None), (19, "warning"), (16, "warning"), (14, "critical"), (3, "critical")],
+    ("used_pct", "severity"),
+    [(50, None), (79, None), (80, "warning"), (86, "warning"), (87, "critical"), (97, "critical")],
 )
-def test_severity_bands(free_pct: int, severity: str | None) -> None:
-    f = var_disk.evaluate_var_disk(var_disk.var_disk_reading(_health(free=TOTAL * free_pct // 100)))
+def test_severity_bands(used_pct: int, severity: str | None) -> None:
+    """The Fleet row's lines are the ``appliance_disk_usage`` alert's, in its
+    terms (``used_bytes`` as reported)."""
+    ch = _health(free=TOTAL * (100 - used_pct) // 100, exact=False)
+    f = var_disk.evaluate_var_disk(var_disk.var_disk_reading(ch))
     assert (f.severity if f else None) == severity
+
+
+def test_lines_are_the_alerts_lines() -> None:
+    assert var_disk.WARN_USED_PCT == alerts_svc._APPLIANCE_DISK_USAGE_DEFAULT_PCT
+    assert var_disk.CRITICAL_USED_PCT == alerts_svc._APPLIANCE_DISK_CRITICAL_PCT
 
 
 def test_disk_pressure_is_critical_whatever_the_reading() -> None:
@@ -235,7 +244,7 @@ async def test_an_unknown_reading_does_not_refuse(
     assert resp.status_code == 200, resp.text
 
 
-# ── the alert rule ─────────────────────────────────────────────────
+# ── the alert is main's appliance_disk_usage rule, not a second one ─
 
 
 async def _no_delivery(rule, event, targets):  # type: ignore[no-untyped-def]
@@ -257,103 +266,37 @@ async def _open(db: AsyncSession, rule: AlertRule) -> list[AlertEvent]:
 
 
 @pytest.mark.asyncio
-async def test_alert_fires_escalates_holds_and_clears(
+async def test_fleet_row_and_the_usage_alert_agree(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from app.api.v1.appliance.supervisor import _var_disk_finding
+
     monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
-
-    async def no_snapshot():
-        return None
-
-    monkeypatch.setattr(alerts_svc, "_cluster_health_snapshot", no_snapshot)
     rule = AlertRule(
-        name="Appliance /var low (test)",
-        rule_type="appliance_disk_low",
-        threshold_percent=20,
+        name="Appliance /var (agreement test)",
+        rule_type="appliance_disk_usage",
+        threshold_percent=80,
         severity="warning",
         enabled=True,
     )
     db_session.add(rule)
-    low = await _node(db_session, free=TOTAL * 18 // 100)
-    await _node(db_session, free=TOTAL // 2)  # healthy
-    await _node(db_session, free=None)  # never reported
-    await db_session.commit()
-
-    await evaluate_all(db_session)
-    events = await _open(db_session, rule)
-    assert [e.subject_id for e in events] == [str(low.id)]
-    assert events[0].severity == "warning"
-
-    low.cluster_health = _health(free=TOTAL * 10 // 100)
+    nodes = {
+        pct: await _node(db_session, free=TOTAL * (100 - pct) // 100)
+        for pct in (50, 79, 80, 86, 87, 95)
+    }
     await db_session.commit()
     await evaluate_all(db_session)
-    events = await _open(db_session, rule)
-    assert len(events) == 1 and events[0].severity == "critical"
-
-    # Eviction takes the supervisor down: the reading goes stale. That is
-    # not a recovery, so the event stands.
-    low.last_seen_at = datetime.now(UTC) - timedelta(hours=1)
-    await db_session.commit()
-    await evaluate_all(db_session)
-    assert len(await _open(db_session, rule)) == 1
-
-    # Space freed, supervisor back -> resolved.
-    low.last_seen_at = datetime.now(UTC)
-    low.cluster_health = _health(free=TOTAL // 2)
-    await db_session.commit()
-    await evaluate_all(db_session)
-    assert await _open(db_session, rule) == []
-
-
-@pytest.mark.asyncio
-async def test_alert_fires_on_the_kubelets_disk_pressure(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
-    node = await _node(db_session, free=TOTAL // 2, hostname="DDI1")
-
-    async def snapshot():
-        return {"nodes": [{"name": "ddi1", "disk_pressure": True}]}
-
-    monkeypatch.setattr(alerts_svc, "_cluster_health_snapshot", snapshot)
-    rule = AlertRule(
-        name="Appliance /var low (pressure test)",
-        rule_type="appliance_disk_low",
-        severity="warning",
-        enabled=True,
-    )
-    db_session.add(rule)
-    await db_session.commit()
-    await evaluate_all(db_session)
-    events = await _open(db_session, rule)
-    assert [e.subject_id for e in events] == [str(node.id)]
-    assert events[0].severity == "critical"
-
-
-@pytest.mark.asyncio
-async def test_seed_creates_one_enabled_rule(db_session: AsyncSession) -> None:
-    from app.services.alerts import seed_appliance_disk_alert_rule
-
-    await seed_appliance_disk_alert_rule()
-    await seed_appliance_disk_alert_rule()
-    rules = (
-        (
-            await db_session.execute(
-                select(AlertRule).where(AlertRule.rule_type == "appliance_disk_low")
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(rules) == 1
-    assert rules[0].enabled is True and rules[0].threshold_percent == 20
+    by_subject = {e.subject_id: e.severity for e in await _open(db_session, rule)}
+    for pct, node in nodes.items():
+        finding = _var_disk_finding(node)
+        assert by_subject.get(str(node.id)) == (finding["severity"] if finding else None), pct
 
 
 @pytest.mark.asyncio
 async def test_fleet_row_carries_the_finding(db_session: AsyncSession) -> None:
     from app.api.v1.appliance.supervisor import _var_disk_finding
 
-    low = await _node(db_session, free=TOTAL * 10 // 100)
+    low = await _node(db_session, free=TOTAL * 3 // 100)
     fine = await _node(db_session, free=TOTAL // 2)
     stale = await _node(
         db_session, free=TOTAL // 100, last_seen=datetime.now(UTC) - timedelta(hours=1)
@@ -638,53 +581,6 @@ async def test_reclaim_yields_to_an_in_flight_schedule(
 
 
 @pytest.mark.asyncio
-async def test_alert_hysteresis(db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Review finding 6: no flapping at the 20 % / 15 % boundaries, and a
-    DiskPressure=False reading alone does not resolve an unreadable node."""
-    monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
-    pressure: dict[str, bool] = {}
-
-    async def snapshot():
-        return {"nodes": [{"name": k, "disk_pressure": v} for k, v in pressure.items()]}
-
-    monkeypatch.setattr(alerts_svc, "_cluster_health_snapshot", snapshot)
-    rule = AlertRule(
-        name="Appliance /var low (hysteresis)",
-        rule_type="appliance_disk_low",
-        threshold_percent=20,
-        severity="warning",
-        enabled=True,
-    )
-    db_session.add(rule)
-    n = await _node(db_session, free=TOTAL * 18 // 100, hostname="hy1")
-    await db_session.commit()
-
-    async def state() -> list[str]:
-        await evaluate_all(db_session)
-        return [e.severity for e in await _open(db_session, rule)]
-
-    assert await state() == ["warning"]
-    n.cluster_health = _health(free=TOTAL * 21 // 100)  # just over 20 %
-    await db_session.commit()
-    assert await state() == ["warning"]
-    n.cluster_health = _health(free=TOTAL * 14 // 100)
-    await db_session.commit()
-    assert await state() == ["critical"]
-    n.cluster_health = _health(free=TOTAL * 16 // 100)  # just over 15 %
-    await db_session.commit()
-    assert await state() == ["critical"]
-    # Supervisor gone, kubelet says no DiskPressure: still not a recovery.
-    n.last_seen_at = datetime.now(UTC) - timedelta(hours=1)
-    pressure["hy1"] = False
-    await db_session.commit()
-    assert await state() == ["critical"]
-    n.last_seen_at = datetime.now(UTC)
-    n.cluster_health = _health(free=TOTAL * 23 // 100)
-    await db_session.commit()
-    assert await state() == []
-
-
-@pytest.mark.asyncio
 async def test_cluster_node_card_carries_the_finding(db_session: AsyncSession) -> None:
     from app.api.v1.appliance.cluster import (
         HostPartition,
@@ -692,7 +588,7 @@ async def test_cluster_node_card_carries_the_finding(db_session: AsyncSession) -
         _merge_supervisor_host_state,
     )
 
-    await _node(db_session, free=TOTAL * 10 // 100, hostname="ddi1")
+    await _node(db_session, free=TOTAL * 3 // 100, hostname="ddi1")
     await _node(db_session, free=TOTAL // 2, hostname="ddi2")
     await db_session.flush()
     snap = {
@@ -710,7 +606,7 @@ async def test_cluster_node_card_carries_the_finding(db_session: AsyncSession) -
     assert by["ddi3"]["severity"] == "critical"
     # The response model keeps both, rather than dropping them unseen.
     part = snap["nodes"][0]["host_disk_partitions"][0]
-    assert HostPartition(**part).available_bytes == TOTAL * 10 // 100
+    assert HostPartition(**part).available_bytes == TOTAL * 3 // 100
     assert "var_disk_finding" in NodeVitals.model_fields
 
 
@@ -718,10 +614,10 @@ async def test_cluster_node_card_carries_the_finding(db_session: AsyncSession) -
 async def test_copilot_fleet_row_carries_var(db_session: AsyncSession) -> None:
     from app.services.ai.tools.appliance import _row_to_dict
 
-    low = await _node(db_session, free=TOTAL * 10 // 100)
+    low = await _node(db_session, free=TOTAL * 3 // 100)
     unknown = await _node(db_session, free=None)
     d = _row_to_dict(low)
-    assert d["var_free_bytes"] == TOTAL * 10 // 100 and d["var_total_bytes"] == TOTAL
+    assert d["var_free_bytes"] == TOTAL * 3 // 100 and d["var_total_bytes"] == TOTAL
     assert d["var_disk_finding"]["severity"] == "critical"
     d = _row_to_dict(unknown)
     assert d["var_free_bytes"] is None and d["var_disk_finding"] is None

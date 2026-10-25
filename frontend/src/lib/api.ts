@@ -13762,7 +13762,7 @@ export interface HostPartition {
 
 /**
  * #2400 — /var against kubelet eviction, judged server-side by the same
- * function behind the `appliance_disk_low` alert. Absent / null = fine or
+ * function behind the `appliance_disk_usage` alert. Absent / null = fine or
  * unknown.
  */
 export interface VarDiskFinding {

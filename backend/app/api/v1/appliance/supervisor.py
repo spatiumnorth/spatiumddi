@@ -3576,7 +3576,7 @@ class ApplianceRow(BaseModel):
     storage_worst_severity: str | None = None
     storage_reported: bool = False
     # #2400 — /var headroom against kubelet eviction, judged by the function
-    # behind the ``appliance_disk_low`` alert. ``None`` = fine or unknown.
+    # behind the ``appliance_disk_usage`` alert. ``None`` = fine or unknown.
     # The raw numbers are in ``cluster_health.host_disk_partitions``.
     var_disk_finding: VarDiskFinding | None = None
     # #1017 — the interface MTU spatium-etc-render actually APPLIED at

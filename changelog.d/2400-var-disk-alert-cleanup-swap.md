@@ -4,10 +4,10 @@
   (#2400).** Scheduling a slot upgrade now refuses, naming the node and
   the numbers, when downloading the image onto that node's /var would
   leave it under 15% free (the kubelet's 5% eviction threshold plus its
-  10% minimum reclaim). A new default-on `appliance_disk_low` alert fires
-  when a node reports DiskPressure or /var is under 15% free (critical)
-  or 20% free (warning), and the Fleet drilldown and Cluster node card
-  show the same warning. The supervisor now reports /var's free space as
+  10% minimum reclaim). The Fleet drilldown and Cluster node card
+  now show a /var warning at the same lines as the existing
+  `appliance_disk_usage` alert (80% used, critical at 87%) and when the
+  kubelet reports DiskPressure. The supervisor now reports /var's free space as
   the kubelet measures it, without ext4's 5% root reserve.
 - **Upgrade images no longer pile up on /var (#2400).** The node's staged
   copy is removed as soon as the slot write ends, on failure as well as

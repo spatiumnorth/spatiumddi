@@ -854,7 +854,7 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
           <StorageRow storage={node.host_storage ?? null} />
           {/*
             #2400 — /var low or under the kubelet's eviction headroom, judged
-            by the evaluator behind the appliance_disk_low alert.
+            by the evaluator that shares the appliance_disk_usage alert's warning and critical lines.
           */}
           <VarDiskWarning finding={node.var_disk_finding} compact />
         </div>
