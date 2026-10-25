@@ -15,9 +15,12 @@ Before each drop, a plaintext value still present is encrypted into its
 "exclude secrets" restore writes). An encrypted value already there is left
 alone: it is what the application has been reading since ``e51ab0dede3e``,
 and a plaintext column a pre-upgrade pod wrote afterwards is no newer by any
-measure the row records. Importing ``app.core.crypto`` is deliberate, as in
-``e51ab0dede3e``: the ciphertext must be exactly what the application reads
-back, under the install's own key.
+measure the row records. The fold is
+``app.services.backup.legacy_columns.fold_plaintext_columns``, shared with the
+selective restore of an archive taken before this drop so the two paths cannot
+disagree; it imports ``app.core.crypto`` deliberately, as ``e51ab0dede3e``
+does: the ciphertext must be exactly what the application reads back, under
+the install's own key.
 
 A value the fold writes back is restored from a column the application has
 not read since ``e51ab0dede3e``, so it may be one an admin has since cleared:
@@ -25,10 +28,11 @@ on a build that blanked nothing on a clear, a cleared value left the old
 plaintext in place beside a NULL ciphertext, which is the same state as one
 never rewritten. So every target the fold writes into is left DISABLED
 (``audit_forward_target.enabled``; for the legacy single webhook,
-``platform_settings.audit_forward_webhook_enabled``), and its id and name are
-logged, so an admin turns it back on knowingly instead of audit events
-starting to flow to an endpoint that may have been removed. A row the fold does
-not write into is left exactly as it is.
+``platform_settings.audit_forward_webhook_enabled``), its id and name are
+logged, and an ``audit_log`` row per target records it (the log line goes
+with the migrate Job; the audit row stays), so an admin turns it back on
+knowingly instead of audit events starting to flow to an endpoint that may
+have been removed. A row the fold does not write into is left exactly as it is.
 
 Each column is dropped only if present, so a schema built from the models (a
 test database, a fresh install that never ran ``e51ab0dede3e``'s expand) and
@@ -48,7 +52,6 @@ Create Date: 2026-10-23
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import sqlalchemy as sa
 
@@ -82,56 +85,28 @@ def _columns(conn: sa.engine.Connection, table: str) -> set[str]:
     return {c["name"] for c in sa.inspect(conn).get_columns(table)}
 
 
-# table -> (enabled column, label column or None). The legacy webhook is one
-# row (id 1) with no name of its own.
-_ENABLED: dict[str, tuple[str, str | None]] = {
-    "audit_forward_target": ("enabled", "name"),
-    "platform_settings": ("audit_forward_webhook_enabled", None),
-}
-
-
 def upgrade() -> None:
-    from app.core.crypto import encrypt_str
+    # The fold is shared with the selective restore of an archive taken
+    # before this drop, so the two cannot disagree. The audit row per target
+    # it leaves disabled outlives this Job's log.
+    from app.services.backup.legacy_columns import (
+        fold_plaintext_columns,
+        record_disabled_sync,
+    )
 
     conn = op.get_bind()
-    rearmed: dict[tuple[str, Any], None] = {}
-    for table, plain, encrypted in _PAIRS:
-        if plain not in _columns(conn, table):
-            continue
-        rows = conn.execute(
-            sa.text(
-                f"SELECT id, {plain} FROM {table} "  # noqa: S608
-                f"WHERE {plain} IS NOT NULL AND {plain} <> '' "
-                f"AND ({encrypted} IS NULL OR octet_length({encrypted}) = 0)"
-            )
-        ).all()
-        for row_id, value in rows:
-            conn.execute(
-                sa.text(f"UPDATE {table} SET {encrypted} = :value WHERE id = :id"),  # noqa: S608
-                {"value": encrypt_str(value), "id": row_id},
-            )
-            rearmed[(table, row_id)] = None
-        op.drop_column(table, plain)
-
-    for table, row_id in rearmed:
-        flag, label = _ENABLED[table]
-        name = ""
-        if label is not None:
-            name = conn.execute(
-                sa.text(f"SELECT {label} FROM {table} WHERE id = :id"),  # noqa: S608
-                {"id": row_id},
-            ).scalar_one_or_none()
-        conn.execute(
-            sa.text(f"UPDATE {table} SET {flag} = false WHERE id = :id"),  # noqa: S608
-            {"id": row_id},
-        )
+    result = fold_plaintext_columns(conn)
+    recorded = record_disabled_sync(conn, result.disabled, source=f"schema upgrade {revision}")
+    for target in result.disabled:
         logger.warning(
             "c2b203844c95: restored a plaintext webhook value into %s id=%s%s and "
             "left it disabled; re-enable it once the endpoint is confirmed",
-            table,
-            row_id,
-            f" name={name!r}" if name else "",
+            target.table,
+            target.row_id,
+            f" name={target.name!r}" if target.name else "",
         )
+    if not recorded:
+        logger.warning("c2b203844c95: the audit rows for the targets above were not written")
 
 
 def downgrade() -> None:

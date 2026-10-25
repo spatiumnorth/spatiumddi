@@ -9,11 +9,14 @@
   into its encrypted column when that column is empty, then drops it.
   An encrypted value already present is left as it is. A target the
   migration writes a value into is left disabled (the Settings webhook
-  likewise) and logged, since that value may be one an admin cleared;
-  re-enable it once the endpoint is confirmed. Archives taken
+  likewise), since that value may be one an admin cleared, and an
+  audit-log row per target says so, so the reason outlives the migrate
+  Job's log; re-enable it once the endpoint is confirmed. Archives taken
   before the drop still restore: a full restore migrates them, and a
   selective restore loads the old columns, encrypts what they hold, and
-  drops them again. The code that blanked the plaintext copy on every write is gone with them.
+  drops them again. Either way a restore leaves a target filled from an
+  old column disabled with the same audit-log row, and its warnings name
+  each one. The code that blanked the plaintext copy on every write is gone with them.
 
 ### Migrations
 

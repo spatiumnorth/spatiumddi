@@ -68,6 +68,8 @@ from app.services.backup.archive import (
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.legacy_columns import (
+    disabled_since,
+    disabled_warning,
     fold_dropped_plaintext_columns,
     selective_readd_sql,
 )
@@ -1377,12 +1379,26 @@ async def _apply_backup_restore_inner(
     # Phase 6b: a selective restore of an archive taken before a contract
     # migration re-added the plaintext secret columns that migration dropped
     # (see ``_selective_prelude``). Encrypt whatever they hold into their
-    # empty ``*_encrypted`` columns and drop them again. Before the rewrap:
-    # the values are encrypted under this install's key, which the rewrap
-    # recognises and leaves alone. Non-fatal, like the steps around it.
+    # empty ``*_encrypted`` columns and drop them again, leaving each target
+    # written into disabled with an audit row, as the migration does. Before
+    # the rewrap: the values are encrypted under this install's key, which
+    # the rewrap recognises and leaves alone. Non-fatal, like the steps
+    # around it.
     fold_warning: str | None = None
     try:
-        await fold_dropped_plaintext_columns(db_url)
+        fold = await fold_dropped_plaintext_columns(db_url)
+        disabled_names = [t.display for t in fold.disabled]
+        # The upgrade step's migration runs the same fold (a full restore, or
+        # a selective one whose archive sits before the drop) and records it
+        # only in the audit log; name those targets too.
+        try:
+            for name in await disabled_since(db_url, started):
+                if name not in disabled_names:
+                    disabled_names.append(name)
+        except Exception as exc:  # noqa: BLE001 — a report, not the fold
+            logger.warning("backup_restore_disabled_targets_scan_failed", error=str(exc))
+        if disabled_names:
+            fold_warning = disabled_warning(disabled_names)
     except Exception as exc:  # noqa: BLE001
         logger.error("backup_restore_legacy_plaintext_fold_failed", error=str(exc))
         fold_warning = (
