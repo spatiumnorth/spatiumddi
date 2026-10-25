@@ -364,7 +364,8 @@ celery_app.conf.update(
             "schedule": schedule(run_every=60.0),
         },
         # Every 5 min, sweep DHCP leases whose expires_at has passed the grace
-        # window and remove their mirrored IPAM rows (auto_from_lease=True).
+        # window and remove their mirrored IPAM rows (auto_from_lease=True);
+        # then hand any ``available`` row a live lease holds to it (#2580).
         "dhcp-lease-cleanup": {
             "task": "app.tasks.dhcp_lease_cleanup.sweep_expired_leases",
             "schedule": schedule(run_every=300.0),
@@ -1192,6 +1193,25 @@ def _dispatch_after_commit_in_background(**_: object) -> None:
     runs in the prefork master; the loop itself starts lazily per PID, so
     each forked child gets its own."""
     importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
+
+
+@beat_init.connect
+def _queue_release_check_at_start(**_: object) -> None:
+    """Run the release check once when beat starts.
+
+    The check is otherwise daily, so a fresh install or a restart waited up
+    to a day before the update pill (or a stored error) could appear. This
+    queues the same task the daily schedule fires, onto a worker: the same
+    already-documented connection (docs/PRIVACY.md §3.1) and the same
+    ``github_release_check_enabled`` gate, which the task checks itself.
+    Nothing new is opened here, and a broker that is not up yet never blocks
+    beat from starting."""
+    try:
+        celery_app.send_task("app.tasks.update_check.check_github_release")
+    except Exception:  # noqa: BLE001 - the daily schedule still covers it
+        structlog.get_logger(__name__).warning(
+            "release_check_at_beat_start_not_queued", exc_info=True
+        )
 
 
 @task_failure.connect

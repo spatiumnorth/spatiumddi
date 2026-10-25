@@ -68,6 +68,24 @@ export function useOverlayLayer(active: boolean): void {
   }, [active]);
 }
 
+/** Esc handler for a popup list (suggestions, combobox) inside a dialog:
+ *  while the list is open, Esc closes the list only; the dialog keeps what
+ *  was typed and takes the next Esc (#2720). Call from the input's keydown;
+ *  returns true when the key was consumed. An IME composition's Esc is left
+ *  alone. */
+export function closePopupOnEscape(
+  e: React.KeyboardEvent,
+  isOpen: boolean,
+  close: () => void,
+): boolean {
+  if (e.key !== "Escape" || !isOpen) return false;
+  if (e.nativeEvent.isComposing || e.keyCode === 229) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  close();
+  return true;
+}
+
 /**
  * Drag hook for modal dialogs. Returns a style to apply to the dialog card
  * (``transform: translate(x, y)``) and a set of props to spread on whatever
@@ -122,6 +140,10 @@ export function useDraggableModal(onClose: () => void) {
     const { token, remove } = escStack.push(seq);
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || !escStack.isTop(token)) return;
+      // An Esc that ends an IME composition belongs to the input method, and
+      // one a control inside already handled (an open suggestion list closing
+      // itself, #2720) belongs to that control: the innermost layer owns it.
+      if (e.isComposing || e.keyCode === 229 || e.defaultPrevented) return;
       e.stopImmediatePropagation();
       onCloseRef.current();
     };

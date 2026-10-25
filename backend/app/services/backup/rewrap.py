@@ -346,12 +346,6 @@ LEGACY_PLAINTEXT_SECRET_COLUMNS: frozenset[tuple[str, str]] = frozenset(
         # the scrubber writes NULL for these columns either way, which
         # a nullable JSONB column accepts.
         ("event_subscription", "headers"),
-        # #1502 — moved to ``url_encrypted`` / ``auth_header_encrypted``.
-        # Made nullable by that migration so the scrubber's NULL restores.
-        ("audit_forward_target", "url"),
-        ("audit_forward_target", "auth_header"),
-        ("platform_settings", "audit_forward_webhook_url"),
-        ("platform_settings", "audit_forward_webhook_auth_header"),
     }
 )
 

@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission, user_has_permission
 from app.models.audit import AuditLog
@@ -429,7 +430,7 @@ async def poll_device_now(device_id: uuid.UUID, db: DB, current_user: CurrentUse
 
     queued_at = datetime.now(UTC)
     try:
-        result = poll_device.delay(str(dev.id))
+        result = await dispatch(poll_device, str(dev.id))
         task_id = result.id
     except Exception as exc:  # noqa: BLE001 — broker down
         logger.warning("snmp_poll_now_broker_unavailable", error=str(exc))

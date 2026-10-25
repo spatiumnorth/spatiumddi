@@ -164,7 +164,7 @@ async def test_plan_asks_about_the_uploaded_image(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _capture_run_all(monkeypatch, orchestrator)
-    monkeypatch.setattr(orchestrator, "detect_cnpg_cluster_name", lambda *_a: "")
+    monkeypatch.setattr(orchestrator, "detect_cnpg_cluster_name", lambda *_a, **_k: "")
     target = SlotImageTarget(url="https://cp.example/x.raw.xz?t=1", image_id=IMAGE)
 
     with pytest.raises(orchestrator.OrchestratorError):

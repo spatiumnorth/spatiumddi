@@ -255,6 +255,26 @@ describe("the list (#1961, #1962)", () => {
     ).toBeTruthy();
     expect(screen.queryByText("Trash is empty.")).toBeNull();
   });
+  it("sends a search of only spaces as no search (#2737)", async () => {
+    list.mockResolvedValue({
+      items: [entry(1)],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+    mount();
+    await screen.findByText(/of 1/);
+    fireEvent.change(screen.getByPlaceholderText("Search name / CIDR…"), {
+      target: { value: "   " },
+    });
+    await waitFor(() =>
+      expect(list).toHaveBeenLastCalledWith(
+        expect.objectContaining({ q: undefined }),
+      ),
+    );
+    expect(screen.queryByText("Trash is empty.")).toBeNull();
+    expect(screen.queryByText("No rows match these filters.")).toBeNull();
+  });
 });
 
 describe("Delete permanently names what goes with the row (#2602)", () => {
@@ -278,17 +298,17 @@ describe("Delete permanently names what goes with the row (#2602)", () => {
     return (await screen.findByText(/This permanently removes/)).textContent;
   }
 
-  it("names a subnet's scopes, addresses and records, and counts the batch", async () => {
+  it("names a subnet's scopes, addresses and records, and does not count the batch", async () => {
     const t = await openDelete("subnet", 4);
     expect(t).toMatch(/DHCP scopes \(with their pools and static/);
     expect(t).toMatch(/addresses and the DNS records published for them/);
-    expect(t).toMatch(/3 other rows deleted with it are removed too/);
+    expect(t).not.toMatch(/other row/);
   });
 
   it("names a zone's records and pools", async () => {
     const t = await openDelete("dns_zone", 3);
     expect(t).toMatch(/All of its DNS records and its DNS pools/);
-    expect(t).toMatch(/2 other rows/);
+    expect(t).not.toMatch(/other row/);
   });
 
   it("adds no count for a row deleted alone", async () => {

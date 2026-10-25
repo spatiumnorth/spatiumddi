@@ -45,6 +45,15 @@ spec:
       max_connections: "200"
       shared_buffers: "256MB"
       work_mem: "16MB"
+      # #2132 — WAL kept for a former primary to pg_rewind and rejoin after
+      # a failover (CNPG's default is 512MB). #2317 — the most WAL a
+      # replication slot may hold back; PostgreSQL's default (-1) lets a
+      # slot for a standby that never follows a new primary fill the
+      # volume. pg_wal stays near max(wal_keep_size, max_slot_wal_keep_size)
+      # + max_wal_size (1GB) = 4GB, well inside the 20Gi below. Same values
+      # as the umbrella chart's postgresql.cnpg.parameters.
+      wal_keep_size: "2GB"
+      max_slot_wal_keep_size: "3GB"
 
   bootstrap:
     initdb:

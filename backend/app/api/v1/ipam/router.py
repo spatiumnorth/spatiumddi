@@ -30,6 +30,7 @@ from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
     name_in_zone_error,
+    publishable_host_owner_error,
     validate_fqdn,
     validate_host_label,
     validate_hostname,
@@ -52,7 +53,7 @@ from app.models.ipam import (
     IP_ROLES,
     IP_ROLES_SHARED,
     IP_STATUSES,
-    IP_STATUSES_OPERATOR_SETTABLE,
+    IP_STATUSES_CREATE_SETTABLE,
     SUBNET_ROLES,
     IPAddress,
     IPBlock,
@@ -2348,6 +2349,56 @@ def _own_alias_clash_detail(ip: IPAddress, zone: DNSZone, alias: DNSRecord) -> s
     )
 
 
+async def _retract_host_records(db: AsyncSession, ip: IPAddress) -> bool:
+    """Retract the address's own auto-generated host records (A / AAAA + PTR).
+
+    For an address whose name is blank: it publishes nothing, so the host
+    record and the PTR an earlier name published are withdrawn through the
+    record-op queue (agents and agentless drivers alike). Aliases are left
+    alone, as the unpublishable-owner branch of :func:`_sync_dns_record`
+    leaves them. ``forward_zone_id`` is kept so a later name returns to the
+    same zone (#493). Returns whether anything was retracted.
+    """
+    result = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_alias.is_(False),
+            DNSRecord.record_type.in_(["A", "AAAA", "PTR"]),
+        )
+    )
+    # #1800 — PTRs first, as the delete action orders them.
+    records = sorted(result.scalars().all(), key=lambda r: r.record_type != "PTR")
+    for record in records:
+        zone = await db.get(DNSZone, record.zone_id)
+        # #1633 — a zone IPAM does not author never took the record: drop the
+        # row, queue no op it would refuse.
+        if zone is not None and ipam_authors_zone(zone):
+            await _enqueue_dns_op(
+                db,
+                zone,
+                "delete",
+                record.name,
+                record.record_type,
+                record.value,
+                record.ttl,
+                record_id=record.id,
+            )
+        await db.delete(record)
+    if not records:
+        return False
+    ip.dns_record_id = None
+    ip.fqdn = None
+    if any(r.record_type == "PTR" for r in records):
+        ip.reverse_zone_id = None
+    logger.info(
+        "ipam_dns_blank_hostname_retracted",
+        ip=str(ip.address),
+        records=len(records),
+    )
+    return True
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -2397,6 +2448,10 @@ async def _sync_dns_record(
     ``skip_create`` holds ``(record_type, zone_id)`` keys whose record is NOT
     to be newly written, however missing: the Sync DNS rows the operator
     unticked (#2471). Records that already exist are still updated.
+
+    A blank or whitespace-only hostname publishes nothing: the address's own
+    auto-generated host record and PTR are retracted, on strict and
+    background paths alike, and the sync returns False.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -2452,11 +2507,36 @@ async def _sync_dns_record(
     # old records (issue #25).
     if effective_zone_id is None:
         effective_zone_id = ip.forward_zone_id
-    if not ip.hostname:
+    if ip.hostname is None or not ip.hostname.strip():
+        # A blank or whitespace-only name publishes nothing. Whatever host
+        # record an earlier name published is retracted here, on every path
+        # (strict or not), rather than refused or skipped: the request models
+        # refuse a blank name at input, so a row only arrives here blank by a
+        # path that stored it (a reservation whose name was cleared, a lease,
+        # an importer, a row from before the validator), and leaving its old
+        # A / PTR served would answer for a name the row no longer carries.
+        await _retract_host_records(db, ip)
         return False
     if effective_zone_id is None and not ip.extra_zone_ids:
         # Nothing to publish to — no primary zone, no extras.
         return False
+    # The hostname becomes the record owner verbatim. The request models
+    # validate it, but a row reaches this sync by other paths too (DHCP
+    # reservations, importers, rows stored before a validator existed). A
+    # whitespace-bearing or control-character owner renders a zone line BIND
+    # reads as another owner's record, or as two records, so such a name is
+    # published nowhere: strict paths answer 422, others skip every zone,
+    # which also retracts what an earlier name published there. (A blank name
+    # was handled above: it always retracts.)
+    owner_err = publishable_host_owner_error(ip.hostname)
+    if owner_err is not None:
+        if strict:
+            raise HTTPException(status_code=422, detail=owner_err)
+        logger.warning(
+            "ipam_dns_hostname_unpublishable",
+            ip=str(ip.address),
+            reason=owner_err,
+        )
 
     zone = await db.get(DNSZone, effective_zone_id) if effective_zone_id else None
     if zone is not None and zone.deleted_at is not None:
@@ -2475,6 +2555,7 @@ async def _sync_dns_record(
         try:
             from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
+            # Honours the subnet's stored skip_reverse_zone opt-out (#2735).
             await ensure_reverse_zones_for_subnet(db, subnet, None)
         except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
             pass
@@ -2486,11 +2567,20 @@ async def _sync_dns_record(
     # primary zone drops out of the desired set below, so a record an earlier
     # name published there is retracted (as is its PTR, ``fqdn`` being None)
     # rather than left naming a host the row no longer carries.
-    primary_too_long = bool(zone_domain) and _name_too_long_for_zone(ip, zone_domain, strict)
-    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain and not primary_too_long else None
+    primary_unpublishable = bool(zone_domain) and owner_err is not None
+    primary_too_long = (
+        bool(zone_domain)
+        and not primary_unpublishable
+        and _name_too_long_for_zone(ip, zone_domain, strict)
+    )
+    fqdn = (
+        f"{ip.hostname}.{zone_domain}"
+        if zone_domain and not primary_too_long and not primary_unpublishable
+        else None
+    )
     if fqdn:
         ip.fqdn = fqdn
-    elif primary_too_long:
+    elif primary_too_long or primary_unpublishable:
         ip.fqdn = None
 
     # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
@@ -2533,8 +2623,10 @@ async def _sync_dns_record(
         )
         if target is not None and ipam_authors_zone(target):
             if desired_zone_id == effective_zone_id:
-                if primary_too_long:
-                    continue  # #2072 — logged above
+                if primary_too_long or primary_unpublishable:
+                    continue  # #2072 / unpublishable owner — logged above
+            elif owner_err is not None:
+                continue  # unpublishable owner — logged above
             elif _name_too_long_for_zone(ip, target.name.rstrip("."), strict):
                 continue  # #2072 — an extra zone the name does not fit in
             authored_zone_ids.append(desired_zone_id)
@@ -2929,6 +3021,9 @@ async def _sync_dns_record(
             await db.delete(rec)
         if stale_ptrs:
             ip.reverse_zone_id = None
+        if owner_err is not None:
+            # Nothing was published: the name is not a usable owner.
+            return False
         if primary_cname_skip and not forward_published:
             # Read by the DDNS path so it reports the CNAME clash, not "no
             # forward zone" (not a mapped column; lives for this request).
@@ -3701,6 +3796,7 @@ class SubnetUpdate(BaseModel):
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
     show_free_ranges: bool | None = None  # #2137 — explicit null restores default
+    skip_reverse_zone: bool | None = None  # #2735
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -3865,6 +3961,8 @@ class SubnetResponse(BaseModel):
     # per-row would put a hierarchy walk inside every list page.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    # #2735 — opted out of the auto-created reverse zone.
+    skip_reverse_zone: bool = False
     # #2137 — the subnet's own choice; None = use the default rule.
     show_free_ranges: bool | None = None
     # #2137 — name of the integration mirroring this subnet (kubernetes,
@@ -4114,7 +4212,7 @@ class IPAddressCreate(BaseModel):
         # the reconcilers — operators picking them on a brand-new
         # row would create a phantom "owned by no integration"
         # record.
-        allowed = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
+        allowed = IP_STATUSES_CREATE_SETTABLE
         if v not in allowed:
             raise ValueError(
                 f"status must be one of: {', '.join(sorted(allowed))}. "
@@ -4346,7 +4444,7 @@ class NextIPRequest(BaseModel):
         # next-IP allocation: same shape as manual create — operator
         # statuses + dhcp. No integration statuses; those rows come
         # from reconcilers, not the next-IP picker.
-        allowed = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
+        allowed = IP_STATUSES_CREATE_SETTABLE
         if v not in allowed:
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v
@@ -5900,7 +5998,6 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             **body.model_dump(
                 exclude={
                     "skip_auto_addresses",
-                    "skip_reverse_zone",
                     "dns_group_id",
                     "template_id",
                 }
@@ -6402,7 +6499,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     try:
         from app.tasks.ipam_discovery import run_subnet_discovery
 
-        run_subnet_discovery.delay(str(subnet_id))
+        await dispatch(run_subnet_discovery, str(subnet_id))
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         queued = False
         logger.warning("ipam_discovery_trigger_enqueue_failed", error=str(exc))
@@ -8784,7 +8881,7 @@ class BackfillReverseZonesResponse(BaseModel):
 
 
 async def _backfill_reverse_zones(
-    db: AsyncSession, subnets: list[Subnet], user: Any
+    db: AsyncSession, subnets: list[Subnet], user: Any, *, honour_opt_out: bool = True
 ) -> BackfillReverseZonesResponse:
     from app.services.dns.reverse_zone import (
         compute_reverse_zone_names,
@@ -8813,7 +8910,9 @@ async def _backfill_reverse_zones(
             resp.skipped += 1
             continue
         try:
-            zones = await ensure_reverse_zones_for_subnet(db, s, user)
+            zones = await ensure_reverse_zones_for_subnet(
+                db, s, user, honour_opt_out=honour_opt_out
+            )
         except Exception:  # noqa: BLE001
             resp.skipped += 1
             continue
@@ -8840,7 +8939,8 @@ async def backfill_reverse_zones_subnet(
     s = await db.get(Subnet, subnet_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
-    resp = await _backfill_reverse_zones(db, [s], current_user)
+    # Asked for by name on this one subnet: overrides its create-time opt-out (#2735).
+    resp = await _backfill_reverse_zones(db, [s], current_user, honour_opt_out=False)
     await db.commit()
     return resp
 
@@ -12216,6 +12316,7 @@ async def bulk_edit_addresses(
 # the IPAM page.
 
 from app.api.v1.network.schemas import NetworkContextEntry  # noqa: E402
+from app.core.celery_dispatch import dispatch  # noqa: E402
 from app.models.network import (  # noqa: E402
     NetworkDevice as _NetworkDevice,
 )

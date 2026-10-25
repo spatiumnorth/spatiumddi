@@ -334,6 +334,9 @@ class ScopeCreate(BaseModel):
     # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
     relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
+    # #2705 — the create dialog offers a PXE profile; before this the field
+    # was dropped (``extra: ignore``) and the scope came back without it.
+    pxe_profile_id: uuid.UUID | None = None
     # #1110 — see ``WindowsPlacementIn``. Only consulted when no Windows
     # member holds the scope yet; an existing one stays where it is held.
     windows_placement: WindowsPlacementIn | None = None
@@ -746,9 +749,18 @@ async def create_scope(
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
     )
+    if body.pxe_profile_id is not None:
+        # Same group rule as update_scope (#2650).
+        _pxe = await db.get(DHCPPXEProfile, body.pxe_profile_id)
+        if _pxe is None or _pxe.group_id != group_id:
+            raise HTTPException(
+                status_code=422,
+                detail="PXE profile does not exist in this scope's server group",
+            )
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
+        pxe_profile_id=body.pxe_profile_id,
         name=(body.name or "").strip(),
         description=(body.description or "").strip(),
         is_active=is_active,

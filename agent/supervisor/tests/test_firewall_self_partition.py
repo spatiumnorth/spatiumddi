@@ -665,3 +665,160 @@ def test_a_healthy_cp_bundle_never_probes_the_apiserver(monkeypatch, tmp_path) -
     monkeypatch.setattr(fpa, "_etcd_membership_uncached", counted)
     heartbeat._server_firewall_body_is_usable(_bundle(CP_BODY), structlog.get_logger("t"))
     assert calls["n"] == 0
+
+
+# ── #2774 — the control-plane path uses the same predicate as the in-pod one ──
+#
+# A one-node install IS a live etcd member and has no peers, so the server's
+# correct body has no 2380 rule. The bundle guard refused it on every heartbeat
+# (it never got #610's sole-member exemption), the dispatch fell back to the
+# in-pod render, which carries no fleet-policy rules — so with enforcement on, a
+# fleet rule never reached the host and the Firewall view showed drift forever.
+
+# A server-rendered one-node body carrying an enforced fleet rule.
+FLEET_BODY = AGENT_BODY + 'tcp dport 47771 accept comment "fleet:allow-47771"\n'
+
+
+def _wire_bundle(monkeypatch, tmp_path, *, is_member, live_members):
+    heartbeat, appliance_state, trigger = _wire(
+        monkeypatch, tmp_path, is_member=is_member, live_members=live_members
+    )
+    # The server path writes the SAME host trigger file through appliance_state.
+    monkeypatch.setattr(appliance_state, "_FIREWALL_TRIGGER_FILE", trigger)
+    monkeypatch.setattr(
+        appliance_state, "_FIREWALL_APPLIED_HASH_SIDECAR", tmp_path / "applied-hash"
+    )
+    monkeypatch.setattr(
+        appliance_state, "_FIREWALL_APPLIED_STATUS_SIDECAR", tmp_path / "applied-status"
+    )
+    return heartbeat, appliance_state, trigger
+
+
+def _dispatch(heartbeat, conf, cluster_peer_cidrs=None):
+    import structlog
+
+    heartbeat._dispatch_firewall(
+        {"config_hash": "fleet-hash-1", "firewall_conf": conf},
+        {"roles": ["dns_bind9"]},
+        structlog.get_logger("t"),
+        cluster_peer_cidrs or [],
+    )
+
+
+def test_a_sole_member_uses_the_server_body_without_a_peer_rule(
+    monkeypatch, tmp_path
+) -> None:
+    import structlog
+
+    heartbeat, appliance_state, _t = _wire_bundle(
+        monkeypatch, tmp_path, is_member=True, live_members=["192.168.0.133"]
+    )
+    assert (
+        heartbeat._server_firewall_body_is_usable(
+            _bundle(FLEET_BODY), structlog.get_logger("t")
+        )
+        is True
+    )
+    assert appliance_state.read_firewall_state() is None
+
+
+def test_a_sole_member_applies_the_enforced_fleet_rule(monkeypatch, tmp_path) -> None:
+    """End to end through the dispatch: the trigger the host runner consumes is
+    the SERVER body, fleet rule included — not the in-pod render."""
+    heartbeat, appliance_state, trigger = _wire_bundle(
+        monkeypatch, tmp_path, is_member=True, live_members=["192.168.0.133"]
+    )
+    _dispatch(heartbeat, FLEET_BODY)
+    assert trigger.exists(), "nothing was handed to the host runner"
+    text = trigger.read_text()
+    assert text.startswith("fleet-hash-1\n"), "fell back to the in-pod render"
+    assert "fleet:allow-47771" in text
+    assert appliance_state.read_firewall_state() is None
+
+
+def test_a_stale_refusal_marker_clears_once_the_server_body_is_used(
+    monkeypatch, tmp_path
+) -> None:
+    """A one-node install refused before the fix carries a control-plane
+    refusal marker; using the server body must clear it, or Fleet keeps
+    showing a divergence that no longer exists."""
+    import structlog
+
+    heartbeat, appliance_state, _t = _wire_bundle(
+        monkeypatch, tmp_path, is_member=True, live_members=["192.168.0.133"]
+    )
+    appliance_state.record_firewall_refusal("control-plane", "old")
+    heartbeat._server_firewall_body_is_usable(
+        _bundle(FLEET_BODY), structlog.get_logger("t")
+    )
+    assert appliance_state.read_firewall_state() is None
+
+
+def test_a_three_node_member_still_refuses_a_body_missing_its_peers(
+    monkeypatch, tmp_path
+) -> None:
+    """The guard is unchanged where the danger is real: live peers, no rule."""
+    import structlog
+
+    heartbeat, appliance_state, _t = _wire_bundle(
+        monkeypatch,
+        tmp_path,
+        is_member=True,
+        live_members=["192.168.0.199", "192.168.0.133", "192.168.0.125"],
+    )
+    assert (
+        heartbeat._server_firewall_body_is_usable(
+            _bundle(FLEET_BODY), structlog.get_logger("t")
+        )
+        is False
+    )
+    state = appliance_state.read_firewall_state()
+    assert state and state["source"] == "control-plane"
+
+
+def test_a_refused_body_falls_back_to_a_render_that_admits_the_peers(
+    monkeypatch, tmp_path
+) -> None:
+    """The refusal must still converge: the in-pod fallback recovers the live
+    peer set and writes a body that keeps this node in raft."""
+    heartbeat, _as, trigger = _wire_bundle(
+        monkeypatch,
+        tmp_path,
+        is_member=True,
+        live_members=["192.168.0.199", "192.168.0.133", "192.168.0.125"],
+    )
+    _dispatch(heartbeat, FLEET_BODY)
+    assert trigger.exists(), "a refusal left the node with nothing to apply"
+    text = trigger.read_text()
+    assert not text.startswith("fleet-hash-1\n"), "the refused server body was used"
+    assert fpa.body_opens_etcd_peers(text)
+    assert "192.168.0.199" in text and "192.168.0.125" in text
+
+
+def test_a_three_node_body_that_admits_the_peers_is_used(monkeypatch, tmp_path) -> None:
+    heartbeat, _as, trigger = _wire_bundle(
+        monkeypatch,
+        tmp_path,
+        is_member=True,
+        live_members=["192.168.0.199", "192.168.0.133", "192.168.0.125"],
+    )
+    _dispatch(heartbeat, CP_BODY)
+    assert trigger.read_text().startswith("fleet-hash-1\n")
+
+
+def test_unreadable_membership_still_refuses_a_peerless_body(
+    monkeypatch, tmp_path
+) -> None:
+    """A member whose peer set cannot be read stays conservative — the same
+    answer the in-pod path gives (``would_self_partition`` with None)."""
+    import structlog
+
+    heartbeat, _as, _t = _wire_bundle(
+        monkeypatch, tmp_path, is_member=True, live_members=None
+    )
+    assert (
+        heartbeat._server_firewall_body_is_usable(
+            _bundle(FLEET_BODY), structlog.get_logger("t")
+        )
+        is False
+    )

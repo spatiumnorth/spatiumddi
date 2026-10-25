@@ -120,6 +120,8 @@ backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:48
 backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:49
 backend/alembic/versions/a2078c5e1d90_dns_server_agent_version.py:drop_column:38
 backend/alembic/versions/a2e7f31c9b48_influxdb_push_export.py:drop_table:99
+backend/alembic/versions/a3c7e91f2d58_retention_settings.py:drop_column:37
+backend/alembic/versions/a3c7e91f2d58_retention_settings.py:drop_column:38
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:83
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:84
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:85
@@ -409,6 +411,7 @@ backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_c
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_constraint_fk:109
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_table:105
 backend/alembic/versions/c6c3137e3554_appliance_slot_image_upload.py:drop_table:110
+backend/alembic/versions/c6d2e84f1a97_subnet_skip_reverse_zone.py:drop_column:39
 backend/alembic/versions/c7a3e1f90d24_subnet_utilization_history.py:drop_table:47
 backend/alembic/versions/c7a3f1e28d94_appliance_cluster_join_state_at.py:drop_column:57
 backend/alembic/versions/c7d1f04e9a2b_tls_cert_target_ip_address.py:drop_column:44

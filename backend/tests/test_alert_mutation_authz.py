@@ -144,3 +144,70 @@ async def test_superadmin_can_evaluate(client: AsyncClient, db_session: AsyncSes
     await db_session.commit()
     resp = await client.post("/api/v1/alerts/evaluate", headers={"Authorization": f"Bearer {tok}"})
     assert resp.status_code == 200, resp.text
+
+
+async def test_manual_evaluate_is_audited(client: AsyncClient, db_session: AsyncSession) -> None:
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+
+    _, tok = await _user(db_session, superadmin=True)
+    await db_session.commit()
+    resp = await client.post("/api/v1/alerts/evaluate", headers={"Authorization": f"Bearer {tok}"})
+    assert resp.status_code == 200, resp.text
+    rows = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.action == "evaluate")))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].resource_type == "alert_rule"
+    assert rows[0].result == "success"
+
+
+async def _user_with(db: AsyncSession, perms: list[dict]) -> str:
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@example.com",
+        display_name="U",
+        hashed_password=hash_password("x"),
+    )
+    db.add(u)
+    await db.flush()
+    role = Role(name=f"r-{uuid.uuid4().hex[:6]}", description="", permissions=perms)
+    db.add(role)
+    await db.flush()
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    group.roles = [role]
+    group.users = [u]
+    db.add(group)
+    await db.flush()
+    await db.commit()
+    return create_access_token(str(u.id))
+
+
+async def test_alert_reads_need_the_read_permission(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    other = await _user_with(db_session, [{"action": "read", "resource_type": "subnet"}])
+    allowed = await _user_with(db_session, [{"action": "read", "resource_type": "alert"}])
+    rule = AlertRule(
+        name="r",
+        description="",
+        rule_type="subnet_utilization",
+        severity="warning",
+        enabled=True,
+        threshold_percent=90,
+    )
+    db_session.add(rule)
+    await db_session.commit()
+    for path in (
+        "/api/v1/alerts/rules",
+        "/api/v1/alerts/events",
+        "/api/v1/alerts/rule-types",
+        f"/api/v1/alerts/rules/{rule.id}",
+    ):
+        r = await client.get(path, headers={"Authorization": f"Bearer {other}"})
+        assert r.status_code == 403, (path, r.text)
+        r = await client.get(path, headers={"Authorization": f"Bearer {allowed}"})
+        assert r.status_code == 200, (path, r.text)
