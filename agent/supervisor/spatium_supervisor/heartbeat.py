@@ -75,6 +75,8 @@ log = structlog.get_logger(__name__)
 # subprocess piece). C2 ships only the env render; C3 wires the
 # actual ``docker compose up -d`` invocation.
 _ROLE_ENV_FILENAME = "role-compose.env"
+# #2801 — read by the re-register path in ``__main__``.
+ROLE_ENV_FILENAME = _ROLE_ENV_FILENAME
 
 # #170 Wave C3 — nftables drop-in path. Lives under /etc/nftables.d
 # (bind-mounted rw on the supervisor compose entry). The host's
@@ -1131,6 +1133,14 @@ def heartbeat_once(
             if appliance_state.detect_deployment_kind() == "appliance":
                 try:
                     lifecycle = tear_down_supervised_services()
+                    # #2801 — the stamp says the role chart for this env is
+                    # applied, and the teardown just un-applied it. Left in
+                    # place, the first accepted heartbeat after the node is
+                    # approved again (same row, or a re-registration that
+                    # restored its roles) renders the same env, matches the
+                    # stamp and skips the apply, so DNS and DHCP stayed down
+                    # until the watchdog's next pass (up to 5 min).
+                    _clear_last_apply_hash(cfg.state_dir)
                     if lifecycle.stopped:
                         log.warning(
                             "supervisor.heartbeat.revoked_teardown",
@@ -2001,6 +2011,15 @@ def _write_last_apply_hash(state_dir: Path, env_hash: str) -> None:
         pass
 
 
+def _clear_last_apply_hash(state_dir: Path) -> None:
+    """Drop the apply stamp so the next accepted heartbeat re-applies the role
+    chart (#2801), whatever env it renders."""
+    try:
+        (state_dir / _LAST_APPLY_HASH_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:
     """Write the most recent compose-lifecycle outcome to disk so the
     NEXT heartbeat reports it (this one has already left)."""
@@ -2029,3 +2048,8 @@ def _read_lifecycle_state(state_dir: Path) -> tuple[str | None, str | None]:
     state = body[0].strip() if body else None
     reason = "\n".join(body[1:]).strip() or None if len(body) > 1 else None
     return state, reason
+
+
+# #2801 — the re-register path reports the last apply's outcome with the roles
+# it asks the control plane to restore.
+read_lifecycle_state = _read_lifecycle_state

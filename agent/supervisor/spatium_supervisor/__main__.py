@@ -32,7 +32,13 @@ import dataclasses
 from . import appliance_state, approval_state, cp_tls, self_bootstrap_token
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import _effective_control_plane_url, heartbeat_once, next_heartbeat_delay
+from .heartbeat import (
+    ROLE_ENV_FILENAME,
+    _effective_control_plane_url,
+    heartbeat_once,
+    next_heartbeat_delay,
+    read_lifecycle_state,
+)
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -52,6 +58,7 @@ from .register import (
     RegisterThrottled,
     register,
 )
+from .role_orchestrator import last_assigned_roles
 from .state import ensure_layout
 
 
@@ -178,6 +185,7 @@ def _maybe_register(
         )
 
     cached_appliance_id = load_appliance_id(cfg.state_dir)
+    restore_roles: dict[str, object] | None = None
     if cached_appliance_id is not None:
         # Issue #170 Wave E follow-up + #272 Phase 1 audit — revoke
         # recovery. If the supervisor flipped to
@@ -224,10 +232,19 @@ def _maybe_register(
                     )
                     return cfg
                 cfg = minted
+                # #2801 — the roles this node was serving, read back from its
+                # role env before the new registration can overwrite it. The
+                # lost row took the assignment with it; without this the node
+                # came back approved and serving nothing.
+                restore_roles = last_assigned_roles(
+                    cfg.state_dir / ROLE_ENV_FILENAME,
+                    read_lifecycle_state(cfg.state_dir)[0],
+                )
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
                 via_self_bootstrap=via_self_bootstrap,
+                restore_roles=(restore_roles or {}).get("roles", []),
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -276,6 +293,7 @@ def _maybe_register(
                 # waiting for the first heartbeat. None on docker / k8s
                 # supervisors (no role-config bind mount).
                 appliance_variant=appliance_state.detect_appliance_variant(),
+                restore_roles=restore_roles,
             )
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
