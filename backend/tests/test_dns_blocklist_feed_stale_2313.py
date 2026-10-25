@@ -182,28 +182,12 @@ async def _noop_publish(_channel: str) -> None:
 
 
 def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, *, fail: bool) -> None:
-    class _Resp:
-        text = "a.example\n"
+    async def _fake_get_text(_url: str, **_kw: object) -> str:
+        if fail:
+            raise httpx.ConnectError("boom")
+        return "a.example\n"
 
-        def raise_for_status(self) -> None:
-            return None
-
-    class _Client:
-        def __init__(self, *a: object, **kw: object) -> None:
-            pass
-
-        async def __aenter__(self) -> _Client:
-            return self
-
-        async def __aexit__(self, *a: object) -> None:
-            return None
-
-        async def get(self, _url: str) -> _Resp:
-            if fail:
-                raise httpx.ConnectError("boom")
-            return _Resp()
-
-    monkeypatch.setattr(dns_tasks.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(dns_tasks, "safe_get_text", _fake_get_text)
     monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
