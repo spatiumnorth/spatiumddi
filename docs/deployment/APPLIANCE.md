@@ -507,6 +507,31 @@ the reference topologies are in
   BestEffort operator restart triggers a watched-volume reconciliation
   storm (issue #315). Its startup probe is also loosened to a 60s window
   for slow VMs. Budget ~128 MiB for it when sizing a control node.
+  - **WAL retention and stuck instances (#2132, #2317).** No WAL archive
+    is configured, so WAL lives only in each instance's `pg_wal` on the
+    node's `/var` (local-path does not enforce the PVC's 8Gi). The Cluster
+    keeps `wal_keep_size: 2GB` so a former primary can `pg_rewind` after a
+    failover, and caps what a replication slot may hold back at
+    `max_slot_wal_keep_size: 3GB`. PostgreSQL keeps the larger of the two,
+    plus up to `max_wal_size` (1GB) since the last checkpoint, so `pg_wal`
+    stays near 4GB even when a slot's standby never follows a new primary;
+    before the cap, one primary's `pg_wal` reached 26 GB while CNPG read
+    healthy. A standby past the cap loses its slot and needs a re-clone, as
+    does a former primary whose rewind needs WAL that is gone. CNPG retries
+    those for ever, so the seed supervisor watches each non-primary
+    instance's log for the loops that never end on their own (`pg_rewind`
+    failing, "Refusing to restore future timeline history file", "requested
+    WAL segment … has already been removed", an invalidated slot). After 10
+    minutes of the same loop under the same primary it logs
+    `supervisor.heartbeat.postgres_instance_stuck` and then annotates the
+    pod `alpha.cnpg.io/unrecoverable`, CNPG's documented request to delete
+    the instance's pod and PVCs and join a fresh copy from the primary
+    (`supervisor.heartbeat.postgres_instance_reclone`). One instance at a
+    time, never the primary, never during a failover or switchover, and
+    only while the primary is Ready. While it runs, the database row on the
+    cluster-health page reads `degraded` (`readyInstances` below
+    `instances`). The manual equivalent is `kubectl cnpg destroy <cluster>
+    <n>`, or deleting the instance's PVC and then its pod.
 - **Redis HA = Sentinel.** Each member pairs a redis-server + a sentinel
   sidecar; app / worker / beat resolve the master via a `sentinel://`
   URL. `sentinel.replicas` scales with the member count.

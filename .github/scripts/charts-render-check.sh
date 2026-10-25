@@ -79,6 +79,11 @@
 #                      container whose liveness probe checks :53 carries a
 #                      startup probe of at least 30 min (#2223), or a cold
 #                      start at scale is killed before the daemon listens.
+#   cnpg-recovery    — every render, plus --require passes and negative
+#                      controls: each CNPG Cluster sets max_slot_wal_keep_size
+#                      and bounds pg_wal at half its volume (#2317), and the
+#                      supervisor's namespace Role grants what its re-clone of
+#                      a stuck instance needs, pods/log get + pods patch (#2132).
 #   bind9 memory     — the appliance dns-bind9 container takes its memory from
 #                      ``dnsBind9.memory`` (sized from node RAM by the
 #                      supervisor, #2223) and an explicit memory in
@@ -180,6 +185,10 @@ render() { # name chart [helm --set args...]
     python3 "$ROOT/.github/scripts/chart-vip-client-ip.py" --allow dhcp-kea-relay "$file" \
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-slot-image-mirror.py" "$file" \
+        || failures=$((failures + 1))
+    # #2317 / #2132 — CNPG WAL bounded at half its volume; the supervisor may
+    # re-clone a stuck instance.
+    python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" "$file" \
         || failures=$((failures + 1))
     # #590 / #1541 — required anti-affinity with a surge-first rollout
     # wedges once replicas == nodes.
@@ -409,6 +418,31 @@ render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
 # wrong values path in cnpg-cluster.yaml ships green with Postgres at
 # priority 0, which is precisely what the gate exists to prevent.
 render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@]}"
+echo "── CNPG WAL budget (umbrella, #2317)"
+python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster \
+    "$OUT/umbrella-ha.yaml" "$OUT/umbrella-posture-ha.yaml" || failures=$((failures + 1))
+# Negative controls: PostgreSQL's unbounded default, and a cap the volume
+# cannot hold, must each be refused naming #2317, or the pass above could be
+# reading a render it cannot parse.
+echo "── negative controls: an unbounded or oversized slot WAL cap must fail"
+neg2317() { # label [helm --set args...]
+    local label="$1"; shift
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        "${UMBRELLA_HA[@]}" "$@" \
+        | python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster - 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#2317"; then
+        echo "   ok: $label refused by the #2317 guard"
+    else
+        echo "   FAIL: expected the #2317 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg2317 "max_slot_wal_keep_size -1" \
+    --set-string postgresql.cnpg.parameters.max_slot_wal_keep_size=-1
+neg2317 "a 3GB cap on a 4Gi volume" --set postgresql.persistence.size=4Gi
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
 
@@ -543,6 +577,26 @@ python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
 echo "── DNS startup probe (appliance, #2223)"
 python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" --require \
     "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── supervisor may re-clone a stuck Postgres instance (appliance, #2132)"
+python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-supervisor-role \
+    "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── negative control: a supervisor Role without pods/log must fail"
+if python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-supervisor-role \
+    <(python3 - "$OUT/appliance-all-on.yaml" <<'PYEOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d.get("kind") == "Role" and d["metadata"]["name"] == "spatium-supervisor-namespace":
+        for rule in d["rules"]:
+            rule["resources"] = [r for r in rule["resources"] if r != "pods/log"]
+print(yaml.safe_dump_all(docs))
+PYEOF
+) >/dev/null 2>&1; then
+    echo "   FAIL: chart-cnpg-recovery.py passed a supervisor Role without pods/log" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: supervisor Role without pods/log refused"
+fi
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true

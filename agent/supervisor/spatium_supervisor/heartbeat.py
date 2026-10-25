@@ -38,7 +38,7 @@ import time
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
@@ -66,6 +66,9 @@ from .service_lifecycle import (
     role_release_fingerprint,
     tear_down_supervised_services,
 )
+
+if TYPE_CHECKING:
+    from . import k8s_api
 
 log = structlog.get_logger(__name__)
 
@@ -337,6 +340,14 @@ _etcd_evictions = etcd_evict.EtcdEvictions()
 # "Postgres is whole" early-out; cleared by the tick that settles them.
 _stranded_pending: set[str] = set()
 
+# #2132 — CNPG instances seen looping on WAL they can never get, and since
+# when (``k8s_api.reclone_stuck_postgres_instances``). Module state: a
+# supervisor restart starts each clock again, which only delays a re-clone.
+_stuck_postgres: dict[str, k8s_api.StuckSighting] = {}
+# The instances already reported as stuck, so the warning is logged when an
+# instance starts looping and not on every tick after.
+_stuck_postgres_reported: set[str] = set()
+
 # #1541 — slot-image mirror claims the seed deleted off an evicted node and
 # still owes the cluster a fresh copy of (``{claim_name: manifest}``). Nothing
 # else re-creates them — the claim is a plain Helm-owned PVC — so they are
@@ -425,6 +436,49 @@ class _ReplaceHold:
 
 
 _replace_hold = _ReplaceHold()
+
+
+def _reclone_stuck_postgres(log: Any, now: float | None = None) -> k8s_api.PostgresReclone:
+    """#2132 — one seed tick of the stuck-instance re-clone, with its journal.
+
+    ``postgres_instance_stuck`` (warning) is logged once when an instance
+    starts looping, naming the loop and the manual fix, so a deployment
+    whose supervisor cannot act (an older Role without ``pods/log``) still
+    says what is wrong. ``postgres_instance_reclone`` is logged when CNPG is
+    asked to rebuild one."""
+    from . import k8s_api  # noqa: PLC0415
+
+    result = k8s_api.reclone_stuck_postgres_instances(
+        _stuck_postgres, now=time.monotonic() if now is None else now
+    )
+    for instance, seen in result.stuck.items():
+        if instance in _stuck_postgres_reported:
+            continue
+        _stuck_postgres_reported.add(instance)
+        log.warning(
+            "supervisor.heartbeat.postgres_instance_stuck",
+            instance=instance,
+            signature=seen["signature"],
+            reclone_after_s=k8s_api.STUCK_INSTANCE_AFTER_S,
+            manual_fix=f"kubectl cnpg destroy <cluster> {instance}, or delete its PVC then its pod",
+        )
+    _stuck_postgres_reported.intersection_update(result.stuck)
+    for instance in result.marked:
+        log.warning(
+            "supervisor.heartbeat.postgres_instance_reclone",
+            instance=instance,
+            annotation="alpha.cnpg.io/unrecoverable",
+        )
+    if result.deferred_reason and any(
+        s["seconds"] >= k8s_api.STUCK_INSTANCE_AFTER_S for s in result.stuck.values()
+    ):
+        log.info(
+            "supervisor.heartbeat.postgres_instance_reclone_deferred",
+            reason=result.deferred_reason,
+        )
+    if result.error:
+        log.warning("supervisor.heartbeat.postgres_instance_reclone_failed", error=result.error)
+    return result
 
 
 def _replace_names(body_out: dict[str, Any]) -> list[str]:
@@ -1609,6 +1663,14 @@ def heartbeat_once(
             )
         if pg_err:
             log.warning("supervisor.heartbeat.postgres_storage_reclaim_failed", error=pg_err)
+
+        # #2132 — a former primary that cannot pg_rewind, or a standby whose
+        # slot #2317's cap invalidated, loops for ever: no WAL archive exists
+        # to restore from and CNPG never re-clones on its own. After 10
+        # minutes of the same loop under the same primary the seed asks CNPG
+        # for the re-clone a person would do by hand (one instance at a time,
+        # never the primary).
+        _reclone_stuck_postgres(log)
 
         # #590 — cluster DNS must survive a node loss. k3s's bundled
         # CoreDNS is a single replica that deterministically sits on the

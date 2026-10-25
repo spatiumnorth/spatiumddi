@@ -1224,6 +1224,255 @@ def reclaim_stranded_postgres_storage(
                            terminating)
 
 
+# #2132 — re-clone a CloudNativePG instance stuck on WAL it can never get.
+#
+# A former primary that cannot ``pg_rewind`` (the WAL it needs was recycled,
+# or cut short by the kill that made it a former primary, and the appliance
+# has no WAL archive to restore it from), or a standby whose replication slot
+# #2317's ``max_slot_wal_keep_size`` invalidated, loops for ever: CNPG retries,
+# never re-clones, and the cluster runs one copy short until someone deletes
+# the PVC by hand. CNPG documents one way to ask it for that re-clone, the
+# ``alpha.cnpg.io/unrecoverable`` pod annotation: the operator deletes the pod
+# and its PVCs and joins a fresh instance from the primary, and ignores the
+# annotation on the current or target primary.
+_CNPG_UNRECOVERABLE_ANNOTATION = "alpha.cnpg.io/unrecoverable"
+_CNPG_JOB_ROLE_LABEL = "cnpg.io/jobRole"
+
+# The loops that never end on their own while no WAL archive is configured.
+# Each is a substring of a line CNPG's instance manager or PostgreSQL writes
+# to the instance pod's log; a hit only counts once it has held for
+# STUCK_INSTANCE_AFTER_S, so one transient line (a pg_rewind attempted while
+# the new primary was still promoting) is never enough.
+_STUCK_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # #2132's first signature: pg_rewind asks the (absent) archive for a
+    # segment the former primary no longer has.
+    ("pg_rewind_archive", ("could not restore file", "from archive")),
+    # #2132's fourth occurrence: the segment is the instance's own, cut short
+    # ("could not read file ... read 0 of 8192"); every pg_rewind failure
+    # ends in this line.
+    ("pg_rewind_failed", ("Failed to execute pg_rewind",)),
+    # #2132's second and third occurrences.
+    ("future_timeline", ("Refusing to restore future timeline history file",)),
+    # A standby asking for WAL the primary has recycled, or whose slot the
+    # #2317 cap invalidated.
+    ("wal_removed", ("has already been removed",)),
+    ("slot_invalidated", ("can no longer get changes from replication slot",)),
+)
+
+# How long a signature must keep appearing before the instance is re-cloned.
+# The QA desk's drill gate is 15 minutes; a rewind that is going to work does
+# so within a minute or two of the instance coming back.
+STUCK_INSTANCE_AFTER_S = 600
+# The log window read per instance per tick: longer than the heartbeat
+# interval (30 s) and the slowest loop above (pg_rewind every 10-20 s).
+_STUCK_LOG_WINDOW_S = 120
+_STUCK_LOG_LIMIT_BYTES = 256 * 1024
+
+
+def stuck_signature(log_text: str) -> str | None:
+    """The first never-heals signature in ``log_text``, or None."""
+    for name, parts in _STUCK_SIGNATURES:
+        if all(part in log_text for part in parts):
+            return name
+    return None
+
+
+@dataclass
+class StuckSighting:
+    """An instance first seen looping at ``since`` (the caller's clock),
+    under ``primary``. A change of primary starts the clock again: the
+    instance may be able to follow the new one."""
+
+    primary: str
+    since: float
+    signature: str
+
+
+@dataclass
+class PostgresReclone:
+    """What one :func:`reclone_stuck_postgres_instances` call did.
+
+    ``stuck`` maps each looping instance to ``{"signature", "seconds"}``;
+    ``marked`` names the instance annotated for a re-clone this call (at
+    most one); ``deferred_reason`` says why a due instance was not."""
+
+    stuck: dict[str, dict[str, Any]] = field(default_factory=dict)
+    marked: list[str] = field(default_factory=list)
+    deferred_reason: str = ""
+    error: str | None = None
+
+
+def _pod_ready(pod: dict) -> bool:
+    for cond in (pod.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "Ready":
+            return str(cond.get("status")) == "True"
+    return False
+
+
+def reclone_stuck_postgres_instances(
+    tracker: dict[str, StuckSighting],
+    *,
+    now: float,
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+    stuck_after_s: float = STUCK_INSTANCE_AFTER_S,
+) -> PostgresReclone:
+    """Find CNPG instances looping on WAL they can never get, and have CNPG
+    re-clone one of them. ``tracker`` is the caller's state across ticks
+    (mutated in place); ``now`` is a monotonic clock.
+
+    An instance counts as stuck when one of :data:`_STUCK_SIGNATURES` is in
+    its pod's last ``_STUCK_LOG_WINDOW_S`` of log on every call for
+    ``stuck_after_s``, under the same primary. Readiness is deliberately not
+    a condition: a former primary looping on ``pg_rewind`` is not ready, but a
+    standby that lost its slot (#2317) runs as a hot standby and reads Ready
+    while it streams nothing.
+
+    A due instance is annotated ``alpha.cnpg.io/unrecoverable`` only when:
+
+    * the Cluster names one primary (``currentPrimary == targetPrimary``), so
+      no failover or switchover is under way, and the instance is not it;
+    * the primary's pod is Ready, since the re-clone copies from it;
+    * no other re-clone is in flight: no instance pod already carries the
+      annotation or is terminating, and no CNPG ``join`` Job pod is running.
+      One copy is rebuilt at a time, as a person doing it by hand would, so
+      a primary left alone (#2132's fourth occurrence: six stuck at once)
+      is never asked for six base backups together.
+
+    Kubeapi errors are returned, never guessed around; a 403 on the log read
+    means the supervisor Role predates #2132 and nothing is marked.
+    """
+    cr_path = (
+        f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
+        f"/clusters/{quote(cluster_name)}"
+    )
+    try:
+        status, resp = _request("GET", cr_path)
+    except RuntimeError as exc:
+        return PostgresReclone(error=str(exc))
+    if status == 404:
+        tracker.clear()
+        return PostgresReclone()  # not a cnpg deployment / Cluster not up yet
+    if status != 200:
+        return PostgresReclone(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        cr_status = json.loads(resp).get("status") or {}
+    except (ValueError, AttributeError):
+        return PostgresReclone(error="unparseable Cluster CR")
+    current = str(cr_status.get("currentPrimary") or "")
+    target = str(cr_status.get("targetPrimary") or "")
+    if not current or current != target:
+        # A failover or switchover is under way, or the primary is unknown:
+        # nothing seen now says anything about the next primary.
+        tracker.clear()
+        return PostgresReclone(
+            deferred_reason="the Cluster names no single primary (failover or switchover under way)"
+        )
+
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    selector = quote(f"{_CNPG_CLUSTER_LABEL}={cluster_name}", safe="")
+    try:
+        status, resp = _request("GET", f"{base}/pods?labelSelector={selector}")
+    except RuntimeError as exc:
+        return PostgresReclone(error=str(exc))
+    if status != 200:
+        return PostgresReclone(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        pods = json.loads(resp).get("items", [])
+    except (ValueError, AttributeError):
+        return PostgresReclone(error="unparseable pod list")
+
+    instances: dict[str, dict] = {}
+    rebuilding: list[str] = []
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        name = str(meta.get("name") or "")
+        if labels.get(_CNPG_JOB_ROLE_LABEL):
+            phase = (pod.get("status") or {}).get("phase")
+            if labels.get(_CNPG_JOB_ROLE_LABEL) == "join" and phase in ("Pending", "Running"):
+                rebuilding.append(name)
+            continue
+        instance = str(labels.get(_CNPG_INSTANCE_LABEL) or "")
+        if not instance:
+            continue
+        instances[instance] = pod
+        if (meta.get("annotations") or {}).get(_CNPG_UNRECOVERABLE_ANNOTATION) or meta.get(
+            "deletionTimestamp"
+        ):
+            rebuilding.append(instance)
+
+    out = PostgresReclone()
+    for gone in set(tracker) - (set(instances) - {current}):
+        tracker.pop(gone, None)
+    for instance, pod in sorted(instances.items()):
+        if instance == current:
+            continue
+        name = str((pod.get("metadata") or {}).get("name") or instance)
+        path = (
+            f"{base}/pods/{quote(name)}/log?container=postgres"
+            f"&sinceSeconds={_STUCK_LOG_WINDOW_S}&limitBytes={_STUCK_LOG_LIMIT_BYTES}"
+        )
+        try:
+            status, resp = _request("GET", path)
+        except RuntimeError as exc:
+            out.error = f"pod {name} log: {exc}"
+            continue
+        if status == 403:
+            out.error = f"pod {name} log: kubeapi status 403 (pods/log not granted): {resp[:200]!r}"
+            return out
+        if status != 200:
+            # A container not started yet (400) or a pod gone between the
+            # list and the read: no evidence either way, so the clock is
+            # neither advanced nor reset.
+            continue
+        signature = stuck_signature(resp.decode("utf-8", "replace"))
+        seen = tracker.get(instance)
+        if signature is None:
+            tracker.pop(instance, None)
+            continue
+        if seen is None or seen.primary != current:
+            seen = tracker[instance] = StuckSighting(current, now, signature)
+        seen.signature = signature
+        out.stuck[instance] = {"signature": signature, "seconds": int(now - seen.since)}
+
+    due = sorted(
+        (i for i, s in out.stuck.items() if s["seconds"] >= stuck_after_s),
+        key=lambda i: -out.stuck[i]["seconds"],
+    )
+    if not due:
+        return out
+    if out.error:
+        out.deferred_reason = "a log read failed this tick; retrying next tick"
+        return out
+    primary_pod = instances.get(current)
+    if primary_pod is None or not _pod_ready(primary_pod):
+        out.deferred_reason = f"the primary {current} is not Ready; a re-clone copies from it"
+        return out
+    if rebuilding:
+        out.deferred_reason = f"a re-clone is already in flight ({', '.join(sorted(rebuilding))})"
+        return out
+    instance = due[0]
+    name = str((instances[instance].get("metadata") or {}).get("name") or instance)
+    patch = {"metadata": {"annotations": {_CNPG_UNRECOVERABLE_ANNOTATION: "true"}}}
+    try:
+        status, resp = _request(
+            "PATCH",
+            f"{base}/pods/{quote(name)}",
+            body=json.dumps(patch).encode(),
+            content_type="application/merge-patch+json",
+        )
+    except RuntimeError as exc:
+        out.error = f"pod {name} annotate: {exc}"
+        return out
+    if status not in (200, 201):
+        out.error = f"pod {name} annotate: kubeapi status {status}: {resp[:200]!r}"
+        return out
+    out.marked.append(instance)
+    tracker.pop(instance, None)
+    return out
+
+
 # #272 — durable control-plane state via k3s HelmChartConfig.
 #
 # The seed supervisor reflects cluster state (control-plane member count,
