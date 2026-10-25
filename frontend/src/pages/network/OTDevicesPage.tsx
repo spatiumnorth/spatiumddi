@@ -285,7 +285,25 @@ export function OTDevicesPage() {
                 {devicesQ.isLoading ? (
                   "Loading devices…"
                 ) : (
-                  <ListEmpty error={devicesQ.error} what="OT devices">
+                  <ListEmpty
+                    error={devicesQ.error}
+                    what="OT devices"
+                    filtered={
+                      search.trim() !== "" ||
+                      protocolFilter !== "" ||
+                      roleFilter !== "" ||
+                      purdueFilter !== "" ||
+                      subnetFilter !== ""
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setProtocolFilter("");
+                      setRoleFilter("");
+                      setPurdueFilter("");
+                      setSubnetFilter("");
+                      setPage(1);
+                    }}
+                  >
                     No OT descriptors recorded. Attach one to an existing IPAM
                     address to start documenting the plant.
                   </ListEmpty>
