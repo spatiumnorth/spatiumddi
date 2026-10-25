@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
@@ -63,7 +64,10 @@ from app.services.backup.targets import (
     safe_filename,
 )
 
-router = APIRouter()
+# nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
+# so every body here is authorised from its headers before it is read
+# (app.api.pre_body_auth).
+router = APIRouter(route_class=PreBodyAuthRoute)
 logger = structlog.get_logger(__name__)
 
 

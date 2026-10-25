@@ -47,3 +47,27 @@ def test_size_parser_negative_control() -> None:
     # size as large would pass it vacuously.
     assert not _mb("512MB") > CNPG_DEFAULT_WAL_KEEP_MB
     assert _mb("2GB") == 2048
+
+
+# #2317 — PostgreSQL's own default for max_slot_wal_keep_size is -1 (no cap).
+def _gib(q: str) -> float:
+    m = re.fullmatch(r"(\d+)(Mi|Gi|Ti)", q)
+    assert m, f"unparsed volume size {q!r}"
+    return int(m.group(1)) * {"Mi": 1 / 1024, "Gi": 1, "Ti": 1024}[m.group(2)]
+
+
+def test_cnpg_caps_the_wal_a_replication_slot_keeps() -> None:
+    pg = _values(UMBRELLA)["postgresql"]
+    params = pg["cnpg"]["parameters"]
+    assert "max_slot_wal_keep_size" in params, (
+        "postgresql.cnpg.parameters has no max_slot_wal_keep_size: a slot for a standby that "
+        "never follows a new primary keeps WAL until the node's /var is full (#2317)"
+    )
+    cap = _mb(params["max_slot_wal_keep_size"])
+    keep = _mb(params["wal_keep_size"])
+    # A cap at or below wal_keep_size would let a slot protect nothing more.
+    assert cap > keep
+    # PostgreSQL keeps max(cap, wal_keep_size) plus up to max_wal_size (1GB
+    # default) since the last checkpoint: at most half the instance volume.
+    max_wal = _mb(params.get("max_wal_size", "1GB"))
+    assert max(cap, keep) + max_wal <= _gib(pg["persistence"]["size"]) * 1024 / 2

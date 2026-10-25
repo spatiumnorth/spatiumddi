@@ -31,6 +31,7 @@ from app.core.agent_wake import (
     dhcp_wake_channels,
     wake_subscription,
 )
+from app.core.celery_dispatch import dispatch
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dhcp.kea import option_defs_for_option_maps
@@ -819,6 +820,12 @@ async def agent_config_longpoll(
                                 # [...]}`` so a centralized Kea matches this
                                 # scope on giaddr for relayed remote subnets.
                                 "relay_addresses": list(s.relay_addresses),
+                                # #2731: the classes of the PXE profile bound
+                                # to this scope. The agent has Kea evaluate
+                                # them for this subnet alone; rendered for the
+                                # whole server, one scope's profile booted the
+                                # PXE clients of every scope on it.
+                                "pxe_class_names": list(s.pxe_class_names),
                                 "pools": [
                                     {
                                         "start_ip": p.start_ip,
@@ -2039,7 +2046,7 @@ async def agent_dhcp_fingerprints(
             for mac in enqueue_macs:
                 # Carry the reporting server so the IP stamp stays in the
                 # spaces it serves (#2577).
-                lookup_fingerprint_task.delay(mac, str(server.id))
+                await dispatch(lookup_fingerprint_task, mac, str(server.id))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",

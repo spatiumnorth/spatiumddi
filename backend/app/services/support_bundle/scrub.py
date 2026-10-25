@@ -480,6 +480,41 @@ def _pem_body_like(line: str, *, last: bool = False) -> bool:
     return bool(pattern.fullmatch(token))
 
 
+def _pem_prefix_shape(tokens: list[str]) -> list[str]:
+    """The log prefix in front of a body token, with its digits folded so
+    two timestamps of the same format compare equal."""
+    return [re.sub(r"[0-9]", "0", t) for t in tokens[:-1]]
+
+
+def _pem_short_last_line(line: str, previous: str | None) -> bool:
+    """Whether ``line`` is the short last line of the key body that ended
+    with ``previous`` (its last full-width body line).
+
+    A body line needs a 16-character token, so the key's last line, which
+    is usually shorter, ends the run of body lines on its own. It is part
+    of the key when its token is base64 and shorter than ``previous``'s,
+    and it carries the same log prefix (same tokens, digits aside) in front
+    of it. A log line that follows the key and says anything more than one
+    base64-shaped word has a different shape and is kept.
+    """
+    if previous is None:
+        return False
+    tokens = line.split()
+    prev_tokens = previous.split()
+    if not tokens or not prev_tokens:
+        return False
+    token = tokens[-1]
+    if len(token) >= len(prev_tokens[-1]) or not _PEM_LAST_TOKEN_RE.fullmatch(token):
+        return False
+    return _pem_prefix_shape(tokens) == _pem_prefix_shape(prev_tokens)
+
+
+def _pem_full_body_line(line: str) -> bool:
+    """A line whose last token is a full-width key body token."""
+    tokens = line.split()
+    return bool(tokens) and bool(_PEM_BODY_TOKEN_RE.fullmatch(tokens[-1]))
+
+
 def _pem_line_tail(rest: str) -> str:
     """What may stay of a line after an unterminated BEGIN marker: nothing
     when it carries key material (a body token, or an escaped newline that
@@ -511,6 +546,7 @@ def _redact_pem_fragments(text: str) -> tuple[str, int]:
             hits += 1
             i += 1
             taken = 0
+            previous: str | None = None
             while (
                 i < len(lines)
                 and taken < _PEM_MAX_LINES
@@ -518,8 +554,20 @@ def _redact_pem_fragments(text: str) -> tuple[str, int]:
                 and not _PEM_END_RE.search(lines[i])
                 and _pem_body_like(lines[i])
             ):
+                if _pem_full_body_line(lines[i]):
+                    previous = lines[i]
                 i += 1
                 taken += 1
+            # The run stops at the key's last line when that line is short
+            # (no END follows it here, so nothing else would take it).
+            if (
+                i < len(lines)
+                and taken < _PEM_MAX_LINES
+                and not _PEM_BEGIN_RE.search(lines[i])
+                and not _PEM_END_RE.search(lines[i])
+                and _pem_short_last_line(lines[i], previous)
+            ):
+                i += 1
             continue
         if end:
             taken = 0
@@ -562,9 +610,20 @@ def redact_log_tail(text: str, lines: int, *, requested: int) -> str:
         out.pop()
     if len(text.splitlines()) >= requested:
         skip = 0
+        previous: str | None = None
         while skip < len(out) and skip < _PEM_MAX_LINES and out[skip].strip():
             if _PEM_REDACTED in out[skip] or not _pem_body_like(out[skip]):
                 break
+            if _pem_full_body_line(out[skip]):
+                previous = out[skip]
+            skip += 1
+        # The same short last line the fragment pass takes after a BEGIN.
+        if (
+            skip < len(out)
+            and skip < _PEM_MAX_LINES
+            and _PEM_REDACTED not in out[skip]
+            and _pem_short_last_line(out[skip], previous)
+        ):
             skip += 1
         out = out[skip:]
     if lines > 0:

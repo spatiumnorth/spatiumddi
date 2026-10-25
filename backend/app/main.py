@@ -181,6 +181,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "network_service"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Address Set Editor": (
@@ -193,6 +194,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "ownership without subnet write.",
         [
             {"action": "admin", "resource_type": "address_set"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Change Approver": (
@@ -206,6 +208,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "approve", "resource_type": "change_request"},
             {"action": "read", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Requester": (
@@ -220,6 +223,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "write", "resource_type": "provisioning_request"},
             {"action": "read", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DNS Editor": (
@@ -235,6 +239,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
             {"action": "read", "resource_type": "manage_dns_pools"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DHCP Editor": (
@@ -253,6 +258,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dhcp_client_class"},
             {"action": "admin", "resource_type": "dhcp_option_template"},
             {"action": "admin", "resource_type": "dhcp_mac_block"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Network Editor": (
@@ -289,6 +295,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "tls_cert"},
             {"action": "admin", "resource_type": "dnsbl"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Auditor": (
@@ -304,6 +311,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "tls_cert"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Compliance Editor": (
@@ -318,6 +326,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Appliance Operator": (
@@ -334,6 +343,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "superadmin always bypasses anyway.",
         [
             {"action": "admin", "resource_type": "appliance"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
 }
@@ -612,6 +622,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_disk_usage_alert_rule,
             seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
@@ -623,6 +634,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Storage redundancy (#999 Part A) — cannot fire on an appliance
         # with no arrays, or on a supervisor too old to report them.
         await seed_appliance_storage_alert_rule()
+        # /var filling (#2240): silent below 80%, and on a supervisor that
+        # does not report /var.
+        await seed_appliance_disk_usage_alert_rule()
         # Silent supervisor (#2259) — cannot fire with no appliances.
         await seed_appliance_heartbeat_alert_rule()
     except Exception as exc:  # noqa: BLE001
