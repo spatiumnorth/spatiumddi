@@ -932,6 +932,7 @@ _render_control_helmchart() {
     }
     local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_LEFT_MIB WORKER_CONCURRENCY
     local POSTGRES_MEM_MIB POSTGRES_SHARED_BUFFERS_MB POSTGRES_MEM_REQUEST_MIB
+    local PG_CONNECTIONS PG_BACKEND_MIB PG_NEED_MIB
     local CPU_COUNT API_CPU_CORES POSTGRES_CPU_CORES API_LIMITS_YAML POSTGRES_LIMITS_YAML
     local API_SIZING_YAML WORKER_SIZING_YAML POSTGRES_SIZING_YAML POSTGRES_PARAMETERS_YAML
     MEM_TOTAL_MIB=$(_mem_total_mib)
@@ -971,6 +972,18 @@ _render_control_helmchart() {
         if [ "$POSTGRES_MEM_REQUEST_MIB" -lt 256 ]; then POSTGRES_MEM_REQUEST_MIB=256; fi
         # _WORKER_SMALL_NODE_MIB = 12288.
         if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
+        # #2156 — the Postgres limit holds the connections the cluster can open
+        # (k8s_api.postgres_connection_budget). A fresh install is one node:
+        # the api pod's whole pool (10 + 20), the worker's processes plus one,
+        # no WAL sender, and the reserve of 10. One backend costs 14 MiB plus
+        # the page tables mapping shared_buffers (shared_buffers / 512,
+        # rounded up); the limit is never below shared_buffers + 256 MiB + the
+        # connections x that. Only ever raises the share above (a node under
+        # ~6 GiB), so shared_buffers, the request and the worker stay as sized.
+        PG_CONNECTIONS=$(( 1 * (10 + 20 + WORKER_CONCURRENCY + 1) + 0 + 10 ))
+        PG_BACKEND_MIB=$(( 14 + (POSTGRES_SHARED_BUFFERS_MB + 511) / 512 ))
+        PG_NEED_MIB=$(( POSTGRES_SHARED_BUFFERS_MB + 256 + PG_CONNECTIONS * PG_BACKEND_MIB ))
+        if [ "$POSTGRES_MEM_MIB" -lt "$PG_NEED_MIB" ]; then POSTGRES_MEM_MIB=$PG_NEED_MIB; fi
         # >&2, NOT bare echo. THIS FUNCTION'S STDOUT IS THE MANIFEST: the
         # caller runs it inside `{ ... } > "$tmp"`, so anything printed here
         # is captured into spatium-control.yaml. The first line happens to
@@ -981,7 +994,7 @@ _render_control_helmchart() {
         # up, with a parse error in the k3s log as the only symptom.
         # firstboot does `exec >>"$LOG" 2>&1` and the caller redirects only
         # stdout, so stderr is still the log.
-        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB (budget ${BUDGET_MIB} MiB after the platform reserve): api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY} postgres=${POSTGRES_MEM_MIB}Mi shared_buffers=${POSTGRES_SHARED_BUFFERS_MB}MB request=${POSTGRES_MEM_REQUEST_MIB}Mi" >&2
+        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB (budget ${BUDGET_MIB} MiB after the platform reserve): api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY} postgres=${POSTGRES_MEM_MIB}Mi shared_buffers=${POSTGRES_SHARED_BUFFERS_MB}MB request=${POSTGRES_MEM_REQUEST_MIB}Mi connections=${PG_CONNECTIONS}" >&2
     else
         echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
     fi
@@ -1214,6 +1227,13 @@ spec:
       # #1003 item 4 — sized from this node's RAM, matching what the
       # supervisor would otherwise re-render on its first heartbeat.
 ${API_SIZING_YAML}
+      # #2156 — the api's database pool per pod (k8s_api.api_db_pool): the
+      # application's own 10 + 20 on one node. The supervisor shrinks the
+      # overflow as nodes are added, so the connections Postgres' limit is
+      # sized for are all it can be sent.
+      databasePool:
+        size: 10
+        maxOverflow: 20
       replicas: 1  # spatium:cp-size
       # #590 — one api per control-plane node. Without this a promote
       # could land every api pod on the seed, so losing the seed left no
@@ -1650,7 +1670,15 @@ _strip_control_priority_class() {
 #   * the document is re-dumped the way the supervisor dumps it
 #     (``safe_dump(sort_keys=True)``), so the supervisor's own compare against
 #     the CR still holds afterwards;
-#   * a Config or manifest it cannot read is left alone, never fatal.
+#   * a Config or manifest it cannot read is left alone, never fatal;
+#   * #2156 — the Postgres memory LIMIT is not among the keys. The supervisor
+#     sizes it for the cluster's node count, and this script only ever
+#     renders one node: on every boot of a seed with members it would bring
+#     the limit down to the one-node value, and the supervisor's next
+#     heartbeat back up, two CloudNativePG rolling restarts per reboot. An
+#     upgrade that changes the formula is one Postgres rolling restart either
+#     way, written by the supervisor a heartbeat after the release. The same
+#     goes for ``api.databasePool``, which was never in the list.
 # The numbers come from the rendered manifest, not from a second copy of the
 # formula, so this cannot drift from _render_control_helmchart. The keys are
 # the ones the supervisor rewrites on every heartbeat anyway, so an operator
@@ -1679,7 +1707,6 @@ PATHS = (
     ("worker", "concurrency"),
     ("worker", "resources", "limits", "memory"),
     ("postgresql", "resources", "requests", "memory"),
-    ("postgresql", "resources", "limits", "memory"),
     ("postgresql", "resources", "limits", "cpu"),
     ("postgresql", "cnpg", "parameters", "shared_buffers"),
 )

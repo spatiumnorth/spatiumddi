@@ -140,6 +140,16 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
     assert req, "could not find firstboot's Postgres request floor"
     thr = re.search(r'\[ "\$MEM_TOTAL_MIB" -le (\d+) \]; then WORKER_CONCURRENCY=(\d+); else WORKER_CONCURRENCY=(\d+)', src)
     assert thr, "could not find firstboot's concurrency threshold"
+    # #2156 — the connection budget and the limit it raises, taken whole: the
+    # lines from PG_CONNECTIONS to the raise ARE the copy.
+    conns = re.search(
+        r"^[ \t]*PG_CONNECTIONS=\$\(\(.*?\)\)\n.*?"
+        r'^[ \t]*if \[ "\$POSTGRES_MEM_MIB" -lt "\$PG_NEED_MIB" \]; '
+        r"then POSTGRES_MEM_MIB=\$PG_NEED_MIB; fi$",
+        src,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert conns, "could not find firstboot's #2156 connection budget"
 
     script = f"""
         set -euo pipefail
@@ -156,8 +166,9 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
         POSTGRES_SHARED_BUFFERS_MB=$(( POSTGRES_MEM_MIB / {sb.group(1)} ))
         POSTGRES_MEM_REQUEST_MIB=$POSTGRES_SHARED_BUFFERS_MB
         if [ "$POSTGRES_MEM_REQUEST_MIB" -lt {req.group(1)} ]; then POSTGRES_MEM_REQUEST_MIB={req.group(2)}; fi
-        if [ "$MEM_TOTAL_MIB" -le {thr.group(1)} ]; then C={thr.group(2)}; else C={thr.group(3)}; fi
-        echo "$API_MEM_MIB $WORKER_MEM_MIB $POSTGRES_MEM_MIB $POSTGRES_SHARED_BUFFERS_MB $C $POSTGRES_MEM_REQUEST_MIB"
+        if [ "$MEM_TOTAL_MIB" -le {thr.group(1)} ]; then WORKER_CONCURRENCY={thr.group(2)}; else WORKER_CONCURRENCY={thr.group(3)}; fi
+{textwrap.indent(textwrap.dedent(conns.group(0)), "        ")}
+        echo "$API_MEM_MIB $WORKER_MEM_MIB $POSTGRES_MEM_MIB $POSTGRES_SHARED_BUFFERS_MB $WORKER_CONCURRENCY $POSTGRES_MEM_REQUEST_MIB $PG_CONNECTIONS"
     """
     out = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=True
@@ -169,6 +180,7 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
         "shared_buffers": int(out[3]),
         "concurrency": int(out[4]),
         "postgres_request": int(out[5]),
+        "postgres_connections": int(out[6]),
     }
 
 
@@ -219,6 +231,10 @@ def test_bash_and_python_agree(mem_mib: int) -> None:
     assert (
         py["postgresql"]["resources"]["requests"]["memory"]
         == f"{sh['postgres_request']}Mi"
+    )
+    # #2156 — at one node, the only size firstboot renders.
+    assert k8s_api.control_plane_sizing(mem_mib, 1)["postgres_connections"] == (
+        sh["postgres_connections"]
     )
 
 
@@ -298,6 +314,8 @@ def test_the_first_render_carries_the_supervisors_postgres_sizing(
     assert values["api"]["resources"] == py["api"]["resources"]
     assert values["worker"]["resources"] == py["worker"]["resources"]
     assert values["worker"]["concurrency"] == py["worker"]["concurrency"]
+    # #2156 — the api pool the one-node connection budget counts.
+    assert values["api"]["databasePool"] == k8s_api.api_db_pool(1)
     # The guard the first heartbeat runs (#1005) then finds nothing to write.
     assert k8s_api._deep_merge(values, py) == values
 
