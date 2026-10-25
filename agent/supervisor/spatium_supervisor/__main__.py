@@ -205,11 +205,29 @@ def _maybe_register(
         if approval_state.read_state(cfg.state_dir) == "revoked" and (
             cfg.bootstrap_pairing_code or can_self_bootstrap
         ):
+            via_self_bootstrap = can_self_bootstrap and not cfg.bootstrap_pairing_code
+            if via_self_bootstrap:
+                # #2696: mint the new code BEFORE clearing anything. The
+                # self-bootstrap mints only while no live appliance row
+                # exists (409 otherwise). This node's own row can still be
+                # there: its heartbeats 404 while registration is switched
+                # off, and a revoked row stays until it is deleted. Clearing
+                # first would then leave the node with no identity and no
+                # code, and nothing could bring it back. Kept, it is approved
+                # again on its own row as soon as its heartbeats are accepted.
+                minted = _self_bootstrap_or_skip(cfg, "control-plane", log)
+                if not minted.bootstrap_pairing_code:
+                    log.info(
+                        "supervisor.register.revoked_reregister_deferred",
+                        appliance_id=str(cached_appliance_id),
+                        reason="no fresh pairing code; keeping this identity",
+                    )
+                    return cfg
+                cfg = minted
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
-                via_self_bootstrap=can_self_bootstrap
-                and not cfg.bootstrap_pairing_code,
+                via_self_bootstrap=via_self_bootstrap,
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -437,6 +455,24 @@ def main() -> int:
         # ``_maybe_register`` on its first line.
         if appliance_id is None:
             cfg = _maybe_register(cfg, log)
+            appliance_id = load_appliance_id(cfg.state_dir)
+        elif (
+            approval_state.read_state(cfg.state_dir) == "revoked"
+            and appliance_state.detect_appliance_variant() == "control-plane"
+        ):
+            # #2696: the revoke recovery runs while the supervisor runs, not
+            # only at start-up. A Fleet row that went away leaves the cached
+            # appliance id in place, so the branch above never ran it, and
+            # the node stayed revoked (role services torn down) until its pod
+            # restarted. Control-plane nodes only: they re-register through
+            # the self-bootstrap, which mints a code only once no live row is
+            # left. A data-plane appliance keeps its identity, so Re-authorize
+            # on the Fleet page restores it on the same row. A code this
+            # process registered with earlier is spent, so the recovery asks
+            # for a fresh one instead of presenting it again.
+            cfg = _maybe_register(
+                dataclasses.replace(cfg, bootstrap_pairing_code=""), log
+            )
             appliance_id = load_appliance_id(cfg.state_dir)
         # #272 — cluster members heartbeat the in-cluster api Service
         # (resolved here so the skip-gate matches what heartbeat_once
