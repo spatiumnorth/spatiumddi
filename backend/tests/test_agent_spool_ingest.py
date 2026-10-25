@@ -38,6 +38,7 @@ from app.models.dns import DNSServer, DNSServerGroup
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.models.settings import PlatformSettings
 from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS, prune_receipts
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.alerts import _matching_agent_spool_trimmed_subjects
@@ -277,6 +278,55 @@ async def test_query_log_drops_lines_past_retention_but_not_undated_ones(
         .all()
     )
     assert names == {"fresh.example", "undated.example"}
+
+
+async def _set_log_retention(db: AsyncSession, hours: int) -> None:
+    row = await db.get(PlatformSettings, 1)
+    if row is None:
+        row = PlatformSettings(id=1)
+        db.add(row)
+    row.log_retention_hours = hours
+    await db.commit()
+
+
+async def test_ingest_expiry_follows_the_configured_log_retention(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2273 — a backlog older than 24 h but inside a raised window is kept."""
+    await _set_log_retention(db_session, 72)
+    dns = await _dns_server(db_session)
+    dhcp = await _dhcp_server(db_session)
+    now = datetime.now(UTC)
+    r = await _post(
+        client,
+        "dns",
+        dns,
+        "query-log-entries",
+        {
+            "lines": [
+                _bind_line(now - timedelta(hours=30), "inside.example"),
+                _bind_line(now - timedelta(hours=80), "outside.example"),
+            ],
+            "batch_id": _bid(),
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["inserted"], r.json()["expired"]) == (1, 1)
+    r = await _post(
+        client,
+        "dhcp",
+        dhcp,
+        "log-entries",
+        {
+            "lines": [
+                _kea_line(now - timedelta(hours=30), "aa:bb:cc:dd:ee:03"),
+                _kea_line(now - timedelta(hours=80), "aa:bb:cc:dd:ee:04"),
+            ],
+            "batch_id": _bid(),
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["inserted"], r.json()["expired"]) == (1, 1)
 
 
 # ── DHCP activity log: same two properties ────────────────────────────────

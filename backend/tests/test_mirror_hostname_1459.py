@@ -336,7 +336,10 @@ async def test_renaming_off_an_illegal_name_still_retracts_it_on_windows(
         sent.append((op, record))
 
     with patch("app.services.dns.record_ops.enqueue_record_op", side_effect=_capture):
-        await _sync_dns_record(db_session, ip, subnet, backfill_reverse_zone=False)
+        # Published the way a release before the owner check did; the sync
+        # now refuses to publish a name with a space in it at all.
+        with patch("app.api.v1.ipam.router.publishable_host_owner_error", return_value=None):
+            await _sync_dns_record(db_session, ip, subnet, backfill_reverse_zone=False)
         await db_session.flush()
         sent.clear()
         ip.hostname = "buero-drucker"

@@ -1322,6 +1322,9 @@ export interface BulkAllocatePreviewResponse {
   conflicts_in_use: number;
   conflicts_in_pool: number;
   conflicts_fqdn: number;
+  // Addresses outside every address set the caller holds on this subnet;
+  // the commit skips them (or, with on_collision="abort", refuses).
+  conflicts_no_perm?: number;
   sample: BulkAllocateItem[];
   warnings: string[];
 }
@@ -3898,6 +3901,14 @@ export interface PlatformSettings {
    *  firewall keeps its unconditional port-22 floor and the list is
    *  inert; on, that floor is retired and the scope applies. */
   ssh_lockdown: boolean;
+  /** Data retention (#2273) — read by the nightly prune tasks.
+   *  Superadmin-only to change. */
+  soft_delete_purge_days: number;
+  dhcp_lease_history_retention_days: number;
+  pcap_retention_days: number;
+  appliance_revoked_retention_days: number;
+  metric_retention_days: number;
+  log_retention_hours: number;
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
@@ -10762,6 +10773,8 @@ export interface AlertRuleTypeSpec {
   group: string;
   description: string | null;
   params: AlertParamSpec[];
+  /** Seeded + driven by the platform: described, but not creatable (#2748). */
+  system_driven?: boolean;
 }
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
@@ -15768,7 +15781,10 @@ export type TrashEntryType =
   | "subnet"
   | "dns_zone"
   | "dns_record"
-  | "dhcp_scope";
+  | "dhcp_scope"
+  | "customer"
+  | "overlay_network"
+  | "network_service";
 
 export interface TrashEntry {
   id: string;
@@ -19044,6 +19060,12 @@ export interface L3VPNSummary {
   edge_circuits: L3VPNCircuitSummary[];
   edge_subnets: L3VPNSubnetSummary[];
   warnings: string[];
+  /** Section -> number of attached rows left out because the caller has no
+   *  read grant on them. Absent on an older server; a missing section was
+   *  shown in full. */
+  withheld?: Partial<
+    Record<"vrf" | "edge_sites" | "edge_circuits" | "edge_subnets", number>
+  >;
 }
 
 export interface CustomGroupedSummary {

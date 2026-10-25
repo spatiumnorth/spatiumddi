@@ -45,7 +45,7 @@ def _bundle(keys: list[dict[str, Any]], **over: Any) -> dict[str, Any]:
 def _render(tmp_path: Path, bundle: dict[str, Any]) -> tuple[str, str]:
     Bind9Driver(state_dir=tmp_path).render(bundle)
     conf = (tmp_path / "rendered.new" / "named.conf").read_text()
-    key_file = tmp_path / "tsig" / "ddns.key"
+    key_file = tmp_path / "rendered.new" / "tsig" / "ddns.key"
     return conf, key_file.read_text() if key_file.exists() else ""
 
 
@@ -112,6 +112,6 @@ def test_well_formed_keys_render_unchanged(tmp_path: Path) -> None:
 def test_write_key_file_refuses_an_unchecked_key_itself(tmp_path: Path) -> None:
     """The writer re-checks rather than trusting its caller."""
     Bind9Driver(state_dir=tmp_path)._write_key_file("x.key", [_GOOD, _INJECTED])
-    text = (tmp_path / "tsig" / "x.key").read_text()
+    text = (tmp_path / "rendered.new" / "tsig" / "x.key").read_text()
     assert "evil" not in text
     assert _stanzas(text) == text.splitlines()

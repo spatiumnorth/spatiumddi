@@ -48,6 +48,17 @@ async def _sql(stmt: str, **params: object) -> None:
         await session.commit()
 
 
+async def _tamper(stmt: str, **params: object) -> None:
+    """Edit an audit row on purpose. ``audit_log`` refuses UPDATE (#2315), so
+    the guard is switched off inside the same transaction, as a tamperer with
+    table-owner rights would."""
+    async with AsyncSessionLocal() as session:
+        await session.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update"))
+        await session.execute(text(stmt), params)
+        await session.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update"))
+        await session.commit()
+
+
 async def _verify(**kw: object):
     async with AsyncSessionLocal() as session:
         return await verify_chain(session, **kw)  # type: ignore[arg-type]
@@ -69,7 +80,7 @@ async def test_clean_chain_verifies_across_many_pages() -> None:
 @pytest.mark.parametrize("index", [2, 3, 5, 6])  # last/first rows of 3-row pages
 async def test_content_edit_at_a_page_boundary_is_found(index: int) -> None:
     seqs = await _seed(9)
-    await _sql("UPDATE audit_log SET resource_display = 'edited' WHERE seq = :s", s=seqs[index])
+    await _tamper("UPDATE audit_log SET resource_display = 'edited' WHERE seq = :s", s=seqs[index])
     result = await _verify(chunk_size=3)
     assert not result.ok
     assert [(b.seq, b.reason) for b in result.breaks] == [(seqs[index], "row_hash_mismatch")]
@@ -153,7 +164,7 @@ async def test_a_break_is_reported_and_the_checkpoint_stops_before_it() -> None:
     seqs = await _seed(6)
     await acv._async_verify_and_alert()
     more = await _seed(4)
-    await _sql("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=more[1])
+    await _tamper("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=more[1])
     out = await acv._async_verify_and_alert()
     assert out["ok"] is False and out["broken"] == 1
     cp = await _checkpoint()
@@ -165,7 +176,7 @@ async def test_a_stale_full_pass_walks_everything_again() -> None:
     seqs = await _seed(4)
     await acv._async_verify_and_alert()
     # Edit a row BELOW the checkpoint: an incremental run cannot see it...
-    await _sql("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=seqs[0])
+    await _tamper("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=seqs[0])
     # (the checkpointed row itself is untouched, so the checkpoint stays valid)
     assert (await acv._async_verify_and_alert())["rows_checked"] == 0
     # ...but once the last full pass is a week old the next run re-walks it.
@@ -183,7 +194,7 @@ async def test_a_full_pass_dated_in_the_future_cannot_postpone_the_weekly_pass()
     # past the weekly interval, or an edit below the checkpoint stays unseen.
     seqs = await _seed(4)
     await acv._async_verify_and_alert()
-    await _sql("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=seqs[0])
+    await _tamper("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=seqs[0])
     await _sql(
         "UPDATE audit_chain_checkpoint SET full_pass_done_at = :t",
         t=datetime.now(UTC) + timedelta(days=3650),

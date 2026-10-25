@@ -197,8 +197,10 @@ If a bundled store lands, the intended shape is **Loki** (aggregation) +
 ### Log Retention
 
 For the **shipped** surfaces, retention is per-table and short — the
-agent-pushed query/activity logs are pruned at 24 h (see § 4½.3) since
-they're operator triage, not analytics. The audit log (§ 5) lives in
+agent-pushed query/activity logs are pruned at 24 h by default (see
+§ 4½.3) since they're operator triage, not analytics. Every retention
+window is a setting (Settings → Data Retention; table in
+[`SYSTEM_ADMIN.md` §2.7](features/SYSTEM_ADMIN.md#27-audit-log-and-data-retention)). The audit log (§ 5) lives in
 PostgreSQL and is not auto-pruned. Long-term log retention belongs in
 an external store (Loki / a SIEM) fed from the stdout streams.
 
@@ -387,9 +389,9 @@ through the same resolution (`app/services/logs/agent_logs.py`).
 
 Two narrow tables (`dns_query_log_entry`, `dhcp_log_entry`) with composite indexes on `(server_id, ts)`. Migration `d8c5f12a47b9_query_log_entries`. FK cascade drops a server's rows when the server is removed.
 
-Retention is a nightly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than 24 h. This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
+Retention is a nightly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than `log_retention_hours` (default 24 h, 1–168 h, Settings → Data Retention; the cap stays until #2185 replaces the single `DELETE` with partition drops). This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
 
-**Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the 24 h window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
+**Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the `log_retention_hours` window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
 
 **Why so short?** Query logs are a firehose. A busy resolver doing 100 qps writes 8.6M rows per day; even 24 h of that is significant. Anyone needing days of history should run Loki alongside and the agent push can coexist with stdout shipping.
 
@@ -427,7 +429,7 @@ Available at `/admin/audit`:
 - Same filtering and live-tail as the log viewer
 - Additional filters: `action`, `resource_type`, `result`
 - Diff view for updates: shows old vs. new value side-by-side
-- Non-deletable — no delete button, enforced at DB level (trigger prevents DELETE)
+- Non-deletable and non-editable — no delete button, and DB triggers refuse DELETE and UPDATE. Tamper-evident, not tamper-proof: the database owner can drop the triggers, which the `audit_log_immutable` conformity check reports
 
 ### 5.1 External forwarding
 
@@ -770,7 +772,9 @@ The control plane stores deltas in two small tables —
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
 inform, receive_drop, socket_drop)`. Retention is enforced by the
-`prune_metric_samples` Celery task (daily, default 7 days).
+`prune_metric_samples` Celery task (daily), which deletes samples older
+than `metric_retention_days` (default 7 days, 1–365, Settings → Data
+Retention).
 
 Two of those DHCP columns are about packets *not* handled, and they do not
 come from the same place or mean the same thing (issue #980).
