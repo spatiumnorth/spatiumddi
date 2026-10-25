@@ -210,8 +210,7 @@ def _maybe_register(
                 # #2696: mint the new code BEFORE clearing anything. The
                 # self-bootstrap mints only while no live appliance row
                 # exists (409 otherwise). This node's own row can still be
-                # there: its heartbeats 404 while registration is switched
-                # off, and a revoked row stays until it is deleted. Clearing
+                # there: a revoked row stays until it is deleted. Clearing
                 # first would then leave the node with no identity and no
                 # code, and nothing could bring it back. Kept, it is approved
                 # again on its own row as soon as its heartbeats are accepted.

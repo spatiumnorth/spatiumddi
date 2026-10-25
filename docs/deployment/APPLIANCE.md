@@ -3763,6 +3763,25 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > *before* the first pairing — otherwise
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
+>
+> The flag refuses **new** pairings only. Appliances already registered
+> keep heartbeating and serving while it is off: `/supervisor/heartbeat`
+> and `/supervisor/poll` are not behind it (#2798). Before that fix,
+> switching it off answered every heartbeat 404, every supervisor read
+> that as a revocation, and DNS and DHCP stopped fleet-wide.
+
+**How a supervisor knows it was revoked (#2798).** A heartbeat the control
+plane refuses on purpose is a **403 carrying the `X-Spatium-Revocation`
+header**: `revoked` when the row is revoked on the Fleet page, `unknown`
+when no row accepts the presented credential (the row was deleted, or the
+appliance was re-keyed). Two of those in a row put the supervisor in
+`revoked` and take its role services down; a control-plane node then
+re-registers through the self-bootstrap once its row is gone (#2696). Any
+other refusal — a 404 from a proxy or a router that is not mounted, a 403
+without the header — is logged as `supervisor.heartbeat.refused_not_revocation`
+and nothing is torn down: the node keeps serving its last applied roles.
+For a control plane that predates the header, the supervisor also accepts
+the two 403 details it answered for the same refusals.
 
 1. On the control plane, open **Appliance → Pairing**.
 2. Click **New pairing code**. Codes are now kind-agnostic (the
