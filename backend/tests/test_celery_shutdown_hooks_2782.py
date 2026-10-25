@@ -33,5 +33,5 @@ def test_hooks_swallow_exceptions() -> None:
 def test_child_hook_is_connected() -> None:
     from celery.signals import worker_process_shutdown
 
-    names = {getattr(r, "__name__", "") for _, r in worker_process_shutdown.receivers}
-    assert "_close_after_commit_dispatch_in_child" in names
+    live = worker_process_shutdown._live_receivers(None)
+    assert celery_app._close_after_commit_dispatch_in_child in live
