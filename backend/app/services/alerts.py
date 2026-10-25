@@ -4510,8 +4510,13 @@ def _var_usage(cluster_health: Any) -> tuple[int, int] | None:
 
     None means UNKNOWN (key absent, no ``/var`` entry, a non-integer, a
     boolean, a zero total, a used figure outside ``0..total``), never empty
-    and never full. Same parse as the upgrade pre-flight's
-    ``_node_var_free_bytes``, so the two cannot disagree about one node.
+    and never full. The upgrade pre-flight's ``_node_var_free_bytes`` reads
+    the same entry with the same type checks, and parts from this only on
+    readings a supervisor never sends (``read_host_disk_partitions`` reports
+    one ``/var``, ``used = blocks - bfree`` of ``total = blocks``): it takes a
+    used figure outside ``0..total`` (one above the total as no free space),
+    and it reads on past a malformed ``/var`` entry to a later one. On every
+    reading a supervisor can send, the two agree about one node.
     """
     if not isinstance(cluster_health, dict):
         return None

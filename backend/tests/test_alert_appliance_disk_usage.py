@@ -247,6 +247,34 @@ async def test_no_reading_is_never_a_match(db_session: AsyncSession) -> None:
     assert await _match(db_session, _rule(threshold=0)) == {}
 
 
+def test_the_alert_and_the_upgrade_preflight_agree_on_what_a_supervisor_sends() -> None:
+    """``_var_usage`` and the pre-flight's ``_node_var_free_bytes`` read the
+    same ``/var`` entry. A supervisor reports ``used = blocks - bfree`` of
+    ``total = blocks``, so ``0 <= used <= total``, and on every such reading
+    the alert's used and total leave exactly the pre-flight's free bytes. They
+    part only where ``_var_usage``'s docstring says, on readings a supervisor
+    never sends: a used figure above the total is UNKNOWN to the alert and no
+    free space to the pre-flight."""
+    from app.services.upgrades.preflight import _node_var_free_bytes
+
+    total = 23 * GIB
+    for used in (0, 1, total // 2, total * 87 // 100, total - 1, total):
+        health = {"host_disk_partitions": _parts((used, total))}
+        assert alerts_svc._var_usage(health) == (used, total)  # noqa: SLF001
+        assert _node_var_free_bytes(health) == total - used
+    for health in (
+        {},
+        {"host_disk_partitions": _parts(None)},
+        {"host_disk_partitions": [{"mount": "/var", "total_bytes": 0, "used_bytes": 0}]},
+    ):
+        assert alerts_svc._var_usage(health) is None  # noqa: SLF001
+        assert _node_var_free_bytes(health) is None
+
+    over = {"host_disk_partitions": _parts((total + 1, total))}
+    assert alerts_svc._var_usage(over) is None  # noqa: SLF001
+    assert _node_var_free_bytes(over) == 0
+
+
 async def test_only_var_is_judged(db_session: AsyncSession) -> None:
     """The root slot is a read-only image and the ESP a fixed boot partition;
     neither fills the way ``/var`` (Postgres, images, logs) does."""
