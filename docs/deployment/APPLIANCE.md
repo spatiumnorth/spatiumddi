@@ -3326,7 +3326,8 @@ so a first-time operator never gets stuck looking for the upload.
    unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
-   `inflight_conflict`, `replication_lag`, `disk_headroom` (each
+   `inflight_conflict` (or `kubeapi_unreachable` when the API did not answer the
+   lease read, #2779), `replication_lag`, `disk_headroom` (each
    node's reported `/var`; a missing or stale report warns; a node
    already on the target stages nothing and is named instead of
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not
