@@ -16,6 +16,7 @@ from celery.signals import (
     task_postrun,
     task_prerun,
     worker_init,
+    worker_process_shutdown,
     worker_shutdown,
 )
 from celery.worker.consumer import Consumer
@@ -1195,11 +1196,34 @@ def _dispatch_after_commit_in_background(**_: object) -> None:
     importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
 
 
+def _drain_after_commit_dispatch() -> None:
+    """Drain this process's dispatch loop and dispose its engine. Never
+    raises: a failure here must not hold up or break shutdown."""
+    try:
+        importlib.import_module("app.services.after_commit_dispatch").shutdown_background()
+    except Exception:  # noqa: BLE001 — shutdown must never be blocked
+        structlog.get_logger(__name__).warning(
+            "after_commit_dispatch_shutdown_hook_failed", exc_info=True
+        )
+
+
 @worker_shutdown.connect
 def _close_after_commit_dispatch(**_: object) -> None:
-    """#2782 — drain the background dispatch loop and close the engine it
-    uses, rather than leaving its connections to the server's reaper."""
-    importlib.import_module("app.services.after_commit_dispatch").shutdown_background()
+    """#2782 — main-process hook. The prefork main process never dispatches
+    after-commit work itself (tasks run in the children), so it has no loop or
+    engine and this is a harmless no-op there (``shutdown_background`` returns
+    once it finds no loop owned by this PID). It still matters for the solo /
+    threads pools, where the main process runs the tasks."""
+    _drain_after_commit_dispatch()
+
+
+@worker_process_shutdown.connect
+def _close_after_commit_dispatch_in_child(**_: object) -> None:
+    """#2782 — per-child hook. Each prefork child has its own background loop
+    and ``dispatch_db`` engine, which ``worker_shutdown`` (main process only)
+    never reaches. Drain the child's in-flight dispatches (bounded) and
+    dispose its engine instead of leaving its sockets to the server's reaper."""
+    _drain_after_commit_dispatch()
 
 
 @beat_init.connect
