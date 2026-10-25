@@ -66,6 +66,7 @@ from app.services.backup.archive import (
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 from app.services.backup.restore import SUPPORTED_FORMAT_VERSIONS
 from app.services.backup.targets import (
+    ArchiveTooLargeError,
     BackupDestinationError,
     SecretFieldError,
     decrypt_config_secrets,
@@ -409,8 +410,9 @@ async def reap_orphaned_scratch_dbs(*, live_db_url: str) -> list[str]:
     killed drill would permanently add another copy until the volume
     filled. The fixed prefix exists precisely so this sweep is possible.
 
-    Liveness, not age, is the safety signal: a drill holds a connection
-    to its scratch database for the whole replay-and-assert window, so
+    Liveness, not age, is the safety signal: a drill holds a keeper
+    connection to its scratch database from right after CREATE DATABASE
+    (before the dump is even written to disk) until just before the drop, so
     "carries the prefix AND has no backend attached" cannot match a
     drill that is still working. That avoids having to guess a safe age
     threshold, and it stays correct however long a legitimate drill
@@ -438,6 +440,29 @@ async def reap_orphaned_scratch_dbs(*, live_db_url: str) -> list[str]:
             note="left behind by drills that were killed before cleanup",
         )
     return reaped
+
+
+async def _open_keeper(scratch_db: str, *, live_db_url: str) -> tuple[Any, Any]:
+    """Open the connection that keeps the reaper off a live drill's
+    scratch database (see the call site)."""
+    engine = create_async_engine(_scratch_url(live_db_url, scratch_db), poolclass=NullPool)
+    try:
+        return engine, await engine.connect()
+    except Exception:
+        await engine.dispose()
+        raise
+
+
+async def _close_keeper(engine: Any, conn: Any) -> None:
+    """Release the connection that marks a scratch database as live."""
+    try:
+        if conn is not None:
+            await conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("restore_drill_keeper_close_failed", error=str(exc))
+    finally:
+        if engine is not None:
+            await engine.dispose()
 
 
 def _scratch_url(live_db_url: str, scratch_db: str) -> str:
@@ -1028,8 +1053,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         # of their own, and an unbounded fetch would make the sweep's
         # stale-mutex threshold meaningless (see
         # STALE_IN_PROGRESS_SECONDS).
+        # ``max_bytes`` backs up the declared-size check above: the
+        # listing's size is the destination's word, and the driver stops
+        # reading at the cap whatever the archive turns out to be.
         archive_bytes = await asyncio.wait_for(
-            driver.download(config=plain_config, filename=newest.filename),
+            driver.download(
+                config=plain_config, filename=newest.filename, max_bytes=MAX_ARCHIVE_BYTES
+            ),
             timeout=_DOWNLOAD_TIMEOUT_SECONDS,
         )
     except TimeoutError:
@@ -1041,6 +1071,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                 f"downloading {newest.filename} from the destination exceeded "
                 f"{_DOWNLOAD_TIMEOUT_SECONDS}s"
             ),
+        )
+    except ArchiveTooLargeError as exc:
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=str(exc),
         )
     except BackupDestinationError as exc:
         return DrillOutcome(
@@ -1158,6 +1195,25 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
             error=f"could not create the scratch database: {exc}",
         )
 
+    # Hold a backend on the scratch database from the moment it exists
+    # (#2272). ``reap_orphaned_scratch_dbs`` treats "no backend" as
+    # "orphaned", and until pg_restore connects there is none: writing the
+    # dump to a temp file takes minutes at the size cap. Closed in the
+    # ``finally`` below, before the DROP, which would otherwise be refused.
+    try:
+        keeper_engine, keeper_conn = await _open_keeper(scratch_db, live_db_url=live_db_url)
+    except Exception as exc:  # noqa: BLE001
+        await _drop_scratch_db(scratch_db, live_db_url=live_db_url)
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            archive_bytes=len(archive_bytes),
+            manifest=manifest,
+            scratch_db=scratch_db,
+            assertions=assertions,
+            error=f"could not hold a connection on the scratch database: {exc}",
+        )
+
     try:
         try:
             await _replay_into_scratch(
@@ -1199,6 +1255,7 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                 error=f"post-replay assertions could not run: {exc}",
             )
     finally:
+        await _close_keeper(keeper_engine, keeper_conn)
         await _drop_scratch_db(scratch_db, live_db_url=live_db_url)
 
     base.state = "failed" if any(a.status == FAIL for a in assertions) else "passed"

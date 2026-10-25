@@ -197,8 +197,10 @@ If a bundled store lands, the intended shape is **Loki** (aggregation) +
 ### Log Retention
 
 For the **shipped** surfaces, retention is per-table and short — the
-agent-pushed query/activity logs are pruned at 24 h (see § 4½.3) since
-they're operator triage, not analytics. The audit log (§ 5) lives in
+agent-pushed query/activity logs are pruned at 24 h by default (see
+§ 4½.3) since they're operator triage, not analytics. Every retention
+window is a setting (Settings → Data Retention; table in
+[`SYSTEM_ADMIN.md` §2.7](features/SYSTEM_ADMIN.md#27-audit-log-and-data-retention)). The audit log (§ 5) lives in
 PostgreSQL and is not auto-pruned. Long-term log retention belongs in
 an external store (Loki / a SIEM) fed from the stdout streams.
 
@@ -326,6 +328,30 @@ Shared helpers (`ServerPicker` / `MaxEventsPicker` / `FilterSearch` / `RefreshBu
 
 Two additional tabs on the same Logs page, sourced from in-container agents instead of WinRM.
 
+**One server, a group, or all of them (#2120).** Both tabs read a merged,
+newest-first list across a set of servers. The picker offers **All servers**,
+then per server group a **`<Group> (all N servers)`** entry followed by that
+group's servers. The three reads behind the tabs —
+`POST /logs/dns-queries`, `POST /logs/dns-queries/analytics` and
+`POST /logs/dhcp-activity` — take an optional `server_id` and an optional
+`group_id`: `server_id` reads that server, `group_id` every agent server in
+that DNS or DHCP server group, neither every agent server. Every row carries
+the `server_id` and `server_name` that logged it, and the results grid shows a
+**Server** column whenever more than one server is selected. The analytics
+panels roll up across the whole selection, so a group behind one
+load-balanced address shows its real top names and top clients. The response
+echoes the scope plus `server_ids`, the servers the read actually covered.
+
+The filter is a request, not an authorisation: the set it selects is always
+intersected with the servers the caller may read (see
+[`PERMISSIONS.md`](PERMISSIONS.md) — a `read` grant on `server` may be scoped
+to one server or to one server group). A group the caller can read none of
+answers 403; "all" answers with whatever the caller can read.
+`GET /logs/agent-sources` lists only readable servers, with `group_id` /
+`group_name`. The Copilot tools `find_dns_queries`, `query_dns_query_log` and
+`query_dhcp_activity_log` take the same `server_id` / `group_id` and go
+through the same resolution (`app/services/logs/agent_logs.py`).
+
 ### 4½.1 DNS Queries tab
 
 **Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on. PowerDNS feeds the same pipeline, but from a **different file**: the agent's `start_daemon` redirects `pdns_server`'s stderr into `<state_dir>/pdns.log` (inside the agent's own state dir, so the unprivileged `spatium` user can write it) and passes that explicit path to `QueryLogShipper`, gated on `log-dns-queries=yes` + `loglevel` ≥ 6. That is the file to inspect, mount or override with `DNS_QUERY_LOG_PATH` on a PowerDNS agent — not `/var/log/named/queries.log`. The control plane dispatches parsing by `server.driver`, so the one ingest endpoint accepts either format.
@@ -343,9 +369,9 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 1. BIND9 writes lines to `/var/log/named/queries.log` (path is templated; agents respect `DNS_QUERY_LOG_PATH` env override).
 2. The DNS agent's `QueryLogShipper` thread (`agent/dns/spatium_dns_agent/query_log_shipper.py`) tails the file like `tail -F`, batches up to 200 lines or 5 s of activity (whichever first), and POSTs to `POST /api/v1/dns/agents/query-log-entries`.
 3. The control plane parses each line into `DNSQueryLogEntry` rows (`backend/app/services/logs/bind9_parser.py`) — timestamp, client IP+port, qname, qclass, qtype, flags, view. The original raw line is preserved alongside.
-4. UI calls `POST /logs/dns-queries` with filters (`q` substring, `qtype`, `client_ip`, `since`, `max_events`); newest first.
+4. UI calls `POST /logs/dns-queries` with a scope (`server_id` / `group_id` / neither) and filters (`q` substring, `qtype`, `client_ip`, `since`, `max_events`); newest first.
 
-**Filters.** Server picker, qtype (A / AAAA / MX / …), client IP, datetime-`since`, max events, raw-substring search.
+**Filters.** Server / group / all picker, qtype (A / AAAA / MX / …), client IP, datetime-`since`, max events, raw-substring search.
 
 **Resilience.** File-not-yet-present (operator hasn't enabled `query_log_enabled`) is silent — the shipper sleeps + re-checks. Inode-change rotation is detected and the file re-opened. Control-plane errors drop the batch (logs are triage data, not durable). Buffer is capped at 5000 lines; older half is trimmed if the control plane stays unreachable.
 
@@ -357,15 +383,15 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 
 **Parser fields.** Severity (`DEBUG` / `INFO` / `WARN` / `ERROR` / `FATAL`), Kea log code (`DHCP4_LEASE_ALLOC`, `DHCP4_LEASE_DECLINE`, `DHCP4_PACKET_PROCESS_STARTED`, etc), MAC address (after `hwtype=N`), lease IP, transaction id. Lines that don't match the regex still get stored with the raw text — Kea has hundreds of log codes and we only structure-parse the most common shape.
 
-**Filters.** Server picker, severity, log code (free-form text — operators paste e.g. `DHCP4_LEASE_ALLOC`), MAC, IP, datetime-since, max events, raw substring.
+**Filters.** Server / group / all picker, severity, log code (free-form text — operators paste e.g. `DHCP4_LEASE_ALLOC`), MAC, IP, datetime-since, max events, raw substring.
 
 ### 4½.3 Storage + retention
 
 Two narrow tables (`dns_query_log_entry`, `dhcp_log_entry`) with composite indexes on `(server_id, ts)`. Migration `d8c5f12a47b9_query_log_entries`. FK cascade drops a server's rows when the server is removed.
 
-Retention is a nightly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than 24 h. This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
+Retention is a nightly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than `log_retention_hours` (default 24 h, 1–168 h, Settings → Data Retention; the cap stays until #2185 replaces the single `DELETE` with partition drops). This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
 
-**Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the 24 h window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
+**Outage backlog (#1077).** Agents spool the batches the control plane could not accept and replay them on reconnect, with the lines' original timestamps — so a maintenance window fills in rather than leaving a hole. The ingest endpoints skip lines already older than the `log_retention_hours` window (reported as `expired` in the response) instead of inserting rows the next prune deletes, and the agents drop spooled log batches older than `AGENT_SPOOL_LOG_MAX_AGE_HOURS` themselves. Replays are deduplicated per batch (`batch_id` → `agent_ingest_receipt`, 35-day retention, pruned by the same nightly task). While an agent is draining a backlog the DNS / DHCP server row shows an amber **Replaying … backlog** chip; if its spool hit the cap, a red **Spool trimmed** chip and the `agent_spool_trimmed` alert (§9.1). See [`DNS_AGENT.md` §3](deployment/DNS_AGENT.md).
 
 **Why so short?** Query logs are a firehose. A busy resolver doing 100 qps writes 8.6M rows per day; even 24 h of that is significant. Anyone needing days of history should run Loki alongside and the agent push can coexist with stdout shipping.
 
@@ -403,7 +429,7 @@ Available at `/admin/audit`:
 - Same filtering and live-tail as the log viewer
 - Additional filters: `action`, `resource_type`, `result`
 - Diff view for updates: shows old vs. new value side-by-side
-- Non-deletable — no delete button, enforced at DB level (trigger prevents DELETE)
+- Non-deletable and non-editable — no delete button, and DB triggers refuse DELETE and UPDATE. Tamper-evident, not tamper-proof: the database owner can drop the triggers, which the `audit_log_immutable` conformity check reports
 
 ### 5.1 External forwarding
 
@@ -746,7 +772,9 @@ The control plane stores deltas in two small tables —
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
 inform, receive_drop, socket_drop)`. Retention is enforced by the
-`prune_metric_samples` Celery task (daily, default 7 days).
+`prune_metric_samples` Celery task (daily), which deletes samples older
+than `metric_retention_days` (default 7 days, 1–365, Settings → Data
+Retention).
 
 Two of those DHCP columns are about packets *not* handled, and they do not
 come from the same place or mean the same thing (issue #980).

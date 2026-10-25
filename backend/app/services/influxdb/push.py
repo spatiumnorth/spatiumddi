@@ -89,6 +89,15 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
             points.extend(await collect.collect_dhcp_scope_lease_points(db, now))
 
         body = render_batch(_prefixed(points, row.measurement_prefix or ""))
+        if not body:
+            # Nothing to send, so nobody was contacted: this is not a push
+            # the destination accepted (#2749). ``last_push_at`` still moves
+            # so interval gating holds; ``last_success_at`` and any recorded
+            # failure are left exactly as the last real attempt left them.
+            row.last_push_at = now
+            row.last_push_points = 0
+            logger.info("influxdb_push_empty", target=row.name)
+            return PushResult(str(row.id), row.name, 0, ok=True)
         await write_lines(config_from_row(row), body)
     # Broad on purpose: this is the per-target failure-isolation boundary.
     # The caller pushes every due target inside one transaction, so an

@@ -70,10 +70,12 @@ EXEMPT_PREFIXES: Final[tuple[str, ...]] = (
     # /supervisor/heartbeat, /supervisor/k8s-proxy/* (config-caching +
     # desired-state delivery, non-negotiable #5).
     "/api/v1/appliance/supervisor",
-    # Local-supervisor self-bootstrap (full-stack / frontend-core appliances
-    # mint their own one-shot pairing code here). Unauthenticated + host-
-    # gated; if a maintenance window 503'd it the appliance's own supervisor
-    # could never register against its control plane (non-negotiable #5).
+    # Local-supervisor self-bootstrap (the control-plane appliance mints its
+    # own one-shot pairing code here). No user session; the caller proves it
+    # is the supervisor on this host with a one-time token from the host
+    # release-state directory. If a maintenance window 503'd it the
+    # appliance's own supervisor could never register against its control
+    # plane (non-negotiable #5).
     "/api/v1/appliance/self-register-bootstrap",
     # HELD (#972). A change window must not stop answering "which room is
     # this phone in" — a PBX asking on behalf of a 911 call is the one

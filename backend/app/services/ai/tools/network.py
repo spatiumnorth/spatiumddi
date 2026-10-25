@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import re
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.ipam import IPAddress
+from app.models.ipam import IPAddress, Subnet
 from app.models.network import (
     NetworkArpEntry,
     NetworkDevice,
@@ -296,6 +297,15 @@ class FindSwitchportArgs(BaseModel):
             "operator already has the MAC."
         ),
     )
+    space_id: str | None = Field(
+        default=None,
+        description=(
+            "IP space UUID to resolve ``ip`` in. IP spaces are independent "
+            "and can reuse the same address; when the IP exists in several "
+            "spaces with different MACs and no space is given, the tool "
+            "returns the candidates instead of guessing."
+        ),
+    )
 
 
 def _normalize_mac(value: str) -> str:
@@ -334,20 +344,53 @@ async def find_switchport(db: AsyncSession, user: User, args: FindSwitchportArgs
     if target_mac is None and args.ip:
         # Prefer the IPAM row's MAC (operator-authoritative); fall back
         # to ARP if IPAM has no MAC recorded.
-        ip_row = (
-            await db.execute(select(IPAddress).where(IPAddress.address == args.ip).limit(1))
-        ).scalar_one_or_none()
-        if ip_row and ip_row.mac_address:
-            target_mac = _normalize_mac(str(ip_row.mac_address))
+        #
+        # #2577 — the same address can exist in several IP spaces. Never
+        # take an arbitrary row: scope to ``space_id`` when given, and
+        # report the candidates when the spaces disagree on the MAC.
+        space_uuid: uuid.UUID | None = None
+        if args.space_id:
+            try:
+                space_uuid = uuid.UUID(args.space_id)
+            except ValueError:
+                return {"error": f"invalid space_id: {args.space_id!r}"}
+        ip_q = (
+            select(IPAddress, Subnet.space_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(IPAddress.address == args.ip)
+        )
+        if space_uuid is not None:
+            ip_q = ip_q.where(Subnet.space_id == space_uuid)
+        ip_rows = [
+            (row, sp) for row, sp in (await db.execute(ip_q)).all() if row.mac_address is not None
+        ]
+        ipam_macs = {_normalize_mac(str(row.mac_address)) for row, _ in ip_rows}
+        if len(ipam_macs) > 1:
+            return {
+                "error": (
+                    f"IP {args.ip!r} exists in more than one IP space with "
+                    "different MACs; pass space_id or mac."
+                ),
+                "candidates": [
+                    {
+                        "space_id": str(sp),
+                        "ip_address_id": str(row.id),
+                        "mac_address": _normalize_mac(str(row.mac_address)),
+                    }
+                    for row, sp in ip_rows
+                ],
+            }
+        if ipam_macs:
+            target_mac = next(iter(ipam_macs))
             ip_source = "ipam"
         else:
+            arp_q = select(NetworkArpEntry).where(func.text(NetworkArpEntry.ip_address) == args.ip)
+            if space_uuid is not None:
+                arp_q = arp_q.join(
+                    NetworkDevice, NetworkDevice.id == NetworkArpEntry.device_id
+                ).where(NetworkDevice.ip_space_id == space_uuid)
             arp = (
-                await db.execute(
-                    select(NetworkArpEntry)
-                    .where(func.text(NetworkArpEntry.ip_address) == args.ip)
-                    .order_by(NetworkArpEntry.last_seen.desc())
-                    .limit(1)
-                )
+                await db.execute(arp_q.order_by(NetworkArpEntry.last_seen.desc()).limit(1))
             ).scalar_one_or_none()
             if arp:
                 target_mac = _normalize_mac(str(arp.mac_address))

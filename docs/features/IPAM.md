@@ -1450,6 +1450,8 @@ This maps to the `PlatformSettings` singleton model defined in `SYSTEM_ADMIN.md 
 - Show a **Purge** (Trash) button that permanently deletes after a confirmation modal
 - `DELETE /ipam/addresses/{id}?permanent=true` hard-deletes immediately
 
+The address's host record and PTR are deleted when it becomes an orphan, and re-created on Restore. Its DNS aliases are **withdrawn, not deleted** (#2604): they leave the served zone, sit in Trash under one deletion batch per address, and come back on Restore, a CNAME re-pointed at the address's current name. A record that took an alias's name while the address was an orphan makes the Restore a 409 naming it. The trash retention purge leaves these aliases alone while the address is still an orphan; purging or permanently deleting the address deletes them for good. An address restored with no hostname leaves its aliases withdrawn.
+
 Note: the current implementation uses `status = "orphan"` instead of a `deleted_at` column. The spec's "Show deleted toggle" and "recycle bin" concept can be revisited in a future density pass.
 
 ### ✅ 14.9 IP Space Table View (Click-Through)

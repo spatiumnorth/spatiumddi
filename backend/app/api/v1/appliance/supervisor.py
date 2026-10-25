@@ -376,15 +376,30 @@ def _client_ip(request: Request) -> str | None:
 # #272 Phase 1 — self-bootstrap path for the control-plane appliance.
 # The local supervisor calls
 # ``POST /api/v1/appliance/self-register-bootstrap`` with its
-# variant; the api gates on the host-mounted ``role-config`` (the
-# api itself has a bind mount of ``/etc/spatiumddi-host/role-
-# config`` per #209) so we can prove the caller is the local
-# supervisor by matching the variant claim against the file the
-# installer wrote. Only the control-plane node self-bootstraps (it IS
-# the control plane); an ``appliance`` pairs against a remote one.
-# Legacy ``full-stack`` / ``frontend-core`` accepted as aliases for a
-# not-yet-reinstalled box.
+# variant and a one-time token. Only the control-plane node
+# self-bootstraps (it IS the control plane); an ``appliance`` pairs
+# against a remote one. Legacy ``full-stack`` / ``frontend-core``
+# accepted as aliases for a not-yet-reinstalled box.
+#
+# The host-mounted ``role-config`` check (the api has a bind mount of
+# ``/etc/spatiumddi-host/role-config`` per #209) only says THIS host is
+# a control-plane node; it proves nothing about the caller, because
+# the role is one of three public strings and the endpoint is
+# reachable from the LAN through the frontend's ``/api/`` proxy. What
+# proves the caller is the local supervisor is the token: the
+# supervisor writes a fresh random value to
+# ``self-bootstrap.token`` in the host release-state directory
+# (``/var/lib/spatiumddi/release-state``, mode 1770 root:2770 — only
+# the supervisor and the api pods, both in group 2770, can reach it)
+# just before the call, presents it in the body, and deletes it after.
+# Nothing on the network can read that file, so nothing on the network
+# can present the value.
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
+_SELF_BOOTSTRAP_TOKEN_FILE = Path("/var/lib/spatiumddi-host/release-state/self-bootstrap.token")
+# A token shorter than this is refused even when it matches, so an
+# empty or truncated file can never make an empty claim succeed.
+_SELF_BOOTSTRAP_TOKEN_MIN_LEN = 32
+_SELF_BOOTSTRAP_TOKEN_MAX_LEN = 256
 _SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
 
 
@@ -420,6 +435,36 @@ def _read_host_role() -> str | None:
             value = line.split("=", 1)[1].strip().strip('"').strip("'")
             return value if value in _SELF_BOOTSTRAP_VARIANTS else None
     return None
+
+
+def _read_self_bootstrap_token() -> str | None:
+    """The token the local supervisor wrote for this attempt, or None.
+
+    None when the file is absent (non-appliance deploys, a supervisor that
+    predates the token, or no attempt in flight), unreadable, or too short
+    to be a real token.
+    """
+    try:
+        with _SELF_BOOTSTRAP_TOKEN_FILE.open("rb") as fh:
+            raw = fh.read(_SELF_BOOTSTRAP_TOKEN_MAX_LEN + 1)
+    except OSError:
+        return None
+    if len(raw) > _SELF_BOOTSTRAP_TOKEN_MAX_LEN:
+        return None
+    token = raw.decode("ascii", errors="replace").strip()
+    if len(token) < _SELF_BOOTSTRAP_TOKEN_MIN_LEN:
+        return None
+    return token
+
+
+def _self_bootstrap_token_matches(presented: str | None) -> bool:
+    """Constant-time comparison of the presented token with the host file."""
+    if not presented:
+        return False
+    expected = _read_self_bootstrap_token()
+    if expected is None:
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _gen_self_bootstrap_code() -> str:
@@ -641,11 +686,17 @@ class SelfRegisterBootstrapRequest(BaseModel):
     variants, where the installer wizard didn't capture a pairing
     code (the control plane IS local).
 
-    The supervisor claims its variant; the api validates against
-    the host-mounted ``role-config:ROLE`` before minting a code.
+    The supervisor claims its variant and presents the one-time token it
+    wrote to the host release-state directory; the api checks the token
+    against that file, then the variant against the host-mounted
+    ``role-config:ROLE``, before minting a code.
     """
 
     appliance_variant: Literal["control-plane", "full-stack", "frontend-core"]
+    # Optional in the schema so an older supervisor's body still parses;
+    # a missing token is refused by the handler with the same 403 as a
+    # wrong one.
+    bootstrap_token: str | None = Field(default=None, max_length=_SELF_BOOTSTRAP_TOKEN_MAX_LEN)
 
 
 class SelfRegisterBootstrapResponse(BaseModel):
@@ -672,32 +723,38 @@ async def self_register_bootstrap(
 
     Gates (all required, in order):
 
-    1. Variant must be ``full-stack`` or ``frontend-core``.
-       ``application`` uses the operator-typed pairing code from
+    1. Variant must be ``control-plane`` (or a legacy alias).
+       ``appliance`` uses the operator-typed pairing code from
        the installer wizard; this endpoint refuses to short-
        circuit that flow.
-    2. The api's host bind mount ``/etc/spatiumddi-host/role-
-       config:ROLE`` must equal the requested variant. Proves the
-       caller has host access AND the host's installer-baked role
-       matches the claim. On non-appliance deploys the file isn't
-       mounted and the endpoint refuses outright.
-    3. No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT
+    2. ``bootstrap_token`` must equal the contents of
+       ``self-bootstrap.token`` in the host release-state directory,
+       which the local supervisor writes just before calling. This is
+       the check that proves the caller is the supervisor on this
+       host: the file is reachable only from the supervisor and api
+       pods, never from the network. It runs BEFORE anything below
+       touches the database, so a caller that cannot present it
+       changes nothing (no orphan-row clearing, no registration-gate
+       flip). On non-appliance deploys the file is never written and
+       the endpoint refuses outright.
+    3. The api's host bind mount ``/etc/spatiumddi-host/role-
+       config:ROLE`` must equal the requested variant — the host's
+       installer-baked role matches the claim.
+    4. No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT
        NULL``). Orphan rows (``last_seen_at IS NULL``) from a
        botched earlier attempt get cleared on each call so the
        endpoint is safe to re-fire when the supervisor lost its
        local state. Multi-node HA (#272 Phase 7) provisions
        additional supervisors through the operator-typed pairing-
        code flow, not this endpoint.
-    4. Module gate (``supervisor_registration_enabled``) — same
-       gate the normal pair-and-register endpoint honours.
 
     Failures collapse into 403 with a constant friction delay so
     the gate decision doesn't leak via response-time delta. Hits
-    one of: variant mismatch / appliances already registered /
-    module disabled / role-config missing.
+    one of: variant mismatch / token missing or wrong / role-config
+    missing. Appliances already registered answers 409.
 
     On success the response carries the cleartext pairing code +
-    the appliance-local control-plane URL (``https://localhost``).
+    the in-cluster api Service URL.
     The supervisor stamps these into its env and proceeds through
     the normal ``/supervisor/register`` flow.
 
@@ -707,8 +764,8 @@ async def self_register_bootstrap(
     supervisor MUST be able to register or the appliance is
     unusable; the operator-controlled module gate gets re-applied
     once they reach the Fleet UI to control remote pairing.
-    Strong gates remain via host role-config + variant + single-
-    shot Appliance-count check below.
+    The token check above is what keeps that exemption from being
+    reachable by anyone but the local supervisor.
     """
     # Variant gate.
     if body.appliance_variant not in _SELF_BOOTSTRAP_VARIANTS:
@@ -716,6 +773,20 @@ async def self_register_bootstrap(
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail="Self-bootstrap is only available for full-stack / frontend-core variants",
+        )
+
+    # Local-caller gate — the one-time token from the host release-state
+    # directory. Checked before anything reads or writes the database.
+    if not _self_bootstrap_token_matches(body.bootstrap_token):
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        logger.warning(
+            "appliance.self_bootstrap.token_refused",
+            token_presented=bool(body.bootstrap_token),
+            source_ip=_client_ip(request),
+        )
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Self-bootstrap unavailable on this host",
         )
 
     # Host role-config gate — read /etc/spatiumddi-host/role-config
@@ -4152,11 +4223,23 @@ async def delete_appliance(
     if dependents.dns or dependents.dhcp:
         from app.models.dhcp import DHCPServer  # noqa: PLC0415
         from app.models.dns import DNSServer  # noqa: PLC0415
+        from app.services.dns.server_move import elect_primary  # noqa: PLC0415
 
+        lost_primary: set[uuid.UUID] = set()
         for d in dependents.dns:
             dns_server = await db.get(DNSServer, d.id)
             if dns_server is not None:
+                if dns_server.is_primary:
+                    lost_primary.add(dns_server.group_id)
                 await db.delete(dns_server)
+        if lost_primary:
+            # #2276 — a group whose primary went with the appliance elects a
+            # successor among its remaining servers, or every later record
+            # write to its zones resolves against no primary. Flushed first so
+            # the election cannot pick a server being deleted here.
+            await db.flush()
+            for group_id in lost_primary:
+                await elect_primary(db, group_id, exclude_id=None)
         for d in dependents.dhcp:
             dhcp_server = await db.get(DHCPServer, d.id)
             if dhcp_server is not None:

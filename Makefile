@@ -714,7 +714,8 @@ appliance-bake-metallb-chart:
 # BAKE_FLAGS=--allow-stale-images  (or ALLOW_STALE_IMAGES=1, which the
 # script also honours from the environment).
 appliance-bake-images: build-supervisor
-	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh $(BAKE_FLAGS)
+	@BAKE_SAVE_PLATFORM="$${BAKE_SAVE_PLATFORM:-$(APPLIANCE_ARCH)}" \
+	  bash $(APPLIANCE_DIR)/scripts/bake-images.sh $(BAKE_FLAGS)
 
 # Convenience for fast laptop iteration on appliance-level changes
 # (installer, firstboot, console dashboard, partition layout,

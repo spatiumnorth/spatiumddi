@@ -266,28 +266,41 @@ async def _serialize_many(db: Any, rows: list[NATMapping]) -> list[NATMappingRes
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
-async def _resolve_ip_to_address_id(db: Any, ip_str: str | None) -> uuid.UUID | None:
-    """Look up an IPAddress row whose ``address`` matches the literal IP.
+async def _resolve_ip_to_address_id(
+    db: Any, ip_str: str | None, *, subnet_id: uuid.UUID | None = None
+) -> uuid.UUID | None:
+    """Look up the IPAddress row whose ``address`` matches the literal IP.
 
-    Returns the UUID if found, ``None`` if the IP isn't tracked in IPAM.
-    The INET ``host()`` cast on both sides handles netmask-suffixed
-    forms (``10.0.0.5/32``) so an exact-match lookup works regardless
-    of how the operator typed it.
+    Returns the UUID if exactly one row matches, ``None`` if the IP isn't
+    tracked in IPAM. The INET ``host()`` cast on both sides handles
+    netmask-suffixed forms (``10.0.0.5/32``) so an exact-match lookup
+    works regardless of how the operator typed it.
+
+    The same address can exist in several IP spaces (#2577). When
+    ``subnet_id`` is given the lookup is confined to that subnet's space;
+    otherwise an address found in more than one space is ambiguous and
+    left unlinked (``None``) — the string stays authoritative — rather
+    than attaching the mapping to whichever space's row came back first.
     """
 
     if not ip_str:
         return None
     try:
-        res = await db.execute(
-            select(IPAddress.id).where(
-                func.host(IPAddress.address) == func.host(cast(ip_str, INET))
-            )
+        stmt = (
+            select(IPAddress.id, Subnet.space_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(func.host(IPAddress.address) == func.host(cast(ip_str, INET)))
         )
-        row = res.first()
-        return row[0] if row else None
+        if subnet_id is not None:
+            space_subq = select(Subnet.space_id).where(Subnet.id == subnet_id).scalar_subquery()
+            stmt = stmt.where(Subnet.space_id == space_subq)
+        rows = (await db.execute(stmt.limit(2))).all()
     except Exception:
         # Bad IP literal — let pydantic validation surface it elsewhere.
         return None
+    if len(rows) != 1:
+        return None
+    return rows[0][0]
 
 
 async def _check_external_conflict(
@@ -425,7 +438,9 @@ async def create_nat_mapping(
     row = NATMapping(**body.model_dump())
     # Auto-resolve string IPs to IPAM rows when known. Strings stay
     # authoritative; the FK is just for fast joins + cascade-on-delete.
-    row.internal_ip_address_id = await _resolve_ip_to_address_id(db, body.internal_ip)
+    row.internal_ip_address_id = await _resolve_ip_to_address_id(
+        db, body.internal_ip, subnet_id=body.internal_subnet_id
+    )
     row.external_ip_address_id = await _resolve_ip_to_address_id(db, body.external_ip)
     db.add(row)
     await db.flush()
@@ -513,7 +528,9 @@ async def update_nat_mapping(
 
     # Re-resolve FK if either IP changed (or was cleared).
     if "internal_ip" in patch:
-        row.internal_ip_address_id = await _resolve_ip_to_address_id(db, patch["internal_ip"])
+        row.internal_ip_address_id = await _resolve_ip_to_address_id(
+            db, patch["internal_ip"], subnet_id=row.internal_subnet_id
+        )
     if "external_ip" in patch:
         row.external_ip_address_id = await _resolve_ip_to_address_id(db, patch["external_ip"])
 
@@ -575,11 +592,14 @@ async def list_nat_mappings_for_ip(
 async def list_nat_mappings_for_subnet(
     subnet_id: uuid.UUID, db: DB, _: CurrentUser
 ) -> list[NATMappingResponse]:
-    """Every NAT mapping whose internal IP falls inside this subnet's CIDR.
+    """Every NAT mapping that references an IP inside this subnet's CIDR.
 
     Combines:
       * mappings with ``internal_subnet_id == subnet_id`` (hide-NAT pinned to subnet)
       * mappings whose ``internal_ip`` is contained by the subnet's network
+      * mappings whose ``external_ip`` is contained by the subnet's network
+        (#2617) — the address rows' "NAT n" badge counts both sides, so the
+        tab has to list both or it contradicts the badge.
     """
 
     subnet = await db.get(Subnet, subnet_id)
@@ -597,6 +617,10 @@ async def list_nat_mappings_for_subnet(
                         and_(
                             NATMapping.internal_ip.is_not(None),
                             NATMapping.internal_ip.op("<<=")(cidr_lit),
+                        ),
+                        and_(
+                            NATMapping.external_ip.is_not(None),
+                            NATMapping.external_ip.op("<<=")(cidr_lit),
                         ),
                     )
                 )
