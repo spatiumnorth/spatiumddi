@@ -584,6 +584,13 @@ async def _apply_delete_block(
     batch = await collect_soft_delete_batch(db, block)
     # A block cascade reaches DHCP scopes (via its subnets), so it owes the same
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
+    # spatiumddi#2734 — the reverse zones its subnets auto-created ride the
+    # batch, as they do on a lone subnet delete (#1066).
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        retire_auto_reverse_zones_for_batch,
+    )
+
+    zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
     deleted_at = await apply_soft_delete(db, batch, user.id)
@@ -598,6 +605,7 @@ async def _apply_delete_block(
     _retracted, dns_wake_group_ids = await retract_trashed_subnet_records(
         db, batch, deleted_at, user.id
     )
+    dns_wake_group_ids |= zone_wake_group_ids
     for row in batch.rows:
         db.add(
             _audit(
@@ -734,6 +742,13 @@ async def _apply_delete_space(
     batch = await collect_soft_delete_batch(db, space)
     # A space cascade reaches DHCP scopes (via its subnets), so it owes the same
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
+    # spatiumddi#2734 — the reverse zones its subnets auto-created ride the
+    # batch, as they do on a lone subnet delete (#1066).
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        retire_auto_reverse_zones_for_batch,
+    )
+
+    zone_wake_group_ids = await retire_auto_reverse_zones_for_batch(db, batch)
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
     deleted_at = await apply_soft_delete(db, batch, user.id)
@@ -744,6 +759,7 @@ async def _apply_delete_space(
     _retracted, dns_wake_group_ids = await retract_trashed_subnet_records(
         db, batch, deleted_at, user.id
     )
+    dns_wake_group_ids |= zone_wake_group_ids
     for row in batch.rows:
         db.add(
             _audit(

@@ -10773,6 +10773,8 @@ export interface AlertRuleTypeSpec {
   group: string;
   description: string | null;
   params: AlertParamSpec[];
+  /** Seeded + driven by the platform: described, but not creatable (#2748). */
+  system_driven?: boolean;
 }
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";

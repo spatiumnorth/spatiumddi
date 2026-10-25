@@ -740,6 +740,13 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Text, nullable=False, default="", server_default=sa_text("''")
     )
 
+    # The create-time opt-out from the auto reverse zone (#2735). Stored, because
+    # the zone is also created by the catch-up every address sync runs and by a
+    # resize, and neither can see the request that said "no".
+    skip_reverse_zone: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
     # Presentational (#2137): show the green "N free · click to allocate"
     # gap rows between allocated addresses. NULL = use the default (off
     # for integration-owned subnets and anything larger than a /16);

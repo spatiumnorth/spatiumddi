@@ -41,7 +41,7 @@ columns, which is all the previous release reads, and ``e51ab0dede3e``'s own
 downgrade copies them back into the clear if the install goes further back.
 
 Revision ID: c2b203844c95
-Revises: c3a8f5e12d94
+Revises: c6d2e84f1a97
 Create Date: 2026-10-23
 """
 
@@ -57,7 +57,7 @@ from alembic import op
 logger = logging.getLogger("alembic.runtime.migration")
 
 revision = "c2b203844c95"
-down_revision = "c3a8f5e12d94"
+down_revision = "c6d2e84f1a97"
 branch_labels = None
 depends_on = None
 
