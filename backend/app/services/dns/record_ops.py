@@ -21,8 +21,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, event, func, or_, select, tuple_, update
+from sqlalchemy import (
+    Select,
+    Text,
+    and_,
+    any_,
+    cast,
+    event,
+    func,
+    literal,
+    literal_column,
+    null,
+    or_,
+    select,
+    tuple_,
+    union_all,
+    update,
+)
 from sqlalchemy import delete as sa_delete
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
@@ -64,8 +82,9 @@ OP_RETRY_MAX_SECONDS = 15 * 60
 # next heartbeat (~30 s) and keeps an unsent ack across failed heartbeats, so
 # five minutes is several missed heartbeats, not a slow one.
 IN_FLIGHT_ACK_TIMEOUT = timedelta(minutes=5)
-# Keys per ``IN`` list when matching RRsets in SQL: three bind parameters a
-# key, well under asyncpg's 32767.
+# Keys per statement when matching RRsets in SQL (``candidates_with_keys``). The
+# keys ride as three array parameters (#2289), so this no longer bounds a
+# bind-parameter count; it only bounds what one statement carries.
 RRSET_KEY_CHUNK = 3000
 
 
@@ -101,11 +120,130 @@ def _op_type_sql() -> Any:
     return func.upper(DNSRecordOp.record["type"].astext)
 
 
+def _keys_in(cols: tuple[Any, Any, Any], keys: Collection[tuple[str, str, str]]) -> Any:
+    """``cols`` is one of ``keys``, with the keys as three array parameters.
+
+    Never a row ``IN`` list (#2289): Postgres cannot turn ``(a, b, c) IN
+    ((..), ..)`` into an array comparison, so a 3,000-key list was a
+    9,000-comparison OR-of-ANDs, costed over ``jit_above_cost`` and
+    JIT-compiled in the backend and every parallel worker — 1.3-1.5 GB and
+    seconds to minutes per process, which OOM-killed the primary under seven
+    polling agents. Unnested, the statement is the same size whatever the key
+    count and the planner joins against the keys. Same rows: no key component
+    is ever NULL (``op_rrset_key``)."""
+    keys = list(keys)
+    wanted = (
+        func.unnest(
+            literal([k[0] for k in keys], ARRAY(Text)),
+            literal([k[1] for k in keys], ARRAY(Text)),
+            literal([k[2] for k in keys], ARRAY(Text)),
+        )
+        .table_valued("zone_name", "name", "type")
+        .render_derived()
+    )
+    return tuple_(*cols).in_(select(wanted.c.zone_name, wanted.c.name, wanted.c.type))
+
+
 def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
     """WHERE clause matching ops whose RRset is one of ``keys``."""
     return and_(
         DNSRecordOp.record.has_key("rrset"),
-        tuple_(DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()).in_(list(keys)),
+        _keys_in((DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()), keys),
+    )
+
+
+def _rrset_candidates(*where: Any) -> Select[Any]:
+    """The ops matching ``where`` as ``(id, zone_name, name, type)`` rows, for
+    ``candidates_with_keys``. Only ops that carry an RRset have a key."""
+    return select(
+        DNSRecordOp.id.label("id"),
+        DNSRecordOp.zone_name.label("zone_name"),
+        _op_name_sql().label("name"),
+        _op_type_sql().label("type"),
+    ).where(*where, DNSRecordOp.record.has_key("rrset"))
+
+
+def candidates_with_keys(candidates: Select[Any], keys: Collection[tuple[str, str, str]]) -> Any:
+    """WHERE clause matching the ops among ``candidates`` (``_rrset_candidates``)
+    whose RRset key is one of ``keys`` — by grouping, never by a join.
+
+    The candidates and the keys go into one ``UNION ALL`` (a key as a row
+    with a NULL ``id``), grouped by RRset key; a group keeps its ids only
+    when a key row is in it. A ``GROUP BY`` is a hash or a sort, linear in
+    the rows either way, so no plan can compare every candidate with every
+    key (#2289). A join could, and did: with statistics taken while the
+    queue was idle, the GENERIC plan a prepared statement switches to after
+    five executions (asyncpg prepares every statement) estimated one
+    candidate and the unnested keys at 10 rows, and ran a nested-loop semi
+    join that rescanned the keys once per candidate — 7.5-10.9 s for 5,000
+    waiting ops and 3,000 keys, against 35 ms for the custom plan.
+
+    The ids come back as ONE array, matched with ``= ANY(..)``: computed
+    once (an InitPlan) and probed through the primary key whatever the
+    estimates, where a semi join on a high estimate could hash the matches
+    and read the whole table to probe them. ``coalesce`` keeps it an array
+    value (bare, ``ANY (SELECT ..)`` is the row-by-row subquery form) and
+    gives an empty array when nothing matches. The keys ride as three array
+    parameters, so the statement is the same size for any key count; no key
+    component is ever NULL (``op_rrset_key``), so the NULL ``id`` cannot be
+    confused with a candidate.
+    """
+    keys = list(keys)
+    wanted = (
+        func.unnest(
+            literal([k[0] for k in keys], ARRAY(Text)),
+            literal([k[1] for k in keys], ARRAY(Text)),
+            literal([k[2] for k in keys], ARRAY(Text)),
+        )
+        .table_valued("zone_name", "name", "type")
+        .render_derived()
+    )
+    c = candidates.subquery("candidates")
+    rows = union_all(
+        select(c.c.id, cast(c.c.zone_name, Text).label("zone_name"), c.c.name, c.c.type),
+        select(
+            cast(null(), PG_UUID(as_uuid=True)).label("id"),
+            wanted.c.zone_name,
+            wanted.c.name,
+            wanted.c.type,
+        ),
+    ).subquery("rrset_rows")
+    matched = (
+        select(func.unnest(func.array_agg(rows.c.id).filter(rows.c.id.is_not(None))).label("id"))
+        .group_by(rows.c.zone_name, rows.c.name, rows.c.type)
+        .having(func.bool_or(rows.c.id.is_(None)))
+        .subquery("matched")
+    )
+    return DNSRecordOp.id == any_(
+        func.coalesce(
+            select(func.array_agg(matched.c.id)).scalar_subquery(),
+            literal_column("'{}'::uuid[]"),
+        )
+    )
+
+
+def backed_off_match_where(
+    server_id: uuid.UUID, now: datetime, keys: Collection[tuple[str, str, str]]
+) -> Any:
+    """WHERE clause matching ``server_id``'s ops still backing off at ``now``
+    (``pending``, ``next_attempt_at`` later) whose RRset is one of ``keys``.
+
+    The candidates are only the ops actually waiting — none, usually — read
+    through the partial ``ix_dns_record_op_server_backoff``, and the keys are
+    matched against that set (``candidates_with_keys``), so the cost follows
+    the page and those ops, never the server's whole backlog or the size of
+    a zone (#2289).
+    """
+    return candidates_with_keys(
+        _rrset_candidates(
+            DNSRecordOp.server_id == server_id,
+            # A literal, not a bind parameter: the partial index's predicate
+            # is ``state = 'pending'``, and a generic plan cannot prove that
+            # from ``state = $1``, so it would read every op of the server.
+            DNSRecordOp.state == literal_column("'pending'"),
+            DNSRecordOp.next_attempt_at > now,
+        ),
+        keys,
     )
 
 
@@ -157,12 +295,16 @@ async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uu
                         DNSRecordOp.created_at,
                         DNSRecordOp.seq,
                     ).where(
-                        DNSRecordOp.server_id == server_id,
-                        # ``>=``: an op of the earliest op's own transaction
-                        # can follow it (#1489).
-                        DNSRecordOp.created_at >= earliest,
-                        DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
-                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                        candidates_with_keys(
+                            _rrset_candidates(
+                                DNSRecordOp.server_id == server_id,
+                                # ``>=``: an op of the earliest op's own
+                                # transaction can follow it (#1489).
+                                DNSRecordOp.created_at >= earliest,
+                                DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
+                            ),
+                            keys[i : i + RRSET_KEY_CHUNK],
+                        )
                     )
                 )
             ).all()
@@ -1973,9 +2115,13 @@ async def retract_address_records(
 
     * ``auto_generated`` records only. A record an operator made by hand is
       theirs; it keeps its place with ``ip_address_id`` null, as before.
-    * live records only. One already in the trash — the PTRs of an
-      auto-created reverse zone that went to the trash with its subnet
-      (#1066) — is not being served, and keeps riding its own batch.
+    * live records are withdrawn through the queue. One already in the
+      trash — the PTRs of an auto-created reverse zone that went to the trash
+      with its subnet (#1066), or the records a zone deleted before the subnet
+      took into ITS batch (#2732) — is not being served, so it is only
+      hard-deleted: left behind, the address's delete would null its
+      ``ip_address_id`` and a later restore of its batch would publish a
+      record owned by nothing.
     * records bound to these subnets' addresses only. The caller passes the
       subnets it is about to hard-delete, so every address concerned is
       really going; a sibling subnet's records in a shared zone are untouched.
@@ -1993,6 +2139,18 @@ async def retract_address_records(
     records: list[DNSRecord] = []
     for start in range(0, len(ids), _RETRACT_CHUNK):
         chunk = ids[start : start + _RETRACT_CHUNK]
+        # #2732 — the trashed ones, whatever batch they ride.
+        await db.execute(
+            sa_delete(DNSRecord)
+            .where(
+                DNSRecord.deleted_at.is_not(None),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_address_id.in_(
+                    select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
+                ),
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
         records.extend(
             (
                 await db.execute(

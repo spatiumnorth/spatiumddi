@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
 import { dhcpApi, type DHCPOption, type DHCPOptionCodeDef } from "@/lib/api";
+import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { Field, inputCls } from "./_shared";
 
 /**
@@ -205,6 +206,12 @@ function CustomOptionRow({
             onFocus={() => setOpen(true)}
             onBlur={commitTyped}
             onKeyDown={(e) => {
+              if (
+                closePopupOnEscape(e, open && matches.length > 0, () =>
+                  setOpen(false),
+                )
+              )
+                return;
               // Enter commits the typed code instead of submitting the
               // surrounding form with the row still on its old code.
               if (e.key === "Enter") {

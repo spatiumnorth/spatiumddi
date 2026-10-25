@@ -78,6 +78,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 from app.core.content_disposition import content_disposition
@@ -93,7 +94,77 @@ from app.services.appliance.upgrade_image_catalog import FleetArchitectures
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter()
+
+def _request_content_length(request: Request) -> int | None:
+    """The declared body size of an upload, or None when it is absent or
+    unparseable (a chunked transfer, which the upload route refuses)."""
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def _require_spool_headroom(content_length: int | None) -> None:
+    """422 when buffering an upload of ``content_length`` bytes would push
+    THIS api pod's node under the kubelet's eviction margin (#2572).
+
+    #2452's :func:`_require_store_headroom` checks where the bytes are
+    finally written (the mirror's PVC when the mirror is on). But an
+    air-gapped multipart upload is spooled whole onto the receiving pod's
+    node ``/var`` first, which is a different node, so the store check
+    never sees it. This must run before the body is read, and after the
+    caller is authorised: answering it first would tell anyone how close
+    the node is to its eviction line. A missing length is refused by the
+    caller (:class:`_SpoolHeadroomRoute`) before this runs."""
+    if content_length is None:
+        return
+    usage = upgrade_image_space.local_volume_usage()
+    if usage is None:
+        return
+    message = upgrade_image_space.spool_shortfall_message(usage, content_length)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
+class _SpoolHeadroomRoute(PreBodyAuthRoute):
+    """Authorise, then refuse an upgrade-image upload that cannot be
+    buffered on the receiving node, before FastAPI reads its body.
+
+    FastAPI reads the request body (``await request.form()``) before it
+    resolves dependencies or runs the handler, so the node's ``/var`` has
+    already taken the whole upload by the time any in-handler or
+    dependency check could run. Wrapping the route handler is the only
+    hook that runs first. :class:`PreBodyAuthRoute` uses it to run the
+    route's superadmin and permission checks from the headers, so a
+    caller who may not upload is answered 401 / 403 without sending a
+    byte of the image; this subclass then checks the spool headroom
+    (#2572) for the upload route.
+
+    The headroom check needs the size up front, so the upload route
+    refuses a body with no ``Content-Length`` (a chunked transfer) with
+    411 rather than spooling it unchecked. Browsers, curl ``-F`` and the
+    common HTTP client libraries all send one for a multipart form."""
+
+    async def before_body(self, request: Request) -> None:
+        if getattr(self.endpoint, "__name__", "") != "upload_upgrade_image":
+            return
+        content_length = _request_content_length(request)
+        if content_length is None:
+            raise HTTPException(
+                status.HTTP_411_LENGTH_REQUIRED,
+                (
+                    "An upgrade-image upload must declare its size in a "
+                    "Content-Length header, so the receiving node's free "
+                    "space can be checked before the image is buffered."
+                ),
+            )
+        await _require_spool_headroom(content_length)
+
+
+router = APIRouter(route_class=_SpoolHeadroomRoute)
 
 
 # On-disk storage. The api container's docker-compose entry binds

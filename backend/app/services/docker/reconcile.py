@@ -137,6 +137,8 @@ class ReconcileSummary:
     subnets_created: int = 0
     subnets_updated: int = 0
     subnets_deleted: int = 0
+    # #2601: un-owned subnets reused at a desired CIDR instead of twinned.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -191,20 +193,32 @@ def _find_enclosing_operator_block(
     return best
 
 
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
+def _find_subnet_for_ip(subnets: list[Subnet], ip: str, host_id: Any = None) -> Subnet | None:
+    """The subnet an address of ``host_id`` belongs in (#2601).
+
+    The host's own subnets come first, then the longest prefix. On a tie
+    (two rows at one CIDR) an un-owned subnet beats another integration's,
+    then the lowest id wins, so the choice never follows the order the
+    database happened to return the rows in.
+    """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return None
     best: Subnet | None = None
-    best_prefix: int = -1
+    best_key: tuple[bool, int, bool, str] | None = None
     for s in subnets:
         net = _parse_net(str(s.network))
-        if net is None:
+        if net is None or addr not in net:
             continue
-        if addr in net and net.prefixlen > best_prefix:
+        own = host_id is not None and s.docker_host_id == host_id
+        owned_elsewhere = not own and (
+            s.docker_host_id is not None or owned_by_other_integration(s, "docker_host_id")
+        )
+        key = (not own, -net.prefixlen, owned_elsewhere, str(s.id))
+        if best_key is None or key < best_key:
             best = s
-            best_prefix = net.prefixlen
+            best_key = key
     return best
 
 
@@ -365,7 +379,37 @@ async def _apply_blocks_and_subnets(
             await db.delete(row)
             summary.subnets_deleted += 1
 
+    # #2601: an un-owned subnet at exactly a desired CIDR is reused as it
+    # stands, never twinned. It is one #1558 kept when its network went
+    # away (above), one a target delete kept for its operator content
+    # (#2287), or one an operator made. As the Proxmox (#177), Cloud and
+    # OPNsense reconcilers do, it is neither claimed nor rewritten, and
+    # the address pass still mirrors into it.
+    wanted: dict[str, str] = {}
+    for net_str in desired_map:
+        parsed = _parse_net(net_str)
+        if net_str not in current_subnets and parsed is not None:
+            wanted[str(parsed)] = net_str
+    unowned_cidrs: set[str] = set()
+    if wanted:
+        res = await db.execute(
+            select(Subnet).where(
+                Subnet.space_id == host.ipam_space_id,
+                Subnet.network.in_(list(wanted)),
+                Subnet.docker_host_id.is_(None),
+            )
+        )
+        unowned_cidrs = {
+            wanted[str(s.network)]
+            for s in res.scalars().all()
+            if not owned_by_other_integration(s, "docker_host_id")
+        }
+
     for net_str, d in desired_map.items():
+        if net_str in unowned_cidrs:
+            summary.subnets_matched += 1
+            continue
+
         parent_block = _find_enclosing_operator_block(blocks, d.network, host.id)
 
         if parent_block is None:
@@ -509,8 +553,21 @@ async def _apply_addresses(
                 await db.delete(row)
                 summary.addresses_deleted += 1
 
+    # #2601: an operator-edited row stays in its subnet. Like its status,
+    # hostname and description (below), a sync does not change it.
+    subnets_by_id = {s.id: s for s in subnets}
+
     for addr, d in desired_map.items():
-        subnet = _find_subnet_for_ip(subnets, d.address)
+        held = current.get(addr)
+        subnet: Subnet | None
+        if (
+            held is not None
+            and held.user_modified_at is not None
+            and held.subnet_id in subnets_by_id
+        ):
+            subnet = subnets_by_id[held.subnet_id]
+        else:
+            subnet = _find_subnet_for_ip(subnets, d.address, host.id)
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
@@ -654,6 +711,7 @@ async def reconcile_host(db: AsyncSession, host: DockerHost) -> ReconcileSummary
                     "created": summary.subnets_created,
                     "updated": summary.subnets_updated,
                     "deleted": summary.subnets_deleted,
+                    "matched": summary.subnets_matched,
                 },
                 "addresses": {
                     "created": summary.addresses_created,
@@ -676,6 +734,7 @@ async def reconcile_host(db: AsyncSession, host: DockerHost) -> ReconcileSummary
         subnets_created=summary.subnets_created,
         subnets_updated=summary.subnets_updated,
         subnets_deleted=summary.subnets_deleted,
+        subnets_matched=summary.subnets_matched,
         addresses_created=summary.addresses_created,
         addresses_updated=summary.addresses_updated,
         addresses_deleted=summary.addresses_deleted,

@@ -16,7 +16,7 @@ from app.models.appliance import (
     PairingCode,
 )
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
-from app.models.audit import AuditLog
+from app.models.audit import AuditChainCheckpoint, AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
@@ -175,6 +175,7 @@ __all__ = [
     "AIChatSession",
     "AIProvider",
     "Base",
+    "AuditChainCheckpoint",
     "AuditLog",
     "AuditForwardTarget",
     "AlertRule",

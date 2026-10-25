@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Copy,
@@ -690,6 +691,90 @@ export function RevealTokenModal({
   );
 }
 
+// ── Re-enable Token Modal ──────────────────────────────────────────────────
+
+/** Re-enabling an inactive token is superadmin-only and needs the step-up:
+ *  the token was revoked by someone, and it outlives this session. */
+function ReenableTokenModal({
+  token,
+  onClose,
+}: {
+  token: ApiToken;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const mut = useMutation({
+    mutationFn: () =>
+      apiTokensApi.update(token.id, {
+        is_active: true,
+        stepup_password: stepPassword || null,
+        stepup_totp_code: stepTotp || null,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["api-tokens"] });
+      onClose();
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setError(
+        typeof detail === "string" ? detail : "Failed to re-enable token.",
+      );
+    },
+  });
+  return (
+    <Modal title="Re-enable API Token" onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          setError(null);
+          mut.mutate();
+        }}
+        className="space-y-3"
+      >
+        <p className="text-sm text-muted-foreground">
+          Re-enable <strong className="text-foreground">{token.name}</strong>
+          {ownerLabel(token) && (
+            <>
+              {" "}
+              (owned by{" "}
+              <strong className="text-foreground">{ownerLabel(token)}</strong>)
+            </>
+          )}
+          ? It starts authenticating again immediately. Confirm it's you.
+        </p>
+        <ReauthFields
+          password={stepPassword}
+          onPassword={setStepPassword}
+          totp={stepTotp}
+          onTotp={setStepTotp}
+          autoFocus
+        />
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={mut.isPending || (!stepPassword && !stepTotp)}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mut.isPending ? "Re-enabling…" : "Re-enable token"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 // ── Main page ──────────────────────────────────────────────────────────────
 
 export function ApiTokensPage() {
@@ -704,10 +789,13 @@ export function ApiTokensPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [justCreated, setJustCreated] = useState<ApiTokenCreated | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
+  const [reenable, setReenable] = useState<ApiToken | null>(null);
+  // Only a superadmin can re-enable an inactive token; owners mint a new one.
+  const { isSuperadmin } = usePermissions();
 
-  const toggleMut = useMutation({
+  const revokeMut = useMutation({
     mutationFn: (t: ApiToken) =>
-      apiTokensApi.update(t.id, { is_active: !t.is_active }),
+      apiTokensApi.update(t.id, { is_active: false }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
   });
   const deleteMut = useMutation({
@@ -826,17 +914,25 @@ export function ApiTokensPage() {
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-1">
-                        <button
-                          onClick={() => toggleMut.mutate(t)}
-                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                          title={t.is_active ? "Revoke" : "Re-enable"}
-                        >
-                          {t.is_active ? (
+                        {t.is_active ? (
+                          <button
+                            onClick={() => revokeMut.mutate(t)}
+                            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                            title="Revoke"
+                          >
                             <PowerOff className="h-3.5 w-3.5" />
-                          ) : (
-                            <Power className="h-3.5 w-3.5" />
-                          )}
-                        </button>
+                          </button>
+                        ) : (
+                          isSuperadmin && (
+                            <button
+                              onClick={() => setReenable(t)}
+                              className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                              title="Re-enable"
+                            >
+                              <Power className="h-3.5 w-3.5" />
+                            </button>
+                          )
+                        )}
                         <button
                           onClick={() => setConfirmDelete(t)}
                           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -866,6 +962,12 @@ export function ApiTokensPage() {
           <RevealTokenModal
             token={justCreated}
             onClose={() => setJustCreated(null)}
+          />
+        )}
+        {reenable && (
+          <ReenableTokenModal
+            token={reenable}
+            onClose={() => setReenable(null)}
           />
         )}
         {confirmDelete && (

@@ -4,6 +4,11 @@ import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
+import {
+  WINRM_FORM_DEFAULTS,
+  winrmFormFrom,
+  winrmSettingsPayload,
+} from "@/lib/winrm";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -1328,7 +1333,7 @@ function GroupModal({
 
 // ── Server Modal (add / edit) ─────────────────────────────────────────────────
 
-function ServerModal({
+export function ServerModal({
   groupId,
   server,
   onClose,
@@ -1366,16 +1371,24 @@ function ServerModal({
   });
 
   // Windows credential state — same contract as the DHCP modal:
-  //   * On edit with creds: leave blank to keep, type to replace.
-  //   * Always send the creds block on windows_dns so transport / port /
-  //     TLS toggles reach the backend (backend merges with stored blob).
+  //   * On edit with creds: username/password blank to keep, type to replace.
+  //   * The connection settings are seeded from what is stored, and only the
+  //     ones the operator changes are sent (the backend merges a partial
+  //     block over the stored one), so an untouched save keeps them.
+  const [winSeed] = useState(() =>
+    server?.driver === "windows_dns" && server.has_credentials
+      ? winrmFormFrom(server.winrm_settings)
+      : undefined,
+  );
+  const winInitial = winSeed ?? WINRM_FORM_DEFAULTS;
   const [winUsername, setWinUsername] = useState("");
   const [winPassword, setWinPassword] = useState("");
-  const [winPort, setWinPort] = useState("5985");
-  const [winTransport, setWinTransport] =
-    useState<WindowsDNSCredentials["transport"]>("ntlm");
-  const [winUseTLS, setWinUseTLS] = useState(false);
-  const [winVerifyTLS, setWinVerifyTLS] = useState(false);
+  const [winPort, setWinPort] = useState(winInitial.port);
+  const [winTransport, setWinTransport] = useState<
+    WindowsDNSCredentials["transport"]
+  >(winInitial.transport);
+  const [winUseTLS, setWinUseTLS] = useState(winInitial.useTls);
+  const [winVerifyTLS, setWinVerifyTLS] = useState(winInitial.verifyTls);
   const [winClearCreds, setWinClearCreds] = useState(false);
   const [testResult, setTestResult] = useState<{
     ok: boolean;
@@ -1559,12 +1572,17 @@ function ServerModal({
         // Path B is opt-in: only send a creds block if the user entered
         // something, or if we're editing a server that may already have
         // creds (lets them flip transport / port without re-typing).
-        const creds: Partial<WindowsDNSCredentials> = {
-          winrm_port: parseInt(winPort, 10) || 5985,
-          transport: winTransport,
-          use_tls: winUseTLS,
-          verify_tls: winVerifyTLS,
-        };
+        // With stored credentials only the changed settings are sent, so an
+        // untouched setting keeps its stored value.
+        const creds: Partial<WindowsDNSCredentials> = winrmSettingsPayload(
+          {
+            port: winPort,
+            transport: winTransport ?? "ntlm",
+            useTls: winUseTLS,
+            verifyTls: winVerifyTLS,
+          },
+          winSeed,
+        );
         if (winUsername) creds.username = winUsername;
         if (winPassword) creds.password = winPassword;
         // First-time set requires both. Edit path is merge — backend
@@ -1579,7 +1597,10 @@ function ServerModal({
           );
           return;
         }
-        if (winUsername || winPassword || (editing && hasExistingCreds)) {
+        if (
+          (winUsername || winPassword || (editing && hasExistingCreds)) &&
+          Object.keys(creds).length > 0
+        ) {
           payload.windows_credentials = creds;
         }
       }
@@ -3595,7 +3616,8 @@ function MoveZoneModal({
       preview.key_names_lost.length > 0 ||
       !!preview.technitium_api_refusal ||
       !!preview.tsig_algorithm_refusal ||
-      !!preview.forward_transport_refusal);
+      !!preview.forward_transport_refusal ||
+      !!preview.technitium_acl_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3664,6 +3686,11 @@ function MoveZoneModal({
             {preview.forward_transport_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.forward_transport_refusal}
+              </div>
+            )}
+            {preview.technitium_acl_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.technitium_acl_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -3945,10 +3972,17 @@ function ZoneDetailView({
   // feature module so disabling it stops the extra query entirely.
   const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
   const tlsCertsOn = moduleEnabled("security.tls_certs");
-  const { data: tlsCerts, isLoading: tlsCertsLoading } = useQuery({
+  // The route takes read on 'tls_cert': a user without it is not asked, and
+  // the tab says so instead of "Certificates (0)" (#2704).
+  const canReadCerts = usePermissions().can("read", "tls_cert");
+  const {
+    data: tlsCerts,
+    isLoading: tlsCertsLoading,
+    error: tlsCertsError,
+  } = useQuery({
     queryKey: ["tls-certs", "dns-zone", zone.id],
     queryFn: () => tlsCertsApi.list({ dns_zone_id: zone.id, limit: 200 }),
-    enabled: modulesReady && tlsCertsOn,
+    enabled: modulesReady && tlsCertsOn && canReadCerts,
   });
   // #118 — toggle auto-discovery of cert probe targets for this zone's
   // A/AAAA records. The discovery reconciler picks the change up on its
@@ -4602,7 +4636,10 @@ function ZoneDetailView({
                   : "border-transparent text-muted-foreground hover:text-foreground")
               }
             >
-              Certificates ({tlsCerts?.items.length ?? 0})
+              Certificates
+              {canReadCerts && !tlsCertsError
+                ? ` (${tlsCerts?.items.length ?? 0})`
+                : ""}
             </button>
           )}
           {/* No count — the drift report AXFRs every server in the group, so
@@ -4657,11 +4694,27 @@ function ZoneDetailView({
                   Auto-discover &amp; probe every A/AAAA record in this zone
                 </span>
               </label>
-              <CertsCompactTable
-                targets={tlsCerts?.items ?? []}
-                isLoading={tlsCertsLoading}
-                emptyLabel="No TLS certificates linked to records in this zone."
-              />
+              {tlsCertsError || !canReadCerts ? (
+                <p className="text-sm">
+                  {tlsCertsError ? (
+                    <ListReadError
+                      error={tlsCertsError}
+                      what="this zone's TLS certificates"
+                    />
+                  ) : (
+                    <span className="text-muted-foreground">
+                      You don't have permission to see this zone's TLS
+                      certificates.
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <CertsCompactTable
+                  targets={tlsCerts?.items ?? []}
+                  isLoading={tlsCertsLoading}
+                  emptyLabel="No TLS certificates linked to records in this zone."
+                />
+              )}
             </>
           )}
         </div>
@@ -5960,7 +6013,14 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
   const hasBind = servers.some((s) => s.driver === "bind9");
 
   const delMut = useMutation({
-    mutationFn: (id: string) => dnsApi.deleteView(group.id, id),
+    // The modal lists the blocking lists scoped to the view, so confirming
+    // it is the acknowledgement the API asks for (#2275).
+    mutationFn: (id: string) =>
+      dnsApi.deleteView(group.id, id, {
+        acknowledgeBlocklistDetach: blocklists.some((b) =>
+          b.applied_view_ids?.includes(id),
+        ),
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-views", group.id] });
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
@@ -6136,13 +6196,25 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           message={
             <div className="space-y-2 text-sm">
               <p>
-                Zones assigned to this view are not deleted — they fall back to
-                being served from every remaining view.
+                A view that still scopes zones or records cannot be deleted:
+                they would otherwise be served from every remaining view. Move
+                them to another view or delete them first, including any in the
+                Trash.
               </p>
-              <p>
-                Any blocking list scoped only to this view stops being applied
-                anywhere.
-              </p>
+              {(() => {
+                const scoped = blocklists.filter((b) =>
+                  b.applied_view_ids?.includes(confirmDelete.id),
+                );
+                if (scoped.length === 0) return null;
+                return (
+                  <p className="text-amber-700 dark:text-amber-400">
+                    Blocking lists scoped to this view lose that scope, so the
+                    clients it matches stop being filtered by them:{" "}
+                    {scoped.map((b) => b.name).join(", ")}. A list scoped to
+                    nothing else stops being applied anywhere.
+                  </p>
+                );
+              })()}
               {views.length === 1 && (
                 <p className="text-amber-700 dark:text-amber-400">
                   This is the last view in the group. Removing it returns the

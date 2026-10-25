@@ -603,6 +603,12 @@ cnpg:
   #  * fast-evict tolerations: even a co-located replica leaves a dead
   #    node in ~20 s instead of 300 s (suppresses DefaultTolerationSeconds,
   #    exactly like api/frontend/worker/postgresql/redis).
+  #
+  # #2240: preferred alone never moves the replicas once both run on the
+  # seed, which is where firstboot starts them. From three nodes the seed
+  # supervisor adds the REQUIRED form of this term to the Deployment itself
+  # (k8s_api.ensure_cnpg_operator_spread) and removes it below three; keep
+  # this term's selector in step with it.
   replicaCount: 2
   affinity:
     podAntiAffinity:

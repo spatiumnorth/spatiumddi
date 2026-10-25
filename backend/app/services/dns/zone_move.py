@@ -38,6 +38,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.acme import ACMEAccount
@@ -64,8 +65,10 @@ from app.services.dns.record_ops import (
     count_queued_zone_ops,
     sweep_zone_ops,
 )
+from app.services.dns.technitium_options import allow_query_problem, allow_transfer_problem
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 from app.services.dns.tsig_algorithms import key_refusal
+from app.services.dns.view_collisions import ExtraZone, zone_render_collisions
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 
 logger = structlog.get_logger(__name__)
@@ -173,6 +176,8 @@ class ZoneMovePlan:
     target_drivers: list[str] = field(default_factory=list)
 
     name_collision: bool = False
+    #: Views of the target that would render this zone's name twice (#2275).
+    name_collision_views: list[str] = field(default_factory=list)
     target_tsig_key_generated: bool = False
     #: Target drivers that cannot sign, when the zone is signed. A move
     #: onto one is refused rather than warned: the row keeps saying
@@ -208,6 +213,13 @@ class ZoneMovePlan:
     #: same check zone create / update run, so the preview reports exactly the
     #: refusal the commit raises. Refused, never waived.
     forward_transport_refusal: str | None = None
+    #: #2263 — the zone's own ``allow_query`` / ``allow_transfer`` holds an
+    #: element the agent-managed Technitium driver in the target cannot
+    #: express. The zone create / update gate refuses the same list; a move
+    #: is another way into the group, and on a zone Technitium creates fresh
+    #: "left as the daemon has it" means open to every client. Refused,
+    #: never waived.
+    technitium_acl_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -334,13 +346,17 @@ async def assemble_move_plan(
     # then renders into no operator view at all rather than into one.
     scoped = (
         await db.execute(
-            select(DNSRecord.id, DNSRecord.view_id)
+            select(DNSRecord.id, DNSRecord.view_id, DNSRecord.deleted_at)
             .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
             .execution_options(include_deleted=True)
         )
     ).all()
-    for _rid, view_id in scoped:
-        action, _new_id, old_name = _resolve(view_id)
+    # Where the zone's LIVE scoped records would place it in the target (#2275).
+    live_record_view_ids: set[uuid.UUID] = set()
+    for _rid, view_id, deleted_at in scoped:
+        action, new_id, old_name = _resolve(view_id)
+        if deleted_at is None and new_id is not None:
+            live_record_view_ids.add(new_id)
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
@@ -370,6 +386,27 @@ async def assemble_move_plan(
         )
     )
     plan.name_collision = clash.first() is not None
+    # #2275 — the constraint is not the whole story: a zone with no view is
+    # rendered into EVERY view of the target (and a zone's scoped records place
+    # it in their views too), so it can land beside a same-name zone pinned to
+    # one of them. BIND refuses a view declaring a zone twice, and the agent
+    # then declines the whole target group's config.
+    if zone.group_id != target_group.id:
+        render = await zone_render_collisions(
+            db,
+            target_group.id,
+            names=[zone.name],
+            extra_zones=[
+                ExtraZone(
+                    id=zone.id,
+                    name=zone.name,
+                    view_id=effective_view_id,
+                    record_view_ids=live_record_view_ids,
+                )
+            ],
+        )
+        plan.name_collision_views = sorted({c.view for c in render if str(zone.id) in c.zone_ids})
+        plan.name_collision = plan.name_collision or bool(plan.name_collision_views)
 
     # ── Dynamic-update grants ─────────────────────────────────────────
     acl_rows = (
@@ -495,6 +532,24 @@ async def assemble_move_plan(
         except HTTPException as exc:
             plan.technitium_api_refusal = str(exc.detail)
 
+    # ── Agent-managed Technitium target (#2263, a refusal) ────────────
+    # The agent applies a primary / secondary / stub zone's own allow_query,
+    # and a primary's allow_transfer, through the address-match translation;
+    # an inexpressible list is left unapplied, which on a zone the move makes
+    # Technitium create means open. Same checks as zone create / update.
+    if "technitium" in plan.target_drivers:
+        defs = await _acl_definitions(db, target_group.id)
+        problem = None
+        if zone.zone_type in ("primary", "secondary", "stub") and zone.allow_query:
+            problem = allow_query_problem(list(zone.allow_query), defs)
+        if problem is None and zone.zone_type == "primary" and zone.allow_transfer:
+            problem = allow_transfer_problem(list(zone.allow_transfer), defs)
+        if problem:
+            plan.technitium_acl_refusal = (
+                f"Group {target_group.name!r} has a Technitium server, which cannot apply "
+                f"this zone's {problem}. Change the zone's list first, or pick another group."
+            )
+
     # ── The forward zone's own upstream transport (#2121, a refusal) ──
     if zone.zone_type == "forward":
         msg = zone_forward_transport_refusal(
@@ -509,6 +564,28 @@ async def assemble_move_plan(
 
     _fill_warnings(plan)
     return plan
+
+
+async def _acl_definitions(
+    db: AsyncSession, group_id: uuid.UUID
+) -> dict[str, list[tuple[str, bool]]]:
+    """The group's named ACLs as ``name -> [(value, negate)]``, for the
+    Technitium address-match translation (#1765, #2263)."""
+    rows = (
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id)
+                .options(selectinload(DNSAcl.entries))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        a.name: [(e.value, bool(e.negate)) for e in sorted(a.entries, key=lambda x: x.order)]
+        for a in rows
+    }
 
 
 async def _count(db: AsyncSession, model: type, *criteria: Any) -> int:
@@ -750,6 +827,8 @@ async def commit_move(
         raise ZoneMoveError(plan.tsig_algorithm_refusal, status_code=422)
     if plan.forward_transport_refusal:
         raise ZoneMoveError(plan.forward_transport_refusal, status_code=422)
+    if plan.technitium_acl_refusal:
+        raise ZoneMoveError(plan.technitium_acl_refusal, status_code=422)
     if plan.technitium_api_refusal:
         # #1784 — refused, not warned: the zone would read as configured on
         # a server that ignores the config. Derived in the plan so the
@@ -783,6 +862,8 @@ async def commit_move(
         )
     if plan.name_collision:
         where = f"view '{plan.zone_view_from}'" if plan.zone_view_to_id is not None else "no view"
+        if plan.name_collision_views:
+            where = "view(s) " + ", ".join(f"'{v}'" for v in plan.name_collision_views)
         raise ZoneMoveError(
             f"Group '{target_group.name}' already has a zone named '{zone.name}' in {where}. "
             f"Delete or rename it first.",

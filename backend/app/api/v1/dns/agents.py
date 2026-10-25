@@ -104,7 +104,7 @@ from app.services.dns.soa_timers import (
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
+from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
 
@@ -1800,7 +1800,7 @@ class QueryLogAck(IngestAck):
     responses_unmatched: int = 0
     dropped: int = 0
     #: Query lines older than the control plane's own query-log retention
-    #: (``prune_logs.DEFAULT_RETENTION_HOURS``) — skipped rather than
+    #: (``PlatformSettings.log_retention_hours``, #2273) — skipped rather than
     #: inserted into a table the nightly prune would empty straight away.
     expired: int = 0
 
@@ -1883,7 +1883,7 @@ async def agent_query_log_entries(
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
-    expired_cutoff = now - timedelta(hours=QUERY_LOG_RETENTION_HOURS)
+    expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     inserted = 0
     expired = 0
     rpz_inserted = 0

@@ -74,7 +74,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
+from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -401,8 +401,8 @@ class DHCPLogAck(IngestAck):
     inserted: int = 0
     dropped: int = 0
     #: Lines older than the control plane's activity-log retention
-    #: (``prune_logs.DEFAULT_RETENTION_HOURS``), skipped rather than inserted
-    #: into a table the nightly prune would empty straight away.
+    #: (``PlatformSettings.log_retention_hours``, #2273), skipped rather than
+    #: inserted into a table the nightly prune would empty straight away.
     expired: int = 0
 
 
@@ -819,6 +819,12 @@ async def agent_config_longpoll(
                                 # [...]}`` so a centralized Kea matches this
                                 # scope on giaddr for relayed remote subnets.
                                 "relay_addresses": list(s.relay_addresses),
+                                # #2731: the classes of the PXE profile bound
+                                # to this scope. The agent has Kea evaluate
+                                # them for this subnet alone; rendered for the
+                                # whole server, one scope's profile booted the
+                                # PXE clients of every scope on it.
+                                "pxe_class_names": list(s.pxe_class_names),
                                 "pools": [
                                     {
                                         "start_ip": p.start_ip,
@@ -1941,7 +1947,7 @@ async def agent_log_entries(
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
-    expired_cutoff = now - timedelta(hours=ACTIVITY_LOG_RETENTION_HOURS)
+    expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     inserted = 0
     expired = 0
     for raw in capped:

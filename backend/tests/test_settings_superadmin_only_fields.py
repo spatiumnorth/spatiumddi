@@ -129,6 +129,13 @@ SUPERADMIN_ONLY_VALUES: dict[str, Any] = {
     "apt_unattended_blocklist": ["linux-image-*"],
     "apt_unattended_automatic_reboot": True,
     "apt_unattended_reboot_time": "03:30",
+    # Data retention (#2273): how long the platform keeps what it collected.
+    "soft_delete_purge_days": 60,
+    "dhcp_lease_history_retention_days": 180,
+    "pcap_retention_days": 14,
+    "appliance_revoked_retention_days": 60,
+    "metric_retention_days": 30,
+    "log_retention_hours": 72,
 }
 
 # One valid value per delegate-writable field.
