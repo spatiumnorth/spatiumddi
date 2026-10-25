@@ -320,7 +320,9 @@ async def _audit_scopes_under(db: Any, current_user: Any, subnet_ids: list[uuid.
         db.add(_purge_audit(current_user, "dhcp_scope", sc))
 
 
-async def _prepare_subnet_purge(db: Any, subnets: list[Any]) -> tuple[int, set[uuid.UUID]]:
+async def _prepare_subnet_purge(
+    db: Any, subnets: list[Any], current_user: Any
+) -> tuple[int, set[uuid.UUID]]:
     """Withdraw what IPAM published for ``subnets`` before they are hard-deleted.
 
     spatiumddi#1151 — the addresses go with the subnet (FK CASCADE); the
@@ -333,7 +335,14 @@ async def _prepare_subnet_purge(db: Any, subnets: list[Any]) -> tuple[int, set[u
     """
     if not subnets:
         return 0, set()
-    return await retract_address_records(db, [sub.id for sub in subnets])
+    retracted, groups = await retract_address_records(db, [sub.id for sub in subnets])
+    # spatiumddi#2734 — the reverse zones IPAM auto-created for them go too.
+    from app.services.dns.reverse_zone import purge_auto_reverse_zones  # noqa: PLC0415
+
+    groups = groups | await purge_auto_reverse_zones(
+        db, subnets, audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z))
+    )
+    return retracted, groups
 
 
 @router.get("/trash", response_model=TrashListResponse)
@@ -769,7 +778,9 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], [], [])
             if live:
                 _refuse_live_children(label, live)
-            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, [target])
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
+                db, [target], current_user
+            )
             await _audit_scopes_under(db, current_user, [target.id])
         elif isinstance(target, (IPBlock, IPSpace)):
             # #1958 — a block or space is purged WITH the trashed subnets and
@@ -781,7 +792,9 @@ async def permanent_delete_from_trash(
             live = await _live_children(db, [target], blocks, subnets)
             if live:
                 _refuse_live_children(label, live)
-            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, subnets)
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(
+                db, subnets, current_user
+            )
             await _audit_scopes_under(db, current_user, [sub.id for sub in subnets])
             for sub in subnets:
                 db.add(_purge_audit(current_user, "subnet", sub))
