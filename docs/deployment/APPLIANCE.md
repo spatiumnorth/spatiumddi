@@ -549,7 +549,17 @@ the reference topologies are in
     the instance's pod and PVCs and join a fresh copy from the primary
     (`supervisor.heartbeat.postgres_instance_reclone`). One instance at a
     time, never the primary, never during a failover or switchover, and
-    only while the primary is Ready. While it runs, the database row on the
+    only while the primary is Ready. And only with proof the WAL the
+    instance needs is gone, because a re-clone copies the whole database:
+    the supervisor reads the primary's replication slots from CNPG's
+    instance status (`/pg/status` on port 8000 of the primary pod, no extra
+    RBAC) and re-clones when the instance's slot is `lost` or gone, when its
+    log shows the WAL-removed or invalidated-slot line, or when `pg_rewind`
+    keeps failing. A standby that only cannot reach the primary logs the
+    future-timeline refusal too, but its slot still reads `reserved`: it is
+    held (`supervisor.heartbeat.postgres_instance_reclone_held`, with the
+    reason) and catches up once it reconnects. If the primary's status
+    cannot be read, nothing is re-cloned. While it runs, the database row on the
     cluster-health page reads `degraded` (`readyInstances` below
     `instances`). The manual equivalent is `kubectl cnpg destroy <cluster>
     <n>`, or deleting the instance's PVC and then its pod.

@@ -354,6 +354,9 @@ _stuck_postgres: dict[str, k8s_api.StuckSighting] = {}
 # tick, "stuck" at warning once the loop has held STUCK_REPORT_AFTER_S), so
 # each is logged once and not on every tick after.
 _stuck_postgres_reported: dict[str, str] = {}
+# The held reason last logged per due instance that is NOT re-cloned (its WAL
+# still exists, or that cannot be told), so each reason is logged once.
+_stuck_postgres_held: dict[str, str] = {}
 
 # #1541 — slot-image mirror claims the seed deleted off an evicted node and
 # still owes the cluster a fresh copy of (``{claim_name: manifest}``). Nothing
@@ -449,44 +452,83 @@ def _reclone_stuck_postgres(log: Any, now: float | None = None) -> k8s_api.Postg
     """#2132 — one seed tick of the stuck-instance re-clone, with its journal.
 
     ``postgres_instance_looping`` (info) is logged once when an instance's
-    log first shows a repeating never-heals loop. ``postgres_instance_stuck``
-    (warning) is logged once the same loop has held for
-    ``STUCK_REPORT_AFTER_S`` across ticks, naming the loop and the manual fix,
-    so a deployment whose supervisor cannot act (an older Role without
-    ``pods/log``) still says what is wrong. A replica that logs a line or two
-    while it joins logs neither (#2765). ``postgres_instance_reclone`` is logged when CNPG is
-    asked to rebuild one."""
+    log shows a never-heals loop that is still logging new lines on a later
+    tick (``confirmed``). ``postgres_instance_stuck`` (warning) is logged once
+    the same loop has held for ``STUCK_REPORT_AFTER_S`` across ticks, naming
+    the loop, its slot on the primary and the manual fix, so a deployment
+    whose supervisor cannot act (an older Role without ``pods/log``) still
+    says what is wrong. A replica that logs a line or two while it joins, or
+    a follower that logs a burst across a switchover, logs neither (#2765).
+    ``postgres_instance_reclone_held`` (info) is logged once per reason when a
+    due loop is NOT re-cloned because nothing proves its WAL is gone.
+    ``postgres_instance_stuck_clock_reset`` (info) is logged when a reported
+    loop's clock restarts under a new primary. ``postgres_instance_reclone``
+    is logged when CNPG is asked to rebuild one."""
     from . import k8s_api  # noqa: PLC0415
 
     result = k8s_api.reclone_stuck_postgres_instances(
         _stuck_postgres, now=time.monotonic() if now is None else now
     )
+    for instance, reason in result.clock_reset.items():
+        if instance in _stuck_postgres_reported:
+            log.info(
+                "supervisor.heartbeat.postgres_instance_stuck_clock_reset",
+                instance=instance,
+                reason=reason,
+            )
+            # Still looping under the new primary: it is reported as stuck
+            # again once it has held STUCK_REPORT_AFTER_S under that one.
+            _stuck_postgres_reported[instance] = "looping"
+            _stuck_postgres_held.pop(instance, None)
     for instance, seen in result.stuck.items():
+        if not seen.get("confirmed"):
+            # Lines in the window but none new since the first tick: a burst
+            # that has stopped (a follower across a switchover), not a loop.
+            continue
         level = _stuck_postgres_reported.get(instance)
         if level is None:
-            # A loop seen on one tick is not yet evidence: a replica can log
-            # a burst while it joins. Info, once.
             _stuck_postgres_reported[instance] = "looping"
             log.info(
                 "supervisor.heartbeat.postgres_instance_looping",
                 instance=instance,
                 signature=seen["signature"],
+                slot=seen.get("slot", "unknown"),
             )
         if (
             _stuck_postgres_reported[instance] != "stuck"
             and seen["seconds"] >= k8s_api.STUCK_REPORT_AFTER_S
         ):
             _stuck_postgres_reported[instance] = "stuck"
+            slot = seen.get("slot", "unknown")
             log.warning(
                 "supervisor.heartbeat.postgres_instance_stuck",
                 instance=instance,
                 signature=seen["signature"],
+                slot=slot,
                 looping_for_s=seen["seconds"],
                 reclone_in_s=max(0, k8s_api.STUCK_INSTANCE_AFTER_S - seen["seconds"]),
+                reclone_held=k8s_api.reclone_blocker(
+                    seen["signature"],
+                    _stuck_postgres[instance].evidence if instance in _stuck_postgres else set(),
+                    slot,
+                )
+                or "",
                 manual_fix=f"kubectl cnpg destroy <cluster> {instance}, or delete its PVC then its pod",
             )
     for gone in set(_stuck_postgres_reported) - set(_stuck_postgres):
         _stuck_postgres_reported.pop(gone, None)
+    for gone in set(_stuck_postgres_held) - set(_stuck_postgres):
+        _stuck_postgres_held.pop(gone, None)
+    for instance, reason in result.held.items():
+        if _stuck_postgres_held.get(instance) != reason:
+            _stuck_postgres_held[instance] = reason
+            log.info(
+                "supervisor.heartbeat.postgres_instance_reclone_held",
+                instance=instance,
+                signature=result.stuck.get(instance, {}).get("signature", ""),
+                slot=result.stuck.get(instance, {}).get("slot", "unknown"),
+                reason=reason,
+            )
     for instance in result.marked:
         log.warning(
             "supervisor.heartbeat.postgres_instance_reclone",
@@ -494,7 +536,8 @@ def _reclone_stuck_postgres(log: Any, now: float | None = None) -> k8s_api.Postg
             annotation="alpha.cnpg.io/unrecoverable",
         )
     if result.deferred_reason and any(
-        s["seconds"] >= k8s_api.STUCK_INSTANCE_AFTER_S for s in result.stuck.values()
+        s.get("confirmed") and s["seconds"] >= k8s_api.STUCK_INSTANCE_AFTER_S
+        for s in result.stuck.values()
     ):
         log.info(
             "supervisor.heartbeat.postgres_instance_reclone_deferred",

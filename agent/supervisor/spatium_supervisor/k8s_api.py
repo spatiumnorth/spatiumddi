@@ -1238,11 +1238,12 @@ def reclaim_stranded_postgres_storage(
 _CNPG_UNRECOVERABLE_ANNOTATION = "alpha.cnpg.io/unrecoverable"
 _CNPG_JOB_ROLE_LABEL = "cnpg.io/jobRole"
 
-# The loops that never end on their own while no WAL archive is configured.
-# Each is a substring of a line CNPG's instance manager or PostgreSQL writes
-# to the instance pod's log; a hit only counts once it has held for
-# STUCK_INSTANCE_AFTER_S, so one transient line (a pg_rewind attempted while
-# the new primary was still promoting) is never enough.
+# The loops that never end on their own while no WAL archive is configured,
+# MOST SPECIFIC FIRST: when several repeat in one window, the earliest here
+# names the loop. Each is a substring of a line CNPG's instance manager or
+# PostgreSQL writes to the instance pod's log; a hit only counts once it has
+# held for STUCK_INSTANCE_AFTER_S, so one transient line (a pg_rewind
+# attempted while the new primary was still promoting) is never enough.
 _STUCK_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # #2132's first signature: pg_rewind asks the (absent) archive for a
     # segment the former primary no longer has.
@@ -1251,13 +1252,28 @@ _STUCK_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # ("could not read file ... read 0 of 8192"); every pg_rewind failure
     # ends in this line.
     ("pg_rewind_failed", ("Failed to execute pg_rewind",)),
-    # #2132's second and third occurrences.
-    ("future_timeline", ("Refusing to restore future timeline history file",)),
-    # A standby asking for WAL the primary has recycled, or whose slot the
-    # #2317 cap invalidated.
-    ("wal_removed", ("has already been removed",)),
+    # A standby whose slot the #2317 cap invalidated, or asking for WAL the
+    # primary has recycled.
     ("slot_invalidated", ("can no longer get changes from replication slot",)),
+    ("wal_removed", ("has already been removed",)),
+    # #2132's second and third occurrences. LAST, because it is the least
+    # specific: CNPG's restore_command logs it on every walreceiver retry once
+    # the cluster is past timeline 1, so it rides along with each of the loops
+    # above (case 4 of the #2765 walk logged it once per wal_removed line, and
+    # a count-based pick named every such run future_timeline) and with a
+    # standby that merely cannot connect to the primary, which heals.
+    ("future_timeline", ("Refusing to restore future timeline history file",)),
 )
+
+# Signatures that prove on their own that the WAL the instance needs is gone:
+# a failed pg_rewind (the former primary's own WAL from the divergence point,
+# which no slot on the new primary covers), or the primary saying it has
+# removed the segment / invalidated the slot the standby asks for.
+# ``future_timeline`` is not one: a standby cut off from the primary logs it
+# just the same, and catches up once it reconnects (#2765's walk re-cloned
+# exactly such a standby, its slot ``reserved`` 32 MB behind).
+_REWIND_SIGNATURES = frozenset({"pg_rewind_archive", "pg_rewind_failed"})
+_WAL_GONE_SIGNATURES = frozenset({"slot_invalidated", "wal_removed"})
 
 # How long a signature must keep appearing before the instance is re-cloned.
 # The QA desk's drill gate is 15 minutes; a rewind that is going to work does
@@ -1280,49 +1296,98 @@ STUCK_MIN_REPEATS = 3
 # warning). Before that it is only "looping" (info): one tick is not evidence.
 STUCK_REPORT_AFTER_S = 120
 
+# CNPG's instance manager serves its own status, including the primary's
+# ``pg_replication_slots`` (``replicationSlotsInfo``: slot name, walStatus),
+# on this port of every instance pod. ``kubectl cnpg status`` reads the same
+# document. Reading it straight off the pod IP needs no RBAC at all, where
+# the alternatives each need a grant much wider than the question: pods/exec
+# (a shell in any pod of the namespace), pods/proxy, or the cluster CA secret
+# (which holds the CA private key).
+_CNPG_STATUS_PORT = 8000
+_CNPG_STATUS_PATH = "/pg/status"
+_CNPG_STATUS_TIMEOUT_S = 4.0
+# The slot name CNPG gives each instance's HA slot on the primary is
+# ``<prefix><instance name with - as _>``, prefix ``_cnpg_`` by default.
+_CNPG_SLOT_PREFIX = "_cnpg_"
+# walStatus values under which the WAL from the slot's restart_lsn is still
+# on the primary (``unreserved``: past max_wal_size, kept until the next
+# checkpoint): the standby can stream it once it reconnects.
+_SLOT_WAL_PRESENT = frozenset({"reserved", "extended", "unreserved"})
 
-def stuck_signature(log_text: str) -> str | None:
-    """The never-heals signature that repeats at least
-    :data:`STUCK_MIN_REPEATS` times in ``log_text`` (one match per line), or
-    None. When several do, the one with the most lines wins."""
+
+def repeating_signatures(log_text: str) -> list[str]:
+    """Every never-heals signature that repeats at least
+    :data:`STUCK_MIN_REPEATS` times in ``log_text`` (one match per line),
+    most specific first (the order of :data:`_STUCK_SIGNATURES`)."""
     counts: dict[str, int] = {}
     for line in log_text.splitlines():
         for name, parts in _STUCK_SIGNATURES:
             if all(part in line for part in parts):
                 counts[name] = counts.get(name, 0) + 1
                 break
-    # Most lines first; on a tie the earlier, more specific signature (a
-    # pg_rewind attempt logs both its archive line and its generic failure).
-    order = [name for name, _ in _STUCK_SIGNATURES]
-    repeating = sorted(
-        (name for name, n in counts.items() if n >= STUCK_MIN_REPEATS),
-        key=lambda name: (-counts[name], order.index(name)),
-    )
+    return [name for name, _ in _STUCK_SIGNATURES if counts.get(name, 0) >= STUCK_MIN_REPEATS]
+
+
+def stuck_signature(log_text: str) -> str | None:
+    """The most specific never-heals signature that repeats in ``log_text``,
+    or None. Specificity, not line count, picks it: ``future_timeline`` is
+    logged alongside every other loop, so it only names a loop that shows
+    nothing else."""
+    repeating = repeating_signatures(log_text)
     return repeating[0] if repeating else None
+
+
+def _newest_match_stamp(log_text: str) -> str:
+    """The kubelet timestamp (``timestamps=true``) of the newest line in
+    ``log_text`` that matches any signature, or "" when the lines carry
+    none. Two ticks reporting the same newest line mean the loop logged
+    nothing new between them."""
+    newest = ""
+    for line in log_text.splitlines():
+        if any(all(part in line for part in parts) for _, parts in _STUCK_SIGNATURES):
+            stamp, _, _ = line.partition(" ")
+            if stamp[:1].isdigit() and "T" in stamp:
+                newest = stamp
+    return newest
 
 
 @dataclass
 class StuckSighting:
     """An instance first seen looping at ``since`` (the caller's clock),
     under ``primary``. A change of primary starts the clock again: the
-    instance may be able to follow the new one."""
+    instance may be able to follow the new one.
+
+    ``confirmed`` is set once a later tick finds the loop still logging new
+    lines (a newer matching line than the first tick saw): a healthy follower
+    that logs a burst of future-timeline refusals across a switchover leaves
+    those lines in the next two windows, but logs no new ones.
+    ``evidence`` collects every repeating signature seen in this sighting."""
 
     primary: str
     since: float
     signature: str
+    first_stamp: str = ""
+    confirmed: bool = False
+    evidence: set[str] = field(default_factory=set)
 
 
 @dataclass
 class PostgresReclone:
     """What one :func:`reclone_stuck_postgres_instances` call did.
 
-    ``stuck`` maps each looping instance to ``{"signature", "seconds"}``;
-    ``marked`` names the instance annotated for a re-clone this call (at
-    most one); ``deferred_reason`` says why a due instance was not."""
+    ``stuck`` maps each looping instance to ``{"signature", "seconds",
+    "confirmed", "slot"}``; ``marked`` names the instance annotated for a
+    re-clone this call (at most one); ``deferred_reason`` says why a due
+    instance was not; ``held`` maps a due instance to why it is NOT being
+    re-cloned at all (its WAL still exists, or that cannot be told);
+    ``clock_reset`` maps an instance whose stuck clock restarted this call
+    to why."""
 
     stuck: dict[str, dict[str, Any]] = field(default_factory=dict)
     marked: list[str] = field(default_factory=list)
     deferred_reason: str = ""
+    held: dict[str, str] = field(default_factory=dict)
+    clock_reset: dict[str, str] = field(default_factory=dict)
     error: str | None = None
 
 
@@ -1331,6 +1396,121 @@ def _pod_ready(pod: dict) -> bool:
         if cond.get("type") == "Ready":
             return str(cond.get("status")) == "True"
     return False
+
+
+def _cnpg_instance_status(pod_ip: str) -> dict | None:
+    """GET CNPG's instance-manager status document off ``pod_ip``, or None
+    when it cannot be read (unreachable, refused, unparseable).
+
+    TLS is not verified against the cluster CA: the supervisor cannot read
+    the CA without a grant on the secret that also holds its private key.
+    What bounds that: the address comes from the authenticated kubeapi pod
+    list, no credential is sent, the document is only read, and the only
+    decision it feeds is whether an instance whose own log has shown a
+    never-heals loop for 10 minutes may be re-cloned (never the primary,
+    one at a time). A forged ``reserved`` only holds a re-clone back."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(
+        pod_ip, _CNPG_STATUS_PORT, timeout=_CNPG_STATUS_TIMEOUT_S, context=ctx
+    )
+    try:
+        conn.request("GET", _CNPG_STATUS_PATH, headers={"Accept": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 200:
+            return None
+        doc = json.loads(body)
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ssl.SSLError, http.client.HTTPException, ValueError):
+        return None
+    finally:
+        conn.close()
+
+
+def _slot_states(primary_pod: dict | None) -> dict[str, str] | None:
+    """``{slot_name: walStatus}`` for the primary's replication slots (a
+    NULL walStatus, a slot that never reserved WAL, reads ``"unset"``), or
+    None when the primary's status cannot be read."""
+    if primary_pod is None:
+        return None
+    pod_ip = str((primary_pod.get("status") or {}).get("podIP") or "")
+    if not pod_ip:
+        return None
+    doc = _cnpg_instance_status(pod_ip)
+    if doc is None or not doc.get("isPrimary"):
+        # Not (or no longer) the primary: its slots say nothing about the
+        # standby's WAL on the primary that counts.
+        return None
+    slots = doc.get("replicationSlotsInfo") or []
+    if not isinstance(slots, list):
+        return None
+    out: dict[str, str] = {}
+    for slot in slots:
+        if isinstance(slot, dict) and slot.get("slotName"):
+            out[str(slot["slotName"])] = str(slot.get("walStatus") or "unset")
+    return out
+
+
+def _instance_slot(instance: str, slots: dict[str, str] | None) -> str:
+    """The walStatus of ``instance``'s HA slot on the primary: a walStatus
+    value, ``"unset"``, ``"absent"`` (the primary has slots, none of them
+    this instance's), ``"none"`` (the primary has no slots at all, so HA
+    slots are off and nothing can be told from them), or ``"unknown"``."""
+    if slots is None:
+        return "unknown"
+    if not slots:
+        return "none"
+    suffix = instance.replace("-", "_")
+    exact = slots.get(_CNPG_SLOT_PREFIX + suffix)
+    if exact is not None:
+        return exact
+    for name, wal_status in slots.items():
+        if name.endswith(suffix):
+            return wal_status
+    return "absent"
+
+
+def reclone_blocker(signature: str, evidence: set[str], slot: str) -> str | None:
+    """Why an instance that has looped for STUCK_INSTANCE_AFTER_S must NOT be
+    re-cloned, or None when there is positive evidence it can never recover.
+
+    A re-clone destroys the instance's volume and copies the whole database,
+    so it needs proof the WAL the instance needs is gone, not just a loop:
+
+    * the slot state could not be read: hold (fail towards keeping data);
+    * a pg_rewind failure loop: re-clone. The former primary needs its own
+      WAL from the divergence point, which no slot on the new primary covers;
+    * the slot on the primary is ``lost`` or gone: re-clone;
+    * the slot still holds the WAL (``reserved`` / ``extended`` /
+      ``unreserved``): hold, it streams once it reconnects;
+    * no slot speaks for it (never reserved WAL, or HA slots off): re-clone
+      only when its log shows the primary removed the WAL it asks for;
+      ``future_timeline`` alone is what a standby that merely cannot
+      connect logs too.
+    """
+    if slot == "unknown":
+        return (
+            "the primary's replication-slot state could not be read, and a "
+            "re-clone needs proof the WAL this instance needs is gone"
+        )
+    if evidence & _REWIND_SIGNATURES:
+        return None
+    if slot in ("lost", "absent"):
+        return None
+    if slot in _SLOT_WAL_PRESENT:
+        return (
+            f"its replication slot on the primary is {slot}: the WAL it needs "
+            "still exists, so it catches up once it reconnects"
+        )
+    if evidence & _WAL_GONE_SIGNATURES:
+        return None
+    return (
+        f"its log shows only {signature} and no slot on the primary says its "
+        f"WAL is gone (slot {slot}); a standby that cannot reach the primary "
+        "logs the same and heals once it reconnects"
+    )
 
 
 def reclone_stuck_postgres_instances(
@@ -1348,12 +1528,13 @@ def reclone_stuck_postgres_instances(
     An instance counts as stuck when one of :data:`_STUCK_SIGNATURES`
     repeats (:data:`STUCK_MIN_REPEATS` lines) in its pod's last
     ``_STUCK_LOG_WINDOW_S`` of log on every call for ``stuck_after_s``, under
-    the same primary. A call where it does not repeat resets the clock, so a
+    the same primary, and a later call has seen it log new lines
+    (``confirmed``). A call where it does not repeat resets the clock, so a
     replica that logs a line or two while it joins and then streams is never
-    counted (#2765's walk). Readiness is deliberately not
-    a condition: a former primary looping on ``pg_rewind`` is not ready, but a
-    standby that lost its slot (#2317) runs as a hot standby and reads Ready
-    while it streams nothing.
+    counted (#2765's walk). Readiness is deliberately not a condition: a
+    former primary looping on ``pg_rewind`` is not ready, but a standby that
+    lost its slot (#2317) runs as a hot standby and reads Ready while it
+    streams nothing.
 
     A due instance is annotated ``alpha.cnpg.io/unrecoverable`` only when:
 
@@ -1364,7 +1545,10 @@ def reclone_stuck_postgres_instances(
       annotation or is terminating, and no CNPG ``join`` Job pod is running.
       One copy is rebuilt at a time, as a person doing it by hand would, so
       a primary left alone (#2132's fourth occurrence: six stuck at once)
-      is never asked for six base backups together.
+      is never asked for six base backups together;
+    * there is positive evidence its WAL is gone (:func:`reclone_blocker`,
+      read against the primary's ``pg_replication_slots``). An instance that
+      fails it is reported in ``held`` and keeps its clock.
 
     Kubeapi errors are returned, never guessed around; a 403 on the log read
     means the supervisor Role predates #2132 and nothing is marked.
@@ -1391,10 +1575,13 @@ def reclone_stuck_postgres_instances(
     if not current or current != target:
         # A failover or switchover is under way, or the primary is unknown:
         # nothing seen now says anything about the next primary.
-        tracker.clear()
-        return PostgresReclone(
-            deferred_reason="the Cluster names no single primary (failover or switchover under way)"
+        reason = "the Cluster names no single primary (failover or switchover under way)"
+        out = PostgresReclone(
+            deferred_reason=reason,
+            clock_reset={instance: reason for instance in tracker},
         )
+        tracker.clear()
+        return out
 
     base = f"/api/v1/namespaces/{quote(namespace)}"
     selector = quote(f"{_CNPG_CLUSTER_LABEL}={cluster_name}", safe="")
@@ -1439,6 +1626,7 @@ def reclone_stuck_postgres_instances(
         path = (
             f"{base}/pods/{quote(name)}/log?container=postgres"
             f"&sinceSeconds={_STUCK_LOG_WINDOW_S}&limitBytes={_STUCK_LOG_LIMIT_BYTES}"
+            "&timestamps=true"
         )
         try:
             status, resp = _request("GET", path)
@@ -1453,18 +1641,41 @@ def reclone_stuck_postgres_instances(
             # list and the read: no evidence either way, so the clock is
             # neither advanced nor reset.
             continue
-        signature = stuck_signature(resp.decode("utf-8", "replace"))
+        text = resp.decode("utf-8", "replace")
+        repeating = repeating_signatures(text)
         seen = tracker.get(instance)
-        if signature is None:
+        if not repeating:
             tracker.pop(instance, None)
             continue
-        if seen is None or seen.primary != current:
-            seen = tracker[instance] = StuckSighting(current, now, signature)
+        signature = repeating[0]
+        stamp = _newest_match_stamp(text)
+        if seen is not None and seen.primary != current:
+            out.clock_reset[instance] = f"the primary changed from {seen.primary} to {current}"
+            seen = None
+        if seen is None:
+            seen = tracker[instance] = StuckSighting(current, now, signature, first_stamp=stamp)
+        elif not seen.confirmed and now > seen.since and (not stamp or stamp != seen.first_stamp):
+            # Still repeating on a later tick, with lines newer than the
+            # first tick's (or no timestamps to tell): a live loop.
+            seen.confirmed = True
         seen.signature = signature
-        out.stuck[instance] = {"signature": signature, "seconds": int(now - seen.since)}
+        seen.evidence.update(repeating)
+        out.stuck[instance] = {
+            "signature": signature,
+            "seconds": int(now - seen.since),
+            "confirmed": seen.confirmed,
+        }
+
+    if any(s["confirmed"] for s in out.stuck.values()):
+        # One read of the primary's slots per tick, and only while something
+        # loops; it rides on every stuck report so the journal can say why a
+        # loop will not be re-cloned before it is due.
+        slots = _slot_states(instances.get(current))
+        for instance, seen_out in out.stuck.items():
+            seen_out["slot"] = _instance_slot(instance, slots)
 
     due = sorted(
-        (i for i, s in out.stuck.items() if s["seconds"] >= stuck_after_s),
+        (i for i, s in out.stuck.items() if s["confirmed"] and s["seconds"] >= stuck_after_s),
         key=lambda i: -out.stuck[i]["seconds"],
     )
     if not due:
@@ -1479,7 +1690,20 @@ def reclone_stuck_postgres_instances(
     if rebuilding:
         out.deferred_reason = f"a re-clone is already in flight ({', '.join(sorted(rebuilding))})"
         return out
-    instance = due[0]
+    eligible = []
+    for instance in due:
+        blocker = reclone_blocker(
+            out.stuck[instance]["signature"],
+            tracker[instance].evidence,
+            out.stuck[instance].get("slot", "unknown"),
+        )
+        if blocker:
+            out.held[instance] = blocker
+        else:
+            eligible.append(instance)
+    if not eligible:
+        return out
+    instance = eligible[0]
     name = str((instances[instance].get("metadata") or {}).get("name") or instance)
     patch = {"metadata": {"annotations": {_CNPG_UNRECOVERABLE_ANNOTATION: "true"}}}
     try:
