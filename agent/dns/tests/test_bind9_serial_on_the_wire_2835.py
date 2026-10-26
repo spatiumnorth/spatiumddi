@@ -780,3 +780,81 @@ def test_a_signer_that_never_catches_up_is_unread(
     driver.apply_record_op(_op(2026102601))
 
     assert driver.reached_serial(ORIGIN) is SERIAL_UNREAD
+
+
+# ── case 3: a serial named reached through an update we never sent ──────────
+
+
+def test_the_driver_reads_the_served_serial_of_every_rendered_zone(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = _FakeNamed(2026102604)
+    monkeypatch.setattr(dns.query, "tcp", named)
+    _note(driver, {"name": ORIGIN, "records": []})
+    driver._rendered_has_views = False
+    assert driver.periodic_served_serials() == {ORIGIN.rstrip("."): 2026102604}
+
+    named.authoritative = False  # unreadable: left out, never guessed
+    assert driver.periodic_served_serials() == {}
+
+    named.authoritative = True
+    driver._rendered_has_views = True  # a group with views reports from renders
+    assert driver.periodic_served_serials() == {}
+
+
+def test_an_outside_update_is_reported_on_change_only(tmp_path: Path) -> None:
+    """The walk's case 3: a third party's nsupdate moved named to 04 while the
+    row said 03 and read in sync for minutes. The periodic read posts the
+    zone whose served serial changed, and nothing while nothing changes."""
+    from tests import test_zone_state_after_ops as zs
+
+    served = {"a.test": 2026100105, "b.test": 2026100107}
+
+    class _Reads(zs._Driver):
+        def periodic_served_serials(self) -> dict[str, int]:
+            return dict(served)
+
+    zs.ensure_layout(tmp_path)
+    loop = zs.SyncLoop(zs._Cfg(tmp_path), ["tok"], _Reads(tmp_path), zs._Heartbeat())
+    cp = zs._ControlPlane()
+    loop._client = lambda: cp  # type: ignore[method-assign]
+    loop._reported_serials = {"a.test": 2026100105, "b.test": 2026100107}
+
+    loop._report_served_serials()
+    assert cp.zone_state == [], "nothing changed, nothing posted"
+
+    served["a.test"] = 2026100106  # an outside update, one past ours
+    loop._report_served_serials()
+    assert cp.zone_state == [[{"zone_name": "a.test", "serial": 2026100106}]]
+
+    loop._report_served_serials()
+    assert len(cp.zone_state) == 1, "reported once, not on every read"
+
+
+def test_the_run_loop_reads_the_served_serials_on_its_interval(tmp_path: Path) -> None:
+    from spatium_dns_agent import sync as sync_mod
+    from tests import test_zone_state_after_ops as zs
+
+    calls: list[int] = []
+
+    class _Reads(zs._Driver):
+        def periodic_served_serials(self) -> dict[str, int]:
+            calls.append(1)
+            return {}
+
+    zs.ensure_layout(tmp_path)
+    loop = zs.SyncLoop(zs._Cfg(tmp_path), ["tok"], _Reads(tmp_path), zs._Heartbeat())
+    assert loop._served_report_at > 0
+    polls = iter([False, True])
+
+    def poll_once() -> None:
+        if next(polls):
+            loop.stop()
+
+    loop._poll_once = poll_once  # type: ignore[method-assign]
+    loop._refresh_dnssec_state = lambda force=False: None  # type: ignore[method-assign]
+    loop._served_report_at = 0.0  # due
+    loop.run()
+    assert calls == [1]
+    assert loop._served_report_at > 0.0
+    assert sync_mod.SERVED_REPORT_SECONDS <= 300

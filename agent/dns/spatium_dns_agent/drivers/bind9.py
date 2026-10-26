@@ -2328,6 +2328,8 @@ class Bind9Driver(DriverBase):
         # per-view further down.
         views = bundle.get("views") or []
         has_views = bool(views)
+        # #2835 — ``periodic_served_serials`` reads only a group without views.
+        self._rendered_has_views = has_views
         # The keys that let the control plane's own transfers select a view
         # (#920). Their own file and include, beside ddns.key rather than in
         # it: ddns.key's FIRST key is the loopback identity the record-op path
@@ -4395,6 +4397,27 @@ class Bind9Driver(DriverBase):
             "signed": bool(zone.get("dnssec_enabled")),
         }
         lines.append(f"{key}\t{json.dumps(state, separators=(',', ':'))}")
+
+    def periodic_served_serials(self) -> dict[str, int]:
+        """Zone name (lowercase, no trailing dot) → the serial named serves,
+        for every primary zone the last render wrote in a group without
+        views (#2835); the sync loop posts the ones that changed.
+
+        Named moves a zone's serial through updates the agent never sent: a
+        third-party RFC 2136 client's, a DNSSEC key event on a signed zone.
+        A zone that cannot be read is left out. A group with views reports as
+        it always did, from its renders, and is not read here.
+        """
+        if getattr(self, "_rendered_has_views", True):
+            return {}
+        blob: bytes = getattr(self, "_apex_blob", b"")
+        keys = [
+            line.split(b"\t", 1)[0].decode()
+            for line in blob.split(b"\n")
+            if b"\t" in line
+        ]
+        served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
+        return {k: v for k, v in zip(keys, served) if v is not None}
 
     def _apex_state(self, key: str) -> dict[str, Any] | None:
         """The apex inputs noted for zone ``key``: as the last op left them,

@@ -133,3 +133,12 @@ async def test_only_the_group_key_is_marked_as_the_agents_own(db_session: AsyncS
         (grp.tsig_key_name, True),
         ("aaa-ops.", False),
     ]
+
+
+def test_the_renderer_revision_moved_with_the_loopback_marker() -> None:
+    """A stored bundle from before the marker must not stay current after the
+    upgrade: the agent would run without the SOA grant until the group's first
+    change (the walk's case 7: 18 minutes). Revision 15 is the marker's."""
+    from app.services.dns import agent_bundle_store as store
+
+    assert store.RENDERER_REVISION >= 15

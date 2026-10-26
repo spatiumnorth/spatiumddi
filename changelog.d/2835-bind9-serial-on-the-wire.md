@@ -11,8 +11,11 @@
   message as the records, whenever it is later than the one named serves
   (never lower); verified against BIND 9.20, named then serves exactly that
   serial. The agent reports the serial named serves after each op and after
-  each reload, so a zone named numbered itself reads out of sync instead of
-  in sync. An inline-signed zone is compared and reported at its signed
+  each reload, and every two minutes for each zone whose served serial has
+  changed since it last reported (a third party's update, a DNSSEC key
+  event), so a zone named numbered itself reads out of sync instead of in
+  sync. The bundle renderer revision moves to 15, so every agent re-renders
+  at the upgrade rather than at its group's first change. An inline-signed zone is compared and reported at its signed
   serial, the one on the wire: when re-signing has moved it past the op's
   serial, the zone reads out of sync rather than in sync at a raw serial
   nothing answers with. An op that changes the apex NS set now also removes
