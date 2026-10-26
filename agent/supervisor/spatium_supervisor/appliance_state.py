@@ -3494,9 +3494,17 @@ def read_host_disk_partitions() -> list[dict[str, object]]:
     """statvfs the reachable host partitions → used/total bytes per mount.
 
     Powers the Cluster → Overview node cards (#402). Each entry:
-    ``{"mount", "label", "total_bytes", "used_bytes"}`` — ``df``-style, where
-    ``used = (blocks - free) * fragment_size``. Returns the partitions that
-    could be statvfs'd (skips any whose mount isn't present in this pod).
+    ``{"mount", "label", "total_bytes", "used_bytes", "available_bytes"}`` —
+    ``df``-style, where ``used = (blocks - free) * fragment_size``. Returns
+    the partitions that could be statvfs'd (skips any whose mount isn't
+    present in this pod).
+
+    ``available_bytes`` is ``f_bavail``: what a non-root writer can still
+    use, which is what the kubelet's ``nodefs.available`` eviction signal
+    measures (#2400). It is NOT ``total - used``: ext4 reserves 5 % for
+    root by default (the installer's ``mkfs.ext4`` keeps that default), so
+    on a 15 GB ``/var`` ``total - used`` overstates the kubelet's headroom
+    by ~750 MB — the difference between "fine" and "evicting".
     """
     out: list[dict[str, object]] = []
     for mount, label, path in _DISK_TARGETS:
@@ -3514,6 +3522,7 @@ def read_host_disk_partitions() -> list[dict[str, object]]:
                 "label": label,
                 "total_bytes": int(total),
                 "used_bytes": int(used),
+                "available_bytes": int(st.f_bavail * st.f_frsize),
             }
         )
     return out

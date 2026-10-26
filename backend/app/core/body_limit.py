@@ -19,8 +19,10 @@ with a larger limit of its own is not covered, or an allowance matches no
 route. A route's allowance never lowers the cap: the larger of the two
 applies.
 
-The upload routes also check the caller's login before reading the body
-(``app.api.pre_body_auth``); this cap is what bounds everything else.
+Every body route an allowance covers also checks the caller's credentials
+from the request headers before reading the body (``app.api.pre_body_auth``;
+``tests/test_pre_body_auth.py`` fails when one does not), as do the upload
+routes; this cap is what bounds everything else.
 """
 
 from __future__ import annotations
