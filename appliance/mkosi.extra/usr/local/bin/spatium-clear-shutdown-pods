@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""spatium-clear-shutdown-pods — once the node is back, delete the pods its
+kubelet ended for the shutdown before (#1976).
+
+The kubelet's graceful node shutdown (kubelet.conf.d/50-spatium-graceful-
+shutdown.conf) stops every pod of the node before a reboot or power-off goes
+on, and leaves each one terminal: Succeeded when its containers exited 0,
+Failed otherwise, with the condition DisruptionTarget, reason
+TerminationByKubelet, "Pod was terminated in response to imminent node
+shutdown." Its controller replaces it. The DaemonSet and StatefulSet
+controllers then delete the old pod, and CloudNativePG re-creates its own; a
+ReplicaSet never does (it only stops counting it), and the pod GC keeps
+terminal pods until there are 12,500 of them. So every reboot left the node's
+Deployment pods listed as Completed beside their running replacements (on a
+single node the api, worker and frontend pods, three a reboot), and anything
+that lists pods without reading their phase counted them.
+
+At each boot, once the API answers, this deletes exactly those: the pods bound
+to this node that are terminal, not already being deleted, owned by a
+ReplicaSet, and whose DisruptionTarget condition says the kubelet ended them
+for a node shutdown. A pod the kubelet evicted under node pressure carries the
+same reason with the eviction's message, and stays for the operator to read.
+Each delete carries the pod's UID as a precondition, so a pod created since the
+list under the same name is never touched.
+
+Best effort: it never holds or fails the boot. It waits for the API (bounded),
+logs every pod it deleted or could not, and exits 0. Whatever it leaves, the
+next boot's run finds again.
+
+Run by spatiumddi-clear-shutdown-pods.service (After=k3s.service, every boot).
+The SPATIUM_* variables below exist for appliance/tests.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import socket
+import subprocess
+import time
+
+KUBECTL = shlex.split(os.environ.get("SPATIUM_KUBECTL", "/usr/local/bin/k3s kubectl"))
+KUBECONFIG = os.environ.get("SPATIUM_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
+API_WAIT_S = float(os.environ.get("SPATIUM_API_WAIT_S", "900"))
+API_POLL_S = float(os.environ.get("SPATIUM_API_POLL_S", "5"))
+
+TERMINAL = ("Succeeded", "Failed")
+#: Words of the kubelet's node-shutdown message (k8s pkg/kubelet/nodeshutdown,
+#: nodeShutdownMessage). The eviction manager sets the same condition reason
+#: with its own message.
+SHUTDOWN_WORDS = "node shutdown"
+
+
+def log(msg: str) -> None:
+    print(f"[clear-shutdown-pods] {msg}", flush=True)
+
+
+def kubectl(*args: str, stdin: str | None = None, timeout: float = 60) -> tuple[int, str, str]:
+    env = {**os.environ, "KUBECONFIG": KUBECONFIG}
+    try:
+        res = subprocess.run(
+            [*KUBECTL, *args],
+            input=stdin,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return 1, "", f"{type(ex).__name__}: {ex}"
+    return res.returncode, res.stdout, res.stderr
+
+
+def last_line(text: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return lines[-1][:300] if lines else "no output"
+
+
+def node_name() -> str:
+    """The Node k3s registered for this host: the hostname, lower-cased (k3s
+    GetHostnameAndIPs; the appliance sets neither node-name nor with-node-id)."""
+    return (os.environ.get("SPATIUM_NODE_NAME") or socket.gethostname()).strip().lower()
+
+
+def uptime_s() -> str:
+    try:
+        with open("/proc/uptime", encoding="ascii") as fh:
+            return str(int(float(fh.read().split()[0])))
+    except (OSError, ValueError, IndexError):
+        return "?"
+
+
+def shutdown_condition(pod: dict) -> dict | None:
+    """The DisruptionTarget condition the kubelet sets on a pod it ended for a
+    node shutdown, or None."""
+    for cond in (pod.get("status") or {}).get("conditions") or []:
+        if (
+            cond.get("type") == "DisruptionTarget"
+            and cond.get("status") == "True"
+            and cond.get("reason") == "TerminationByKubelet"
+            and SHUTDOWN_WORDS in (cond.get("message") or "").lower()
+        ):
+            return cond
+    return None
+
+
+def controller_of(pod: dict) -> dict:
+    for ref in (pod.get("metadata") or {}).get("ownerReferences") or []:
+        if ref.get("controller"):
+            return ref
+    return {}
+
+
+def leftovers(pods: list[dict], node: str) -> list[dict]:
+    """The pods of `node` that a shutdown ended and nothing else will delete."""
+    out = []
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        if (pod.get("spec") or {}).get("nodeName") != node:
+            continue
+        if (pod.get("status") or {}).get("phase") not in TERMINAL:
+            continue
+        if meta.get("deletionTimestamp") or not meta.get("uid"):
+            continue
+        if controller_of(pod).get("kind") != "ReplicaSet":
+            continue
+        if shutdown_condition(pod) is None:
+            continue
+        out.append(pod)
+    return out
+
+
+def api_ready() -> bool:
+    rc, _, _ = kubectl("--request-timeout=5s", "get", "--raw=/readyz", timeout=30)
+    return rc == 0
+
+
+def list_pods(node: str) -> list[dict] | None:
+    rc, out, err = kubectl(
+        "--request-timeout=30s",
+        "get",
+        "pods",
+        "--all-namespaces",
+        "--field-selector",
+        f"spec.nodeName={node}",
+        "-o",
+        "json",
+    )
+    if rc != 0:
+        log(f"could not list the pods of {node}: {last_line(err or out)}")
+        return None
+    try:
+        return json.loads(out).get("items") or []
+    except ValueError as ex:
+        log(f"could not read the pod list: {ex}")
+        return None
+
+
+def delete(pod: dict) -> tuple[str, str]:
+    """(outcome, kubectl's last line): deleted, gone, replaced or failed."""
+    meta = pod["metadata"]
+    body = json.dumps(
+        {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": {"uid": meta["uid"]}}
+    )
+    path = f"/api/v1/namespaces/{meta['namespace']}/pods/{meta['name']}"
+    rc, out, err = kubectl("--request-timeout=30s", "delete", "--raw", path, "-f", "-", stdin=body)
+    if rc == 0:
+        return "deleted", ""
+    text = f"{out}\n{err}"
+    if "NotFound" in text or "not found" in text:
+        return "gone", last_line(text)
+    if "Precondition failed" in text:
+        return "replaced", last_line(text)
+    return "failed", last_line(text)
+
+
+def describe(pod: dict) -> str:
+    meta, owner = pod["metadata"], controller_of(pod)
+    cond = shutdown_condition(pod) or {}
+    return (
+        f"{meta['namespace']}/{meta['name']} ({pod['status']['phase']}, "
+        f"{owner.get('kind')}/{owner.get('name')}, ended {cond.get('lastTransitionTime', '?')})"
+    )
+
+
+def main() -> int:
+    node = node_name()
+    started = time.monotonic()
+    deadline = started + API_WAIT_S
+    pods = None
+    while pods is None:
+        if api_ready():
+            pods = list_pods(node)
+        if pods is None:
+            if time.monotonic() >= deadline:
+                log(
+                    f"{node}: no pod list within {int(API_WAIT_S)} s of start; nothing deleted "
+                    "(the next boot looks again)"
+                )
+                return 0
+            time.sleep(API_POLL_S)
+    waited = int(time.monotonic() - started)
+    found = leftovers(pods, node)
+    if not found:
+        log(
+            f"{node}: none of its {len(pods)} pods was left by a shutdown "
+            f"(API answered after {waited} s, uptime {uptime_s()} s)"
+        )
+        return 0
+    counts: dict[str, int] = {}
+    for pod in found:
+        outcome, detail = delete(pod)
+        counts[outcome] = counts.get(outcome, 0) + 1
+        if outcome == "deleted":
+            log(f"deleted {describe(pod)}")
+        elif outcome == "gone":
+            log(f"already gone: {describe(pod)}")
+        elif outcome == "replaced":
+            log(f"left alone, a newer pod has its name: {describe(pod)}: {detail}")
+        else:
+            log(f"could not delete {describe(pod)}: {detail}")
+    summary = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+    log(
+        f"{node}: {len(found)} pod(s) a shutdown left: {summary} "
+        f"(API answered after {waited} s, uptime {uptime_s()} s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -52,6 +52,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-publish-k3s-token.service \
             spatiumddi-publish-k3s-token.path \
             k3s.service \
+            spatiumddi-clear-shutdown-pods.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
             spatiumddi-chrony-reload.path \
@@ -412,6 +413,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.path"
+# #1976 — at each boot, deletes the pods the kubelet's graceful node shutdown
+# ended and nothing else deletes (a ReplicaSet's).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-clear-shutdown-pods"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-clear-shutdown-pods.service"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user
