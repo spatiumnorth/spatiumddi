@@ -55,7 +55,9 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owned_subnets_in_space,
     refuse_sync_into_trashed_space,
+    subnet_for_address,
     subnet_has_surviving_addresses,
+    unowned_subnets_at,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 
@@ -193,35 +195,6 @@ def _find_enclosing_operator_block(
     return best
 
 
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str, host_id: Any = None) -> Subnet | None:
-    """The subnet an address of ``host_id`` belongs in (#2601).
-
-    The host's own subnets come first, then the longest prefix. On a tie
-    (two rows at one CIDR) an un-owned subnet beats another integration's,
-    then the lowest id wins, so the choice never follows the order the
-    database happened to return the rows in.
-    """
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    best: Subnet | None = None
-    best_key: tuple[bool, int, bool, str] | None = None
-    for s in subnets:
-        net = _parse_net(str(s.network))
-        if net is None or addr not in net:
-            continue
-        own = host_id is not None and s.docker_host_id == host_id
-        owned_elsewhere = not own and (
-            s.docker_host_id is not None or owned_by_other_integration(s, "docker_host_id")
-        )
-        key = (not own, -net.prefixlen, owned_elsewhere, str(s.id))
-        if best_key is None or key < best_key:
-            best = s
-            best_key = key
-    return best
-
-
 async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
     """Mirrors the same helper in the k8s reconciler — copied to keep
     the Docker package free of cross-integration imports.
@@ -259,7 +232,7 @@ def _compute_desired(
 
     # Map network name → list of (cidr_str, gateway) for subnet lookup
     # when we decide which subnets a container's IPs belong to. We
-    # don't strictly need this because ``_find_subnet_for_ip`` works
+    # don't strictly need this because ``subnet_for_address`` works
     # off the Subnet rows in the DB, but we use the gateway data to
     # seed gateway placeholder rows.
     for n in networks:
@@ -385,28 +358,12 @@ async def _apply_blocks_and_subnets(
     # (#2287), or one an operator made. As the Proxmox (#177), Cloud and
     # OPNsense reconcilers do, it is neither claimed nor rewritten, and
     # the address pass still mirrors into it.
-    wanted: dict[str, str] = {}
-    for net_str in desired_map:
-        parsed = _parse_net(net_str)
-        if net_str not in current_subnets and parsed is not None:
-            wanted[str(parsed)] = net_str
-    unowned_cidrs: set[str] = set()
-    if wanted:
-        res = await db.execute(
-            select(Subnet).where(
-                Subnet.space_id == host.ipam_space_id,
-                Subnet.network.in_(list(wanted)),
-                Subnet.docker_host_id.is_(None),
-            )
-        )
-        unowned_cidrs = {
-            wanted[str(s.network)]
-            for s in res.scalars().all()
-            if not owned_by_other_integration(s, "docker_host_id")
-        }
+    kept = await unowned_subnets_at(
+        db, host.ipam_space_id, [n for n in desired_map if n not in current_subnets]
+    )
 
     for net_str, d in desired_map.items():
-        if net_str in unowned_cidrs:
+        if net_str in kept:
             summary.subnets_matched += 1
             continue
 
@@ -553,21 +510,13 @@ async def _apply_addresses(
                 await db.delete(row)
                 summary.addresses_deleted += 1
 
-    # #2601: an operator-edited row stays in its subnet. Like its status,
-    # hostname and description (below), a sync does not change it.
-    subnets_by_id = {s.id: s for s in subnets}
-
     for addr, d in desired_map.items():
-        held = current.get(addr)
-        subnet: Subnet | None
-        if (
-            held is not None
-            and held.user_modified_at is not None
-            and held.subnet_id in subnets_by_id
-        ):
-            subnet = subnets_by_id[held.subnet_id]
-        else:
-            subnet = _find_subnet_for_ip(subnets, d.address, host.id)
+        # #2601: the host's own subnet first, a fixed tie-break, and an
+        # operator-edited row stays in its subnet (like its status, hostname
+        # and description, below, a sync does not change it).
+        subnet = subnet_for_address(
+            subnets, d.address, "docker_host_id", host.id, held=current.get(addr)
+        )
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue

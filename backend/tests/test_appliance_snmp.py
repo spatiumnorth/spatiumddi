@@ -67,6 +67,28 @@ def test_v2c_renders_rocommunity_for_each_source() -> None:
     assert "agentAddress udp:161,udp6:[::1]:161" in text
 
 
+def test_renders_agentx_master_for_subagents() -> None:
+    """Issue #2154 — this renderer REPLACES Debian's stock snmpd.conf, which
+    is where ``master agentx`` used to come from. Without it snmpd never
+    takes the AgentX master role and ``lldpd -x`` (LLDP → Expose via SNMP)
+    has nothing to register LLDP-MIB with: the toggle saves, lldpd runs,
+    and lldpRemTable is never served. Emitted for every version and
+    whatever the LLDP settings say — it is a root-only local socket."""
+    for version in ("v2c", "v3"):
+        s = _bare_settings()
+        s.snmp_enabled = True
+        s.snmp_version = version
+        lines = render_snmpd_conf(s).splitlines()
+        assert "master agentx" in lines
+        assert "agentXSocket /run/agentx/master" in lines
+        # Root-only socket + directory: the only subagent is lldpd, whose
+        # monitor keeps CAP_DAC_OVERRIDE, so nothing needs group access.
+        assert "agentXPerms 0600 0700" in lines
+        # The master role is a unix socket, never a TCP listener — no
+        # ``tcp:`` agentXSocket that the host firewall would have to open.
+        assert not any(ln.startswith("agentXSocket tcp") for ln in lines)
+
+
 def test_v2c_empty_community_emits_no_rocommunity_lines() -> None:
     s = _bare_settings()
     s.snmp_enabled = True

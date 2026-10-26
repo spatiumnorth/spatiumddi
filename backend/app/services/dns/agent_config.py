@@ -26,7 +26,7 @@ from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import structlog
 from sqlalchemy import Boolean, Text, and_, cast, func, literal, not_, or_, select
@@ -65,6 +65,7 @@ from app.services.dns.named_conf_validation import (
     UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
     ViewValidationError,
+    bind9_refused_prefix,
     is_name_reference,
     key_reference,
     order_acls_for_render,
@@ -283,9 +284,16 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for e in sorted(acl.entries, key=lambda e: (e.order, e.value)):
             try:
-                # Syntax only — whether a bare name actually resolves is
-                # decided by the known-set sweep below.
-                validate_address_match_list([e.value], field="entries", allow_unknown_names=True)
+                # Syntax only: whether a bare name actually resolves is
+                # decided by the known-set sweep below, and how a prefix
+                # BIND 9 refuses renders by the server's driver (#2695,
+                # ``_drop_undefined_key_refs``).
+                validate_address_match_list(
+                    [e.value],
+                    field="entries",
+                    allow_unknown_names=True,
+                    allow_bind9_refused_prefixes=True,
+                )
             except ViewValidationError as exc:
                 logger.warning(
                     "dns_acl_entry_dropped_unrenderable",
@@ -328,6 +336,11 @@ def _key_name_norm(name: str) -> str:
     return name.rstrip(".").lower()
 
 
+#: What :func:`_drop_undefined_key_refs` does with a stored prefix BIND 9
+#: refuses (#2695): ship it as stored, as the network it stands for, or not.
+_Bind9RefusedPrefixes = Literal["keep", "network", "drop"]
+
+
 def _drop_undefined_key_refs(
     elements: Any,
     known_keys: frozenset[str],
@@ -335,6 +348,7 @@ def _drop_undefined_key_refs(
     where: str,
     known_acls: frozenset[str] | None = None,
     deny_if_emptied: bool = False,
+    bind9_refused_prefixes: _Bind9RefusedPrefixes = "keep",
 ) -> Any:
     """``elements`` without any citation the bundle does not define (#2282, #2283).
 
@@ -347,8 +361,8 @@ def _drop_undefined_key_refs(
     whose secret no longer decrypts and was therefore left out of ``tsig_keys``.
     ``known_keys`` holds :func:`_key_name_norm` forms; ``known_acls`` holds ACL
     names verbatim (BIND ACL names are case-sensitive). Returns the original
-    object untouched when nothing is dropped, so a healthy bundle keeps its
-    ETag.
+    object untouched when nothing is dropped or rewritten, so a healthy
+    bundle keeps its ETag.
 
     Dropping must never widen access. Every renderer reads an empty
     address-match list as "unset" and falls back to something wider: the
@@ -363,24 +377,65 @@ def _drop_undefined_key_refs(
     ``also-notify`` is not an access list and ``none`` is not legal there;
     ACL entries are not either, since an entry-less ACL already renders
     ``{ none; }``.
+
+    ``bind9_refused_prefixes`` is what to do with a prefix BIND 9 refuses
+    (#2695): one with host bits set (``10.0.0.5/24``) or a mask where the
+    length goes (``10.0.0.0/255.255.255.0``). The API refuses both now, but a
+    row saved before that may hold one, and BIND refuses the element, so
+    shipping it as stored keeps the whole group from loading new config.
+
+    * ``"network"``, an address-match list for a BIND9 server: the network
+      it stands for, where it was, with its ``!`` (``!10.0.0.5/24`` ships
+      as ``!10.0.0.0/24``), logged so the row can be found and re-saved.
+      That is the network the Technitium and PowerDNS agents apply for the
+      same value where they apply the list. The element is not dropped, so
+      it never empties a list or loses a negation; leaving it out would turn
+      a list it was the only entry of into ``none``, an ``allow-query`` that
+      REFUSES every query. The rules above still hold for whatever else is
+      dropped beside it.
+    * ``"drop"``, ``also-notify`` for a BIND9 server: left out. It names the
+      servers to send NOTIFY to and takes addresses, so the network loads
+      there no more than the stored value does.
+    * ``"keep"``, any other server: shipped as stored. The Technitium and
+      PowerDNS agents apply the network themselves.
     """
     if not isinstance(elements, list):
         return elements
     kept = []
     widened = False
+    rewritten = False
     for el in elements:
         text = str(el)
         name = key_reference(text)
         acl = is_name_reference(text) if known_acls is not None else None
+        network = bind9_refused_prefix(text) if bind9_refused_prefixes != "keep" else None
         if name is not None and _key_name_norm(name) not in known_keys:
             logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
         elif acl is not None and known_acls is not None and acl not in known_acls:
             logger.warning("dns_bundle_entry_dropped_undefined_acl", where=where, acl=acl)
+        elif network is not None and bind9_refused_prefixes == "drop":
+            logger.warning(
+                "dns_bundle_entry_dropped_bind9_refused_prefix",
+                where=where,
+                value=text,
+                network=str(network),
+            )
+        elif network is not None:
+            rendered = f"!{network}" if text.strip().startswith("!") else str(network)
+            logger.warning(
+                "dns_bundle_entry_normalised_bind9_refused_prefix",
+                where=where,
+                value=text,
+                rendered=rendered,
+            )
+            kept.append(rendered)
+            rewritten = True
+            continue
         else:
             kept.append(el)
             continue
         widened = widened or text.strip().startswith("!")
-    if len(kept) == len(elements):
+    if len(kept) == len(elements) and not rewritten:
         return elements
     if deny_if_emptied and (widened or not kept):
         return ["none"]
@@ -1690,14 +1745,26 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
 
     # #2282 / #2283 — never ship a ``key <name>`` or ACL name the bundle does
     # not define. Access lists that empty out become ``none``, not "inherit".
+    # #2695: a prefix BIND 9 refuses, saved before the API refused it, ships
+    # to a BIND9 server as the network it stands for, and is left out of
+    # ``also-notify``, which takes addresses.
     known_key_names = frozenset(_key_name_norm(k["name"]) for k in tsig_keys)
     known_acl_names = frozenset(a["name"] for a in acls_block)
+    bind9 = server.driver == "bind9"
+    refused: _Bind9RefusedPrefixes = "network" if bind9 else "keep"
+    refused_notify: _Bind9RefusedPrefixes = "drop" if bind9 else "keep"
     for a in acls_block:
-        a["entries"] = [
-            e
-            for e in a["entries"]
-            if _drop_undefined_key_refs([e["value"]], known_key_names, where=f"acl:{a['name']}")
-        ]
+        entries: list[dict[str, Any]] = []
+        for e in a["entries"]:
+            value = _drop_undefined_key_refs(
+                [e["value"]],
+                known_key_names,
+                where=f"acl:{a['name']}",
+                bind9_refused_prefixes=refused,
+            )
+            if value:
+                entries.append({**e, "value": value[0]})
+        a["entries"] = entries
     for ve in views_block:
         for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
             ve[f] = _drop_undefined_key_refs(
@@ -1706,6 +1773,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 where=f"view:{ve['name']}.{f}",
                 known_acls=known_acl_names,
                 deny_if_emptied=True,
+                bind9_refused_prefixes=refused,
             )
     for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
         if f in options_block:
@@ -1715,6 +1783,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 where=f"options.{f}",
                 known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
+                bind9_refused_prefixes=refused_notify if f == "also_notify" else refused,
             )
 
     def _drop_zone_refs(zp: dict[str, Any]) -> dict[str, Any]:
@@ -1725,6 +1794,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 where=f"zone:{zp['name']}.{f}",
                 known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
+                bind9_refused_prefixes=refused_notify if f == "also_notify" else refused,
             )
         return zp
 
