@@ -28,6 +28,7 @@ from typing import Any, NamedTuple
 import structlog
 
 try:
+    import dns.message
     import dns.name
     import dns.query
     import dns.rdata
@@ -35,6 +36,7 @@ try:
     import dns.rdatatype
     import dns.tsigkeyring
     import dns.update
+    import dns.zone
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
@@ -543,7 +545,10 @@ def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> s
     """
     lines: list[str] = []
     if group_key_name:
-        lines.append(f"grant {group_key_name} zonesub;")
+        # ``ANY``: with no type list BIND grants every type EXCEPT RRSIG, NS,
+        # SOA, NSEC and NSEC3, which refused the SOA a record op carries to
+        # set the serial (#2835) and an apex NS record op outright.
+        lines.append(f"grant {group_key_name} zonesub ANY;")
     for e in zone.get("update_acl") or []:
         if e.get("match_kind") != "tsig_key" or not e.get("tsig_key_name"):
             continue
@@ -1552,6 +1557,10 @@ _RNDC_QUERY_TIMEOUT_S = 10.0
 # bound is a load's, since a large zone writes as slowly as it loads.
 _ZONE_DUMP_TIMEOUT_S = 60.0
 _ZONE_DUMP_POLL_S = 0.1
+# Bound on the loopback SOA read a record op makes before and after its update
+# (#2835). Loopback answers in well under a millisecond; this only stops a
+# wedged named holding the op path for rndc's minute.
+_SOA_READ_TIMEOUT_S = 5.0
 
 # Bulk applies (#2180). Every per-zone step of an apply is a process: one
 # ``named-checkzone`` (~63 ms, nearly all of it BIND's library start-up, not the
@@ -1887,6 +1896,30 @@ def _soa_serial(path: Path) -> int | None:
     if len(tokens) < 3 or not tokens[2].isdigit():
         return None
     return int(tokens[2])
+
+
+def _same_zone_data(staged: Path, dumped: Path, origin: str) -> bool:
+    """Whether two zone files hold the same records (#2835).
+
+    ``staged``: the render; ``dumped``: the copy named wrote out on a freeze,
+    in its own layout (owners and TTLs spelled out, ``$ORIGIN`` lines), so the
+    files are compared as record sets, not bytes. Anything unreadable is "not
+    the same", which keeps the serial move (#1407) as the safe default.
+    """
+    if dns is None:
+        return False
+
+    def records(path: Path) -> frozenset[tuple[Any, int, Any]] | None:
+        try:
+            zone = dns.zone.from_file(
+                str(path), origin=origin, relativize=False, check_origin=False
+            )
+        except Exception:  # noqa: BLE001 — unreadable reads as different
+            return None
+        return frozenset(zone.iterate_rdatas())
+
+    a = records(staged)
+    return a is not None and a == records(dumped)
 
 
 def _serial_at_least(got: int, want: int) -> bool:
@@ -3710,6 +3743,18 @@ class Bind9Driver(DriverBase):
             serial = _soa_serial(staged)
             if serving is None or serial is None or _serial_later(serial, serving):
                 continue
+            if (
+                serial == serving
+                and (zname, view) not in pending
+                and _same_zone_data(staged, live / _zone_rel(zname, view), zname)
+            ):
+                # #2835 — named already serves this very data at this very
+                # serial: in a group without views the record ops since the
+                # last render carried both the records and the serial into
+                # it, and the new render only writes them down. Moving it on
+                # would serve a serial the control plane never assigned, and
+                # its next op (one past this one) would then not be later.
+                continue
             # Past 2**32 - 1 the next serial is 0, which the render reads as
             # "no serial" (``_write_zone_file``); 1 is later too.
             later = (serving + 1) % 2**32 or 1
@@ -4139,16 +4184,153 @@ class Bind9Driver(DriverBase):
                     upd.delete(name, rtype)
             else:
                 raise ValueError(f"unknown op: {op['op']}")
+        # #2835 — named numbers an update with no SOA in it itself
+        # (``serial-update-method increment``: 1, 2, 3, …), so a zone that took
+        # its records over this path served a serial the control plane never
+        # assigned, while the op's ``target_serial`` was reported as reached.
+        # The serial goes in the SAME message as the records, so it lands with
+        # them or not at all. Verified against BIND 9.20: an update carrying a
+        # SOA whose serial is later than the served one is served at exactly
+        # that serial, with no +1 on top; one that is not later is ignored and
+        # named increments as usual — so it is only sent when it is later, and
+        # never moves the served serial backwards.
+        target = op.get("target_serial")
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        key = zone.rstrip(".").lower()
+        reached = self._op_reached_map()
+        reached.pop(key, None)
+        set_serial = False
+        if has_target:
+            soa, soa_ttl, serving = self._served_soa(zone)
+            if soa is not None and serving is not None and _serial_later(target, serving):
+                upd.add(
+                    "@",
+                    soa_ttl,
+                    "SOA",
+                    f"{soa.mname.to_text()} {soa.rname.to_text()} {target} "
+                    f"{soa.refresh} {soa.retry} {soa.expire} {soa.minimum}",
+                )
+                soa_rrset = upd.update[-1]
+                set_serial = True
         resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
         rcode = resp.rcode()
+        if set_serial and rcode == 5:  # REFUSED
+            # A fine-grained zone (``update-policy``) whose live config still
+            # grants the agent's key the default type list, which leaves out
+            # SOA, until the next render grants it ``ANY``. The records still
+            # land; named numbers them itself, as before #2835.
+            log.info("bind9_record_op_soa_refused", zone=zone)
+            upd.update.remove(soa_rrset)
+            set_serial = False
+            resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
+            rcode = resp.rcode()
         if rcode != 0:  # NOERROR
             raise RuntimeError(
                 f"nsupdate returned rcode={rcode} "
                 f"(zone={zone} op={op['op']} name={name} type={rtype})"
             )
+        if set_serial:
+            # named took the message whole, so it serves ``target`` now.
+            reached[key] = int(target)
+        elif has_target:
+            # It numbered this one itself: report what it serves, not ours.
+            _soa, _ttl, served = self._served_soa(zone)
+            if served is not None:
+                reached[key] = served
         # Explicit None so the record-op path matches the dict|None return
         # type the DNSSEC branches use (no implicit fall-through).
         return None
+
+    def _op_reached_map(self) -> dict[str, int]:
+        reached = getattr(self, "_op_reached", None)
+        if reached is None:
+            reached = self._op_reached = {}
+        return reached
+
+    def reached_serial(self, zone_name: str) -> int | None:
+        """The serial named serves ``zone_name`` at after the last record op,
+        or None when it could not be read (#2835).
+
+        The sync loop reports this instead of the op's ``target_serial``.
+        Usually the two are the same number, since the op carries the serial
+        into named (``apply_record_op``); when the op's serial was not later
+        than the one named served, named numbered the change itself and this
+        is that number."""
+        return self._op_reached_map().get(zone_name.rstrip(".").lower())
+
+    def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
+        """Zone name (no trailing dot, lowercased) → the serial to report for it.
+
+        The sync loop's zone-state reporter uses this instead of the bundle's
+        serials (#2835, as #1522 did for PowerDNS). In a group without views a
+        primary zone's serial is read back from named (``_served_soa``): the
+        render writes the bundle's serial, but a zone named was serving at
+        that very serial with other data is served one past it
+        (``_freeze_and_wait``), and reporting the bundle's would read in sync
+        at a serial named does not serve. A zone that cannot be read is left
+        out, so it is not reported. Every other zone — any zone of a group
+        with views, which re-renders on each change and is reported as it
+        always was, and secondary / stub / forward zones — reports the
+        bundle's serial, unchanged.
+        """
+        out: dict[str, int] = {}
+        has_views = any(v.get("name") for v in (bundle.get("views") or []))
+        reads: list[str] = []
+        for z in bundle.get("zones") or []:
+            name = str(z.get("name") or "").rstrip(".")
+            serial = z.get("serial")
+            if not name or serial is None:
+                continue
+            if has_views or z.get("type", "primary") not in {"primary", "master"}:
+                out[name.lower()] = int(serial)
+            else:
+                reads.append(name)
+        served = _parallel_map(lambda n: self._served_soa(n + ".")[2], reads)
+        for name, serial in zip(reads, served):
+            if serial is not None:
+                out[name.lower()] = serial
+        return out
+
+    def _served_soa(self, zone: str) -> tuple[Any | None, int, int | None]:
+        """``(soa_rdata, soa_ttl, serial)`` for ``zone`` as named holds it.
+
+        The SOA comes from a loopback query; the serial is the one an RFC 2136
+        update writes to. For an unsigned zone the two are the same SOA. An
+        inline-signed zone answers with its SIGNED serial, which BIND moves on
+        each re-signing and keeps ahead of the raw zone's, while updates go to
+        the raw zone; so the serial is read from ``rndc zonestatus`` there
+        (``serial:``, the raw one), as it is when the query is refused (a zone
+        ``allow-query`` without loopback). A SOA that cannot be read at all is
+        ``None`` and the op goes out as before, without one.
+        """
+        soa = None
+        ttl = 3600
+        signed = False
+        try:
+            q = dns.message.make_query(zone, "SOA", want_dnssec=True)
+            r = dns.query.tcp(q, "127.0.0.1", timeout=_SOA_READ_TIMEOUT_S)
+            if r.rcode() == 0:
+                origin = dns.name.from_text(zone)
+                for rrset in r.answer:
+                    if rrset.name != origin:
+                        continue
+                    if rrset.rdtype == dns.rdatatype.SOA and len(rrset):
+                        soa, ttl = rrset[0], int(rrset.ttl)
+                    elif (
+                        rrset.rdtype == dns.rdatatype.RRSIG
+                        and rrset.covers == dns.rdatatype.SOA
+                    ):
+                        signed = True
+        except Exception as e:  # noqa: BLE001 — a failed read means "unknown"
+            log.info("bind9_soa_read_failed", zone=zone, error=str(e)[:200])
+        if soa is not None and not signed:
+            return soa, ttl, int(soa.serial)
+        serial: int | None = None
+        if shutil.which("rndc"):
+            scopes = self._zone_rndc_scopes(zone)
+            rc, out, _err = _rndc_run(self._rndc_base(), "zonestatus", *scopes[0])
+            serial = _zonestatus_serial(out) if rc == 0 else None
+        return soa, ttl, serial
 
     # ── DNSSEC (issue #49) ──────────────────────────────────────────────────
 

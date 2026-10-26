@@ -1332,8 +1332,11 @@ async def agent_zone_state(
     # small step from the lower number) is below what the server holds and the
     # agent floors it again, so the zone never reads in sync and every change
     # costs a floor. Move ours up to the one it serves: forward only (RFC 1982),
-    # primary zones only, and only for PowerDNS — BIND9 reports the serial it
-    # was sent, which is ours by construction.
+    # primary zones only, and only for PowerDNS. A BIND9 agent reports the
+    # serial named serves too (#2835), and carries ours into named with every
+    # record op whenever ours is later, so the two agree; a BIND9 zone served
+    # AHEAD of ours (a third-party RFC 2136 client updated it) is reported as
+    # it is and reads out of sync, rather than moving ours.
     if server.driver == "powerdns":
         adopted: list[dict[str, Any]] = []
         today_base = int(datetime.now(UTC).strftime("%Y%m%d")) * 100

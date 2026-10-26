@@ -1196,9 +1196,11 @@ class SyncLoop:
                     zone=op.get("zone_name"),
                 )
                 _note_reached(reached, op)
-                # A driver that moves a zone to a serial of its own (PowerDNS
-                # never goes backwards from the one it serves, #1968) reports
-                # THAT serial, not the op's target.
+                # A driver that can serve a zone at a serial of its own
+                # (PowerDNS never goes backwards from the one it serves,
+                # #1968; BIND9 numbers an update itself when the op's serial
+                # is not later than the served one, #2835) reports THAT
+                # serial, not the op's target.
                 actual_hook = getattr(self.driver, "reached_serial", None)
                 if callable(actual_hook):
                     actual = actual_hook(str(op.get("zone_name") or ""))

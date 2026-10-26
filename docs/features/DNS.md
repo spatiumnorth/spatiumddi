@@ -833,11 +833,21 @@ carries the same RR twice.
 > reports zone-serial telemetry back to the control plane.
 
 **BIND9:**
-- Record add/modify/delete → RFC 2136 `nsupdate` via `dnspython`
-- Zone creation/deletion → `rndc addzone` / `rndc delzone`
-- Config changes (views, options) → regenerate `named.conf`, push via SSH/SCP, then `rndc reconfig`
+- Record add/modify/delete → an RFC 2136 update over loopback via `dnspython`
+  (in a group without views; a group with views re-renders the zone instead)
+- Zone creation/deletion → the agent writes the zone's `type master` stanza
+  into its rendered `named.conf` (or drops it) and runs `rndc reconfig`; it
+  does not use `rndc addzone` / `rndc delzone`
+- Config changes (views, options) → the agent re-renders `named.conf` locally
+  from the config bundle, then `rndc reconfig`
 - **A full `named` restart is never required** for normal operations
-- Serial is auto-incremented on every change (YYYYMMDDNN format)
+- The serial is the control plane's, in YYYYMMDDNN form, from the moment the
+  zone is created (#2835). A re-render writes it into the zone file; an RFC
+  2136 update carries it as the SOA in the same message as the records, so
+  named serves exactly that number rather than counting updates itself (it is
+  only sent when it is later than the served serial, so the served serial
+  never goes backwards). The agent reports the serial named actually serves,
+  which is what the per-server zone sync state compares
 
 **PowerDNS:**
 - Record add/modify/delete → `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch via the REST API
@@ -2399,7 +2409,7 @@ The renderer picks **one** clause per zone by what the ACL needs:
 
   ```
   update-policy {
-      grant spatium-loop. zonesub;                       # internal loopback
+      grant spatium-loop. zonesub ANY;                   # internal loopback
       grant dc01-ddns. subdomain wks.example.com. A AAAA;
       grant dhcp01-ddns. zonesub PTR;
       deny  dc01-ddns. name _locked.example.com.;
