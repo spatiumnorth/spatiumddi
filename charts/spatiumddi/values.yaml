@@ -171,6 +171,15 @@ api:
       timeoutSeconds: 15
       failureThreshold: 3
   env: []                        # extra env entries appended to container
+  # #2156 — the api's SQLAlchemy pool per pod, rendered as DATABASE_POOL_SIZE /
+  # DATABASE_MAX_OVERFLOW. Unset (the default) leaves the application's own
+  # 10 + 20. Every api pod holds its pool against the same Postgres, so
+  # replicas x (size + maxOverflow) is what Postgres' max_connections and its
+  # memory limit have to hold. The appliance's supervisor sets it from the
+  # control-plane node count (fewer per pod past four nodes).
+  databasePool:
+    size:
+    maxOverflow:
   nodeSelector: {}
   # Fast-eviction tolerations are NOT a chart default: setting both taint
   # keys explicitly suppresses Kubernetes' DefaultTolerationSeconds
@@ -773,6 +782,11 @@ postgresql:
     # Server-side parameters. Tune for your workload; defaults match
     # the prototype at ``k8s/ha/postgres-cluster.yaml``.
     parameters:
+      # #2156 — every api pod's pool (api.databasePool) and every worker
+      # process connects here, plus two per api / worker / beat process for
+      # the after-commit hooks (#2782); replicas x pool has to stay under
+      # this. The appliance's supervisor raises it past 200 when its
+      # connection budget does (from five control-plane nodes).
       max_connections: "200"
       shared_buffers: "256MB"
       work_mem: "16MB"
