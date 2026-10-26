@@ -41,7 +41,21 @@ log = structlog.get_logger(__name__)
 _SKIP_FILE_NAMES: frozenset[str] = frozenset()
 # Bookkeeping, not config (#2157): an RPZ zone file's content-hash sidecar,
 # and a temp file a crash left behind mid-write.
-_SKIP_FILE_SUFFIXES: tuple[str, ...] = (".sha256", ".tmp")
+#
+# Plus the binary companions BIND writes beside the zone files once a zone is
+# inline-signed (#2842): ``.jnl`` (dynamic-update journal), ``.jbk``
+# (journal backup), ``.signed`` / ``.raw`` (raw-format signed zone). They are
+# not config, and their NUL bytes still decode as UTF-8, so the control plane
+# could not store them. ``_walk_rendered`` also drops any file holding a NUL
+# byte, which catches binary files whatever they are called.
+_SKIP_FILE_SUFFIXES: tuple[str, ...] = (
+    ".sha256",
+    ".tmp",
+    ".jnl",
+    ".jbk",
+    ".signed",
+    ".raw",
+)
 _RENDERED_DIR_NAME = "rendered"
 
 _REDACTED = "***REDACTED***"
@@ -110,6 +124,10 @@ def _walk_rendered(rendered_dir: Path) -> Iterable[tuple[str, str]]:
         except UnicodeDecodeError:
             continue
         rel = path.relative_to(rendered_dir).as_posix()
+        if "\x00" in content:
+            # Binary, not config (#2842): PostgreSQL JSONB cannot store NUL.
+            log.debug("rendered_config_skip_binary", path=rel)
+            continue
         # Redact on the way OUT of the appliance, not at the call site — this
         # generator is the single chokepoint every pushed file passes through,
         # so a future caller can't accidentally bypass it (#869).
