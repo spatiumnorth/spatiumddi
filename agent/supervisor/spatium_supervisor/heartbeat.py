@@ -569,7 +569,15 @@ def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundL
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
     first watchdog cadence after startup); subsequent calls gate on
-    monotonic elapsed."""
+    monotonic elapsed.
+
+    ``_last_watchdog_at == 0.0`` means "never ran / invalidated" and is due
+    at once. It used to be compared like a timestamp, but ``time.monotonic()``
+    counts from boot, so within the first ``_WATCHDOG_INTERVAL_S`` of host
+    uptime neither the first probe nor the invalidation after a role apply
+    (#2808's first approved heartbeat) was due until 5 min after boot."""
+    if _last_watchdog_at == 0.0:
+        return True
     return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
 
 

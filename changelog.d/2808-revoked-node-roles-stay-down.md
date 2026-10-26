@@ -12,3 +12,6 @@
   drilldown rather than a red `missing`, and nothing is re-applied. The first
   accepted heartbeat after approval applies the roles at once, whether or not
   the apply stamp still names the same role env.
+  The watchdog's first probe after start-up, and its re-probe after a role
+  apply, are also due at once in the first 5 minutes after the host boots;
+  before, both waited until the host had been up for 5 minutes.

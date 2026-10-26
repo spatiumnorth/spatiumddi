@@ -320,3 +320,15 @@ def test_the_first_accepted_heartbeat_after_a_revoke_applies_the_roles(
     # And the one after skips again.
     accepted()
     assert len(heartbeat_applies) == 2
+
+
+def test_an_invalidated_watchdog_is_due_right_after_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``time.monotonic()`` counts from boot. ``_last_watchdog_at = 0.0`` (never
+    ran, or invalidated after a role apply) was compared like a timestamp, so
+    in the first 5 min of host uptime the watchdog was not due at all. A fresh
+    CI runner is exactly that host, which is how this was found."""
+    monkeypatch.setattr(heartbeat.time, "monotonic", lambda: 60.0)
+    monkeypatch.setattr(heartbeat, "_last_watchdog_at", 0.0)
+    assert heartbeat._watchdog_check_due() is True
+    monkeypatch.setattr(heartbeat, "_last_watchdog_at", 30.0)
+    assert heartbeat._watchdog_check_due() is False
