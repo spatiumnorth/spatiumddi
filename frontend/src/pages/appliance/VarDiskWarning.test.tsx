@@ -26,9 +26,24 @@ describe("VarDiskWarning", () => {
       />,
     );
     const alert = screen.getByRole("alert");
-    expect(alert.textContent).toContain("Disk space critical · 12% free");
+    expect(alert.textContent).toContain("Disk space critical · 13% free");
     expect(alert.textContent).toContain("1946 MiB of 15360 MiB free on /var");
     expect(alert.className).toContain("rose");
+  });
+
+  it("shows the same free percentage in the headline and the detail (#2838)", () => {
+    render(
+      <VarDiskWarning
+        finding={{
+          severity: "warning",
+          free_pct: 12.8,
+          detail: "2979 MiB of 23260 MiB free on /var (13%).",
+        }}
+      />,
+    );
+    const text = screen.getByRole("alert").textContent ?? "";
+    const pcts = [...text.matchAll(/(\d+)%/g)].map((m) => m[1]);
+    expect(pcts).toEqual(["13", "13"]);
   });
 
   it("marks a warning amber", () => {
