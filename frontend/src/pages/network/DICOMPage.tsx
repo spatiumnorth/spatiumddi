@@ -307,6 +307,19 @@ export function DICOMPage() {
                   <ListEmpty
                     error={aesQ.error}
                     what="DICOM application entities"
+                    filtered={
+                      search.trim() !== "" ||
+                      subnetFilter !== "" ||
+                      classFilter !== "" ||
+                      reservationsOnly
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setSubnetFilter("");
+                      setClassFilter("");
+                      setReservationsOnly(false);
+                      setPage(1);
+                    }}
                   >
                     No DICOM application entities recorded.
                   </ListEmpty>
