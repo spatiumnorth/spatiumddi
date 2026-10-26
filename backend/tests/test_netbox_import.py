@@ -616,3 +616,43 @@ async def test_commit_rerun_is_noop(
     assert len({s.name for s in spaces}) == 3
     subnets = (await db_session.execute(select(Subnet))).scalars().all()
     assert len(subnets) == 4
+
+
+@pytest.mark.asyncio
+async def test_commit_failed_entity_does_not_poison_the_rest_2816(
+    db_session: AsyncSession,
+) -> None:
+    """A VRF whose write raises rolls back only itself (#2816).
+
+    The old per-entity ``db.rollback()`` expired the signed-in user, so the
+    NEXT entity's audit row read ``actor.id`` outside the greenlet and failed
+    too. Every entity after the bad one must still be created and audited.
+    """
+    from app.services.netbox_import.canonical import ImportedVRF
+
+    actor = await _make_admin(db_session)
+    await db_session.commit()
+    preview = ImportPreview(
+        source="netbox",
+        vrfs=[
+            ImportedVRF(name="good-before"),
+            ImportedVRF(name="x" * 300),  # over String(255): the INSERT raises
+            ImportedVRF(name="good-after"),
+        ],
+    )
+
+    result = await commit_import(
+        db_session, preview=preview, conflict_actions={}, space_strategy="per_vrf", actor=actor
+    )
+
+    taken = [e.action_taken for e in result.entities]
+    assert taken == ["created", "failed", "created"], [e.error for e in result.entities]
+    names = {v.name for v in (await db_session.execute(select(VRF))).scalars()}
+    assert names == {"good-before", "good-after"}
+    audited = {
+        a.resource_display
+        for a in (
+            await db_session.execute(select(AuditLog).where(AuditLog.resource_type == "vrf"))
+        ).scalars()
+    }
+    assert audited == {"good-before", "good-after"}
