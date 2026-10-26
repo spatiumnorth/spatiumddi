@@ -350,6 +350,14 @@ class _RedisUp:
         return None
 
 
+class _RedisDown:
+    async def ping(self) -> bool:
+        raise ConnectionError("redis is down")
+
+    async def aclose(self) -> None:
+        return None
+
+
 @pytest.fixture
 def redis_up(monkeypatch: pytest.MonkeyPatch) -> None:
     """Readiness's Redis check answers, so its verdict turns on the schema."""
@@ -452,6 +460,33 @@ async def test_fresh_process_on_a_newer_schema_stays_unready(
 
 
 @pytest.mark.asyncio
+async def test_a_probe_that_fails_on_redis_does_not_latch(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a probe that answers 200 with the schema at head means the pod
+    has been Ready at its own head. One that found the schema at head but
+    failed on Redis answered 503, so a newer schema afterwards is refused."""
+    from app.core import redis_client  # noqa: PLC0415
+
+    expected, _ = schema_module.expected_alembic_head()
+    monkeypatch.setattr(redis_client, "make_async_redis", lambda *_a, **_k: _RedisDown())
+    response = await client.get("/health/ready")
+    body = response.json()
+    assert response.status_code == 503, body
+    assert body["checks"]["schema"] == "ok"
+    assert body["checks"]["redis"].startswith("error: ")
+
+    monkeypatch.setattr(redis_client, "make_async_redis", lambda *_a, **_k: _RedisUp())
+    await _stamp(NEWER)
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503, response.json()
+    assert response.json()["checks"]["schema"] == (
+        f"error: schema at {NEWER}, image expects {expected}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ready_pod_still_refuses_a_schema_behind_its_head(
     client: AsyncClient, redis_up: None
 ) -> None:
@@ -486,13 +521,15 @@ async def test_ready_pod_still_refuses_an_unstamped_schema(
 
 
 @pytest.mark.asyncio
-async def test_schema_mismatch_is_logged_once_per_change() -> None:
+async def test_schema_mismatch_is_logged_once_per_change(
+    client: AsyncClient, redis_up: None
+) -> None:
     """A mismatch logs a warning once per change, never once per probe,
     and the way back to head logs once at info."""
     expected, _ = schema_module.expected_alembic_head()
     parent = _parent_of_head()
-    verdict, detail = await health_module._check_schema_ready()  # in service at head
-    assert verdict == "ok", detail
+    response = await client.get("/health/ready")  # in service at head
+    assert response.status_code == 200, response.json()
 
     with capture_logs() as logs:
         for revision in (NEWER, parent, expected):

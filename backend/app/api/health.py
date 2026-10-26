@@ -43,20 +43,23 @@ router = APIRouter(tags=["health"])
 # release's pods still serve (expand/contract keeps the old code safe on
 # the new schema, docs/DEVELOPMENT.md). Refusing it took EVERY old api
 # pod out of the Service at once, before any new pod was ready: ~80 s of
-# 502 on a three-node roll. So a process that has already been ready at
-# its own head keeps serving there. One that never was (a new pod, a
-# restarted container, an older release rolled back onto a newer
-# database) still refuses it, as wait-for-migrate and #1227's guard do.
-# Behind, unstamped and failed checks stay 503 whatever the history.
+# 502 on a three-node roll. So a process that has been Ready at its own
+# head (a whole probe answered 200 there) keeps serving there. One that
+# never was (a new pod, a restarted container, an older release rolled
+# back onto a newer database) still refuses it, as wait-for-migrate and
+# #1227's guard do. Behind, unstamped and failed checks stay 503 whatever
+# the history.
 @dataclass(slots=True)
 class _SchemaReadiness:
     """This process's schema history across probes (#2777).
 
-    ``seen_head`` latches the first time the check finds the DB at this
-    image's own head, which is also the first moment the pod could have
-    been Ready (one uvicorn worker per api container, so the process is
-    the pod). ``logged`` is the last (verdict, detail) logged, so a
-    mismatch logs once per change, not once per probe.
+    ``seen_head`` latches the first time a whole readiness probe answers
+    200 with the DB exactly at this image's own head: the pod has been
+    Ready at its own head (one uvicorn worker per api container, so the
+    process is the pod). A probe that found the schema at head but failed
+    on Redis answered 503 and does not set it. ``logged`` is the last
+    (verdict, detail) logged, so a mismatch logs once per change, not
+    once per probe.
     """
 
     seen_head: bool = False
@@ -99,13 +102,12 @@ async def _check_schema_ready() -> tuple[str, str]:
 
     Returns ``("ok", "<detail>")`` if the schema matches;
     ``("newer", "<detail>")`` when a newer release migrated the DB and
-    this process has already been ready at its own head, so it keeps
-    serving (#2777); else ``("error", "<detail>")`` with an
-    operator-actionable message.
+    this process has been Ready at its own head, so it keeps serving
+    (#2777); else ``("error", "<detail>")`` with an operator-actionable
+    message. It reads the latch; only ``readiness`` sets it.
     """
     result = await schema_at_head()
     if result.ok:
-        _schema_readiness.seen_head = True
         verdict, detail = "ok", result.detail
     elif result.ahead and _schema_readiness.seen_head:
         verdict = "newer"
@@ -143,8 +145,9 @@ async def readiness() -> JSONResponse:
     bare nginx 502s through the frontend proxy (issue #299).
 
     A schema AHEAD of this image (a newer release migrated it) keeps a
-    process that has already been ready at its own head in service:
-    ``checks.schema`` reads ``ok: …`` naming both revisions (#2777).
+    process that has been Ready at its own head (this probe answered 200
+    there) in service: ``checks.schema`` reads ``ok: …`` naming both
+    revisions (#2777).
     """
     checks: dict[str, str] = {}
     healthy = True
@@ -220,6 +223,11 @@ async def readiness() -> JSONResponse:
         logger.warning("readiness_check_failed", check="redis", error=str(exc))
         checks["redis"] = f"error: {exc}"
         healthy = False
+
+    if healthy and checks.get("schema") == "ok":
+        # #2777: the latch means "has been Ready at its own head", so only a
+        # probe that answers 200 with the schema exactly at head sets it.
+        _schema_readiness.seen_head = True
 
     body = {"status": "ok" if healthy else "degraded", "checks": checks}
     code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
