@@ -33,7 +33,9 @@ Resumability: the celery task wrapper in ``app/tasks/upgrade_
 orchestrator.py`` is idempotent. Re-enqueuing the same ``run_id`` (e.g.
 after the celery worker dies mid-run) picks up from the row's
 ``progress.per_node`` map — completed nodes are skipped, the next
-incomplete node is driven.
+incomplete node is driven. A node a drive was in the middle of when it died
+is resumed at the step it was in, from ``progress.in_flight`` (#2809): the
+checkpoint its chain wrote before each step.
 """
 
 from __future__ import annotations
@@ -48,7 +50,8 @@ from typing import Any
 
 import structlog
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
+from sqlalchemy import literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -774,6 +777,45 @@ async def _bail(db: AsyncSession, run: SystemUpgradeRun, holder: str | None, why
         logger.warning("upgrade_lease_release_failed", run_id=run_id)
 
 
+# ``progress`` key holding the checkpoint of the node being driven (#2809).
+IN_FLIGHT_KEY = "in_flight"
+
+
+def _without_in_flight(progress: dict[str, Any] | None) -> dict[str, Any]:
+    """``progress`` with the node checkpoint dropped: the node has ended, so
+    a later drive must not resume it (#2809)."""
+    return {k: v for k, v in (progress or {}).items() if k != IN_FLIGHT_KEY}
+
+
+def _checkpoint_writer(
+    db: AsyncSession, run_id: uuid.UUID, holder: str | None
+) -> per_node.Checkpoint:
+    """Store the per-node chain's checkpoints on the run as
+    ``progress.in_flight`` (#2809).
+
+    One UPDATE merging the key into the stored JSON, never a write of the
+    whole ``progress``: the drive's copy of the row is as it was when the
+    node started, and writing it back would undo an operator's Halt event or
+    a takeover's. Only while the run is still this drive's: after a takeover
+    the other drive owns the checkpoint."""
+
+    async def _write(entry: dict[str, Any]) -> None:
+        stmt = (
+            update(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .values(
+                progress=SystemUpgradeRun.progress.op("||")(literal({IN_FLIGHT_KEY: entry}, JSONB))
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if holder:
+            stmt = stmt.where(SystemUpgradeRun.lease_holder == holder)
+        await db.execute(stmt)
+        await db.commit()
+
+    return _write
+
+
 async def _record_node_after_stop(
     db: AsyncSession,
     run: SystemUpgradeRun,
@@ -786,7 +828,7 @@ async def _record_node_after_stop(
     the operator's state alone (#1702). A halted run resumes from here."""
     per_node_progress = dict((run.progress or {}).get("per_node") or {})
     per_node_progress[node] = entry
-    run.progress = {**run.progress, "per_node": per_node_progress}
+    run.progress = {**_without_in_flight(run.progress), "per_node": per_node_progress}
     await _record_event(
         db,
         run,
@@ -1332,8 +1374,18 @@ async def _drive_loop(
             await _bail(db, run, holder, why)
             return
 
-        # Drive Phase C for this node.
-        await _record_event(db, run, "node_started", node=next_node)
+        # Drive Phase C for this node. #2809 — a node an earlier drive was in
+        # the middle of resumes at the step it was in, not at ``preflight``:
+        # by then it may be cordoned and drained, and the preflight's CNPG
+        # wait would wait for the instance that drain evicted.
+        resume = per_node.resume_from_checkpoint((run.progress or {}).get(IN_FLIGHT_KEY), next_node)
+        if resume is not None:
+            await _record_event(db, run, "node_started", node=next_node, resumed_at=resume.step)
+            logger.info(
+                "upgrade_node_resumed", run_id=str(run.id), node=next_node, step=resume.step
+            )
+        else:
+            await _record_event(db, run, "node_started", node=next_node)
         await db.commit()
         result = await per_node.single_node_upgrade(
             db,
@@ -1349,12 +1401,15 @@ async def _drive_loop(
             # #1709 — the node's preflight asks for /var room only on the
             # nodes the run has still to upgrade.
             remaining_nodes=[n for n in plan_order if n not in completed_nodes],
+            resume=resume,
+            checkpoint=_checkpoint_writer(db, run.id, holder),
         )
 
         per_node_progress[next_node] = {
             "ok": result.ok,
             "failed_at": result.failed_at,
             "error": result.error,
+            **({"resumed_at": resume.step} if resume is not None else {}),
             "steps": [
                 {
                     "name": s.name,
@@ -1380,7 +1435,7 @@ async def _drive_loop(
             **dict(run.progress.get("per_node") or {}),
             next_node: per_node_progress[next_node],
         }
-        run.progress = {**run.progress, "per_node": per_node_progress}
+        run.progress = {**_without_in_flight(run.progress), "per_node": per_node_progress}
 
         if not result.ok:
             run.last_error = (
