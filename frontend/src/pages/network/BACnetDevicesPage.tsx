@@ -258,7 +258,23 @@ export function BACnetDevicesPage() {
                 {devicesQ.isLoading ? (
                   "Loading devices…"
                 ) : (
-                  <ListEmpty error={devicesQ.error} what="BACnet devices">
+                  <ListEmpty
+                    error={devicesQ.error}
+                    what="BACnet devices"
+                    filtered={
+                      search.trim() !== "" ||
+                      subnetFilter !== "" ||
+                      vendorFilter.trim() !== "" ||
+                      bbmdOnly
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setSubnetFilter("");
+                      setVendorFilter("");
+                      setBbmdOnly(false);
+                      setPage(1);
+                    }}
+                  >
                     No BACnet devices recorded.
                   </ListEmpty>
                 )}

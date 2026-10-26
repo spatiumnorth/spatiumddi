@@ -18,6 +18,7 @@ from app.api.health import router as health_router
 from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
+from app.core.body_limit import RequestBodyLimitMiddleware
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
@@ -590,6 +591,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_blocklist_feed_stale_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_blocklist_feed_stale_alert_rule_seed_skipped", reason=str(exc))
+    # Stale DNS pool health alert rule — singleton, ENABLED by default
+    # (issue #2312). Silent unless a pool's health checks stopped. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_pool_health_stale_alert_rule,
+        )
+
+        await seed_dns_pool_health_stale_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_pool_health_stale_alert_rule_seed_skipped", reason=str(exc))
     # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
     # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
     # deleted. A startup seed would re-create it on every restart.
@@ -936,6 +947,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cert_deploy_task.cancel()
         with suppress(asyncio.CancelledError):
             await cert_deploy_task
+    from app.services import after_commit_dispatch  # noqa: PLC0415
+
+    await after_commit_dispatch.shutdown()
     logger.info("shutdown", service="api")
 
 
@@ -1016,8 +1030,9 @@ def create_app() -> FastAPI:
 
     # Middleware (outermost first). Note Starlette wraps in REVERSE add
     # order: the LAST-added middleware runs outermost. So the request
-    # flows in as TrustedHost → CORS → Prometheus → Maintenance →
-    # RequestContext, and the response unwinds the other way.
+    # flows in as RequestBodyLimit → TrustedProxy → TrustedHost → CORS →
+    # Prometheus → Maintenance → RequestContext, and the response unwinds
+    # the other way.
     app.add_middleware(RequestContextMiddleware)
 
     # Maintenance mode (issue #57). Added AFTER RequestContextMiddleware so
@@ -1085,6 +1100,11 @@ def create_app() -> FastAPI:
     # resolved values. uvicorn runs with --no-proxy-headers for this to see
     # the real peer (backend/Dockerfile).
     app.add_middleware(TrustedProxyMiddleware, trusted=settings.trusted_proxy_networks)
+
+    # #2780 — cap every request body. Added last so it runs outermost: an
+    # oversized body is refused (413) before any other middleware, route or
+    # dependency reads a byte of it. See app.core.body_limit.
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.max_request_body_bytes)
 
     # Routes
     app.include_router(health_router)

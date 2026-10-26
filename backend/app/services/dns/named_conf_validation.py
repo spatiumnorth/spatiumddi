@@ -47,6 +47,7 @@ __all__ = [
     "RESERVED_VIEW_NAMES",
     "AclCycleError",
     "ViewValidationError",
+    "bind9_refused_prefix",
     "is_name_reference",
     "UPDATE_POLICY_NAMED_SCOPES",
     "UPDATE_POLICY_RR_TYPES",
@@ -140,12 +141,48 @@ def validate_view_name(name: str, *, field: str = "name") -> str:
     return candidate
 
 
+def bind9_refused_prefix(element: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """The network a prefix BIND 9 refuses stands for, or ``None`` (#2695).
+
+    BIND reads a prefix as an address, ``/`` and a decimal length, with no
+    host bits set. ``ipaddress`` also reads two forms ``named-checkconf``
+    refuses, and each gives its network here:
+
+    * host bits set: ``10.0.0.5/24`` gives ``10.0.0.0/24``
+      ("'10.0.0.5/24': address/prefix length mismatch '24'");
+    * a mask where the length goes: ``10.0.0.0/255.255.255.0`` gives
+      ``10.0.0.0/24`` ("expected prefix length near '255.255.255.0'").
+
+    One element BIND refuses fails the whole group's config. An address, a
+    name, a prefix BIND reads and anything malformed give ``None``; a
+    leading ``!`` is ignored.
+    """
+    body = (element or "").strip()
+    if body.startswith("!"):
+        body = body[1:].strip()
+    if "/" not in body:
+        return None
+    try:
+        network = ipaddress.ip_network(body, strict=False)
+    except ValueError:
+        return None
+    length = body.partition("/")[2]
+    if not (length.isascii() and length.isdigit()):
+        return network
+    try:
+        ipaddress.ip_network(body)
+    except ValueError:
+        return network
+    return None
+
+
 def _validate_element(
     element: str,
     field: str,
     known_acls: frozenset[str],
     known_keys: frozenset[str],
     allow_unknown_names: bool = False,
+    allow_bind9_refused_prefixes: bool = False,
 ) -> None:
     raw = (element or "").strip()
     if not raw:
@@ -186,8 +223,13 @@ def _validate_element(
             )
         return
 
-    # An address or prefix. ``strict=False`` so 10.0.0.5/24 is accepted the
-    # way BIND accepts it, rather than rejected for having host bits set.
+    # An address or prefix. BIND 9 refuses a prefix with host bits set
+    # (10.0.0.5/24, "address/prefix length mismatch") and one with a mask
+    # where the length goes (10.0.0.0/255.255.255.0, "expected prefix
+    # length"), though ``ipaddress`` reads both. Accepting either would stop
+    # every BIND9 server in the group loading new config (#2695). Each is
+    # refused rather than rewritten: 10.0.0.5/24 may mean the network or the
+    # one host.
     if "/" in body:
         try:
             ipaddress.ip_network(body, strict=False)
@@ -197,6 +239,20 @@ def _validate_element(
                 field=field,
                 value=element,
             ) from exc
+        network = None if allow_bind9_refused_prefixes else bind9_refused_prefix(body)
+        if network is not None:
+            address = body.partition("/")[0].strip()
+            if ipaddress.ip_address(address) != network.network_address:
+                message = (
+                    f"'{body}' has host bits set, which BIND refuses: use {network} for "
+                    f"the network, or {address} for the one address."
+                )
+            else:
+                message = (
+                    f"'{body}' gives its mask as an address, which BIND refuses: "
+                    f"write it as {network}."
+                )
+            raise ViewValidationError(message, field=field, value=element)
         return
     try:
         ipaddress.ip_address(body)
@@ -240,6 +296,7 @@ def validate_address_match_list(
     known_acls: frozenset[str] = frozenset(),
     known_keys: frozenset[str] = frozenset(),
     allow_unknown_names: bool = False,
+    allow_bind9_refused_prefixes: bool = False,
 ) -> list[str]:
     """Validate every element of a BIND address-match-list.
 
@@ -247,6 +304,14 @@ def validate_address_match_list(
     without asking whether it resolves. The bundle builder uses it to
     decide whether a legacy row is *renderable*; resolution is a separate
     question it answers with its own known-set.
+
+    ``allow_bind9_refused_prefixes`` accepts a prefix BIND 9 refuses, one
+    with host bits set (10.0.0.5/24) or a mask where the length goes
+    (10.0.0.0/255.255.255.0), which is otherwise refused (#2695). The bundle
+    builder passes it too: it ships such a prefix to a BIND 9 server as the
+    network it stands for, and as stored to the Technitium and PowerDNS
+    agents, which apply that network themselves, so how one renders is a
+    per-server question it answers itself.
 
     ``known_keys`` is the set of TSIG key names the group ships to its
     agents; a ``key <name>`` element naming one that doesn't exist renders a
@@ -264,7 +329,14 @@ def validate_address_match_list(
         return []
     cleaned: list[str] = []
     for element in elements:
-        _validate_element(element, field, known_acls, known_keys, allow_unknown_names)
+        _validate_element(
+            element,
+            field,
+            known_acls,
+            known_keys,
+            allow_unknown_names,
+            allow_bind9_refused_prefixes,
+        )
         cleaned.append((element or "").strip())
     return cleaned
 

@@ -30,7 +30,12 @@
 # Persistence across A/B slot swaps (Phase 8a, issue #138): /etc/lldpd.d/ +
 # /etc/default/lldpd live on the /etc overlay upper (/var/persist/etc) and
 # the sidecars on /var directly, so operator LLDP config + lldpd's enable
-# state survive a slot swap with no reapply.
+# link survive a slot swap ON DISK. At boot that is not enough (#2376): the
+# image ships lldpd disabled, the operator's enable link lives only in the
+# overlay upper, and etc.mount puts that up after systemd has loaded its
+# units, so nothing wants lldpd. ``--boot`` (run by
+# spatiumddi-optin-services-boot.service after etc.mount) starts it when
+# the operator has LLDP on — see spatiumddi-snmp-reload for the details.
 
 set -euo pipefail
 
@@ -45,6 +50,45 @@ LOCK=/run/spatiumddi-lldp-reload.lock
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$ETC_CONF")"
 exec >> "$LOG" 2>&1
+
+# ── --boot: start lldpd when the operator has LLDP on (#2376) ───────
+# The hash sidecar is the plane's record of "on" (non-empty only after a
+# successful enabled apply, truncated by a disabled one).
+if [ "${1:-}" = "--boot" ]; then
+    echo
+    echo "[$(date -Iseconds)] === lldp boot re-arm ==="
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        echo "  an apply is in progress; it owns lldpd's state"
+        exit 0
+    fi
+    want=""
+    [ -f "$HASH_SIDECAR" ] && want=$(tr -d '[:space:]' < "$HASH_SIDECAR")
+    if [ -z "$want" ]; then
+        echo "  LLDP is not configured on; nothing to start"
+        if [ -f "$STATUS_SIDECAR" ] && ! systemctl is-active --quiet lldpd; then
+            echo "stopped" > "$STATUS_SIDECAR"
+        fi
+        exit 0
+    fi
+    if ! systemctl is-enabled --quiet lldpd 2>/dev/null; then
+        echo "  LLDP is on but lldpd is not enabled; re-enabling"
+        systemctl enable lldpd >/dev/null 2>&1 || echo "  ! systemctl enable lldpd failed"
+    fi
+    if ! systemctl is-active --quiet lldpd; then
+        systemctl start lldpd >/dev/null 2>&1 || echo "  ! systemctl start lldpd failed"
+        sleep 2
+    fi
+    if systemctl is-active --quiet lldpd; then
+        echo "  ✓ lldpd is active"
+        echo "running" > "$STATUS_SIDECAR"
+    else
+        echo "  ✗ lldpd is not running"
+        systemctl status lldpd --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+        echo "stopped" > "$STATUS_SIDECAR"
+    fi
+    exit 0
+fi
 
 echo
 echo "[$(date -Iseconds)] === spatiumddi-lldp-reload fired ==="

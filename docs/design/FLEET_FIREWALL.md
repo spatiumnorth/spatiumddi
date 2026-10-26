@@ -297,6 +297,8 @@ Re-specified away from the fragile "transient `systemd-run` timer fired from a o
 
 If `rendered_hash != applied_hash` for more than `firewall_apply_lag_intervals` heartbeats, the backend raises a typed `firewall.apply_stalled` alert distinct from agent-offline, cross-referencing Wave E's external-watchdog state so "supervisor wedged" is shown as the cause. The Fleet drift chip differentiates `pending / applied-ok / applied-error / stalled / reverted` — a true status, not a bare hash mismatch.
 
+**Drift only exists while enforcement is on (#2794).** With `firewall_enabled` off there is no server render a node is expected to match, so `/effective`, `find_firewall_effective` and the `firewall.apply_stalled` alarm all report no drift, and the heartbeat clears the stored `rendered_hash` (and the stall watermark) so re-enabling starts from a fresh render. `drift` stays a boolean (false when off).
+
 ### 3.5 Control-plane-loss survival (non-negotiable #5)
 
 The rendered `spatium-role.nft` lives on the `/etc` overlay upper (`/var/persist/etc`); sidecars on `/var` — both survive reboots and A/B slot swaps. On a non-200 heartbeat, `heartbeat_once` returns early and `maybe_fire_firewall_reload` is never reached → **last-good stays loaded indefinitely**. Nothing tightens, nothing flushes. The supervisor retains `firewall_renderer.py` for **one release** as a cache-fallback: if a heartbeat arrives without a `firewall_settings` block (old control plane / transitional bundle), it re-renders from cached `role_assignment` as today. A node that reboots while the control plane is down loads its last-good drop-in from the overlay — fully functional, no control plane needed.

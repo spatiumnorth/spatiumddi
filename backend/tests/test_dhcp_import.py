@@ -570,3 +570,41 @@ async def test_commit_source_mismatch_400(db_session: AsyncSession, client: Asyn
         json={"target_group_id": str(group.id), "plan": preview, "conflict_actions": {}},
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_kea_commit_failed_scope_does_not_poison_the_next_2816(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A scope that fails rolls back only itself (#2816): the scope after it
+    is created and audited, and the route answers 200, not 500."""
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "10.9.0.0/16")
+    await _make_subnet(db_session, space, block, "10.9.9.0/24")
+    await _make_subnet(db_session, space, block, "10.9.10.0/24")
+    await db_session.commit()
+
+    # Link-only (no space). The first scope carries a reservation whose MAC
+    # the MACADDR column rejects, so its write RAISES (not a returned
+    # failure); the second must still land.
+    plan = (await _kea_preview(client, token, str(group.id))).json()
+    good = {**plan["scopes"][0], "subnet_cidr": "10.9.10.0/24"}
+    bad_res = {**plan["scopes"][0]["reservations"][0], "mac_address": "not-a-mac"}
+    bad = {**plan["scopes"][0], "subnet_cidr": "10.9.9.0/24", "reservations": [bad_res]}
+    plan["scopes"] = [bad, good]
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"target_group_id": str(group.id), "plan": plan, "conflict_actions": {}},
+    )
+    assert resp.status_code == 200, resp.text
+    scopes = resp.json()["scopes"]
+    assert [x["action_taken"] for x in scopes] == ["failed", "created"], scopes
+    audits = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.resource_type == "dhcp_scope")))
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1

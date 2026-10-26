@@ -1118,7 +1118,14 @@ function GroupServersList({
                         className={`inline-block h-2 w-2 rounded-full ${SERVER_STATUS_DOT_CLS[s.status] ?? "bg-muted"}`}
                         title={`status: ${s.status}`}
                       />
-                      <span className="text-sm font-medium">{s.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => onSelectServer(s)}
+                        aria-label={`View details of ${s.name}`}
+                        className="text-sm font-medium hover:underline focus-visible:underline focus:outline-none"
+                      >
+                        {s.name}
+                      </button>
                       <span
                         className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${SERVER_STATUS_PILL_CLS[s.status] ?? "bg-muted text-muted-foreground"}`}
                       >

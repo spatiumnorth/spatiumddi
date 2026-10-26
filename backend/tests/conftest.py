@@ -196,15 +196,30 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     cluster_health.invalidate_probe_cache()
     # GHSA-c58p-8cq9-g3gm — /health/platform caches its Celery worker ping.
     health.invalidate_worker_ping_cache()
+    # #2777: /health/ready remembers whether this process has been ready
+    # at its own head; a test that got there would carry it into every
+    # later test on the same worker, and a newer schema the test expects
+    # refused would pass instead.
+    health.reset_schema_readiness()
     # The idle-session timeout is cached the same way.
     session_idle.invalidate_cache()
+    # #2782 — "nothing to deliver to" is cached per process on a monotonic
+    # clock, so a test that ran with no subscription / target would keep the
+    # next test's after-commit publish and forward from running.
+    from app.services import audit_forward, event_publisher
+
+    event_publisher.subscriptions_cache.invalidate()
+    audit_forward.targets_cache.invalidate()
     yield
+    event_publisher.subscriptions_cache.invalidate()
+    audit_forward.targets_cache.invalidate()
     maintenance_mode.invalidate_cache()
     session_idle.invalidate_cache()
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()
     health.invalidate_worker_ping_cache()
+    health.reset_schema_readiness()
 
 
 @pytest.fixture(autouse=True)
@@ -277,6 +292,39 @@ def _all_feature_modules_enabled() -> Iterator[None]:
         fm.MODULES_BY_ID = original_by_id
 
 
+async def _drain_after_commit_dispatch() -> None:
+    """Let this test's fire-and-forget after-commit dispatches finish, and
+    release the shared dispatch engine's connections, before the TRUNCATE.
+
+    ``event_publisher`` / ``audit_forward`` dispatch tasks (#2782) run a
+    multi-statement transaction on ``dispatch_db``'s pooled engine (read a
+    target table, then fall back to ``platform_settings``). A task still
+    in flight when the TRUNCATE queues its ACCESS EXCLUSIVE locks holds an
+    ACCESS SHARE on the first table while waiting for the second, which the
+    TRUNCATE already holds: a deadlock the server resolves by killing the
+    TRUNCATE (seen as a fixture-setup error in an unrelated test)."""
+    import asyncio
+
+    from app.services import after_commit_dispatch, dispatch_db
+
+    loop = asyncio.get_running_loop()
+    for _ in range(5):
+        pending = [
+            t for t in list(after_commit_dispatch._tasks) if not t.done() and t.get_loop() is loop
+        ]
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=30)
+    engine, state_loop = dispatch_db._state.engine, dispatch_db._state.loop
+    if engine is not None:
+        if state_loop is loop:
+            await dispatch_db.dispose()
+        else:
+            # Pool belongs to a finished loop; its sockets are not ours to await on.
+            engine.sync_engine.dispose(close=False)
+            dispatch_db._state.engine = None
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _isolate_db() -> AsyncGenerator[None, None]:
     """Truncate every table after each test so state doesn't leak.
@@ -289,6 +337,7 @@ async def _isolate_db() -> AsyncGenerator[None, None]:
     NullPool gives us a fresh connection.
     """
     yield
+    await _drain_after_commit_dispatch()
     tables = ", ".join(f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables))
     if not tables:
         return

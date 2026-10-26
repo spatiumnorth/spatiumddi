@@ -119,6 +119,21 @@ compares it against `SELECT version_num FROM alembic_version`
 behind / image expects Y" so cold-boot vs connectivity failures are
 never ambiguous.
 
+A schema *ahead* of the image is the other side of a rolling upgrade:
+the new release's migration commits while the old release's api pods
+still serve. A revision the image's own migrations do not contain was
+written by a newer release (with one head, every revision the image
+knows is its head or behind it). A pod that has already been ready at
+its own head stays in service there while every table and column its
+models map is in the database (read once per revision), with
+`checks.schema` reading `ok: …` and naming both revisions. One missing,
+or a read that fails, answers 503: a revision the image does not know
+can also be a forked head, a mistyped `alembic stamp` or a restore made
+with `allow_newer_schema`. A pod that never was ready stays out, as the
+`wait-for-migrate` init container and #1227's guard keep an older
+release off a newer database (#2777). Each change of schema state is
+logged once (`readiness_schema_mismatch`, warning).
+
 ### PostgreSQL 16 — the source of truth
 
 Holds IPAM (spaces / blocks / subnets / addresses), DNS (zones /
