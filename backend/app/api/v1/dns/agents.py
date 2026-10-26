@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
+from app.api.pre_body_auth import PreBodyAuthRoute, header_auth
 from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
@@ -114,7 +115,10 @@ _SERIAL_ADOPT_HEADROOM = 1_000_000
 #: Never adopt into the last stretch of the signed 32-bit ``last_serial``
 #: column, so the bump that follows cannot overflow it.
 _SERIAL_ADOPT_MAX = 2**31 - 1 - _SERIAL_ADOPT_HEADROOM
-router = APIRouter(prefix="/agents", tags=["dns-agents"])
+# Every body route here checks the agent's credential from the headers
+# before the body is read: ``/ingested-records`` takes up to 64 MiB
+# (``app.core.body_limit``), and the batch routes take several MiB.
+router = APIRouter(prefix="/agents", tags=["dns-agents"], route_class=PreBodyAuthRoute)
 
 LONGPOLL_TIMEOUT_SECONDS = int(os.environ.get("DNS_AGENT_LONGPOLL_TIMEOUT", "30"))
 LONGPOLL_POLL_INTERVAL = 2.0
@@ -245,6 +249,12 @@ class AgentHeartbeatResponseV2(BaseModel):
 # ── Auth dependencies ──────────────────────────────────────────────────────────
 
 
+async def _bootstrap_key_from_headers(request: Request) -> None:
+    """:func:`_require_bootstrap_key`, run before the body is read."""
+    _require_bootstrap_key(request.headers.get("X-DNS-Agent-Key"))
+
+
+@header_auth(_bootstrap_key_from_headers)
 def _require_bootstrap_key(
     x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key")
 ) -> str:
@@ -265,11 +275,23 @@ def _require_bootstrap_key(
     return x_dns_agent_key
 
 
+async def _agent_from_headers(request: Request, db: DB) -> None:
+    """:func:`_auth_agent`, run before the body is read."""
+    await _agent_from_authorization(db, request.headers.get("authorization"))
+
+
+@header_auth(_agent_from_headers)
 async def _auth_agent(
     db: DB,
     authorization: str | None = Header(default=None),
 ) -> tuple[DNSServer, dict[str, Any]]:
     """Verify the Bearer agent_token, return (server, jwt_payload)."""
+    return await _agent_from_authorization(db, authorization)
+
+
+async def _agent_from_authorization(
+    db: AsyncSession, authorization: str | None
+) -> tuple[DNSServer, dict[str, Any]]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = authorization.split(None, 1)[1].strip()

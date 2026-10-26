@@ -6767,7 +6767,17 @@ export function SubnetDetail({
                               </td>
                               <td className="px-4 py-2 font-mono font-medium">
                                 <span className="inline-flex items-center gap-0.5">
-                                  {addr.address}
+                                  {/* The keyboard path to the row's detail
+                                      dialog, which a click on the row opens
+                                      (#2724). */}
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingAddress(addr)}
+                                    title="View details"
+                                    className="font-mono font-medium hover:underline focus-visible:underline focus:outline-none"
+                                  >
+                                    {addr.address}
+                                  </button>
                                   <CopyButton text={addr.address} />
                                 </span>
                               </td>
@@ -13076,7 +13086,7 @@ export function EditBlockModal({
 
 // ─── Recursive Block Tree Row ─────────────────────────────────────────────────
 
-function BlockTreeRow({
+export function BlockTreeRow({
   node,
   selectedSubnetId,
   selectedBlockId,
@@ -13190,12 +13200,13 @@ function BlockTreeRow({
               ) : (
                 <Layers className="h-3 w-3 flex-shrink-0" />
               )}
-              <span className="font-mono font-medium flex-1 truncate">
+              {/* The CIDR never shrinks; the name is what gets cut (#2822). */}
+              <span className="font-mono font-medium shrink-0 whitespace-nowrap">
                 {node.block.network}
               </span>
               <BlockNameTag
                 name={node.block.name}
-                className="truncate text-[10px] opacity-60 mr-1"
+                className="min-w-0 flex-1 truncate text-[10px] opacity-60 mr-1"
               />
               <CustomerChip customerId={node.block.customer_id} />
               <SiteChip siteId={node.block.site_id} />

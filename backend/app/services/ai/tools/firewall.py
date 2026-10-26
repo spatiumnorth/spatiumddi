@@ -295,15 +295,18 @@ async def find_firewall_effective(
         ssh_scope_cidrs=inputs.get("ssh_scope_cidrs") or [],
     )
     state = await db.get(FirewallApplyState, row.id)
+    enforced = bool(inputs["firewall_enabled"])
+    # #2794 — no drift while enforcement is off (see the /effective route).
+    rendered_hash = getattr(state, "rendered_hash", None) if enforced else None
     return {
         "appliance_id": str(row.id),
         "hostname": row.hostname,
         "firewall_enabled": bool(inputs["firewall_enabled"]),
         "firewall_conf": body,
-        "rendered_hash": getattr(state, "rendered_hash", None),
+        "rendered_hash": rendered_hash,
         "applied_hash": getattr(state, "applied_hash", None),
         "applied_status": getattr(state, "applied_status", None),
-        "drift": bool(state and state.rendered_hash and state.rendered_hash != state.applied_hash),
+        "drift": bool(state and rendered_hash and rendered_hash != state.applied_hash),
     }
 
 

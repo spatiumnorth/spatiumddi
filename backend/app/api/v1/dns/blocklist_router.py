@@ -34,6 +34,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_resource_permission
 from app.core.safe_fetch import (
     FetchRefusedError,
@@ -52,6 +53,7 @@ from app.models.dns import (
     DNSView,
 )
 from app.services.dns import technitium_api_scope
+from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.blocklist_templates import (
     BlocklistTemplate,
     TemplateGroupConflict,
@@ -292,6 +294,11 @@ class BlockListResponse(BaseModel):
     last_synced_at: datetime | None
     last_sync_status: str | None
     last_sync_error: str | None
+    # Last refresh that SUCCEEDED (#2313); NULL = never has.
+    last_success_at: datetime | None = None
+    # ok | error | stale | never; NULL for a manual list (no feed). One
+    # classification shared with the ``dns_blocklist_feed_stale`` alert.
+    feed_sync_state: str | None = None
     entry_count: int
     # NULL = no adblock refresh has recorded counts (or not an adblock feed).
     feed_parse_skipped: FeedParseSkipped | None = None
@@ -466,6 +473,8 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         last_synced_at=bl.last_synced_at,
         last_sync_status=bl.last_sync_status,
         last_sync_error=bl.last_sync_error,
+        last_success_at=bl.last_success_at,
+        feed_sync_state=feed_sync_state(bl),
         entry_count=bl.entry_count,
         feed_parse_skipped=(
             FeedParseSkipped(**bl.feed_parse_skipped) if bl.feed_parse_skipped else None
@@ -1737,7 +1746,7 @@ async def refresh_blocklist(
 
     task_id: str | None = None
     try:
-        result = refresh_blocklist_feed.delay(str(bl.id))
+        result = await dispatch(refresh_blocklist_feed, str(bl.id))
         task_id = result.id
     except Exception as e:  # noqa: BLE001
         logger.warning("blocklist_refresh_enqueue_failed", list_id=str(bl.id), error=str(e))

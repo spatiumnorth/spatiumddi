@@ -27,7 +27,7 @@ async def _approved_supervisor(db: AsyncSession) -> tuple[Appliance, str]:
     if s is None:
         s = PlatformSettings(id=1)
         db.add(s)
-    s.supervisor_registration_enabled = True  # supervisor endpoints 404 otherwise
+    s.supervisor_registration_enabled = True  # only register needs it since #2798
     token, token_hash = generate_session_token()
     der = os.urandom(32)
     row = Appliance(

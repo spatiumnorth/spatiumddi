@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
@@ -56,7 +57,10 @@ from app.services.dns_import.cname_check import annotate_cname_conflicts
 from app.services.dns_import.commit import commit_import, detect_conflicts
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# Every body route here checks the login from the request headers before
+# the body is read, JSON routes included (app.api.pre_body_auth): these
+# routes carry body allowances above the app-wide cap (app.core.body_limit).
+router = APIRouter(route_class=PreBodyAuthRoute)
 
 # Match the BIND9 parser's archive cap so the multipart upload guard
 # fails fast before unpack.
