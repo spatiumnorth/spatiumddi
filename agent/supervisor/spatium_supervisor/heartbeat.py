@@ -2076,8 +2076,10 @@ def _clear_last_apply_hash(state_dir: Path) -> None:
     chart (#2801), whatever env it renders."""
     try:
         (state_dir / _LAST_APPLY_HASH_FILE).unlink(missing_ok=True)
-    except OSError:
-        pass
+    except OSError as exc:
+        # Best effort: a stamp left behind only means the next apply may be
+        # skipped as unchanged, which the role watchdog then re-fires.
+        log.warning("supervisor.heartbeat.apply_stamp_clear_failed", error=str(exc))
 
 
 def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:
