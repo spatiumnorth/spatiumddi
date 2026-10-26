@@ -261,7 +261,7 @@
         }
       ],
       "upstream": { "kind": "none" },
-      "hold": "The PostgreSQL major CNPG runs, so it moves with `postgres` above and with #208, not on its own. Bumping it alone would put the appliance's CNPG cluster on a different major from every other deployment shape.",
+      "hold": "The PostgreSQL major CNPG runs, so it moves with `postgres` above and with #208, not on its own. Bumping it alone would put the appliance's CNPG cluster on a different major from every other deployment shape. A replicated cluster updates its primary by switchover (#2831), and under switchover CNPG's webhook refuses an update that changes `imageName` and any `postgresql.parameters` key together, which fails the helm upgrade (#1313): move the image in a release that changes no parameter.",
       "note": "The one bake-array/chart-values pair the first pass of this manifest missed, and the pair where a divergence is worst: the appliance imports baked images into containerd and never pulls, so a chart naming a tag the bake did not save is ImagePullBackOff on an AIR-GAPPED box -- no error until the cluster is already offline and no network to recover over. `cnpg.imageName` in the umbrella chart and the CNPG_IMAGES entry must stay byte-identical."
     },
 
