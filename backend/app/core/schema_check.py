@@ -240,8 +240,12 @@ async def schema_at_head(session_factory=None) -> SchemaCheck:
     return SchemaCheck(True, expected, actual, f"schema at head {expected}")
 
 
-# Every table of one schema (the connection's own when :schema is NULL) and
-# its live columns, from the catalog alone. Not the SQLAlchemy inspector: its
+# Every table of one schema (when :schema is NULL, every table visible on the
+# search_path, as the SQLAlchemy inspector read them: a name resolves to the
+# one table the search_path reaches first, so it is never counted twice, and
+# an empty schema earlier on the path, such as "$user", does not hide the
+# tables, which current_schema() would) and its live columns, from the
+# catalog alone. Not the SQLAlchemy inspector: its
 # column reflection deparses each column default with pg_get_expr(), which
 # opens the table with ACCESS SHARE, so it waits behind the ACCESS EXCLUSIVE
 # lock a migration holds on a table it alters until its revision commits.
@@ -253,8 +257,11 @@ _TABLES_AND_COLUMNS = text(
     " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
     " LEFT JOIN pg_catalog.pg_attribute a"
     "   ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
-    " WHERE n.nspname = coalesce(CAST(:schema AS text), current_schema())"
-    "   AND c.relkind IN ('r', 'p')"
+    " WHERE c.relkind IN ('r', 'p')"
+    "   AND CASE WHEN CAST(:schema AS text) IS NULL"
+    "     THEN pg_catalog.pg_table_is_visible(c.oid)"
+    "       AND n.nspname NOT IN ('pg_catalog', 'information_schema')"
+    "     ELSE n.nspname = CAST(:schema AS text) END"
 )
 
 
