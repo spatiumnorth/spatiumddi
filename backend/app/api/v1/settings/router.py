@@ -25,6 +25,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.celery_dispatch import dispatch
 from app.core.config_text import has_control_chars, reject_control_chars
@@ -102,7 +103,9 @@ _RESOLVER_DNSSEC: set[str] = {"yes", "no", "allow-downgrade"}
 _RESOLVER_DOT: set[str] = {"yes", "opportunistic", "no"}
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
+router = APIRouter(route_class=PreBodyAuthUploadRoute)
 
 _SINGLETON_ID = 1
 

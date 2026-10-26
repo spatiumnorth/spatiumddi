@@ -647,9 +647,40 @@ Common status codes across the surface:
 | `403 Forbidden` | Authenticated but not permitted (RBAC denial, superadmin-only, disabled account, forced password change) |
 | `404 Not Found` | Resource doesn't exist **or** its feature module is disabled |
 | `409 Conflict` | Uniqueness / overlap / collision conflict, or a delete refused because rows still reference the target |
+| `413 Content Too Large` | The request body is over the API's body cap (see below) |
 | `422 Unprocessable Entity` | Pydantic request-body / query-param validation failure, or a request-supplied reference to a row that does not exist |
 | `429 Too Many Requests` | Per-IP login rate limit tripped |
 | `503 Service Unavailable` | Maintenance mode, transient DB-connection-closed (carries `Retry-After`), or a failing readiness check |
+
+### Request body limits
+
+**Every request body is capped** ([#2780](https://github.com/spatiumnorth/spatiumddi/issues/2780)).
+The api answers `413` to a body over the cap. A declared `Content-Length`
+over it is refused before any of the body is read; a body sent without one
+is counted as it arrives and refused once it passes the cap. The cap is
+`MAX_REQUEST_BODY_BYTES` (default **8 MiB**, minimum 64 KiB), set in the
+api's environment: `.env` on Docker Compose, `api.env` in the Helm chart.
+It applies to the api port itself; traffic through the bundled nginx is
+already limited to 1 MiB on `/api/`.
+
+Routes that take larger bodies keep their own limits, which the cap never
+lowers:
+
+| Route | Limit |
+|---|---|
+| `POST /appliance/upgrade-images` | 4 GiB image |
+| `POST /backup/…` | 2 GiB archive |
+| `POST /dns/import/…` | 50 MiB (BIND9 archive, and its preview sent back to commit) |
+| `POST /dhcp/import/…`, `POST /ipam/import/…` | 25 MiB |
+| `POST /dns/groups/{id}/zones/{id}/import/spreadsheet/{preview,commit}` | 10 MiB |
+| `POST /appliance/supervisor/pcap/upload/{id}` | 116 MiB capture |
+| `POST /dns/agents/ingested-records` | 64 MiB (one dynamic zone per request) |
+
+The upload routes (the importers, the zone spreadsheet import, the
+branding logo, upgrade images and backups) **check the login before
+reading the upload**: a request without a valid login, or without the
+permission, is answered 401 / 403 before any of the file is read. The HELD
+endpoints read at most their 64 KiB document limit.
 
 A `422` validation error carries FastAPI's structured field-error list:
 

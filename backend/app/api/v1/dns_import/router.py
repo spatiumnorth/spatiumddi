@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
@@ -56,7 +57,9 @@ from app.services.dns_import.cname_check import annotate_cname_conflicts
 from app.services.dns_import.commit import commit_import, detect_conflicts
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
+router = APIRouter(route_class=PreBodyAuthUploadRoute)
 
 # Match the BIND9 parser's archive cap so the multipart upload guard
 # fails fast before unpack.
