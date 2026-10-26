@@ -44,7 +44,7 @@ from structlog.testing import capture_logs
 
 from app.api import health as health_module
 from app.core import schema_check as schema_module
-from app.db import AsyncSessionLocal
+from app.db import AsyncSessionLocal, engine
 
 # A revision no release has: what a NEWER release's migration leaves in
 # ``alembic_version`` as far as this image can tell (#2777).
@@ -755,3 +755,30 @@ async def test_the_read_does_not_wait_behind_a_migrations_lock(
 
     assert response.status_code == 200, (f"{took:.1f} s", response.json())
     assert inspections == ["read"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_schema_first_on_the_search_path_hides_nothing(
+    client: AsyncClient, redis_up: None
+) -> None:
+    """#2825: ``current_schema()`` names the first existing schema on the
+    search_path, so an empty ``"$user"`` schema created after the tables
+    made every table read as missing. The inspector this replaced read
+    what is visible on the path."""
+    from app.models import Base
+
+    async with engine.connect() as conn:
+        user = (await conn.execute(text("SELECT session_user"))).scalar_one()
+    quoted = '"' + user.replace('"', '""') + '"'
+    async with engine.connect() as conn:
+        await conn.execute(text(f"CREATE SCHEMA {quoted}"))
+        await conn.commit()
+        try:
+            current = (await conn.execute(text("SELECT current_schema()"))).scalar_one()
+            assert current == user, "the empty schema must come first on the path"
+            tables, columns = await conn.run_sync(schema_module.missing_objects, Base.metadata)
+        finally:
+            await conn.rollback()
+            await conn.execute(text(f"DROP SCHEMA IF EXISTS {quoted}"))
+            await conn.commit()
+    assert (tables, columns) == ([], [])
