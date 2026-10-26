@@ -31,6 +31,7 @@ from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.ssrf import assert_safe_target
 from app.services.netbox_import import (
     CommitResult,
@@ -52,7 +53,10 @@ from app.services.netbox_import import (
 from app.services.netbox_import.canonical import ConflictAction
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# Every body route here checks the login from the request headers before
+# the body is read (app.api.pre_body_auth): the preview sent back to commit
+# carries the /ipam/import/ body allowance (app.core.body_limit).
+router = APIRouter(route_class=PreBodyAuthRoute)
 
 
 # ── Pydantic IO models ───────────────────────────────────────────────

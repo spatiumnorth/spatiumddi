@@ -6967,6 +6967,10 @@ export interface DNSBlockList {
   last_synced_at: string | null;
   last_sync_status: string | null;
   last_sync_error: string | null;
+  /** Last refresh that SUCCEEDED (#2313); null = never. */
+  last_success_at?: string | null;
+  /** ok | error | stale | never; null for a list with no feed (#2313). */
+  feed_sync_state?: "ok" | "error" | "stale" | "never" | null;
   entry_count: number;
   /** Rules the last adblock refresh could not enforce, by category (#2123).
    *  null = not recorded (no adblock refresh yet, or another feed format). */
@@ -13184,6 +13188,9 @@ export interface ApplianceRow {
   // False = the supervisor never looked (too old to collect it), which is
   // UNKNOWN — distinct from "looked and found no arrays".
   storage_reported: boolean;
+  // #2400 — /var low or under the kubelet eviction headroom. Null = fine
+  // or unknown (no reading, or a stale one).
+  var_disk_finding?: VarDiskFinding | null;
   // #1017 — the interface MTU spatium-etc-render actually APPLIED at this
   // node's last boot, which is not what STATE asked for: the renderer
   // drops a value that is out of range, that would break a pinned IPv6
@@ -13759,6 +13766,20 @@ export interface HostPartition {
   label: string;
   total_bytes: number;
   used_bytes: number;
+  // #2400 — statvfs f_bavail (the kubelet's eviction measure). Absent from
+  // a supervisor too old to send it.
+  available_bytes?: number | null;
+}
+
+/**
+ * #2400 — /var against kubelet eviction, judged server-side by the same
+ * function behind the `appliance_disk_usage` alert. Absent / null = fine or
+ * unknown.
+ */
+export interface VarDiskFinding {
+  severity: "warning" | "critical" | string;
+  free_pct: number | null;
+  detail: string;
 }
 
 /** One member of a software-RAID array (#999 Part A). */
@@ -13988,6 +14009,7 @@ export interface ClusterNodeVitals {
    * real "no arrays here" reading.
    */
   host_storage: NodeStorage | null;
+  var_disk_finding?: VarDiskFinding | null;
 }
 
 /** One /proc/pressure line's rolling averages, as % of wall time. */

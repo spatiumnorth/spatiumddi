@@ -152,6 +152,10 @@ services:
       # capture, so it writes here; the api reads the same volume on
       # download. MUST stay in sync with the api mount above.
       - spatium_pcaps:/var/lib/spatiumddi/pcaps
+      # Upgrade-image store (issue #2400) — the worker's reclaim beat task
+      # deletes images every node has committed to. MUST stay in sync with
+      # the api mount above.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
     # group_add:
     #   - "${DOCKER_GID:-999}"

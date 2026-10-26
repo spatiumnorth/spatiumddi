@@ -29,10 +29,13 @@ import structlog
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 
+# evictionHard 5 % (+ evictionMinimumReclaim 10 % = the 15 % headroom): one
+# definition in var_disk, shared with the /var alert and the slot-upgrade
+# scheduling pre-flight.
+from app.services.appliance.var_disk import EVICTION_HARD_PCT, EVICTION_HEADROOM_PCT
+
 logger = structlog.get_logger(__name__)
 
-# evictionHard 5 % + evictionMinimumReclaim 10 %.
-EVICTION_HEADROOM_PCT = 15
 
 # Just evictionHard, with no reclaim term (#2572). The store rule above keeps
 # 15 % because a stored image stays on the volume, so the node is not healthy
@@ -41,8 +44,8 @@ EVICTION_HEADROOM_PCT = 15
 # kubelet's eviction trigger (``nodefs.available<5%`` in
 # ``appliance/mkosi.extra/etc/rancher/k3s/config.yaml``). Checking it against
 # 15 % would refuse uploads that dip the node to, say, 10 % and recover without
-# ever evicting a pod. Keep in step with that config's ``evictionHard``.
-EVICTION_HARD_PCT = 5
+# ever evicting a pod. ``EVICTION_HARD_PCT`` is imported from
+# ``services/appliance/var_disk`` above, the single definition of the trigger.
 
 _MIB = 1024 * 1024
 

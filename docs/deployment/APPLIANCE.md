@@ -3189,6 +3189,57 @@ enough free space on /var". Free space by deleting unused upgrade images
 in Fleet, then retry. On a 15 GB `/var` that is about 2.25 GB of headroom
 on top of the image.
 
+Scheduling a slot upgrade on one appliance (Fleet → **Schedule OS
+upgrade**) applies the same rule to the node itself before anything is
+stamped: the node downloads the image onto its own `/var`, so the request
+is refused with a 422 naming the node and the numbers when its last
+reported `/var` reading (statvfs `f_bavail`, which is what the kubelet
+measures; `total - used` also counts ext4's 5% root reserve) would drop
+under 15% free. A node with no reading, or one older than 10 minutes, is
+not refused; the host runner's own check (rc 7) still applies.
+
+**Low-disk warning.** The alert is the default-on `appliance_disk_usage`
+rule (#2240; see the data-disk section above): a warning at 80% used and
+critical at 87%. This change adds no second alert. The Fleet drilldown
+(**Disk space**) and the Cluster → Overview node card show a finding from an
+evaluator that uses the same two lines in the same terms (and a test pins
+them equal), plus the kubelet's `DiskPressure` condition (critical), which
+those two screens can read and the alert, evaluated in the worker, cannot.
+
+**Cached images are cleaned up.** `spatium-upgrade-slot` removes its
+staged copy in `/var/lib/spatiumddi/slot-staging/` as soon as the slot
+write is over, success or failure (a failed run's copy was never reused:
+the next apply discards it before fetching). On the control plane, a
+periodic task (every 10 minutes, on the worker) deletes a stored upgrade
+image, audited as `appliance.upgrade_image_reclaimed`, once:
+
+- every appliance it applies to (same architecture, or either side
+  unlabelled), approved **or still pending approval**, *runs* its
+  version durably: installed, on a committed boot (durable default slot
+  = current slot, not a trial boot). A version that is only written to
+  the inactive slot does not count, because the node can still roll back
+  or the write was cancelled;
+- no node is scheduled to fetch it and no active rolling run names it;
+- it was uploaded more than an hour ago, or more than **7 days** ago when
+  nothing (no per-node schedule, no rolling run) ever named it, since such
+  an image was most likely uploaded ahead for a node not paired yet.
+
+The sweep takes the upgrade-image catalogue lock exclusively, the same lock
+scheduling takes shared from resolving the image until it commits, so an
+image cannot be deleted under a schedule that is being written. The row is
+deleted and committed before the bytes are removed. Re-import it from
+GitHub (or upload it again) to re-apply.
+
+**No swapfile.** Releases before #2400 created a 2 GiB
+`/var/lib/spatiumddi/swapfile` on first boot. Its `/etc/fstab` entry was
+written into the `/etc` overlay, which mounts after systemd has generated
+its units from the image's own `/etc/fstab`, so the swap was active until
+the first reboot and never again. `spatiumddi-firstboot` now deletes an
+inactive swapfile and its fstab line on boot and no longer creates one; an
+active one is left alone until a later boot. Memory sizing and the
+memory-eviction thresholds were calibrated on appliances that in practice
+ran without swap.
+
 **Two source modes for the upgrade image:**
 
 1. **Uploaded / imported image** (staged). Operator stages the image

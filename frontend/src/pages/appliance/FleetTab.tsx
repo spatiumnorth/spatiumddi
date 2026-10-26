@@ -68,6 +68,7 @@ import {
 import { heldByEviction, hostnamesBeingEvicted } from "@/lib/cluster-eviction";
 import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
+import { VarDiskWarning } from "./VarDiskWarning";
 import { AptTab } from "./AptTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
@@ -2706,6 +2707,17 @@ function ApplianceDrilldownModal({
           Object.keys(row.role_health ?? {}).length > 0 && (
             <ApplianceRoleHealthSection row={row} />
           )}
+
+        {row.state === "approved" && row.var_disk_finding && (
+          <div className="border-t pt-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Disk space
+            </h3>
+            <div className="mt-2">
+              <VarDiskWarning finding={row.var_disk_finding} />
+            </div>
+          </div>
+        )}
 
         {row.state === "approved" && <ApplianceStorageSection row={row} />}
 

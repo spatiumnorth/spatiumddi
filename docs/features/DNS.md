@@ -1418,6 +1418,19 @@ due together are queued a minute apart, at most 55 per sweep so each has run
 before the next sweep looks again; any beyond that go in the next hour,
 longest-overdue first.
 
+The list row shows a sync chip so a bad feed is visible without opening it:
+red when the last refresh failed (with how long ago it last worked), amber
+when no refresh has succeeded for more than 3 update intervals, grey when the
+feed has never synced. The default-on `dns_blocklist_feed_stale` alert (warning,
+one event per list) fires on the same 3-interval test, measured from the last
+*successful* refresh (`last_success_at`) or, for a feed that never succeeded,
+from its creation. Manual-only lists (interval `0`), disabled lists and
+hand-made (non-feed) lists never alert and show no `never synced` / `stale`
+chip; a failed last refresh still shows `sync failed` on any feed list.
+Assignment to a group is not a condition: an unassigned feed that stops
+refreshing alerts too. The alert text says only that the last refresh failed;
+the stored fetch error (which can quote the feed URL) stays in the list detail.
+
 #### Which feed URLs can be fetched?
 
 A feed URL is fetched by the control plane, so it goes through the same

@@ -142,6 +142,7 @@ import {
   zoneTransportOptions,
 } from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
+import { feedChip, FEED_CHIP_CLS } from "@/lib/blocklist-feed";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
 import {
@@ -10307,6 +10308,20 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         feed
                       </span>
                     )}
+                    {(() => {
+                      const chip = feedChip(l);
+                      return chip ? (
+                        <span
+                          className={cn(
+                            "inline-flex items-center rounded px-1.5 py-0.5 text-xs",
+                            FEED_CHIP_CLS[chip.tone],
+                          )}
+                          title={chip.title}
+                        >
+                          {chip.label}
+                        </span>
+                      ) : null;
+                    })()}
                     {!l.enabled && (
                       <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600">
                         disabled
