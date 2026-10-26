@@ -315,6 +315,10 @@ def _supervisor_version() -> str:
 # spamming the docker daemon every minute.
 _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
+# #2833 — while any service reads missing / starting the verdict is likely to
+# change within seconds (a pod coming up), so re-check this soon rather than
+# holding it for the full interval.
+_WATCHDOG_RECHECK_S = 20.0
 _cached_role_health: dict[str, Any] = {}
 
 # #285 Phase 5 — throttle for the warn-only etcd/peer-drift cross-check.
@@ -580,7 +584,12 @@ def _watchdog_check_due() -> bool:
     (#2808's first approved heartbeat) was due until 5 min after boot."""
     if _last_watchdog_at == 0.0:
         return True
-    return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
+    unsettled = any(
+        isinstance(e, dict) and e.get("status") in ("missing", "starting")
+        for e in _cached_role_health.values()
+    )
+    interval = _WATCHDOG_RECHECK_S if unsettled else _WATCHDOG_INTERVAL_S
+    return time.monotonic() - _last_watchdog_at >= interval
 
 
 # Phase 9 rewrite — the pre-Phase-9 drift detector (live nft -j
@@ -2022,6 +2031,9 @@ def _run_role_lifecycle(
         # the watchdog cache so the next heartbeat re-probes
         # immediately rather than rendering 5-min-stale health.
         _last_watchdog_at = 0.0
+        # #2833 — the chart is written but its pod is not up yet: the pass
+        # that is now due must read that as starting, not missing.
+        watchdog.note_apply()
         # Only stamp the hash on success — a failed apply should
         # re-attempt on the next heartbeat (the failure may have
         # been transient: image pull glitch, transient port
