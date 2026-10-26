@@ -59,7 +59,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import structlog
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -520,6 +520,18 @@ class SupervisorCapabilities(BaseModel):
     supervisor_version: str | None = None
 
 
+class SupervisorRoleRestore(BaseModel):
+    """The role assignment a re-registering control-plane node was serving
+    before its Fleet row went away (#2801), read back from its role env."""
+
+    roles: list[Annotated[str, Field(max_length=32)]] = Field(default_factory=list, max_length=8)
+    dns_group_name: str | None = Field(default=None, max_length=128)
+    dhcp_group_name: str | None = Field(default=None, max_length=128)
+    # The outcome of the node's last role apply (``ready`` / ``failed`` / …),
+    # recorded in the audit row so the restore says what the node reported.
+    last_apply_state: str | None = Field(default=None, max_length=32)
+
+
 class SupervisorRegisterRequest(BaseModel):
     pairing_code: str = Field(
         min_length=_CODE_LENGTH,
@@ -568,6 +580,10 @@ class SupervisorRegisterRequest(BaseModel):
         ]
         | None
     ) = None
+    # #2801 — sent by a control-plane supervisor re-registering after its
+    # Fleet row went away. Honoured only on a self-bootstrap (auto-approve)
+    # registration; see ``_restore_supervisor_roles``.
+    restore_roles: SupervisorRoleRestore | None = None
 
     @field_validator("pairing_code")
     @classmethod
@@ -1278,6 +1294,7 @@ async def supervisor_register(
     # render. Operator-typed pairing codes from the Fleet → Pairing
     # tab keep ``auto_approve=False`` so manual approval stays the
     # norm for any remote pairing.
+    restore_not_applied: str | None = None
     if code_row.auto_approve:
         await _approve_appliance_inline(db, appliance_row, approved_by_user_id=None)
         db.add(
@@ -1299,6 +1316,17 @@ async def supervisor_register(
                 },
             )
         )
+        if body.restore_roles is not None and body.restore_roles.roles:
+            if body.appliance_variant in _SELF_BOOTSTRAP_VARIANTS:
+                await _restore_supervisor_roles(
+                    db, appliance_row, body.restore_roles, client_ip=client_ip
+                )
+            else:
+                restore_not_applied = "not a control-plane registration"
+    elif body.restore_roles is not None and body.restore_roles.roles:
+        # An operator-typed code: the operator approves the node and assigns
+        # its roles; nothing the node sends grants it one.
+        restore_not_applied = "registration needs operator approval"
     db.add(
         PairingClaim(
             pairing_code_id=code_row.id,
@@ -1346,6 +1374,16 @@ async def supervisor_register(
                 "fingerprint": pubkey_fingerprint,
                 "supervisor_version": body.supervisor_version,
                 "paired_via_code_id": str(code_row.id),
+                **(
+                    {
+                        "roles_not_restored": {
+                            "roles": list(body.restore_roles.roles),
+                            "reason": restore_not_applied,
+                        }
+                    }
+                    if restore_not_applied is not None and body.restore_roles is not None
+                    else {}
+                ),
             },
         )
     )
@@ -1367,6 +1405,116 @@ async def supervisor_register(
         state=appliance_row.state,  # type: ignore[arg-type]
         public_key_fingerprint=pubkey_fingerprint,
         session_token=session_cleartext,
+    )
+
+
+async def _restore_supervisor_roles(
+    db: DB,
+    row: Appliance,
+    restore: SupervisorRoleRestore,
+    *,
+    client_ip: str | None,
+) -> None:
+    """Put back the roles a control-plane node was serving when its Fleet row
+    went away (#2801).
+
+    Only called for a self-bootstrap registration: the code was minted by the
+    local supervisor's host-token-gated call, which answers only while no live
+    appliance row exists, so this is the lone control-plane node coming back,
+    not a new box. The roles are the node's own record of its last assignment
+    (its role env, rewritten by every accepted heartbeat), so a role the
+    operator removed is not in it. Each role still passes the checks a Fleet
+    save applies to a NEW role (known service role, one DNS engine, its module
+    on); a group is restored by name only if it still exists and the
+    supervisor can use the name. Whatever is dropped is named in the audit
+    row, which records the restore either way.
+    """
+    from app.models.dhcp import DHCPServerGroup
+    from app.models.dns import DNSServerGroup
+    from app.services.feature_modules import is_module_enabled
+
+    dropped: dict[str, str] = {}
+    requested = list(dict.fromkeys(restore.roles))
+    roles: list[str] = []
+    for r in requested:
+        if r in _RESTORABLE_ROLES:
+            roles.append(r)
+        else:
+            dropped[r] = "not a service role"
+    dns_roles = [r for r in roles if r in _DNS_ROLES]
+    if len(dns_roles) > 1:
+        for r in dns_roles:
+            dropped[r] = "more than one DNS engine"
+        roles = [r for r in roles if r not in _DNS_ROLES]
+    if any(r in _DNS_ROLES for r in roles) and not await is_module_enabled(db, "core.dns"):
+        for r in roles:
+            if r in _DNS_ROLES:
+                dropped[r] = "the DNS module (core.dns) is disabled"
+        roles = [r for r in roles if r not in _DNS_ROLES]
+    if "dhcp" in roles and not await is_module_enabled(db, "core.dhcp"):
+        dropped["dhcp"] = "the DHCP module (core.dhcp) is disabled"
+        roles = [r for r in roles if r != "dhcp"]
+
+    groups_not_restored: dict[str, str] = {}
+    dns_group_id: uuid.UUID | None = None
+    if any(r in _DNS_ROLES for r in roles) and restore.dns_group_name:
+        dns_group = (
+            await db.execute(
+                select(DNSServerGroup).where(DNSServerGroup.name == restore.dns_group_name)
+            )
+        ).scalar_one_or_none()
+        if dns_group is None:
+            groups_not_restored["dns"] = f"no DNS server group named {restore.dns_group_name!r}"
+        elif group_name_problem("dns", dns_group.name) is not None:
+            groups_not_restored["dns"] = f"DNS server group name {dns_group.name!r} is unusable"
+        else:
+            dns_group_id = dns_group.id
+    dhcp_group_id: uuid.UUID | None = None
+    if "dhcp" in roles and restore.dhcp_group_name:
+        dhcp_group = (
+            await db.execute(
+                select(DHCPServerGroup).where(DHCPServerGroup.name == restore.dhcp_group_name)
+            )
+        ).scalar_one_or_none()
+        if dhcp_group is None:
+            groups_not_restored["dhcp"] = f"no DHCP server group named {restore.dhcp_group_name!r}"
+        elif group_name_problem("dhcp", dhcp_group.name) is not None:
+            groups_not_restored["dhcp"] = f"DHCP server group name {dhcp_group.name!r} is unusable"
+        else:
+            dhcp_group_id = dhcp_group.id
+
+    row.assigned_roles = roles
+    row.assigned_dns_group_id = dns_group_id
+    row.assigned_dhcp_group_id = dhcp_group_id
+    db.add(
+        AuditLog(
+            user_id=None,
+            user_display_name=row.hostname,
+            auth_source="self_bootstrap",
+            source_ip=client_ip,
+            action="appliance.roles_restored",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "roles": roles,
+                "dns_group_id": str(dns_group_id) if dns_group_id else None,
+                "dhcp_group_id": str(dhcp_group_id) if dhcp_group_id else None,
+                "source": "supervisor_last_assigned",
+                "requested_roles": requested,
+                "last_apply_state": restore.last_apply_state,
+                **({"dropped_roles": dropped} if dropped else {}),
+                **({"groups_not_restored": groups_not_restored} if groups_not_restored else {}),
+            },
+        )
+    )
+    logger.info(
+        "appliance_roles_restored",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        roles=roles,
+        dropped=dropped or None,
     )
 
 
@@ -4574,6 +4722,9 @@ _VALID_ROLES = {
     "custom",
 }
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
+# #2801 — the roles a re-registering control-plane node may get back: the ones
+# that run a service, i.e. what the supervisor's role env carries.
+_RESTORABLE_ROLES = _DNS_ROLES | {"dhcp", "looking-glass"}
 
 
 # #1715 / #1749 — the ownership matching (``_own_server_condition``,
