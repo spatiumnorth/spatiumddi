@@ -5769,8 +5769,10 @@ class ServerZoneStateEntry(BaseModel):
     # errored, disabled), so a serial it reported earlier is not evidence it
     # serves the zone now and it is never counted as in sync. ``paused``:
     # the operator put it in maintenance — excluded from the count and shown
-    # separately. ``counted`` is True only for ``ok``.
-    freshness: Literal["ok", "unreachable", "paused"] = "ok"
+    # separately. ``disabled`` (#2853): the operator disabled the server —
+    # excluded from the verdict like ``paused``.  ``counted`` is True only
+    # for ``ok``.
+    freshness: Literal["ok", "unreachable", "paused", "disabled"] = "ok"
     counted: bool = True
 
 
@@ -5849,8 +5851,10 @@ async def get_zone_server_state(
         current = int(st.current_serial) if st else None
         reported = st.reported_at if st else None
         pending = queued.get((srv.id, zone.name), 0)
-        freshness: Literal["ok", "unreachable", "paused"]
-        if srv.maintenance_mode:
+        freshness: Literal["ok", "unreachable", "paused", "disabled"]
+        if not srv.is_enabled:
+            freshness = "disabled"
+        elif srv.maintenance_mode:
             freshness = "paused"
         elif srv.status != "active":
             freshness = "unreachable"
@@ -5868,7 +5872,7 @@ async def get_zone_server_state(
                 counted=freshness == "ok",
             )
         )
-        if freshness == "paused":
+        if freshness in ("paused", "disabled"):
             continue
         if freshness == "unreachable":
             all_in_sync = False

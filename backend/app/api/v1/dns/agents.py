@@ -1090,7 +1090,9 @@ async def agent_heartbeat(
     await lock_heartbeat_ops(db, server.id, body.ops_ack, now)
     server.last_seen_at = now
     server.last_health_check_at = now
-    server.status = "active"
+    # #2853 — a disabled server stays ``disabled`` (the health task's verdict):
+    # its agent is still checking in, which is liveness, not re-enablement.
+    server.status = "active" if server.is_enabled else "disabled"
     if not displaced:
         # Capture the source IP so the operator can identify which host
         # this agent is running on — the operator-set ``host`` column is
