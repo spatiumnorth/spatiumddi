@@ -29,6 +29,7 @@ it resolved.
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -2702,6 +2703,27 @@ async def _matching_server_subjects(
 
 
 _SEVERITY_ORDER = ("info", "warning", "critical")
+
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def _message_numbers(message: str) -> tuple[str, list[str]]:
+    """Split a message into its digit-free skeleton and its numeric tokens."""
+    return _NUM_RE.sub("#", message), _NUM_RE.findall(message)
+
+
+def _compose_peak_and_now(peak: str, current: str) -> str:
+    """The message of an open event whose reading has moved off its peak (#2839)."""
+    if current == peak:
+        return peak
+    cur_skel, cur_nums = _message_numbers(current)
+    peak_skel, peak_nums = _message_numbers(peak)
+    if cur_skel == peak_skel and len(cur_nums) == len(peak_nums):
+        now = " / ".join(c for c, p in zip(cur_nums, peak_nums, strict=True) if c != p)
+    else:
+        now = current
+    return f"{peak} [now: {now}]"
 
 
 def _severity_rank(severity: str) -> int:
@@ -8161,6 +8183,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         existing.message = message
+                        existing.last_observed_value = {
+                            **(existing.last_observed_value or {}),
+                            "peak_message": message,
+                        }
                         ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
                         # stay flagged even if a later escalation skips it.
@@ -8173,6 +8199,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                             delivered_webhook += 1
                         if dm:
                             delivered_smtp += 1
+                    else:
+                        # #2839 — severity did not rise, but the reading may
+                        # have moved. The peak is the message stored when the
+                        # event fired or last escalated (severity is the only
+                        # measure of "worst" that holds for every rule type;
+                        # nothing is inferred from numbers). Show the current
+                        # reading beside it. Text only: delivery is triggered
+                        # above, by severity alone.
+                        lov = existing.last_observed_value or {}
+                        peak = lov.get("peak_message") or existing.message
+                        composed = _compose_peak_and_now(peak, message)
+                        if composed != existing.message or lov.get("peak_message") != peak:
+                            existing.message = composed
+                            existing.last_observed_value = {**lov, "peak_message": peak}
                     continue
                 event = AlertEvent(
                     rule_id=rule.id,

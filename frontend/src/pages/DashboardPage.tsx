@@ -4276,7 +4276,10 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
                       {humanTime(e.fired_at)}
                     </span>
                   </div>
-                  <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                  <p
+                    className="mt-0.5 truncate text-[11px] text-muted-foreground"
+                    title={e.message}
+                  >
                     {e.message}
                   </p>
                 </li>
