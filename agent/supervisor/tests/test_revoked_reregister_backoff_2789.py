@@ -3,8 +3,8 @@
 Since #2786 the main loop runs the revoke recovery while a control-plane node is
 revoked, and the recovery asks the in-cluster self-bootstrap for a fresh pairing code
 before it clears anything. The self-bootstrap refuses (409) while any live appliance
-row exists, so a node whose own row is still there (appliance registration switched
-off, say) was refused on every heartbeat tick. Each tick wrote and removed the
+row exists, so a node whose own row is still there (a row revoked but not deleted, or
+any node of a multi-node cluster, whose peers' rows stay live) was refused on every heartbeat tick. Each tick wrote and removed the
 self-bootstrap token file, POSTed ``/self-register-bootstrap`` and logged four info
 lines, for as long as the node stayed revoked.
 
@@ -188,16 +188,12 @@ def _asked_at(cp: _ControlPlane) -> list[float]:
     return [TICK_S * sent for sent in cp.bootstrap_at]
 
 
-def _switch_off(cp: _ControlPlane) -> None:
-    cp.registration_on = False
-
-
-def _switch_on(cp: _ControlPlane) -> None:
-    cp.registration_on = True
-
-
 def _revoke(cp: _ControlPlane) -> None:
     cp.rows[STALE] = "revoked"
+
+
+def _reauthorize(cp: _ControlPlane) -> None:
+    cp.rows[STALE] = "approved"
 
 
 def _delete(cp: _ControlPlane) -> None:
@@ -238,16 +234,17 @@ def test_a_reset_makes_the_next_attempt_due_at_once_and_starts_the_wait_over() -
 def test_a_revoked_node_with_a_live_row_backs_its_self_bootstrap_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Registration switched off: every heartbeat 404s and the node's own row stays
-    live, so every self-bootstrap is refused."""
+    """Revoked on the Fleet page but not deleted: every heartbeat is the marked
+    403 (#2798) and the node's own row stays live, so every self-bootstrap is
+    refused."""
     state_dir = tmp_path / "state"
     cp = _ControlPlane(new_ids=[FRESH])
     _registered_before(state_dir, cp)
 
-    logs = _run_main(monkeypatch, state_dir, cp, ticks=24, events={1: _switch_off})
+    logs = _run_main(monkeypatch, state_dir, cp, ticks=24, events={1: _revoke})
 
     # Ticks 2 and 3 are refused, and the second refusal revokes the node.
-    assert cp.statuses[:4] == [200, 404, 404, 404]
+    assert cp.statuses[:4] == [200, 403, 403, 403]
     # Tick 4 (90 s) asks; then a minute later, then two, then four, not every tick.
     assert _asked_at(cp) == [90.0, 150.0, 270.0, 510.0], (
         f"self-bootstrap asked at {_asked_at(cp)} s over {len(cp.statuses)} ticks"
@@ -270,7 +267,7 @@ def test_ticks_between_attempts_write_no_token_post_nothing_and_log_nothing(
     load_or_generate(state_dir)  # a node that restarted has its keypair already
     api = _Api(cp)
 
-    logs = _run_main(monkeypatch, state_dir, cp, ticks=24, events={1: _switch_off}, api=api)
+    logs = _run_main(monkeypatch, state_dir, cp, ticks=24, events={1: _revoke}, api=api)
 
     revoked_ticks = 24 - 3
     assert api.posts == 4, f"{api.posts} self-bootstrap POSTs in {revoked_ticks} revoked ticks"
@@ -297,13 +294,13 @@ def test_the_wait_starts_over_once_the_node_is_approved_again(
         state_dir,
         cp,
         ticks=18,
-        events={1: _switch_off, 11: _switch_on, 13: _switch_off},
+        events={1: _revoke, 11: _reauthorize, 13: _revoke},
     )
 
     # Revoked by tick 3's heartbeat, approved again by tick 12's, revoked again by
     # tick 15's. The second spell asks at its first revoked tick (450 s) and waits a
     # minute again, not the four the first spell had reached.
-    assert cp.statuses[11:15] == [200, 200, 404, 404]
+    assert cp.statuses[11:15] == [200, 200, 403, 403]
     assert _asked_at(cp) == [90.0, 150.0, 270.0, 450.0, 510.0]
     deferred = _events(logs, "supervisor.register.revoked_reregister_deferred")
     assert [e["retry_in_seconds"] for e in deferred] == [60.0, 120.0, 240.0, 60.0, 120.0]

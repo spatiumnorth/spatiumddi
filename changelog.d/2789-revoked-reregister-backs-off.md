@@ -5,8 +5,8 @@
   (#2789).** Since #2696 the running supervisor asks the
   self-bootstrap for a fresh code while the node is revoked. The
   self-bootstrap refuses while any live appliance row exists, so a
-  node whose own row was still there (appliance registration switched
-  off, for example) was refused on every heartbeat: each time it wrote
+  node whose own row was still there (revoked but not deleted, or any
+  node of a multi-node cluster) was refused on every heartbeat: each time it wrote
   and removed the self-bootstrap token file, called the api and logged
   four lines. An attempt that brings no code back now waits a minute
   before the next, doubling up to four minutes, and the wait starts
