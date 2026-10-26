@@ -185,7 +185,9 @@ export function PairingTab() {
       {/* #407 — registration gate. Surfaces + toggles
           ``supervisor_registration_enabled`` so an operator can enable
           appliance pairing from the UI instead of hand-editing the DB.
-          Generic Kubernetes/Helm control planes ship with it OFF. */}
+          Generic Kubernetes/Helm control planes ship with it OFF. It
+          gates new registrations only, never the heartbeat of an
+          appliance that is already registered (#2798). */}
       <div
         className={cn(
           "mb-4 rounded-md border p-3",
@@ -211,8 +213,8 @@ export function PairingTab() {
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
               {registrationEnabled === false
-                ? "New supervisors cannot pair while this is off — the register endpoint returns 404. Enable it before pairing an appliance."
-                : "Remote supervisors may register with a valid pairing code. Turn this off to refuse all new pairings."}
+                ? "New supervisors cannot pair while this is off — the register endpoint returns 404. Appliances already registered keep heartbeating and serving. Enable it before pairing an appliance."
+                : "Remote supervisors may register with a valid pairing code. Turn this off to refuse all new pairings; appliances already registered are not affected."}
             </p>
           </div>
           <button

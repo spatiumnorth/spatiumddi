@@ -63,7 +63,6 @@ class _ControlPlane:
 
     def __init__(self, new_ids: list[uuid.UUID]) -> None:
         self.rows: dict[uuid.UUID, str] = {}  # id -> "approved" | "revoked"
-        self.registration_on = True
         self.heartbeats: list[tuple[uuid.UUID, str | None]] = []
         self.statuses: list[int] = []
         self.bootstrap_calls = 0
@@ -110,9 +109,9 @@ class _ControlPlane:
         **_kwargs: Any,
     ) -> bool:
         self.heartbeats.append((appliance_id, session_token))
-        if not self.registration_on:
-            status = 404
-        elif self.rows.get(appliance_id) != "approved":
+        # Revoked or missing rows answer the marked 403 (#2798); the
+        # registration flag does not reach the heartbeat at all.
+        if self.rows.get(appliance_id) != "approved":
             status = 403
         else:
             status = 200
@@ -252,20 +251,21 @@ def test_running_supervisor_reregisters_when_its_row_goes_away(
 def test_identity_kept_while_the_control_plane_still_holds_a_live_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Registration switched off makes every heartbeat 404, which revokes the
-    node, but its row is still there and the self-bootstrap refuses (409). The
-    node must keep its identity so it is approved again, on the same row, as
-    soon as its heartbeats are accepted; discarding it first would leave it with
-    no identity and no code."""
+    """Revoked from the Fleet page, the node reads revoked, but its row is still
+    there and the self-bootstrap refuses (409). The node must keep its identity
+    so it is approved again, on the same row, as soon as it is re-authorized;
+    discarding it first would leave it with no identity and no code. (This
+    used to be driven by switching registration off, which answered every
+    heartbeat 404; since #2798 that no longer revokes anything.)"""
     state_dir = tmp_path / "state"
     cp = _ControlPlane(new_ids=[FRESH])
     _registered_before(state_dir, cp)
 
-    def switch_off(c: _ControlPlane) -> None:
-        c.registration_on = False
+    def revoke(c: _ControlPlane) -> None:
+        c.rows[STALE] = "revoked"
 
-    def switch_on(c: _ControlPlane) -> None:
-        c.registration_on = True
+    def reauthorize(c: _ControlPlane) -> None:
+        c.rows[STALE] = "approved"
 
     logs = _run_main(
         monkeypatch,
@@ -273,10 +273,10 @@ def test_identity_kept_while_the_control_plane_still_holds_a_live_row(
         cp,
         variant="control-plane",
         ticks=9,
-        events={1: switch_off, 6: switch_on},
+        events={1: revoke, 6: reauthorize},
     )
 
-    assert cp.statuses[:3] == [200, 404, 404]
+    assert cp.statuses[:3] == [200, 403, 403]
     # The recovery ran while revoked and was refused.
     assert cp.bootstrap_calls >= 1
     assert _events(logs, "supervisor.register.revoked_reregister_deferred")

@@ -18,6 +18,7 @@ from app.api.health import router as health_router
 from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
+from app.core.body_limit import RequestBodyLimitMiddleware
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
@@ -1009,8 +1010,9 @@ def create_app() -> FastAPI:
 
     # Middleware (outermost first). Note Starlette wraps in REVERSE add
     # order: the LAST-added middleware runs outermost. So the request
-    # flows in as TrustedHost → CORS → Prometheus → Maintenance →
-    # RequestContext, and the response unwinds the other way.
+    # flows in as RequestBodyLimit → TrustedProxy → TrustedHost → CORS →
+    # Prometheus → Maintenance → RequestContext, and the response unwinds
+    # the other way.
     app.add_middleware(RequestContextMiddleware)
 
     # Maintenance mode (issue #57). Added AFTER RequestContextMiddleware so
@@ -1078,6 +1080,11 @@ def create_app() -> FastAPI:
     # resolved values. uvicorn runs with --no-proxy-headers for this to see
     # the real peer (backend/Dockerfile).
     app.add_middleware(TrustedProxyMiddleware, trusted=settings.trusted_proxy_networks)
+
+    # #2780 — cap every request body. Added last so it runs outermost: an
+    # oversized body is refused (413) before any other middleware, route or
+    # dependency reads a byte of it. See app.core.body_limit.
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.max_request_body_bytes)
 
     # Routes
     app.include_router(health_router)

@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 from pyrad.client import Client
+from pyrad.client import Timeout as PyradTimeout
 from pyrad.dictionary import Dictionary
 from pyrad.packet import AccessAccept, AccessReject, AccessRequest
 
@@ -218,7 +219,9 @@ def authenticate_radius(
         try:
             reply = client.SendPacket(req)
             break  # got a response — don't fail over
-        except TimeoutError:
+        except (TimeoutError, PyradTimeout):
+            # pyrad raises its own ``Timeout`` (a plain Exception, not the
+            # builtin TimeoutError) when no datagram comes back.
             last_error = (
                 f"no reply from {host}:{port} after " f"{cfg.retries} retries × {cfg.timeout}s"
             )
@@ -229,7 +232,10 @@ def authenticate_radius(
             logger.warning("radius_target_unreachable", host=host, port=port, error=last_error)
             continue
         except Exception as exc:  # noqa: BLE001 — bad shared-secret → MAC mismatch
-            last_error = f"RADIUS protocol error from {host}:{port}: {exc}"
+            # Some pyrad exceptions stringify to "" — name the type so the
+            # reason is never blank.
+            reason = str(exc) or type(exc).__name__
+            last_error = f"RADIUS protocol error from {host}:{port}: {reason}"
             logger.warning("radius_target_protocol_error", host=host, port=port, error=last_error)
             continue
 

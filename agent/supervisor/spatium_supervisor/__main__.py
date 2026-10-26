@@ -33,7 +33,13 @@ import dataclasses
 from . import appliance_state, approval_state, cp_tls, self_bootstrap_token
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import _effective_control_plane_url, heartbeat_once, next_heartbeat_delay
+from .heartbeat import (
+    ROLE_ENV_FILENAME,
+    _effective_control_plane_url,
+    heartbeat_once,
+    next_heartbeat_delay,
+    read_lifecycle_state,
+)
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -53,6 +59,7 @@ from .register import (
     RegisterThrottled,
     register,
 )
+from .role_orchestrator import last_assigned_roles
 from .state import ensure_layout
 
 
@@ -154,8 +161,8 @@ def _self_bootstrap_or_skip(
 
 # #2789: how long the revoke recovery waits after an attempt that brought no fresh
 # pairing code back. The self-bootstrap refuses (409) while any live appliance row
-# exists, and a node whose own row is still there (registration switched off, or a
-# row revoked but not deleted) changes nothing by asking again a heartbeat later:
+# exists, and a node whose own row is still there (a row revoked but not deleted,
+# or any node of a multi-node cluster) changes nothing by asking again a heartbeat later:
 # each attempt writes and removes the self-bootstrap token file, holds the api
 # through its failure delay and logs four lines. So the next attempt waits a minute,
 # then two, then four, and every four minutes from then on. Four minutes caps the
@@ -234,6 +241,7 @@ def _maybe_register(
         )
 
     cached_appliance_id = load_appliance_id(cfg.state_dir)
+    restore_roles: dict[str, object] | None = None
     if cached_appliance_id is not None:
         # Issue #170 Wave E follow-up + #272 Phase 1 audit — revoke
         # recovery. If the supervisor flipped to
@@ -266,8 +274,7 @@ def _maybe_register(
                 # #2696: mint the new code BEFORE clearing anything. The
                 # self-bootstrap mints only while no live appliance row
                 # exists (409 otherwise). This node's own row can still be
-                # there: its heartbeats 404 while registration is switched
-                # off, and a revoked row stays until it is deleted. Clearing
+                # there: a revoked row stays until it is deleted. Clearing
                 # first would then leave the node with no identity and no
                 # code, and nothing could bring it back. Kept, it is approved
                 # again on its own row as soon as its heartbeats are accepted.
@@ -282,10 +289,19 @@ def _maybe_register(
                     )
                     return cfg
                 cfg = minted
+                # #2801 — the roles this node was serving, read back from its
+                # role env before the new registration can overwrite it. The
+                # lost row took the assignment with it; without this the node
+                # came back approved and serving nothing.
+                restore_roles = last_assigned_roles(
+                    cfg.state_dir / ROLE_ENV_FILENAME,
+                    read_lifecycle_state(cfg.state_dir)[0],
+                )
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
                 via_self_bootstrap=via_self_bootstrap,
+                restore_roles=(restore_roles or {}).get("roles", []),
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -334,6 +350,7 @@ def _maybe_register(
                 # waiting for the first heartbeat. None on docker / k8s
                 # supervisors (no role-config bind mount).
                 appliance_variant=appliance_state.detect_appliance_variant(),
+                restore_roles=restore_roles,
             )
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
@@ -533,7 +550,7 @@ def main() -> int:
             # process registered with earlier is spent, so the recovery asks
             # for a fresh one instead of presenting it again.
             # #2789: not on every tick. While a live row is left (this node's own,
-            # with registration switched off, or one revoked but not deleted) the
+            # revoked but not deleted, or a cluster peer's) the
             # self-bootstrap refuses, so an attempt that brought no code back
             # waits a minute, doubling to four, before the next.
             if reregister_retry.due():
