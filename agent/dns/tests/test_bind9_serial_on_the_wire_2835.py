@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import dns.flags
 import dns.message
 import dns.query
 import dns.rcode
@@ -29,6 +30,7 @@ import dns.update
 import pytest
 
 from spatium_dns_agent.drivers import bind9
+from spatium_dns_agent.drivers.base import SERIAL_UNREAD
 from spatium_dns_agent.drivers.bind9 import Bind9Driver, _soa_serial
 from tests.test_zone_render_over_updates import (
     ZONE,
@@ -43,10 +45,23 @@ ORIGIN = "lab.example.test."
 class _FakeNamed:
     """``dns.query.tcp`` against one zone, answering as BIND 9.20 does."""
 
-    def __init__(self, serial: int, *, signed: bool = False, refuse_soa: bool = False):
+    def __init__(
+        self,
+        serial: int,
+        *,
+        signed: bool = False,
+        refuse_soa: bool = False,
+        authoritative: bool = True,
+    ):
         self.serial = serial
         self.signed = signed
         self.refuse_soa = refuse_soa
+        self.authoritative = authoritative
+        # Things that happen to the zone just before our next update lands:
+        # a third-party RFC 2136 client's own update (+1), say.
+        self.before_next_update: list[Any] = []
+        self.fail_reads_after_update = False
+        self.queries: list[Any] = []
         self.updates: list[dns.update.UpdateMessage] = []
         self.sent_soas: list[list[int]] = []  # per update, as it was sent
 
@@ -59,7 +74,12 @@ class _FakeNamed:
         assert where == "127.0.0.1"
         if isinstance(q, dns.update.UpdateMessage):
             return self._update(q)
+        self.queries.append(q)
+        if self.fail_reads_after_update and self.updates:
+            raise ConnectionResetError(104, "Connection reset by peer")
         resp = dns.message.make_response(q)
+        if self.authoritative:
+            resp.flags |= dns.flags.AA
         # A signed zone answers with its signed serial, kept ahead of the raw.
         shown = self.serial + 7 if self.signed else self.serial
         resp.answer.append(
@@ -78,6 +98,8 @@ class _FakeNamed:
         return resp
 
     def _update(self, upd: dns.update.UpdateMessage) -> Any:
+        while self.before_next_update:
+            self.before_next_update.pop(0)(self)
         self.updates.append(upd)
         self.sent_soas.append(_soa_serials(upd))
         resp = dns.message.make_response(upd)
@@ -224,6 +246,7 @@ def test_the_agents_key_may_write_the_soa_under_update_policy() -> None:
             ],
         },
         "spatium-loop.",
+        grant_soa=True,
     )
     assert out.startswith("update-policy { grant spatium-loop. zonesub ANY; ")
 
@@ -345,3 +368,176 @@ def test_a_render_with_other_data_at_the_served_serial_still_moves(
     drv.swap_and_reload()
 
     assert _soa_serial(tmp_path / "rendered" / "zones" / f"{ZONE}.db") == 2026102606
+
+
+# ── review findings ──────────────────────────────────────────────────────────
+
+
+def test_a_third_party_update_between_read_and_write_is_reported_as_served(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A #641 client updates the zone after our SOA read: our serial is then
+    not later, named numbers ours itself, and THAT is what is reported."""
+    named = _FakeNamed(2026102600)
+    monkeypatch.setattr(dns.query, "tcp", named)
+
+    def third_party(n: _FakeNamed) -> None:
+        n.serial += 1  # 2026102601, the very serial our op carries
+
+    named.before_next_update.append(third_party)
+    driver.apply_record_op(_op(2026102601))
+
+    assert named.sent_soas == [[2026102601]]
+    assert named.serial == 2026102602
+    assert driver.reached_serial(ORIGIN) == 2026102602
+
+
+def test_a_dnssec_op_does_not_report_the_last_record_ops_serial(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = _FakeNamed(1)
+    monkeypatch.setattr(dns.query, "tcp", named)
+    monkeypatch.setattr(driver, "_dnssec_rollover", lambda op: None)
+
+    driver.apply_record_op(_op(2026102601))
+    assert driver.reached_serial(ORIGIN) == 2026102601
+    named.serial = 2026102603  # moved on since (a re-render, a third party)
+
+    driver.apply_record_op({"op_id": "r", "op": "dnssec_rollover", "zone_name": ORIGIN})
+    assert driver.reached_serial(ORIGIN) is None
+    for kind in ("dnssec_sign", "dnssec_unsign"):
+        driver.apply_record_op(_op(2026102601))
+        driver.apply_record_op({"op_id": kind, "op": kind, "zone_name": ORIGIN})
+        assert driver.reached_serial(ORIGIN) is None
+
+
+def test_a_serial_that_cannot_be_read_back_is_unread_not_the_target(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = _FakeNamed(1)
+    named.fail_reads_after_update = True
+    monkeypatch.setattr(dns.query, "tcp", named)
+
+    driver.apply_record_op(_op(2026102601))
+
+    assert named.sent_soas == [[2026102601]]
+    assert driver.reached_serial(ORIGIN) is SERIAL_UNREAD
+
+
+def test_the_soa_read_asks_for_no_recursion_and_needs_an_authoritative_answer(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolver-enabled named whose zone failed to load answers someone
+    else's SOA without AA. That is no read: no SOA is sent, nothing reported."""
+    named = _FakeNamed(1, authoritative=False)
+    monkeypatch.setattr(dns.query, "tcp", named)
+
+    driver.apply_record_op(_op(2026102601))
+
+    assert all(not (q.flags & dns.flags.RD) for q in named.queries)
+    assert named.sent_soas == [[]]
+    assert driver.reached_serial(ORIGIN) is SERIAL_UNREAD
+    bundle = {"zones": [{"name": ORIGIN, "type": "primary", "serial": 2026102601}]}
+    assert driver.served_zone_serials(bundle) == {}
+
+
+def test_a_refused_soa_is_not_tried_again_until_the_next_render(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    named = _FakeNamed(3, refuse_soa=True)
+    monkeypatch.setattr(dns.query, "tcp", named)
+
+    driver.apply_record_op(_op(2026102601))
+    driver.apply_record_op(_op(2026102602, name="mail"))
+
+    assert named.sent_soas == [[2026102601], [], []], "one message for the second op"
+    driver.render({"options": {}, "tsig_keys": [], "zones": []})
+    named.refuse_soa = False
+    driver.apply_record_op(_op(2026102603, name="ftp"))
+    assert named.sent_soas[-1] == [2026102603]
+
+
+# ── only the product's own key may write the SOA ─────────────────────────────
+
+_GROUP_KEY = {
+    "name": "spatium-loop.",
+    "secret": "c2VjcmV0c2VjcmV0",
+    "algorithm": "hmac-sha256",
+    "loopback": True,
+}
+_OPERATOR_KEY = {
+    "name": "aaa-ops.",
+    "secret": "b3BzLXhmZXI=",
+    "algorithm": "hmac-sha256",
+}
+
+
+def _policy_render(tmp_path: Path, keys: list[dict[str, Any]]) -> str:
+    bundle = {
+        "options": {
+            "forwarders": [],
+            "allow_query": ["any"],
+            "allow_transfer": ["none"],
+        },
+        "tsig_keys": keys,
+        "zones": [
+            {
+                "name": ORIGIN,
+                "type": "primary",
+                "serial": 2026102601,
+                "records": [],
+                "dynamic_update_enabled": True,
+                "update_acl": [
+                    {
+                        "action": "grant",
+                        "match_kind": "tsig_key",
+                        "tsig_key_name": "aaa-ops.",
+                        "record_types": ["A"],
+                    }
+                ],
+            }
+        ],
+    }
+    Bind9Driver(state_dir=tmp_path).render(bundle)
+    return (tmp_path / "rendered.new" / "named.conf").read_text()
+
+
+def test_the_group_key_is_granted_any(tmp_path: Path) -> None:
+    conf = _policy_render(tmp_path, [_GROUP_KEY, _OPERATOR_KEY])
+    assert "grant spatium-loop. zonesub ANY;" in conf
+    assert "grant aaa-ops. zonesub A;" in conf
+
+
+def test_an_operator_key_standing_in_as_loopback_keeps_its_grant(
+    tmp_path: Path,
+) -> None:
+    """No group key: ``tsig_keys[0]`` is an operator key external clients
+    hold, and it must not gain SOA and NS."""
+    conf = _policy_render(tmp_path, [_OPERATOR_KEY])
+    assert "grant aaa-ops. zonesub;" in conf
+    assert "ANY" not in conf
+
+
+def test_the_sync_loop_reports_nothing_for_an_unread_serial(tmp_path: Path) -> None:
+    """``SERIAL_UNREAD`` drops the zone from the report instead of falling
+    back to the op's target; another zone in the same pass is reported."""
+    from tests import test_zone_state_after_ops as zs
+
+    class _Unread(zs._Driver):
+        def reached_serial(self, zone_name: str) -> object:
+            return SERIAL_UNREAD if zone_name.startswith("a.") else 2026100107
+
+    zs.ensure_layout(tmp_path)
+    driver = _Unread(tmp_path)
+    loop = zs.SyncLoop(zs._Cfg(tmp_path), ["tok"], driver, zs._Heartbeat())
+    loop._current_structural_etag = zs.STRUCTURAL
+    cp = zs._ControlPlane()
+    loop._client = lambda: cp  # type: ignore[method-assign]
+    cp.bundle = zs._bundle(
+        "e1", [zs._op("o1", "a.test.", 2026100105), zs._op("o2", "b.test.", 2026100107)]
+    )
+
+    loop._poll_once()
+
+    assert driver.applied == ["o1", "o2"]
+    assert cp.zone_state == [[{"zone_name": "b.test", "serial": 2026100107}]]

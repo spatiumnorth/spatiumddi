@@ -28,6 +28,7 @@ from typing import Any, NamedTuple
 import structlog
 
 try:
+    import dns.flags
     import dns.message
     import dns.name
     import dns.query
@@ -50,7 +51,7 @@ from ._process import (
     wait_for_daemon,
 )
 from ._txt import quote_txt as _quote_txt
-from .base import RRSET_OP_KINDS, DriverBase, HeldZone
+from .base import RRSET_OP_KINDS, SERIAL_UNREAD, DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
@@ -533,7 +534,9 @@ def _zone_needs_update_policy(zone: dict[str, Any]) -> bool:
     return False
 
 
-def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> str:
+def _render_update_policy(
+    zone: dict[str, Any], group_key_name: str | None, *, grant_soa: bool = False
+) -> str:
     """Build the ``update-policy { ... };`` clause for a fine-grained zone.
 
     TSIG-identity only (IP entries can't be expressed and are rejected at the
@@ -545,10 +548,14 @@ def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> s
     """
     lines: list[str] = []
     if group_key_name:
-        # ``ANY``: with no type list BIND grants every type EXCEPT RRSIG, NS,
-        # SOA, NSEC and NSEC3, which refused the SOA a record op carries to
-        # set the serial (#2835) and an apex NS record op outright.
-        lines.append(f"grant {group_key_name} zonesub ANY;")
+        # ``grant_soa`` (#2835): with no type list BIND grants every type
+        # EXCEPT RRSIG, NS, SOA, NSEC and NSEC3, which refuses the SOA a
+        # record op carries to set the serial (and an apex NS op outright).
+        # ``ANY`` is granted only when the loopback key is the product's own
+        # group key: in a group without one, ``tsig_keys[0]`` is an operator
+        # key external clients hold, and it keeps exactly the grant it had.
+        types = " ANY" if grant_soa else ""
+        lines.append(f"grant {group_key_name} zonesub{types};")
     for e in zone.get("update_acl") or []:
         if e.get("match_kind") != "tsig_key" or not e.get("tsig_key_name"):
             continue
@@ -2176,6 +2183,8 @@ class Bind9Driver(DriverBase):
 
     def render(self, bundle: dict[str, Any]) -> None:
         self._skipped_records = set()
+        # A new render may grant the SOA where the last one did not (#2835).
+        self._soa_refused_zones: set[str] = set()
         try:
             self._render(bundle)
         finally:
@@ -2241,6 +2250,9 @@ class Bind9Driver(DriverBase):
 
         tsig_keys = _dedupe_key_names(_renderable_tsig_keys(bundle.get("tsig_keys") or []))
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
+        # #2835 — the control plane marks its own group key; only that one
+        # may write the SOA under ``update-policy``.
+        loopback_owned = bool(tsig_keys and tsig_keys[0].get("loopback"))
         # Derived from ``state_dir``, not hardcoded (#920). AGENT_STATE_DIR is
         # an honoured override and every other path the config points at —
         # zone files, rndc.key, the DoT/DoH cert — is already built from it.
@@ -2427,7 +2439,9 @@ class Bind9Driver(DriverBase):
             # Coarse allow-update (IP + TSIG) unless the ACL needs the
             # fine-grained update-policy path (name-scope / per-type / deny).
             if _zone_needs_update_policy(zone):
-                update_clause = _render_update_policy(zone, tsig_key_name)
+                update_clause = _render_update_policy(
+                    zone, tsig_key_name, grant_soa=loopback_owned
+                )
             else:
                 update_clause = _render_allow_update(zone, tsig_key_name)
             # Transfer policy (issues #641 + #734). The key grant that makes
@@ -4071,6 +4085,12 @@ class Bind9Driver(DriverBase):
         # zone's dnssec_enabled flip already reshaped the bundle + triggered a
         # reload. A manual rollover is the one thing that needs an rndc call.
         op_kind = op.get("op")
+        # #2835 — forget what the last op left this zone at before anything
+        # else, DNSSEC ops included: the sync loop asks ``reached_serial``
+        # after every op, and a value left from an earlier one is stale.
+        self._op_reached_map().pop(
+            str(op.get("zone_name") or "").rstrip(".").lower(), None
+        )
         if op_kind == "dnssec_rollover":
             return self._dnssec_rollover(op)
         if op_kind in ("dnssec_sign", "dnssec_unsign"):
@@ -4197,10 +4217,11 @@ class Bind9Driver(DriverBase):
         target = op.get("target_serial")
         has_target = isinstance(target, int) and not isinstance(target, bool)
         key = zone.rstrip(".").lower()
-        reached = self._op_reached_map()
-        reached.pop(key, None)
-        set_serial = False
-        if has_target:
+        refused = getattr(self, "_soa_refused_zones", None)
+        if refused is None:
+            refused = self._soa_refused_zones = set()
+        soa_rrset = None
+        if has_target and key not in refused:
             soa, soa_ttl, serving = self._served_soa(zone)
             if soa is not None and serving is not None and _serial_later(target, serving):
                 upd.add(
@@ -4211,17 +4232,17 @@ class Bind9Driver(DriverBase):
                     f"{soa.refresh} {soa.retry} {soa.expire} {soa.minimum}",
                 )
                 soa_rrset = upd.update[-1]
-                set_serial = True
         resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
         rcode = resp.rcode()
-        if set_serial and rcode == 5:  # REFUSED
-            # A fine-grained zone (``update-policy``) whose live config still
-            # grants the agent's key the default type list, which leaves out
-            # SOA, until the next render grants it ``ANY``. The records still
-            # land; named numbers them itself, as before #2835.
+        if soa_rrset is not None and rcode == 5:  # REFUSED
+            # A fine-grained zone (``update-policy``) whose loopback key may
+            # not write the SOA: the live config predates the ``ANY`` grant,
+            # or the key is an operator's (no group key, so no ``ANY``). The
+            # records still land; named numbers them itself, as before #2835.
+            # Not tried again for this zone until the next render.
             log.info("bind9_record_op_soa_refused", zone=zone)
+            refused.add(key)
             upd.update.remove(soa_rrset)
-            set_serial = False
             resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
             rcode = resp.rcode()
         if rcode != 0:  # NOERROR
@@ -4229,33 +4250,33 @@ class Bind9Driver(DriverBase):
                 f"nsupdate returned rcode={rcode} "
                 f"(zone={zone} op={op['op']} name={name} type={rtype})"
             )
-        if set_serial:
-            # named took the message whole, so it serves ``target`` now.
-            reached[key] = int(target)
-        elif has_target:
-            # It numbered this one itself: report what it serves, not ours.
+        if has_target:
+            # Read back, never assumed from what was sent: a third-party
+            # update landing between the read above and this update makes
+            # our SOA "not later" and named numbers it itself. What it
+            # serves is what is reported; unread is reported as nothing.
             _soa, _ttl, served = self._served_soa(zone)
-            if served is not None:
-                reached[key] = served
+            self._op_reached_map()[key] = served if served is not None else SERIAL_UNREAD
         # Explicit None so the record-op path matches the dict|None return
         # type the DNSSEC branches use (no implicit fall-through).
         return None
 
-    def _op_reached_map(self) -> dict[str, int]:
+    def _op_reached_map(self) -> dict[str, object]:
         reached = getattr(self, "_op_reached", None)
         if reached is None:
             reached = self._op_reached = {}
         return reached
 
-    def reached_serial(self, zone_name: str) -> int | None:
-        """The serial named serves ``zone_name`` at after the last record op,
-        or None when it could not be read (#2835).
+    def reached_serial(self, zone_name: str) -> object:
+        """The serial named serves ``zone_name`` at after the last op (#2835).
 
         The sync loop reports this instead of the op's ``target_serial``.
         Usually the two are the same number, since the op carries the serial
-        into named (``apply_record_op``); when the op's serial was not later
-        than the one named served, named numbered the change itself and this
-        is that number."""
+        into named (``apply_record_op``); when it did not (its serial was not
+        later, or the SOA was refused), named numbered the change itself and
+        this is that number. ``SERIAL_UNREAD`` when it could not be read
+        back, so nothing is reported; None when the op carried no serial
+        (a DNSSEC op), so nothing is reported either."""
         return self._op_reached_map().get(zone_name.rstrip(".").lower())
 
     def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
@@ -4308,8 +4329,12 @@ class Bind9Driver(DriverBase):
         signed = False
         try:
             q = dns.message.make_query(zone, "SOA", want_dnssec=True)
+            # No recursion, and only an authoritative answer counts: a
+            # resolver-enabled named whose zone failed to load would
+            # otherwise answer with someone else's SOA.
+            q.flags &= ~dns.flags.RD
             r = dns.query.tcp(q, "127.0.0.1", timeout=_SOA_READ_TIMEOUT_S)
-            if r.rcode() == 0:
+            if r.rcode() == 0 and r.flags & dns.flags.AA:
                 origin = dns.name.from_text(zone)
                 for rrset in r.answer:
                     if rrset.name != origin:

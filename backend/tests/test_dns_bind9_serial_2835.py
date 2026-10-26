@@ -101,3 +101,35 @@ async def test_a_bind9_zone_reads_in_sync_only_at_the_serial_named_serves(
     await _report(client, db_session, server, [(str(zone["name"]), target)])
     state = await _in_sync(client, headers, grp_id, zone_id)
     assert state["in_sync"] is True
+
+
+@pytest.mark.asyncio
+async def test_only_the_group_key_is_marked_as_the_agents_own(db_session: AsyncSession) -> None:
+    """The BIND9 agent grants the SOA (``zonesub ANY``) only to a key marked
+    ``loopback``: the product's own group key, never an operator key that
+    external clients hold — which is ``tsig_keys[0]`` in a group without one."""
+    from app.core.crypto import encrypt_str
+    from app.models.dns import DNSTSIGKey
+    from app.services.dns.tsig import ensure_group_tsig_key
+
+    grp, server = await _group_with_server(db_session)
+    db_session.add(
+        DNSTSIGKey(
+            group_id=grp.id,
+            name="aaa-ops.",
+            algorithm="hmac-sha256",
+            secret_encrypted=encrypt_str("b3BzLXhmZXI="),
+        )
+    )
+    await db_session.flush()
+
+    bundle = await build_config_bundle(db_session, server)
+    assert [k.get("loopback", False) for k in bundle["tsig_keys"]] == [False]
+
+    ensure_group_tsig_key(grp)
+    await db_session.flush()
+    bundle = await build_config_bundle(db_session, server)
+    assert [(k["name"], k.get("loopback", False)) for k in bundle["tsig_keys"]] == [
+        (grp.tsig_key_name, True),
+        ("aaa-ops.", False),
+    ]

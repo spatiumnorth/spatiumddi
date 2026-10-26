@@ -49,7 +49,7 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
-from .drivers.base import DriverBase, HeldZone
+from .drivers.base import SERIAL_UNREAD, DriverBase, HeldZone
 from .fetch import get_config
 from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch, is_oom_status
@@ -1204,7 +1204,11 @@ class SyncLoop:
                 actual_hook = getattr(self.driver, "reached_serial", None)
                 if callable(actual_hook):
                     actual = actual_hook(str(op.get("zone_name") or ""))
-                    if isinstance(actual, int) and not isinstance(actual, bool):
+                    if actual is SERIAL_UNREAD:
+                        # Applied, but what it serves is unknown: say nothing
+                        # rather than claim the op's target (#2835).
+                        reached.pop(_zone_key(op.get("zone_name")), None)
+                    elif isinstance(actual, int) and not isinstance(actual, bool):
                         reached[_zone_key(op.get("zone_name"))] = actual
                 # PowerDNS DNSSEC ops return the DS rrset so we can ship
                 # it back to the control plane in one batched POST below.

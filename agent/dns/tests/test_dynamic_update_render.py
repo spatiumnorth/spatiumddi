@@ -182,7 +182,7 @@ def test_render_update_policy_grammar_and_loopback_and_ip_skip() -> None:
     }
     out = _render_update_policy(zone, "spatium-loop.")
     assert out.startswith("update-policy { ")
-    assert "grant spatium-loop. zonesub ANY;" in out  # loopback grant kept
+    assert "grant spatium-loop. zonesub;" in out  # loopback grant kept
     assert "grant dc01. subdomain wks.example.com. A AAAA;" in out
     assert "grant dhcp01. zonesub PTR;" in out
     assert "deny dc01. name _locked.example.com.;" in out
