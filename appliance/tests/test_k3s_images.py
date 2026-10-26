@@ -33,6 +33,7 @@ HOW TO RUN (from the repo root or this directory):
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -64,6 +65,27 @@ TARBALLS = {
     ),
 }
 OLD = 1_760_000_000  # every tarball's mtime at the start-up import
+MIB = 1024 * 1024
+# #2788: what a node ran on the release before TAG. containerd unpacked these
+# when the kubelet started them; pause is the same image in both releases.
+OLD_TAG = "2026.10.05-1"
+RAN = (
+    f"ghcr.io/spatiumnorth/dhcp-kea:{OLD_TAG}",
+    f"ghcr.io/spatiumnorth/dns-bind9:{OLD_TAG}",
+    "docker.io/rancher/mirrored-pause:3.10.2",
+    "docker.io/rancher/mirrored-coredns-coredns:1.14.5",
+)
+# ...so these are what the tag move would have the kubelet unpack on it
+NEW = [
+    f"ghcr.io/spatiumnorth/dhcp-kea:{TAG}",
+    f"ghcr.io/spatiumnorth/dns-bind9:{TAG}",
+    "docker.io/rancher/mirrored-coredns-coredns:1.14.6",
+]
+
+
+def _digest(ref: str) -> str:
+    """The target digest FakeK3s gives an image."""
+    return "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
 
 
 def _rfc3339(epoch: float) -> str:
@@ -89,7 +111,13 @@ class FakeK3s:
     ``<proc>/<pid>/fd/<n>`` symlink names it, which is what k3s's open file
     looks like in /proc (#2109). The cache entry records the file as it was
     when its import began, so a tarball touched mid-import is imported again
-    once this import ends, as k3s does."""
+    once this import ends, as k3s does.
+
+    For ``unpack`` (#2788) it also plays ``k3s ctr``'s image list and check
+    and its snapshot unpack against containerd's snapshotter, and /var's
+    fill: unpacking an image takes ``unpack_s[ref]`` seconds and writes
+    ``unpack_mib[ref]`` MiB. An unpack listed in ``unpack_fails`` fails, and
+    takes containerd down for ``restart_s`` seconds, as a k3s restart does."""
 
     PID = "4242"
 
@@ -116,6 +144,17 @@ class FakeK3s:
         self.current: list | None = None  # [name, seconds left, mtime it started on]
         self.done_at: dict[str, float] = {}
         self._seen: dict[str, float] = {}
+        self.unpacked: set[str] = set()
+        self.unpack_s: dict[str, float] = {}
+        self.unpack_mib: dict[str, int] = {}
+        self.unpack_fails: dict[str, int] = {}
+        self.restart_s = 0.0
+        self.back_at = 0.0
+        self.disk_total = 20 * 1024 * MIB
+        self.disk_used = 10 * 1024 * MIB
+        self.ctr_calls: list[tuple[str, ...]] = []
+        self.unpacked_at: dict[str, float] = {}
+        self.slept: list[float] = []
         for name, (_, index) in TARBALLS.items():
             p = self.images_dir / name
             p.write_bytes(name.encode() * 100)
@@ -216,7 +255,60 @@ class FakeK3s:
         return self.kubelet_at is not None and self.clock >= self.kubelet_at
 
     def present(self):
-        return None if self.down else set(self.store)
+        return None if self.down or self.clock < self.back_at else set(self.store)
+
+    # ── containerd's snapshotter, for unpack (#2788) ──
+
+    def ran(self, *refs: str) -> None:
+        self.store.update(refs)
+        self.unpacked.update(refs)
+
+    def ctr(self, *args: str, timeout: float = 60.0):
+        self.ctr_calls.append(args)
+        if self.present() is None:
+            return None
+
+        def answer(rc: int = 0, out: str = "", err: str = ""):
+            return subprocess.CompletedProcess(["k3s", "ctr", "-n", "k8s.io", *args], rc, out, err)
+
+        if args == ("images", "check", "-q", "--snapshotter", "overlayfs"):
+            return answer(out="".join(f"{ref}\n" for ref in sorted(self.unpacked & self.store)))
+        if args == ("images", "ls"):
+            # ctr's own layout: REF TYPE DIGEST SIZE PLATFORMS LABELS, the
+            # size in two words
+            rows = ["REF TYPE DIGEST SIZE PLATFORMS LABELS"] + [
+                f"{ref} application/vnd.oci.image.manifest.v1+json {_digest(ref)} 116.9 MiB "
+                "linux/amd64 io.cattle.k3s.pinned=pinned,io.cri-containerd.image=managed"
+                for ref in sorted(self.store)
+            ]
+            return answer(out="".join(f"{row}\n" for row in rows))
+        assert args[:5] == ("snapshots", "unpack", "--sync-fs", "--snapshotter", "overlayfs"), args
+        ref = self.by_digest()[args[5]]
+        if self.unpack_fails.get(ref):
+            self.unpack_fails[ref] -= 1
+            self.back_at = self.clock + self.restart_s
+            return answer(1, err='ctr: failed to dial "/run/k3s/containerd/containerd.sock": '
+                                 "connection refused\n")
+        self.tick(self.unpack_s.get(ref, 1.0))
+        if ref not in self.unpacked:
+            self.disk_used += self.unpack_mib.get(ref, 100) * MIB
+        self.unpacked.add(ref)
+        self.unpacked_at[ref] = self.clock
+        return answer(out=f"unpacking {args[5]} (application/vnd.oci.image.manifest.v1+json)...done\n")
+
+    def by_digest(self) -> dict[str, str]:
+        return {_digest(ref): ref for ref in self.store}
+
+    def disk(self):
+        return self.disk_used, (self.disk_total - self.disk_used) / self.disk_total
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.tick(seconds)
+
+    def unpacks(self) -> list[str]:
+        """The images ``unpack`` asked containerd to unpack, in order."""
+        return [self.by_digest()[c[5]] for c in self.ctr_calls if c[:2] == ("snapshots", "unpack")]
 
 
 @pytest.fixture()
@@ -235,6 +327,23 @@ def k3s(tmp_path, monkeypatch) -> FakeK3s:
 
 def _verify(k3s: FakeK3s, *args: str) -> int:
     return k3s.mod.main(["verify", "--repair-wait", "0", *args])
+
+
+@pytest.fixture()
+def unpacking(k3s: FakeK3s, monkeypatch) -> FakeK3s:
+    monkeypatch.setattr(k3s.mod, "_ctr", k3s.ctr)
+    monkeypatch.setattr(k3s.mod, "disk_usage", k3s.disk)
+    monkeypatch.setattr(k3s.mod, "_sleep", k3s.sleep)
+    return k3s
+
+
+@pytest.fixture()
+def upgraded(unpacking: FakeK3s) -> FakeK3s:
+    """A node that ran the release before TAG, just rebooted into TAG's
+    slot: k3s imported the new tarballs and the kubelet answers."""
+    unpacking.booted()
+    unpacking.ran(*RAN)
+    return unpacking
 
 
 # ── clear-ingests ────────────────────────────────────────────────────────────
@@ -650,3 +759,237 @@ def test_a_fractional_mtime_is_not_counted_as_imported(k3s: FakeK3s) -> None:
     assert k3s.mod.imported(p, k3s.mod.read_import_cache()[p.name]) is False
     os.utime(p, ns=(OLD * 10**9, OLD * 10**9))
     assert k3s.mod.imported(p, k3s.mod.read_import_cache()[p.name]) is True
+
+
+# ── #2788: the slot's new images, unpacked in the node's own turn ────────────
+#
+# k3s's import leaves an image packed, and containerd unpacks it when the
+# kubelet starts its first container from it. A rolling upgrade moves the
+# shared image tags on every node at once when its last node is done
+# (#1710), so every node unpacked 1-2 GB together on the /var etcd's WAL is
+# on, and on a shared disk a kube-scheduler lease ran out and k3s exited.
+# ``unpack`` does that work right after the node's reboot, in its own turn.
+
+UNPACK_UNIT = APPLIANCE / "mkosi.extra" / "etc" / "systemd" / "system" / "spatiumddi-image-unpack.service"
+
+
+def _unpack(k3s: FakeK3s, *args: str) -> int:
+    return k3s.mod.main(["unpack", *args])
+
+
+def test_unpack_unpacks_the_new_release_of_every_image_this_node_runs(upgraded: FakeK3s, capsys) -> None:
+    assert _unpack(upgraded) == 0
+
+    assert upgraded.unpacks() == NEW, "unpacked something other than the new release of what this node runs"
+    assert set(NEW) <= upgraded.unpacked
+    out = capsys.readouterr().out
+    assert f"unpacking 3 image(s), at most 32 MiB/s: {', '.join(NEW)}" in out
+    assert f"unpacked ghcr.io/spatiumnorth/dns-bind9:{TAG}: 100 MiB in 1.0s" in out
+    assert "unpacked 3 image(s), 300 MiB, in" in out
+
+
+def test_unpack_leaves_alone_an_image_this_node_never_ran(upgraded: FakeK3s) -> None:
+    # a DNS-only node: the kubelet never started the DHCP agent here, and the
+    # tag move will not start it either
+    upgraded.unpacked.discard(f"ghcr.io/spatiumnorth/dhcp-kea:{OLD_TAG}")
+
+    assert _unpack(upgraded) == 0
+
+    assert f"ghcr.io/spatiumnorth/dhcp-kea:{TAG}" not in upgraded.unpacks()
+    assert f"ghcr.io/spatiumnorth/dhcp-kea:{TAG}" not in upgraded.unpacked
+
+
+def test_unpack_runs_containerds_own_unpack_with_its_layers_synced_and_mounts_nothing(
+    upgraded: FakeK3s,
+) -> None:
+    assert _unpack(upgraded) == 0
+
+    unpacks = [c for c in upgraded.ctr_calls if c[0] == "snapshots"]
+    assert unpacks == [("snapshots", "unpack", "--sync-fs", "--snapshotter", "overlayfs", _digest(ref))
+                       for ref in NEW]
+    # containerd 2.3's ``ctr images mount`` activates its mount under the
+    # target's name and ``ctr images unmount`` leaves that in place, so the
+    # next image mounted at the same target failed "already exists"
+    assert not [c for c in upgraded.ctr_calls if c[:2] in (("images", "mount"), ("images", "unmount"))]
+
+
+def test_unpack_names_each_image_by_the_digest_ctr_lists_for_it(k3s: FakeK3s, monkeypatch) -> None:
+    # verbatim from ``k3s ctr -n k8s.io images ls`` on a node (labels cut)
+    listing = (
+        "REF                                              TYPE                                       DIGEST"
+        "                                                                  SIZE      PLATFORMS   LABELS\n"
+        "ghcr.io/spatiumnorth/dns-bind9:nightly-20261024  application/vnd.oci.image.manifest.v1+json "
+        "sha256:b96cc310713a01d3dd15b8ec606871090c5b190c7c9bbd672983d354b0fcea25 116.9 MiB linux/amd64 "
+        "io.cattle.k3s.pinned=pinned\n"
+    )
+    monkeypatch.setattr(
+        k3s.mod, "_ctr", lambda *args, timeout=60.0: subprocess.CompletedProcess(args, 0, listing, "")
+    )
+    assert k3s.mod.image_targets() == {
+        "ghcr.io/spatiumnorth/dns-bind9:nightly-20261024":
+            "sha256:b96cc310713a01d3dd15b8ec606871090c5b190c7c9bbd672983d354b0fcea25",
+    }
+
+
+@pytest.mark.parametrize("unpacked", [False, True], ids=["fresh-install", "second-boot"])
+def test_unpack_has_nothing_to_do_on_a_fresh_install_or_once_it_is_done(
+    unpacking: FakeK3s, unpacked: bool, capsys
+) -> None:
+    unpacking.booted()
+    if unpacked:
+        unpacking.ran(*RAN, *NEW)
+
+    assert _unpack(unpacking) == 0
+
+    assert unpacking.unpacks() == []
+    assert "nothing to unpack: every image this node runs is unpacked" in capsys.readouterr().out
+
+
+def test_unpack_waits_for_k3s_start_up_import_to_end(unpacking: FakeK3s) -> None:
+    unpacking.ran(*RAN)
+    unpacking.booting(dns_bind9=40, k3s_airgap_images_amd64=30)
+
+    assert _unpack(unpacking) == 0
+
+    imported = max(unpacking.done_at.values())
+    assert imported >= 70
+    assert min(unpacking.unpacked_at[ref] for ref in NEW) > imported, (
+        "unpacked while k3s was still importing the slot's images"
+    )
+
+
+def test_unpack_is_paced_at_the_upgrades_own_rate(upgraded: FakeK3s) -> None:
+    for ref in NEW:
+        upgraded.unpack_mib[ref] = 64
+        upgraded.unpack_s[ref] = 0.5
+
+    assert _unpack(upgraded) == 0
+
+    # 64 MiB at 32 MiB/s is 2 s an image; it took 0.5 s, so 1.5 s after each
+    # but the last
+    assert upgraded.slept == [1.5, 1.5]
+
+
+def test_unpack_at_rate_zero_is_unpaced(upgraded: FakeK3s) -> None:
+    assert _unpack(upgraded, "--rate", "0") == 0
+    assert upgraded.slept == []
+
+
+def test_unpack_tries_an_image_again_once_k3s_is_back(upgraded: FakeK3s, capsys) -> None:
+    dns = f"ghcr.io/spatiumnorth/dns-bind9:{TAG}"
+    upgraded.unpack_fails[dns] = 1
+    upgraded.restart_s = 12
+
+    assert _unpack(upgraded) == 0
+
+    assert upgraded.unpacks() == [NEW[0], dns, dns, NEW[2]]
+    assert set(NEW) <= upgraded.unpacked
+    assert f"could not unpack {dns}: ctr: failed to dial" in capsys.readouterr().err
+
+
+def test_an_image_that_will_not_unpack_is_left_to_the_kubelet(upgraded: FakeK3s, capsys) -> None:
+    dns = f"ghcr.io/spatiumnorth/dns-bind9:{TAG}"
+    upgraded.unpack_fails[dns] = 2
+
+    assert _unpack(upgraded) == 1
+
+    assert {NEW[0], NEW[2]} <= upgraded.unpacked and dns not in upgraded.unpacked
+    assert f"unpacked 2 of 3 image(s); the kubelet unpacks the rest when it starts them: {dns}" in (
+        capsys.readouterr().err
+    )
+
+
+def test_unpack_stops_before_var_runs_short(upgraded: FakeK3s, capsys) -> None:
+    # 11% free before the first image, 9% after it
+    upgraded.disk_used = upgraded.disk_total * 89 // 100
+    upgraded.unpack_mib[NEW[0]] = 410
+
+    assert _unpack(upgraded) == 1
+
+    assert upgraded.unpacks() == [NEW[0]]
+    assert "/var is 91% full; leaving 2 image(s) to the kubelet" in capsys.readouterr().err
+
+
+def test_unpack_stops_when_its_time_runs_out(upgraded: FakeK3s, capsys) -> None:
+    for ref in NEW:
+        upgraded.unpack_s[ref] = 400
+
+    assert _unpack(upgraded, "--max-time", "600") == 1
+
+    assert upgraded.unpacks() == NEW[:2]
+    assert "out of time after 800s; leaving 1 image(s) to the kubelet" in capsys.readouterr().err
+
+
+def test_unpack_with_containerd_down_unpacks_nothing(upgraded: FakeK3s, capsys) -> None:
+    upgraded.down = True
+
+    assert _unpack(upgraded) == 1
+
+    assert upgraded.unpacks() == []
+    assert "unpacked nothing: containerd did not answer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("name", "repository"),
+    [
+        (f"ghcr.io/spatiumnorth/dns-bind9:{TAG}", "ghcr.io/spatiumnorth/dns-bind9"),
+        ("docker.io/rancher/mirrored-pause@sha256:" + "f5" * 32, "docker.io/rancher/mirrored-pause"),
+        ("registry.lan:5000/spatium/dhcp-kea:nightly-20261024", "registry.lan:5000/spatium/dhcp-kea"),
+        ("registry.lan:5000/spatium/dhcp-kea", "registry.lan:5000/spatium/dhcp-kea"),
+        ("sha256:" + "00" * 32, None),
+    ],
+)
+def test_an_image_name_gives_its_repository(k3s: FakeK3s, name: str, repository: str | None) -> None:
+    assert k3s.mod._repository(name) == repository
+
+
+def test_an_image_id_never_counts_as_a_workload_this_node_ran(upgraded: FakeK3s) -> None:
+    # containerd lists every image under its ID too (``sha256:...``)
+    upgraded.unpacked = {"sha256:" + "00" * 32}
+
+    assert _unpack(upgraded) == 0
+    assert upgraded.unpacks() == []
+
+
+def _unit(path: Path) -> list[tuple[str, str, str]]:
+    section, out = "", []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            out.append((section, key.strip(), value.strip()))
+    return out
+
+
+def test_the_unpack_unit_runs_on_every_boot_after_k3s_without_starting_it() -> None:
+    entries = _unit(UNPACK_UNIT)
+    unit = {(s, k): v for s, k, v in entries}
+    assert "k3s.service" in unit[("Unit", "After")].split()
+    pulls = [k for s, k, v in entries if s == "Unit" and k in (
+        "Wants", "Requires", "BindsTo", "Upholds", "OnSuccess", "OnFailure") and "k3s" in v]
+    assert not pulls, "a unit never pulls k3s in (#1723)"
+    assert unit[("Unit", "ConditionKernelCommandLine")] == "!boot=live"
+    assert unit[("Service", "ExecStart")] == "/usr/local/bin/spatium-k3s-images unpack"
+    # boot does not wait the minute or more an unpack takes
+    assert unit[("Service", "Type")] == "exec"
+    assert unit[("Install", "WantedBy")] == "multi-user.target"
+
+
+def test_the_unpack_unit_ships_enabled() -> None:
+    postinst = (APPLIANCE / "mkosi.postinst").read_text()
+    loop = postinst.split("for unit in", 1)[1].split("; do", 1)[0]
+    assert "spatiumddi-image-unpack.service" in loop.split()
+    assert 'chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-unpack.service"' in postinst
+
+
+def test_k3s_unpacks_into_the_snapshotter_the_helper_unpacks_into(k3s: FakeK3s) -> None:
+    # k3s's default; a snapshotter set in its config would leave every image
+    # the helper unpacked for the kubelet to unpack again
+    config = APPLIANCE / "mkosi.extra" / "etc" / "rancher" / "k3s"
+    for path in [config / "config.yaml", *sorted((config / "config.yaml.d").glob("*"))]:
+        keys = [ln.split(":", 1)[0].strip() for ln in path.read_text().splitlines()
+                if not ln.lstrip().startswith("#")]
+        assert "snapshotter" not in keys, f"{path.name} sets k3s's snapshotter"
+    assert k3s.mod.SNAPSHOTTER == "overlayfs"

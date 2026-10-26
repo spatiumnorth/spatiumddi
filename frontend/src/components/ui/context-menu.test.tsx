@@ -171,8 +171,10 @@ describe.each(wrappers)("context menu focus (%s) (#2051)", (_n, wrap) => {
   // A menu inside an open dialog: the host dialog was there before the menu
   // opened, so it is not one the menu launched.
   it("inside a dialog: an item that opens nothing leaves focus on the row", async () => {
-    const before = live;
     render(wrap(<RowInDialog />));
+    // The host dialog watches its own content for the focused node leaving
+    // (#2723); that observer lives as long as the dialog, so count from here.
+    const before = live;
     const row = screen.getByRole("treeitem");
     await choose(row, "Copy");
     expect(document.activeElement).toBe(row);
@@ -180,8 +182,10 @@ describe.each(wrappers)("context menu focus (%s) (#2051)", (_n, wrap) => {
   });
 
   it("inside a dialog: a nested dialog keeps focus, then returns it to the row", async () => {
-    const before = live;
     render(wrap(<RowInDialog />));
+    // The host dialog watches its own content for the focused node leaving
+    // (#2723); that observer lives as long as the dialog, so count from here.
+    const before = live;
     const row = screen.getByRole("treeitem");
     await choose(row, "Delete…");
     const nested = screen

@@ -23,6 +23,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 
 import httpx
 import structlog
@@ -158,8 +159,60 @@ def _self_bootstrap_or_skip(
     )
 
 
+# #2789: how long the revoke recovery waits after an attempt that brought no fresh
+# pairing code back. The self-bootstrap refuses (409) while any live appliance row
+# exists, and a node whose own row is still there (a row revoked but not deleted,
+# or any node of a multi-node cluster) changes nothing by asking again a heartbeat later:
+# each attempt writes and removes the self-bootstrap token file, holds the api
+# through its failure delay and logs four lines. So the next attempt waits a minute,
+# then two, then four, and every four minutes from then on. Four minutes caps the
+# one delay this adds: a row revoked first and deleted minutes later is replaced at
+# most four minutes and a heartbeat after the delete, instead of a heartbeat after.
+REVOKED_RETRY_FIRST_S = 60.0
+REVOKED_RETRY_MAX_S = 240.0
+
+# The retry schedule's clock: a module name, so a test can move it.
+_monotonic = time.monotonic
+
+
+class RevokedReregisterRetry:
+    """When the revoke recovery may ask the self-bootstrap again (#2789).
+
+    Due at once until an attempt brings no code back; ``defer()`` then sets the
+    wait: REVOKED_RETRY_FIRST_S, doubling up to REVOKED_RETRY_MAX_S. The main loop
+    calls ``reset()`` on every tick the node is not revoked, so a node approved
+    again starts over: its next revocation is handled at once, and the waits after
+    it start from the first again.
+    """
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or _monotonic
+        self._wait = 0.0
+        self._next_at: float | None = None
+
+    def due(self) -> bool:
+        return self._next_at is None or self._clock() >= self._next_at
+
+    def defer(self) -> float:
+        """An attempt brought no code back: wait before the next. Returns the
+        wait, in seconds."""
+        if self._wait:
+            self._wait = min(self._wait * 2, REVOKED_RETRY_MAX_S)
+        else:
+            self._wait = REVOKED_RETRY_FIRST_S
+        self._next_at = self._clock() + self._wait
+        return self._wait
+
+    def reset(self) -> None:
+        self._wait = 0.0
+        self._next_at = None
+
+
 def _maybe_register(
-    cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger
+    cfg: SupervisorConfig,
+    log: structlog.stdlib.BoundLogger,
+    *,
+    retry: RevokedReregisterRetry | None = None,
 ) -> SupervisorConfig:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
@@ -171,6 +224,9 @@ def _maybe_register(
     refreshed in the returned config so the caller's heartbeat
     loop can use the new control-plane URL going forward.
     Otherwise returns the input verbatim.
+
+    ``retry`` (#2789), when given, is told when the revoke recovery's
+    self-bootstrap brings no code back, so the caller waits before asking again.
     """
     identity, generated = load_or_generate(cfg.state_dir)
     if generated:
@@ -218,8 +274,7 @@ def _maybe_register(
                 # #2696: mint the new code BEFORE clearing anything. The
                 # self-bootstrap mints only while no live appliance row
                 # exists (409 otherwise). This node's own row can still be
-                # there: its heartbeats 404 while registration is switched
-                # off, and a revoked row stays until it is deleted. Clearing
+                # there: a revoked row stays until it is deleted. Clearing
                 # first would then leave the node with no identity and no
                 # code, and nothing could bring it back. Kept, it is approved
                 # again on its own row as soon as its heartbeats are accepted.
@@ -229,6 +284,8 @@ def _maybe_register(
                         "supervisor.register.revoked_reregister_deferred",
                         appliance_id=str(cached_appliance_id),
                         reason="no fresh pairing code; keeping this identity",
+                        # #2789: the next attempt waits this long.
+                        retry_in_seconds=retry.defer() if retry is not None else None,
                     )
                     return cfg
                 cfg = minted
@@ -367,7 +424,11 @@ def main() -> int:
         heartbeat_interval_seconds=cfg.heartbeat_interval_seconds,
     )
 
-    cfg = _maybe_register(cfg, log)
+    # #2789: paces the revoke recovery while the node stays revoked. An attempt here
+    # that brings no code back counts too, so the loop's first tick does not ask
+    # again at once.
+    reregister_retry = RevokedReregisterRetry()
+    cfg = _maybe_register(cfg, log, retry=reregister_retry)
 
     # Issue #183 Phase 4 — k3s proxy thread. Daemon thread that
     # long-polls the control plane for queued kubeapi requests +
@@ -488,10 +549,21 @@ def main() -> int:
             # on the Fleet page restores it on the same row. A code this
             # process registered with earlier is spent, so the recovery asks
             # for a fresh one instead of presenting it again.
-            cfg = _maybe_register(
-                dataclasses.replace(cfg, bootstrap_pairing_code=""), log
-            )
-            appliance_id = load_appliance_id(cfg.state_dir)
+            # #2789: not on every tick. While a live row is left (this node's own,
+            # revoked but not deleted, or a cluster peer's) the
+            # self-bootstrap refuses, so an attempt that brought no code back
+            # waits a minute, doubling to four, before the next.
+            if reregister_retry.due():
+                cfg = _maybe_register(
+                    dataclasses.replace(cfg, bootstrap_pairing_code=""),
+                    log,
+                    retry=reregister_retry,
+                )
+                appliance_id = load_appliance_id(cfg.state_dir)
+        else:
+            # #2789: not revoked (or not a node that runs the recovery), so a later
+            # revocation is handled at once and its waits start from the first again.
+            reregister_retry.reset()
         # #272 — cluster members heartbeat the in-cluster api Service
         # (resolved here so the skip-gate matches what heartbeat_once
         # will actually POST to). A control-plane member always has a

@@ -62,6 +62,8 @@ services:
       # Scope is the api container's own ``com.docker.compose.project``
       # label, so it can never reach a container outside this stack.
       SERVICE_CONTROL_ENABLED: ${SERVICE_CONTROL_ENABLED:-false}
+      # #2780 — cap on a request body sent to the api (413 over it).
+      MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-8388608}
     # Docker integration — uncomment both entries below to poll the
     # host's Docker daemon over its local Unix socket. Required when
     # adding a Docker host with connection_type=unix, and by service

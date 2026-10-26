@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +46,7 @@ from app.services.dhcp.class_refs import reserved_name_reason
 from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import rekey_raw_options
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
+from app.services.import_savepoint import entity_savepoint
 
 from .canonical import (
     ConflictAction,
@@ -53,6 +55,8 @@ from .canonical import (
     ImportSource,
     ScopeConflict,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -470,49 +474,50 @@ async def _commit_client_classes(
             warnings.append(f"Client class '{cc.name}' was not imported: {reason}.")
             continue
         try:
-            existing = (
-                (
-                    await db.execute(
-                        select(DHCPClientClass).where(
-                            DHCPClientClass.group_id == target_group_id,
-                            DHCPClientClass.name == cc.name,
+            async with entity_savepoint(db):
+                existing = (
+                    (
+                        await db.execute(
+                            select(DHCPClientClass).where(
+                                DHCPClientClass.group_id == target_group_id,
+                                DHCPClientClass.name == cc.name,
+                            )
                         )
                     )
+                    .scalars()
+                    .first()
                 )
-                .scalars()
-                .first()
-            )
-            if existing is not None:
-                continue
-            row = DHCPClientClass(
-                group_id=target_group_id,
-                name=cc.name,
-                match_expression=cc.match_expression or "",
-                description=cc.description or "",
-                address_family=cc.address_family or "ipv4",
-                options=dict(cc.options or {}),
-                import_source=source,
-                imported_at=now,
-            )
-            db.add(row)
-            await db.flush()
-            db.add(
-                AuditLog(
-                    user_id=current_user.id,
-                    user_display_name=current_user.display_name,
-                    auth_source=current_user.auth_source,
-                    action="create",
-                    resource_type="dhcp_client_class",
-                    resource_id=str(row.id),
-                    resource_display=cc.name,
-                    result="success",
-                    new_value={"import_source": source},
+                if existing is not None:
+                    continue
+                row = DHCPClientClass(
+                    group_id=target_group_id,
+                    name=cc.name,
+                    match_expression=cc.match_expression or "",
+                    description=cc.description or "",
+                    address_family=cc.address_family or "ipv4",
+                    options=dict(cc.options or {}),
+                    import_source=source,
+                    imported_at=now,
                 )
-            )
-            await db.commit()
-            created += 1
+                db.add(row)
+                await db.flush()
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="create",
+                        resource_type="dhcp_client_class",
+                        resource_id=str(row.id),
+                        resource_display=cc.name,
+                        result="success",
+                        new_value={"import_source": source},
+                    )
+                )
+                await db.commit()
+                created += 1
         except Exception:  # noqa: BLE001 — one bad class shouldn't poison the rest
-            await db.rollback()
+            logger.warning("dhcp_import.client_class_failed", name=cc.name, exc_info=True)
     return created
 
 
@@ -587,19 +592,19 @@ async def commit_import(
             continue
         action: ConflictAction = conflict_actions.get(cidr, "skip")
         try:
-            result = await _commit_one_scope(
-                db,
-                parsed=parsed,
-                target_group_id=target_group_id,
-                ipam_space_id=ipam_space_id,
-                ipam_block_id=ipam_block_id,
-                source=preview.source,
-                action=action,
-                current_user=current_user,
-                now=now,
-            )
+            async with entity_savepoint(db):
+                result = await _commit_one_scope(
+                    db,
+                    parsed=parsed,
+                    target_group_id=target_group_id,
+                    ipam_space_id=ipam_space_id,
+                    ipam_block_id=ipam_block_id,
+                    source=preview.source,
+                    action=action,
+                    current_user=current_user,
+                    now=now,
+                )
         except Exception as exc:  # noqa: BLE001 — operator-facing error capture
-            await db.rollback()
             result = CommitScopeResult(
                 subnet_cidr=cidr,
                 action_taken="failed",

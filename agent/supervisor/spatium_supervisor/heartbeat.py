@@ -939,6 +939,51 @@ def next_heartbeat_delay(
     return rearm_floor_s if held else float(interval_s)
 
 
+
+# #2798 — how the control plane says "this appliance is revoked" on a
+# heartbeat: a 403 carrying this header (``revoked`` for a revoked row,
+# ``unknown`` when no row accepts the credential). Mirrors
+# ``REVOCATION_HEADER`` in ``backend/app/api/v1/appliance/supervisor.py``.
+REVOCATION_HEADER = "X-Spatium-Revocation"
+# The 403 details a control plane from before the header answered for the
+# same two refusals. Recognised so a supervisor upgraded ahead of its
+# control plane still stops when it is revoked or deleted.
+_LEGACY_REVOCATION_DETAILS = (
+    ("Appliance has been revoked.", "revoked"),
+    ("Invalid appliance or session.", "unknown"),
+)
+
+
+def _refusal_detail(resp: httpx.Response) -> str | None:
+    try:
+        detail = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    return detail if isinstance(detail, str) else None
+
+
+def revocation_reason(resp: httpx.Response) -> str | None:
+    """The revocation the control plane stated on this heartbeat response,
+    or None when it stated none (#2798).
+
+    Only a 403 can be one: the marked 403 from a current control plane, or
+    one of the two legacy 403 details. A 404 never is — it said "registration
+    is switched off" on older control planes and says "nothing is mounted
+    here" behind a proxy, and reading it as a revocation took DNS and DHCP
+    down on every appliance when pairing was switched off."""
+    if resp.status_code != 403:
+        return None
+    marker = resp.headers.get(REVOCATION_HEADER)
+    if marker:
+        return marker.strip().lower() or "revoked"
+    detail = _refusal_detail(resp)
+    if detail:
+        for prefix, reason in _LEGACY_REVOCATION_DETAILS:
+            if detail.startswith(prefix):
+                return reason
+    return None
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -1101,19 +1146,34 @@ def heartbeat_once(
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
         return None
-    if resp.status_code == 403 or resp.status_code == 404:
-        # 403 = approval revoked or cert no longer valid for any
-        # known appliance row. 404 = appliance row deleted, or the
-        # control plane's supervisor_registration_enabled flag is
-        # off. Both mean "you shouldn't be talking to me anymore" —
-        # increment the consecutive-strike counter; flip to
-        # ``revoked`` once REVOCATION_STRIKE_LIMIT in a row, which
-        # de-noises a short control-plane restart.
+    revocation = revocation_reason(resp)
+    if revocation is None and resp.status_code in (403, 404):
+        # #2798 — a refusal that is NOT the control plane's revocation
+        # answer: a 404 (a proxy, an api whose router is not mounted, an
+        # older api whose registration flag was switched off) or a 403
+        # without the marker. None of these says the row is gone, so it is
+        # no strike and nothing is torn down: the role services keep
+        # serving from the last applied assignment (non-negotiable #5) and
+        # this keeps being logged until the heartbeat is accepted again.
+        log.warning(
+            "supervisor.heartbeat.refused_not_revocation",
+            status_code=resp.status_code,
+            detail=_refusal_detail(resp),
+            appliance_id=str(appliance_id),
+        )
+        return False
+    if revocation is not None:
+        # 403 marked as a revocation: the row is revoked, or no row
+        # accepts our credential (deleted, or re-keyed). Increment the
+        # consecutive-strike counter; flip to ``revoked`` once
+        # REVOCATION_STRIKE_LIMIT in a row, which de-noises a short
+        # control-plane restart.
         prior_state = approval_state.read_state(cfg.state_dir)
         new_state, strikes = approval_state.record_revocation_signal(cfg.state_dir)
         log.warning(
             "supervisor.heartbeat.rejected",
             status_code=resp.status_code,
+            revocation=revocation,
             strikes=strikes,
             new_state=new_state,
             appliance_id=str(appliance_id),
