@@ -13201,10 +13201,7 @@ export function BlockTreeRow({
                 <Layers className="h-3 w-3 flex-shrink-0" />
               )}
               {/* The CIDR never shrinks; the name is what gets cut (#2822). */}
-              <span
-               
-                className="font-mono font-medium shrink-0 whitespace-nowrap"
-              >
+              <span className="font-mono font-medium shrink-0 whitespace-nowrap">
                 {node.block.network}
               </span>
               <BlockNameTag
