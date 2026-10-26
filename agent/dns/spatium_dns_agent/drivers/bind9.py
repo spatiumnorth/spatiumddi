@@ -1862,6 +1862,9 @@ _OWNED_SUFFIX = ".owned"
 # First line of a staged file that carries records forward, so the next
 # render knows the live file holds more than a render of the bundle.
 _CARRY_MARKER = "; spatium-dns-agent: RFC 2136 records carried over (#2850)"
+# Between the render and the records carried after it, so the render's own
+# lines can be told apart again (``_owned_from_render``).
+_CARRY_BLOCK = "; carried:"
 # What the daemon owns, never carried: the ingest skips the same set.
 _CARRY_IGNORED_TYPES = frozenset(
     {
@@ -1917,7 +1920,7 @@ def _rendered_rrset_keys(lines: Iterable[str], origin: str) -> set[str]:
     return keys
 
 
-_OWNED_LINE = re.compile(r"^[+-]\S+ [A-Z0-9]+$")
+_OWNED_LINE = re.compile(r"^[+-]\S+ [A-Z0-9-]+$")
 
 
 def _write_durable(path: Path, data: bytes) -> None:
@@ -1936,11 +1939,15 @@ def _read_owned(sidecar: Path) -> set[str] | None:
 
     One ``+<key>`` or ``-<key>`` per line, applied in order: the render
     writes the ``+`` lines, a record op appends either. Unknown is a missing
-    sidecar (a tree an agent older than #2850 wrote) and equally an empty,
-    torn or otherwise malformed one: read as an empty set, that would say the
-    control plane owns nothing, and every record it ever deleted would be
-    carried back. A render always writes its SOA, so a real one is never
-    empty."""
+    sidecar and equally an empty, torn or otherwise malformed one (a render
+    always writes its SOA, so a real one is never empty): never an empty set,
+    which would say the control plane owns nothing.
+
+    The caller tells the two apart. No sidecar at all is the first start
+    after the upgrade into #2850, and everything the render lacks is carried.
+    A damaged one is read from the previous render's own lines instead
+    (``_owned_from_render``), so nothing the control plane deleted comes
+    back."""
     try:
         text = sidecar.read_text()
     except (OSError, UnicodeDecodeError):
@@ -1968,6 +1975,26 @@ def _restage_owned(live_file: Path, staged_file: Path) -> None:
         _copy_new_inode(_owned_sidecar(live_file), _owned_sidecar(staged_file))
     else:
         _owned_sidecar(staged_file).unlink(missing_ok=True)
+
+
+def _owned_from_render(zone_file: Path, origin: str) -> set[str] | None:
+    """What a live file the agent wrote says the control plane owns: the
+    RRsets of its render, the carried block left out. None for a file named
+    rewrote (its dump no longer tells the render's records from the rest)."""
+    try:
+        text = zone_file.read_text(errors="replace")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    if lines and lines[0] == _CARRY_MARKER:
+        lines = lines[1:]
+    if len(lines) < 2 or not (
+        lines[0].startswith("$TTL ") and lines[1].startswith("@ IN SOA ")
+    ):
+        return None
+    if _CARRY_BLOCK in lines:
+        lines = lines[: lines.index(_CARRY_BLOCK)]
+    return _rendered_rrset_keys(lines, origin)
 
 
 def _is_pure_render(zone_file: Path) -> bool:
@@ -2001,15 +2028,32 @@ class _NamedZoneState(NamedTuple):
     serial: int | None
 
 
+class _Unloadable(NamedTuple):
+    """``named-compilezone``'s verdict that a zone file does not load, even
+    without its journal: named cannot load it either."""
+
+    reason: str
+
+
 def _named_zone_state(
     zname: str, zone_file: Path, scratch: Path
-) -> _NamedZoneState | None:
+) -> _NamedZoneState | _Unloadable | None:
     """Read a zone as named would load it from ``zone_file``: the file with
-    its journal applied. None when it cannot be read.
+    its journal applied.
+
+    None when it could not be read at all (an I/O error, a timeout): that
+    says nothing about the zone. :class:`_Unloadable` when the checker read
+    it and refused it, which is a verdict on the file.
 
     A journal that does not start at the file's serial is one named itself
     would discard on load ("journal out of sync"), so the file is then read
     alone, as named would."""
+    try:
+        with zone_file.open("rb") as fh:
+            fh.read(1)
+    except OSError as exc:
+        log.error("bind9_dynamic_zone_unreadable", zone=zname, error=str(exc))
+        return None
     fd, tmp_name = tempfile.mkstemp(prefix=".carry-", suffix=".tmp", dir=scratch)
     os.close(fd)
     out = Path(tmp_name)
@@ -2037,15 +2081,8 @@ def _named_zone_state(
                     )
                 break
         else:
-            log.error(
-                "bind9_dynamic_zone_unreadable",
-                zone=zname,
-                file=str(zone_file),
-                stderr=_first_line(
-                    res.stderr if res else "", res.stdout if res else ""
-                )[:200],
-            )
-            return None
+            out_text, err_text = (res.stdout, res.stderr) if res else ("", "")
+            return _Unloadable(_first_line(out_text, err_text)[:200])
         text = out.read_text(errors="replace")
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.error("bind9_dynamic_zone_unreadable", zone=zname, error=str(exc))
@@ -2092,7 +2129,8 @@ def _carried_records(
     ``staged``, and the RRsets left out for colliding with it.
 
     Carried: every RRset the render does not have, that the control plane
-    never shipped here (``owned``), and that is not the daemon's own (SOA,
+    never shipped here (``owned``; None, only on the first start after the
+    upgrade into #2850, filters nothing), and that is not the daemon's own (SOA,
     apex NS, DNSSEC). Left out: one that cannot sit beside the render, a
     CNAME at a name the render uses or anything at a name it has a CNAME
     for. The render wins those, as a managed name wins in the ingest."""
@@ -3799,10 +3837,14 @@ class Bind9Driver(DriverBase):
         start nothing is running, and the file and journal are exactly what
         the last named left.
 
-        Never fails the apply, and fails closed: a zone that cannot be read
-        back, a merge ``named-checkzone`` refuses, and a zone in ``hold`` (a
-        running named refused its freeze) are held back (#1403) on named's own
-        copy, so they cost the zone this render rather than its records."""
+        Never fails the apply, and fails closed: a zone that could not be
+        read back (an I/O error, a timeout), a merge ``named-checkzone``
+        refuses, and a zone in ``hold`` (a running named refused its freeze)
+        are held back (#1403) on named's own copy, so they cost the zone this
+        render rather than its records. A file the checker reads and refuses
+        is not held: named cannot load it either, and holding it would leave
+        the zone unserved and fail every later apply. The render replaces it,
+        and the records only named held are reported lost."""
         held = {(h.zone, h.view) for h in self.held_back if h.served}
         results = _parallel_map(
             lambda zv: self._carry_zone(
@@ -3828,6 +3870,21 @@ class Bind9Driver(DriverBase):
         staged = new_dir / rel
         live = prev / rel
         state = _named_zone_state(zname, live, new_dir)
+        if isinstance(state, _Unloadable):
+            # named cannot load this file either, so holding the zone on it
+            # would leave it unserved and fail every apply after this one.
+            # The render replaces it, as it always did; what named held of
+            # it beyond the bundle is gone, and said so.
+            log.error(
+                "bind9_dynamic_records_lost",
+                zone=zname,
+                view=view,
+                reason=state.reason,
+                detail="named's copy of this zone does not load, so it is "
+                "rendered from the bundle alone; any RFC 2136 record only "
+                "named held is lost",
+            )
+            return None
         if state is None:
             # Fail closed: rendered from the bundle alone, the zone would drop
             # every record only named holds. Keep named's own file, and its
@@ -3870,7 +3927,25 @@ class Bind9Driver(DriverBase):
         if staged_keys is None:
             # Our own render: its record lines say what it holds.
             staged_keys = _rendered_rrset_keys(staged.read_text().splitlines(), origin)
-        owned = _read_owned(_owned_sidecar(live))
+        live_sidecar = _owned_sidecar(live)
+        owned = _read_owned(live_sidecar)
+        if owned is None and live_sidecar.exists():
+            # A damaged sidecar is not "no sidecar": carrying everything
+            # would bring back what the control plane deleted. The previous
+            # render's own lines are the best record of what it shipped;
+            # failing that (named rewrote the file), everything named holds
+            # is taken as owned, so nothing is carried back that may have
+            # been deleted.
+            owned = _owned_from_render(live, origin)
+            if owned is None:
+                owned = {key for key, _line in state.records}
+            log.error(
+                "bind9_owned_sidecar_damaged",
+                zone=zname,
+                view=view,
+                detail="read what the control plane owns from the previous "
+                "render instead",
+            )
         lines, conflicts = _carried_records(state, origin, staged_keys, owned)
         if conflicts:
             log.warning(
@@ -3886,7 +3961,15 @@ class Bind9Driver(DriverBase):
         rendered = staged.read_text()
         _write_new_inode(
             staged,
-            (_CARRY_MARKER + "\n" + rendered + "\n".join(lines) + "\n").encode(),
+            (
+                _CARRY_MARKER
+                + "\n"
+                + rendered
+                + _CARRY_BLOCK
+                + "\n"
+                + "\n".join(lines)
+                + "\n"
+            ).encode(),
         )
         if not frozen and state.serial is not None:
             # No running named decided this zone's serial (``_freeze_and_wait``
@@ -3898,7 +3981,7 @@ class Bind9Driver(DriverBase):
             serial = _soa_serial(staged)
             if serial is None or not _serial_later(serial, state.serial):
                 merged = _named_zone_state(zname, staged, new_dir)
-                same = merged is not None and (
+                same = isinstance(merged, _NamedZoneState) and (
                     _record_set(merged) == _record_set(state)
                 )
                 target = state.serial if same else (state.serial + 1) % 2**32 or 1

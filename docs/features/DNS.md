@@ -2472,8 +2472,17 @@ uses, is left out and logged (`bind9_dynamic_records_not_carried`). The
 agent fails closed. If `named-checkzone` refuses the merge, if named's copy
 cannot be read back, or if a running named refuses to freeze a zone it still
 serves, the zone is held back on named's own copy (#1403) rather than losing
-the records. A zone whose live file is still exactly a render, with no
+the records. A zone file the checker reads and refuses is the exception:
+named cannot load it either, so the render replaces it, as it did before
+#2850, and `bind9_dynamic_records_lost` names the zone whose RFC 2136 records
+went with it. A zone whose live file is still exactly a render, with no
 journal, is not read back.
+
+Two costs of failing closed. A zone whose read-back times out is held, and on
+every later apply it spends up to the 300 s checker timeout reading the zone
+back while the zone is frozen. And a zone an operator has frozen with `rndc
+freeze` refuses the agent's own freeze, so the first apply holds that zone
+back, and the reload's thaw then clears the operator's freeze.
 
 As with the ingest's own rule, the RRset is the unit. A third party's apex NS
 record is not carried, and neither is an extra value at a name and type the

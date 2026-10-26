@@ -98,7 +98,9 @@ class Named:
         freeze_ok: bool = True,
         compile_ok: bool = True,
         on_freeze: Any = None,
+        compile_hangs: bool = False,
     ):
+        self.compile_hangs = compile_hangs
         self.freeze_ok = freeze_ok
         self.compile_ok = compile_ok
         self.on_freeze = on_freeze
@@ -118,6 +120,8 @@ class Named:
         tool = Path(cmd[0]).name
         out = ""
         rc = 0
+        if tool == "named-compilezone" and self.compile_hangs:
+            raise subprocess.TimeoutExpired(cmd, 300)
         if tool == "named-compilezone" and not self.compile_ok:
             rc, out = 1, "dyn.test: loading from master file failed"
         elif tool == "named-compilezone":
@@ -530,12 +534,13 @@ def test_a_refused_freeze_on_a_served_zone_holds_it_back(
 def test_a_zone_that_cannot_be_read_back_is_held_on_named_copy(
     driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fail closed: when named-compilezone cannot read named's copy, the zone
-    keeps named's own file and journal instead of the bundle-only render."""
+    """Fail closed: when named's copy cannot be read back (here, the checker
+    times out), which says nothing about the file, the zone keeps named's own
+    file and journal instead of the bundle-only render."""
     live_file = _previous_tree(driver, [("www", "A", "192.0.2.1")])
     live_file.write_text(NAMED_DUMP)
     live_file.with_name(live_file.name + ".jnl").write_bytes(b"journal")
-    monkeypatch.setattr(bind9.subprocess, "run", Named(compile_ok=False))
+    monkeypatch.setattr(bind9.subprocess, "run", Named(compile_hangs=True))
     _boot(driver, monkeypatch)
 
     driver.render(_bundle([("www", "A", "192.0.2.9")]))
@@ -581,3 +586,52 @@ def test_an_op_finds_the_sidecar_whatever_the_case(driver: Bind9Driver) -> None:
         }
     )
     assert "opadd.dyn.test. A" in (_read_owned(sidecar) or set())
+
+
+def test_a_zone_file_named_cannot_load_is_rendered_from_the_bundle(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verdict on the file, not a failure to read it: named cannot load it
+    either, so holding the zone on it would leave it unserved and fail every
+    apply after. The render replaces it, as before #2850."""
+    live_file = _previous_tree(driver, [("www", "A", "192.0.2.1")])
+    live_file.write_text(NAMED_DUMP + "bad line here !!!\n")
+    monkeypatch.setattr(bind9.subprocess, "run", Named(compile_ok=False))
+    _boot(driver, monkeypatch)
+
+    driver.render(_bundle([("www", "A", "192.0.2.9")]))
+    driver.swap_and_reload()
+
+    served = live_file.read_text()
+    assert "bad line" not in served
+    assert "www 300 IN A 192.0.2.9" in served
+    assert driver.held_back == ()
+
+
+def test_a_damaged_sidecar_reads_ownership_from_the_previous_render(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A torn ``.owned`` is not the upgrade's missing one: ``gone``, which
+    the previous render wrote and the control plane has since deleted, must
+    not come back, while the third party's dc01 still is carried."""
+    live_file = _previous_tree(
+        driver, [("www", "A", "192.0.2.1"), ("gone", "A", "192.0.2.2")]
+    )
+    sidecar = live_file.with_name(f"{ZONE}.db.owned")
+    sidecar.write_text(sidecar.read_text()[:-3])
+    live_file.with_name(live_file.name + ".jnl").write_bytes(b"journal")
+    monkeypatch.setattr(bind9.subprocess, "run", Named())
+    _boot(driver, monkeypatch)
+
+    driver.render(_bundle([("www", "A", "192.0.2.1")]))
+    driver.swap_and_reload()
+
+    served = live_file.read_text()
+    assert "dc01.dyn.test. 600 IN A 10.9.9.9" in served
+    assert "gone" not in served
+
+
+def test_a_type_with_a_hyphen_is_a_valid_sidecar_line(tmp_path: Path) -> None:
+    sidecar = tmp_path / "z.db.owned"
+    sidecar.write_text("+dyn.test. SOA\n+x.dyn.test. NSAP-PTR\n")
+    assert _read_owned(sidecar) == {"dyn.test. SOA", "x.dyn.test. NSAP-PTR"}
