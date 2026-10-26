@@ -2995,7 +2995,7 @@ function formatRelativeSince(iso: string): string {
 }
 
 const WATCHDOG_STATUS_STYLES: Record<
-  "healthy" | "missing" | "unhealthy" | "starting",
+  "healthy" | "missing" | "unhealthy" | "starting" | "held",
   { className: string; label: string; Icon: typeof CheckCircle2 }
 > = {
   healthy: {
@@ -3021,6 +3021,13 @@ const WATCHDOG_STATUS_STYLES: Record<
       "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
     label: "starting",
     Icon: Loader2,
+  },
+  // #2808 — down on purpose: the node is revoked or not yet approved, so the
+  // supervisor keeps its role services stopped and does not heal them.
+  held: {
+    className: "bg-muted text-muted-foreground border-border",
+    label: "held",
+    Icon: Ban,
   },
 };
 

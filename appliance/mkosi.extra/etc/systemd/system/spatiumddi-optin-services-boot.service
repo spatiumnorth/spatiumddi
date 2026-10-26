@@ -1,0 +1,30 @@
+[Unit]
+Description=Start operator-enabled SNMP / LLDP after the /etc overlay (issue #2376)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/2376
+ConditionKernelCommandLine=!boot=live
+# snmpd and lldpd ship DISABLED in the image (00-spatiumddi.preset): they
+# run only once the operator turns SNMP / LLDP on, and their runners'
+# ``systemctl enable`` writes the wants/ link into /etc/systemd/system —
+# which on the appliance is the /var-backed overlay UPPER layer. etc.mount
+# puts that layer up AFTER PID 1 has loaded its units, and systemd reads a
+# .wants directory only at load time, so at boot nothing wants either
+# daemon and neither is started (#2376 case 7, after a reboot and after a
+# slot upgrade alike). This oneshot runs on this side of etc.mount and
+# starts each daemon whose plane the operator has on, and makes the
+# runners' status sidecars report what is actually running.
+#
+# Same shape as spatiumddi-removable-boot.service (#989). A targeted start
+# rather than a ``daemon-reload``: it touches only these two units and does
+# not re-run every generator mid-boot.
+After=etc.mount local-fs.target spatium-etc-reconcile.service nftables.service network.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+# ``-``: one plane failing to start must not keep the other from trying.
+ExecStart=-/usr/local/bin/spatiumddi-snmp-reload --boot
+ExecStart=-/usr/local/bin/spatiumddi-lldp-reload --boot
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

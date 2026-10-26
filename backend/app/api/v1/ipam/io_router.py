@@ -13,6 +13,7 @@ from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.core.content_disposition import content_disposition
 from app.core.permissions import (
     token_scope_allows,
@@ -35,7 +36,9 @@ from app.services.ipam_io import (
 )
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
+router = APIRouter(route_class=PreBodyAuthUploadRoute)
 
 
 # Upload size guard: 25 MB is plenty for IPAM imports.

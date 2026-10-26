@@ -1418,6 +1418,19 @@ due together are queued a minute apart, at most 55 per sweep so each has run
 before the next sweep looks again; any beyond that go in the next hour,
 longest-overdue first.
 
+The list row shows a sync chip so a bad feed is visible without opening it:
+red when the last refresh failed (with how long ago it last worked), amber
+when no refresh has succeeded for more than 3 update intervals, grey when the
+feed has never synced. The default-on `dns_blocklist_feed_stale` alert (warning,
+one event per list) fires on the same 3-interval test, measured from the last
+*successful* refresh (`last_success_at`) or, for a feed that never succeeded,
+from its creation. Manual-only lists (interval `0`), disabled lists and
+hand-made (non-feed) lists never alert and show no `never synced` / `stale`
+chip; a failed last refresh still shows `sync failed` on any feed list.
+Assignment to a group is not a condition: an unassigned feed that stops
+refreshing alerts too. The alert text says only that the last refresh failed;
+the stored fetch error (which can quote the feed URL) stays in the list detail.
+
 #### Which feed URLs can be fetched?
 
 A feed URL is fetched by the control plane, so it goes through the same
@@ -2094,6 +2107,21 @@ holds only PTRs.
 > expires — clients may keep hitting a dead / distant box for up to
 > `ttl` seconds. Keep the TTL short (default 30 s). See the
 > **TTL-race caveat** below.
+
+**Pools fail open on a stopped health checker
+([#2312](https://github.com/spatiumnorth/spatiumddi/issues/2312)).** A
+member renders while it is enabled and its last verdict is `healthy`; the
+verdict has no expiry. If the health-check task stops running (the `dns`
+queue backed up, a worker down), a member that last checked healthy keeps
+being answered even if it has since died, because withdrawing every member
+would be an outage of its own. This is deliberate and unchanged. What is
+added is visibility: a verdict older than 3 x the pool's check interval
+(the task's floor of 30 s applies) is **stale**. The members table shows
+`stale · 4h ago` instead of a bare time, the API reports `check_stale` and
+`check_age_seconds` per member, and the default-on `dns_pool_health_stale`
+alert (warning, one event per pool) fires and resolves when the pool is
+checked again. Disabled pools and members are not checked on purpose and
+never count as stale. Every alert rule is evaluated by the Celery worker, so a stopped worker stops the health checks AND this alert; a stopped worker is reported by the platform health components `celery-workers` / `celery-beat` instead.
 
 ### 17.1 Serving scope — steering one name to the nearest datacenter
 

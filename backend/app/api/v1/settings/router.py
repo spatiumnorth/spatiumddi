@@ -25,6 +25,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.celery_dispatch import dispatch
 from app.core.config_text import has_control_chars, reject_control_chars
@@ -64,6 +65,7 @@ from app.services.appliance.apt import (
 )
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
+from app.services.audit_forward import targets_cache
 from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
@@ -101,7 +103,9 @@ _RESOLVER_DNSSEC: set[str] = {"yes", "no", "allow-downgrade"}
 _RESOLVER_DOT: set[str] = {"yes", "opportunistic", "no"}
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
+router = APIRouter(route_class=PreBodyAuthUploadRoute)
 
 _SINGLETON_ID = 1
 
@@ -2755,6 +2759,7 @@ async def update_settings(
         )
 
     await db.commit()
+    targets_cache.invalidate()
     await db.refresh(settings)
 
     # Drop the middleware's process-local cache so the flipping worker
@@ -3598,6 +3603,7 @@ async def create_audit_target(
     _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
+        targets_cache.invalidate()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
         raise HTTPException(
@@ -3626,6 +3632,7 @@ async def update_audit_target(
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
+        targets_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(
@@ -3643,6 +3650,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db
     _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
+    targets_cache.invalidate()
 
 
 @router.post("/audit-forward-targets/{target_id}/test")

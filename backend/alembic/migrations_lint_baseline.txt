@@ -373,6 +373,7 @@ backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:46
 backend/alembic/versions/c3f8a2d61e94_dns_ingest_snapshot.py:drop_table:64
 backend/alembic/versions/c4a8e1f26d93_subnet_show_free_ranges.py:drop_column:31
+backend/alembic/versions/c4a8e2f7b913_dns_blocklist_last_success_at.py:drop_column:39
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:127
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_table:129
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_column:106

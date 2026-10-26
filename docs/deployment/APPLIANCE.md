@@ -96,6 +96,20 @@ not the operator's:
   HelmChart manifest on every restart.) The api and Postgres CPU limits are
   sized the same way from the node's CPU count (#2240): the api a quarter
   of the cores (1–4), Postgres half (1–8), where both were a fixed 1 core.
+  The Postgres memory limit also has to hold the connections the cluster
+  can open, which grow with the control-plane node count (#2156): every
+  node runs an api pod with its own database pool and a worker, every api,
+  worker and beat process holds up to two more for the after-commit hooks
+  (#2782), and the primary runs a WAL sender per replica. So the api's pool
+  per pod shrinks past four nodes (10 + 20 up to four, 10 + 3 at nine;
+  about 120 api connections in all), and the limit is never below
+  shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
+  can open 51 connections at one node, 131 at three and 218 at nine (two
+  worker processes); `max_connections` stays the chart's 200 until that
+  passes it, then follows it. One node of 8 GiB or more keeps the share
+  above; a three-node cluster on a 12 GiB seed gets 2971Mi, a nine-node one
+  4363Mi. A promote or demote that moves the limit is one CloudNativePG
+  rolling restart.
   These limits are keys the supervisor **owns**, so a different value written
   into that HelmChartConfig by hand is put back on the next heartbeat; there
   is no supported per-install override for them today (see "Who owns which
@@ -566,8 +580,11 @@ state on its heartbeat:
   migrate Job (which replaces a running one) and a second api / worker
   rollout. firstboot now brings the sizing keys an existing Config already
   carries (api / worker memory and concurrency, the api and Postgres CPU
-  limits, the Postgres requests / limits and `shared_buffers`) to the values
-  this boot's HelmChart renders.
+  limits, the Postgres request and `shared_buffers`) to the values
+  this boot's HelmChart renders. The Postgres memory limit is not among
+  them (#2156): the supervisor sizes it for the cluster's node count and
+  firstboot renders one node, so reconciling it would restart Postgres
+  twice on every seed reboot.
   It computes them while that HelmChart is still held back as `.deferred`
   and writes them as soon as k3s has applied it, so helm-controller's job
   for the new chart is replaced, before it runs, by one carrying the new
@@ -609,7 +626,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -2821,6 +2838,10 @@ introduced by an upgrade don't clobber operator-created ones.
    out, the slot is not committed; once
    `spatium-k3s-images verify` passes, **Approve trial** in
    Fleet keeps it before the next reboot reverts it.
+   Once k3s's import is over, `spatiumddi-image-unpack.service`
+   unpacks the new release of each image the node runs, one at a
+   time at 32 MiB/s (`spatium-k3s-images unpack`, #2788). The
+   kubelet unpacks whatever it leaves.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
@@ -3408,6 +3429,11 @@ the cluster runs until every node reports the target:
   writing it, with the old tag.
 - When every node is done, the run removes the pins and ends the hold in
   one step. Each node's DNS and DHCP pods restart once at that moment.
+  Each node unpacked their new images right after its own reboot
+  (`spatiumddi-image-unpack.service`), so little or nothing is left to
+  unpack then. Before #2788 every node unpacked 1-2 GB of image layers
+  at this moment, all at once on the `/var` etcd writes its WAL to, and
+  on a shared disk that stalled etcd until a k3s server exited.
 
 A pin, or the removal of the pins, that the kubeapi does not take (a
 request refused or unanswered, as while a k3s server restarts) does
@@ -3763,6 +3789,25 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > *before* the first pairing — otherwise
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
+>
+> The flag refuses **new** pairings only. Appliances already registered
+> keep heartbeating and serving while it is off: `/supervisor/heartbeat`
+> and `/supervisor/poll` are not behind it (#2798). Before that fix,
+> switching it off answered every heartbeat 404, every supervisor read
+> that as a revocation, and DNS and DHCP stopped fleet-wide.
+
+**How a supervisor knows it was revoked (#2798).** A heartbeat the control
+plane refuses on purpose is a **403 carrying the `X-Spatium-Revocation`
+header**: `revoked` when the row is revoked on the Fleet page, `unknown`
+when no row accepts the presented credential (the row was deleted, or the
+appliance was re-keyed). Two of those in a row put the supervisor in
+`revoked` and take its role services down; a control-plane node then
+re-registers through the self-bootstrap once its row is gone (#2696). Any
+other refusal — a 404 from a proxy or a router that is not mounted, a 403
+without the header — is logged as `supervisor.heartbeat.refused_not_revocation`
+and nothing is torn down: the node keeps serving its last applied roles.
+For a control plane that predates the header, the supervisor also accepts
+the two 403 details it answered for the same refusals.
 
 1. On the control plane, open **Appliance → Pairing**.
 2. Click **New pairing code**. Codes are now kind-agnostic (the

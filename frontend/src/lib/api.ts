@@ -5341,6 +5341,10 @@ export interface DNSPoolMember {
   last_check_state: "unknown" | "healthy" | "unhealthy";
   last_check_at: string | null;
   last_check_error: string | null;
+  /** Verdict older than 3 x the pool's check interval; a healthy member is
+   *  still served (fail-open) (#2312). */
+  check_stale?: boolean;
+  check_age_seconds?: number | null;
   consecutive_failures: number;
   consecutive_successes: number;
   created_at: string;
@@ -6963,6 +6967,10 @@ export interface DNSBlockList {
   last_synced_at: string | null;
   last_sync_status: string | null;
   last_sync_error: string | null;
+  /** Last refresh that SUCCEEDED (#2313); null = never. */
+  last_success_at?: string | null;
+  /** ok | error | stale | never; null for a list with no feed (#2313). */
+  feed_sync_state?: "ok" | "error" | "stale" | "never" | null;
   entry_count: number;
   /** Rules the last adblock refresh could not enforce, by category (#2123).
    *  null = not recorded (no adblock refresh yet, or another feed format). */
@@ -13118,9 +13126,12 @@ export interface ApplianceRow {
     string,
     {
       role: string;
-      status: "healthy" | "missing" | "unhealthy" | "starting";
+      // #2808 — ``held``: the node is revoked or not yet approved, so its
+      // role services are down on purpose (``held_by`` names the state).
+      status: "healthy" | "missing" | "unhealthy" | "starting" | "held";
       since: string;
       container_id: string | null;
+      held_by?: string;
     }
   >;
   // #387 — per-plane host-config apply health from the supervisor's

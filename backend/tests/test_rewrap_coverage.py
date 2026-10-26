@@ -108,6 +108,24 @@ def test_schema_direction_gate_passes_the_cases_it_should() -> None:
     assert schema_direction_error(_local_head()) is None, "same head is fine"
 
 
+def test_the_override_warning_says_what_the_api_does_on_a_newer_schema() -> None:
+    """A restore made with ``allow_newer_schema`` leads with this warning.
+    Readiness no longer refuses every newer schema (#2777), so the warning
+    says what holds: an api pod that starts on it stays unready, and one
+    already serving keeps serving only while what its build uses is there."""
+    from app.services.backup.restore import _schema_override_warning
+
+    refusal = "This archive was taken on a NEWER schema than this install."
+    warning = _schema_override_warning(refusal)
+
+    assert warning.startswith(f"Schema-direction check OVERRIDDEN: {refusal} ")
+    assert "allow_newer_schema was set" in warning
+    assert "An api pod that starts or restarts on it stays unready" in warning
+    assert "keeps serving only while every table and column this build uses" in warning
+    assert "Upgrade to a build at or past the archive's head" in warning
+    assert "rejects" not in warning, "readiness no longer rejects every newer schema"
+
+
 # ── selective-restore section catalog (#781) ─────────────────────────
 
 # Tables the section catalog does not classify today. A table that is

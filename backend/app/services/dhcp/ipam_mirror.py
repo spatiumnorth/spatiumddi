@@ -69,12 +69,17 @@ async def insert_ipam_mirror_row(db: Any, row: IPAddress) -> tuple[IPAddress, bo
             await db.flush()
         return row, True
     except IntegrityError:
+        # Locked (#2580): every caller decides what to do with the incumbent
+        # from its status, and that decision has to hold until it commits.
         existing = (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.subnet_id == subnet_id,
                     IPAddress.address == address,
                 )
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if existing is None:
