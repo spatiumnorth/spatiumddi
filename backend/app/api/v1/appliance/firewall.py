@@ -941,6 +941,11 @@ async def effective(
     ap = await load_appliance_policy(db, row.id)
     body = _render_for(inputs, ps, ap)
     state = await db.get(FirewallApplyState, row.id)
+    enforced = bool(inputs["firewall_enabled"])
+    # #2794 — drift is "the server render is enforced and the node hasn't
+    # applied it". With enforcement off nothing is expected of the node, so
+    # drift is False whatever hash an earlier enforced render left behind.
+    rendered_hash = getattr(state, "rendered_hash", None) if enforced else None
     return EffectiveResponse(
         appliance_id=row.id,
         hostname=row.hostname,
@@ -948,11 +953,11 @@ async def effective(
         config_hash=hashlib.sha256(body.encode("utf-8")).hexdigest(),
         firewall_conf=body,
         layers=_layer_breakdown(body),
-        rendered_hash=getattr(state, "rendered_hash", None),
+        rendered_hash=rendered_hash,
         applied_hash=getattr(state, "applied_hash", None),
         applied_status=getattr(state, "applied_status", None),
         base_conf_marker=getattr(state, "base_conf_marker", None),
-        drift=bool(state and state.rendered_hash and state.rendered_hash != state.applied_hash),
+        drift=bool(state and rendered_hash and rendered_hash != state.applied_hash),
     )
 
 

@@ -53,6 +53,41 @@ logger = structlog.get_logger(__name__)
 # the appliance shape.
 _AGENT_ADDRESS_LINE = "agentAddress udp:161,udp6:[::1]:161"
 
+# AgentX master socket (issue #2154). lldpd's "Expose via SNMP" toggle
+# (#348) runs ``lldpd -x``, which registers LLDP-MIB as an AgentX
+# *subagent* — and that only works when snmpd is an AgentX *master*.
+# net-snmp does not take the master role unless ``master agentx`` is
+# configured; Debian's stock snmpd.conf carries the line, but this
+# renderer REPLACES that file, so it has to carry it too or the LLDP
+# toggle silently does nothing.
+#
+# Emitted whenever SNMP is enabled, not only when the LLDP toggle is on:
+# it is a local unix socket (no listener on the network, nothing for
+# nftables to open) restricted to root by ``agentXPerms``, so it exposes
+# nothing; and keeping it unconditional means the snmpd config does not
+# depend on LLDP settings — flipping the LLDP toggle never has to
+# restart snmpd, and a later subagent (the planned SPATIUMDDI-MIB) needs
+# no second switch.
+#
+# ``/run/agentx`` is the directory Debian's snmpd.service already creates
+# (``RuntimeDirectory=agentx``): tmpfs, so a stale socket never survives
+# a reboot the way one under the persistent /var would. lldpd is pointed
+# at the same path explicitly (``-X``, see ``lldp.render_lldpd_daemon_args``)
+# rather than relying on both sides' compiled-in defaults agreeing.
+#
+# 0600 / 0700 root-only is enough for lldpd: its monitor process keeps
+# CAP_DAC_OVERRIDE after dropping to ``_lldpd`` and connects fine —
+# verified against Debian 13's snmpd 5.9.4 + lldpd 1.0.18, including the
+# reconnect after an snmpd restart (lldpd's AgentX ping re-registers
+# within ~15 s, so the reload runner does not need to bounce lldpd).
+AGENTX_SOCKET = "/run/agentx/master"
+_AGENTX_LINES = (
+    "# AgentX master — lets local subagents (lldpd -x → LLDP-MIB) register.",
+    "master agentx",
+    f"agentXSocket {AGENTX_SOCKET}",
+    "agentXPerms 0600 0700",
+)
+
 # net-snmp Debian ships a default that loads HOST-RESOURCES + DISMAN
 # implicitly; we don't have to ``load`` them explicitly. The lines
 # below are the minimum operator-meaningful config — sysContact /
@@ -123,6 +158,9 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     # View that exposes the whole MIB tree to authorised queries.
     # Per-OID restrictions are out of scope for the first cut.
     lines.append("view all included .1")
+    lines.append("")
+
+    lines.extend(_AGENTX_LINES)
     lines.append("")
 
     version = (settings.snmp_version or "v2c").strip()

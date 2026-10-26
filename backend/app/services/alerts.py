@@ -4383,6 +4383,15 @@ async def _matching_firewall_apply_stalled_subjects(
     """
     from app.models.appliance import Appliance  # noqa: PLC0415
     from app.models.firewall import FirewallApplyState  # noqa: PLC0415
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    # #2794 — with enforcement off nothing is expected of the node; a stale
+    # rendered_hash must not keep the alarm open.
+    enforced = (
+        await db.execute(select(PlatformSettings.firewall_enabled).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if not enforced:
+        return []
 
     rows = (
         await db.execute(

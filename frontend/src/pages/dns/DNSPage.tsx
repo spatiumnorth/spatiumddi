@@ -5765,7 +5765,14 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                     className={`inline-block h-2 w-2 rounded-full ${dotCls[s.status] ?? "bg-muted"}`}
                     title={`status: ${s.status}${s.last_health_check_at ? ` · last check: ${new Date(s.last_health_check_at).toLocaleString()}` : " · never checked"}`}
                   />
-                  <span className="text-sm font-medium">{s.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => setDetailServer(s)}
+                    aria-label={`View details of ${s.name}`}
+                    className="text-sm font-medium hover:underline focus-visible:underline focus:outline-none"
+                  >
+                    {s.name}
+                  </button>
                   <span
                     className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusCls[s.status] ?? "bg-muted text-muted-foreground"}`}
                   >
