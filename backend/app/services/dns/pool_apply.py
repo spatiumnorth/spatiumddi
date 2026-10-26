@@ -78,6 +78,10 @@ async def apply_pool_state(
             deleted += 1
 
     for member in pool.members:
+        # Deliberately fail-open on an OLD verdict (#2312): ``last_check_at`` is not
+        # consulted here, so a stopped health checker keeps the last-known set
+        # rather than emptying the answer. Staleness is surfaced instead (see
+        # ``pool_health_staleness`` and the ``dns_pool_health_stale`` alert).
         # A disabled pool renders nothing: every record it owns is removed
         # (#1974), and re-enabling restores the healthy + enabled members.
         should_render = (
