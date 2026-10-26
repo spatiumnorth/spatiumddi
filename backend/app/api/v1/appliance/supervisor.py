@@ -58,7 +58,7 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func as sa_func
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -3170,6 +3170,23 @@ async def supervisor_heartbeat(
                     "last_rendered_at": rendered_at,
                 },
             )
+        )
+        await db.commit()
+    else:
+        # #2794 — enforcement off: there is no server render this node is
+        # expected to match. Drop the stale hash (and the stall watermark) so
+        # drift / the apply-stalled alarm read clean and re-enabling starts
+        # from a fresh render rather than the last enforced one.
+        await db.execute(
+            update(FirewallApplyState)
+            .where(
+                FirewallApplyState.appliance_id == row.id,
+                or_(
+                    FirewallApplyState.rendered_hash.is_not(None),
+                    FirewallApplyState.stalled_since.is_not(None),
+                ),
+            )
+            .values(rendered_hash=None, stalled_since=None)
         )
         await db.commit()
 
