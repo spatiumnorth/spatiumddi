@@ -87,6 +87,43 @@ def _describe(fqdn: str, name: str, rtype: str, value: str, ttl: int | None) -> 
     return {"name": name, "fqdn": fqdn, "record_type": rtype, "value": value, "ttl": ttl}
 
 
+# The glue the BIND9 agent renders beside its placeholder apex NS, for a zone
+# that names no name server of its own (#2841). It is the renderer's own
+# data, not an external writer's, so it is never mirrored.
+_PLACEHOLDER_LABEL = "ns1"
+_PLACEHOLDER_ADDRESS = "127.0.0.1"
+
+
+def _placeholder_glue_in_use(zone: DNSZone, managed: list[DNSRecord]) -> bool:
+    """True when the agent's renderer falls back to ``ns1.<zone>`` + glue.
+
+    Mirrors ``_zone_apex`` in the agent's BIND9 driver: no managed NS record
+    at the apex, and no usable ``primary_ns`` (empty, or inside the zone
+    with no managed address of its own). ``managed`` is every live row that
+    is not an external mirror, since only those reach the agent's bundle.
+    """
+    if any(r.record_type.upper() == "NS" and r.name in ("@", "") for r in managed):
+        return False
+    origin = zone.name.rstrip(".").lower()
+    primary = (zone.primary_ns or "").strip().rstrip(".").lower()
+    if not primary:
+        return True
+    if not primary.endswith("." + origin):
+        return False  # resolves wherever it lives; no placeholder
+    label = primary[: -(len(origin) + 1)]
+    return not any(
+        r.record_type.upper() in ("A", "AAAA") and r.name.lower() == label for r in managed
+    )
+
+
+def _is_placeholder_glue(name: str, rtype: str, value: str) -> bool:
+    return (
+        name.lower() == _PLACEHOLDER_LABEL
+        and rtype.upper() == "A"
+        and value.strip() == _PLACEHOLDER_ADDRESS
+    )
+
+
 def _is_apex_ns(name: str, rtype: str) -> bool:
     # The zone's own delegation NS at the apex is zone-management data, not
     # an external writer's record. Sub-label NS (delegations) are kept.
@@ -139,12 +176,21 @@ async def reconcile_external_records(
         if r.import_source == EXTERNAL_IMPORT_SOURCE
     }
 
+    # An earlier build mirrored the placeholder glue as an external row. It is
+    # simply never "desired" here, so the vanished-row sweep below removes it.
+    placeholder_in_use = _placeholder_glue_in_use(
+        zone, [r for r in existing if r.import_source != EXTERNAL_IMPORT_SOURCE]
+    )
+
     zone_name_no_dot = zone.name.rstrip(".")
     desired_keys: set[tuple[str, str, str]] = set()
 
     for rec in incoming:
         rtype = rec.record_type.upper()
         if rtype in _IGNORED_TYPES or _is_apex_ns(rec.name, rtype):
+            result.skipped_ignored += 1
+            continue
+        if placeholder_in_use and _is_placeholder_glue(rec.name, rtype, rec.value):
             result.skipped_ignored += 1
             continue
         if (rec.name.lower(), rtype) in managed_nt:
