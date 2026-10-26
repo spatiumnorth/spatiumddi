@@ -62,5 +62,9 @@ def test_appliance_operator_does_not_claim_full_control() -> None:
     assert "full control" not in desc.lower()
     assert "superadmin" in desc.lower()
     assert "upgrade-image store" in desc
-    # The description was the only thing that changed: the grant is untouched.
-    assert perms == [{"action": "admin", "resource_type": "appliance"}]
+    # #2620 changed only the description: the appliance grant is untouched,
+    # beside the alert read every builtin role carries (#2588).
+    assert perms == [
+        {"action": "admin", "resource_type": "appliance"},
+        {"action": "read", "resource_type": "alert"},
+    ]

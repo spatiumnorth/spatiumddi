@@ -240,7 +240,21 @@ export function AVFlowsPage() {
                 {flowsQ.isLoading ? (
                   "Loading AV flows…"
                 ) : (
-                  <ListEmpty error={flowsQ.error} what="AV flows">
+                  <ListEmpty
+                    error={flowsQ.error}
+                    what="AV flows"
+                    filtered={
+                      search.trim() !== "" ||
+                      protocolFilter !== "" ||
+                      ptpFilter.trim() !== ""
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setProtocolFilter("");
+                      setPtpFilter("");
+                      setPage(1);
+                    }}
+                  >
                     No AV flows recorded. Stamp a multicast group as an AV flow
                     to start documenting the plant.
                   </ListEmpty>

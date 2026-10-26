@@ -98,6 +98,7 @@ def register(
     supervisor_version: str,
     client: httpx.Client,
     appliance_variant: str | None = None,
+    restore_roles: dict[str, object] | None = None,
     max_attempts: int = 60,
     backoff_seconds: float = 2.0,
 ) -> RegisterResult:
@@ -117,6 +118,12 @@ def register(
         # + auto-assigns the variant's fixed role set at register time
         # instead of waiting for the first heartbeat.
         payload["appliance_variant"] = appliance_variant
+    if restore_roles:
+        # #2801 — the roles this node was serving before its Fleet row went
+        # away (``role_orchestrator.last_assigned_roles``). The control plane
+        # restores them only on a self-bootstrap registration, and audits it;
+        # an older control plane ignores the field.
+        payload["restore_roles"] = restore_roles
     url = control_plane_url.rstrip("/") + "/api/v1/appliance/supervisor/register"
 
     last_error: str | None = None

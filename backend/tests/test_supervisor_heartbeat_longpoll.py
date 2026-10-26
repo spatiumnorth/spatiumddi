@@ -43,7 +43,7 @@ async def _enable(db: AsyncSession) -> None:
     if s is None:
         s = PlatformSettings(id=1)
         db.add(s)
-    # Supervisor endpoints 404 unless the registration flag is on.
+    # Only /supervisor/register needs the flag since #2798; kept on for parity.
     s.supervisor_registration_enabled = True
     await db.flush()
 
