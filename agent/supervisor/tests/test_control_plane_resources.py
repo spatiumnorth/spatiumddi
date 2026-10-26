@@ -78,13 +78,16 @@ def test_sizing_scales_with_ram_inside_the_clamps() -> None:
     six = k8s_api.control_plane_resources(6144)
     assert _limit(six, "api") == "2048Mi"
     assert _limit(six, "worker") == "1024Mi"
-    assert _limit(six, "postgresql") == "1024Mi"
+    # #2156 — the share is the chart's 1Gi floor, which cannot hold one
+    # node's 51 connections at 15 MiB beside 256MB of shared_buffers.
+    assert _limit(six, "postgresql") == "1277Mi"
     # Floors: a 2 GiB box still gets the minimum the bundle build needs, and
-    # the database never gets less than the chart ships (1Gi, 256MB).
+    # the database never gets less than the chart ships (1Gi, 256MB) or than
+    # its connections need (#2156).
     small = k8s_api.control_plane_resources(2048)
     assert _limit(small, "api") == "1024Mi"
     assert _limit(small, "worker") == "1024Mi"
-    assert _limit(small, "postgresql") == "1024Mi"
+    assert _limit(small, "postgresql") == "1277Mi"
     assert small["postgresql"]["cnpg"]["parameters"]["shared_buffers"] == "256MB"
     # #2240 — the scale lab's 24 GiB node: the worker's 2/5 share (~8.8
     # GiB) is under what the api's and Postgres' caps leave (10 GiB).
@@ -124,7 +127,10 @@ def test_the_budget_fits_the_node_beside_the_reserve() -> None:
     the seven-node lab bottomed out at 551 MiB MemAvailable under load."""
     # #2240 — still true with the worker's larger share: it only takes what
     # the api and Postgres leave.
-    for mem in (6144, 8192, 12288, 16384, 20480, 22528, 24030, 24576, 32768, 65536):
+    # #2156 — from 8 GiB: below it the Postgres limit is raised past its
+    # share to hold one node's connections (6 GiB: 1277Mi), a ceiling 253 MiB
+    # over the reserve rather than a cgroup kill of the database.
+    for mem in (8192, 12288, 16384, 20480, 22528, 24030, 24576, 32768, 65536):
         s = k8s_api.control_plane_sizing(mem)
         assert s["api"] + s["worker"] + s["postgres"] + 2048 <= mem, (mem, s)
     s = k8s_api.control_plane_sizing(12288)
@@ -134,6 +140,9 @@ def test_the_budget_fits_the_node_beside_the_reserve() -> None:
         "postgres": 2560,
         "shared_buffers": 640,
         "postgres_request": 640,
+        "concurrency": 2,
+        "postgres_connections": 51,
+        "max_connections": 200,
     }
 
 
@@ -225,9 +234,14 @@ def test_the_overrides_carry_the_sizing_and_state_the_redis_kind(monkeypatch) ->
     # #1115 — the database's limit and shared_buffers sit beside the instance
     # count, under the one ``postgresql`` key the chart reads.
     assert doc["postgresql"] == {
-        "cnpg": {"instances": 1, "parameters": {"shared_buffers": "384MB"}},
+        "cnpg": {
+            "instances": 1,
+            "parameters": {"shared_buffers": "384MB", "max_connections": "200"},
+        },
         "resources": {"requests": {"memory": "384Mi"}, "limits": {"memory": "1536Mi"}},
     }
+    # #2156 — one node keeps the application's own pool.
+    assert doc["api"]["databasePool"] == {"size": 10, "maxOverflow": 20}
     assert doc["redis"] == {"kind": "sentinel", "sentinel": {"replicas": 1}}
 
 
@@ -243,11 +257,18 @@ def test_the_overrides_carry_the_cpu_limits_2240(monkeypatch) -> None:
     doc = rec.doc
     assert doc["api"]["resources"] == {"limits": {"memory": "8192Mi", "cpu": "2000m"}}
     assert doc["worker"]["resources"] == {"limits": {"memory": "9011Mi"}}
+    # #2156 — seven api pods share ~120 connections, and the cluster can open
+    # 242 with four worker processes and the #2782 hooks: the limit passes
+    # the 4 GiB share (1024 + 256 + 242 x 16) and max_connections the 200.
+    assert doc["api"]["databasePool"] == {"size": 10, "maxOverflow": 7}
     assert doc["postgresql"] == {
-        "cnpg": {"instances": 7, "parameters": {"shared_buffers": "1024MB"}},
+        "cnpg": {
+            "instances": 7,
+            "parameters": {"shared_buffers": "1024MB", "max_connections": "242"},
+        },
         "resources": {
             "requests": {"memory": "1024Mi"},
-            "limits": {"memory": "4096Mi", "cpu": "4000m"},
+            "limits": {"memory": "5152Mi", "cpu": "4000m"},
         },
     }
 
@@ -324,8 +345,16 @@ def test_an_operators_own_postgres_parameters_survive_the_merge(monkeypatch) -> 
     assert ok
     doc = rec.doc
     assert doc["postgresql"] == {
-        "cnpg": {"instances": 3, "parameters": {"work_mem": "32MB", "shared_buffers": "640MB"}},
-        "resources": {"requests": {"memory": "640Mi"}, "limits": {"memory": "2560Mi"}},
+        "cnpg": {
+            "instances": 3,
+            "parameters": {
+                "work_mem": "32MB",
+                "shared_buffers": "640MB",
+                "max_connections": "200",
+            },
+        },
+        # #2156 — three nodes' connections (131 x 16 MiB + 640 + 256).
+        "resources": {"requests": {"memory": "640Mi"}, "limits": {"memory": "2992Mi"}},
     }
 
 

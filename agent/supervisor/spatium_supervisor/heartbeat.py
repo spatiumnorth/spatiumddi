@@ -75,6 +75,8 @@ log = structlog.get_logger(__name__)
 # subprocess piece). C2 ships only the env render; C3 wires the
 # actual ``docker compose up -d`` invocation.
 _ROLE_ENV_FILENAME = "role-compose.env"
+# #2801 — read by the re-register path in ``__main__``.
+ROLE_ENV_FILENAME = _ROLE_ENV_FILENAME
 
 # #170 Wave C3 — nftables drop-in path. Lives under /etc/nftables.d
 # (bind-mounted rw on the supervisor compose entry). The host's
@@ -945,6 +947,51 @@ def next_heartbeat_delay(
     return rearm_floor_s if held else float(interval_s)
 
 
+
+# #2798 — how the control plane says "this appliance is revoked" on a
+# heartbeat: a 403 carrying this header (``revoked`` for a revoked row,
+# ``unknown`` when no row accepts the credential). Mirrors
+# ``REVOCATION_HEADER`` in ``backend/app/api/v1/appliance/supervisor.py``.
+REVOCATION_HEADER = "X-Spatium-Revocation"
+# The 403 details a control plane from before the header answered for the
+# same two refusals. Recognised so a supervisor upgraded ahead of its
+# control plane still stops when it is revoked or deleted.
+_LEGACY_REVOCATION_DETAILS = (
+    ("Appliance has been revoked.", "revoked"),
+    ("Invalid appliance or session.", "unknown"),
+)
+
+
+def _refusal_detail(resp: httpx.Response) -> str | None:
+    try:
+        detail = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    return detail if isinstance(detail, str) else None
+
+
+def revocation_reason(resp: httpx.Response) -> str | None:
+    """The revocation the control plane stated on this heartbeat response,
+    or None when it stated none (#2798).
+
+    Only a 403 can be one: the marked 403 from a current control plane, or
+    one of the two legacy 403 details. A 404 never is — it said "registration
+    is switched off" on older control planes and says "nothing is mounted
+    here" behind a proxy, and reading it as a revocation took DNS and DHCP
+    down on every appliance when pairing was switched off."""
+    if resp.status_code != 403:
+        return None
+    marker = resp.headers.get(REVOCATION_HEADER)
+    if marker:
+        return marker.strip().lower() or "revoked"
+    detail = _refusal_detail(resp)
+    if detail:
+        for prefix, reason in _LEGACY_REVOCATION_DETAILS:
+            if detail.startswith(prefix):
+                return reason
+    return None
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -1112,19 +1159,34 @@ def heartbeat_once(
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
         return None
-    if resp.status_code == 403 or resp.status_code == 404:
-        # 403 = approval revoked or cert no longer valid for any
-        # known appliance row. 404 = appliance row deleted, or the
-        # control plane's supervisor_registration_enabled flag is
-        # off. Both mean "you shouldn't be talking to me anymore" —
-        # increment the consecutive-strike counter; flip to
-        # ``revoked`` once REVOCATION_STRIKE_LIMIT in a row, which
-        # de-noises a short control-plane restart.
+    revocation = revocation_reason(resp)
+    if revocation is None and resp.status_code in (403, 404):
+        # #2798 — a refusal that is NOT the control plane's revocation
+        # answer: a 404 (a proxy, an api whose router is not mounted, an
+        # older api whose registration flag was switched off) or a 403
+        # without the marker. None of these says the row is gone, so it is
+        # no strike and nothing is torn down: the role services keep
+        # serving from the last applied assignment (non-negotiable #5) and
+        # this keeps being logged until the heartbeat is accepted again.
+        log.warning(
+            "supervisor.heartbeat.refused_not_revocation",
+            status_code=resp.status_code,
+            detail=_refusal_detail(resp),
+            appliance_id=str(appliance_id),
+        )
+        return False
+    if revocation is not None:
+        # 403 marked as a revocation: the row is revoked, or no row
+        # accepts our credential (deleted, or re-keyed). Increment the
+        # consecutive-strike counter; flip to ``revoked`` once
+        # REVOCATION_STRIKE_LIMIT in a row, which de-noises a short
+        # control-plane restart.
         prior_state = approval_state.read_state(cfg.state_dir)
         new_state, strikes = approval_state.record_revocation_signal(cfg.state_dir)
         log.warning(
             "supervisor.heartbeat.rejected",
             status_code=resp.status_code,
+            revocation=revocation,
             strikes=strikes,
             new_state=new_state,
             appliance_id=str(appliance_id),
@@ -1144,6 +1206,14 @@ def heartbeat_once(
             if appliance_state.detect_deployment_kind() == "appliance":
                 try:
                     lifecycle = tear_down_supervised_services()
+                    # #2801 — the stamp says the role chart for this env is
+                    # applied, and the teardown just un-applied it. Left in
+                    # place, the first accepted heartbeat after the node is
+                    # approved again (same row, or a re-registration that
+                    # restored its roles) renders the same env, matches the
+                    # stamp and skips the apply, so DNS and DHCP stayed down
+                    # until the watchdog's next pass (up to 5 min).
+                    _clear_last_apply_hash(cfg.state_dir)
                     if lifecycle.stopped:
                         log.warning(
                             "supervisor.heartbeat.revoked_teardown",
@@ -2039,6 +2109,17 @@ def _write_last_apply_hash(state_dir: Path, env_hash: str) -> None:
         pass
 
 
+def _clear_last_apply_hash(state_dir: Path) -> None:
+    """Drop the apply stamp so the next accepted heartbeat re-applies the role
+    chart (#2801), whatever env it renders."""
+    try:
+        (state_dir / _LAST_APPLY_HASH_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        # Best effort: a stamp left behind only means the next apply may be
+        # skipped as unchanged, which the role watchdog then re-fires.
+        log.warning("supervisor.heartbeat.apply_stamp_clear_failed", error=str(exc))
+
+
 def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:
     """Write the most recent compose-lifecycle outcome to disk so the
     NEXT heartbeat reports it (this one has already left)."""
@@ -2067,3 +2148,8 @@ def _read_lifecycle_state(state_dir: Path) -> tuple[str | None, str | None]:
     state = body[0].strip() if body else None
     reason = "\n".join(body[1:]).strip() or None if len(body) > 1 else None
     return state, reason
+
+
+# #2801 — the re-register path reports the last apply's outcome with the roles
+# it asks the control plane to restore.
+read_lifecycle_state = _read_lifecycle_state
