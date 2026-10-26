@@ -2038,6 +2038,19 @@ def _named_zone_state(
     return _NamedZoneState(text, records, serial)
 
 
+def _record_set(state: _NamedZoneState) -> frozenset[str]:
+    """A zone's records for comparison, the SOA serial aside."""
+    out: set[str] = set()
+    for key, line in state.records:
+        if key.endswith(" SOA"):
+            parts = line.split()
+            if len(parts) >= 7:
+                parts[6] = "0"  # owner ttl IN SOA mname rname SERIAL ...
+            line = " ".join(parts)
+        out.add(line)
+    return frozenset(out)
+
+
 def _carried_records(
     state: _NamedZoneState, origin: str, staged: set[str], owned: set[str] | None
 ) -> tuple[list[str], list[str]]:
@@ -3646,13 +3659,18 @@ class Bind9Driver(DriverBase):
             changed |= carry
         frozen: dict[tuple[str, str | None], int | None] = {}
         if rndc and current.exists() and self.daemon_running():
-            frozen = self._freeze_before_swap(base, new_dir, current, changed)
+            frozen = self._freeze_before_swap(
+                base, new_dir, current, changed, carry=carry
+            )
         # Until thawed, a zone frozen here refuses every update: whatever
         # fails below, nothing may leave it frozen.
         still_frozen = set(frozen)
         try:
-            if carry:
-                self._carry_dynamic_updates(new_dir, prev_tree, carry, frozen)
+            # Zones no running named froze (a start, or a freeze refused):
+            # the frozen ones were carried inside the freeze (#2850).
+            unfrozen = carry - frozen.keys()
+            if unfrozen:
+                self._carry_dynamic_updates(new_dir, prev_tree, unfrozen, frozen)
             # The serial each changed zone has to be served under: the
             # render's, read before the swap, so nothing written to the live
             # file afterwards can stand in for it.
@@ -3778,13 +3796,20 @@ class Bind9Driver(DriverBase):
             (_CARRY_MARKER + "\n" + rendered + "\n".join(lines) + "\n").encode(),
         )
         if not frozen and state.serial is not None:
-            # No running named moved the render past the serial it served
-            # (``_freeze_and_wait``), so do it here: these records are data
-            # a secondary may not have, and must not come back under a serial
-            # it already holds.
+            # No running named decided this zone's serial (``_freeze_and_wait``
+            # does on a running one), so do it here, by the same rule. A render
+            # not later than named's serial is served at named's serial when
+            # it holds exactly what named served, so a restart does not move
+            # it (#2835, D5), and one past it otherwise: new data must not
+            # come back under a serial a secondary already holds.
             serial = _soa_serial(staged)
             if serial is None or not _serial_later(serial, state.serial):
-                _set_rendered_serial(staged, (state.serial + 1) % 2**32 or 1)
+                merged = _named_zone_state(zname, staged, new_dir)
+                same = merged is not None and (
+                    _record_set(merged) == _record_set(state)
+                )
+                target = state.serial if same else (state.serial + 1) % 2**32 or 1
+                _set_rendered_serial(staged, target)
         reason = self._checkzone(new_dir, zv)
         if reason is not None:
             self._stage_named_copy(staged, live, state)
@@ -4018,6 +4043,7 @@ class Bind9Driver(DriverBase):
         new_dir: Path,
         live: Path,
         changed: set[tuple[str, str | None]] | None,
+        carry: Collection[tuple[str, str | None]] = (),
     ) -> dict[tuple[str, str | None], int | None]:
         """Freeze each changed zone named serves, and wait until named has
         written it to its live file, before the new render goes in (#1407).
@@ -4060,7 +4086,9 @@ class Bind9Driver(DriverBase):
         # the pool, #2180, or the wait below), it thaws them itself.
         froze: list[tuple[str, str | None]] = []
         try:
-            return self._freeze_and_wait(base, new_dir, live, changed, froze)
+            return self._freeze_and_wait(
+                base, new_dir, live, changed, froze, carry=carry
+            )
         except BaseException:
             if froze:
                 self._thaw(base, list(froze))
@@ -4073,9 +4101,15 @@ class Bind9Driver(DriverBase):
         live: Path,
         changed: set[tuple[str, str | None]] | None,
         froze: list[tuple[str, str | None]],
+        carry: Collection[tuple[str, str | None]] = (),
     ) -> dict[tuple[str, str | None], int | None]:
         """``_freeze_before_swap``'s body; appends each zone to ``froze`` the
-        moment named confirms the freeze."""
+        moment named confirms the freeze.
+
+        ``carry``: dynamic zones whose RFC 2136 records are carried into the
+        render (#2850). Done here, once named has written each frozen one
+        out and before the serial is decided, so the serial is decided on
+        the data that will be served, carried records included."""
         candidates = [
             (zname, view)
             for zname, view in _zone_views_under(new_dir)
@@ -4127,6 +4161,9 @@ class Bind9Driver(DriverBase):
                 file_serial=_soa_serial(live / _zone_rel(zname, view)),
                 waited_s=_ZONE_DUMP_TIMEOUT_S,
             )
+        carried = [zv for zv in frozen if zv in carry]
+        if carried:
+            self._carry_dynamic_updates(new_dir, live, carried, frozen)
         for (zname, view), serving in frozen.items():
             staged = new_dir / _zone_rel(zname, view)
             serial = _soa_serial(staged)

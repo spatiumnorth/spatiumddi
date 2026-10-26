@@ -47,7 +47,10 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 
 
 def _bundle(
-    records: list[tuple[str, str, str]], ttl: int = 3600, view: str | None = None
+    records: list[tuple[str, str, str]],
+    ttl: int = 3600,
+    view: str | None = None,
+    other: str | None = None,
 ) -> dict:
     zone = {
         "name": _ZONE,
@@ -76,6 +79,20 @@ def _bundle(
         ],
         "zones": [zone],
     }
+    if other:
+        # A second zone, so an apply can be structural without touching this one.
+        bundle["zones"].append(
+            {
+                "name": "other.example.",
+                "type": "primary",
+                "ttl": 3600,
+                "serial": 1,
+                "dynamic_update_enabled": False,
+                "update_acl": [],
+                "allow_transfer": None,
+                "records": [{"name": "x", "type": "A", "value": other, "ttl": 300}],
+            }
+        )
     if view:
         zone["view_name"] = view
         bundle["views"] = [{"name": view, "match_clients": ["any"], "recursion": False}]
@@ -292,6 +309,56 @@ def views(state: Path) -> None:
     _stop(driver)
 
 
+def serial_stable(state: Path) -> None:
+    from spatium_dns_agent.drivers import bind9
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    print("\n=== a zone carrying an RFC 2136 record keeps its serial ===")
+    driver = Bind9Driver(state_dir=state)
+    base = [("www", "A", "192.0.2.1")]
+    driver.apply_config(_bundle(base, other="192.0.2.100"))
+    check(
+        "a third party adds dc01",
+        _nsupdate(adds=[("dc01", 600, "A", "10.9.9.9")]) == "NOERROR",
+    )
+    served = _serial()
+    # Structural applies that change another zone only. The serial a running
+    # named keeps through them is #2835's rule (``_same_zone_data``); main
+    # before it moves every zone named is ahead of on every structural apply.
+    keeps = hasattr(bind9, "_same_zone_data")
+    for n in range(3):
+        driver.apply_config(_bundle(base, other=f"192.0.2.{101 + n}"))
+        check(
+            f"structural apply {n + 1}: dc01 still served",
+            _q("dc01") == "10.9.9.9",
+            _q("dc01"),
+        )
+        if keeps:
+            check(
+                f"structural apply {n + 1}: the serial does not climb",
+                _serial() == served,
+                f"{served} -> {_serial()}",
+            )
+        else:
+            print(
+                f"  NOTE  structural apply {n + 1}: serial {_serial()} (no #2835 rule here)"
+            )
+    served = _serial()
+    for n in range(3):
+        _stop(driver)
+        driver = Bind9Driver(state_dir=state)
+        driver.apply_config(_bundle(base, other="192.0.2.103"))
+        check(
+            f"restart {n + 1}: dc01 still served", _q("dc01") == "10.9.9.9", _q("dc01")
+        )
+        check(
+            f"restart {n + 1}: the serial does not climb",
+            _serial() == served,
+            f"{served} -> {_serial()}",
+        )
+    _stop(driver)
+
+
 def main() -> int:
     for tool in ("named", "rndc", "rndc-confgen", "named-compilezone"):
         if not shutil.which(tool):
@@ -303,6 +370,7 @@ def main() -> int:
         lambda s: flat(s, signal.SIGTERM),
         lambda s: flat(s, signal.SIGKILL),
         views,
+        serial_stable,
     ]
     for case in cases:
         state = Path(tempfile.mkdtemp(prefix="ddns-restart-check-"))

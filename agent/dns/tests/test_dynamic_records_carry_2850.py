@@ -90,8 +90,15 @@ class Named:
     named-checkzone accepts (unless told not to), rndc answers like a named
     that serves serial 9 until a reload makes it serve the staged file."""
 
-    def __init__(self, state: str = NAMED_STATE, checkzone_ok: bool = True):
+    def __init__(
+        self,
+        state: str = NAMED_STATE,
+        checkzone_ok: bool = True,
+        staged_state: str | None = None,
+    ):
         self.state = state
+        # What a staged (merged) file reads back as; by default not named's.
+        self.staged_state = staged_state
         self.checkzone_ok = checkzone_ok
         self.calls: list[list[str]] = []
         self.reloaded = False
@@ -106,7 +113,13 @@ class Named:
         out = ""
         rc = 0
         if tool == "named-compilezone":
-            Path(cmd[cmd.index("-o") + 1]).write_text(self.state)
+            staged = "rendered.new" in cmd[-1]
+            text = self.state
+            if staged:
+                text = self.staged_state or self.state.replace(
+                    "gone.dyn.test.\t300 IN A\t192.0.2.2\n", ""
+                )
+            Path(cmd[cmd.index("-o") + 1]).write_text(text)
         elif tool == "named-checkzone":
             rc = 0 if self.checkzone_ok else 1
             out = "" if self.checkzone_ok else "dyn.test: CNAME and other data"
@@ -250,6 +263,24 @@ def test_a_merge_named_refuses_holds_the_zone_back_on_named_copy(
     assert driver.held_back == (
         HeldZone(ZONE, None, "dyn.test: CNAME and other data", True),
     )
+
+
+def test_a_start_keeps_named_serial_when_the_merge_is_what_named_served(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restarting with nothing changed must not move the serial (#2835, D5):
+    the render plus the carried records is exactly what named served."""
+    records = [("www", "A", "192.0.2.1"), ("gone", "A", "192.0.2.2")]
+    live_file = _previous_tree(driver, records)
+    live_file.with_name(live_file.name + ".jnl").write_bytes(b"journal")
+    monkeypatch.setattr(bind9.subprocess, "run", Named(staged_state=NAMED_STATE))
+    _boot(driver, monkeypatch)
+
+    driver.render(_bundle(records))
+    driver.swap_and_reload()
+
+    assert "dc01.dyn.test. 600 IN A 10.9.9.9" in live_file.read_text()
+    assert _soa_serial(live_file) == 9
 
 
 # ── a structural re-render on a running named ─────────────────────────────────
