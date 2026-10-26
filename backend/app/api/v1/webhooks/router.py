@@ -46,6 +46,7 @@ from app.services.event_publisher import (
     _RESOURCE_NAMESPACE,
     _SPECIAL_EVENT_MAP,
     _VERB_MAP,
+    subscriptions_cache,
 )
 from app.services.forward_secrets import url_display
 
@@ -323,6 +324,7 @@ async def create_subscription(
     )
     try:
         await db.commit()
+        subscriptions_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
@@ -370,6 +372,7 @@ async def update_subscription(
     )
     try:
         await db.commit()
+        subscriptions_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
@@ -393,6 +396,7 @@ async def delete_subscription(sub_id: uuid.UUID, user: SuperAdmin, db: DB) -> No
     )
     await db.delete(sub)
     await db.commit()
+    subscriptions_cache.invalidate()
 
 
 # ── Test + delivery inspection ─────────────────────────────────────────────
@@ -519,5 +523,6 @@ async def retry_delivery(
         new_value={"state": row.state, "attempts": row.attempts},
     )
     await db.commit()
+    subscriptions_cache.invalidate()
     await db.refresh(row)
     return WebhookDeliveryResponse.model_validate(row, from_attributes=True)
