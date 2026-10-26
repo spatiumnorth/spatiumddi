@@ -173,9 +173,11 @@ def schema_direction_error(source_head: str | None) -> str | None:
     Callable BEFORE anything destructive happens. ``maybe_upgrade_after_
     restore`` performs the same test, but only after the dump has already
     been replayed — at which point refusing is theatre: the database has
-    been overwritten, ``alembic_version`` sits ahead of the running code,
-    and the api's schema-head readiness gate keeps the pod out of the
-    Service until someone upgrades or restores something older (#781).
+    been overwritten and ``alembic_version`` sits ahead of the running
+    code. Readiness keeps every api pod that starts on it out of the
+    Service, and a pod already serving stays in only while every table
+    and column its image uses is present (#2777), until someone upgrades
+    or restores something older (#781).
 
     Returns None when the direction is fine (same head, an ancestor we can
     upgrade, or a manifest that never recorded one).
