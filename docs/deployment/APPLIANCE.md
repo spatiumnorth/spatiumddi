@@ -2821,6 +2821,10 @@ introduced by an upgrade don't clobber operator-created ones.
    out, the slot is not committed; once
    `spatium-k3s-images verify` passes, **Approve trial** in
    Fleet keeps it before the next reboot reverts it.
+   Once k3s's import is over, `spatiumddi-image-unpack.service`
+   unpacks the new release of each image the node runs, one at a
+   time at 32 MiB/s (`spatium-k3s-images unpack`, #2788). The
+   kubelet unpacks whatever it leaves.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
@@ -3408,6 +3412,11 @@ the cluster runs until every node reports the target:
   writing it, with the old tag.
 - When every node is done, the run removes the pins and ends the hold in
   one step. Each node's DNS and DHCP pods restart once at that moment.
+  Each node unpacked their new images right after its own reboot
+  (`spatiumddi-image-unpack.service`), so little or nothing is left to
+  unpack then. Before #2788 every node unpacked 1-2 GB of image layers
+  at this moment, all at once on the `/var` etcd writes its WAL to, and
+  on a shared disk that stalled etcd until a k3s server exited.
 
 A pin, or the removal of the pins, that the kubeapi does not take (a
 request refused or unanswered, as while a k3s server restarts) does
