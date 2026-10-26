@@ -1,1 +1,12 @@
-- **A role just applied no longer reads red `missing` in Fleet for five minutes while its pod is ready** (#2833). The watchdog pass that fell due right after a role apply ran before the chart's pod existed, reported `missing`, cached it for the whole 300 s interval and fired a redundant second apply. For 90 s after an apply a service with no pod yet now reads `starting` and heals nothing, and while any service is `missing` or `starting` the watchdog re-checks every 20 s instead of every 5 min. A chart deleted later on an approved node is still detected and healed, and a revoked or pending node still heals nothing (#2808).
+### Fixed
+
+- **A role just applied no longer reads red `missing` in Fleet for five
+  minutes while its pod is ready (#2833).** The watchdog pass that fell
+  due right after a role apply ran before the chart's pod existed,
+  reported `missing`, cached it for the whole 300 s interval and fired a
+  redundant second apply. For 90 s after an apply, a service with no pod
+  yet now reads `starting` and heals nothing, and while any service is
+  `missing` or `starting` the watchdog re-checks every 20 s instead of
+  every 5 min. A chart deleted later on an approved node is still
+  detected and healed, and a revoked or pending node still heals nothing
+  (#2808).
