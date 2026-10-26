@@ -15,7 +15,10 @@
   value, never a whole-RRset replace, so a value a server holds that
   has not been reported yet is never wiped. A paused server's last
   report is kept, so a writer's change made on it during the pause is
-  propagated on re-enable rather than undone. A change one of our own
+  propagated on re-enable rather than undone; for that, the re-render a
+  re-enable forces (#2281) now waits until the server has reported its
+  dynamic zones (at most 7 minutes), or it would replace the zone with
+  the database's copy before the report could mirror the record. A change one of our own
   ops explains waits for the next report, and a correction that fails
   is retried after 6 hours, not every sweep. A managed record taking
   over a mirrored name drops the mirror without a wire delete, as in a
@@ -28,4 +31,5 @@
 ### Migrations
 
 - `c3f8a2d61e94` — #2654, adds `dns_ingest_snapshot`: each agent
-  server's last DDNS ingest report per dynamic zone.
+  server's last DDNS ingest report per dynamic zone, and
+  `dns_server.zone_resync_pending_since`, a re-enable's owed re-render.

@@ -2509,6 +2509,19 @@ agents. A record arriving on two servers in the same sweep is mirrored once
   instead of being corrected away. A server whose agent was simply offline
   is handled the same way. The stored report is never aged out: however
   long a server was away, what it held when it left is the right baseline.
+  **Re-enabling waits for that report.** Re-enabling a server forces its
+  agent to re-render every zone from the database (#2281), and the
+  re-render replaces each zone with the database's copy: forced at once, it
+  landed a second or two after the re-enable and wiped a record learned
+  during the pause before any report could mirror it. So for a BIND9 or
+  PowerDNS agent in a group with dynamic zones, the re-enable only records
+  that a re-render is owed (`dns_server.zone_resync_pending_since`); the
+  ingest endpoint releases it once that server has reported every dynamic
+  zone of its group, and the 60 s agent stale sweep releases it after 7
+  minutes regardless. The cost: until then (up to one 180 s sweep) the
+  server still serves its pre-pause copy of managed records and
+  non-dynamic zones; changes made after the re-enable reach it as ordinary
+  record ops meanwhile.
 * **Agentless member** (Windows DNS, `technitium_api`, cloud). It does not
   run the ingest loop and is not sent these ops. A group whose only agent is
   a single BIND9 or PowerDNS server behaves as a one-server group.

@@ -195,7 +195,7 @@ from app.services.dns.server_move import (
     lock_server_row,
     move_server_to_group,
 )
-from app.services.dns.server_resync import force_zone_resync
+from app.services.dns.server_resync import resync_after_reenable
 from app.services.dns.technitium_options import (
     allow_query_problem as technitium_query_problem,
 )
@@ -2495,8 +2495,14 @@ async def update_server(
         setattr(server, k, v)
     if reenabled:
         # #2281 — it got no record ops while disabled; make its agent
-        # re-render every zone from the current records.
-        changes["zone_resync_ops_retired"] = await force_zone_resync(db, server)
+        # re-render every zone from the current records. #2654 — where the
+        # agent reads dynamic zones back, the re-render waits for that read,
+        # so a record a writer added on it while it was off is mirrored first.
+        changes["zone_resync_ops_retired"] = await resync_after_reenable(db, server)
+    elif body.is_enabled is False:
+        # A re-render still owed from an earlier re-enable is owed again,
+        # from the next one; nothing is done for a disabled server.
+        server.zone_resync_pending_since = None
 
     # Credentials contract matches DHCP:
     #   None → leave alone, {} → clear, partial dict → decrypt-merge-reencrypt

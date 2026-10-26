@@ -10,6 +10,11 @@ the external (name, type, value) keys the server held. Rows are replaced on
 every report and cascade with their server and zone. No backfill: a server
 with no row is compared against nothing, which only ever adds.
 
+It also adds ``dns_server.zone_resync_pending_since``: a re-enabled server's
+#2281 forced re-render now waits until that server has reported its dynamic
+zones, so records a writer added on it while it was disabled are mirrored
+before the re-render would replace them with the database's copy.
+
 Revision ID: c3f8a2d61e94
 Revises: c4a8e2f7b913
 Create Date: 2026-10-24 09:00:00.000000
@@ -57,8 +62,14 @@ def upgrade() -> None:
     op.create_index(
         "ix_dns_ingest_snapshot_zone_id", "dns_ingest_snapshot", ["zone_id"], unique=False
     )
+    # A re-enabled server's forced re-render waits for its ingest report.
+    op.add_column(
+        "dns_server",
+        sa.Column("zone_resync_pending_since", sa.DateTime(timezone=True), nullable=True),
+    )
 
 
 def downgrade() -> None:
+    op.drop_column("dns_server", "zone_resync_pending_since")
     op.drop_index("ix_dns_ingest_snapshot_zone_id", table_name="dns_ingest_snapshot")
     op.drop_table("dns_ingest_snapshot")

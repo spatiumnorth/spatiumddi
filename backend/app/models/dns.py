@@ -558,6 +558,17 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     zone_resync_seq: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=sa_text("0")
     )
+    # #2654 — set instead of bumping ``zone_resync_seq`` when a server that
+    # reads dynamic zones back (BIND9 / PowerDNS agent ingest) is re-enabled:
+    # the re-render would replace each zone with the database's copy and drop
+    # whatever an RFC 2136 writer added on it while it was disabled, before
+    # its next ingest report could mirror it. The bump happens once that
+    # server has reported every dynamic zone of its group since this time
+    # (``server_resync.complete_deferred_resync``), or after
+    # ``RESYNC_INGEST_WAIT`` regardless. Never rendered. NULL = nothing owed.
+    zone_resync_pending_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:

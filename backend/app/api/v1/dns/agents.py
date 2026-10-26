@@ -1589,9 +1589,15 @@ async def _reconcile_and_audit(
         reconcile_external_records,
         to_summary,
     )
+    from app.services.dns.server_resync import complete_deferred_resync  # noqa: PLC0415
 
     result = await reconcile_external_records(db, zone, incoming, server=server)
     summary: dict[str, Any] = dict(to_summary(result))
+    # #2654 — a re-enabled server's #2281 re-render waits for this: once it
+    # has reported every dynamic zone, what it learned while disabled is in
+    # the database, and the re-render keeps it instead of wiping it.
+    if await complete_deferred_resync(db, server):
+        summary["zone_resync"] = "released"
     if result.mode == "disabled_reporter":
         summary["skipped"] = "server_disabled"
     if summary["added"] or summary["removed"]:

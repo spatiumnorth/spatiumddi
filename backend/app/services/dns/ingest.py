@@ -59,7 +59,9 @@ target server holds at that name.
 The server a record came from is never sent an op for it: it already holds
 the record. A disabled server's report is ignored and its snapshot is kept
 as it was when it was paused, so on re-enable the changes a writer made on it
-meanwhile read as changes.
+meanwhile read as changes. The re-render a re-enable forces (#2281) waits
+for that report (``server_resync.resync_after_reenable``), or it would
+replace the zone with the database's copy first and the change would be gone.
 """
 
 from __future__ import annotations
