@@ -43,6 +43,7 @@ from app.api.deps import DB, CurrentUser, authenticate_bearer
 from app.api.pagination import MAX_PAGE
 from app.api.stream_auth import StreamAuthGuard
 from app.api.v1.probe_guard import enforce_probe_target
+from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission, user_has_permission
 from app.core.responses import EventStreamResponse
 from app.db import get_db
@@ -247,7 +248,7 @@ async def create_scan(body: NmapScanCreate, db: DB, current_user: CurrentUser) -
     try:
         from app.tasks.nmap import run_scan_task  # noqa: PLC0415
 
-        run_scan_task.delay(str(scan.id))
+        await dispatch(run_scan_task, str(scan.id))
     except Exception as exc:  # noqa: BLE001 — broker down
         logger.warning("nmap_scan_dispatch_failed", scan_id=str(scan.id), error=str(exc))
 

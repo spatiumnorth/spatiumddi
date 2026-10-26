@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.core.celery_dispatch import dispatch
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission
 from app.models.acme_client import (
@@ -470,7 +471,7 @@ async def issue_certificate(
     # include list and task_routes so this dispatch can't silently fail).
     from app.tasks.acme import run_acme_order  # noqa: PLC0415
 
-    run_acme_order.delay(str(order.id))
+    await dispatch(run_acme_order, str(order.id))
     logger.info(
         "acme_client_order_enqueued",
         order_id=str(order.id),

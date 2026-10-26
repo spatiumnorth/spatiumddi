@@ -3,7 +3,7 @@ import binascii
 import re
 import sys
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.request_meta import (
@@ -359,6 +359,15 @@ class Settings(BaseSettings):
     # returns the location ONLY — never the MAC, the port or the hostname —
     # because a phone has no need for those and an attacker would.
     e911_self_query_enabled: bool = False
+
+    # #2780 — app-wide cap on a request body, in bytes. The api port has no
+    # body limit of its own (nginx's 1 MiB applies only to traffic through
+    # the web tier), and FastAPI reads a JSON body whole before any check
+    # runs. Over the cap is 413, refused before the body is read when
+    # Content-Length says so. Routes that take more (backups, upgrade
+    # images, the importers) carry their own allowance in
+    # ``app.core.body_limit.ALLOWANCES``, which this never lowers.
+    max_request_body_bytes: int = Field(default=8 * 1024 * 1024, ge=64 * 1024)
 
     # Appliance mode — set true by the appliance ISO compose env so
     # the API knows it's running on an appliance image (vs. plain

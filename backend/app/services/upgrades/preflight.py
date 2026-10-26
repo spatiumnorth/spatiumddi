@@ -141,7 +141,7 @@ def check_inflight_conflict(
             message="the upgrade lease is held by this run",
             detail={"holder": state.holder, "transitions": state.transitions},
         )
-    if own_holder and state.holder == "<unreachable>":
+    if own_holder and state.holder == mutex.UNREACHABLE_HOLDER:
         # #1713 — the kubeapi did not answer the read. The run asking holds
         # the Lease by its own renewals, which stop the drive if it is lost;
         # failing its node on a read nobody answered would fail the run on
@@ -151,6 +151,21 @@ def check_inflight_conflict(
             level="warn",
             message="the upgrade lease could not be read; this run's renewals hold it",
             detail={"holder": state.holder},
+        )
+    if state.holder == mutex.UNREACHABLE_HOLDER:
+        # #2779 — the kubeapi did not answer the lease read (after the read's
+        # own retries). That is not another run holding the lease: say the API
+        # could not be reached, so the operator checks it instead of hunting a
+        # run that does not exist.
+        return PreflightResult(
+            name="kubeapi_unreachable",
+            level="fail",
+            message=(
+                "the Kubernetes API did not answer the read of the upgrade lease "
+                f"({mutex.LEASE_NAME}), so whether another upgrade is in flight is "
+                "unknown; check the control-plane nodes and retry"
+            ),
+            detail={"read": "get_lease", "lease": mutex.LEASE_NAME, "holder": state.holder},
         )
     if state.held and not state.expired:
         return PreflightResult(

@@ -31,6 +31,7 @@ from app.core.agent_wake import (
     dhcp_wake_channels,
     wake_subscription,
 )
+from app.core.celery_dispatch import dispatch
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dhcp.kea import option_defs_for_option_maps
@@ -1397,8 +1398,40 @@ async def agent_lease_events(
     # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
     # so overlapping ranges across spaces stay disambiguated (subnets were
     # resolved space-aware above).
+    #
+    # #2580 — row-locked, and only AFTER the lease upsert above has flushed.
+    # The mirror pass below decides from the row's status (take over an
+    # ``available`` row, leave a ``static_dhcp`` one alone), and a reservation
+    # DELETE decides that same row's status from the lease table. On plain
+    # reads each could read the other's pre-commit state and both commit
+    # ``available`` beside the live lease. Holding the row lock while deciding
+    # serialises the two: if the DELETE locks first, this read waits for its
+    # commit and sees ``available``; if this locks first, the DELETE waits for
+    # this commit, by which point the lease inserted above is visible to it.
+    # Ordered by id, like ``static_ipam.lock_static_rows``, so concurrent
+    # lockers never wait on each other in a cycle. Narrowed to the subnets
+    # the events resolved to, so another space's row at the same address is
+    # not locked for nothing.
+    mirror_subnet_ids = {sn.id for sn in subnet_for_ip.values() if sn is not None}
     ipam_existing = (
-        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
+        (
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .where(
+                        IPAddress.address.in_(ips),
+                        IPAddress.subnet_id.in_(mirror_subnet_ids),
+                    )
+                    .order_by(IPAddress.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if mirror_subnet_ids
+        else []
     )
     # Normalised for the same reason as ``lease_by_key`` above (#1110): the
     # stored ``address`` is an ``IPv4Address``, the event's is a string. Raw
@@ -2045,7 +2078,7 @@ async def agent_dhcp_fingerprints(
             for mac in enqueue_macs:
                 # Carry the reporting server so the IP stamp stays in the
                 # spaces it serves (#2577).
-                lookup_fingerprint_task.delay(mac, str(server.id))
+                await dispatch(lookup_fingerprint_task, mac, str(server.id))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "dhcp_fingerprint_dispatch_failed",

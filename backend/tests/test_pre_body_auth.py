@@ -25,11 +25,12 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.pre_body_auth import PreBodyAuthRoute
+from app.api.pre_body_auth import EFFECTIVE_CONTEXT_VAR, PreBodyAuthRoute, takes_upload
 from app.api.v1.appliance import upgrade_images
 from app.main import app
 from app.models.audit import AuditLog
 from app.services.appliance import upgrade_image_space
+from tests.test_settings_branding import _tiny_png
 from tests.test_upgrade_images import _BASE, _hdr, _token
 
 GIB = 1024**3
@@ -324,6 +325,122 @@ async def test_backup_target_json_body_is_refused_unread_without_credentials(
     assert body.read is False
 
 
+# ── upload routes on the importer and settings routers (#2780) ────
+
+
+async def test_bind9_import_without_credentials_is_refused_unread(
+    client: AsyncClient, spools: list[object]
+) -> None:
+    body = _Body(_multipart({}, "file", b"$ORIGIN example.com.\n" * 20_000))
+    resp = await _post(client, "/api/v1/dns/import/bind9/preview", body)
+    assert resp.status_code == 401, resp.text
+    assert body.read is False
+    assert spools == []
+
+
+async def test_kea_import_without_credentials_is_refused_unread(
+    client: AsyncClient, spools: list[object]
+) -> None:
+    body = _Body(_multipart({}, "file", b"{}" + b" " * 200_000))
+    resp = await _post(client, "/api/v1/dhcp/import/kea/preview", body)
+    assert resp.status_code == 401, resp.text
+    assert body.read is False
+    assert spools == []
+
+
+async def test_zone_spreadsheet_import_without_credentials_is_refused_unread(
+    client: AsyncClient, spools: list[object]
+) -> None:
+    zone = "00000000-0000-4000-8000-000000000001"
+    body = _Body(_multipart({}, "file", b"name,type,value\n" * 20_000))
+    resp = await _post(
+        client,
+        f"/api/v1/dns/groups/{zone}/zones/{zone}/import/spreadsheet/preview",
+        body,
+    )
+    assert resp.status_code == 401, resp.text
+    assert body.read is False
+    assert spools == []
+
+
+async def test_ipam_import_by_a_user_without_the_permission_is_refused_unread(
+    db_session: AsyncSession, client: AsyncClient, spools: list[object]
+) -> None:
+    """The IPAM router's permission gate is a router-level dependency, and
+    it runs before the body too: 403 with the same detail and a ``denied``
+    audit row, the upload unread."""
+    token = await _token(db_session, superadmin=False, username="plainimport")
+    body = _Body(_multipart({"strategy": "skip"}, "file", b"network\n10.0.0.0/24\n" * 10_000))
+    resp = await _post(
+        client,
+        "/api/v1/ipam/import/preview",
+        body,
+        headers=_hdr(token),
+        content_length=len(body.payload),
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"].startswith("Permission denied")
+    assert body.read is False
+    assert spools == []
+    denied = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.result == "denied")))
+        .scalars()
+        .all()
+    )
+    assert len(denied) == 1
+
+
+async def test_logo_upload_by_a_non_superadmin_is_refused_unread(
+    db_session: AsyncSession, client: AsyncClient, spools: list[object]
+) -> None:
+    token = await _token(db_session, superadmin=False, username="plainlogo")
+    body = _Body(_multipart({}, "file", b"\x89PNG" + b"0" * 200_000))
+    resp = await client.put(
+        "/api/v1/settings/branding/logo",
+        content=body.stream(),
+        headers={**_hdr(token), "Content-Type": _MULTIPART},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"] == "Superadmin required"
+    assert body.read is False
+    assert spools == []
+
+
+async def test_superadmin_streamed_logo_upload_still_stores(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _token(db_session, username="logoadmin")
+    png = _tiny_png()
+    body = _Body(_multipart({}, "file", png))
+    resp = await client.put(
+        "/api/v1/settings/branding/logo",
+        content=body.stream(),
+        headers={**_hdr(token), "Content-Type": _MULTIPART},
+    )
+    assert resp.status_code == 200, resp.text
+    assert body.read is True
+    public = (await client.get("/api/v1/settings/public")).json()
+    assert public["logo_sha256"] == hashlib.sha256(png).hexdigest()
+
+
+async def test_json_routes_on_an_upload_router_are_served_as_before(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Only the upload routes on these routers check first; a JSON route
+    still reads (and validates) its body before its dependencies, as
+    before (#2780 bounds those with the app-wide body cap instead)."""
+    body = _Body(b"{}")
+    resp = await _post(
+        client,
+        "/api/v1/dns/import/bind9/commit",
+        body,
+        content_type="application/json",
+        content_length=len(body.payload),
+    )
+    assert body.read is True
+    assert resp.status_code in (401, 422), resp.text
+
+
 # ── structure ────────────────────────────────────────────────────────
 
 # The nginx locations that raise the body limit above the 1 MiB default
@@ -348,6 +465,57 @@ def _effective_routes(routes):  # noqa: ANN001, ANN202
             nested = getattr(r, "original_router", None)
             if nested is not None:
                 yield from _effective_routes(nested.routes)
+
+
+# The one form route that is not an upload: the SSO callback, whose body
+# is the identity provider's signed response, i.e. the credential itself.
+_FORM_ROUTES_READ_FIRST = {
+    ("POST", "/api/v1/auth/{provider_id}/callback"): "the SSO response is the credential",
+}
+
+
+def test_every_upload_route_checks_the_login_before_reading_the_body() -> None:
+    """Every route taking a multipart / form body (a file upload) uses the
+    route class, so a new upload route on a plain router fails here."""
+    uploads = [
+        (method, path, route)
+        for path, route in _effective_routes(app.routes)
+        if takes_upload(route)
+        for method in sorted(route.methods - {"HEAD", "OPTIONS"})
+    ]
+    found = {(m, p) for m, p, _ in uploads}
+    # Guard against the walk silently finding nothing.
+    for expected in (
+        ("POST", "/api/v1/dns/import/bind9/preview"),
+        ("POST", "/api/v1/dhcp/import/kea/preview"),
+        ("POST", "/api/v1/dhcp/import/isc/preview"),
+        ("POST", "/api/v1/ipam/import/preview"),
+        ("POST", "/api/v1/ipam/import/commit"),
+        ("POST", "/api/v1/ipam/import/addresses/preview"),
+        ("POST", "/api/v1/ipam/import/addresses/commit"),
+        ("POST", "/api/v1/dns/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview"),
+        ("POST", "/api/v1/dns/groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit"),
+        ("PUT", "/api/v1/settings/branding/logo"),
+    ):
+        assert expected in found, expected
+    unchecked = sorted(
+        f"{m} {p}"
+        for m, p, r in uploads
+        if not isinstance(r, PreBodyAuthRoute) and (m, p) not in _FORM_ROUTES_READ_FIRST
+    )
+    assert unchecked == []
+    assert set(_FORM_ROUTES_READ_FIRST) <= found
+
+
+def test_router_level_dependencies_are_still_visible() -> None:
+    """The IPAM upload routes' permission gate is a router-level dependency,
+    reached through a FastAPI-private context variable. If a FastAPI upgrade
+    removes it, the login is still checked first but that gate silently
+    moves back behind the body read; this fails so the change is seen."""
+    assert EFFECTIVE_CONTEXT_VAR is not None, (
+        "fastapi.routing._effective_route_context_var is gone: "
+        "app.api.pre_body_auth must find router-level dependencies another way"
+    )
 
 
 def test_every_body_route_under_a_large_body_location_authorises_first() -> None:

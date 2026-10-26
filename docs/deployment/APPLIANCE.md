@@ -2838,6 +2838,10 @@ introduced by an upgrade don't clobber operator-created ones.
    out, the slot is not committed; once
    `spatium-k3s-images verify` passes, **Approve trial** in
    Fleet keeps it before the next reboot reverts it.
+   Once k3s's import is over, `spatiumddi-image-unpack.service`
+   unpacks the new release of each image the node runs, one at a
+   time at 32 MiB/s (`spatium-k3s-images unpack`, #2788). The
+   kubelet unpacks whatever it leaves.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
@@ -3343,7 +3347,8 @@ so a first-time operator never gets stuck looking for the upload.
    unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
-   `inflight_conflict`, `replication_lag`, `disk_headroom` (each
+   `inflight_conflict` (or `kubeapi_unreachable` when the API did not answer the
+   lease read, #2779), `replication_lag`, `disk_headroom` (each
    node's reported `/var`; a missing or stale report warns; a node
    already on the target stages nothing and is named instead of
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not
@@ -3424,6 +3429,11 @@ the cluster runs until every node reports the target:
   writing it, with the old tag.
 - When every node is done, the run removes the pins and ends the hold in
   one step. Each node's DNS and DHCP pods restart once at that moment.
+  Each node unpacked their new images right after its own reboot
+  (`spatiumddi-image-unpack.service`), so little or nothing is left to
+  unpack then. Before #2788 every node unpacked 1-2 GB of image layers
+  at this moment, all at once on the `/var` etcd writes its WAL to, and
+  on a shared disk that stalled etcd until a k3s server exited.
 
 A pin, or the removal of the pins, that the kubeapi does not take (a
 request refused or unanswered, as while a k3s server restarts) does
@@ -3779,6 +3789,25 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > *before* the first pairing — otherwise
 > ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
 > supervisor idles (#407).
+>
+> The flag refuses **new** pairings only. Appliances already registered
+> keep heartbeating and serving while it is off: `/supervisor/heartbeat`
+> and `/supervisor/poll` are not behind it (#2798). Before that fix,
+> switching it off answered every heartbeat 404, every supervisor read
+> that as a revocation, and DNS and DHCP stopped fleet-wide.
+
+**How a supervisor knows it was revoked (#2798).** A heartbeat the control
+plane refuses on purpose is a **403 carrying the `X-Spatium-Revocation`
+header**: `revoked` when the row is revoked on the Fleet page, `unknown`
+when no row accepts the presented credential (the row was deleted, or the
+appliance was re-keyed). Two of those in a row put the supervisor in
+`revoked` and take its role services down; a control-plane node then
+re-registers through the self-bootstrap once its row is gone (#2696). Any
+other refusal — a 404 from a proxy or a router that is not mounted, a 403
+without the header — is logged as `supervisor.heartbeat.refused_not_revocation`
+and nothing is torn down: the node keeps serving its last applied roles.
+For a control plane that predates the header, the supervisor also accepts
+the two 403 details it answered for the same refusals.
 
 1. On the control plane, open **Appliance → Pairing**.
 2. Click **New pairing code**. Codes are now kind-agnostic (the

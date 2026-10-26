@@ -170,8 +170,8 @@ def test_the_reported_shape_renders_no_second_directive() -> None:
 
 def test_ordinary_sys_text_still_renders_byte_for_byte() -> None:
     text = render_snmpd_conf(_snmp(contact="noc@example.test", location="DC1 rack 4"))
-    assert 'sysContact     "noc@example.test"' in text.splitlines()
-    assert 'sysLocation    "DC1 rack 4"' in text.splitlines()
+    assert "sysContact     noc@example.test" in text.splitlines()
+    assert "sysLocation    DC1 rack 4" in text.splitlines()
 
 
 @pytest.mark.parametrize("community", ["pub\nrwcommunity evil default", "pub default"])

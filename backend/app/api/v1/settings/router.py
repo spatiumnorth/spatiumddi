@@ -21,12 +21,13 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
-from sqlalchemy import func, select, text
-from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
+from app.core.celery_dispatch import dispatch
 from app.core.config_text import has_control_chars, reject_control_chars
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
@@ -64,6 +65,7 @@ from app.services.appliance.apt import (
 )
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
+from app.services.audit_forward import targets_cache
 from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
@@ -101,7 +103,9 @@ _RESOLVER_DNSSEC: set[str] = {"yes", "no", "allow-downgrade"}
 _RESOLVER_DOT: set[str] = {"yes", "opportunistic", "no"}
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
+router = APIRouter(route_class=PreBodyAuthUploadRoute)
 
 _SINGLETON_ID = 1
 
@@ -2163,17 +2167,11 @@ async def update_settings(
     # The legacy webhook's URL + Authorization header (#1502): same
     # encrypt-and-redact shape, so neither reaches the column in clear or the
     # ``platform_settings_updated`` log line below.
-    _legacy_webhook_written: list[str] = []
     for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
         if _field in changes:
             raw = changes.pop(_field)
             setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
             changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
-            _legacy_webhook_written.append(_field)
-    if _legacy_webhook_written:
-        # GHSA-g9gv-9qp2-3qwm: blank the plaintext leftovers too, in the
-        # same transaction, or the pre-upgrade value outlives the change.
-        await _blank_legacy_plaintext(db, "platform_settings", settings.id, _legacy_webhook_written)
 
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
@@ -2761,6 +2759,7 @@ async def update_settings(
         )
 
     await db.commit()
+    targets_cache.invalidate()
     await db.refresh(settings)
 
     # Drop the middleware's process-local cache so the flipping worker
@@ -2920,7 +2919,7 @@ async def trigger_reverse_dns_run(current_user: CurrentUser, db: DB) -> ReverseD
     try:
         from app.tasks.reverse_dns import sweep_reverse_dns
 
-        result = sweep_reverse_dns.delay(force=True)
+        result = await dispatch(sweep_reverse_dns, force=True)
         task_id = result.id
     except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
         logger.warning("reverse_dns_trigger_enqueue_failed", error=str(exc))
@@ -3232,7 +3231,7 @@ async def trigger_oui_refresh(current_user: CurrentUser, db: DB) -> OUIRefreshRe
     # into its startup path.
     from app.tasks.oui_update import update_oui_database_now  # noqa: PLC0415
 
-    result = update_oui_database_now.delay()
+    result = await dispatch(update_oui_database_now)
     logger.info("oui_refresh_triggered", user=current_user.username, task_id=result.id)
     return OUIRefreshResponse(status="queued", task_id=result.id)
 
@@ -3463,41 +3462,6 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
-async def _blank_legacy_plaintext(db: DB, table: str, row_id: Any, columns: list[str]) -> None:
-    """Blank the pre-#1506 plaintext leftovers for a written secret.
-
-    GHSA-g9gv-9qp2-3qwm: the ``*_encrypted`` migration kept the old
-    plaintext columns, unmapped and unread, holding the pre-upgrade
-    values. Clearing or replacing a secret changed only the encrypted
-    column, so the old value stayed readable in the DB and in full
-    backups. On any write of that secret, set its leftover column to
-    ``''`` in the same transaction — ``''`` is the column's server
-    default and the value the old application (which maps it as a
-    non-null string) reads as unset, so a rolling upgrade stays safe;
-    the migration's downgrade copies a still-encrypted value back, and
-    a cleared secret has none, so it stays ``''`` there too.
-
-    The columns are unmapped, so this is raw SQL, guarded by inspection:
-    a schema built from the models (tests, a fresh install before the
-    migration) may not have them at all, and the next release drops
-    them. Identifiers come only from the fixed call sites below, never
-    from request data.
-    """
-    if not columns:
-        return
-    conn = await db.connection()
-    existing = await conn.run_sync(
-        lambda c: {col["name"] for col in sa_inspect(c).get_columns(table)}
-    )
-    assignments = [f"{col} = ''" for col in columns if col in existing]
-    if not assignments:
-        return
-    await db.execute(
-        text(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
-        {"id": row_id},
-    )
-
-
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     from app.core.crypto import encrypt_str
 
@@ -3636,18 +3600,10 @@ async def create_audit_target(
     _apply_body(row, body)
     db.add(row)
     await db.flush()
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
+        targets_cache.invalidate()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
         raise HTTPException(
@@ -3673,18 +3629,10 @@ async def update_audit_target(
     _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
     _apply_body(row, body)
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
+        targets_cache.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(
@@ -3702,6 +3650,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db
     _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
+    targets_cache.invalidate()
 
 
 @router.post("/audit-forward-targets/{target_id}/test")
