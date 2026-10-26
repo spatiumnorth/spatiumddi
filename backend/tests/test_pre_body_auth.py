@@ -35,9 +35,10 @@ from app.api.pre_body_auth import (
     EFFECTIVE_CONTEXT_VAR,
     PreBodyAuthRoute,
     PreBodyAuthUploadRoute,
+    auth_checks,
     takes_upload,
 )
-from app.api.v1.appliance import upgrade_images
+from app.api.v1.appliance import slot_image_mirror, upgrade_images
 from app.api.v1.dns import agents as dns_agents
 from app.core.body_limit import DEFAULT_MAX_REQUEST_BODY_BYTES, limit_for
 from app.main import app
@@ -660,6 +661,21 @@ def _effective_routes(routes):  # noqa: ANN001, ANN202
                 yield from _effective_routes(nested.routes)
 
 
+# The slot-image mirror's router is mounted only on the mirror Deployment
+# (``SLOT_IMAGE_MIRROR_MODE``), which is the same app; the api the tests
+# import does not carry it, so it is added here at the path it is served on.
+_MIRROR_PREFIX = "/api/v1/appliance/internal/slot-images"
+
+
+def _deployed_routes():  # noqa: ANN202
+    """(full path, route) for every API route either deployment serves: the
+    api, and the slot-image mirror."""
+    yield from _effective_routes(app.routes)
+    for r in slot_image_mirror.router.routes:
+        if isinstance(r, APIRoute):
+            yield _MIRROR_PREFIX + r.path, r
+
+
 # The one form route that is not an upload: the SSO callback, whose body
 # is the identity provider's signed response, i.e. the credential itself.
 _FORM_ROUTES_READ_FIRST = {
@@ -732,13 +748,16 @@ def _checks_before_body(route: APIRoute) -> bool:
 
 
 def test_every_body_route_with_a_large_allowance_authorises_first() -> None:
-    """Every body route ``app.core.body_limit`` lets take more than the
-    app-wide cap checks the caller before reading the body, JSON routes
-    included."""
+    """Every route ``app.core.body_limit`` lets take more than the app-wide
+    cap checks the caller before reading the body, JSON routes included.
+
+    A route with no body parameter is included too: FastAPI reads nothing
+    before it runs its dependencies, so such a route may read its body as a
+    raw stream in the handler (the slot-image mirror write, the pcap
+    upload), and must then declare its authorisation as a dependency rather
+    than call it from the handler, where this test cannot see it."""
     found = []
-    for path, route in _effective_routes(app.routes):
-        if not route.dependant.body_params:
-            continue
+    for path, route in _deployed_routes():
         concrete = re.sub(r"\{[^}]+\}", "x", path)
         for method in route.methods - {"HEAD", "OPTIONS"}:
             if limit_for(method, concrete, DEFAULT_MAX_REQUEST_BODY_BYTES) > (
@@ -753,9 +772,15 @@ def test_every_body_route_with_a_large_allowance_authorises_first() -> None:
         "/api/v1/dhcp/import/kea/commit",
         "/api/v1/ipam/import/preview-json",
         "/api/v1/ipam/import/netbox/commit",
+        "/api/v1/appliance/internal/slot-images/{image_id}",
+        "/api/v1/appliance/supervisor/pcap/upload/{capture_id}",
     ):
         assert expected in paths, expected
-    wrong = sorted(f"{m} {p}" for m, p, r in found if not _checks_before_body(r))
+    wrong = sorted(
+        f"{m} {p}"
+        for m, p, r in found
+        if not (_checks_before_body(r) if r.dependant.body_params else auth_checks(r))
+    )
     assert wrong == []
 
 

@@ -44,6 +44,11 @@ _FORM_OVERHEAD = MIB
 
 DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * MIB
 
+# Largest appliance upgrade (slot) image the api stores. The upload route
+# enforces it while it streams (``upgrade_images.MAX_UPLOAD_BYTES`` is this
+# value), and the api forwards at most this much to the slot-image mirror.
+UPGRADE_IMAGE_MAX_BYTES = 4 * GIB
+
 
 @dataclass(frozen=True)
 class Allowance:
@@ -63,8 +68,17 @@ ALLOWANCES: tuple[Allowance, ...] = (
     _allow(
         "POST",
         r"/api/v1/appliance/upgrade-images",
-        4 * GIB + _FORM_OVERHEAD,
+        UPGRADE_IMAGE_MAX_BYTES + _FORM_OVERHEAD,
         "Appliance upgrade image upload (upgrade_images.MAX_UPLOAD_BYTES, 4 GiB).",
+    ),
+    _allow(
+        "PUT",
+        r"/api/v1/appliance/internal/slot-images/[^/]+",
+        UPGRADE_IMAGE_MAX_BYTES,
+        "Slot-image mirror write: the api forwards the stored image as a raw body, "
+        "and stops at upgrade_images.MAX_UPLOAD_BYTES while it streams. The route "
+        "is mounted only on the mirror (SLOT_IMAGE_MIRROR_MODE) and checks its "
+        "X-Mirror-Auth header before reading the body.",
     ),
     _allow(
         "POST",
