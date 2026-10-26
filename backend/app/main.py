@@ -926,6 +926,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cert_deploy_task.cancel()
         with suppress(asyncio.CancelledError):
             await cert_deploy_task
+    from app.services import after_commit_dispatch  # noqa: PLC0415
+
+    await after_commit_dispatch.shutdown()
     logger.info("shutdown", service="api")
 
 
