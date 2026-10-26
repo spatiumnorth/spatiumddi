@@ -2131,7 +2131,14 @@ async def agent_rendered_config(
     files = body.files[:_RENDERED_FILES_MAX]
     total = 0
     sanitised: list[dict[str, str]] = []
+    skipped_binary: list[str] = []
     for f in files:
+        # PostgreSQL JSONB cannot store NUL (\u0000), and one such file would
+        # refuse the whole snapshot (#2842). A NUL means binary, not config
+        # (BIND's journals and signed-zone files): drop it, keep the rest.
+        if "\x00" in f.content or "\x00" in f.path:
+            skipped_binary.append(f.path.replace("\x00", ""))
+            continue
         if len(f.content) > _RENDERED_FILE_SIZE_MAX:
             # Truncate rather than reject — operator wants to *see*
             # something even if a single file blew the cap.
@@ -2142,6 +2149,14 @@ async def agent_rendered_config(
         if total > _RENDERED_TOTAL_SIZE_MAX:
             break
         sanitised.append({"path": f.path, "content": content})
+
+    if skipped_binary:
+        logger.warning(
+            "rendered_config_skipped_binary",
+            server_id=str(server.id),
+            paths=skipped_binary[:50],
+            count=len(skipped_binary),
+        )
 
     now = datetime.now(UTC)
     state = await db.get(DNSServerRuntimeState, server.id)

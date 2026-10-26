@@ -94,6 +94,7 @@ from app.core.auth_throttle import (
     claim_pairing_attempt,
     refund_pairing_attempt,
 )
+from app.core.db_transient import is_transient_db_error
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import upgrade_direction
@@ -2348,6 +2349,38 @@ async def supervisor_heartbeat(
     A deliberate refusal (revoked row, or no row the credential opens) is a
     403 carrying ``REVOCATION_HEADER``; see its comment.
     """
+    try:
+        return await _supervisor_heartbeat(body, request, db)
+    except Exception as exc:
+        # #2845 — a CNPG switchover drops the connection under whichever
+        # statement is in flight: most often the re-read after the long-poll
+        # hold, which runs a minute after the telemetry commit. That is the
+        # database being briefly away, not a bug, so answer it as one: 503,
+        # which the supervisor logs as a server error and retries on its next
+        # heartbeat — never a revocation strike (only a marked 403 is one).
+        # Nothing here reads the ORM row: the failed statement's rollback has
+        # expired every attribute, and loading one in an async session raises
+        # MissingGreenlet. ``body`` is plain pydantic data.
+        if not is_transient_db_error(exc):
+            raise
+        logger.info(
+            "supervisor_heartbeat_db_unavailable",
+            appliance_id=str(body.appliance_id),
+            error=str(exc)[:200],
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The database is briefly unavailable (a failover is likely in progress). Retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+async def _supervisor_heartbeat(
+    body: SupervisorHeartbeatRequest,
+    request: Request,
+    db: AsyncSession,
+) -> SupervisorHeartbeatResponse:
+    """The heartbeat itself; ``supervisor_heartbeat`` above is the route."""
 
     # #170 Wave D follow-up — cert auth takes precedence when the
     # supervisor presents X-Appliance-Cert + X-Appliance-Signature +

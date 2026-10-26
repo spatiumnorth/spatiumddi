@@ -107,6 +107,24 @@ class ServiceHealth:
 # watchdog tick after restart re-observes).
 _status_history: dict[str, tuple[str, float, float]] = {}
 
+# #2833 — a role apply returns once the chart is written; its pod appears a few
+# seconds later. A pass in that window reads "no pod" and used to report a red
+# ``missing`` (cached for the whole watchdog interval) and fire a redundant
+# heal. For this long after an apply the watchdog wrote, a service with no pod
+# yet is ``starting``; past it, a pod that never came is genuinely ``missing``.
+APPLY_GRACE_S = 90.0
+_last_apply_at: float | None = None
+
+
+def note_apply() -> None:
+    """Record that a role apply just wrote the chart (#2833)."""
+    global _last_apply_at
+    _last_apply_at = time.monotonic()
+
+
+def _in_apply_grace(now_mono: float) -> bool:
+    return _last_apply_at is not None and 0.0 <= now_mono - _last_apply_at < APPLY_GRACE_S
+
 
 def read_assigned_profiles(env_file: Path) -> list[str]:
     """Parse the ``COMPOSE_PROFILES`` value from role-compose.env.
@@ -288,9 +306,17 @@ def _check_health_k3s(
         if pod is None:
             # #2808 — a role service a non-approved node does not run is down
             # on purpose, not missing: no red chip, no heal.
-            status = "held" if held_by is not None else "missing"
             container_id = None
-            missing_services.append(svc)
+            if held_by is not None:
+                status = "held"
+                missing_services.append(svc)
+            elif _in_apply_grace(now_mono):
+                # #2833 — the apply just wrote the chart; its pod is not up
+                # yet. Not a fault and nothing to heal.
+                status = "starting"
+            else:
+                status = "missing"
+                missing_services.append(svc)
         else:
             status = _derive_pod_status(pod)
             container_id = (pod.name[:24]) or None
@@ -339,6 +365,7 @@ def _check_health_k3s(
         # supervisor re-assert desired state when a pod's been
         # ``kubectl delete``'d out from under us.
         result = apply_role_assignment(list(desired_services.values()), env_file)
+        note_apply()
         log.info(
             "supervisor.watchdog.heal_attempted",
             state=result.state,
