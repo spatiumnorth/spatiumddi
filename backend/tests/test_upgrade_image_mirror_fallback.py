@@ -346,7 +346,7 @@ async def test_delete_clears_the_local_copy_in_mirror_mode(
     local = _stage_local(monkeypatch, tmp_path, image.id)
     monkeypatch.setattr(upgrade_images.settings, "slot_image_mirror_url", "http://mirror")
 
-    async def _noop_delete(_id):
+    async def _noop_delete(_id, **_kw):
         return None
 
     monkeypatch.setattr(upgrade_images, "_delete_from_mirror", _noop_delete)

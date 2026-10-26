@@ -71,6 +71,7 @@ from app.models.appliance import (
 )
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer
+from app.services.appliance import var_disk
 from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
 from app.services.upgrades import kubeapi_retry, mutex
 
@@ -141,7 +142,7 @@ def check_inflight_conflict(
             message="the upgrade lease is held by this run",
             detail={"holder": state.holder, "transitions": state.transitions},
         )
-    if own_holder and state.holder == "<unreachable>":
+    if own_holder and state.holder == mutex.UNREACHABLE_HOLDER:
         # #1713 — the kubeapi did not answer the read. The run asking holds
         # the Lease by its own renewals, which stop the drive if it is lost;
         # failing its node on a read nobody answered would fail the run on
@@ -151,6 +152,21 @@ def check_inflight_conflict(
             level="warn",
             message="the upgrade lease could not be read; this run's renewals hold it",
             detail={"holder": state.holder},
+        )
+    if state.holder == mutex.UNREACHABLE_HOLDER:
+        # #2779 — the kubeapi did not answer the lease read (after the read's
+        # own retries). That is not another run holding the lease: say the API
+        # could not be reached, so the operator checks it instead of hunting a
+        # run that does not exist.
+        return PreflightResult(
+            name="kubeapi_unreachable",
+            level="fail",
+            message=(
+                "the Kubernetes API did not answer the read of the upgrade lease "
+                f"({mutex.LEASE_NAME}), so whether another upgrade is in flight is "
+                "unknown; check the control-plane nodes and retry"
+            ),
+            detail={"read": "get_lease", "lease": mutex.LEASE_NAME, "holder": state.holder},
         )
     if state.held and not state.expired:
         return PreflightResult(
@@ -338,26 +354,13 @@ def _node_var_free_bytes(cluster_health: Any) -> int | None:
     """Free bytes on a node's ``/var`` from its reported partitions.
 
     ``None`` = no usable reading (key absent, entry absent, malformed) —
-    UNKNOWN, never zero and never "plenty".
+    UNKNOWN, never zero and never "plenty". Read through
+    :func:`var_disk.var_disk_reading`, which prefers the kubelet's own
+    measure (``available_bytes``, statvfs f_bavail) over ``total - used``,
+    which counts ext4's root reserve as free (#2400).
     """
-    if not isinstance(cluster_health, dict):
-        return None
-    parts = cluster_health.get("host_disk_partitions")
-    if not isinstance(parts, list):
-        return None
-    for p in parts:
-        if not isinstance(p, dict) or p.get("mount") != "/var":
-            continue
-        total, used = p.get("total_bytes"), p.get("used_bytes")
-        if (
-            isinstance(total, int)
-            and isinstance(used, int)
-            and not isinstance(total, bool)
-            and not isinstance(used, bool)
-            and total > 0
-        ):
-            return max(total - used, 0)
-    return None
+    reading = var_disk.var_disk_reading(cluster_health)
+    return reading.free_bytes if reading is not None else None
 
 
 def judge_node_disk_headroom(

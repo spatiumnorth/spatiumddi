@@ -7,6 +7,19 @@ FALSE, so Wave A's landing doesn't change behaviour for any existing
 dns / dhcp agent install (which still uses ``/dns/agents/register`` /
 ``/dhcp/agents/register`` + the long PSK).
 
+That flag gates NEW registrations only (``/supervisor/register``, which is
+where a pairing code is claimed). It never gates ``/supervisor/poll`` or
+``/supervisor/heartbeat`` (#2798): those authenticate an appliance that
+already has a row, and a supervisor that loses its heartbeat reads that as
+a revocation and takes its DNS / DHCP down. Switching new pairings off must
+not do that to every appliance in the fleet.
+
+A heartbeat the control plane refuses on purpose — the row is revoked, or
+there is no row the presented credential opens — is a 403 carrying the
+``X-Spatium-Revocation`` header (``REVOCATION_HEADER``). That header is the
+supervisor's revocation signal; any other refusal (a 404 from a proxy or a
+disabled router, an unmarked 403) leaves it serving its last applied roles.
+
 Flow:
 
 1. Supervisor generates an Ed25519 keypair on first boot, persists
@@ -46,7 +59,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import structlog
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -58,11 +71,12 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func as sa_func
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1.appliance.cluster import VarDiskFinding
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WAKE_TICK_SECONDS,
@@ -80,6 +94,7 @@ from app.core.auth_throttle import (
     claim_pairing_attempt,
     refund_pairing_attempt,
 )
+from app.core.db_transient import is_transient_db_error
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import upgrade_direction
@@ -99,6 +114,7 @@ from app.models.appliance import (
     DESIRED_CLUSTER_ROLE_MEMBER,
     DESIRED_CLUSTER_ROLE_NONE,
     Appliance,
+    ApplianceUpgradeImage,
     PairingClaim,
     PairingCode,
 )
@@ -166,6 +182,12 @@ from app.services.appliance.storage_health import (
 )
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
+from app.services.appliance.var_disk import (
+    reading_is_fresh,
+    staging_shortfall,
+    var_disk_fields,
+    var_disk_reading,
+)
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
 from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
@@ -507,6 +529,18 @@ class SupervisorCapabilities(BaseModel):
     supervisor_version: str | None = None
 
 
+class SupervisorRoleRestore(BaseModel):
+    """The role assignment a re-registering control-plane node was serving
+    before its Fleet row went away (#2801), read back from its role env."""
+
+    roles: list[Annotated[str, Field(max_length=32)]] = Field(default_factory=list, max_length=8)
+    dns_group_name: str | None = Field(default=None, max_length=128)
+    dhcp_group_name: str | None = Field(default=None, max_length=128)
+    # The outcome of the node's last role apply (``ready`` / ``failed`` / …),
+    # recorded in the audit row so the restore says what the node reported.
+    last_apply_state: str | None = Field(default=None, max_length=32)
+
+
 class SupervisorRegisterRequest(BaseModel):
     pairing_code: str = Field(
         min_length=_CODE_LENGTH,
@@ -555,6 +589,10 @@ class SupervisorRegisterRequest(BaseModel):
         ]
         | None
     ) = None
+    # #2801 — sent by a control-plane supervisor re-registering after its
+    # Fleet row went away. Honoured only on a self-bootstrap (auto-approve)
+    # registration; see ``_restore_supervisor_roles``.
+    restore_roles: SupervisorRoleRestore | None = None
 
     @field_validator("pairing_code")
     @classmethod
@@ -666,10 +704,49 @@ def _decode_pubkey(payload: str) -> tuple[bytes, str]:
     return canonical, fingerprint
 
 
+# #2798 — the explicit revocation signal. A heartbeat refused because the
+# appliance is revoked (``revoked``) or because no row accepts the presented
+# credential (``unknown``: the row was deleted, or the session token is not
+# this row's) answers 403 WITH this header. The supervisor counts only such a
+# 403 towards revocation, so a refusal it cannot attribute to the row (a 404
+# from a proxy, a router that is not mounted, an unmarked 403) never tears
+# down its role services. Keep the header on both refusals below; dropping it
+# means a deleted or revoked appliance keeps serving.
+REVOCATION_HEADER = "X-Spatium-Revocation"
+REVOCATION_REVOKED = "revoked"
+REVOCATION_UNKNOWN = "unknown"
+
+
+def _heartbeat_refusal(row: Appliance | None) -> HTTPException | None:
+    """The revocation refusal a heartbeat for ``row`` answers, or None.
+
+    ``None`` row (no row the credential opens: deleted, or a token that is
+    not this row's) → 403 ``unknown``; a revoked row → 403 ``revoked``.
+    Used before the long-poll hold AND after it (#2807), so a heartbeat
+    whose row was revoked or deleted while it was held answers exactly what
+    a fresh heartbeat would, instead of 500ing on the response model."""
+    if row is None:
+        return HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Invalid appliance or session.",
+            headers={REVOCATION_HEADER: REVOCATION_UNKNOWN},
+        )
+    if row.state == APPLIANCE_STATE_REVOKED:
+        return HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
+            headers={REVOCATION_HEADER: REVOCATION_REVOKED},
+        )
+    return None
+
+
 async def _module_enabled(db: DB) -> bool:
-    """Read the feature flag. Cached settings row is fine — operator
+    """Read the registration flag. Cached settings row is fine — operator
     flipping the toggle takes effect on the next API call without a
-    process restart."""
+    process restart.
+
+    Gates NEW registrations only (#2798). Never call it on a path an
+    already-registered appliance needs to keep serving (poll, heartbeat)."""
     stmt = select(PlatformSettings).where(PlatformSettings.id == 1)
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
@@ -1226,6 +1303,7 @@ async def supervisor_register(
     # render. Operator-typed pairing codes from the Fleet → Pairing
     # tab keep ``auto_approve=False`` so manual approval stays the
     # norm for any remote pairing.
+    restore_not_applied: str | None = None
     if code_row.auto_approve:
         await _approve_appliance_inline(db, appliance_row, approved_by_user_id=None)
         db.add(
@@ -1247,6 +1325,17 @@ async def supervisor_register(
                 },
             )
         )
+        if body.restore_roles is not None and body.restore_roles.roles:
+            if body.appliance_variant in _SELF_BOOTSTRAP_VARIANTS:
+                await _restore_supervisor_roles(
+                    db, appliance_row, body.restore_roles, client_ip=client_ip
+                )
+            else:
+                restore_not_applied = "not a control-plane registration"
+    elif body.restore_roles is not None and body.restore_roles.roles:
+        # An operator-typed code: the operator approves the node and assigns
+        # its roles; nothing the node sends grants it one.
+        restore_not_applied = "registration needs operator approval"
     db.add(
         PairingClaim(
             pairing_code_id=code_row.id,
@@ -1294,6 +1383,16 @@ async def supervisor_register(
                 "fingerprint": pubkey_fingerprint,
                 "supervisor_version": body.supervisor_version,
                 "paired_via_code_id": str(code_row.id),
+                **(
+                    {
+                        "roles_not_restored": {
+                            "roles": list(body.restore_roles.roles),
+                            "reason": restore_not_applied,
+                        }
+                    }
+                    if restore_not_applied is not None and body.restore_roles is not None
+                    else {}
+                ),
             },
         )
     )
@@ -1315,6 +1414,116 @@ async def supervisor_register(
         state=appliance_row.state,  # type: ignore[arg-type]
         public_key_fingerprint=pubkey_fingerprint,
         session_token=session_cleartext,
+    )
+
+
+async def _restore_supervisor_roles(
+    db: DB,
+    row: Appliance,
+    restore: SupervisorRoleRestore,
+    *,
+    client_ip: str | None,
+) -> None:
+    """Put back the roles a control-plane node was serving when its Fleet row
+    went away (#2801).
+
+    Only called for a self-bootstrap registration: the code was minted by the
+    local supervisor's host-token-gated call, which answers only while no live
+    appliance row exists, so this is the lone control-plane node coming back,
+    not a new box. The roles are the node's own record of its last assignment
+    (its role env, rewritten by every accepted heartbeat), so a role the
+    operator removed is not in it. Each role still passes the checks a Fleet
+    save applies to a NEW role (known service role, one DNS engine, its module
+    on); a group is restored by name only if it still exists and the
+    supervisor can use the name. Whatever is dropped is named in the audit
+    row, which records the restore either way.
+    """
+    from app.models.dhcp import DHCPServerGroup
+    from app.models.dns import DNSServerGroup
+    from app.services.feature_modules import is_module_enabled
+
+    dropped: dict[str, str] = {}
+    requested = list(dict.fromkeys(restore.roles))
+    roles: list[str] = []
+    for r in requested:
+        if r in _RESTORABLE_ROLES:
+            roles.append(r)
+        else:
+            dropped[r] = "not a service role"
+    dns_roles = [r for r in roles if r in _DNS_ROLES]
+    if len(dns_roles) > 1:
+        for r in dns_roles:
+            dropped[r] = "more than one DNS engine"
+        roles = [r for r in roles if r not in _DNS_ROLES]
+    if any(r in _DNS_ROLES for r in roles) and not await is_module_enabled(db, "core.dns"):
+        for r in roles:
+            if r in _DNS_ROLES:
+                dropped[r] = "the DNS module (core.dns) is disabled"
+        roles = [r for r in roles if r not in _DNS_ROLES]
+    if "dhcp" in roles and not await is_module_enabled(db, "core.dhcp"):
+        dropped["dhcp"] = "the DHCP module (core.dhcp) is disabled"
+        roles = [r for r in roles if r != "dhcp"]
+
+    groups_not_restored: dict[str, str] = {}
+    dns_group_id: uuid.UUID | None = None
+    if any(r in _DNS_ROLES for r in roles) and restore.dns_group_name:
+        dns_group = (
+            await db.execute(
+                select(DNSServerGroup).where(DNSServerGroup.name == restore.dns_group_name)
+            )
+        ).scalar_one_or_none()
+        if dns_group is None:
+            groups_not_restored["dns"] = f"no DNS server group named {restore.dns_group_name!r}"
+        elif group_name_problem("dns", dns_group.name) is not None:
+            groups_not_restored["dns"] = f"DNS server group name {dns_group.name!r} is unusable"
+        else:
+            dns_group_id = dns_group.id
+    dhcp_group_id: uuid.UUID | None = None
+    if "dhcp" in roles and restore.dhcp_group_name:
+        dhcp_group = (
+            await db.execute(
+                select(DHCPServerGroup).where(DHCPServerGroup.name == restore.dhcp_group_name)
+            )
+        ).scalar_one_or_none()
+        if dhcp_group is None:
+            groups_not_restored["dhcp"] = f"no DHCP server group named {restore.dhcp_group_name!r}"
+        elif group_name_problem("dhcp", dhcp_group.name) is not None:
+            groups_not_restored["dhcp"] = f"DHCP server group name {dhcp_group.name!r} is unusable"
+        else:
+            dhcp_group_id = dhcp_group.id
+
+    row.assigned_roles = roles
+    row.assigned_dns_group_id = dns_group_id
+    row.assigned_dhcp_group_id = dhcp_group_id
+    db.add(
+        AuditLog(
+            user_id=None,
+            user_display_name=row.hostname,
+            auth_source="self_bootstrap",
+            source_ip=client_ip,
+            action="appliance.roles_restored",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "roles": roles,
+                "dns_group_id": str(dns_group_id) if dns_group_id else None,
+                "dhcp_group_id": str(dhcp_group_id) if dhcp_group_id else None,
+                "source": "supervisor_last_assigned",
+                "requested_roles": requested,
+                "last_apply_state": restore.last_apply_state,
+                **({"dropped_roles": dropped} if dropped else {}),
+                **({"groups_not_restored": groups_not_restored} if groups_not_restored else {}),
+            },
+        )
+    )
+    logger.info(
+        "appliance_roles_restored",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        roles=roles,
+        dropped=dropped or None,
     )
 
 
@@ -1345,10 +1554,8 @@ async def supervisor_poll(
     mode so an attacker probing for valid appliance_ids can't
     distinguish "wrong token" from "doesn't exist" via timing.
     """
-    if not await _module_enabled(db):
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
-
+    # #2798 — deliberately NOT behind the registration flag: the row already
+    # exists, and the session token is what authenticates this call.
     row = await db.get(Appliance, body.appliance_id)
     valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
     if not valid:
@@ -2133,10 +2340,47 @@ async def supervisor_heartbeat(
       different boot than the one the request applied to (#1446), with a
       give-up backstop. It used to clear 15 s after the stamp, which could
       happen before the request was ever delivered.
+
+    Not behind ``supervisor_registration_enabled`` (#2798): that flag
+    refuses new pairings. Gating the heartbeat on it answered every
+    registered appliance 404, which the supervisor read as a revocation —
+    switching pairing off took DNS and DHCP down fleet-wide.
+
+    A deliberate refusal (revoked row, or no row the credential opens) is a
+    403 carrying ``REVOCATION_HEADER``; see its comment.
     """
-    if not await _module_enabled(db):
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
+    try:
+        return await _supervisor_heartbeat(body, request, db)
+    except Exception as exc:
+        # #2845 — a CNPG switchover drops the connection under whichever
+        # statement is in flight: most often the re-read after the long-poll
+        # hold, which runs a minute after the telemetry commit. That is the
+        # database being briefly away, not a bug, so answer it as one: 503,
+        # which the supervisor logs as a server error and retries on its next
+        # heartbeat — never a revocation strike (only a marked 403 is one).
+        # Nothing here reads the ORM row: the failed statement's rollback has
+        # expired every attribute, and loading one in an async session raises
+        # MissingGreenlet. ``body`` is plain pydantic data.
+        if not is_transient_db_error(exc):
+            raise
+        logger.info(
+            "supervisor_heartbeat_db_unavailable",
+            appliance_id=str(body.appliance_id),
+            error=str(exc)[:200],
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The database is briefly unavailable (a failover is likely in progress). Retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+async def _supervisor_heartbeat(
+    body: SupervisorHeartbeatRequest,
+    request: Request,
+    db: AsyncSession,
+) -> SupervisorHeartbeatResponse:
+    """The heartbeat itself; ``supervisor_heartbeat`` above is the route."""
 
     # #170 Wave D follow-up — cert auth takes precedence when the
     # supervisor presents X-Appliance-Cert + X-Appliance-Signature +
@@ -2205,20 +2449,20 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+            refusal = _heartbeat_refusal(None)
+            assert refusal is not None
+            raise refusal
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
     # appliances even when the cert chain still validates. The
-    # supervisor's three-strike detector turns the 403 into local
+    # supervisor's strike detector turns the marked 403 into local
     # ``revoked`` state + tears down service containers. Keeps the
     # cert-auth path simple (still trust the cert) while honouring
     # the operator's soft-delete intent at the API boundary.
-    if row.state == APPLIANCE_STATE_REVOKED:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
-        )
+    refusal = _heartbeat_refusal(row)
+    if refusal is not None:
+        raise refusal
 
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
@@ -2948,6 +3192,9 @@ async def supervisor_heartbeat(
         )
         if not has_pending_command:
             long_poll = True
+            # #2807 — captured before the hold: after it the instance may be
+            # expired (row deleted) and any attribute load would raise.
+            held_appliance_id = row.id
             hold_for = min(float(body.wait_seconds), _HEARTBEAT_HOLD_CAP_S)
             deadline = asyncio.get_running_loop().time() + hold_for
             async with wake_subscription([*appliance_wake_channels(row), HOSTCONFIG_ALL]) as wake:
@@ -2959,17 +3206,23 @@ async def supervisor_heartbeat(
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
-            # building the desired-state response below. Guarded: if the row
-            # was hard-deleted during the hold, refresh raises — serve one
-            # last response from the in-memory row (the next heartbeat
-            # 403/404s cleanly) instead of 500ing.
-            try:
-                await db.refresh(row)
-            except Exception:  # noqa: BLE001
+            # building the desired-state response below, and answer what a
+            # fresh heartbeat would for the row's NEW state (#2807): revoked
+            # during the hold → 403 ``revoked``; deleted (or revoked then
+            # permanently deleted) → 403 ``unknown``. Previously a revoked
+            # row failed the response model and a deleted one failed its
+            # refresh — both 500s, so the revoke landed a heartbeat late.
+            fresh = await db.get(Appliance, held_appliance_id, populate_existing=True)
+            refusal = _heartbeat_refusal(fresh)
+            if refusal is not None:
                 logger.info(
-                    "supervisor_heartbeat_refresh_after_hold_failed",
-                    appliance_id=str(row.id),
+                    "supervisor_heartbeat_refused_after_hold",
+                    appliance_id=str(held_appliance_id),
+                    revocation=(refusal.headers or {}).get(REVOCATION_HEADER),
                 )
+                raise refusal
+            assert fresh is not None
+            row = fresh
 
     # Resolve assigned role config so the supervisor can bring up
     # service containers. DNS / DHCP group lookups are best-effort —
@@ -3170,6 +3423,23 @@ async def supervisor_heartbeat(
                     "last_rendered_at": rendered_at,
                 },
             )
+        )
+        await db.commit()
+    else:
+        # #2794 — enforcement off: there is no server render this node is
+        # expected to match. Drop the stale hash (and the stall watermark) so
+        # drift / the apply-stalled alarm read clean and re-enabling starts
+        # from a fresh render rather than the last enforced one.
+        await db.execute(
+            update(FirewallApplyState)
+            .where(
+                FirewallApplyState.appliance_id == row.id,
+                or_(
+                    FirewallApplyState.rendered_hash.is_not(None),
+                    FirewallApplyState.stalled_since.is_not(None),
+                ),
+            )
+            .values(rendered_hash=None, stalled_since=None)
         )
         await db.commit()
 
@@ -3567,6 +3837,10 @@ class ApplianceRow(BaseModel):
     storage_findings: list[dict[str, str]] = []
     storage_worst_severity: str | None = None
     storage_reported: bool = False
+    # #2400 — /var headroom against kubelet eviction, judged by the function
+    # behind the ``appliance_disk_usage`` alert. ``None`` = fine or unknown.
+    # The raw numbers are in ``cluster_health.host_disk_partitions``.
+    var_disk_finding: VarDiskFinding | None = None
     # #1017 — the interface MTU spatium-etc-render actually APPLIED at
     # this node's last boot, not what STATE asked for: the renderer drops
     # a value that is out of range, that would break a pinned IPv6
@@ -3655,6 +3929,15 @@ def _storage_findings(row: Appliance) -> list[StorageFinding]:
 
 def _storage_worst_severity(row: Appliance) -> str | None:
     return worst_severity(_storage_findings(row))
+
+
+def _var_disk_finding(row: Appliance) -> dict[str, Any] | None:
+    """#2400 — the /var finding for one appliance row (``None`` = fine or
+    unknown). A stale reading is not judged: it says nothing about now."""
+    finding: dict[str, Any] | None = var_disk_fields(row.cluster_health, row.last_seen_at)[
+        "var_disk_finding"
+    ]
+    return finding
 
 
 def mtu_fields(cluster_health: Any) -> dict[str, Any]:
@@ -3767,6 +4050,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ],
         storage_worst_severity=_storage_worst_severity(row),
         storage_reported=has_storage_report(row.cluster_health),
+        var_disk_finding=_var_disk_finding(row),
         **mtu_fields(row.cluster_health),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
@@ -4493,6 +4777,9 @@ _VALID_ROLES = {
     "custom",
 }
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
+# #2801 — the roles a re-registering control-plane node may get back: the ones
+# that run a service, i.e. what the supervisor's role env carries.
+_RESTORABLE_ROLES = _DNS_ROLES | {"dhcp", "looking-glass"}
 
 
 # #1715 / #1749 — the ownership matching (``_own_server_condition``,
@@ -6689,6 +6976,27 @@ class ApplianceUpgradeRequest(BaseModel):
     acknowledge_schema_rollback: bool = False
 
 
+async def _require_node_staging_headroom(
+    db: AsyncSession, row: Appliance, slot_image_id: uuid.UUID | None
+) -> None:
+    """422 when staging the image on ``row``'s /var would leave it under the
+    kubelet's eviction headroom (#2400). Silent when the node's reading is
+    absent or stale — unknown is not a refusal."""
+    if not reading_is_fresh(row.last_seen_at):
+        return
+    reading = var_disk_reading(row.cluster_health)
+    if reading is None:
+        return
+    image_bytes = 0
+    if slot_image_id is not None:
+        image = await db.get(ApplianceUpgradeImage, slot_image_id)
+        if image is not None:
+            image_bytes = int(image.size_bytes or 0)
+    message = staging_shortfall(reading, image_bytes, row.hostname)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
 @router.post(
     "/appliances/{appliance_id}/upgrade",
     response_model=ApplianceRow,
@@ -6745,6 +7053,16 @@ async def schedule_appliance_upgrade(
                 "for docker / k8s deployments."
             ),
         )
+
+    # #2400 — the node downloads the image onto its own /var before writing
+    # the slot. If that leaves under the kubelet's eviction headroom, the
+    # kubelet evicts the control plane mid-upgrade. The host runner refuses
+    # too (rc 7), but only after the operator has been told "scheduled";
+    # refuse here, with the numbers, while the request is still open. The
+    # size is the stored image's for an uploaded/imported one; an external
+    # URL's is unknown, so only the margin itself is checked. A missing or
+    # stale reading is UNKNOWN and does not refuse (the host check remains).
+    await _require_node_staging_headroom(db, row, body.slot_image_id)
 
     # #1227 — an "upgrade" to an older image on a control-plane node is a
     # downgrade of the release that runs on THE database, which that release

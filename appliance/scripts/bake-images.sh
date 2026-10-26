@@ -96,7 +96,7 @@ OBSERVABILITY_IMAGES=(
     # Agent landing page — always-on nginx serving the rendered
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
     # 1.31.5-alpine matching values.yaml's ``agentLanding.image.tag``.
-    "nginx:1.31.7-alpine"
+    "nginx:1.31.8-alpine"
     # Phase 11 (#183) — Redis datastore for the control plane.
     # Tag follows the umbrella chart's ``redis.image.tag`` default.
     # NOTE: the standalone ``postgres:16-alpine`` image is intentionally

@@ -78,6 +78,8 @@ log = structlog.get_logger(__name__)
 # subprocess piece). C2 ships only the env render; C3 wires the
 # actual ``docker compose up -d`` invocation.
 _ROLE_ENV_FILENAME = "role-compose.env"
+# #2801 — read by the re-register path in ``__main__``.
+ROLE_ENV_FILENAME = _ROLE_ENV_FILENAME
 
 # #170 Wave C3 — nftables drop-in path. Lives under /etc/nftables.d
 # (bind-mounted rw on the supervisor compose entry). The host's
@@ -316,6 +318,10 @@ def _supervisor_version() -> str:
 # spamming the docker daemon every minute.
 _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
+# #2833 — while any service reads missing / starting the verdict is likely to
+# change within seconds (a pod coming up), so re-check this soon rather than
+# holding it for the full interval.
+_WATCHDOG_RECHECK_S = 20.0
 _cached_role_health: dict[str, Any] = {}
 
 # #285 Phase 5 — throttle for the warn-only etcd/peer-drift cross-check.
@@ -641,8 +647,21 @@ def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundL
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
     first watchdog cadence after startup); subsequent calls gate on
-    monotonic elapsed."""
-    return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
+    monotonic elapsed.
+
+    ``_last_watchdog_at == 0.0`` means "never ran / invalidated" and is due
+    at once. It used to be compared like a timestamp, but ``time.monotonic()``
+    counts from boot, so within the first ``_WATCHDOG_INTERVAL_S`` of host
+    uptime neither the first probe nor the invalidation after a role apply
+    (#2808's first approved heartbeat) was due until 5 min after boot."""
+    if _last_watchdog_at == 0.0:
+        return True
+    unsettled = any(
+        isinstance(e, dict) and e.get("status") in ("missing", "starting")
+        for e in _cached_role_health.values()
+    )
+    interval = _WATCHDOG_RECHECK_S if unsettled else _WATCHDOG_INTERVAL_S
+    return time.monotonic() - _last_watchdog_at >= interval
 
 
 # Phase 9 rewrite — the pre-Phase-9 drift detector (live nft -j
@@ -834,6 +853,65 @@ def _maybe_apply_firewall(
         log.warning("supervisor.firewall.trigger_write_failed", error=str(exc))
 
 
+def _dispatch_firewall(
+    fw_settings: object,
+    role_assignment: dict[str, Any] | None,
+    log: structlog.stdlib.BoundLogger,
+    cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
+) -> None:
+    """#285 Phase 2a bundle-first / renderer-fallback dispatch, one tick.
+
+    Extracted from ``heartbeat_once`` (#2774) so the guard and its fallback are
+    tested as the single decision they are: a refused server body must still
+    leave the node converging on the in-pod render.
+    """
+    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
+
+    if use_bundle:
+        if appliance_state.maybe_fire_firewall_reload(fw_settings):
+            log.info(
+                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
+            )
+    else:
+        # #5 fallback — control plane too old to render, firewall_enabled
+        # still off, or its body refused by the #593 guard; render in-pod from
+        # the same derived inputs. The in-pod render carries NO fleet-policy
+        # rules (those are server-only), so a refusal costs enforcement on this
+        # node until the server body is acceptable — which is why the guard
+        # must refuse only a body that would really partition (#2774).
+        #
+        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
+        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
+        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
+        # rendered drop-in is now the SOLE source of that accept, so it must be
+        # present on EVERY appliance node — including idle / non-CP nodes that
+        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
+        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
+        # runner short-circuits on an unchanged body hash, so an unconditional
+        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
+        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
+        # a separate file the glob pulls in, so even a total drop-in failure
+        # still leaves the node SSH-recoverable.
+        _maybe_apply_firewall(
+            role_assignment,
+            log,
+            cluster_peer_cidrs,
+            pod_cidrs=pod_cidrs,
+            service_cidrs=service_cidrs,
+            cp_member_count=cp_member_count,
+            vip_configured=vip_configured,
+            web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+            ssh_scope_cidrs=ssh_scope_cidrs,
+        )
+
+
 def _server_firewall_body_is_usable(
     fw_settings: object, log: structlog.stdlib.BoundLogger
 ) -> bool:
@@ -853,14 +931,38 @@ def _server_firewall_body_is_usable(
 
     The structural test runs first, so a body that already opens 2380 — every
     healthy control-plane node — costs no apiserver read.
+
+    #2774 — the decision is the SAME predicate the in-pod path uses
+    (``would_self_partition`` over the live peer set), so the two paths cannot
+    disagree about a node. A readable sole etcd member (a one-node install) has
+    no raft peer to be cut off from, so the server's correct body has no peer
+    rule and must be used: refusing it sent every one-node install down the
+    in-pod renderer, which carries no fleet-policy rules, so an enforced fleet
+    rule never reached the host and the Firewall view reported drift forever.
+    The in-pod path got this exemption in #610; this path never did.
     """
     if not isinstance(fw_settings, dict) or not fw_settings.get("config_hash"):
         return False
 
     conf = str(fw_settings.get("firewall_conf") or "")
     if firewall_peer_audit.body_opens_etcd_peers(conf):
+        # A body we are willing to pipe is, by construction, one that keeps
+        # this node in raft — drop any earlier refusal marker, or a node that
+        # healed keeps reporting a divergence it no longer has. The in-pod
+        # path clears it the same way when it writes.
+        appliance_state.clear_firewall_refusal()
         return True
-    if firewall_peer_audit.local_node_is_etcd_member() is not True:
+
+    is_etcd_member = firewall_peer_audit.local_node_is_etcd_member()
+    live_peers = None
+    if is_etcd_member is True:
+        live_peers = firewall_peer_audit.observed_peer_cidrs(
+            appliance_state.read_node_ips() or []
+        )
+    if not firewall_peer_audit.would_self_partition(
+        conf, is_etcd_member=is_etcd_member, live_peers=live_peers
+    ):
+        appliance_state.clear_firewall_refusal()
         return True
 
     reason = (
@@ -924,6 +1026,51 @@ def next_heartbeat_delay(
         step = FAILED_RETRY_FIRST_S * (2 ** max(0, consecutive_failures - 1))
         return min(float(interval_s), step)
     return rearm_floor_s if held else float(interval_s)
+
+
+
+# #2798 — how the control plane says "this appliance is revoked" on a
+# heartbeat: a 403 carrying this header (``revoked`` for a revoked row,
+# ``unknown`` when no row accepts the credential). Mirrors
+# ``REVOCATION_HEADER`` in ``backend/app/api/v1/appliance/supervisor.py``.
+REVOCATION_HEADER = "X-Spatium-Revocation"
+# The 403 details a control plane from before the header answered for the
+# same two refusals. Recognised so a supervisor upgraded ahead of its
+# control plane still stops when it is revoked or deleted.
+_LEGACY_REVOCATION_DETAILS = (
+    ("Appliance has been revoked.", "revoked"),
+    ("Invalid appliance or session.", "unknown"),
+)
+
+
+def _refusal_detail(resp: httpx.Response) -> str | None:
+    try:
+        detail = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    return detail if isinstance(detail, str) else None
+
+
+def revocation_reason(resp: httpx.Response) -> str | None:
+    """The revocation the control plane stated on this heartbeat response,
+    or None when it stated none (#2798).
+
+    Only a 403 can be one: the marked 403 from a current control plane, or
+    one of the two legacy 403 details. A 404 never is — it said "registration
+    is switched off" on older control planes and says "nothing is mounted
+    here" behind a proxy, and reading it as a revocation took DNS and DHCP
+    down on every appliance when pairing was switched off."""
+    if resp.status_code != 403:
+        return None
+    marker = resp.headers.get(REVOCATION_HEADER)
+    if marker:
+        return marker.strip().lower() or "revoked"
+    detail = _refusal_detail(resp)
+    if detail:
+        for prefix, reason in _LEGACY_REVOCATION_DETAILS:
+            if detail.startswith(prefix):
+                return reason
+    return None
 
 
 def heartbeat_once(
@@ -998,7 +1145,12 @@ def heartbeat_once(
         if _watchdog_check_due():
             try:
                 env_file = cfg.state_dir / _ROLE_ENV_FILENAME
-                _cached_role_health = watchdog.check_health(env_file)
+                # #2808 — no heal while the node is not approved: the revoked
+                # teardown keeps the role env, and healing from it brought
+                # DNS and DHCP back on a node taken out of service.
+                _cached_role_health = watchdog.check_health(
+                    env_file, held_by=approval_state.role_services_hold(cfg.state_dir)
+                )
                 _last_watchdog_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 # Never let a watchdog crash kill the heartbeat path.
@@ -1088,19 +1240,34 @@ def heartbeat_once(
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
         return None
-    if resp.status_code == 403 or resp.status_code == 404:
-        # 403 = approval revoked or cert no longer valid for any
-        # known appliance row. 404 = appliance row deleted, or the
-        # control plane's supervisor_registration_enabled flag is
-        # off. Both mean "you shouldn't be talking to me anymore" —
-        # increment the consecutive-strike counter; flip to
-        # ``revoked`` once REVOCATION_STRIKE_LIMIT in a row, which
-        # de-noises a short control-plane restart.
+    revocation = revocation_reason(resp)
+    if revocation is None and resp.status_code in (403, 404):
+        # #2798 — a refusal that is NOT the control plane's revocation
+        # answer: a 404 (a proxy, an api whose router is not mounted, an
+        # older api whose registration flag was switched off) or a 403
+        # without the marker. None of these says the row is gone, so it is
+        # no strike and nothing is torn down: the role services keep
+        # serving from the last applied assignment (non-negotiable #5) and
+        # this keeps being logged until the heartbeat is accepted again.
+        log.warning(
+            "supervisor.heartbeat.refused_not_revocation",
+            status_code=resp.status_code,
+            detail=_refusal_detail(resp),
+            appliance_id=str(appliance_id),
+        )
+        return False
+    if revocation is not None:
+        # 403 marked as a revocation: the row is revoked, or no row
+        # accepts our credential (deleted, or re-keyed). Increment the
+        # consecutive-strike counter; flip to ``revoked`` once
+        # REVOCATION_STRIKE_LIMIT in a row, which de-noises a short
+        # control-plane restart.
         prior_state = approval_state.read_state(cfg.state_dir)
         new_state, strikes = approval_state.record_revocation_signal(cfg.state_dir)
         log.warning(
             "supervisor.heartbeat.rejected",
             status_code=resp.status_code,
+            revocation=revocation,
             strikes=strikes,
             new_state=new_state,
             appliance_id=str(appliance_id),
@@ -1120,6 +1287,14 @@ def heartbeat_once(
             if appliance_state.detect_deployment_kind() == "appliance":
                 try:
                     lifecycle = tear_down_supervised_services()
+                    # #2801 — the stamp says the role chart for this env is
+                    # applied, and the teardown just un-applied it. Left in
+                    # place, the first accepted heartbeat after the node is
+                    # approved again (same row, or a re-registration that
+                    # restored its roles) renders the same env, matches the
+                    # stamp and skips the apply, so DNS and DHCP stayed down
+                    # until the watchdog's next pass (up to 5 min).
+                    _clear_last_apply_hash(cfg.state_dir)
                     if lifecycle.stopped:
                         log.warning(
                             "supervisor.heartbeat.revoked_teardown",
@@ -1162,6 +1337,13 @@ def heartbeat_once(
         return False
     # Heartbeat accepted — clear any prior strike counter and stamp
     # ``approved`` if we weren't there yet.
+    #
+    # #2808 — remember whether the role services were held (revoked or
+    # pending) up to now. The watchdog no longer heals a held node, so the
+    # first accepted heartbeat is what brings its roles back, and it must
+    # apply whatever the stamp says: the stamp may still name the env the
+    # teardown un-applied.
+    held_until_now = approval_state.role_services_hold(cfg.state_dir)
     approval_state.record_success(cfg.state_dir)
 
     try:
@@ -1772,41 +1954,18 @@ def heartbeat_once(
     # the BYTE-IDENTICAL body, so applied state is the same whichever ran —
     # this is what makes the rolling upgrade (supervisor/control-plane skew in
     # either direction) safe.
-    fw_settings = body_out.get("firewall_settings")
-    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
-
-    if use_bundle:
-        if appliance_state.maybe_fire_firewall_reload(fw_settings):
-            log.info(
-                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
-            )
-    else:
-        # #5 fallback — control plane too old to render, or firewall_enabled
-        # still off; render in-pod from the same derived inputs.
-        #
-        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
-        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
-        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
-        # rendered drop-in is now the SOLE source of that accept, so it must be
-        # present on EVERY appliance node — including idle / non-CP nodes that
-        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
-        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
-        # runner short-circuits on an unchanged body hash, so an unconditional
-        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
-        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
-        # a separate file the glob pulls in, so even a total drop-in failure
-        # still leaves the node SSH-recoverable.
-        _maybe_apply_firewall(
-            role_assignment,
-            log,
-            cluster_peer_cidrs,
-            pod_cidrs=fw_pod_cidrs,
-            service_cidrs=fw_service_cidrs,
-            cp_member_count=fw_cp_member_count,
-            vip_configured=fw_vip_configured,
-            web_ui_allowed_cidrs=fw_web_ui_cidrs,
-            ssh_scope_cidrs=fw_ssh_scope_cidrs,
-        )
+    _dispatch_firewall(
+        body_out.get("firewall_settings"),
+        role_assignment,
+        log,
+        cluster_peer_cidrs,
+        pod_cidrs=fw_pod_cidrs,
+        service_cidrs=fw_service_cidrs,
+        cp_member_count=fw_cp_member_count,
+        vip_configured=fw_vip_configured,
+        web_ui_allowed_cidrs=fw_web_ui_cidrs,
+        ssh_scope_cidrs=fw_ssh_scope_cidrs,
+    )
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
@@ -1877,13 +2036,19 @@ def heartbeat_once(
     # toward a state the control plane no longer expects. The console
     # dashboard surfaces the red ``Approval revoked`` chip so the
     # operator knows the recovery is "re-pair from /appliance/pairing".
-    if approval_state.read_state(cfg.state_dir) == "revoked":
+    if approval_state.role_services_hold(cfg.state_dir) is not None:
         log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
         _ = identity
         return False
 
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        _run_role_lifecycle(cfg.state_dir, target.profiles, rendered, env_path)
+        _run_role_lifecycle(
+            cfg.state_dir,
+            target.profiles,
+            rendered,
+            env_path,
+            force=held_until_now is not None,
+        )
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
@@ -1894,7 +2059,12 @@ def heartbeat_once(
 
 
 def _run_role_lifecycle(
-    state_dir: Path, profiles: list[str], rendered: str, env_path: Path
+    state_dir: Path,
+    profiles: list[str],
+    rendered: str,
+    env_path: Path,
+    *,
+    force: bool = False,
 ) -> None:
     """Write the role chart (when due), THEN reconcile the node labels (#2190).
 
@@ -1908,9 +2078,16 @@ def _run_role_lifecycle(
     only what its new template can serve, and the reconcile after it — which
     still runs on every tick, to catch an out-of-band ``kubectl label`` — gates
     the same way.
+
+    ``force`` applies even when the stamp matches: the first accepted
+    heartbeat after the node was held (revoked or pending, #2808), whose
+    role chart was torn down under an env the stamp still names.
     """
     global _last_watchdog_at
     apply_due, env_hash = _role_apply_due(state_dir, rendered, env_path)
+    if force and not apply_due:
+        log.info("supervisor.heartbeat.lifecycle_forced", reason="approved_again")
+        apply_due = True
     if not apply_due:
         log.info(
             "supervisor.heartbeat.lifecycle_skipped",
@@ -1934,6 +2111,9 @@ def _run_role_lifecycle(
         # the watchdog cache so the next heartbeat re-probes
         # immediately rather than rendering 5-min-stale health.
         _last_watchdog_at = 0.0
+        # #2833 — the chart is written but its pod is not up yet: the pass
+        # that is now due must read that as starting, not missing.
+        watchdog.note_apply()
         # Only stamp the hash on success — a failed apply should
         # re-attempt on the next heartbeat (the failure may have
         # been transient: image pull glitch, transient port
@@ -2021,6 +2201,17 @@ def _write_last_apply_hash(state_dir: Path, env_hash: str) -> None:
         pass
 
 
+def _clear_last_apply_hash(state_dir: Path) -> None:
+    """Drop the apply stamp so the next accepted heartbeat re-applies the role
+    chart (#2801), whatever env it renders."""
+    try:
+        (state_dir / _LAST_APPLY_HASH_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        # Best effort: a stamp left behind only means the next apply may be
+        # skipped as unchanged, which the role watchdog then re-fires.
+        log.warning("supervisor.heartbeat.apply_stamp_clear_failed", error=str(exc))
+
+
 def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:
     """Write the most recent compose-lifecycle outcome to disk so the
     NEXT heartbeat reports it (this one has already left)."""
@@ -2049,3 +2240,8 @@ def _read_lifecycle_state(state_dir: Path) -> tuple[str | None, str | None]:
     state = body[0].strip() if body else None
     reason = "\n".join(body[1:]).strip() or None if len(body) > 1 else None
     return state, reason
+
+
+# #2801 — the re-register path reports the last apply's outcome with the roles
+# it asks the control plane to restore.
+read_lifecycle_state = _read_lifecycle_state

@@ -53,6 +53,41 @@ logger = structlog.get_logger(__name__)
 # the appliance shape.
 _AGENT_ADDRESS_LINE = "agentAddress udp:161,udp6:[::1]:161"
 
+# AgentX master socket (issue #2154). lldpd's "Expose via SNMP" toggle
+# (#348) runs ``lldpd -x``, which registers LLDP-MIB as an AgentX
+# *subagent* — and that only works when snmpd is an AgentX *master*.
+# net-snmp does not take the master role unless ``master agentx`` is
+# configured; Debian's stock snmpd.conf carries the line, but this
+# renderer REPLACES that file, so it has to carry it too or the LLDP
+# toggle silently does nothing.
+#
+# Emitted whenever SNMP is enabled, not only when the LLDP toggle is on:
+# it is a local unix socket (no listener on the network, nothing for
+# nftables to open) restricted to root by ``agentXPerms``, so it exposes
+# nothing; and keeping it unconditional means the snmpd config does not
+# depend on LLDP settings — flipping the LLDP toggle never has to
+# restart snmpd, and a later subagent (the planned SPATIUMDDI-MIB) needs
+# no second switch.
+#
+# ``/run/agentx`` is the directory Debian's snmpd.service already creates
+# (``RuntimeDirectory=agentx``): tmpfs, so a stale socket never survives
+# a reboot the way one under the persistent /var would. lldpd is pointed
+# at the same path explicitly (``-X``, see ``lldp.render_lldpd_daemon_args``)
+# rather than relying on both sides' compiled-in defaults agreeing.
+#
+# 0600 / 0700 root-only is enough for lldpd: its monitor process keeps
+# CAP_DAC_OVERRIDE after dropping to ``_lldpd`` and connects fine —
+# verified against Debian 13's snmpd 5.9.4 + lldpd 1.0.18, including the
+# reconnect after an snmpd restart (lldpd's AgentX ping re-registers
+# within ~15 s, so the reload runner does not need to bounce lldpd).
+AGENTX_SOCKET = "/run/agentx/master"
+_AGENTX_LINES = (
+    "# AgentX master — lets local subagents (lldpd -x → LLDP-MIB) register.",
+    "master agentx",
+    f"agentXSocket {AGENTX_SOCKET}",
+    "agentXPerms 0600 0700",
+)
+
 # net-snmp Debian ships a default that loads HOST-RESOURCES + DISMAN
 # implicitly; we don't have to ``load`` them explicitly. The lines
 # below are the minimum operator-meaningful config — sysContact /
@@ -84,6 +119,17 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     # render: both lines are informational, so dropping one keeps snmpd
     # loading with every access line intact, where refusing to render would
     # take SNMP down over a contact string.
+    #
+    # snmpd reads the rest of a sysContact / sysLocation line LITERALLY
+    # (verified against net-snmp 5.9.4, the Debian 13 package the appliance
+    # ships): there is no quoting or escaping, so quotes and backslashes
+    # become part of the served value and the value is written bare, not
+    # via _quote() (#2773). Whitespace between the keyword and the value and
+    # at the end of the line is dropped by the parser (hence the strip, which
+    # loses nothing). A "#" in the middle of the value is kept; one at the
+    # START makes the whole line a comment and snmpd logs "Blank line
+    # following ... token" and serves its default, so that value is left out
+    # with a note instead of emitting a line that never takes effect.
     for directive, column, raw in (
         ("sysContact", "snmp_sys_contact", settings.snmp_sys_contact),
         ("sysLocation", "snmp_sys_location", settings.snmp_sys_location),
@@ -99,13 +145,22 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
                 "Re-enter it in the UI."
             )
             continue
-        lines.append(f"{directive:<14} {_quote(value)}")
+        if value.startswith("#"):
+            lines.append(
+                f"# {directive} OMITTED — a value starting with '#' is read by "
+                "snmpd as a comment and cannot be expressed."
+            )
+            continue
+        lines.append(f"{directive:<14} {value}")
     lines.append(_AGENT_ADDRESS_LINE)
     lines.append("")
 
     # View that exposes the whole MIB tree to authorised queries.
     # Per-OID restrictions are out of scope for the first cut.
     lines.append("view all included .1")
+    lines.append("")
+
+    lines.extend(_AGENTX_LINES)
     lines.append("")
 
     version = (settings.snmp_version or "v2c").strip()

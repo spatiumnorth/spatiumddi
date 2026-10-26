@@ -292,6 +292,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 or 0
             )
             bl.last_synced_at = datetime.now(UTC)
+            bl.last_success_at = bl.last_synced_at
             bl.last_sync_status = "success"
             bl.last_sync_error = None
 

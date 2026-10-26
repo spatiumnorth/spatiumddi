@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -229,6 +230,50 @@ def render_env_file(target: TargetEnv, header: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def last_assigned_roles(
+    env_path: Path, last_apply_state: str | None = None
+) -> dict[str, Any] | None:
+    """The role assignment this node last received and applied, read back
+    from its rendered role env, for a re-registration to restore (#2801).
+
+    The role env is rewritten on every accepted heartbeat from the control
+    plane's ``role_assignment``, and left alone while the node is revoked, so
+    when a control-plane node's Fleet row goes away it still holds what the
+    node was serving. Only the service roles (the env's ``COMPOSE_PROFILES``)
+    and the group NAMES travel; the agent keys stay on disk. A role the
+    operator removed is already gone from it, since the heartbeat that
+    carried the removal rewrote the file.
+
+    ``None`` when there is nothing to restore: no file, or no service role in
+    it (a node that was never assigned any).
+    """
+    env: dict[str, str] = {}
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    profiles = (p.strip() for p in env.get("COMPOSE_PROFILES", "").split(","))
+    roles = [p for p in dict.fromkeys(profiles) if p in _SERVICE_ROLES]
+    if not roles:
+        return None
+    out: dict[str, Any] = {"roles": roles}
+    dns_group = env.get("AGENT_GROUP")
+    if dns_group and _GROUP_NAME_RE.match(dns_group):
+        out["dns_group_name"] = dns_group
+    dhcp_group = env.get("DHCP_AGENT_GROUP")
+    if dhcp_group and _GROUP_NAME_RE.match(dhcp_group):
+        out["dhcp_group_name"] = dhcp_group
+    if last_apply_state:
+        out["last_apply_state"] = last_apply_state[:32]
+    return out
+
+
 # ── DHCP bridged-mode port-conflict pre-flight (#170 Phase E2) ────
 
 
@@ -352,6 +397,7 @@ def probe_port_conflicts() -> dict[str, str]:
 __all__ = [
     "TargetEnv",
     "compute_target_env",
+    "last_assigned_roles",
     "render_env_file",
     "PortConflict",
     "detect_port_conflict",

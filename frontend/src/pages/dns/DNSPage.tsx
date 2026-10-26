@@ -11,7 +11,12 @@ import {
 } from "@/lib/winrm";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { ZoneSerialsLine } from "./ZoneSerialsLine";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
@@ -137,6 +142,7 @@ import {
   zoneTransportOptions,
 } from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
+import { feedChip, FEED_CHIP_CLS } from "@/lib/blocklist-feed";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
 import {
@@ -1062,6 +1068,34 @@ function buildDnsTree(zones: DNSZone[]): DnsTreeNode[] {
   return roots;
 }
 
+// ── Cached-list write-back after an edit (#2830) ─────────────────────────────
+
+/**
+ * Put a saved row into every cached list under `queryKey` (prefix match, so a
+ * list keyed with extra params is covered too), replacing the one row by id.
+ *
+ * The edit dialogs seed their form once, from the row the page holds, which
+ * comes from a cached list. `invalidateQueries` only starts a refetch; a
+ * dialog reopened before it resolves would show the pre-save row, and an
+ * untouched Save would write that back (#2462 / #2830). Writing the PUT's
+ * response first closes that gap; the invalidate still runs afterwards.
+ */
+function patchCachedRow(
+  qc: QueryClient,
+  queryKey: readonly unknown[],
+  saved: unknown,
+) {
+  const row = saved as { id?: string } | null | undefined;
+  if (!row || typeof row !== "object" || !row.id) return;
+  qc.setQueriesData({ queryKey }, (old: unknown) =>
+    Array.isArray(old)
+      ? old.map((r) =>
+          r && (r as { id?: string }).id === row.id ? { ...r, ...row } : r,
+        )
+      : old,
+  );
+}
+
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
 function GroupModal({
@@ -1116,7 +1150,8 @@ function GroupModal({
   const mut = useMutation({
     mutationFn: (d: Partial<DNSServerGroup>) =>
       group ? dnsApi.updateGroup(group.id, d) : dnsApi.createGroup(d),
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      if (group) patchCachedRow(qc, ["dns-groups"], saved);
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
       onClose();
     },
@@ -1454,7 +1489,8 @@ export function ServerModal({
       server
         ? dnsApi.updateServer(groupId, server.id, d)
         : dnsApi.createServer(groupId, d),
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      if (server) patchCachedRow(qc, ["dns-servers", groupId], saved);
       // Prefix-invalidate EVERY group's server list, not just this one.
       // A #934 move writes rows in two groups (the server leaves one and
       // joins the other) and primary re-election touches a sibling in each,
@@ -2719,7 +2755,8 @@ export function ZoneModal({
       zone
         ? dnsApi.updateZone(groupId, zone.id, d)
         : dnsApi.createZone(groupId, d),
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      if (zone) patchCachedRow(qc, ["dns-zones", groupId], saved);
       qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
       onClose();
     },
@@ -3485,9 +3522,13 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   // #2316 — a paused (maintenance) server is shown separately and left out
   // of the count; a server that is not active is counted, but never as in
   // sync, whatever serial it reported before it went away.
-  const paused = state.servers.filter((s) => s.freshness === "paused");
+  const paused = state.servers.filter(
+    (s) => s.freshness === "paused" || s.freshness === "disabled",
+  );
   const down = state.servers.filter((s) => s.freshness === "unreachable");
-  const counted = state.servers.filter((s) => s.freshness !== "paused");
+  const counted = state.servers.filter(
+    (s) => s.freshness !== "paused" && s.freshness !== "disabled",
+  );
   const total = counted.length;
   const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
@@ -3498,17 +3539,19 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   );
   const tooltip = state.servers
     .map((s) =>
-      s.freshness === "paused"
-        ? `${s.server_name}: paused (maintenance), not counted`
-        : s.freshness === "unreachable"
-          ? `${s.server_name}: ${s.server_status}, not counted as in sync`
-          : s.current_serial === null
-            ? `${s.server_name}: not reported`
-            : `${s.server_name}: serial ${s.current_serial}` +
-              (s.current_serial !== state.target_serial ? " (drift)" : "") +
-              (s.pending_ops
-                ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
-                : ""),
+      s.freshness === "disabled"
+        ? `${s.server_name}: disabled, not counted`
+        : s.freshness === "paused"
+          ? `${s.server_name}: paused (maintenance), not counted`
+          : s.freshness === "unreachable"
+            ? `${s.server_name}: ${s.server_status}, not counted as in sync`
+            : s.current_serial === null
+              ? `${s.server_name}: not reported`
+              : `${s.server_name}: serial ${s.current_serial}` +
+                (s.current_serial !== state.target_serial ? " (drift)" : "") +
+                (s.pending_ops
+                  ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+                  : ""),
     )
     .join("\n");
 
@@ -5765,7 +5808,14 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                     className={`inline-block h-2 w-2 rounded-full ${dotCls[s.status] ?? "bg-muted"}`}
                     title={`status: ${s.status}${s.last_health_check_at ? ` · last check: ${new Date(s.last_health_check_at).toLocaleString()}` : " · never checked"}`}
                   />
-                  <span className="text-sm font-medium">{s.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => setDetailServer(s)}
+                    aria-label={`View details of ${s.name}`}
+                    className="text-sm font-medium hover:underline focus-visible:underline focus:outline-none"
+                  >
+                    {s.name}
+                  </button>
                   <span
                     className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusCls[s.status] ?? "bg-muted text-muted-foreground"}`}
                   >
@@ -6275,7 +6325,8 @@ function ViewModal({
       view
         ? dnsApi.updateView(groupId, view.id, payload)
         : dnsApi.createView(groupId, payload),
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      if (view) patchCachedRow(qc, ["dns-views", groupId], saved);
       qc.invalidateQueries({ queryKey: ["dns-views", groupId] });
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
       onClose();
@@ -10263,6 +10314,20 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         feed
                       </span>
                     )}
+                    {(() => {
+                      const chip = feedChip(l);
+                      return chip ? (
+                        <span
+                          className={cn(
+                            "inline-flex items-center rounded px-1.5 py-0.5 text-xs",
+                            FEED_CHIP_CLS[chip.tone],
+                          )}
+                          title={chip.title}
+                        >
+                          {chip.label}
+                        </span>
+                      ) : null;
+                    })()}
                     {!l.enabled && (
                       <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600">
                         disabled

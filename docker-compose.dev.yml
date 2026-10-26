@@ -164,6 +164,8 @@ services:
       # sweep so it has to write the same files the api reads
       # back from the "list archives" endpoint.
       - spatium_backups:/var/lib/spatiumddi/backups
+      # Upgrade-image store (issue #2400) — the reclaim beat task runs here.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
     # Docker integration — the worker runs the reconcile tasks, so it
     # needs the host socket too. Uncomment alongside the matching
     # entries on the api service above.

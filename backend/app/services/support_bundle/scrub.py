@@ -235,10 +235,10 @@ _SECRET_VALUE_PATTERNS: tuple[
 SECRET_KEY_NAME_RE = re.compile(
     r"(password|passwd|passphrase|secret|token|apikey|credential|"
     r"_encrypted$|psk|tsig|hmac|salt|gpg|bearer|cookie|session[_-]?id"
-    # ``audit_forward_webhook_auth_header`` holds a literal
-    # "Bearer …" / "Basic …" in PLAINTEXT (see its column comment) and
-    # matched none of the terms above, so the settings collector shipped
-    # it verbatim into an archive destined for a public issue. An
+    # ``audit_forward_webhook_auth_header`` carries a literal
+    # "Bearer …" / "Basic …" once decrypted and matched none of the terms
+    # above, so the settings collector shipped it verbatim into an archive
+    # destined for a public issue. An
     # incoming-webhook URL is a bearer credential in its own right — the
     # path segment IS the authentication — so both are matched by name.
     r"|auth[_-]?header|authorization|webhook[_-]?url"

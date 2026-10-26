@@ -1992,6 +1992,93 @@ _API_CPU_DIVISOR = 4
 _API_CPU_MIN = 1
 _API_CPU_MAX = 4
 
+# #2156 — the Postgres memory limit has to hold the connections the cluster
+# can open, and that number grows with the control-plane node count: every
+# node runs an api pod with its own SQLAlchemy pool (``pool_size`` 10 +
+# ``max_overflow`` 20, held open at idle because the agents' long-polls keep
+# a session each) and a worker, and the primary runs one WAL sender per
+# replica. The share above is sized from the seed's RAM alone, so at nine
+# nodes it did not move while the backends did: the primary was killed at
+# its 2479Mi limit on a node with 14 GiB free, with ~120 processes holding
+# 1.6 GiB of private memory (~14 MiB each, most of it transparent huge
+# pages), 660 MiB of shared buffers and 150 MiB of page tables.
+#
+# Two halves, so the envelope is closed from both sides:
+#
+# * the api's pool per pod shrinks as pods are added, so the cluster's api
+#   connections stop at ~120 instead of growing 30 per node (``api_db_pool``):
+#   unchanged up to four nodes, 13 per pod at nine;
+# * the limit is never below shared_buffers + a fixed allowance + the
+#   connections that can then be open x what one backend costs
+#   (``postgres_connection_budget``). One backend is the issue's measured
+#   ~14 MiB of private memory (with THP) plus its page tables for mapping
+#   shared_buffers in 4 KiB pages (8 bytes per page, so shared_buffers / 512).
+#
+# #2782 — the after-commit event publisher and audit forwarder share one
+# small engine per PROCESS (``pool_size=2, max_overflow=0``), outside the
+# api's own pool: two more connections per api pod, per worker process and
+# for the one celery-beat.
+#
+# ``max_connections`` is the chart's 200 until the budget passes it (from
+# five nodes with four worker processes, eight with two), then the budget, so a pool is never refused a connection it was sized for
+# (``tests/test_postgres_connection_budget_2156.py`` holds that). It moves
+# with the memory limit, so it costs no restart of its own.
+_API_DB_POOL_SIZE = 10
+_API_DB_CONN_PER_POD_MAX = 30
+_API_DB_CONN_PER_POD_MIN = 12
+_API_DB_CONN_CLUSTER = 120
+_WORKER_DB_CONN_SLACK = 1
+# #2782 — the after-commit hooks' engine, per api / worker / beat process.
+_HOOK_DB_CONN_PER_PROCESS = 2
+_PG_CONN_RESERVE = 10
+_PG_BACKEND_BASE_MIB = 14
+_PG_FIXED_MIB = 256
+# charts/spatiumddi/values.yaml: postgresql.cnpg.parameters.max_connections.
+_PG_CHART_MAX_CONNECTIONS = 200
+
+
+def api_db_pool(cp_size: int) -> dict[str, int]:
+    """PURE (#2156): the api's SQLAlchemy pool for ``cp_size`` api pods, as
+    the chart's ``api.databasePool`` values. Each pod may open
+    ``clamp(120 // cp_size, 12, 30)`` connections: the application's own
+    10 + 20 up to four pods, then fewer per pod so the cluster's total stays
+    near 120. ``size`` (the connections kept open) stays 10 while the total
+    allows it, the rest is overflow."""
+    per_pod = min(
+        max(_API_DB_CONN_CLUSTER // max(cp_size, 1), _API_DB_CONN_PER_POD_MIN),
+        _API_DB_CONN_PER_POD_MAX,
+    )
+    size = min(_API_DB_POOL_SIZE, per_pod)
+    return {"size": size, "maxOverflow": per_pod - size}
+
+
+def postgres_connection_budget(cp_size: int, worker_concurrency: int) -> int:
+    """PURE (#2156): the backends the cluster can hold open on the primary —
+    every api pod's whole pool, every worker's processes plus one, the
+    #2782 after-commit hooks' two per api pod, per worker process and for
+    celery-beat, the WAL senders (one per replica) and a fixed reserve
+    (CloudNativePG's own and superuser connections, celery-beat's own, a
+    migrate Job, an operator's psql)."""
+    cp = max(cp_size, 1)
+    pool = api_db_pool(cp)
+    hooks = _HOOK_DB_CONN_PER_PROCESS
+    per_node = (
+        pool["size"]
+        + pool["maxOverflow"]
+        + hooks  # the api pod's hooks (#2782)
+        + worker_concurrency * (1 + hooks)  # each worker process, and its hooks
+        + _WORKER_DB_CONN_SLACK
+    )
+    beat_hooks = hooks  # the one celery-beat's hooks (#2782)
+    return cp * per_node + (cp - 1) + _PG_CONN_RESERVE + beat_hooks
+
+
+def postgres_backend_mib(shared_buffers_mb: int) -> int:
+    """PURE (#2156): what one Postgres backend costs the instance's cgroup, in
+    MiB: the measured private memory plus the page tables mapping
+    shared_buffers (rounded up)."""
+    return _PG_BACKEND_BASE_MIB + (shared_buffers_mb + 511) // 512
+
 
 def _clamp_mib(total_mib: int, fraction: float, lo: int, hi: int) -> int:
     return int(min(max(total_mib * fraction, lo), hi))
@@ -2006,14 +2093,16 @@ def _millicores(cores: int) -> str:
     return f"{cores * 1000}m"
 
 
-def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
+def control_plane_sizing(mem_total_mib: int, cp_size: int = 1) -> dict[str, int]:
     """PURE: the whole-node budget for a node with ``mem_total_mib`` of RAM —
     the ``api``, ``worker`` and ``postgres`` memory limits in MiB, Postgres'
     ``shared_buffers`` in MB (which Postgres reads as MiB) and the Postgres
     memory request in MiB (``postgres_request``, at or above
-    ``shared_buffers``). The one place the arithmetic lives; firstboot mirrors
-    it in bash so a fresh install's first render already carries these
-    numbers."""
+    ``shared_buffers``), the worker ``concurrency`` and (#2156) the
+    connection budget the Postgres limit holds for a control plane of
+    ``cp_size`` nodes. The one place the arithmetic lives;
+    firstboot mirrors it in bash (at one node, the only size a fresh install
+    has) so a fresh install's first render already carries these numbers."""
     budget = max(mem_total_mib - _PLATFORM_RESERVE_MIB, 0)
     api_mib = _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB)
     postgres_mib = _clamp_mib(
@@ -2029,11 +2118,25 @@ def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
         _WORKER_MEM_MIN_MIB,
     )
     shared_buffers_mb = int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE)
+    concurrency = 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4
+    # #2156 — the limit holds the connections the cluster can open. The share
+    # still sets shared_buffers, the request and what the worker is left, so
+    # this only ever RAISES the limit, and only where the share was too small
+    # for the connections (a node under ~6 GiB, or a multi-node cluster).
+    connections = postgres_connection_budget(cp_size, concurrency)
+    postgres_mib = max(
+        postgres_mib,
+        shared_buffers_mb + _PG_FIXED_MIB + connections * postgres_backend_mib(shared_buffers_mb),
+    )
     return {
         "api": api_mib,
         "worker": worker_mib,
         "postgres": postgres_mib,
         "shared_buffers": shared_buffers_mb,
+        "concurrency": concurrency,
+        "postgres_connections": connections,
+        # The chart's 200 until the budget passes it (#2156, #2782).
+        "max_connections": max(_PG_CHART_MAX_CONNECTIONS, connections),
         # CloudNativePG refuses a Cluster whose memory request is below
         # shared_buffers (Postgres reads MB as MiB, so the two compare one
         # to one); the chart's own 256Mi is the floor.
@@ -2055,7 +2158,7 @@ def control_plane_cpu_sizing(cpu_count: int) -> dict[str, int]:
 
 
 def control_plane_resources(
-    mem_total_mib: int | None, cpu_count: int | None = None
+    mem_total_mib: int | None, cpu_count: int | None = None, cp_size: int = 1
 ) -> dict[str, Any]:
     """PURE: the ``api`` / ``worker`` / ``postgresql`` resource overrides for
     a node with ``mem_total_mib`` of RAM and ``cpu_count`` CPUs. Each input
@@ -2078,11 +2181,11 @@ def control_plane_resources(
     first heartbeat, and the #1005 guard keeps every later heartbeat quiet."""
     out: dict[str, Any] = {}
     if mem_total_mib and mem_total_mib > 0:
-        sized = control_plane_sizing(mem_total_mib)
+        sized = control_plane_sizing(mem_total_mib, cp_size)
         out = {
             "api": {"resources": {"limits": {"memory": f"{sized['api']}Mi"}}},
             "worker": {
-                "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
+                "concurrency": sized["concurrency"],
                 "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
             },
             "postgresql": {
@@ -2090,7 +2193,12 @@ def control_plane_resources(
                     "requests": {"memory": f"{sized['postgres_request']}Mi"},
                     "limits": {"memory": f"{sized['postgres']}Mi"},
                 },
-                "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
+                "cnpg": {
+                    "parameters": {
+                        "shared_buffers": f"{sized['shared_buffers']}MB",
+                        "max_connections": str(sized["max_connections"]),
+                    }
+                },
             },
         }
     if cpu_count and cpu_count > 0:
@@ -2297,7 +2405,9 @@ def apply_control_plane_overrides(
     memory limits, Postgres' shared_buffers and the worker concurrency,
     sized from ``mem_total_mib``, and the api / Postgres CPU limits, sized
     from ``cpu_count`` (#2240; see ``control_plane_resources``), plus the api
-    Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``).
+    Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``),
+    plus (#2156) the api's database pool per pod, with the Postgres limit
+    held to the connections ``cp_size`` nodes can open.
     Written to the spatium-control HelmChartConfig so it survives a k3s
     restart (#272).
 
@@ -2306,6 +2416,12 @@ def apply_control_plane_overrides(
     restart and one api / worker rollout, on the first heartbeat that writes
     it; the #1005 guard in ``_merge_owned_overrides`` keeps every later
     heartbeat quiet.
+
+    #2156 — the Postgres limit follows ``cp_size``, so a promote or demote
+    that moves it is also one CloudNativePG rolling restart (replicas first,
+    then the primary restarted in place: the chart leaves CNPG's default
+    ``primaryUpdateMethod: restart``), and a promote past four nodes is one
+    api rollout for the smaller pool.
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
     ``patch_cnpg_instances`` left on the Cluster this tick
@@ -2359,7 +2475,7 @@ def apply_control_plane_overrides(
         "podAntiAffinity": "hard",
         "tolerations": _CONTROL_PLANE_FAST_EVICT,
     }
-    sized = control_plane_resources(mem_total_mib, cpu_count)
+    sized = control_plane_resources(mem_total_mib, cpu_count, cp_size)
 
     def owned(current_doc: dict) -> dict[str, Any]:
         # The slot-image mirror latch (#787) reads the live document, so
@@ -2367,6 +2483,9 @@ def apply_control_plane_overrides(
         return {
             "api": dict(scaled)
             | sized.get("api", {})
+            # #2156 — the pool per api pod shrinks as pods are added, so the
+            # connections Postgres' limit is sized for are all it can be sent.
+            | {"databasePool": api_db_pool(cp_size)}
             | {"service": {"trafficDistribution": _NODE_LOCAL_API}},
             "frontend": dict(scaled)
             | {

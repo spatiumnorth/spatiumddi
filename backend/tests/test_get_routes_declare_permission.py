@@ -87,7 +87,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/dhcp/option-codes": "static RFC option-code catalogue, no install data",
     "/api/v1/dhcp/voip-options": "static VoIP vendor option catalogue, no install data",
     "/api/v1/webhooks/event-types": "static event-type catalogue",
-    "/api/v1/alerts/rule-types": "static rule-type catalogue",
     "/api/v1/search/types": "the searchable type list; filtered to the caller's grants",
     # ── platform-wide reads open to every signed-in user by design ──────
     "/api/v1/settings": "platform settings the UI shell reads on every screen",
@@ -95,9 +94,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/settings/resolver": "slice of GET /settings",
     "/api/v1/settings/oui/status": "OUI database status, no install data",
     "/api/v1/settings/oui/refresh/{task_id}": "status of an OUI refresh task",
-    "/api/v1/alerts/rules": "alert rules are readable by every signed-in user; writes are superadmin",
-    "/api/v1/alerts/rules/{rule_id}": "as /alerts/rules",
-    "/api/v1/alerts/events": "alert events are readable by every signed-in user, as the bell icon",
     "/api/v1/groups": "group pickers (auth providers, groups page); writes need admin on group",
     "/api/v1/groups/{group_id}": "as /groups",
     "/api/v1/roles": "role picker on the groups page; writes need admin on role",

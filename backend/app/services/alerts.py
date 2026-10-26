@@ -29,6 +29,7 @@ it resolved.
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -512,6 +513,17 @@ RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 # shows, so the alarm and the panel cannot disagree.
 RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
 
+# Issue #2313 — a blocklist feed whose refresh has not SUCCEEDED within three
+# of its own update intervals. A family filter that stopped refreshing keeps
+# enforcing the list it last had, and nothing else says so.
+RULE_TYPE_DNS_BLOCKLIST_FEED_STALE = "dns_blocklist_feed_stale"
+
+# Issue #2312 — a DNS pool whose members' health verdicts have not been
+# refreshed within three check intervals. Serving stays fail-open (a member
+# last seen healthy is still rendered), so a stopped health-check dispatcher
+# leaves a dead member in the answer set with nothing else saying so.
+RULE_TYPE_DNS_POOL_HEALTH_STALE = "dns_pool_health_stale"
+
 # Issue #1762 — a DNSSEC-signed zone on a group with more than one agent DNS
 # server (BIND9 / PowerDNS / Technitium; disabled servers count — they still
 # serve the bundle). Each server signs with keys it generated, so the zone is
@@ -720,6 +732,8 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+        RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
+        RULE_TYPE_DNS_POOL_HEALTH_STALE,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -944,6 +958,45 @@ def _include_subnet(subnet: Subnet, settings: PlatformSettings | None) -> bool:
     return prefix <= max_prefix
 
 
+# ── Resolve hysteresis for percentage-threshold rules (#2778) ───────────────
+#
+# A rule that opens at ``pct >= threshold`` and, in the same pass, resolves
+# the moment ``pct < threshold`` re-fires and re-delivers on every crossing of
+# a value that merely hovers at the line (a node GC trimming around 80%).
+# ``evaluate_all`` closes every open event whose subject a pass leaves out,
+# so hysteresis lives in the matcher: a subject that ALREADY has an open
+# event keeps matching until it falls ``_PCT_RESOLVE_MARGIN`` points below
+# the threshold. Opening is unchanged (still at the threshold), and a
+# subject with no open event never gets the margin, so existing rules and
+# existing open events behave as before apart from resolving a little later.
+# Severity needs no hysteresis of its own: ``evaluate_all`` only ever raises
+# an open event's severity, so an open critical stays critical until the event
+# resolves, which happens only below the WARNING threshold minus the margin.
+# A critical that dips under its own line therefore neither de-escalates nor
+# re-delivers.
+_PCT_RESOLVE_MARGIN = 5.0
+
+
+def _pct_resolve_floor(threshold: float) -> float:
+    """The value an open event must fall below to resolve."""
+    return threshold - _PCT_RESOLVE_MARGIN
+
+
+async def _open_subject_ids(db: AsyncSession, rule: AlertRule) -> set[str]:
+    """``subject_id`` of every unresolved event of ``rule`` (conformity
+    events excluded, as ``evaluate_all`` ignores them)."""
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+
+    rows = await db.execute(
+        select(AlertEvent.subject_id).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+            AlertEvent.subject_type != "conformity",
+        )
+    )
+    return {r[0] for r in rows.all()}
+
+
 # ── Subject evaluation ─────────────────────────────────────────────────────
 
 
@@ -954,13 +1007,17 @@ async def _matching_subnet_subjects(
 ) -> list[tuple[str, str, str]]:
     """Return [(subject_id, display, message), ...] for a subnet_utilization rule."""
     threshold = rule.threshold_percent if rule.threshold_percent is not None else 90
-    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= threshold))
+    open_ids = await _open_subject_ids(db, rule)
+    floor = _pct_resolve_floor(float(threshold))
+    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= floor))
     subnets = list(res.scalars().all())
     matches: list[tuple[str, str, str]] = []
     for s in subnets:
         if not _include_subnet(s, settings):
             continue
         pct = float(s.utilization_percent)
+        if pct < threshold and str(s.id) not in open_ids:
+            continue  # inside the resolve margin, but nothing open to hold (#2778)
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
             f"Subnet {display} utilisation {pct:.1f}% (threshold {threshold}%) — "
@@ -1057,13 +1114,18 @@ async def _matching_dhcp_pool_exhaustion_subjects(
 
     # One batched lease query for all pools rather than one per pool (N+1).
     occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+    open_ids = await _open_subject_ids(db, rule)
 
     matches: list[tuple[str, str, str]] = []
     for pool in pools:
         occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
-        over_pct = pct_threshold is not None and occ.percent >= pct_threshold
+        over_pct = pct_threshold is not None and (
+            occ.percent >= pct_threshold
+            # Open event: hold until the margin below the threshold (#2778).
+            or (str(pool.id) in open_ids and occ.percent >= _pct_resolve_floor(pct_threshold))
+        )
         under_free = min_free is not None and occ.free < min_free
         if not (over_pct or under_free):
             continue
@@ -2643,6 +2705,27 @@ async def _matching_server_subjects(
 _SEVERITY_ORDER = ("info", "warning", "critical")
 
 
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def _message_numbers(message: str) -> tuple[str, list[str]]:
+    """Split a message into its digit-free skeleton and its numeric tokens."""
+    return _NUM_RE.sub("#", message), _NUM_RE.findall(message)
+
+
+def _compose_peak_and_now(peak: str, current: str) -> str:
+    """The message of an open event whose reading has moved off its peak (#2839)."""
+    if current == peak:
+        return peak
+    cur_skel, cur_nums = _message_numbers(current)
+    peak_skel, peak_nums = _message_numbers(peak)
+    if cur_skel == peak_skel and len(cur_nums) == len(peak_nums):
+        now = " / ".join(c for c, p in zip(cur_nums, peak_nums, strict=True) if c != p)
+    else:
+        now = current
+    return f"{peak} [now: {now}]"
+
+
 def _severity_rank(severity: str) -> int:
     """Ordinal rank for an alert severity: ``info < warning < critical``.
 
@@ -4104,6 +4187,121 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
     return matches
 
 
+async def _matching_dns_blocklist_feed_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_blocklist_feed_stale`` — every enabled feed list whose refresh has
+    not succeeded within 3 x its ``update_interval_hours`` (#2313).
+
+    Judged from ``last_success_at`` (``last_synced_at`` moves on failure too).
+    A list that has never succeeded is measured from its creation. Interval 0
+    (manual refresh) never matches. Auto-resolves on the next good refresh.
+    """
+    from app.models.dns import DNSBlockList  # noqa: PLC0415
+    from app.services.dns.blocklist_feed_health import (  # noqa: PLC0415
+        STALE_AFTER_INTERVALS,
+        is_feed_stale,
+        stale_since,
+    )
+
+    now = now or datetime.now(UTC)
+    rows = (
+        (
+            await db.execute(
+                select(DNSBlockList).where(
+                    DNSBlockList.enabled.is_(True),
+                    DNSBlockList.feed_url.is_not(None),
+                    DNSBlockList.update_interval_hours > 0,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for bl in rows:
+        if not is_feed_stale(bl, now):
+            continue
+        since = stale_since(bl)
+        age_h = int((now - since).total_seconds() // 3600) if since else 0
+        how = (
+            f"last refreshed successfully {age_h} h ago"
+            if bl.last_success_at
+            else f"has never refreshed successfully (created {age_h} h ago)"
+        )
+        # Fixed text only: the stored fetch error can quote the feed URL, which
+        # may carry credentials, and alert events are widely readable/forwarded.
+        err = " The last refresh attempt failed." if bl.last_sync_status == "error" else ""
+        matches.append(
+            (
+                str(bl.id),
+                bl.name,
+                f"Blocklist feed '{bl.name}' {how}; it refreshes every "
+                f"{bl.update_interval_hours} h and is now past "
+                f"{STALE_AFTER_INTERVALS} intervals. Servers keep enforcing the entries "
+                f"it last had.{err}",
+                "warning",
+            )
+        )
+    return matches
+
+
+async def _matching_dns_pool_health_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_pool_health_stale`` — one event per enabled pool with at least one
+    enabled member whose health verdict is older than 3 x the pool's check
+    interval (#2312).
+
+    The pool keeps serving whatever it last decided (fail-open); this is the
+    signal that the decision is no longer being refreshed. Auto-resolves when
+    the dispatcher runs again and the members are re-checked.
+    """
+    from app.models.dns import DNSPool  # noqa: PLC0415
+    from app.services.dns.pool_health_staleness import (  # noqa: PLC0415
+        STALE_AFTER_INTERVALS,
+        format_age,
+        is_member_check_stale,
+        member_check_age_seconds,
+    )
+
+    now = now or datetime.now(UTC)
+    pools = (
+        (await db.execute(select(DNSPool).where(DNSPool.enabled.is_(True)).order_by(DNSPool.name)))
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for pool in pools:
+        stale = [m for m in pool.members if is_member_check_stale(pool, m, now)]
+        if not stale:
+            continue
+        oldest = format_age(max((member_check_age_seconds(m, now) or 0) for m in stale))
+        serving = [m for m in stale if m.last_check_state == "healthy"]
+        consequence = (
+            f" {len(serving)} of them last checked healthy and are still being served "
+            "(pools fail open), whether or not they are up now."
+            if serving
+            else ""
+        )
+        matches.append(
+            (
+                str(pool.id),
+                pool.name,
+                f"DNS pool '{pool.name}': {len(stale)} of {len(pool.members)} member(s) have "
+                f"not been health-checked for over {STALE_AFTER_INTERVALS} intervals "
+                f"({pool.hc_interval_seconds} s each; oldest {oldest} ago). The pool "
+                f"health-check task is not running.{consequence}",
+                "warning",
+            )
+        )
+    return matches
+
+
 async def _matching_agent_daemon_degraded_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4335,6 +4533,15 @@ async def _matching_firewall_apply_stalled_subjects(
     """
     from app.models.appliance import Appliance  # noqa: PLC0415
     from app.models.firewall import FirewallApplyState  # noqa: PLC0415
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    # #2794 — with enforcement off nothing is expected of the node; a stale
+    # rendered_hash must not keep the alarm open.
+    enforced = (
+        await db.execute(select(PlatformSettings.firewall_enabled).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if not enforced:
+        return []
 
     rows = (
         await db.execute(
@@ -4645,6 +4852,7 @@ async def _matching_appliance_disk_usage_subjects(
         used, total = usage
         pct = used * 100 / total
         size = f"{_fmt_bytes(used)} of {_fmt_bytes(total)}"
+        held_sev = open_severity_by_subject.get(subject_id)
         if pct >= _APPLIANCE_DISK_CRITICAL_PCT:
             matches.append(
                 (
@@ -4669,6 +4877,21 @@ async def _matching_appliance_disk_usage_subjects(
                     "kubelet starts evicting pods (at about 90%); free space or grow "
                     "the data disk before then.",
                     "warning",
+                )
+            )
+        elif held_sev is not None and pct >= _pct_resolve_floor(threshold):
+            # Below the line but inside the resolve margin: an open event
+            # stands (at its own severity, which evaluate_all never lowers)
+            # instead of resolving and re-opening as /var hovers (#2778).
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"/var on {a.hostname} is {pct:.0f}% full ({size}), below the "
+                    f"rule's {threshold:.0f}% threshold but not yet under "
+                    f"{_pct_resolve_floor(threshold):.0f}%; the alert resolves "
+                    "below that.",
+                    held_sev,
                 )
             )
     return matches
@@ -5847,6 +6070,90 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
                 ),
                 rule_type=RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
                 severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+_DNS_BLOCKLIST_FEED_STALE_RULE_NAME = "DNS blocklist feed stale"
+
+
+async def seed_dns_blocklist_feed_stale_alert_rule() -> None:
+    """Seed the #2313 rule, ENABLED by default.
+
+    Silent on an install with no feed-sourced blocklist. A feed that stops
+    refreshing keeps enforcing its last entries, so nothing visibly breaks and
+    nothing else says it has gone stale. The 3-interval threshold is fixed
+    (the issue's "~3x"), so the rule has no parameters. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_BLOCKLIST_FEED_STALE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_BLOCKLIST_FEED_STALE_RULE_NAME,
+                description=(
+                    "Fires for each enabled blocklist feed whose refresh has not "
+                    "succeeded within three of its own update intervals (a feed that "
+                    "never succeeded is measured from its creation). The servers keep "
+                    "enforcing the entries the list last had. Lists set to manual "
+                    "refresh are ignored. Resolves on the next successful refresh."
+                ),
+                rule_type=RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+_DNS_POOL_HEALTH_STALE_RULE_NAME = "DNS pool health checks stale"
+
+
+async def seed_dns_pool_health_stale_alert_rule() -> None:
+    """Seed the #2312 rule, ENABLED by default.
+
+    Silent on an install with no DNS pool. Pools fail open, so when the
+    health-check dispatcher stops, a member that died afterwards keeps being
+    answered and every surface still reads "healthy". The 3-interval threshold
+    is fixed, so the rule has no parameters. Keyed on ``name``; an operator who
+    disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_POOL_HEALTH_STALE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_POOL_HEALTH_STALE_RULE_NAME,
+                description=(
+                    "Fires for each enabled DNS pool whose members' health verdicts have "
+                    "not been refreshed within three of the pool's check intervals. The "
+                    "pool keeps serving the members it last judged healthy, so a member "
+                    "that has since died stays in the answer set. Resolves when the "
+                    "health-check task checks the pool again."
+                ),
+                rule_type=RULE_TYPE_DNS_POOL_HEALTH_STALE,
+                severity="warning",
                 enabled=True,
                 notify_syslog=True,
                 notify_webhook=True,
@@ -7338,6 +7645,8 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
+    RULE_TYPE_DNS_BLOCKLIST_FEED_STALE: "core.dns",
+    RULE_TYPE_DNS_POOL_HEALTH_STALE: "core.dns",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -7629,6 +7938,14 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # A scope held on Windows need not have a SpatiumDDI row, so the
                 # subject is "<group id>:<cidr>", not a dhcp_scope id.
                 subject_type = "dhcp_scope"
+            elif rule.rule_type == RULE_TYPE_DNS_BLOCKLIST_FEED_STALE:
+                stale_feeds = await _matching_dns_blocklist_feed_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_feeds]
+                subject_type = "dns_blocklist"
+            elif rule.rule_type == RULE_TYPE_DNS_POOL_HEALTH_STALE:
+                stale_pools = await _matching_dns_pool_health_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_pools]
+                subject_type = "dns_pool"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]
@@ -7866,6 +8183,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         existing.message = message
+                        existing.last_observed_value = {
+                            **(existing.last_observed_value or {}),
+                            "peak_message": message,
+                        }
                         ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
                         # stay flagged even if a later escalation skips it.
@@ -7878,6 +8199,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                             delivered_webhook += 1
                         if dm:
                             delivered_smtp += 1
+                    else:
+                        # #2839 — severity did not rise, but the reading may
+                        # have moved. The peak is the message stored when the
+                        # event fired or last escalated (severity is the only
+                        # measure of "worst" that holds for every rule type;
+                        # nothing is inferred from numbers). Show the current
+                        # reading beside it. Text only: delivery is triggered
+                        # above, by severity alone.
+                        lov = existing.last_observed_value or {}
+                        peak = lov.get("peak_message") or existing.message
+                        composed = _compose_peak_and_now(peak, message)
+                        if composed != existing.message or lov.get("peak_message") != peak:
+                            existing.message = composed
+                            existing.last_observed_value = {**lov, "peak_message": peak}
                     continue
                 event = AlertEvent(
                     rule_id=rule.id,
