@@ -65,9 +65,11 @@ for unit in chrony.service ssh.service \
             spatiumddi-storage-action.path \
             spatiumddi-removable-reload.path \
             spatiumddi-removable-boot.service \
+            spatiumddi-optin-services-boot.service \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
+            spatiumddi-image-unpack.service \
             spatiumddi-webui-selfcheck.timer \
             spatiumddi-helm-stuck-recover.timer \
             spatium-install.service \
@@ -121,6 +123,19 @@ rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/snmpd.service"
 # trigger; the spatiumddi-lldp-reload runner then ``enable --now``s it.
 # Disable (not mask) so the runner's enable+start works without an unmask.
 rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/lldpd.service"
+
+# #2376 — removing the symlink above was not enough: a fresh install came up
+# with snmpd + lldpd ``enabled`` and running (snmpd then held UDP 161, so the
+# SNMP runner's own start could never succeed). Something re-enables them
+# after this script (mkosi's preset-all, whose Debian default is "enable"), so
+# pin it with a preset (mkosi.extra/usr/lib/systemd/system-preset/) AND
+# disable them here too, wherever the wants symlink might live.
+for svc in snmpd lldpd; do
+    systemctl --root="$BUILDROOT" disable "$svc.service" >/dev/null 2>&1 || true
+    for d in etc/systemd/system usr/lib/systemd/system lib/systemd/system; do
+        rm -f "$BUILDROOT/$d/multi-user.target.wants/$svc.service"
+    done
+done
 
 # Mask systemd-networkd so it doesn't fight NetworkManager for
 # the same interfaces. The package stays installed (it ships in
@@ -268,7 +283,8 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-network-adopt"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
 # #1630 — k3s.service's ExecStartPre (clear-ingests) and firstboot's image
-# check before a slot commit (verify --repair).
+# check before a slot commit (verify --repair), and the unpack that
+# spatiumddi-image-unpack.service runs (#2788).
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-images"
 # #1215 — k3s.service's ExecStartPre=- that skips the first-boot TLS
 # manifest on an upgraded seed. The ``-`` would swallow a 203/EXEC silently.
@@ -329,12 +345,17 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-apt-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-image-prune"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-prune.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-prune.timer"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-unpack.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
+# #2376 — starts snmpd / lldpd at boot when the operator has SNMP / LLDP on.
+# Their enable links live in the /etc overlay upper, which PID 1 has not
+# loaded at boot; see the unit.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-optin-services-boot.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-syslog-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.service"

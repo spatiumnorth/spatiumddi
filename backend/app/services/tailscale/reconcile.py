@@ -45,6 +45,8 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owned_subnets_in_space,
     refuse_sync_into_trashed_space,
+    subnet_for_address,
+    unowned_subnets_at,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.tailscale.client import (
@@ -81,6 +83,8 @@ class ReconcileSummary:
     device_count: int = 0
     blocks_created: int = 0
     subnets_created: int = 0
+    # #2790: an un-owned subnet reused at the tenant's CIDR instead of twinned.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -139,23 +143,6 @@ def _expires_in_past(iso: str | None) -> bool:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt < datetime.now(UTC)
-
-
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    best: Subnet | None = None
-    best_prefix: int = -1
-    for s in subnets:
-        net = _parse_net(str(s.network))
-        if net is None:
-            continue
-        if addr in net and net.prefixlen > best_prefix:
-            best = s
-            best_prefix = net.prefixlen
-    return best
 
 
 async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> None:
@@ -258,7 +245,8 @@ async def _ensure_block_and_subnet(
     label: str,
     summary: ReconcileSummary,
 ) -> Subnet | None:
-    """Ensure a tenant-owned block + subnet exist for ``cidr``.
+    """Ensure a tenant-owned block + subnet exist for ``cidr``, unless an
+    un-owned subnet already sits there (#2790), which is reused instead.
 
     Returns the subnet row, or ``None`` if the CIDR is unparseable
     (operator typo on the tenant config). Idempotent — safe to call
@@ -269,6 +257,32 @@ async def _ensure_block_and_subnet(
         summary.warnings.append(f"unparseable CIDR on tenant: {cidr!r}")
         return None
     cidr_norm = str(net)
+
+    # #2577 — the overlay subnet in the tenant's own space only; one it owns
+    # in another space (its old space, after a space change) is released.
+    existing_subnet = next(
+        (
+            s
+            for s in await owned_subnets_in_space(
+                db,
+                "tailscale_tenant_id",
+                tenant.id,
+                tenant.ipam_space_id,
+                summary=summary,
+            )
+            if str(s.network) == cidr_norm
+        ),
+        None,
+    )
+    if existing_subnet is None:
+        # #2790: an un-owned subnet at exactly this CIDR, one a tenant delete
+        # kept for its operator content (#2287) or one an operator made, is
+        # reused as it stands, with no block or subnet put beside it, as the
+        # Docker reconciler does (#2601). The address pass mirrors into it.
+        kept = (await unowned_subnets_at(db, tenant.ipam_space_id, [cidr_norm])).get(cidr_norm)
+        if kept is not None:
+            summary.subnets_matched += 1
+            return kept
 
     existing_block = (
         await db.execute(
@@ -291,22 +305,6 @@ async def _ensure_block_and_subnet(
         await db.flush()
         summary.blocks_created += 1
 
-    # #2577 — the overlay subnet in the tenant's own space only; one it owns
-    # in another space (its old space, after a space change) is released.
-    existing_subnet = next(
-        (
-            s
-            for s in await owned_subnets_in_space(
-                db,
-                "tailscale_tenant_id",
-                tenant.id,
-                tenant.ipam_space_id,
-                summary=summary,
-            )
-            if str(s.network) == cidr_norm
-        ),
-        None,
-    )
     if existing_subnet is None:
         existing_subnet = Subnet(
             space_id=tenant.ipam_space_id,
@@ -395,7 +393,12 @@ async def _apply_addresses(
                 summary.addresses_deleted += 1
 
     for addr, d in desired_map.items():
-        subnet = _find_subnet_for_ip(subnets, d.address)
+        # #2790: the tenant's own subnet first, then the longest prefix,
+        # with a fixed tie-break (never the order the rows came back in);
+        # an operator-edited row stays in its subnet.
+        subnet = subnet_for_address(
+            subnets, d.address, "tailscale_tenant_id", tenant.id, held=current.get(addr)
+        )
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
@@ -731,6 +734,7 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
                 "released": summary.released.as_dict(),
                 "blocks_created": summary.blocks_created,
                 "subnets_created": summary.subnets_created,
+                "subnets_matched": summary.subnets_matched,
                 "addresses": {
                     "created": summary.addresses_created,
                     "updated": summary.addresses_updated,
@@ -758,6 +762,7 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
         devices=summary.device_count,
         blocks_created=summary.blocks_created,
         subnets_created=summary.subnets_created,
+        subnets_matched=summary.subnets_matched,
         addresses_created=summary.addresses_created,
         addresses_updated=summary.addresses_updated,
         addresses_deleted=summary.addresses_deleted,

@@ -45,6 +45,7 @@ import socket
 import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
 
@@ -59,6 +60,7 @@ from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
+from app.services import dispatch_db
 from app.services.after_commit_dispatch import dispatch
 from app.services.audit_redact import redact_audit_payload
 from app.services.forward_secrets import redact, reveal, secret_url_in_flight
@@ -1036,24 +1038,52 @@ async def _deliver_one(
 # ── Config loading ─────────────────────────────────────────────────────────
 
 
+# The session the current task already holds, so the loaders below share ONE
+# connection instead of taking up to three in a row (#2782).
+_held_session: ContextVar[AsyncSession | None] = ContextVar("audit_forward_session", default=None)
+# True on the after-commit dispatch path, which uses the shared capped engine;
+# other callers (Celery tasks, alerts) run on a throwaway loop of their own and
+# keep a NullPool engine, which has no loop-bound state to leak.
+_on_dispatch_path: ContextVar[bool] = ContextVar("audit_forward_on_dispatch", default=False)
+
+# Nothing to forward to: no enabled target and no legacy flat config.
+# Invalidated by the settings routes that write targets / the legacy columns;
+# another process sees a new target within the TTL.
+targets_cache = dispatch_db.NegativeCache()
+
+
 @asynccontextmanager
 async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
-    """Short-lived engine + session for audit-forward config reads.
+    """Session for audit-forward config reads; re-entrant (the held session
+    is reused).
 
-    Why: the ``after_commit`` listener runs on whatever event loop
-    committed the parent session. In FastAPI that's the long-lived
-    request loop; in Celery workers each task spins its own loop via
-    ``asyncio.run``. Using the global engine from ``app.db`` would
-    reuse asyncpg connections created on a prior loop and race them
-    ("another operation is in progress"). An ephemeral engine with
-    ``NullPool`` has no loop-bound pool state to leak.
-    """
+    On the dispatch path it comes from the shared, capped engine
+    (``app.services.dispatch_db``, #2782). Otherwise: short-lived engine +
+    ``NullPool``, because those callers' loop is per-task (``asyncio.run``)
+    and an asyncpg connection from a previous loop would race
+    ("another operation is in progress")."""
+    held = _held_session.get()
+    if held is not None:
+        yield held
+        return
+    if _on_dispatch_path.get():
+        async with dispatch_db.session() as session:
+            token = _held_session.set(session)
+            try:
+                yield session
+            finally:
+                _held_session.reset(token)
+        return
     engine = create_async_engine(
         _app_settings.database_url, poolclass=NullPool, connect_args=task_connect_args()
     )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:
-            yield session
+            token = _held_session.set(session)
+            try:
+                yield session
+            finally:
+                _held_session.reset(token)
     finally:
         await engine.dispose()
 
@@ -1065,11 +1095,17 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
     ``audit_forward_target``; falls back to the flat settings columns
     when the table is empty.
     """
-    async with _ephemeral_session() as session:
+    async with _ephemeral_session() as session:  # held: the fallback reuses it
         res = await session.execute(
             select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
         )
         rows = list(res.scalars().all())
+        return await _forward_config_from(session, rows)
+
+
+async def _forward_config_from(
+    session: AsyncSession, rows: list[AuditForwardTarget]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
 
     syslog_cfg: dict[str, Any] | None = None
     webhook_cfg: dict[str, Any] | None = None
@@ -1099,8 +1135,7 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
     # No targets configured — fall back to legacy flat columns so a
     # pre-multi-target deployment keeps forwarding after upgrade without
     # the operator having to re-create the row.
-    async with _ephemeral_session() as session:
-        ps = await session.get(PlatformSettings, _SINGLETON_ID)
+    ps = await session.get(PlatformSettings, _SINGLETON_ID)
     if ps is None:
         return None, None
     if (
@@ -1129,8 +1164,16 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
 async def _load_targets() -> list[dict[str, Any]]:
     """Return every enabled target as a dict. Includes a fallback from
     the legacy flat settings when the targets table is empty, so existing
-    deployments keep forwarding across the upgrade boundary."""
-    async with _ephemeral_session() as session:
+    deployments keep forwarding across the upgrade boundary.
+
+    One connection for the whole call (#2782): the legacy fallback used to
+    open a second and third in sequence."""
+    async with _ephemeral_session():
+        return await _load_targets_held()
+
+
+async def _load_targets_held() -> list[dict[str, Any]]:
+    async with _ephemeral_session() as session:  # re-entrant: the held one
         res = await session.execute(
             select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
         )
@@ -1209,7 +1252,7 @@ async def _load_targets() -> list[dict[str, Any]]:
         return out
 
     # Legacy flat-config fallback.
-    syslog_cfg, webhook_cfg = await _load_forward_config()
+    syslog_cfg, webhook_cfg = await _load_forward_config()  # reuses the held session
     if syslog_cfg is not None:
         out.append(
             {
@@ -1239,8 +1282,15 @@ async def _load_targets() -> list[dict[str, Any]]:
 
 
 async def _dispatch(rows: list[dict[str, Any]]) -> None:
-    targets = await _load_targets()
+    if targets_cache.known_empty():
+        return
+    token = _on_dispatch_path.set(True)
+    try:
+        targets = await _load_targets()
+    finally:
+        _on_dispatch_path.reset(token)
     if not targets:
+        targets_cache.mark_empty()
         return
 
     tasks: list[Any] = []

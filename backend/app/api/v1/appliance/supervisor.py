@@ -7,6 +7,19 @@ FALSE, so Wave A's landing doesn't change behaviour for any existing
 dns / dhcp agent install (which still uses ``/dns/agents/register`` /
 ``/dhcp/agents/register`` + the long PSK).
 
+That flag gates NEW registrations only (``/supervisor/register``, which is
+where a pairing code is claimed). It never gates ``/supervisor/poll`` or
+``/supervisor/heartbeat`` (#2798): those authenticate an appliance that
+already has a row, and a supervisor that loses its heartbeat reads that as
+a revocation and takes its DNS / DHCP down. Switching new pairings off must
+not do that to every appliance in the fleet.
+
+A heartbeat the control plane refuses on purpose — the row is revoked, or
+there is no row the presented credential opens — is a 403 carrying the
+``X-Spatium-Revocation`` header (``REVOCATION_HEADER``). That header is the
+supervisor's revocation signal; any other refusal (a 404 from a proxy or a
+disabled router, an unmarked 403) leaves it serving its last applied roles.
+
 Flow:
 
 1. Supervisor generates an Ed25519 keypair on first boot, persists
@@ -58,7 +71,7 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func as sa_func
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -666,10 +679,49 @@ def _decode_pubkey(payload: str) -> tuple[bytes, str]:
     return canonical, fingerprint
 
 
+# #2798 — the explicit revocation signal. A heartbeat refused because the
+# appliance is revoked (``revoked``) or because no row accepts the presented
+# credential (``unknown``: the row was deleted, or the session token is not
+# this row's) answers 403 WITH this header. The supervisor counts only such a
+# 403 towards revocation, so a refusal it cannot attribute to the row (a 404
+# from a proxy, a router that is not mounted, an unmarked 403) never tears
+# down its role services. Keep the header on both refusals below; dropping it
+# means a deleted or revoked appliance keeps serving.
+REVOCATION_HEADER = "X-Spatium-Revocation"
+REVOCATION_REVOKED = "revoked"
+REVOCATION_UNKNOWN = "unknown"
+
+
+def _heartbeat_refusal(row: Appliance | None) -> HTTPException | None:
+    """The revocation refusal a heartbeat for ``row`` answers, or None.
+
+    ``None`` row (no row the credential opens: deleted, or a token that is
+    not this row's) → 403 ``unknown``; a revoked row → 403 ``revoked``.
+    Used before the long-poll hold AND after it (#2807), so a heartbeat
+    whose row was revoked or deleted while it was held answers exactly what
+    a fresh heartbeat would, instead of 500ing on the response model."""
+    if row is None:
+        return HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Invalid appliance or session.",
+            headers={REVOCATION_HEADER: REVOCATION_UNKNOWN},
+        )
+    if row.state == APPLIANCE_STATE_REVOKED:
+        return HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
+            headers={REVOCATION_HEADER: REVOCATION_REVOKED},
+        )
+    return None
+
+
 async def _module_enabled(db: DB) -> bool:
-    """Read the feature flag. Cached settings row is fine — operator
+    """Read the registration flag. Cached settings row is fine — operator
     flipping the toggle takes effect on the next API call without a
-    process restart."""
+    process restart.
+
+    Gates NEW registrations only (#2798). Never call it on a path an
+    already-registered appliance needs to keep serving (poll, heartbeat)."""
     stmt = select(PlatformSettings).where(PlatformSettings.id == 1)
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
@@ -1345,10 +1397,8 @@ async def supervisor_poll(
     mode so an attacker probing for valid appliance_ids can't
     distinguish "wrong token" from "doesn't exist" via timing.
     """
-    if not await _module_enabled(db):
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
-
+    # #2798 — deliberately NOT behind the registration flag: the row already
+    # exists, and the session token is what authenticates this call.
     row = await db.get(Appliance, body.appliance_id)
     valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
     if not valid:
@@ -2133,10 +2183,15 @@ async def supervisor_heartbeat(
       different boot than the one the request applied to (#1446), with a
       give-up backstop. It used to clear 15 s after the stamp, which could
       happen before the request was ever delivered.
+
+    Not behind ``supervisor_registration_enabled`` (#2798): that flag
+    refuses new pairings. Gating the heartbeat on it answered every
+    registered appliance 404, which the supervisor read as a revocation —
+    switching pairing off took DNS and DHCP down fleet-wide.
+
+    A deliberate refusal (revoked row, or no row the credential opens) is a
+    403 carrying ``REVOCATION_HEADER``; see its comment.
     """
-    if not await _module_enabled(db):
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     # #170 Wave D follow-up — cert auth takes precedence when the
     # supervisor presents X-Appliance-Cert + X-Appliance-Signature +
@@ -2205,20 +2260,20 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+            refusal = _heartbeat_refusal(None)
+            assert refusal is not None
+            raise refusal
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
     # appliances even when the cert chain still validates. The
-    # supervisor's three-strike detector turns the 403 into local
+    # supervisor's strike detector turns the marked 403 into local
     # ``revoked`` state + tears down service containers. Keeps the
     # cert-auth path simple (still trust the cert) while honouring
     # the operator's soft-delete intent at the API boundary.
-    if row.state == APPLIANCE_STATE_REVOKED:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
-        )
+    refusal = _heartbeat_refusal(row)
+    if refusal is not None:
+        raise refusal
 
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
@@ -2948,6 +3003,9 @@ async def supervisor_heartbeat(
         )
         if not has_pending_command:
             long_poll = True
+            # #2807 — captured before the hold: after it the instance may be
+            # expired (row deleted) and any attribute load would raise.
+            held_appliance_id = row.id
             hold_for = min(float(body.wait_seconds), _HEARTBEAT_HOLD_CAP_S)
             deadline = asyncio.get_running_loop().time() + hold_for
             async with wake_subscription([*appliance_wake_channels(row), HOSTCONFIG_ALL]) as wake:
@@ -2959,17 +3017,23 @@ async def supervisor_heartbeat(
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
-            # building the desired-state response below. Guarded: if the row
-            # was hard-deleted during the hold, refresh raises — serve one
-            # last response from the in-memory row (the next heartbeat
-            # 403/404s cleanly) instead of 500ing.
-            try:
-                await db.refresh(row)
-            except Exception:  # noqa: BLE001
+            # building the desired-state response below, and answer what a
+            # fresh heartbeat would for the row's NEW state (#2807): revoked
+            # during the hold → 403 ``revoked``; deleted (or revoked then
+            # permanently deleted) → 403 ``unknown``. Previously a revoked
+            # row failed the response model and a deleted one failed its
+            # refresh — both 500s, so the revoke landed a heartbeat late.
+            fresh = await db.get(Appliance, held_appliance_id, populate_existing=True)
+            refusal = _heartbeat_refusal(fresh)
+            if refusal is not None:
                 logger.info(
-                    "supervisor_heartbeat_refresh_after_hold_failed",
-                    appliance_id=str(row.id),
+                    "supervisor_heartbeat_refused_after_hold",
+                    appliance_id=str(held_appliance_id),
+                    revocation=(refusal.headers or {}).get(REVOCATION_HEADER),
                 )
+                raise refusal
+            assert fresh is not None
+            row = fresh
 
     # Resolve assigned role config so the supervisor can bring up
     # service containers. DNS / DHCP group lookups are best-effort —
@@ -3170,6 +3234,23 @@ async def supervisor_heartbeat(
                     "last_rendered_at": rendered_at,
                 },
             )
+        )
+        await db.commit()
+    else:
+        # #2794 — enforcement off: there is no server render this node is
+        # expected to match. Drop the stale hash (and the stall watermark) so
+        # drift / the apply-stalled alarm read clean and re-enabling starts
+        # from a fresh render rather than the last enforced one.
+        await db.execute(
+            update(FirewallApplyState)
+            .where(
+                FirewallApplyState.appliance_id == row.id,
+                or_(
+                    FirewallApplyState.rendered_hash.is_not(None),
+                    FirewallApplyState.stalled_since.is_not(None),
+                ),
+            )
+            .values(rendered_hash=None, stalled_since=None)
         )
         await db.commit()
 
