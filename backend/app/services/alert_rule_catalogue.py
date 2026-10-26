@@ -398,6 +398,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
             )
         ],
     ),
+    (a.RULE_TYPE_DNS_POOL_HEALTH_STALE, "DNS pool health checks stale", "DNS", []),
     (a.RULE_TYPE_DNSSEC_MULTI_SIGNER, "DNSSEC zone signed by several servers", "DNS", []),
     (a.RULE_TYPE_DNS_RECORD_OP_FAILED, "DNS record operation failed", "DNS", []),
     (a.RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE, "Two DNS agents on one server", "DNS", []),

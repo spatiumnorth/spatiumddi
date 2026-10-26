@@ -33,6 +33,10 @@ from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
 from app.services.dns import technitium_api_scope
 from app.services.dns.pool_apply import apply_pool_state, withdraw_member_records
+from app.services.dns.pool_health_staleness import (
+    is_member_check_stale,
+    member_check_age_seconds,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -114,6 +118,11 @@ class PoolMemberResponse(BaseModel):
     last_check_state: str
     last_check_at: datetime | None
     last_check_error: str | None
+    # The verdict is older than 3 x the pool's check interval: the health-check
+    # dispatcher has stopped refreshing it, but a ``healthy`` member is still
+    # served (fail-open). ``check_age_seconds`` is None when never checked (#2312).
+    check_stale: bool = False
+    check_age_seconds: int | None = None
     consecutive_failures: int
     consecutive_successes: int
     created_at: datetime
@@ -231,6 +240,13 @@ async def _assert_site_exists(db: DB, site_id: uuid.UUID | None) -> None:
         raise HTTPException(status_code=404, detail=f"Site {site_id} not found")
 
 
+def _member_response(m: DNSPoolMember, pool: DNSPool) -> PoolMemberResponse:
+    out = PoolMemberResponse.model_validate(m, from_attributes=True)
+    out.check_stale = is_member_check_stale(pool, m)
+    out.check_age_seconds = member_check_age_seconds(m)
+    return out
+
+
 def _pool_to_response(p: DNSPool) -> PoolResponse:
     return PoolResponse(
         id=p.id,
@@ -254,9 +270,7 @@ def _pool_to_response(p: DNSPool) -> PoolResponse:
         hc_healthy_threshold=p.hc_healthy_threshold,
         next_check_at=p.next_check_at,
         last_checked_at=p.last_checked_at,
-        members=[
-            PoolMemberResponse.model_validate(m, from_attributes=True) for m in (p.members or [])
-        ],
+        members=[_member_response(m, p) for m in (p.members or [])],
         created_at=p.created_at,
         modified_at=p.modified_at,
     )
