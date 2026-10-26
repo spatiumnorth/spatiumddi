@@ -95,7 +95,13 @@ class Named:
         state: str = NAMED_STATE,
         checkzone_ok: bool = True,
         staged_state: str | None = None,
+        freeze_ok: bool = True,
+        compile_ok: bool = True,
+        on_freeze: Any = None,
     ):
+        self.freeze_ok = freeze_ok
+        self.compile_ok = compile_ok
+        self.on_freeze = on_freeze
         self.state = state
         # What a staged (merged) file reads back as; by default not named's.
         self.staged_state = staged_state
@@ -112,7 +118,9 @@ class Named:
         tool = Path(cmd[0]).name
         out = ""
         rc = 0
-        if tool == "named-compilezone":
+        if tool == "named-compilezone" and not self.compile_ok:
+            rc, out = 1, "dyn.test: loading from master file failed"
+        elif tool == "named-compilezone":
             staged = "rendered.new" in cmd[-1]
             text = self.state
             if staged:
@@ -129,6 +137,11 @@ class Named:
             )
             if verb == "reload":
                 self.reloaded = True
+            if verb == "freeze":
+                if not self.freeze_ok:
+                    return subprocess.CompletedProcess(cmd, 1, "", "refused")
+                if self.on_freeze is not None:
+                    self.on_freeze()
             if verb == "zonestatus":
                 serial = _soa_serial(self.live) if self.reloaded and self.live else 9
                 out = f"name: {ZONE}\nserial: {serial}\n"
@@ -437,3 +450,134 @@ def test_which_live_files_may_hold_more_than_a_render(tmp_path: Path) -> None:
     assert _may_hold_unrendered(carried)
     (tmp_path / "r.db.jnl").write_bytes(b"j")
     assert _may_hold_unrendered(render)
+
+
+# ── review findings ───────────────────────────────────────────────────────────
+
+
+def test_a_held_back_render_keeps_the_live_ownership(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A render named-checkzone refuses is held on the live copy; its
+    ``.owned`` must be the live one too. The refused render's would say the
+    control plane gave up ``gone``, which it still serves, and the next
+    render would carry ``gone`` back as a third party's for good."""
+    live_file = _previous_tree(
+        driver, [("www", "A", "192.0.2.1"), ("gone", "A", "192.0.2.2")]
+    )
+    monkeypatch.setattr(
+        bind9.subprocess,
+        "run",
+        lambda cmd, *a, **kw: subprocess.CompletedProcess(
+            cmd, 0 if "named-checkconf" in cmd[0] else 1, "zone: no address", ""
+        ),
+    )
+    monkeypatch.setattr(driver, "_screen_zone_batches", lambda new, targets: set())
+    driver.render(_bundle([("www", "A", "192.0.2.1")]))
+    driver.validate()
+
+    assert driver.held_back and driver.held_back[0].served
+    staged = driver.state_dir / "rendered.new" / "zones" / f"{ZONE}.db.owned"
+    assert _read_owned(staged) == _read_owned(live_file.with_name(f"{ZONE}.db.owned"))
+    assert "gone.dyn.test. A" in (_read_owned(staged) or set())
+
+
+def test_an_update_after_the_candidates_were_chosen_is_carried(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live file was a bare render with no journal when the carry set was
+    chosen; an update landed before the freeze, which named then wrote out.
+    The frozen zone is looked at again and carried."""
+    live_file = _previous_tree(driver, [("www", "A", "192.0.2.1")])
+
+    def update_lands() -> None:
+        live_file.write_text(NAMED_DUMP)
+        live_file.with_name(live_file.name + ".jnl").write_bytes(b"journal")
+
+    named = Named(on_freeze=update_lands)
+    named.live = live_file
+    monkeypatch.setattr(bind9.subprocess, "run", named)
+    monkeypatch.setattr(driver, "daemon_running", lambda: True)
+    monkeypatch.setattr(driver, "_sync_logging_runtime", lambda base: None)
+
+    driver.render(_bundle([("www", "A", "192.0.2.9")]))
+    driver.swap_and_reload()
+
+    assert "dc01.dyn.test. 600 IN A 10.9.9.9" in live_file.read_text()
+
+
+def test_a_refused_freeze_on_a_served_zone_holds_it_back(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """named would not freeze the zone but serves it, so it may take an
+    update after the read-back that the reload would drop: the zone keeps
+    named's copy this apply instead of taking the render."""
+    live_file = _previous_tree(driver, [("www", "A", "192.0.2.1")])
+    live_file.with_name(live_file.name + ".jnl").write_bytes(b"journal")
+    named = Named(freeze_ok=False)
+    named.live = live_file
+    monkeypatch.setattr(bind9.subprocess, "run", named)
+    monkeypatch.setattr(driver, "daemon_running", lambda: True)
+    monkeypatch.setattr(driver, "_sync_logging_runtime", lambda base: None)
+
+    driver.render(_bundle([("www", "A", "192.0.2.9")]))
+    driver.swap_and_reload()
+
+    assert live_file.read_text() == NAMED_STATE
+    assert [h.reason for h in driver.held_back] == ["named refused to freeze the zone"]
+
+
+def test_a_zone_that_cannot_be_read_back_is_held_on_named_copy(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: when named-compilezone cannot read named's copy, the zone
+    keeps named's own file and journal instead of the bundle-only render."""
+    live_file = _previous_tree(driver, [("www", "A", "192.0.2.1")])
+    live_file.write_text(NAMED_DUMP)
+    live_file.with_name(live_file.name + ".jnl").write_bytes(b"journal")
+    monkeypatch.setattr(bind9.subprocess, "run", Named(compile_ok=False))
+    _boot(driver, monkeypatch)
+
+    driver.render(_bundle([("www", "A", "192.0.2.9")]))
+    driver.swap_and_reload()
+
+    assert live_file.read_text() == NAMED_DUMP
+    assert live_file.with_name(live_file.name + ".jnl").read_bytes() == b"journal"
+    assert driver.held_back == (
+        HeldZone(ZONE, None, "named's copy of the zone could not be read back", True),
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "+dyn.test. SOA", "+dyn.test. SOA\ngarbage\n", "-www.dyn.test. A\n", "\xff\n"],
+)
+def test_an_empty_or_damaged_sidecar_is_unknown_not_empty(
+    tmp_path: Path, text: str
+) -> None:
+    """Read as an empty set it would say the control plane owns nothing, and
+    every record it ever deleted would be carried back."""
+    sidecar = tmp_path / "z.db.owned"
+    sidecar.write_bytes(text.encode("latin-1"))
+    assert _read_owned(sidecar) is None
+
+
+def test_the_sidecar_is_written_whole(driver: Bind9Driver) -> None:
+    driver.render(_bundle([("www", "A", "192.0.2.1")]))
+    zones = driver.state_dir / "rendered.new" / "zones"
+    assert not list(zones.glob("*.tmp"))
+    assert _read_owned(zones / f"{ZONE}.db.owned")
+
+
+def test_an_op_finds_the_sidecar_whatever_the_case(driver: Bind9Driver) -> None:
+    sidecar = _previous_tree(driver, [("www", "A", "192.0.2.1")]).with_name(
+        f"{ZONE}.db.owned"
+    )
+    driver.note_record_op_applied(
+        {
+            "op": "create",
+            "zone_name": "DYN.Test.",
+            "record": {"name": "OpAdd", "type": "a", "value": "192.0.2.3"},
+        }
+    )
+    assert "opadd.dyn.test. A" in (_read_owned(sidecar) or set())

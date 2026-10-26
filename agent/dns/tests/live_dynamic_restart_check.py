@@ -359,6 +359,73 @@ def serial_stable(state: Path) -> None:
     _stop(driver)
 
 
+def races(state: Path) -> None:
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    def update_first(driver, name: str):
+        freeze = driver._freeze_before_swap
+
+        def hooked(*a, **kw):
+            check(
+                f"a third party adds {name}",
+                _nsupdate(adds=[(name, 600, "A", "10.9.9.9")]) == "NOERROR",
+            )
+            driver._freeze_before_swap = freeze
+            return freeze(*a, **kw)
+
+        driver._freeze_before_swap = hooked
+
+    for changes in (True, False):
+        what = (
+            "changes, so it is frozen"
+            if changes
+            else "does not change: no freeze, no reload"
+        )
+        print(f"\n=== an update just before the freeze; the zone's render {what} ===")
+        st = state / ("changed" if changes else "unchanged")
+        st.mkdir()
+        _rndc_keys(st)
+        driver = Bind9Driver(state_dir=st)
+        driver.apply_config(_bundle([("www", "A", "192.0.2.1")], other="192.0.2.100"))
+        update_first(driver, "dc09")
+        www = "192.0.2.5" if changes else "192.0.2.1"
+        # The zone was a bare render, no journal, when the candidates were
+        # chosen; the update lands after that.
+        driver.apply_config(_bundle([("www", "A", www)], other="192.0.2.101"))
+        check("dc09 served after the apply", _q("dc09") == "10.9.9.9", _q("dc09"))
+        _stop(driver)
+        driver = Bind9Driver(state_dir=st)
+        driver.apply_config(_bundle([("www", "A", www)], other="192.0.2.101"))
+        check("dc09 survives a restart", _q("dc09") == "10.9.9.9", _q("dc09"))
+        _stop(driver)
+
+    print("\n=== a render held back, then an update, then a fixed render (views) ===")
+    state2 = state / "held"
+    state2.mkdir()
+    _rndc_keys(state2)
+    driver = Bind9Driver(state_dir=state2)
+    driver.apply_config(
+        _bundle([("www", "A", "192.0.2.1"), ("gone", "A", "192.0.2.2")], view="v1")
+    )
+    # Deletes ``gone`` and names an in-zone NS with no address: held back.
+    driver.apply_config(
+        _bundle([("www", "A", "192.0.2.1"), ("@", "NS", "nsx.dyn.example.")], view="v1")
+    )
+    check("the zone is held back", bool(driver.held_back), str(driver.held_back))
+    check(
+        "a third party adds dc01",
+        _nsupdate(adds=[("dc01", 600, "A", "10.9.9.9")]) == "NOERROR",
+    )
+    driver.apply_config(_bundle([("www", "A", "192.0.2.1")], view="v1"))
+    check("dc01 is carried", _q("dc01") == "10.9.9.9", _q("dc01"))
+    check(
+        "gone, deleted by the held render, is not brought back",
+        _q("gone") == "NXDOMAIN",
+        _q("gone"),
+    )
+    _stop(driver)
+
+
 def main() -> int:
     for tool in ("named", "rndc", "rndc-confgen", "named-compilezone"):
         if not shutil.which(tool):
@@ -371,6 +438,7 @@ def main() -> int:
         lambda s: flat(s, signal.SIGKILL),
         views,
         serial_stable,
+        races,
     ]
     for case in cases:
         state = Path(tempfile.mkdtemp(prefix="ddns-restart-check-"))

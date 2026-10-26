@@ -2468,10 +2468,17 @@ zone's file has a `<zone>.db.owned` sidecar listing what the render wrote,
 which applied record ops then update. That second half is what keeps a record
 the control plane deleted while the agent was down from coming back. A name
 the render holds a CNAME for, or a third-party CNAME at a name the render
-uses, is left out and logged (`bind9_dynamic_records_not_carried`). If
-`named-checkzone` refuses the merge, the zone is held back on named's own copy
-(#1403) rather than losing the records. A zone whose live file is still
-exactly a render, with no journal, is not read back.
+uses, is left out and logged (`bind9_dynamic_records_not_carried`). The
+agent fails closed. If `named-checkzone` refuses the merge, if named's copy
+cannot be read back, or if a running named refuses to freeze a zone it still
+serves, the zone is held back on named's own copy (#1403) rather than losing
+the records. A zone whose live file is still exactly a render, with no
+journal, is not read back.
+
+As with the ingest's own rule, the RRset is the unit. A third party's apex NS
+record is not carried, and neither is an extra value at a name and type the
+control plane manages. Records are carried per zone and per view, so renaming
+a view loses its zones' third-party records.
 
 **Audit.** Every batch that adds or removes mirror records writes one
 `dns.record.external_ingest` audit row on the zone (not one per record, so
