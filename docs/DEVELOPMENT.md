@@ -683,7 +683,11 @@ the old one in release N+1.
 The old pods really do serve through that window. Once the new release's
 migration commits, each old api pod finds `alembic_version` at a revision
 its image does not know, and `/health/ready` keeps a pod that has already
-been ready at its own head in service there (#2777). A pod that never was
+been ready at its own head in service there, as long as every table and
+column its models map is still in the database (#2777). Readiness reads
+that once per revision and answers 503, naming what is missing, when one
+is gone: a contract step taken a release too early takes the old pods out
+of service instead of failing their requests. A pod that never was ready
 (a new pod of an older release, a restarted container), a schema behind
 the image and an unstamped one still answer 503.
 

@@ -57,6 +57,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.core.schema_check import missing_objects as _missing_objects
 from app.services.backup.archive import _pg_env_from_url
 
 logger = structlog.get_logger(__name__)
@@ -486,40 +487,6 @@ class SchemaVerdict:
     missing_columns: list[str]
     version_num: str | None = None
     error: str | None = None
-
-
-def _missing_objects(sync_conn, metadata) -> tuple[list[str], list[str]]:
-    """Tables and ``table.column`` pairs ``metadata`` declares that the
-    connected database lacks.
-
-    Deliberately one-directional, and limited to tables and columns.
-    What head declares must exist: a revision that stopped short leaves
-    exactly that missing, and it is the evidence that holds on a database
-    migrated cleanly to head. The reverse direction does not: measured on
-    a database at head, the models omit a column the initial schema still
-    carries (``subnet.ntp_servers``) and index / constraint names differ
-    in dozens of places, so a full ``compare_metadata`` would refuse the
-    very case this recovery exists for.
-    """
-    insp = inspect(sync_conn)
-    missing_tables: list[str] = []
-    missing_columns: list[str] = []
-    by_schema: dict[str | None, list] = {}
-    for table in metadata.tables.values():
-        by_schema.setdefault(table.schema, []).append(table)
-    for schema, tables in by_schema.items():
-        present = set(insp.get_table_names(schema=schema))
-        columns = insp.get_multi_columns(schema=schema)
-        for table in sorted(tables, key=lambda t: t.name):
-            label = f"{schema}.{table.name}" if schema else table.name
-            if table.name not in present:
-                missing_tables.append(label)
-                continue
-            have = {c["name"] for c in columns.get((schema, table.name), [])}
-            missing_columns.extend(
-                f"{label}.{col.name}" for col in table.columns if col.name not in have
-            )
-    return missing_tables, missing_columns
 
 
 async def _verify_schema_at_head(db_url: str) -> SchemaVerdict:

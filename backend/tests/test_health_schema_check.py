@@ -21,6 +21,9 @@ Covers:
   (the mixed-version window of a rolling upgrade) and refuses it on a
   process that never was; behind and unstamped stay 503 either way; a
   mismatch is logged once per change.
+* That pod keeps serving only while every table and column its models
+  map is in the database: read once per revision, 503 naming what is
+  missing, and a read that fails or times out answers 503 and is not kept.
 
 The cached ``_EXPECTED_HEAD`` module global is reset around each test
 so a previous test's view of the head doesn't bleed into the next.
@@ -30,6 +33,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from time import monotonic
+from typing import Any
 
 import pytest
 from httpx import AsyncClient
@@ -544,3 +549,209 @@ async def test_schema_mismatch_is_logged_once_per_change(
     ]
     back = [e for e in logs if e["event"] == "readiness_schema_at_head"]
     assert [(e["log_level"], e["expected"]) for e in back] == [("info", expected)]
+
+
+# ── #2777 review: a newer schema must still carry what this image uses ──
+#
+# ``ahead`` only says the image's tree lacks the revision: a newer release,
+# but also a forked or squashed head, a mistyped ``alembic stamp`` or a
+# restore made with ``allow_newer_schema``. A pod in service keeps serving
+# there only while every table and column its models map is present.
+
+# A second revision no release has: the next migration of the newer release.
+NEWER_STILL = "f00dfeed2778"
+
+
+@asynccontextmanager
+async def _column_renamed_away(table: str, column: str) -> AsyncIterator[None]:
+    """A column this image maps, gone from this worker's own database (as a
+    newer release that dropped it would leave it), and put back afterwards."""
+    gone = f"{column}_gone_2777"
+    async with AsyncSessionLocal() as s:
+        await s.execute(text(f'ALTER TABLE "{table}" RENAME COLUMN "{column}" TO "{gone}"'))
+        await s.commit()
+    try:
+        yield
+    finally:
+        async with AsyncSessionLocal() as s:
+            await s.execute(text(f'ALTER TABLE "{table}" RENAME COLUMN "{gone}" TO "{column}"'))
+            await s.commit()
+
+
+@pytest.fixture
+def inspections(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Count readiness's reads of the tables and columns; the real read runs."""
+    calls: list[str] = []
+    real = schema_module.missing_objects
+
+    def counting(sync_conn: Any, metadata: Any) -> tuple[list[str], list[str]]:
+        calls.append("read")
+        return real(sync_conn, metadata)
+
+    monkeypatch.setattr(schema_module, "missing_objects", counting)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_ready_pod_refuses_a_newer_schema_that_lacks_a_column_it_uses(
+    client: AsyncClient, redis_up: None
+) -> None:
+    """The database stamped to a revision this image does not know, with a
+    column its models map missing: 503, naming the revisions and the column."""
+    expected, _ = schema_module.expected_alembic_head()
+    assert (await client.get("/health/ready")).status_code == 200  # in service at head
+
+    async with _column_renamed_away("subnet", "description"):
+        await _stamp(NEWER)
+        with capture_logs() as logs:
+            response = await client.get("/health/ready")
+
+    body = response.json()
+    assert response.status_code == 503, body
+    assert body["status"] == "degraded"
+    assert body["checks"]["schema"] == (
+        f"error: schema at {NEWER} is newer than this image's head {expected} "
+        "and lacks 1 table or column this image uses: subnet.description"
+    )
+    [warning] = [e for e in logs if e["event"] == "readiness_schema_mismatch"]
+    assert (warning["serving"], warning["missing"], warning["missing_count"]) == (
+        False,
+        ["subnet.description"],
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_newer_schema_is_checked_once_per_revision(
+    client: AsyncClient, redis_up: None, inspections: list[str]
+) -> None:
+    """Nothing missing: 200, and the check is not run again for the same
+    revision. The next revision is checked again."""
+    assert (await client.get("/health/ready")).status_code == 200
+    assert inspections == [], "a schema at head is not read"
+
+    await _stamp(NEWER)
+    for _ in range(2):
+        response = await client.get("/health/ready")
+        assert response.status_code == 200, response.json()
+        assert response.json()["checks"]["schema"].startswith(f"ok: schema at {NEWER} is newer")
+    assert inspections == ["read"]
+
+    await _stamp(NEWER_STILL)
+    response = await client.get("/health/ready")
+    assert response.status_code == 200, response.json()
+    assert inspections == ["read", "read"]
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_names_the_first_few_and_counts_the_rest(
+    client: AsyncClient, redis_up: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected, _ = schema_module.expected_alembic_head()
+    assert (await client.get("/health/ready")).status_code == 200
+    gone = (["t1", "t2"], ["t3.a", "t3.b", "t3.c", "t3.d", "t3.e"])
+    monkeypatch.setattr(schema_module, "missing_objects", lambda *_a: gone)
+    await _stamp(NEWER)
+
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["schema"] == (
+        f"error: schema at {NEWER} is newer than this image's head {expected} "
+        "and lacks 7 tables and columns this image uses: t1, t2, t3.a, t3.b, t3.c "
+        "and 2 more"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_check_that_cannot_run_fails_closed_and_is_retried(
+    client: AsyncClient, redis_up: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that raises proves nothing: 503, and nothing is kept, so the
+    next probe at the same revision reads again."""
+    expected, _ = schema_module.expected_alembic_head()
+    real = schema_module.missing_objects
+
+    def broken(_sync_conn: Any, _metadata: Any) -> tuple[list[str], list[str]]:
+        raise OSError("catalog read failed")
+
+    assert (await client.get("/health/ready")).status_code == 200
+    await _stamp(NEWER)
+    monkeypatch.setattr(schema_module, "missing_objects", broken)
+
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["schema"] == (
+        f"error: schema at {NEWER} is newer than this image's head {expected}, and its "
+        "tables and columns could not be checked: OSError: catalog read failed"
+    )
+    monkeypatch.setattr(schema_module, "missing_objects", real)
+    response = await client.get("/health/ready")
+    assert response.status_code == 200, response.json()
+
+
+@pytest.mark.asyncio
+async def test_a_check_cut_off_by_the_probe_timeout_fails_closed_and_is_not_kept(
+    client: AsyncClient, redis_up: None, inspections: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read slower than readiness's 4 s budget answers 503 and keeps
+    nothing: the next probe reads again. (Takes the 4 s.)"""
+    counting = schema_module.missing_objects
+
+    def slow(sync_conn: Any, _metadata: Any) -> tuple[list[str], list[str]]:
+        sync_conn.execute(text("SELECT pg_sleep(10)"))
+        raise AssertionError("readiness's timeout should have cut this read off")
+
+    assert (await client.get("/health/ready")).status_code == 200
+    await _stamp(NEWER)
+    monkeypatch.setattr(schema_module, "missing_objects", slow)
+
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["schema"] == "error: timed out after 4s"
+    monkeypatch.setattr(schema_module, "missing_objects", counting)
+    response = await client.get("/health/ready")
+    assert response.status_code == 200, response.json()
+    assert inspections == ["read"]
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_process_refuses_a_newer_schema_without_reading_it(
+    client: AsyncClient, redis_up: None, fresh_api_process: None, inspections: list[str]
+) -> None:
+    expected, _ = schema_module.expected_alembic_head()
+    await _stamp(NEWER)
+
+    for _ in range(2):
+        response = await client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["schema"] == (
+            f"error: schema at {NEWER}, image expects {expected}"
+        )
+    assert inspections == []
+
+
+@pytest.mark.asyncio
+async def test_the_read_does_not_wait_behind_a_migrations_lock(
+    client: AsyncClient, redis_up: None, inspections: list[str]
+) -> None:
+    """A migration holds ACCESS EXCLUSIVE on each table it alters until its
+    revision commits. The read of the tables and columns comes from the
+    catalog and does not wait for that lock, so the probe still answers
+    within its budget while another session holds one."""
+    assert (await client.get("/health/ready")).status_code == 200
+    await _stamp(NEWER)
+    async with AsyncSessionLocal() as migration:
+        # What a revision does: alter a table, and hold it until it commits.
+        await migration.execute(text('ALTER TABLE "subnet" ADD COLUMN "lock_probe_2777" integer'))
+        try:
+            started = monotonic()
+            response = await client.get("/health/ready")
+            took = monotonic() - started
+        finally:
+            await migration.rollback()
+
+    assert response.status_code == 200, (f"{took:.1f} s", response.json())
+    assert inspections == ["read"]

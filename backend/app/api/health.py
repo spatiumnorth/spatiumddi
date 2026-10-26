@@ -13,7 +13,7 @@ from sqlalchemy import text
 from starlette import status
 from starlette.responses import JSONResponse
 
-from app.core.schema_check import SchemaCheck, schema_at_head
+from app.core.schema_check import SchemaCheck, missing_from_database, schema_at_head
 from app.db import AsyncSessionLocal
 
 logger = structlog.get_logger(__name__)
@@ -49,6 +49,13 @@ router = APIRouter(tags=["health"])
 # back onto a newer database) still refuses it, as wait-for-migrate and
 # #1227's guard do. Behind, unstamped and failed checks stay 503 whatever
 # the history.
+#
+# ``ahead`` only says the image's tree lacks the revision, which is also
+# true of a forked or squashed head, a mistyped ``alembic stamp`` and a
+# restore made with ``allow_newer_schema``. So a Ready pod keeps serving on
+# a newer schema only while every table and column its models map is in
+# the database: read once per revision, and a read that fails or times
+# out answers 503 and is not kept.
 @dataclass(slots=True)
 class _SchemaReadiness:
     """This process's schema history across probes (#2777).
@@ -59,26 +66,37 @@ class _SchemaReadiness:
     process is the pod). A probe that found the schema at head but failed
     on Redis answered 503 and does not set it. ``logged`` is the last
     (verdict, detail) logged, so a mismatch logs once per change, not
-    once per probe.
+    once per probe. ``checked`` is the last newer revision whose tables
+    and columns were read, with what it lacks of them (empty: nothing);
+    only a read that finished is kept.
     """
 
     seen_head: bool = False
     logged: tuple[str, str] | None = None
+    checked: tuple[str, tuple[str, ...]] | None = None
 
 
 _schema_readiness = _SchemaReadiness()
 
+# How many missing tables and columns a refusal names, and its warning logs.
+_MISSING_SHOWN = 5
+_MISSING_LOGGED = 20
+
 
 def reset_schema_readiness() -> None:
     """Forget this process's schema history, as if it had just started:
-    the latch and the last state logged (tests)."""
+    the latch, the last state logged and the newer revision whose tables
+    and columns were read (tests)."""
     global _schema_readiness
     _schema_readiness = _SchemaReadiness()
 
 
-def _log_schema_change(verdict: str, result: SchemaCheck) -> None:
-    """Log a schema mismatch at warning once per change (#2777)."""
-    key = (verdict, result.detail)
+def _log_schema_change(
+    verdict: str, detail: str, result: SchemaCheck, missing: tuple[str, ...] = ()
+) -> None:
+    """Log a schema mismatch at warning once per change of what readiness
+    answers (#2777), with what a newer schema lacks when it lacks something."""
+    key = (verdict, detail)
     previous = _schema_readiness.logged
     if key == previous:
         return
@@ -87,13 +105,62 @@ def _log_schema_change(verdict: str, result: SchemaCheck) -> None:
         if previous is not None:
             logger.info("readiness_schema_at_head", expected=result.expected, previous=previous[1])
         return
+    lacks: dict[str, Any] = {}
+    if missing:
+        lacks = {"missing": list(missing[:_MISSING_LOGGED]), "missing_count": len(missing)}
     logger.warning(
         "readiness_schema_mismatch",
         expected=result.expected,
         actual=result.actual,
         ahead=result.ahead,
         serving=verdict == "newer",
-        detail=result.detail,
+        detail=detail,
+        **lacks,
+    )
+
+
+async def _judge_newer_schema(
+    actual: str, expected: str | None
+) -> tuple[str, str, tuple[str, ...]]:
+    """Keep a Ready pod serving on a newer schema only while every table and
+    column its image uses is there (#2777).
+
+    Returns ``(verdict, detail, missing)``. The schema is read once per
+    revision: a revision's DDL and its ``alembic_version`` commit together
+    (one transaction per revision). A read that raises answers 503 and is
+    not kept, so the next probe reads again; one cut off by readiness's
+    timeout keeps nothing either.
+    """
+    newer = f"schema at {actual} is newer than this image's head {expected}"
+    checked = _schema_readiness.checked
+    if checked is not None and checked[0] == actual:
+        missing = checked[1]
+    else:
+        try:
+            tables, columns = await missing_from_database()
+        except Exception as exc:  # noqa: BLE001
+            # A read that could not run proves nothing: fail closed, keep nothing.
+            first = (str(exc).splitlines() or [""])[0][:160]
+            reason = f"{type(exc).__name__}: {first}"
+            return (
+                "error",
+                f"{newer}, and its tables and columns could not be checked: {reason}",
+                (),
+            )
+        missing = (*tables, *columns)
+        _schema_readiness.checked = (actual, missing)
+    if missing:
+        count = len(missing)
+        names = ", ".join(missing[:_MISSING_SHOWN])
+        if count > _MISSING_SHOWN:
+            names += f" and {count - _MISSING_SHOWN} more"
+        what = "table or column" if count == 1 else "tables and columns"
+        return "error", f"{newer} and lacks {count} {what} this image uses: {names}", missing
+    return (
+        "newer",
+        f"{newer}: a newer release migrated the database, and this pod keeps serving "
+        "until it is replaced",
+        (),
     )
 
 
@@ -101,24 +168,21 @@ async def _check_schema_ready() -> tuple[str, str]:
     """Verify the DB schema is at the head this api image expects.
 
     Returns ``("ok", "<detail>")`` if the schema matches;
-    ``("newer", "<detail>")`` when a newer release migrated the DB and
-    this process has been Ready at its own head, so it keeps serving
-    (#2777); else ``("error", "<detail>")`` with an operator-actionable
-    message. It reads the latch; only ``readiness`` sets it.
+    ``("newer", "<detail>")`` when a newer release migrated the DB, this
+    process has been Ready at its own head, and every table and column its
+    image uses is in the database, so it keeps serving (#2777); else
+    ``("error", "<detail>")`` with an operator-actionable message. It reads
+    the latch; only ``readiness`` sets it.
     """
     result = await schema_at_head()
+    missing: tuple[str, ...] = ()
     if result.ok:
         verdict, detail = "ok", result.detail
-    elif result.ahead and _schema_readiness.seen_head:
-        verdict = "newer"
-        detail = (
-            f"schema at {result.actual} is newer than this image's head "
-            f"{result.expected}: a newer release migrated the database, and "
-            "this pod keeps serving until it is replaced"
-        )
+    elif result.ahead and result.actual is not None and _schema_readiness.seen_head:
+        verdict, detail, missing = await _judge_newer_schema(result.actual, result.expected)
     else:
         verdict, detail = "error", result.detail
-    _log_schema_change(verdict, result)
+    _log_schema_change(verdict, detail, result, missing)
     return verdict, detail
 
 
@@ -195,7 +259,7 @@ async def readiness() -> JSONResponse:
                 verdict, detail = await _check_schema_ready()
         except TimeoutError:
             verdict, detail = "error", "timed out after 4s"
-            _log_schema_change(verdict, SchemaCheck(False, None, None, detail))
+            _log_schema_change(verdict, detail, SchemaCheck(False, None, None, detail))
         if verdict == "ok":
             checks["schema"] = "ok"
         elif verdict == "newer":

@@ -26,6 +26,12 @@ is the head or an ancestor of it, so a known revision that is not the
 head is behind; one the tree does not contain was written by a newer
 release. ``ok`` still means "exactly at head" for every caller.
 
+``ahead`` is only what the tree says: a revision it lacks may also be a
+forked or squashed head, a mistyped ``alembic stamp`` or a restore made
+with ``allow_newer_schema``. So readiness admits a newer schema only after
+``missing_from_database`` finds every table and column this image's models
+map present in it (#2777).
+
 This module holds the framework-agnostic core so ``app/api/health.py``
 and the Celery startup / periodic checks share one implementation. It
 does pure DB + bundled-migration-file introspection — **no docker /
@@ -232,6 +238,86 @@ async def schema_at_head(session_factory=None) -> SchemaCheck:
             ahead=bool(known) and actual not in known,
         )
     return SchemaCheck(True, expected, actual, f"schema at head {expected}")
+
+
+# Every table of one schema (the connection's own when :schema is NULL) and
+# its live columns, from the catalog alone. Not the SQLAlchemy inspector: its
+# column reflection deparses each column default with pg_get_expr(), which
+# opens the table with ACCESS SHARE, so it waits behind the ACCESS EXCLUSIVE
+# lock a migration holds on a table it alters until its revision commits.
+# Readiness reads this while a newer release migrates (#2777); the catalog
+# rows are read under MVCC and take no lock on the tables themselves.
+_TABLES_AND_COLUMNS = text(
+    "SELECT c.relname, a.attname"
+    " FROM pg_catalog.pg_class c"
+    " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+    " LEFT JOIN pg_catalog.pg_attribute a"
+    "   ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
+    " WHERE n.nspname = coalesce(CAST(:schema AS text), current_schema())"
+    "   AND c.relkind IN ('r', 'p')"
+)
+
+
+def missing_objects(sync_conn, metadata) -> tuple[list[str], list[str]]:
+    """Tables and ``table.column`` pairs ``metadata`` declares that the
+    connected database lacks.
+
+    Deliberately one-directional, and limited to tables and columns.
+    What head declares must exist: a revision that stopped short leaves
+    exactly that missing, and it is the evidence that holds on a database
+    migrated cleanly to head. The reverse direction does not: measured on
+    a database at head, the models omit a column the initial schema still
+    carries (``subnet.ntp_servers``) and index / constraint names differ
+    in dozens of places, so a full ``compare_metadata`` would refuse the
+    very case this recovery exists for.
+
+    Two callers: the restore's drift recovery stamps head only when this
+    finds nothing (#1233), and readiness keeps a pod serving on a newer
+    schema only when it finds nothing this image uses missing (#2777).
+    Names come from the catalog (``_TABLES_AND_COLUMNS``), so the read
+    never waits on a lock a migration holds.
+    """
+    missing_tables: list[str] = []
+    missing_columns: list[str] = []
+    by_schema: dict[str | None, list] = {}
+    for table in metadata.tables.values():
+        by_schema.setdefault(table.schema, []).append(table)
+    for schema, tables in by_schema.items():
+        present: dict[str, set[str]] = {}
+        for relname, attname in sync_conn.execute(_TABLES_AND_COLUMNS, {"schema": schema}):
+            columns = present.setdefault(relname, set())
+            if attname is not None:
+                columns.add(attname)
+        for table in sorted(tables, key=lambda t: t.name):
+            label = f"{schema}.{table.name}" if schema else table.name
+            if table.name not in present:
+                missing_tables.append(label)
+                continue
+            have = present[table.name]
+            missing_columns.extend(
+                f"{label}.{col.name}" for col in table.columns if col.name not in have
+            )
+    return missing_tables, missing_columns
+
+
+async def missing_from_database(session_factory=None) -> tuple[list[str], list[str]]:
+    """``missing_objects`` for every table this image's models map, read
+    from the live database (#2777).
+
+    ``session_factory`` defaults to ``app.db.AsyncSessionLocal``. Raises
+    whatever the read raised: what a check that could not run means is the
+    caller's to decide.
+    """
+    if session_factory is None:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+        session_factory = AsyncSessionLocal
+    # Importing the models package registers every mapped table.
+    from app.models import Base  # noqa: PLC0415
+
+    async with session_factory() as session:
+        conn = await session.connection()
+        return await conn.run_sync(missing_objects, Base.metadata)
 
 
 # Alembic's own wording when a revision id is not in the script directory.

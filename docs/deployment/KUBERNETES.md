@@ -659,7 +659,8 @@ un-migrated database.
 
 Meanwhile the previous release's api pods stay in service: a pod that has
 already been ready keeps answering `/health/ready` while the database is at the
-new release's schema (#2777). Under `hard` anti-affinity on a one-node control
+new release's schema, as long as every table and column it uses is still there
+(#2777). Under `hard` anti-affinity on a one-node control
 plane the only api pod is replaced first, so that install still takes its brief
 api outage on every rollout.
 
