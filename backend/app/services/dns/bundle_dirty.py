@@ -187,6 +187,7 @@ _NOT_RENDERED: dict[type, frozenset[str]] = {
             "last_synced_at",
             "last_sync_status",
             "last_sync_error",
+            "last_success_at",
             "entry_count",
             "feed_parse_skipped",
         }

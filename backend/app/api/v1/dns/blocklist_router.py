@@ -53,6 +53,7 @@ from app.models.dns import (
     DNSView,
 )
 from app.services.dns import technitium_api_scope
+from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.blocklist_templates import (
     BlocklistTemplate,
     TemplateGroupConflict,
@@ -293,6 +294,11 @@ class BlockListResponse(BaseModel):
     last_synced_at: datetime | None
     last_sync_status: str | None
     last_sync_error: str | None
+    # Last refresh that SUCCEEDED (#2313); NULL = never has.
+    last_success_at: datetime | None = None
+    # ok | error | stale | never; NULL for a manual list (no feed). One
+    # classification shared with the ``dns_blocklist_feed_stale`` alert.
+    feed_sync_state: str | None = None
     entry_count: int
     # NULL = no adblock refresh has recorded counts (or not an adblock feed).
     feed_parse_skipped: FeedParseSkipped | None = None
@@ -467,6 +473,8 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         last_synced_at=bl.last_synced_at,
         last_sync_status=bl.last_sync_status,
         last_sync_error=bl.last_sync_error,
+        last_success_at=bl.last_success_at,
+        feed_sync_state=feed_sync_state(bl),
         entry_count=bl.entry_count,
         feed_parse_skipped=(
             FeedParseSkipped(**bl.feed_parse_skipped) if bl.feed_parse_skipped else None
