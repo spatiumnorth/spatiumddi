@@ -37,7 +37,7 @@ export function VarDiskWarning({
             ? "Disk space critical"
             : "Disk space low"}
           {finding.free_pct != null &&
-            ` · ${Math.floor(finding.free_pct)}% free`}
+            ` · ${Math.round(finding.free_pct)}% free`}
           :
         </span>{" "}
         {finding.detail}
