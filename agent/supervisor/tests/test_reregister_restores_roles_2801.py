@@ -182,7 +182,12 @@ def test_revoked_teardown_keeps_the_role_env_and_drops_the_apply_stamp(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"detail": "Not found."})
+        # #2798: only a marked 403 is a revocation; a bare 404 is not.
+        return httpx.Response(
+            403,
+            json={"detail": "Appliance has been revoked."},
+            headers={heartbeat.REVOCATION_HEADER: "revoked"},
+        )
 
     cfg = types.SimpleNamespace(heartbeat_interval_seconds=0, state_dir=tmp_path)
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
