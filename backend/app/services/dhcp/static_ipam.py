@@ -54,7 +54,7 @@ from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
     lease_hostname_suppressed_subnets,
 )
-from app.services.dhcp.lease_cleanup import _resolve_lease_subnet_id
+from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 
 logger = structlog.get_logger(__name__)
 
@@ -63,7 +63,9 @@ __all__ = [
     "LeaseHandover",
     "candidate_scopes_for_ipam_row",
     "detach_ipam_for_static",
+    "lock_static_rows",
     "publish_handover_ddns",
+    "remirror_available_rows_with_live_leases",
     "remirror_scope_statics",
     "remove_ipam_for_scope_statics",
     "remove_ipam_for_static",
@@ -158,8 +160,10 @@ async def upsert_ipam_for_static(
     # When a live lease still holds the address left behind, the address
     # becomes that lease's row instead of free (#1302, ``_release_moved_row``).
     handovers: list[LeaseHandover] = []
-    prior = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    for row in prior.scalars().all():
+    # Locked: a row released here asks the lease table whether a live lease
+    # holds its address, and that answer is only good while the lease ingest
+    # cannot decide about the same row (#2580, ``lock_static_rows``).
+    for row in await lock_static_rows(db, st):
         if str(row.address) == ip_str:
             continue
         if row.status == "static_dhcp":
@@ -237,6 +241,40 @@ async def upsert_ipam_for_static(
     # Last, with the reservation already at its new address: DDNS lets a
     # reservation's hostname win, and none sits at the address handed over.
     await publish_handover_ddns(db, handovers)
+
+
+async def lock_static_rows(db: AsyncSession, st: DHCPStaticAssignment) -> list[IPAddress]:
+    """The IPAM rows mirroring ``st``, row-locked (``SELECT ... FOR UPDATE``).
+
+    A reservation's release decides the row's new status from the lease
+    table: ``dhcp`` when a live lease holds the address, ``available`` when
+    none does (#1274, #1302). The lease-event ingest decides the other half
+    from the row: it takes over an ``available`` row and leaves a
+    ``static_dhcp`` one alone. Decided on plain reads, the two could miss each
+    other (#2580): the ingest read the row while the release was still
+    uncommitted (``static_dhcp``, left alone), the release read the lease
+    table while the ingest was still uncommitted (no lease, so
+    ``available``), both committed, and the address read ``available`` beside
+    a live lease until the agent next re-sent it.
+
+    Both sides now decide while holding this row's lock, so whichever takes
+    it second sees the other's committed work: the ingest inserts its lease
+    BEFORE it locks the row, so a release that locks second finds the lease;
+    an ingest that locks second finds the row already ``available``.
+
+    Ordered by id, the order every other locker of ``ip_address`` rows in
+    these paths uses, so two of them never wait on each other in a cycle.
+    ``populate_existing`` so a row the session already holds is refreshed from
+    the locked read instead of answered from the identity map.
+    """
+    res = await db.execute(
+        select(IPAddress)
+        .where(IPAddress.static_assignment_id == str(st.id))
+        .order_by(IPAddress.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return list(res.scalars().all())
 
 
 async def _release_moved_row(
@@ -329,8 +367,8 @@ async def detach_ipam_for_static(
 
     handovers: list[LeaseHandover] = []
 
-    res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    rows = list(res.scalars().all())
+    # #2580 — row-locked before the lease table is asked; see lock_static_rows.
+    rows = await lock_static_rows(db, st)
     # #2269 — one scope lookup for every row, not one per row.
     suppressed = await lease_hostname_suppressed_subnets(db, subnet_ids={r.subnet_id for r in rows})
     for row in rows:
@@ -397,7 +435,11 @@ async def publish_handover_ddns(db: AsyncSession, handovers: list[LeaseHandover]
 
 
 async def _live_lease_at(
-    db: AsyncSession, row: IPAddress, *, now: datetime | None = None
+    db: AsyncSession,
+    row: IPAddress,
+    *,
+    now: datetime | None = None,
+    subnet_cache: list[Any] | None = None,
 ) -> DHCPLease | None:
     """The active lease the product holds on ``row``'s address in ``row``'s subnet.
 
@@ -427,7 +469,7 @@ async def _live_lease_at(
         .all()
     )
     for lease in leases:
-        if await _resolve_lease_subnet_id(db, lease) == row.subnet_id:
+        if await _resolve_lease_subnet_id(db, lease, subnet_cache) == row.subnet_id:
             return lease
     return None
 
@@ -449,6 +491,111 @@ def _mirror_lease_onto(row: IPAddress, lease: DHCPLease, *, write_hostname: bool
     if row.last_seen_at is None or lease.last_seen_at > row.last_seen_at:
         row.last_seen_at = lease.last_seen_at
         row.last_seen_method = "dhcp"
+
+
+async def remirror_available_rows_with_live_leases(
+    db: AsyncSession, *, limit: int = 500, now: datetime | None = None
+) -> list[LeaseHandover]:
+    """Hand every ``available`` row that a live lease holds to that lease (#2580).
+
+    The backstop under the lease mirror. An ``available`` row whose address an
+    active, unexpired lease holds in the row's own subnet is a live device's
+    address offered to next-free allocation, and nothing re-derived it until
+    the agent sent that lease again — its own start or a recovery walk, which
+    on a healthy appliance can be days. Two routes led there: a reservation
+    DELETE racing the lease ingest (closed at the source by the row locks, see
+    ``lock_static_rows``), and a lease batch the agent dropped after a
+    non-retry 4xx, which no lock can close. This heals both: the row becomes
+    the lease's ``dhcp`` mirror, exactly what the ingest makes of an
+    ``available`` row when the lease arrives.
+
+    Idempotent: a row it mirrors is no longer ``available``, so the next run
+    does not see it, and a healthy install finds nothing and writes nothing.
+
+    Operator edits (``user_modified_at``) are respected the way the
+    integration mirrors respect them. A row an operator edited AFTER the lease
+    was last reported is their later word, and the backstop leaves it alone
+    (the lease's own next report still takes it, as it always has). A row
+    edited before that is mirrored, but its hostname stays the operator's.
+
+    Each row is re-read under its lock and re-checked before it is written, so
+    a reservation created or deleted meanwhile is never overwritten. Locked in
+    id order, like the ingest and the reservation release. Returns the rows
+    handed over; their DDNS is the caller's to publish
+    (``publish_handover_ddns``).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    # Candidates by address. A lease that names a scope is narrowed to that
+    # scope's subnet here, so the same address in another IP space cannot keep
+    # a row in the candidate set (and the cap) forever; a legacy scope-less
+    # lease is resolved per row below, by longest prefix.
+    candidate_ids = (
+        (
+            await db.execute(
+                select(IPAddress.id)
+                .join(DHCPLease, DHCPLease.ip_address == IPAddress.address)
+                .where(
+                    IPAddress.status == "available",
+                    IPAddress.static_assignment_id.is_(None),
+                    DHCPLease.state == "active",
+                    or_(DHCPLease.expires_at.is_(None), DHCPLease.expires_at > now),
+                    or_(
+                        DHCPLease.scope_id.is_(None),
+                        DHCPLease.scope_id.in_(
+                            select(DHCPScope.id).where(DHCPScope.subnet_id == IPAddress.subnet_id)
+                        ),
+                    ),
+                )
+                .distinct()
+                .order_by(IPAddress.id)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not candidate_ids:
+        return []
+
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(IPAddress.id.in_(candidate_ids))
+                .order_by(IPAddress.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    suppressed = await lease_hostname_suppressed_subnets(db, subnet_ids={r.subnet_id for r in rows})
+    subnet_cache = await _load_subnet_cache(db)
+    handovers: list[LeaseHandover] = []
+    for row in rows:
+        # Re-checked under the lock: the candidate query read without one.
+        if row.status != "available" or row.static_assignment_id is not None:
+            continue
+        lease = await _live_lease_at(db, row, now=now, subnet_cache=subnet_cache)
+        if lease is None:
+            continue
+        if (
+            row.user_modified_at is not None
+            and lease.last_seen_at is not None
+            and row.user_modified_at > lease.last_seen_at
+        ):
+            continue
+        _mirror_lease_onto(
+            row,
+            lease,
+            write_hostname=row.subnet_id not in suppressed and row.user_modified_at is None,
+        )
+        subnet_row = await db.get(Subnet, row.subnet_id)
+        if subnet_row is not None:
+            handovers.append(LeaseHandover(subnet_row, row, lease))
+    return handovers
 
 
 async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> int:

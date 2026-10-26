@@ -6767,7 +6767,17 @@ export function SubnetDetail({
                               </td>
                               <td className="px-4 py-2 font-mono font-medium">
                                 <span className="inline-flex items-center gap-0.5">
-                                  {addr.address}
+                                  {/* The keyboard path to the row's detail
+                                      dialog, which a click on the row opens
+                                      (#2724). */}
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingAddress(addr)}
+                                    title="View details"
+                                    className="font-mono font-medium hover:underline focus-visible:underline focus:outline-none"
+                                  >
+                                    {addr.address}
+                                  </button>
                                   <CopyButton text={addr.address} />
                                 </span>
                               </td>
