@@ -13,4 +13,6 @@
   controllers replace them on the other nodes, and only then lets the
   reboot go on. It takes effect on the reboots of nodes already running
   this release, so the reboots that finish an upgrade to it still run
-  the old way.
+  the old way. When the node is back, it deletes the pods it stopped
+  that nothing else would (a Deployment's), so they do not stay listed
+  as Completed beside their replacements.

@@ -1,0 +1,25 @@
+[Unit]
+Description=Delete the pods this node's kubelet ended for its last shutdown (issue #1976)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/1976
+# Where k3s runs, and only there: k3s.service's own conditions.
+ConditionKernelCommandLine=!boot=live
+ConditionPathExists=/etc/spatiumddi/appliance-release
+# Ordering only: a unit never pulls k3s in (#1723). The runner waits for
+# the API itself.
+After=k3s.service
+
+[Service]
+# The kubelet's graceful node shutdown (#1976) ends every pod of the node
+# before a reboot goes on, and their controllers replace them. The pods a
+# ReplicaSet owns then stay listed as Completed (or Error) beside their
+# replacements, because nothing deletes a terminal pod of a ReplicaSet
+# until the pod GC's threshold of 12,500. This deletes them once the node
+# is back, and nothing else (the runner's header has the selector).
+#
+# exec, not oneshot: boot does not wait for the API. The runner gives up
+# after 15 minutes and always exits 0; the next boot looks again.
+Type=exec
+ExecStart=/usr/local/bin/spatium-clear-shutdown-pods
+
+[Install]
+WantedBy=multi-user.target
