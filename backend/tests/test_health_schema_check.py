@@ -359,11 +359,11 @@ def redis_up(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def fresh_api_process(monkeypatch: pytest.MonkeyPatch) -> None:
+def fresh_api_process() -> None:
     """This process has not been ready at its own head yet: a new pod, a
     restarted container, or an older release rolled back onto a newer
-    database."""
-    monkeypatch.setattr(health_module, "_schema_readiness", health_module._SchemaReadiness())
+    database. (conftest resets it before every test too; this says so.)"""
+    health_module.reset_schema_readiness()
 
 
 @pytest.mark.asyncio
@@ -415,6 +415,23 @@ async def test_ready_pod_keeps_serving_when_a_newer_release_migrates(
     assert body["checks"]["schema"].startswith("ok: ")
     assert NEWER in body["checks"]["schema"]
     assert expected in body["checks"]["schema"]
+
+
+@pytest.mark.asyncio
+async def test_a_test_starts_as_a_fresh_api_process(client: AsyncClient, redis_up: None) -> None:
+    """No test inherits an earlier test's readiness history: conftest's
+    ``_reset_global_caches`` resets it around every test. This test follows
+    one that leaves the process ready at its head, so without the reset it
+    would find that latch on the same worker and answer 200."""
+    expected, _ = schema_module.expected_alembic_head()
+    await _stamp(NEWER)
+
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 503, response.json()
+    assert response.json()["checks"]["schema"] == (
+        f"error: schema at {NEWER}, image expects {expected}"
+    )
 
 
 @pytest.mark.asyncio

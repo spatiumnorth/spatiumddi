@@ -66,6 +66,13 @@ class _SchemaReadiness:
 _schema_readiness = _SchemaReadiness()
 
 
+def reset_schema_readiness() -> None:
+    """Forget this process's schema history, as if it had just started:
+    the latch and the last state logged (tests)."""
+    global _schema_readiness
+    _schema_readiness = _SchemaReadiness()
+
+
 def _log_schema_change(verdict: str, result: SchemaCheck) -> None:
     """Log a schema mismatch at warning once per change (#2777)."""
     key = (verdict, result.detail)

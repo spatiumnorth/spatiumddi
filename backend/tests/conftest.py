@@ -196,6 +196,11 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     cluster_health.invalidate_probe_cache()
     # GHSA-c58p-8cq9-g3gm — /health/platform caches its Celery worker ping.
     health.invalidate_worker_ping_cache()
+    # #2777: /health/ready remembers whether this process has been ready
+    # at its own head; a test that got there would carry it into every
+    # later test on the same worker, and a newer schema the test expects
+    # refused would pass instead.
+    health.reset_schema_readiness()
     # The idle-session timeout is cached the same way.
     session_idle.invalidate_cache()
     yield
@@ -205,6 +210,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()
     health.invalidate_worker_ping_cache()
+    health.reset_schema_readiness()
 
 
 @pytest.fixture(autouse=True)
