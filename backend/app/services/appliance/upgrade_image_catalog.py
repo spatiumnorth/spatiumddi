@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance, ApplianceUpgradeImage
@@ -30,6 +30,28 @@ from app.services.appliance.architecture import normalize
 from app.services.appliance.releases import UpgradeImageRelease, release_channel
 
 _ACTIVE_RUN_STATES = ("planned", "running", "halted")
+
+# #2400 — the upgrade-image catalogue lock (transaction-scoped advisory).
+# SHARED by every path that turns an image into a schedule (from resolving
+# the image until that transaction commits), EXCLUSIVE by the paths that
+# delete images (the delete endpoint, the reclaim sweep). So an image can
+# never be deleted between "is anything using it?" and a new schedule.
+CATALOG_LOCK_KEY = 0x53504D55504749  # "SPMUPGI"
+
+
+async def lock_catalog_shared(db: AsyncSession) -> None:
+    await db.execute(text("SELECT pg_advisory_xact_lock_shared(:k)"), {"k": CATALOG_LOCK_KEY})
+
+
+async def lock_catalog_exclusive(db: AsyncSession) -> None:
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": CATALOG_LOCK_KEY})
+
+
+async def try_lock_catalog_exclusive(db: AsyncSession) -> bool:
+    got = await db.scalar(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": CATALOG_LOCK_KEY})
+    return bool(got)
+
+
 _IMAGE_URL_RE = re.compile(r"/upgrade-images/([0-9a-fA-F-]{36})/raw\.xz")
 
 
