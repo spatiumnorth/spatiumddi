@@ -571,7 +571,15 @@ def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundL
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
     first watchdog cadence after startup); subsequent calls gate on
-    monotonic elapsed."""
+    monotonic elapsed.
+
+    ``_last_watchdog_at == 0.0`` means "never ran / invalidated" and is due
+    at once. It used to be compared like a timestamp, but ``time.monotonic()``
+    counts from boot, so within the first ``_WATCHDOG_INTERVAL_S`` of host
+    uptime neither the first probe nor the invalidation after a role apply
+    (#2808's first approved heartbeat) was due until 5 min after boot."""
+    if _last_watchdog_at == 0.0:
+        return True
     return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
 
 
@@ -1056,7 +1064,12 @@ def heartbeat_once(
         if _watchdog_check_due():
             try:
                 env_file = cfg.state_dir / _ROLE_ENV_FILENAME
-                _cached_role_health = watchdog.check_health(env_file)
+                # #2808 — no heal while the node is not approved: the revoked
+                # teardown keeps the role env, and healing from it brought
+                # DNS and DHCP back on a node taken out of service.
+                _cached_role_health = watchdog.check_health(
+                    env_file, held_by=approval_state.role_services_hold(cfg.state_dir)
+                )
                 _last_watchdog_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 # Never let a watchdog crash kill the heartbeat path.
@@ -1243,6 +1256,13 @@ def heartbeat_once(
         return False
     # Heartbeat accepted — clear any prior strike counter and stamp
     # ``approved`` if we weren't there yet.
+    #
+    # #2808 — remember whether the role services were held (revoked or
+    # pending) up to now. The watchdog no longer heals a held node, so the
+    # first accepted heartbeat is what brings its roles back, and it must
+    # apply whatever the stamp says: the stamp may still name the env the
+    # teardown un-applied.
+    held_until_now = approval_state.role_services_hold(cfg.state_dir)
     approval_state.record_success(cfg.state_dir)
 
     try:
@@ -1927,13 +1947,19 @@ def heartbeat_once(
     # toward a state the control plane no longer expects. The console
     # dashboard surfaces the red ``Approval revoked`` chip so the
     # operator knows the recovery is "re-pair from /appliance/pairing".
-    if approval_state.read_state(cfg.state_dir) == "revoked":
+    if approval_state.role_services_hold(cfg.state_dir) is not None:
         log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
         _ = identity
         return False
 
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        _run_role_lifecycle(cfg.state_dir, target.profiles, rendered, env_path)
+        _run_role_lifecycle(
+            cfg.state_dir,
+            target.profiles,
+            rendered,
+            env_path,
+            force=held_until_now is not None,
+        )
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
@@ -1944,7 +1970,12 @@ def heartbeat_once(
 
 
 def _run_role_lifecycle(
-    state_dir: Path, profiles: list[str], rendered: str, env_path: Path
+    state_dir: Path,
+    profiles: list[str],
+    rendered: str,
+    env_path: Path,
+    *,
+    force: bool = False,
 ) -> None:
     """Write the role chart (when due), THEN reconcile the node labels (#2190).
 
@@ -1958,9 +1989,16 @@ def _run_role_lifecycle(
     only what its new template can serve, and the reconcile after it — which
     still runs on every tick, to catch an out-of-band ``kubectl label`` — gates
     the same way.
+
+    ``force`` applies even when the stamp matches: the first accepted
+    heartbeat after the node was held (revoked or pending, #2808), whose
+    role chart was torn down under an env the stamp still names.
     """
     global _last_watchdog_at
     apply_due, env_hash = _role_apply_due(state_dir, rendered, env_path)
+    if force and not apply_due:
+        log.info("supervisor.heartbeat.lifecycle_forced", reason="approved_again")
+        apply_due = True
     if not apply_due:
         log.info(
             "supervisor.heartbeat.lifecycle_skipped",

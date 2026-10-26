@@ -37,6 +37,14 @@ Algorithm:
    controller diffs internally — present-and-healthy services
    no-op, missing ones come up.
 
+   Never while the node is not approved (#2808). A revoked node's
+   teardown deletes the role chart but keeps ``role-compose.env`` (a
+   re-registration restores the roles from it, #2801), so the env still
+   names the roles; healing from it started DNS and DHCP again on a node
+   taken out of service. While held, a missing service is reported as
+   ``held`` (down on purpose) rather than ``missing``, and nothing is
+   applied.
+
 Cadence: 5 min (5 heartbeats at the default 60 s interval). Steady-
 state cost is one ``GET /api/v1/namespaces/spatium/pods`` + dict
 bookkeeping; sub-100 ms.
@@ -76,9 +84,9 @@ _PROFILE_TO_SERVICE: dict[str, str] = {
 class ServiceHealth:
     """Per-service watchdog verdict.
 
-    ``status`` ∈ {healthy, missing, unhealthy, starting}. The Fleet
+    ``status`` ∈ {healthy, missing, unhealthy, starting, held}. The Fleet
     drilldown renders a green chip on healthy, amber on starting,
-    rose on unhealthy / missing. ``since_ts`` is the unix-epoch
+    rose on unhealthy / missing, neutral on held. ``since_ts`` is the unix-epoch
     seconds of the first observation in this status; the heartbeat
     serialises it as an ISO-8601 wall-clock string for the API.
     """
@@ -212,6 +220,7 @@ def _check_health_k3s(
     desired_services: dict[str, str],
     *,
     auto_heal: bool,
+    held_by: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """One k3s health-check pass.
 
@@ -232,19 +241,22 @@ def _check_health_k3s(
     # useful (HelmChart PATCH would fail too). Surface this loud.
     if not k8s_api.check_kubeapi_ready():
         log.error("supervisor.watchdog.kubeapi_unreachable")
+        down = "held" if held_by is not None else "missing"
         for svc, role in desired_services.items():
             prev = _status_history.get(svc)
-            if prev is None or prev[0] != "missing":
-                _status_history[svc] = ("missing", now_mono, now_wall)
+            if prev is None or prev[0] != down:
+                _status_history[svc] = (down, now_mono, now_wall)
                 since_wall = now_wall
             else:
                 since_wall = prev[2]
             out[svc] = {
                 "role": role,
-                "status": "missing",
+                "status": down,
                 "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_wall)),
                 "container_id": None,
             }
+            if held_by is not None:
+                out[svc]["held_by"] = held_by
         return out
 
     pods = k8s_api.list_pods(
@@ -274,7 +286,9 @@ def _check_health_k3s(
         # in the if-branch below (issue #241).
         pod: k8s_api.PodStatus | None = by_service.get(svc)
         if pod is None:
-            status = "missing"
+            # #2808 — a role service a non-approved node does not run is down
+            # on purpose, not missing: no red chip, no heal.
+            status = "held" if held_by is not None else "missing"
             container_id = None
             missing_services.append(svc)
         else:
@@ -294,6 +308,8 @@ def _check_health_k3s(
             "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_wall)),
             "container_id": container_id,
         }
+        if held_by is not None:
+            entry["held_by"] = held_by
         # #2018 — only a pod known to be this node's: another node's OOM
         # kill must not be reported as this appliance's.
         if pod is not None and (own_node is None or _on_node(pod, own_node)):
@@ -302,7 +318,18 @@ def _check_health_k3s(
                 entry["container"] = runtime
         out[svc] = entry
 
-    if auto_heal and missing_services:
+    if held_by is not None:
+        if missing_services:
+            # #2808 — the role chart is down because the node is not
+            # approved (the revoked teardown deleted it). Re-applying it here
+            # started DNS and DHCP on a node taken out of service. The first
+            # accepted heartbeat after approval applies the roles again.
+            log.info(
+                "supervisor.watchdog.heal_skipped_not_approved",
+                approval_state=held_by,
+                held=missing_services,
+            )
+    elif auto_heal and missing_services:
         log.warning(
             "supervisor.watchdog.missing_services",
             missing=missing_services,
@@ -326,6 +353,7 @@ def check_health(
     env_file: Path,
     *,
     auto_heal: bool = True,
+    held_by: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """One watchdog pass.
 
@@ -333,6 +361,11 @@ def check_health(
     name. Empty dict when no roles are assigned (idle appliance —
     nothing to watch). ``auto_heal=False`` lets tests drive the
     watcher without re-firing the apply path.
+
+    ``held_by`` is the approval state holding the role services down
+    (``approval_state.role_services_hold``), or ``None`` when the node is
+    approved. When set, nothing is healed and a missing service reports
+    ``held`` (#2808).
 
     Phase 7: k3s-only. The pre-Phase-7 runtime branch (compose vs
     k3s) is gone with the rest of docker.
@@ -349,7 +382,7 @@ def check_health(
         _status_history.clear()
         return {}
 
-    out = _check_health_k3s(env_file, desired_services, auto_heal=auto_heal)
+    out = _check_health_k3s(env_file, desired_services, auto_heal=auto_heal, held_by=held_by)
 
     # Garbage-collect stale entries (operator switched roles).
     for stale in list(_status_history):

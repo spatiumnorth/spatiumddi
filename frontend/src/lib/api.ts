@@ -13126,9 +13126,12 @@ export interface ApplianceRow {
     string,
     {
       role: string;
-      status: "healthy" | "missing" | "unhealthy" | "starting";
+      // #2808 — ``held``: the node is revoked or not yet approved, so its
+      // role services are down on purpose (``held_by`` names the state).
+      status: "healthy" | "missing" | "unhealthy" | "starting" | "held";
       since: string;
       container_id: string | null;
+      held_by?: string;
     }
   >;
   // #387 — per-plane host-config apply health from the supervisor's
