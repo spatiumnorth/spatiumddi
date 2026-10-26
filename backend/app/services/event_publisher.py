@@ -38,13 +38,11 @@ from typing import Any
 
 import structlog
 from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings as _app_settings
-from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
+from app.services import dispatch_db
 from app.services.after_commit_dispatch import dispatch
 from app.services.audit_redact import redact_audit_value
 
@@ -288,25 +286,16 @@ def _subscription_matches(sub: EventSubscription, event_type: str) -> bool:
 
 @asynccontextmanager
 async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
-    """Short-lived engine + session used by the after-commit publisher.
+    """Session on the shared, capped dispatch engine (#2782) -- see
+    ``app.services.dispatch_db``. Not a fresh engine per commit: that put
+    no ceiling on the connections this hook could hold."""
+    async with dispatch_db.session() as session:
+        yield session
 
-    Why a fresh engine per dispatch — see
-    ``audit_forward._ephemeral_session``: in FastAPI we'd pin to the
-    request loop, in Celery the loop is per-task. NullPool keeps the
-    connection lifetime explicit; the cost is one fresh
-    connection/dispatch which is fine for audit-rate write volumes.
-    """
-    engine = create_async_engine(
-        _app_settings.database_url,
-        poolclass=NullPool,
-        echo=False,
-        connect_args=task_connect_args(),
-    )
-    try:
-        async with AsyncSession(engine, expire_on_commit=False) as session:
-            yield session
-    finally:
-        await engine.dispose()
+
+# Nothing to publish to: no enabled subscription. Invalidated by the webhook
+# routes; a subscription created on another process is seen within the TTL.
+subscriptions_cache = dispatch_db.NegativeCache()
 
 
 # ── Outbox writer ──────────────────────────────────────────────────────────
@@ -323,6 +312,8 @@ async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
     """
     if not snapshots:
         return
+    if subscriptions_cache.known_empty():
+        return
     try:
         async with _ephemeral_session() as session:
             res = await session.execute(
@@ -330,6 +321,7 @@ async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
             )
             subs = list(res.scalars().all())
             if not subs:
+                subscriptions_cache.mark_empty()
                 return
 
             now = datetime.now(UTC)

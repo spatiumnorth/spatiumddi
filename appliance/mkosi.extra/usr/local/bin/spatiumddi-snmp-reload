@@ -22,6 +22,11 @@
 #   7. Verify it's up; write the hash sidecar + status sidecar. If it is
 #      not, restore step 3's copies and snmpd's previous state
 #
+# lldpd (when its "Expose via SNMP" toggle is on) is an AgentX subagent
+# of this snmpd. It is NOT restarted here: lldpd's AgentX ping notices
+# the master went away and re-registers LLDP-MIB on its own within
+# ~15 s of snmpd coming back (verified, #2154).
+#
 # Apply flow when disabled:
 #   1. systemctl disable --now snmpd (idempotent)
 #   2. Truncate /etc/snmp/snmpd.conf to a "managed off" stub

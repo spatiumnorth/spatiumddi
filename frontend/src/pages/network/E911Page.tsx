@@ -314,6 +314,17 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
                   <ListEmpty
                     error={query.error}
                     what="Emergency Response Locations"
+                    filtered={
+                      search.trim() !== "" ||
+                      validation !== "" ||
+                      dispatchable !== ""
+                    }
+                    onClearFilters={() => {
+                      setSearch("");
+                      setValidation("");
+                      setDispatchable("");
+                      setPage(1);
+                    }}
                   >
                     No Emergency Response Locations yet. A voice subnet with no
                     ERL carries no dispatchable location on a 911 call.
@@ -924,7 +935,15 @@ function BindingsTab({ canQuery }: { canQuery: boolean }) {
                   colSpan={5}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
-                  <ListEmpty error={query.error} what="location bindings">
+                  <ListEmpty
+                    error={query.error}
+                    what="location bindings"
+                    filtered={kind !== ""}
+                    onClearFilters={() => {
+                      setKind("");
+                      setPage(1);
+                    }}
+                  >
                     No bindings yet — every lookup will answer{" "}
                     <code>confidence: none</code>.
                   </ListEmpty>
