@@ -13202,7 +13202,7 @@ export function BlockTreeRow({
               )}
               {/* The CIDR never shrinks; the name is what gets cut (#2822). */}
               <span
-                data-testid="block-cidr"
+               
                 className="font-mono font-medium shrink-0 whitespace-nowrap"
               >
                 {node.block.network}
