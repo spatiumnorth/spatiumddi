@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.models.dhcp import DHCPServer
 from app.services.dhcp_import import (
@@ -48,7 +49,10 @@ from app.services.dhcp_import.canonical import (
 )
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+# Every body route here checks the login from the request headers before
+# the body is read, JSON routes included (app.api.pre_body_auth): these
+# routes carry body allowances above the app-wide cap (app.core.body_limit).
+router = APIRouter(route_class=PreBodyAuthRoute)
 
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 

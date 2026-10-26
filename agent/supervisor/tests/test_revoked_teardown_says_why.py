@@ -40,7 +40,11 @@ def _revoked_heartbeats(
     monkeypatch.setattr(heartbeat, "tear_down_supervised_services", lambda: teardown)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"detail": "Appliance revoked."})
+        return httpx.Response(
+            403,
+            json={"detail": "Appliance revoked."},
+            headers={heartbeat.REVOCATION_HEADER: "revoked"},
+        )
 
     cfg = types.SimpleNamespace(heartbeat_interval_seconds=0, state_dir=tmp_path)
     with (

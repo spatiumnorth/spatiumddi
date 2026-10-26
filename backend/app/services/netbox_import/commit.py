@@ -65,6 +65,7 @@ from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.ownership import Customer, Site
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
+from app.services.import_savepoint import entity_savepoint as _entity_savepoint
 from app.services.router_naming import pick_unique_router_name
 
 from .canonical import (
@@ -583,10 +584,19 @@ async def _block_overlap_reparent(
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class _Actor:
+    """Plain-value snapshot of the signed-in user for ``_audit`` (#2816)."""
+
+    id: uuid.UUID
+    display_name: str
+    auth_source: str
+
+
 def _audit(
     db: AsyncSession,
     *,
-    actor: User,
+    actor: _Actor,
     action: str,
     resource_type: str,
     resource_id: str,
@@ -630,7 +640,7 @@ async def _commit_customer(
     imported: Any,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
 ) -> CommitEntityResult:
     key = _customer_key(imported.name)
@@ -695,7 +705,7 @@ async def _commit_site(
     imported: Any,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     code_to_id: dict[str, uuid.UUID],
 ) -> CommitEntityResult:
@@ -762,7 +772,7 @@ async def _commit_vrf(
     imported: Any,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     customer_id: uuid.UUID | None,
 ) -> tuple[CommitEntityResult, uuid.UUID | None]:
@@ -835,7 +845,7 @@ async def _commit_space(
     imported: Any,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     vrf_id: uuid.UUID | None,
     customer_id: uuid.UUID | None,
@@ -912,7 +922,7 @@ async def _commit_vlan(
     db: AsyncSession,
     imported: Any,
     *,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     router_id: uuid.UUID,
 ) -> tuple[CommitEntityResult, uuid.UUID | None]:
@@ -1045,7 +1055,7 @@ async def _commit_block(
     imported: ImportedBlock,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     space_id: uuid.UUID,
     customer_id: uuid.UUID | None,
@@ -1164,7 +1174,7 @@ async def _auto_wrapper_block(
     *,
     space_id: uuid.UUID,
     net: IPNetwork,
-    actor: User,
+    actor: _Actor,
     now: datetime,
 ) -> uuid.UUID:
     """Create an ``auto:<cidr>`` wrapper block at the subnet's own CIDR.
@@ -1213,7 +1223,7 @@ async def _commit_subnet(
     imported: ImportedSubnet,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     space_id: uuid.UUID,
     customer_id: uuid.UUID | None,
@@ -1333,7 +1343,7 @@ async def _commit_address(
     imported: ImportedAddress,
     *,
     action: ConflictAction,
-    actor: User,
+    actor: _Actor,
     now: datetime,
     space_id: uuid.UUID,
 ) -> CommitEntityResult:
@@ -1503,6 +1513,10 @@ async def commit_import(
         if single_space is None or single_space.deleted_at is not None:
             raise ValueError(f"target IP space {target_space_id} does not exist")
 
+    # Plain values, never the ORM row: a failed entity's savepoint rollback
+    # (or any rollback) expires loaded objects, and the next ``_audit`` would
+    # lazy-load the user outside the greenlet (#2816).
+    snap = _Actor(id=actor.id, display_name=actor.display_name, auth_source=actor.auth_source)
     now = datetime.now(UTC)
     result = CommitResult(source=_SOURCE, warnings=list(preview.warnings))
 
@@ -1514,11 +1528,11 @@ async def commit_import(
     for c in preview.customers:
         key = _customer_key(c.name)
         try:
-            res = await _commit_customer(db, c, action=_action(key), actor=actor, now=now)
-            if res.entity_id:
-                customer_name_to_id[c.name] = uuid.UUID(res.entity_id)
+            async with _entity_savepoint(db):
+                res = await _commit_customer(db, c, action=_action(key), actor=snap, now=now)
+                if res.entity_id:
+                    customer_name_to_id[c.name] = uuid.UUID(res.entity_id)
         except Exception as exc:  # noqa: BLE001 — per-row failure capture
-            await db.rollback()
             res = CommitEntityResult(
                 kind="customer", key=key, action_taken="failed", error=str(exc)
             )
@@ -1530,11 +1544,11 @@ async def commit_import(
     for s in preview.sites:
         key = _site_key(s.name, s.code)
         try:
-            res = await _commit_site(
-                db, s, action=_action(key), actor=actor, now=now, code_to_id=site_code_to_id
-            )
+            async with _entity_savepoint(db):
+                res = await _commit_site(
+                    db, s, action=_action(key), actor=snap, now=now, code_to_id=site_code_to_id
+                )
         except Exception as exc:  # noqa: BLE001
-            await db.rollback()
             res = CommitEntityResult(kind="site", key=key, action_taken="failed", error=str(exc))
         result.entities.append(res)
 
@@ -1544,13 +1558,13 @@ async def commit_import(
         key = _vrf_key(v.name, v.rd)
         cust_id = customer_name_to_id.get(v.customer_name) if v.customer_name else None
         try:
-            res, vid = await _commit_vrf(
-                db, v, action=_action(key), actor=actor, now=now, customer_id=cust_id
-            )
-            if vid is not None:
-                vrf_name_to_id[v.name] = vid
+            async with _entity_savepoint(db):
+                res, vid = await _commit_vrf(
+                    db, v, action=_action(key), actor=snap, now=now, customer_id=cust_id
+                )
+                if vid is not None:
+                    vrf_name_to_id[v.name] = vid
         except Exception as exc:  # noqa: BLE001
-            await db.rollback()
             res = CommitEntityResult(kind="vrf", key=key, action_taken="failed", error=str(exc))
         result.entities.append(res)
 
@@ -1562,18 +1576,18 @@ async def commit_import(
             vrf_id = vrf_name_to_id.get(sp.vrf_name) if sp.vrf_name else None
             cust_id = customer_name_to_id.get(sp.customer_name) if sp.customer_name else None
             try:
-                res, sid = await _commit_space(
-                    db,
-                    sp,
-                    action=_action(key),
-                    actor=actor,
-                    now=now,
-                    vrf_id=vrf_id,
-                    customer_id=cust_id,
-                )
-                space_name_to_id[sp.name] = sid
+                async with _entity_savepoint(db):
+                    res, sid = await _commit_space(
+                        db,
+                        sp,
+                        action=_action(key),
+                        actor=snap,
+                        now=now,
+                        vrf_id=vrf_id,
+                        customer_id=cust_id,
+                    )
+                    space_name_to_id[sp.name] = sid
             except Exception as exc:  # noqa: BLE001
-                await db.rollback()
                 res = CommitEntityResult(
                     kind="ip_space", key=key, action_taken="failed", error=str(exc)
                 )
@@ -1589,11 +1603,11 @@ async def commit_import(
     # ── 5. Router + VLANs ─────────────────────────────────────────────
     vlan_vid_to_id: dict[int, uuid.UUID] = {}
     if preview.vlans:
-        router: Router | None = None
+        router_id: uuid.UUID | None = None
         try:
-            router = await _ensure_router(db, default_router_name)
+            async with _entity_savepoint(db):
+                router_id = (await _ensure_router(db, default_router_name)).id
         except Exception as exc:  # noqa: BLE001 — never let the whole import 500
-            await db.rollback()
             result.entities.append(
                 CommitEntityResult(
                     kind="vlan",
@@ -1602,17 +1616,17 @@ async def commit_import(
                     error=f"could not create import router {default_router_name!r}: {exc}",
                 )
             )
-        if router is not None:
+        if router_id is not None:
             for vl in preview.vlans:
                 key = _vlan_key(vl.vid)
                 try:
-                    res, vlid = await _commit_vlan(
-                        db, vl, actor=actor, now=now, router_id=router.id
-                    )
-                    if vlid is not None:
-                        vlan_vid_to_id[vl.vid] = vlid
+                    async with _entity_savepoint(db):
+                        res, vlid = await _commit_vlan(
+                            db, vl, actor=snap, now=now, router_id=router_id
+                        )
+                        if vlid is not None:
+                            vlan_vid_to_id[vl.vid] = vlid
                 except Exception as exc:  # noqa: BLE001
-                    await db.rollback()
                     res = CommitEntityResult(
                         kind="vlan", key=key, action_taken="failed", error=str(exc)
                     )
@@ -1635,18 +1649,18 @@ async def commit_import(
         cust_id = customer_name_to_id.get(b.customer_name) if b.customer_name else None
         site_id = site_code_to_id.get(b.site_code) if b.site_code else None
         try:
-            res, _bid = await _commit_block(
-                db,
-                b,
-                action=_action(key),
-                actor=actor,
-                now=now,
-                space_id=space_id,
-                customer_id=cust_id,
-                site_id=site_id,
-            )
+            async with _entity_savepoint(db):
+                res, _bid = await _commit_block(
+                    db,
+                    b,
+                    action=_action(key),
+                    actor=snap,
+                    now=now,
+                    space_id=space_id,
+                    customer_id=cust_id,
+                    site_id=site_id,
+                )
         except Exception as exc:  # noqa: BLE001
-            await db.rollback()
             res = CommitEntityResult(
                 kind="ip_block", key=key, action_taken="failed", error=str(exc)
             )
@@ -1670,22 +1684,22 @@ async def commit_import(
         site_id = site_code_to_id.get(sub.site_code) if sub.site_code else None
         vlan_id = vlan_vid_to_id.get(sub.vlan_vid) if sub.vlan_vid is not None else None
         try:
-            res, _sid, wrapper_entities = await _commit_subnet(
-                db,
-                sub,
-                action=_action(key),
-                actor=actor,
-                now=now,
-                space_id=space_id,
-                customer_id=cust_id,
-                site_id=site_id,
-                vlan_id=vlan_id,
-            )
-            # Wrapper block(s) committed together with the subnet — record them
-            # before the subnet row so blocks_created reflects reality.
-            result.entities.extend(wrapper_entities)
+            async with _entity_savepoint(db):
+                res, _sid, wrapper_entities = await _commit_subnet(
+                    db,
+                    sub,
+                    action=_action(key),
+                    actor=snap,
+                    now=now,
+                    space_id=space_id,
+                    customer_id=cust_id,
+                    site_id=site_id,
+                    vlan_id=vlan_id,
+                )
+                # Wrapper block(s) committed together with the subnet — record them
+                # before the subnet row so blocks_created reflects reality.
+                result.entities.extend(wrapper_entities)
         except Exception as exc:  # noqa: BLE001
-            await db.rollback()
             res = CommitEntityResult(kind="subnet", key=key, action_taken="failed", error=str(exc))
         result.entities.append(res)
 
@@ -1703,11 +1717,11 @@ async def commit_import(
             result.entities.append(res)
             continue
         try:
-            res = await _commit_address(
-                db, a, action=_action(key), actor=actor, now=now, space_id=space_id
-            )
+            async with _entity_savepoint(db):
+                res = await _commit_address(
+                    db, a, action=_action(key), actor=snap, now=now, space_id=space_id
+                )
         except Exception as exc:  # noqa: BLE001
-            await db.rollback()
             res = CommitEntityResult(
                 kind="ip_address", key=key, action_taken="failed", error=str(exc)
             )

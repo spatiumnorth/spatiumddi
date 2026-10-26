@@ -68,6 +68,7 @@ import {
 import { heldByEviction, hostnamesBeingEvicted } from "@/lib/cluster-eviction";
 import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
+import { VarDiskWarning } from "./VarDiskWarning";
 import { AptTab } from "./AptTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
@@ -2707,6 +2708,17 @@ function ApplianceDrilldownModal({
             <ApplianceRoleHealthSection row={row} />
           )}
 
+        {row.state === "approved" && row.var_disk_finding && (
+          <div className="border-t pt-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Disk space
+            </h3>
+            <div className="mt-2">
+              <VarDiskWarning finding={row.var_disk_finding} />
+            </div>
+          </div>
+        )}
+
         {row.state === "approved" && <ApplianceStorageSection row={row} />}
 
         {row.state === "approved" && <ApplianceRemovableSection row={row} />}
@@ -2995,7 +3007,7 @@ function formatRelativeSince(iso: string): string {
 }
 
 const WATCHDOG_STATUS_STYLES: Record<
-  "healthy" | "missing" | "unhealthy" | "starting",
+  "healthy" | "missing" | "unhealthy" | "starting" | "held",
   { className: string; label: string; Icon: typeof CheckCircle2 }
 > = {
   healthy: {
@@ -3021,6 +3033,13 @@ const WATCHDOG_STATUS_STYLES: Record<
       "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
     label: "starting",
     Icon: Loader2,
+  },
+  // #2808 — down on purpose: the node is revoked or not yet approved, so the
+  // supervisor keeps its role services stopped and does not heal them.
+  held: {
+    className: "bg-muted text-muted-foreground border-border",
+    label: "held",
+    Icon: Ban,
   },
 };
 

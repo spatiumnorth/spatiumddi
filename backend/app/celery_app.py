@@ -16,6 +16,8 @@ from celery.signals import (
     task_postrun,
     task_prerun,
     worker_init,
+    worker_process_shutdown,
+    worker_shutdown,
 )
 from celery.worker.consumer import Consumer
 from redis.backoff import NoBackoff
@@ -156,6 +158,7 @@ celery_app = Celery(
         "app.tasks.prune_pairing_codes",
         "app.tasks.firewall_lint_scan",
         "app.tasks.prune_revoked_appliances",
+        "app.tasks.upgrade_image_reclaim",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.ipam_discovery",
@@ -281,6 +284,7 @@ celery_app.conf.update(
         "app.tasks.looking_glass.*": {"queue": "default"},
         "app.tasks.conformity.*": {"queue": "default"},
         "app.tasks.prune_revoked_appliances.*": {"queue": "default"},
+        "app.tasks.upgrade_image_reclaim.*": {"queue": "default"},
         "app.tasks.upgrade_orchestrator.*": {"queue": "default"},
         "app.tasks.dnsbl_sweep.*": {"queue": "default"},
         # #1111 — DNS agent bundle renders. Their own queue so a 30–60 s
@@ -789,6 +793,13 @@ celery_app.conf.update(
             "task": "app.tasks.prune_revoked_appliances.prune_revoked_appliances",
             "schedule": schedule(run_every=3600.0),
         },
+        # #2400 — delete stored upgrade images every node has committed to.
+        # Every 10 min: the gate inside is an hour (a week for an image
+        # nothing ever scheduled), so finer would only add idle passes.
+        "appliances-reclaim-upgrade-images": {
+            "task": "app.tasks.upgrade_image_reclaim.reclaim_upgrade_images",
+            "schedule": schedule(run_every=600.0),
+        },
         # Every 60 s, fire any backup target whose ``next_run_at``
         # is now in the past (issue #117 Phase 1b). The sweep + the
         # per-target ``last_run_status`` mutex keep the cost bounded
@@ -1193,6 +1204,36 @@ def _dispatch_after_commit_in_background(**_: object) -> None:
     runs in the prefork master; the loop itself starts lazily per PID, so
     each forked child gets its own."""
     importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
+
+
+def _drain_after_commit_dispatch() -> None:
+    """Drain this process's dispatch loop and dispose its engine. Never
+    raises: a failure here must not hold up or break shutdown."""
+    try:
+        importlib.import_module("app.services.after_commit_dispatch").shutdown_background()
+    except Exception:  # noqa: BLE001 — shutdown must never be blocked
+        structlog.get_logger(__name__).warning(
+            "after_commit_dispatch_shutdown_hook_failed", exc_info=True
+        )
+
+
+@worker_shutdown.connect
+def _close_after_commit_dispatch(**_: object) -> None:
+    """#2782 — main-process hook. The prefork main process never dispatches
+    after-commit work itself (tasks run in the children), so it has no loop or
+    engine and this is a harmless no-op there (``shutdown_background`` returns
+    once it finds no loop owned by this PID). It still matters for the solo /
+    threads pools, where the main process runs the tasks."""
+    _drain_after_commit_dispatch()
+
+
+@worker_process_shutdown.connect
+def _close_after_commit_dispatch_in_child(**_: object) -> None:
+    """#2782 — per-child hook. Each prefork child has its own background loop
+    and ``dispatch_db`` engine, which ``worker_shutdown`` (main process only)
+    never reaches. Drain the child's in-flight dispatches (bounded) and
+    dispose its engine instead of leaving its sockets to the server's reaper."""
+    _drain_after_commit_dispatch()
 
 
 @beat_init.connect

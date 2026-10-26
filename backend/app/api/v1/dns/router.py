@@ -46,6 +46,7 @@ from app.api.pagination import (
     Page,
     paginate,
 )
+from app.api.pre_body_auth import PreBodyAuthUploadRoute
 from app.api.v1._common import WinRMSettings, winrm_settings_from_blob
 from app.config import settings
 from app.core.agent_wake import (
@@ -271,8 +272,11 @@ logger = structlog.get_logger(__name__)
 # router gate. Handlers that need finer scoping (e.g. "record write permitted
 # only when dns_zone permits write") can do inline checks with
 # `user_has_permission`.
+# The upload routes here check the login from the request headers before
+# the multipart body is read (app.api.pre_body_auth, #2780).
 router = APIRouter(
-    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))]
+    route_class=PreBodyAuthUploadRoute,
+    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))],
 )
 
 # The router gate takes the action from the HTTP method, so a POST asks for

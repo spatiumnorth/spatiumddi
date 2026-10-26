@@ -53,7 +53,9 @@ from app.services.integration_ownership import (
     owned_subnets_in_space,
     owning_integration,
     refuse_sync_into_trashed_space,
+    subnet_for_address,
     subnet_has_surviving_addresses,
+    unowned_subnets_at,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.router_naming import pick_unique_router_name
@@ -127,6 +129,8 @@ class ReconcileSummary:
     subnets_created: int = 0
     subnets_updated: int = 0
     subnets_deleted: int = 0
+    # #2790: un-owned subnets reused at a desired CIDR instead of twinned.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -246,23 +250,6 @@ def _find_enclosing_operator_block(
         if net.subnet_of(bnet) and bnet.prefixlen > best_prefix:  # type: ignore[arg-type]
             best = b
             best_prefix = bnet.prefixlen
-    return best
-
-
-def _find_subnet_for_ip(subnets: list[Subnet], ip: str) -> Subnet | None:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    best: Subnet | None = None
-    best_prefix: int = -1
-    for s in subnets:
-        net = _parse_net(str(s.network))
-        if net is None:
-            continue
-        if addr in net and net.prefixlen > best_prefix:
-            best = s
-            best_prefix = net.prefixlen
     return best
 
 
@@ -633,7 +620,21 @@ async def _apply_blocks_and_subnets(
         await db.delete(row)
         summary.subnets_deleted += 1
 
+    # #2790: an un-owned subnet at exactly a desired CIDR is reused as it
+    # stands, never twinned, as the Docker reconciler does (#2601). It is one
+    # the loop above un-claimed when its network left (#1558), one a
+    # controller delete kept for its operator content (#2287), or one an
+    # operator made. It is neither claimed nor rewritten, and the address
+    # pass still mirrors into it.
+    kept = await unowned_subnets_at(
+        db, controller.ipam_space_id, [n for n in desired_map if n not in current_subnets]
+    )
+
     for net_str, d in desired_map.items():
+        if net_str in kept:
+            summary.subnets_matched += 1
+            continue
+
         parent_block = _find_enclosing_operator_block(blocks, d.network, controller.id)
 
         if parent_block is None:
@@ -845,7 +846,13 @@ async def _apply_addresses(
                 summary.addresses_deleted += 1
 
     for addr, d in desired_map.items():
-        subnet = _find_subnet_for_ip(subnets, d.address)
+        # #2790: the controller's own subnet first, then the longest prefix,
+        # with a fixed tie-break (never the order the rows came back in);
+        # an operator-edited row stays in its subnet, so it is neither moved
+        # nor dropped as a duplicate below.
+        subnet = subnet_for_address(
+            subnets, d.address, "unifi_controller_id", controller.id, held=current.get(addr)
+        )
         if subnet is None:
             summary.skipped_no_subnet += 1
             continue
@@ -1185,6 +1192,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     "created": summary.subnets_created,
                     "updated": summary.subnets_updated,
                     "deleted": summary.subnets_deleted,
+                    "matched": summary.subnets_matched,
                 },
                 "addresses": {
                     "created": summary.addresses_created,
@@ -1214,6 +1222,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
         networks=summary.network_count,
         clients=summary.client_count,
         subnets_created=summary.subnets_created,
+        subnets_matched=summary.subnets_matched,
         addresses_created=summary.addresses_created,
         addresses_deleted=summary.addresses_deleted,
     )
