@@ -2453,6 +2453,26 @@ whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
 NS, RRSIG/NSEC*/DNSKEY/CDS/CDNSKEY, private-type 65534) are never ingested.
 
+**A re-render keeps what named holds (#2850, BIND9).** The mirror protects a
+record only once it exists and the agent has fetched a bundle carrying it,
+which is at least one sweep after the update. Every agent start renders each
+zone from the cached bundle, and every structural apply re-renders it, and the
+swap sets named's own zone file and its journal aside. So before the swap the
+BIND9 agent reads each dynamic zone back as named would load it (its file with
+the journal applied, `named-compilezone -j`; on a running named, after the
+freeze that writes the zone out) and appends to the staged file every RRset
+the control plane does not account for. "Accounts for" means the render has
+that name and type (its copy wins, as in the conflict rule above), or the
+control plane once shipped it to this server and has stopped: each dynamic
+zone's file has a `<zone>.db.owned` sidecar listing what the render wrote,
+which applied record ops then update. That second half is what keeps a record
+the control plane deleted while the agent was down from coming back. A name
+the render holds a CNAME for, or a third-party CNAME at a name the render
+uses, is left out and logged (`bind9_dynamic_records_not_carried`). If
+`named-checkzone` refuses the merge, the zone is held back on named's own copy
+(#1403) rather than losing the records. A zone whose live file is still
+exactly a render, with no journal, is not read back.
+
 **Audit.** Every batch that adds or removes mirror records writes one
 `dns.record.external_ingest` audit row on the zone (not one per record, so
 a churning writer cannot flood the log): the added records in `new_value`,
