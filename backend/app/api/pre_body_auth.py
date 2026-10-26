@@ -23,11 +23,21 @@ bodies, the same ``denied`` audit row), because they are the same
 functions. The dependencies still run again in the normal way afterwards;
 the early pass only decides whether the body is read at all.
 
-The importers and the branding logo (#2780) use
+The importers (DNS, DHCP, IPAM and NetBox) and the DNS agent router use
+:class:`PreBodyAuthRoute` for every body route, JSON ones included: their
+routes carry body allowances well above the app-wide cap
+(``app.core.body_limit``), so the caller is checked before any of it is
+read. The zone-spreadsheet import and the branding logo use
 :class:`PreBodyAuthUploadRoute`, which does the same for a router's
-multipart / form routes only: their routers also serve JSON routes, and a
-JSON body is bounded by the app-wide body cap (``app.core.body_limit``)
-rather than checked first.
+multipart / form routes only: their routers also serve JSON routes that
+stay under the app-wide body cap.
+
+A dependency that authenticates something other than a user (the DNS
+agent's bearer token, its bootstrap key) takes part by carrying a
+``spatium_header_auth`` attribute: an async callable taking any of
+``request`` / ``db`` that performs the same check from the headers alone
+and raises the same ``HTTPException`` (:func:`header_auth`). A route
+whose checks are all of that kind never resolves a user.
 
 A route that takes a body on a router using this class and declares none
 of those dependencies is refused when the router is built: the class
@@ -39,7 +49,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Any
+from typing import Any, TypeVar
 
 import fastapi.routing as _fastapi_routing
 from fastapi import Request
@@ -55,6 +65,7 @@ from app.db import get_db
 _KNOWN_PARAMS = frozenset({"request", "current_user", "db"})
 
 AuthCheck = Callable[..., Awaitable[Any]]
+_Dep = TypeVar("_Dep", bound=Callable[..., Any])
 
 # FastAPI serves a route included through ``include_router`` from an
 # "effective" route that carries the router-level dependencies as well as
@@ -67,11 +78,30 @@ AuthCheck = Callable[..., Awaitable[Any]]
 EFFECTIVE_CONTEXT_VAR = getattr(_fastapi_routing, "_effective_route_context_var", None)
 
 
+def header_auth(check: AuthCheck) -> Callable[[_Dep], _Dep]:
+    """Mark a dependency as an authorisation check :class:`PreBodyAuthRoute`
+    can run before the body, by naming ``check``: an async callable taking
+    any of ``request`` / ``db`` that gives the dependency's own answer from
+    the request headers alone.
+
+    When the dependency is replaced through ``app.dependency_overrides``
+    (tests), ``check`` is skipped: the override is what the route then
+    authorises with, and it runs in the normal way."""
+
+    def mark(dependency: _Dep) -> _Dep:
+        dependency.spatium_header_auth = check  # type: ignore[attr-defined]
+        check.spatium_header_auth_for = dependency  # type: ignore[attr-defined]
+        return dependency
+
+    return mark
+
+
 def _is_auth_check(call: Any) -> bool:
     return (
         call is get_current_user
         or call is require_superadmin
         or getattr(call, "spatium_requires", None) is not None
+        or getattr(call, "spatium_header_auth", None) is not None
     )
 
 
@@ -100,6 +130,9 @@ def _auth_checks(route: APIRoute) -> list[AuthCheck]:
             # declares ``CurrentUser`` directly lists it here).
             checks.append(call)
             continue
+        header_check = getattr(call, "spatium_header_auth", None)
+        if header_check is not None:
+            call = header_check
         params = set(inspect.signature(call).parameters)
         unknown = params - _KNOWN_PARAMS
         if unknown:
@@ -118,13 +151,25 @@ async def authorise_from_headers(request: Request, checks: list[AuthCheck]) -> N
     database session is taken from the same provider FastAPI would use
     (honouring ``dependency_overrides``) and closed before returning, so
     no connection is held while a large body is then received."""
-    provider = request.app.dependency_overrides.get(get_db, get_db)
+    overrides = request.app.dependency_overrides
+    checks = [
+        check
+        for check in checks
+        if getattr(check, "spatium_header_auth_for", None) not in overrides
+    ]
+    if not checks:
+        return
+    provider = overrides.get(get_db, get_db)
     sessions = provider()
     db = await sessions.__anext__()
     try:
-        credentials = await _bearer(request)
-        user = await get_current_user(request, db, credentials)
-        values = {"request": request, "current_user": user, "db": db}
+        values: dict[str, Any] = {"request": request, "db": db}
+        if any(
+            check is get_current_user or "current_user" in inspect.signature(check).parameters
+            for check in checks
+        ):
+            credentials = await _bearer(request)
+            values["current_user"] = await get_current_user(request, db, credentials)
         for check in checks:
             if check is get_current_user:
                 continue
@@ -177,7 +222,8 @@ class PreBodyAuthUploadRoute(PreBodyAuthRoute):
     serves JSON routes: only a route taking a multipart / form body (a file
     upload) is checked before its body is read (#2780). Every other route on
     the router is served exactly as by ``APIRoute``; the app-wide body cap
-    (``app.core.body_limit``) bounds those."""
+    (``app.core.body_limit``) bounds those, so a router whose JSON routes
+    carry a larger allowance uses :class:`PreBodyAuthRoute` instead."""
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         if not takes_upload(self):
