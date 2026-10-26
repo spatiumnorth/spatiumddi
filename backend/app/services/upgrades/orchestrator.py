@@ -34,8 +34,9 @@ orchestrator.py`` is idempotent. Re-enqueuing the same ``run_id`` (e.g.
 after the celery worker dies mid-run) picks up from the row's
 ``progress.per_node`` map — completed nodes are skipped, the next
 incomplete node is driven. A node a drive was in the middle of when it died
-is resumed at the step it was in, from ``progress.in_flight`` (#2809): the
-checkpoint its chain wrote before each step.
+is driven first, whatever the plan order, and resumed at the step it was in,
+from ``progress.in_flight`` (#2809): the checkpoint its chain wrote before
+each step.
 """
 
 from __future__ import annotations
@@ -677,7 +678,23 @@ def _release_lease(run: SystemUpgradeRun, holder: str | None) -> None:
     expires (#1449). Only ``holder``'s lease — this drive's own identity
     (#1512) — is released, never another drive's."""
     if not mutex.release_if_held(holder=holder, attempts=_LEASE_RELEASE_ATTEMPTS):
-        logger.warning("upgrade_lease_release_failed", run_id=str(run.id))
+        logger.warning("upgrade_lease_release_failed", run_id=str(_run_pk(run)))
+
+
+def _run_pk(run: SystemUpgradeRun) -> uuid.UUID:
+    """``run.id`` without loading anything (#2809).
+
+    A rollback expires every attribute of every object the session holds, the
+    primary key included, and reading an expired attribute loads it with a
+    lazy SELECT, which an async session cannot run outside ``await``: it
+    raises ``MissingGreenlet``. The chain rolls the drive's session back
+    whenever a statement meets a Postgres failover (#2177, #2809), so after a
+    node the drive's ``run`` may well be expired. The identity key is kept
+    through an expiry, and is what the session itself looks the row up by."""
+    state = sa_inspect(run, raiseerr=False)
+    if state is not None and state.identity:
+        return uuid.UUID(str(state.identity[0]))
+    return run.id
 
 
 def _own_node() -> str | None:
@@ -710,7 +727,7 @@ async def _locked_reread(db: AsyncSession, run: SystemUpgradeRun) -> SystemUpgra
     record, a ``progress`` key) would otherwise be written back over the
     operator's Halt or Abort by the very read meant to protect it. Callers
     that need such a change re-apply it to the fresh row."""
-    run_id = run.id
+    run_id = _run_pk(run)
     db.expire(run)
     return (
         await db.execute(
@@ -749,7 +766,16 @@ async def _fence(
     aborted too, since they record a change already made to the cluster
     (the shared-tag hold's pins) that the beat task or the next run must be
     able to find; only after a takeover are they dropped."""
-    carried = {k: run.progress[k] for k in carry if k in (run.progress or {})}
+    # An expired ``progress`` (the session was rolled back) holds no change of
+    # this drive's: the rollback discarded it. Reading it would load it, which
+    # an async session cannot do here (#2809).
+    state = sa_inspect(run, raiseerr=False)
+    progress_loaded = state is None or "progress" not in state.unloaded
+    carried = (
+        {k: run.progress[k] for k in carry if k in (run.progress or {})}
+        if carry and progress_loaded
+        else {}
+    )
     fresh = await _locked_reread(db, run)
     if fresh is None:
         return "gone"
@@ -785,6 +811,25 @@ def _without_in_flight(progress: dict[str, Any] | None) -> dict[str, Any]:
     """``progress`` with the node checkpoint dropped: the node has ended, so
     a later drive must not resume it (#2809)."""
     return {k: v for k, v in (progress or {}).items() if k != IN_FLIGHT_KEY}
+
+
+def _in_flight_node(
+    progress: dict[str, Any] | None, plan_order: list[str], completed_nodes: list[str]
+) -> str | None:
+    """The node an earlier drive was in the middle of, if it is one to resume
+    (#2809): named by ``progress.in_flight``, in this run's plan, not yet
+    completed, and past ``preflight``. A node checkpointed AT ``preflight``
+    holds nothing (no stamp, no window, no cordon), so it waits its turn in
+    plan order like any other."""
+    entry = (progress or {}).get(IN_FLIGHT_KEY)
+    if not isinstance(entry, dict):
+        return None
+    node = entry.get("node")
+    if not isinstance(node, str) or node not in plan_order or node in completed_nodes:
+        return None
+    if per_node.resume_from_checkpoint(entry, node) is None:
+        return None
+    return node
 
 
 def _checkpoint_writer(
@@ -1068,7 +1113,7 @@ async def _drive_loop(
             # take-over will pick up. Don't flip to failed; that'd
             # mis-attribute a transient kubeapi blip as a real
             # upgrade failure.
-            logger.warning("upgrade_drive_exit_lease_lost", run_id=str(run.id))
+            logger.warning("upgrade_drive_exit_lease_lost", run_id=str(_run_pk(run)))
             if holder and lease_ok is not None and lease_ok.is_set():
                 # #1713 — the renewal gave up, then landed again while the
                 # node in flight finished: the Lease is still this drive's.
@@ -1119,13 +1164,24 @@ async def _drive_loop(
         ]
         own_node = _own_node()
         next_node = node_order.next_node_to_upgrade(plan_order, completed_nodes, defer=own_node)
+        # #2809 — a node an earlier drive was in the middle of comes first,
+        # whatever the plan order and this worker's node say. It may be
+        # stamped, cordoned, drained and in the CNPG window; starting another
+        # node instead would run that node's preflight, whose CNPG wait
+        # counts the instance the in-flight node's drain evicted, and a
+        # failure there releases nothing the earlier drive took.
+        in_flight = _in_flight_node(run.progress, plan_order, completed_nodes)
+        if in_flight is not None:
+            next_node = in_flight
         if next_node is not None and next_node == own_node and len(plan_order) > 1:
-            # Every other node is done and the one left is the node this
-            # worker runs on. Draining it would evict this drive mid-chain,
-            # and the run would sit in ``running`` with nothing driving it
-            # until Celery redelivers the task an hour later (#1449). Hand
-            # the drive to a worker on another node instead: release the
-            # lease, enqueue the drive asking to be run elsewhere, and stop.
+            # The node to drive is the one this worker runs on: every other
+            # node is done, or it is the node in flight (#2809), which no
+            # other node may start before. Draining it would evict this
+            # drive mid-chain, and the run would sit in ``running`` with
+            # nothing driving it until Celery redelivers the task an hour
+            # later (#1449). Hand the drive to a worker on another node
+            # instead: release the lease, enqueue the drive asking to be run
+            # elsewhere, and stop.
             # The new drive takes the lease over and resumes at this node.
             why = await _fence(db, run, holder)
             if why is not None:

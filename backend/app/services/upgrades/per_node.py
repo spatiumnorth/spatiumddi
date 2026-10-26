@@ -1618,8 +1618,10 @@ async def single_node_upgrade(
             is run again, and the steps before it are taken as done, so a
             failure releases what they took.
         checkpoint: called before each step with ``checkpoint_entry``'s
-            JSON, for the caller to store. Best-effort: an exception from it
-            is logged and the chain goes on.
+            JSON, for the caller to store on ``db``. A connection error is
+            retried after a rollback, as a step's is (``_store_checkpoint``);
+            any other exception, or one outlasting the budget, is logged and
+            the chain goes on.
     """
     steps_in_order: list[StepName] = list(CHAIN)
     if resume is not None:
@@ -1691,21 +1693,13 @@ async def single_node_upgrade(
         """Hand the caller a checkpoint before ``step`` runs (#2809)."""
         if checkpoint is None:
             return
-        try:
-            await checkpoint(
-                checkpoint_entry(node_name, step, stamped_at=stamped_at, pre_cordon=pre_cordon)
-            )
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never fails the node
-            # A lost checkpoint only makes a later takeover resume one step
-            # earlier, which every step tolerates. Roll back so the session
-            # the next step uses is not left in a failed transaction.
-            logger.warning(
-                "single_node_upgrade_checkpoint_failed",
-                node=node_name,
-                step=step,
-                error=str(exc),
-            )
-            await _rollback_quietly(db)
+        await _store_checkpoint(
+            db,
+            checkpoint,
+            checkpoint_entry(node_name, step, stamped_at=stamped_at, pre_cordon=pre_cordon),
+            node_name=node_name,
+            step=step,
+        )
 
     async def _fail(step: StepName) -> SingleNodeResult:
         """Fail the chain, first releasing what this run holds (#1542):
@@ -1890,6 +1884,66 @@ async def single_node_upgrade(
         failed_at=None,
         steps=results,
     )
+
+
+async def _store_checkpoint(
+    db: AsyncSession,
+    checkpoint: Checkpoint,
+    entry: dict[str, Any],
+    *,
+    node_name: str,
+    step: StepName,
+    budget_s: float | None = None,
+) -> None:
+    """Store one checkpoint, riding out a Postgres failover (#2809).
+
+    The checkpoints before ``verify_primary_moved``, ``drain`` and ``reboot``
+    fall inside the CNPG switchover the cordon of the primary's node starts,
+    so a refused connect there is expected, not exceptional. It is retried
+    after a rollback, on a fresh connection (the engine pings on checkout),
+    with the same backoff and budget a step gets: a checkpoint lost there
+    would make a later takeover resume at the step before, which every step
+    tolerates, but the drive the walk found crashing (#2809) lost it to the
+    switchover on every roll of the primary's node.
+
+    The rollback expires every object the session holds, the run row among
+    them; the drive reads that row back only through ``_fence``, which never
+    loads an expired attribute (#2809). Anything else, and a database still
+    unreachable once the budget is spent, is logged and the node goes on:
+    bookkeeping never fails a node."""
+    budget = DB_FAILOVER_BUDGET_S if budget_s is None else budget_s
+    first_failure: float | None = None
+    attempt = 0
+    while True:
+        try:
+            await checkpoint(entry)
+            return
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never fails the node
+            await _rollback_quietly(db)
+            if is_transient_db_error(exc):
+                now = _db_retry_clock()
+                if first_failure is None:
+                    first_failure = now
+                delay = _DB_RETRY_BACKOFF_S[min(attempt, len(_DB_RETRY_BACKOFF_S) - 1)]
+                if now - first_failure + delay <= budget:
+                    attempt += 1
+                    logger.warning(
+                        "single_node_upgrade_checkpoint_db_unavailable",
+                        node=node_name,
+                        step=step,
+                        attempt=attempt,
+                        retry_in_s=delay,
+                        error=str(exc),
+                    )
+                    await _db_retry_sleep(delay)
+                    continue
+            logger.warning(
+                "single_node_upgrade_checkpoint_failed",
+                node=node_name,
+                step=step,
+                error=str(exc),
+            )
+            return
 
 
 async def _rollback_quietly(db: AsyncSession) -> None:

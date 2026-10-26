@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.system_upgrade import SystemUpgradeRun
@@ -43,32 +45,37 @@ class _DriveDied(BaseException):
 
 
 class _Cluster:
-    """A three-instance CNPG cluster whose instance on ``NODE`` (local-path
-    volume) is evicted by the drain and comes back only once the node is
-    uncordoned."""
+    """A CNPG cluster with one instance on each of three nodes (local-path
+    volumes): a node's instance is evicted by its drain and comes back only
+    once the node is uncordoned. ``cordoned`` / ``drained`` are the node
+    names, so ``assert cluster.cordoned`` asks whether any node is."""
 
     def __init__(self) -> None:
-        self.cordoned = False
-        self.drained = False
+        self.cordoned: set[str] = set()
+        self.drained: set[str] = set()
         self.window = False
         self.calls: list[str] = []
+        # (call, node) for the calls that name a node.
+        self.node_calls: list[tuple[str, str]] = []
 
     def cnpg(self, *_a: Any, **_k: Any) -> tuple[int, dict[str, Any]]:
-        ready = 2 if (self.cordoned and self.drained) else 3
+        ready = 3 - len(self.cordoned & self.drained)
         return 200, {"spec": {"instances": 3}, "status": {"readyInstances": ready}}
 
-    def get_node(self, _name: str) -> tuple[int, dict[str, Any]]:
-        return 200, {"metadata": {"name": NODE}, "spec": {"unschedulable": self.cordoned}}
+    def get_node(self, name: str) -> tuple[int, dict[str, Any]]:
+        return 200, {"metadata": {"name": name}, "spec": {"unschedulable": name in self.cordoned}}
 
-    def cordon(self, _name: str) -> tuple[bool, None]:
-        self.cordoned = True
+    def cordon(self, name: str) -> tuple[bool, None]:
+        self.cordoned.add(name)
         self.calls.append("cordon")
+        self.node_calls.append(("cordon", name))
         return True, None
 
-    def uncordon(self, _name: str) -> tuple[bool, None]:
-        self.cordoned = False
-        self.drained = False
+    def uncordon(self, name: str) -> tuple[bool, None]:
+        self.cordoned.discard(name)
+        self.drained.discard(name)
         self.calls.append("uncordon")
+        self.node_calls.append(("uncordon", name))
         return True, None
 
     def patch_window(self, _name: str, *, in_progress: bool, **_k: Any) -> tuple[bool, None]:
@@ -113,9 +120,10 @@ def cluster(monkeypatch: pytest.MonkeyPatch) -> _Cluster:
     async def _verify(target: str, **kw: Any) -> per_node.StepResult:
         return await real_verify(target, **{**kw, "cnpg_timeout_s": 0.2})
 
-    async def _drain(*_a: Any, **_k: Any) -> per_node.StepResult:
-        c.drained = True
+    async def _drain(node_name: str, *_a: Any, **_k: Any) -> per_node.StepResult:
+        c.drained.add(node_name)
         c.calls.append("drain")
+        c.node_calls.append(("drain", node_name))
         return per_node.StepResult(name="drain", started_at="t").finish(True)
 
     monkeypatch.setattr(per_node, "_step_preflight", _preflight)
@@ -151,6 +159,13 @@ def stubs(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     s = SimpleNamespace(
         release_if_held=MagicMock(return_value=True),
         alert=AsyncMock(return_value=None),
+        enqueued=[],
+    )
+    monkeypatch.delenv("NODE_NAME", raising=False)
+    monkeypatch.setattr(orchestrator.mutex, "acquire", lambda **_kw: (True, None))
+    monkeypatch.setattr(orchestrator.mutex, "renew", lambda **_kw: (True, None))
+    monkeypatch.setattr(
+        orchestrator, "_enqueue_drive", lambda rid, *, avoid_node: s.enqueued.append(avoid_node)
     )
     monkeypatch.setattr(orchestrator.mutex, "release_if_held", s.release_if_held)
     monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
@@ -178,14 +193,14 @@ async def other(db_session: AsyncSession) -> Any:
         yield s
 
 
-async def _make_run(db: AsyncSession) -> SystemUpgradeRun:
+async def _make_run(db: AsyncSession, nodes: list[str] | None = None) -> SystemUpgradeRun:
     run = SystemUpgradeRun(
         kind="cluster_rolling",
         state="running",
         target_version=TARGET,
         source_versions={},
         plan={
-            "node_order": [NODE],
+            "node_order": nodes or [NODE],
             "slot_image_url": "http://x",
             "cnpg_cluster_name": "pg",
             "cnpg_namespace": "spatium",
@@ -582,3 +597,412 @@ def test_resume_point_from_checkpoint() -> None:
     assert r.step == "reboot"
     assert r.stamped_at == datetime(2026, 10, 25, 23, 55, tzinfo=UTC)
     assert r.pre_cordon_known is False and r.was_unschedulable is None
+
+
+# ── The walk's crash: a checkpoint met the CNPG switchover ───────────────────
+
+
+class _Orig(Exception):
+    def __init__(self, msg: str, sqlstate: str | None = None) -> None:
+        super().__init__(msg)
+        self.sqlstate = sqlstate
+
+
+def _connect_failed() -> DBAPIError:
+    """A connection error, as the switchover's refused connect is classified
+    (``is_transient_db_error``)."""
+    return DBAPIError("UPDATE system_upgrade_run", {}, _Orig("Connect call failed", "08006"))
+
+
+@pytest.fixture
+def no_db_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    slept: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(per_node, "_db_retry_sleep", _sleep)
+    return slept
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_that_meets_the_switchover_is_retried_and_the_node_completes(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: _Cluster,
+    stubs: SimpleNamespace,
+    no_db_backoff: list[float],
+) -> None:
+    """The gate walk's case 1 (#2809): on a clean roll, the checkpoint before
+    ``drain`` landed 2-3 s into the CNPG switchover the cordon of the
+    primary's node started, and its connect was refused. The failure rolled
+    the drive's session back, which expires the run row, and the node-end
+    fence's read of ``run.id`` then raised ``MissingGreenlet``: the drive
+    crashed at the end of a node that had upgraded, ``in_flight`` left on it.
+
+    The checkpoint is now retried on a fresh connection and the fence never
+    loads an expired attribute, so the node and the run complete.
+
+    Negative control: on ``04addc2`` the drive raises MissingGreenlet out of
+    ``_drive_loop``."""
+    run = await _make_run(db_session)
+    run_id = run.id
+    real_writer = orchestrator._checkpoint_writer
+    attempts: list[str] = []
+
+    def _writer(db: AsyncSession, rid: uuid.UUID, holder: str | None) -> Any:
+        write = real_writer(db, rid, holder)
+
+        async def _write(entry: dict[str, Any]) -> None:
+            attempts.append(entry["step"])
+            if entry["step"] == "drain" and attempts.count("drain") == 1:
+                # The UPDATE began a transaction on the drive's session, and
+                # the connection under it was closed by the switchover.
+                await db.execute(select(1))
+                raise _connect_failed()
+            await write(entry)
+
+        return _write
+
+    monkeypatch.setattr(orchestrator, "_checkpoint_writer", _writer)
+    await orchestrator._drive_loop(db_session, run, asyncio.Event(), FIRST)
+
+    db_session.expire_all()
+    row = await db_session.get(SystemUpgradeRun, run_id, populate_existing=True)
+    assert row is not None
+    assert row.state == "succeeded", row.last_error
+    assert attempts.count("drain") == 2
+    assert no_db_backoff == [per_node._DB_RETRY_BACKOFF_S[0]]
+    assert "in_flight" not in row.progress
+    assert "resumed_at" not in row.progress["per_node"][NODE]
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_rides_a_failover_does_not_crash_the_node_end(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: _Cluster,
+    stubs: SimpleNamespace,
+    no_db_backoff: list[float],
+) -> None:
+    """The same expiry from main's own path (#2177): a step whose read met a
+    failover is retried after a rollback of the drive's session. The node-end
+    fence must not load the expired run row.
+
+    Negative control: on ``04addc2`` (and main) MissingGreenlet."""
+    run = await _make_run(db_session)
+    run_id = run.id
+    calls = {"n": 0}
+
+    async def _reboot(db: AsyncSession, *_a: Any, **_k: Any) -> per_node.StepResult:
+        calls["n"] += 1
+        # The reboot step reads the appliance row; the first read's
+        # connection is closed under it by the failover.
+        await db.execute(select(1))
+        if calls["n"] == 1:
+            raise _connect_failed()
+        return per_node.StepResult(name="reboot", started_at="t").finish(True)
+
+    monkeypatch.setattr(per_node, "_step_reboot", _reboot)
+    await orchestrator._drive_loop(db_session, run, asyncio.Event(), FIRST)
+
+    db_session.expire_all()
+    row = await db_session.get(SystemUpgradeRun, run_id, populate_existing=True)
+    assert row is not None
+    assert row.state == "succeeded", row.last_error
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_gives_up_after_the_budget_and_the_node_goes_on(
+    no_db_backoff: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database still unreachable once the step budget is spent: the
+    checkpoint is dropped (logged), never the node."""
+    clock = {"t": 0.0}
+
+    async def _sleep(delay: float) -> None:
+        clock["t"] += delay
+
+    monkeypatch.setattr(per_node, "_db_retry_sleep", _sleep)
+    monkeypatch.setattr(per_node, "_db_retry_clock", lambda: clock["t"])
+    db = MagicMock(rollback=AsyncMock())
+    tries = {"n": 0}
+
+    async def _checkpoint(_entry: dict[str, Any]) -> None:
+        tries["n"] += 1
+        raise _connect_failed()
+
+    await per_node._store_checkpoint(
+        db, _checkpoint, {"node": NODE, "step": "drain"}, node_name=NODE, step="drain"
+    )
+    assert tries["n"] > 1
+    assert clock["t"] <= per_node.DB_FAILOVER_BUDGET_S
+    assert db.rollback.await_count == tries["n"]
+
+
+# ── Takeovers on a multi-node plan (the gate walk's read of the code) ────────
+
+M1, M2, SEED = "member-1", "member-2", "seed"
+PLAN = [M1, M2, SEED]
+
+
+async def _drive_as(
+    db: AsyncSession, run_id: uuid.UUID, holder: str, own_node: str | None, mp: Any
+) -> SystemUpgradeRun:
+    """A whole drive (``drive_upgrade``: Lease takeover, then the loop) by a
+    worker on ``own_node``."""
+    if own_node is None:
+        mp.delenv("NODE_NAME", raising=False)
+    else:
+        mp.setenv("NODE_NAME", own_node)
+    return await orchestrator.drive_upgrade(db, run_id, holder=holder)
+
+
+async def _first_drive_dies_in(
+    db: AsyncSession, run: SystemUpgradeRun, monkeypatch: pytest.MonkeyPatch, step: str
+) -> None:
+    """The first drive, on ``M1``'s worker, defers ``M1`` and drives ``M2``
+    until ``step`` starts, then its worker is killed."""
+    monkeypatch.setenv("NODE_NAME", M1)
+    await _first_drive_dies_at(db, run, monkeypatch, step)
+
+
+def _started_since_takeover(row: SystemUpgradeRun) -> list[dict[str, Any]]:
+    events = row.progress["events"]
+    last = max(i for i, e in enumerate(events) if e["event"] == "lease_takeover")
+    return [e for e in events[last:] if e["event"] == "node_started"]
+
+
+@pytest.mark.asyncio
+async def test_a_takeover_on_a_third_worker_resumes_the_node_in_flight_first(
+    db_session: AsyncSession,
+    other: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: _Cluster,
+    stubs: SimpleNamespace,
+) -> None:
+    """Gate walk case 2, and the concern read from the code: the first drive
+    (on M1's worker) dies after M2's drain. The takeover runs on the seed's
+    worker, so plan order with its own node deferred names M1. It must resume
+    M2 first, at the step it was in, with no CNPG wait for M2's evicted
+    instance; then M1, then the seed via a hand-off, and the run succeeds.
+
+    Negative control: on ``04addc2`` the takeover starts M1 at preflight,
+    whose CNPG wait counts M2's evicted instance (2/3) and times out; the run
+    fails ``preflight_fail`` with M2 still cordoned."""
+    run = await _make_run(db_session, PLAN)
+    await _first_drive_dies_in(db_session, run, monkeypatch, "reboot")
+    assert cluster.cordoned == {M2} and cluster.drained == {M2} and cluster.window
+
+    cluster.calls.clear()
+    cluster.node_calls.clear()
+    await _drive_as(other, run.id, SECOND, SEED, monkeypatch)
+
+    other.expire_all()
+    row = await other.get(SystemUpgradeRun, run.id, populate_existing=True)
+    assert row is not None
+    assert row.state == "running", (row.last_error, row.progress["per_node"])
+    started = _started_since_takeover(row)
+    assert started[0] == {**started[0], "node": M2, "resumed_at": "reboot"}
+    assert [e["node"] for e in started] == [M2, M1]
+    # M2's chain went on from the reboot: its uncordon came first, before
+    # any preflight (whose CNPG wait would have timed out on 2/3).
+    assert cluster.node_calls[0] == ("uncordon", M2)
+    assert cluster.calls.index("uncordon") < cluster.calls.index("preflight")
+    # The seed is this worker's own node: handed to a worker elsewhere.
+    assert stubs.enqueued == [SEED]
+
+    third = "worker-2_cccc"
+    await _drive_as(other, run.id, third, M1, monkeypatch)
+    other.expire_all()
+    row = await other.get(SystemUpgradeRun, run.id, populate_existing=True)
+    assert row is not None
+    assert row.state == "succeeded", (row.last_error, row.progress["per_node"])
+    per = row.progress["per_node"]
+    assert all(per[n]["ok"] is True for n in PLAN)
+    assert per[M2]["resumed_at"] == "reboot"
+    assert "resumed_at" not in per[M1] and "resumed_at" not in per[SEED]
+    assert "in_flight" not in row.progress
+    assert not cluster.cordoned and not cluster.window
+    stubs.alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_node_that_fails_on_a_third_worker_is_released(
+    db_session: AsyncSession,
+    other: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: _Cluster,
+    stubs: SimpleNamespace,
+) -> None:
+    """Gate walk case 3: as above, but M2 never comes back healthy after the
+    takeover. M2 is uncordoned, the window is off, the run fails at the step
+    that failed (not ``preflight_fail``), the failed-run alert is raised, and
+    M1 is never started.
+
+    Negative control: on ``04addc2`` the takeover fails M1 at preflight,
+    ``preflight_fail``, M2 left cordoned and the window on."""
+    run = await _make_run(db_session, PLAN)
+    await _first_drive_dies_in(db_session, run, monkeypatch, "reboot")
+
+    async def _gate(*_a: Any, **_k: Any) -> per_node.StepResult:
+        return per_node.StepResult(name="health_gate", started_at="t").finish(
+            False, error="health gate timed out after 1800s"
+        )
+
+    monkeypatch.setattr(per_node, "_step_health_gate", _gate)
+    await _drive_as(other, run.id, SECOND, SEED, monkeypatch)
+
+    other.expire_all()
+    row = await other.get(SystemUpgradeRun, run.id, populate_existing=True)
+    assert row is not None
+    assert row.state == "failed"
+    assert [e["node"] for e in _started_since_takeover(row)] == [M2]
+    entry = row.progress["per_node"][M2]
+    assert entry["resumed_at"] == "reboot"
+    assert entry["failed_at"] == "health_gate"
+    assert entry["failure_category"] != "preflight_fail"
+    assert entry["steps"][-1]["name"] == "release_node" and entry["steps"][-1]["ok"]
+    assert M1 not in row.progress["per_node"]
+    assert not cluster.cordoned and not cluster.window
+    assert "in_flight" not in row.progress
+    stubs.alert.assert_awaited_once()
+    assert stubs.alert.await_args.kwargs["failed_node"] == M2
+    assert stubs.alert.await_args.kwargs["failed_at_step"] == "health_gate"
+
+
+@pytest.mark.asyncio
+async def test_a_takeover_during_stage_resumes_that_node_at_stage(
+    db_session: AsyncSession,
+    other: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: _Cluster,
+    stubs: SimpleNamespace,
+) -> None:
+    """Gate walk case 4, ``stage``: the first drive dies while M2 stages.
+    M2 is already stamped (``trigger_slot_apply`` ran), so it is resumed AT
+    stage, before any other node starts, and the run succeeds.
+
+    Negative control: on ``04addc2`` the takeover starts M1 instead, and M2
+    is later restarted at preflight with no ``resumed_at``."""
+    run = await _make_run(db_session, PLAN)
+    await _first_drive_dies_in(db_session, run, monkeypatch, "stage")
+    assert not cluster.cordoned
+
+    await _drive_as(other, run.id, SECOND, SEED, monkeypatch)
+    await _drive_as(other, run.id, "worker-2_cccc", M1, monkeypatch)
+
+    other.expire_all()
+    row = await other.get(SystemUpgradeRun, run.id, populate_existing=True)
+    assert row is not None
+    assert row.state == "succeeded", (row.last_error, row.progress["per_node"])
+    per = row.progress["per_node"]
+    assert per[M2]["resumed_at"] == "stage"
+    assert per[M2]["steps"][0]["name"] == "stage"
+    first_takeover = next(
+        i for i, e in enumerate(row.progress["events"]) if e["event"] == "lease_takeover"
+    )
+    started = [e for e in row.progress["events"][first_takeover:] if e["event"] == "node_started"]
+    assert started[0]["node"] == M2
+    assert "in_flight" not in row.progress
+    assert not cluster.cordoned and not cluster.window
+
+
+@pytest.mark.asyncio
+async def test_a_takeover_during_preflight_restarts_that_node_from_preflight(
+    db_session: AsyncSession,
+    other: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: _Cluster,
+    stubs: SimpleNamespace,
+) -> None:
+    """Gate walk case 4, ``preflight``: the first drive dies in M2's
+    preflight, which holds nothing. The takeover drives the plan in order
+    (M1 first), M2 later starts over at preflight with no ``resumed_at``,
+    and the run succeeds. (Behaves the same on ``04addc2``.)"""
+    run = await _make_run(db_session, PLAN)
+    await _first_drive_dies_in(db_session, run, monkeypatch, "preflight")
+
+    await _drive_as(other, run.id, SECOND, SEED, monkeypatch)
+    await _drive_as(other, run.id, "worker-2_cccc", M1, monkeypatch)
+
+    other.expire_all()
+    row = await other.get(SystemUpgradeRun, run.id, populate_existing=True)
+    assert row is not None
+    assert row.state == "succeeded", (row.last_error, row.progress["per_node"])
+    per = row.progress["per_node"]
+    assert all("resumed_at" not in per[n] for n in PLAN)
+    assert per[M2]["steps"][0]["name"] == "preflight"
+    assert "in_flight" not in row.progress
+
+
+# ── A crashed drive raises the failed-run alert ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_drive_raises_the_failed_run_alert_naming_the_node_in_flight(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's two crashed runs ended ``failed`` with the
+    cluster-upgrade-failed rule on and raised nothing: only the drive's own
+    failure paths called the alert. The crash handler now raises it, naming
+    the node in flight, and says what that node may still hold.
+
+    Negative control: on ``04addc2`` the alert is never emitted."""
+    from contextlib import asynccontextmanager
+
+    from app.services.upgrades import alerts as upgrade_alerts
+    from app.services.upgrades import mutex
+    from app.tasks import upgrade_orchestrator as task
+
+    run = await _make_run(db_session, PLAN)
+    run.lease_holder = None
+    run.progress = {
+        **run.progress,
+        "in_flight": {"node": M2, "step": "drain", "stamped_at": None, "at": "t"},
+    }
+    await db_session.commit()
+    run_id = run.id
+    monkeypatch.setattr(mutex, "release_if_held", lambda **_k: True)
+    alert = AsyncMock(return_value=None)
+    monkeypatch.setattr(upgrade_alerts, "emit_upgrade_failed_alert", alert)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield db_session
+
+    async def _drive(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("greenlet_spawn has not been called")
+
+    monkeypatch.setattr(task, "task_session", _session)
+    monkeypatch.setattr(task, "drive_upgrade", _drive)
+
+    out = await task._async_drive(str(run_id))
+    assert out["state"] == "failed"
+    db_session.expire_all()
+    row = await db_session.get(SystemUpgradeRun, run_id)
+    assert row is not None and row.state == "failed"
+    assert row.last_error is not None
+    assert "orchestrator crashed" in row.last_error
+    assert "cordon" in row.last_error and "maintenance_window" in row.last_error
+    alert.assert_awaited_once()
+    kw = alert.await_args.kwargs
+    assert kw["failed_node"] == M2
+    assert kw["failed_at_step"] == "drain"
+    assert kw["category"] == upgrade_alerts.CATEGORY_OTHER
+
+
+def test_in_flight_hold_names_only_what_the_step_may_hold() -> None:
+    from app.tasks.upgrade_orchestrator import _in_flight_hold
+
+    assert _in_flight_hold(None) == (None, None, [])
+    assert _in_flight_hold({"in_flight": {"node": M2, "step": "stage"}}) == (M2, "stage", [])
+    assert _in_flight_hold({"in_flight": {"node": M2, "step": "cnpg_maintenance_on"}})[2] == [
+        "maintenance_window"
+    ]
+    assert _in_flight_hold({"in_flight": {"node": M2, "step": "uncordon"}})[2] == [
+        "cordon",
+        "maintenance_window",
+    ]
+    assert _in_flight_hold({"in_flight": {"node": M2, "step": "cluster_verify"}})[2] == []

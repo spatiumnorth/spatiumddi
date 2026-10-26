@@ -13,3 +13,19 @@
   to run again. A failure after a takeover releases the cordon and the
   window the earlier drive took, and the run's events and per-node record
   say where the node was resumed (`resumed_at`).
+  The node in flight is driven first, whatever the plan order or the new
+  drive's own node, so no other node's preflight can start while it is
+  still cordoned.
+- **A rolling upgrade's drive no longer crashes at the end of a node after
+  a Postgres switchover (#2809).** When a statement met the switchover, the
+  rollback that followed expired the run row the drive was holding, and the
+  next read of it raised `MissingGreenlet` ("orchestrator crashed:
+  greenlet_spawn has not been called"), failing a run whose node had
+  upgraded. The drive now never loads an expired attribute of the run, and
+  the step checkpoint is retried on a fresh connection through the
+  switchover, as a step is.
+- **A rolling upgrade whose drive crashed now raises the
+  cluster-upgrade-failed alert (#2809).** Only the drive's own failure paths
+  raised it, so a run the crash handler marked failed paged nobody. The
+  alert, and the run's error, name the node that was in flight, its step,
+  and whether it may still be cordoned or in the CNPG maintenance window.
