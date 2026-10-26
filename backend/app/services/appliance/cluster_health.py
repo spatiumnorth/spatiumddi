@@ -28,7 +28,7 @@ from typing import Any
 
 import structlog
 
-from app.services.appliance import k8s
+from app.services.appliance import k8s, postgres_instances
 
 logger = structlog.get_logger(__name__)
 
@@ -657,10 +657,56 @@ def cluster_unavailable(detail: str) -> dict[str, Any]:
     return _unavailable(detail)
 
 
+def _ready_since(pod: dict[str, Any]) -> str | None:
+    """When the pod's ``Ready`` condition last changed — for a pod that is
+    not Ready, how long it has been that way."""
+    for c in (pod.get("status") or {}).get("conditions") or []:
+        if c.get("type") == "Ready":
+            return c.get("lastTransitionTime")
+    return None
+
+
+def _pod_role(pod: dict[str, Any]) -> str | None:
+    """CNPG's own role label: ``cnpg.io/instanceRole`` (CNPG >= 1.24) or the
+    legacy ``role``. ``primary`` / ``replica``, or None when absent."""
+    labels = (pod.get("metadata") or {}).get("labels") or {}
+    return labels.get("cnpg.io/instanceRole") or labels.get("role")
+
+
+def _instance_rows(pods: list[dict[str, Any]], current_primary: str | None) -> list[dict[str, Any]]:
+    """One row per CNPG instance pod (#2856), primary first.
+
+    ``role`` comes from the Cluster's ``status.currentPrimary`` when it was
+    read, and from the pod's own role label otherwise.
+    """
+    rows: list[dict[str, Any]] = []
+    for p in pods:
+        name = (p.get("metadata") or {}).get("name") or "?"
+        ready_n, total_n = _ready_counts(p)
+        ready = total_n > 0 and ready_n == total_n
+        if current_primary:
+            role = "primary" if name == current_primary else "standby"
+        else:
+            role = "primary" if _pod_role(p) == "primary" else "standby"
+        rows.append(
+            {
+                "name": name,
+                "node": (p.get("spec") or {}).get("nodeName"),
+                "role": role,
+                "ready": ready,
+                "ready_since": _ready_since(p),
+                "streaming": None,
+            }
+        )
+    rows.sort(key=lambda r: (r["role"] != "primary", r["name"]))
+    return rows
+
+
 def _apply_cnpg_instances(
     workloads: list[dict[str, Any]],
     clusters: set[tuple[str, str]],
     components: set[str],
+    instance_pods: list[dict[str, Any]] | None = None,
 ) -> None:
     """Take the database row's verdict from CNPG, not a pod count (#1387).
 
@@ -689,11 +735,15 @@ def _apply_cnpg_instances(
     try:
         status_code, body = k8s.get_cnpg_cluster(name, namespace=namespace or None)
     except k8s.KubeapiUnavailableError:
-        return
+        status_code, body = 0, None
     if status_code != 200 or not body:
+        # The pod count stands; the per-instance view still comes from the
+        # pods, with roles read off CNPG's own pod labels.
+        _attach_instances(row, instance_pods or [], None, None)
         return
     wanted = int((body.get("spec") or {}).get("instances") or 0)
     if wanted <= 0:
+        _attach_instances(row, instance_pods or [], None, None)
         return
     ready = int((body.get("status") or {}).get("readyInstances") or 0)
     if row is None:
@@ -715,6 +765,38 @@ def _apply_cnpg_instances(
         row["status"] = "degraded"
     else:
         row["status"] = "down"
+    cstatus = body.get("status") or {}
+    _attach_instances(
+        row,
+        instance_pods or [],
+        cstatus.get("currentPrimary"),
+        cstatus.get("targetPrimary"),
+    )
+
+
+def _attach_instances(
+    row: dict[str, Any] | None,
+    pods: list[dict[str, Any]],
+    current_primary: str | None,
+    target_primary: str | None,
+) -> None:
+    """Per-instance rows + the kube-only findings on the database row (#2856).
+
+    CNPG counts a standby that is Ready but not replicating as a healthy
+    instance, so the row's ready / total cannot say "a standby is stuck".
+    The instances can: a not-Ready one is found here, and the router (and
+    the alert) add the streaming half from ``pg_stat_replication`` — see
+    :mod:`app.services.appliance.postgres_instances`.
+    """
+    if row is None or not pods:
+        return
+    instances = _instance_rows(pods, current_primary)
+    row["instances"] = instances
+    row["current_primary"] = current_primary or next(
+        (i["name"] for i in instances if i["role"] == "primary"), None
+    )
+    row["target_primary"] = target_primary
+    postgres_instances.apply(row, None)
 
 
 def get_cluster_health() -> dict[str, Any]:
@@ -870,6 +952,9 @@ def get_cluster_health() -> dict[str, Any]:
     # puts on every pod it runs (instances, and its initdb / join Jobs).
     cnpg_clusters: set[tuple[str, str]] = set()
     cnpg_components: set[str] = set()
+    # #2856 — the instance pods themselves (not the initdb / join Jobs), for
+    # the per-instance verdict on the database row.
+    cnpg_instance_pods: list[dict[str, Any]] = []
     for p in pods_raw:
         meta = p.get("metadata") or {}
         status = p.get("status") or {}
@@ -880,6 +965,8 @@ def get_cluster_health() -> dict[str, Any]:
             cnpg_clusters.add((str(cnpg_name), ns))
             cnpg_components.add(_pod_component(p))
         phase = status.get("phase") or "Unknown"
+        if cnpg_name and _pod_owner_kind(p) != "Job" and phase not in ("Succeeded", "Failed"):
+            cnpg_instance_pods.append(p)
         pods_by_phase[phase] = pods_by_phase.get(phase, 0) + 1
         if phase == "Running":
             pods_running += 1
@@ -937,7 +1024,7 @@ def get_cluster_health() -> dict[str, Any]:
         else:
             wstatus = "down"
         workloads.append({**agg, "jobs_running": n_jobs, "status": wstatus})
-    _apply_cnpg_instances(workloads, cnpg_clusters, cnpg_components)
+    _apply_cnpg_instances(workloads, cnpg_clusters, cnpg_components, cnpg_instance_pods)
     workloads.sort(
         key=lambda w: (
             (

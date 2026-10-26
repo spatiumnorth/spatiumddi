@@ -838,7 +838,13 @@ class FindClusterMetricsArgs(BaseModel):
         "CoreDNS replica count, node spread, and a live resolve probe — "
         "replicas existing and DNS actually answering are different facts, "
         "and a failed probe with healthy replicas points at kube-proxy or "
-        "the pod network rather than at CoreDNS. Appliance control plane only; "
+        "the pod network rather than at CoreDNS. The ``database`` workload "
+        "carries one entry per PostgreSQL instance (node, primary / standby, "
+        "Ready, and whether a standby is streaming from the primary per "
+        "pg_stat_replication) plus ``findings`` naming any instance that is "
+        "not Ready or not streaming (#2856) — CNPG counts a Ready standby "
+        "that is not replicating as healthy, so ready/total alone can read "
+        "3/3 through a replication outage. Appliance control plane only; "
         "read-only — the same data the Cluster → Overview dashboard renders."
     ),
     args_model=FindClusterMetricsArgs,
@@ -868,6 +874,11 @@ async def find_cluster_metrics(
         return {"error": f"kubeapi unreachable: {exc}"}
     if not snap.get("available"):
         return {"available": False, "detail": snap.get("detail")}
+    # #2856 — the database row's streaming half, the same verdict the
+    # Cluster screen and the postgres_instance_unhealthy alert use.
+    from app.services.appliance import postgres_instances  # noqa: PLC0415
+
+    await postgres_instances.enrich_snapshot_best_effort(db, snap)
 
     def _pct(used: float | None, cap: float | None) -> float | None:
         return round(100.0 * used / cap, 1) if used is not None and cap else None
