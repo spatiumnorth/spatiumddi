@@ -96,6 +96,20 @@ not the operator's:
   HelmChart manifest on every restart.) The api and Postgres CPU limits are
   sized the same way from the node's CPU count (#2240): the api a quarter
   of the cores (1–4), Postgres half (1–8), where both were a fixed 1 core.
+  The Postgres memory limit also has to hold the connections the cluster
+  can open, which grow with the control-plane node count (#2156): every
+  node runs an api pod with its own database pool and a worker, every api,
+  worker and beat process holds up to two more for the after-commit hooks
+  (#2782), and the primary runs a WAL sender per replica. So the api's pool
+  per pod shrinks past four nodes (10 + 20 up to four, 10 + 3 at nine;
+  about 120 api connections in all), and the limit is never below
+  shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
+  can open 51 connections at one node, 131 at three and 218 at nine (two
+  worker processes); `max_connections` stays the chart's 200 until that
+  passes it, then follows it. One node of 8 GiB or more keeps the share
+  above; a three-node cluster on a 12 GiB seed gets 2971Mi, a nine-node one
+  4363Mi. A promote or demote that moves the limit is one CloudNativePG
+  rolling restart.
   These limits are keys the supervisor **owns**, so a different value written
   into that HelmChartConfig by hand is put back on the next heartbeat; there
   is no supported per-install override for them today (see "Who owns which
@@ -566,8 +580,11 @@ state on its heartbeat:
   migrate Job (which replaces a running one) and a second api / worker
   rollout. firstboot now brings the sizing keys an existing Config already
   carries (api / worker memory and concurrency, the api and Postgres CPU
-  limits, the Postgres requests / limits and `shared_buffers`) to the values
-  this boot's HelmChart renders.
+  limits, the Postgres request and `shared_buffers`) to the values
+  this boot's HelmChart renders. The Postgres memory limit is not among
+  them (#2156): the supervisor sizes it for the cluster's node count and
+  firstboot renders one node, so reconciling it would restart Postgres
+  twice on every seed reboot.
   It computes them while that HelmChart is still held back as `.deferred`
   and writes them as soon as k3s has applied it, so helm-controller's job
   for the new chart is replaced, before it runs, by one carrying the new
@@ -609,7 +626,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 

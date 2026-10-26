@@ -512,6 +512,12 @@ RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 # shows, so the alarm and the panel cannot disagree.
 RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
 
+# Issue #2312 — a DNS pool whose members' health verdicts have not been
+# refreshed within three check intervals. Serving stays fail-open (a member
+# last seen healthy is still rendered), so a stopped health-check dispatcher
+# leaves a dead member in the answer set with nothing else saying so.
+RULE_TYPE_DNS_POOL_HEALTH_STALE = "dns_pool_health_stale"
+
 # Issue #1762 — a DNSSEC-signed zone on a group with more than one agent DNS
 # server (BIND9 / PowerDNS / Technitium; disabled servers count — they still
 # serve the bundle). Each server signs with keys it generated, so the zone is
@@ -720,6 +726,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+        RULE_TYPE_DNS_POOL_HEALTH_STALE,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -4152,6 +4159,60 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
     return matches
 
 
+async def _matching_dns_pool_health_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_pool_health_stale`` — one event per enabled pool with at least one
+    enabled member whose health verdict is older than 3 x the pool's check
+    interval (#2312).
+
+    The pool keeps serving whatever it last decided (fail-open); this is the
+    signal that the decision is no longer being refreshed. Auto-resolves when
+    the dispatcher runs again and the members are re-checked.
+    """
+    from app.models.dns import DNSPool  # noqa: PLC0415
+    from app.services.dns.pool_health_staleness import (  # noqa: PLC0415
+        STALE_AFTER_INTERVALS,
+        format_age,
+        is_member_check_stale,
+        member_check_age_seconds,
+    )
+
+    now = now or datetime.now(UTC)
+    pools = (
+        (await db.execute(select(DNSPool).where(DNSPool.enabled.is_(True)).order_by(DNSPool.name)))
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for pool in pools:
+        stale = [m for m in pool.members if is_member_check_stale(pool, m, now)]
+        if not stale:
+            continue
+        oldest = format_age(max((member_check_age_seconds(m, now) or 0) for m in stale))
+        serving = [m for m in stale if m.last_check_state == "healthy"]
+        consequence = (
+            f" {len(serving)} of them last checked healthy and are still being served "
+            "(pools fail open), whether or not they are up now."
+            if serving
+            else ""
+        )
+        matches.append(
+            (
+                str(pool.id),
+                pool.name,
+                f"DNS pool '{pool.name}': {len(stale)} of {len(pool.members)} member(s) have "
+                f"not been health-checked for over {STALE_AFTER_INTERVALS} intervals "
+                f"({pool.hc_interval_seconds} s each; oldest {oldest} ago). The pool "
+                f"health-check task is not running.{consequence}",
+                "warning",
+            )
+        )
+    return matches
+
+
 async def _matching_agent_daemon_degraded_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -5929,6 +5990,48 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_POOL_HEALTH_STALE_RULE_NAME = "DNS pool health checks stale"
+
+
+async def seed_dns_pool_health_stale_alert_rule() -> None:
+    """Seed the #2312 rule, ENABLED by default.
+
+    Silent on an install with no DNS pool. Pools fail open, so when the
+    health-check dispatcher stops, a member that died afterwards keeps being
+    answered and every surface still reads "healthy". The 3-interval threshold
+    is fixed, so the rule has no parameters. Keyed on ``name``; an operator who
+    disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_POOL_HEALTH_STALE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_POOL_HEALTH_STALE_RULE_NAME,
+                description=(
+                    "Fires for each enabled DNS pool whose members' health verdicts have "
+                    "not been refreshed within three of the pool's check intervals. The "
+                    "pool keeps serving the members it last judged healthy, so a member "
+                    "that has since died stays in the answer set. Resolves when the "
+                    "health-check task checks the pool again."
+                ),
+                rule_type=RULE_TYPE_DNS_POOL_HEALTH_STALE,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_agent_daemon_degraded_alert_rule() -> None:
     """Seed the #1067 rule, ENABLED by default.
 
@@ -7411,6 +7514,7 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
+    RULE_TYPE_DNS_POOL_HEALTH_STALE: "core.dns",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -7702,6 +7806,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # A scope held on Windows need not have a SpatiumDDI row, so the
                 # subject is "<group id>:<cidr>", not a dhcp_scope id.
                 subject_type = "dhcp_scope"
+            elif rule.rule_type == RULE_TYPE_DNS_POOL_HEALTH_STALE:
+                stale_pools = await _matching_dns_pool_health_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_pools]
+                subject_type = "dns_pool"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]

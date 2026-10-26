@@ -108,6 +108,17 @@ spec:
             - name: SERVICE_CONTROL_ENABLED
               value: "true"
             {{- end }}
+            {{- with .Values.api.databasePool }}
+            {{- if not (kindIs "invalid" .size) }}
+            # #2156 — the pool per pod; see api.databasePool in values.yaml.
+            - name: DATABASE_POOL_SIZE
+              value: {{ .size | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .maxOverflow) }}
+            - name: DATABASE_MAX_OVERFLOW
+              value: {{ .maxOverflow | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.api.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
