@@ -22,8 +22,10 @@ from typing import Any
 
 import dns.flags
 import dns.message
+import dns.name
 import dns.query
 import dns.rcode
+import dns.rdataclass
 import dns.rdatatype
 import dns.rrset
 import dns.update
@@ -43,20 +45,38 @@ ORIGIN = "lab.example.test."
 
 
 class _FakeNamed:
-    """``dns.query.tcp`` against one zone, answering as BIND 9.20 does."""
+    """``dns.query.tcp`` against one zone, answering as BIND 9.20 does.
+
+    Measured against a real named: an update carrying a SOA whose serial is
+    later than the raw one is served at exactly that serial; otherwise the raw
+    serial goes up by one. An inline-signed zone (``signed``) answers with its
+    signed serial, which then becomes the raw one if that is later, or its
+    own plus one. A delete of the whole apex NS RRset is ignored, and so is a
+    delete of the last apex NS by value (RFC 2136 §3.4.2.4).
+    """
 
     def __init__(
         self,
         serial: int,
         *,
-        signed: bool = False,
+        signed: int | None = None,
         refuse_soa: bool = False,
         authoritative: bool = True,
+        ns: tuple[str, ...] = (f"ns1.{ORIGIN}",),
+        glue: bool = False,
     ):
         self.serial = serial
         self.signed = signed
         self.refuse_soa = refuse_soa
         self.authoritative = authoritative
+        self.ns = list(ns)
+        self.glue = glue  # ``ns1 A 127.0.0.1`` present
+        self.mname = f"ns1.{ORIGIN}"
+        # BIND re-signs asynchronously: the signed serial an update moves to
+        # shows only after this many more ``rndc zonestatus`` reads.
+        self.sign_lag = 0
+        self._pending_signed: int | None = None
+        self._lag_left = 0
         # Things that happen to the zone just before our next update lands:
         # a third-party RFC 2136 client's own update (+1), say.
         self.before_next_update: list[Any] = []
@@ -65,8 +85,19 @@ class _FakeNamed:
         self.updates: list[dns.update.UpdateMessage] = []
         self.sent_soas: list[list[int]] = []  # per update, as it was sent
 
+    @property
+    def wire_serial(self) -> int:
+        return self.signed if self.signed is not None else self.serial
+
+    def _tick_signer(self) -> None:
+        if self._pending_signed is not None:
+            if self._lag_left <= 0:
+                self.signed, self._pending_signed = self._pending_signed, None
+            else:
+                self._lag_left -= 1
+
     def soa_text(self, serial: int) -> str:
-        return f"ns1.{ORIGIN} hostmaster.{ORIGIN} {serial} 3600 600 86400 300"
+        return f"{self.mname} hostmaster.{ORIGIN} {serial} 3600 600 86400 300"
 
     def __call__(
         self, q: Any, where: str, timeout: float | None = None, **kw: Any
@@ -80,22 +111,36 @@ class _FakeNamed:
         resp = dns.message.make_response(q)
         if self.authoritative:
             resp.flags |= dns.flags.AA
-        # A signed zone answers with its signed serial, kept ahead of the raw.
-        shown = self.serial + 7 if self.signed else self.serial
-        resp.answer.append(
-            dns.rrset.from_text(ORIGIN, 3600, "IN", "SOA", self.soa_text(shown))
-        )
-        if self.signed:
+        qtype = q.question[0].rdtype
+        if qtype == dns.rdatatype.NS:
+            resp.answer.append(dns.rrset.from_text(ORIGIN, 3600, "IN", "NS", *self.ns))
+        else:
             resp.answer.append(
                 dns.rrset.from_text(
-                    ORIGIN,
-                    3600,
-                    "IN",
-                    "RRSIG",
-                    f"SOA 13 3 3600 20991231000000 20260101000000 1 {ORIGIN} AAAA",
+                    ORIGIN, 3600, "IN", "SOA", self.soa_text(self.wire_serial)
                 )
             )
+            if self.signed is not None and q.ednsflags & dns.flags.DO:
+                resp.answer.append(
+                    dns.rrset.from_text(
+                        ORIGIN,
+                        3600,
+                        "IN",
+                        "RRSIG",
+                        f"SOA 13 3 3600 20991231000000 20260101000000 1 {ORIGIN} AAAA",
+                    )
+                )
         return resp
+
+    def zonestatus(
+        self, cmd: list[str], *a: Any, **kw: Any
+    ) -> subprocess.CompletedProcess:
+        """``rndc zonestatus`` as named prints it: raw, then signed."""
+        self._tick_signer()
+        out = f"name: {ORIGIN}\nserial: {self.serial}\n"
+        if self.signed is not None:
+            out += f"signed serial: {self.signed}\n"
+        return subprocess.CompletedProcess(cmd, 0, out, "")
 
     def _update(self, upd: dns.update.UpdateMessage) -> Any:
         while self.before_next_update:
@@ -107,11 +152,37 @@ class _FakeNamed:
         if soas and self.refuse_soa:
             resp.set_rcode(dns.rcode.REFUSED)
             return resp
+        origin = dns.name.from_text(ORIGIN)
+        glue_name = dns.name.from_text(f"ns1.{ORIGIN}")
+        for rrset in upd.update:
+            owner = rrset.name.derelativize(origin)
+            if rrset.rdtype == dns.rdatatype.NS and owner == origin:
+                vals = [rd.target.derelativize(origin).to_text() for rd in rrset]
+                if rrset.deleting == dns.rdataclass.ANY:
+                    continue  # ignored at the apex
+                if rrset.deleting == dns.rdataclass.NONE:
+                    for v in vals:
+                        if v in self.ns and len(self.ns) > 1:
+                            self.ns.remove(v)
+                else:
+                    self.ns += [v for v in vals if v not in self.ns]
+            elif rrset.rdtype == dns.rdatatype.A and owner == glue_name:
+                if rrset.deleting is not None:
+                    self.glue = False
+                elif any(rd.address == "127.0.0.1" for rd in rrset):
+                    self.glue = True
+            elif rrset.rdtype == dns.rdatatype.SOA and rrset.deleting is None:
+                self.mname = rrset[0].mname.derelativize(origin).to_text()
         new = soas[-1][0].serial if soas else None
         if new is not None and bind9._serial_later(new, self.serial):
             self.serial = new
         else:
             self.serial = (self.serial + 1) % 2**32 or 1
+        if self.signed is not None:
+            later = bind9._serial_later(self.serial, self.signed)
+            self._pending_signed = self.serial if later else self.signed + 1
+            self._lag_left = self.sign_lag
+            self._tick_signer()
         return resp
 
 
@@ -202,25 +273,52 @@ def test_an_op_without_a_target_serial_sends_no_soa_and_reads_nothing(
     assert driver.reached_serial(ORIGIN) is None
 
 
-def test_a_signed_zone_compares_the_raw_serial(
+@pytest.mark.parametrize(
+    ("raw", "signed", "target", "wire"),
+    [
+        # the target is later than both: raw and signed both reach it
+        (2026102600, 2026102600, 2026102601, 2026102601),
+        # D4: signed ahead of the target (re-signing moved it): no SOA, and
+        # the wire serial (signed + 1) is what is reported, not the target
+        (2026102601, 2026102603, 2026102602, 2026102604),
+    ],
+)
+def test_a_signed_zone_is_compared_and_reported_at_its_wire_serial(
+    driver: Bind9Driver,
+    monkeypatch: pytest.MonkeyPatch,
+    raw: int,
+    signed: int,
+    target: int,
+    wire: int,
+) -> None:
+    named = _FakeNamed(raw, signed=signed)
+    monkeypatch.setattr(dns.query, "tcp", named)
+    monkeypatch.setattr(bind9.shutil, "which", lambda n: f"/usr/sbin/{n}")
+    monkeypatch.setattr(subprocess, "run", named.zonestatus)
+
+    driver.apply_record_op(_op(target))
+
+    assert named.sent_soas == [[target] if target == wire else []]
+    assert named.wire_serial == wire
+    assert driver.reached_serial(ORIGIN) == wire
+    bundle = {"zones": [{"name": ORIGIN, "type": "primary", "serial": target}]}
+    assert driver.served_zone_serials(bundle) == {ORIGIN.rstrip("."): wire}
+
+
+def test_an_unanswered_signed_zone_falls_back_to_its_signed_serial(
     driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An inline-signed zone answers with its signed serial, which runs ahead
-    of the raw zone an update writes to; the raw one comes from zonestatus."""
-    named = _FakeNamed(2026102600, signed=True)
+    named = _FakeNamed(2026102601, authoritative=False)
     monkeypatch.setattr(dns.query, "tcp", named)
     monkeypatch.setattr(bind9.shutil, "which", lambda n: f"/usr/sbin/{n}")
 
     def rndc(cmd: list[str], *a: Any, **kw: Any) -> subprocess.CompletedProcess:
-        assert cmd[-2:] == ["zonestatus", ORIGIN]
-        out = f"name: {ORIGIN}\nserial: {named.serial}\nsigned serial: {named.serial + 7}\n"
+        out = f"name: {ORIGIN}\nserial: 2026102601\nsigned serial: 2026102604\n"
         return subprocess.CompletedProcess(cmd, 0, out, "")
 
     monkeypatch.setattr(subprocess, "run", rndc)
-    # signed serial 2026102607 is "later" than the target; the raw one is not
-    driver.apply_record_op(_op(2026102601))
-    assert _soa_serials(named.updates[-1]) == [2026102601]
-    assert driver.reached_serial(ORIGIN) == named.serial == 2026102601
+    bundle = {"zones": [{"name": ORIGIN, "type": "primary", "serial": 2026102601}]}
+    assert driver.served_zone_serials(bundle) == {ORIGIN.rstrip("."): 2026102604}
 
 
 def test_a_soa_the_live_config_refuses_still_lands_the_records(
@@ -541,3 +639,144 @@ def test_the_sync_loop_reports_nothing_for_an_unread_serial(tmp_path: Path) -> N
 
     assert driver.applied == ["o1", "o2"]
     assert cp.zone_state == [[{"zone_name": "b.test", "serial": 2026100107}]]
+
+
+# ── D5: an apex NS op leaves named with the apex the next render writes ──────
+
+
+def _note(drv: Bind9Driver, zone: dict[str, Any]) -> None:
+    """What ``render`` notes of a zone's apex, without rendering it."""
+    drv._apex_lines = []
+    drv._remember_apex(zone)
+    drv._apex_blob = ("\n" + "\n".join(drv._apex_lines) + "\n").encode()
+
+
+def _ns_op(target: int, *values: str) -> dict[str, Any]:
+    return {
+        "op_id": f"ns-{target}",
+        "op": "create" if values else "delete",
+        "zone_name": ORIGIN,
+        "target_serial": target,
+        "record": {
+            "name": "@",
+            "type": "NS",
+            "value": values[0] if values else "gone.example.",
+            "ttl": 3600,
+            "rrset": {"ttl": 3600, "members": [{"value": v} for v in values]},
+        },
+    }
+
+
+def _rendered(zone: dict[str, Any]) -> tuple[set[str], bool, str]:
+    """``(apex NS, placeholder glue, SOA MNAME)`` as the render writes them."""
+    apex = bind9._zone_apex(zone)
+    origin = zone["name"]
+    declared = {
+        bind9._zone_file_name(r["value"], origin).lower()
+        for r in zone["records"]
+        if r["type"] == "NS" and r["name"] in ("@", "")
+    }
+    return (
+        (declared or {n.lower() for n in apex.ns}),
+        apex.placeholder_glue,
+        apex.soa_mname,
+    )
+
+
+@pytest.mark.parametrize("primary_ns", ["ns-a.provider.test.", None])
+def test_an_apex_ns_op_leaves_named_with_the_rendered_ns_set(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch, primary_ns: str | None
+) -> None:
+    """The walk's D5: the zone's first NS (``primary_ns``, or the placeholder
+    and its glue) stayed beside the op's, while the render writes the op's
+    alone; every structural apply then found other data at the same serial."""
+    first = primary_ns or f"ns1.{ORIGIN}"
+    named = _FakeNamed(2026102600, ns=(first,), glue=primary_ns is None)
+    named.mname = first
+    monkeypatch.setattr(dns.query, "tcp", named)
+    zone: dict[str, Any] = {"name": ORIGIN, "primary_ns": primary_ns, "records": []}
+    _note(driver, zone)
+
+    driver.apply_record_op(_ns_op(2026102601, "ns.other.test."))
+    zone["records"] = [{"name": "@", "type": "NS", "value": "ns.other.test."}]
+    ns, glue, mname = _rendered(zone)
+    assert {n.lower() for n in named.ns} == ns == {"ns.other.test."}
+    assert named.glue is glue is False
+    assert named.mname.lower() == mname.lower()
+    assert driver.reached_serial(ORIGIN) == named.serial == 2026102601
+
+    # deleting the last declared NS: the render falls back, and so does named
+    driver.apply_record_op(_ns_op(2026102602))
+    zone["records"] = []
+    ns, glue, mname = _rendered(zone)
+    assert {n.lower() for n in named.ns} == ns == {first.lower()}
+    assert named.glue is glue
+    assert named.mname.lower() == mname.lower()
+    assert driver.reached_serial(ORIGIN) == named.serial == 2026102602
+
+
+def test_two_servers_converge_on_the_same_apex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bind9.shutil, "which", lambda _n: None)
+    zone = {"name": ORIGIN, "primary_ns": "ns-a.provider.test.", "records": []}
+    servers = []
+    for i in range(2):
+        named = _FakeNamed(2026102600, ns=("ns-a.provider.test.",))
+        drv = Bind9Driver(tmp_path / f"s{i}")
+        _note(drv, zone)
+        monkeypatch.setattr(dns.query, "tcp", named)
+        drv.apply_record_op(_ns_op(2026102601, "ns.other.test.", "ns2.other.test."))
+        servers.append(named)
+    assert [sorted(n.ns) for n in servers] == [
+        ["ns.other.test.", "ns2.other.test."]
+    ] * 2
+    assert [n.serial for n in servers] == [2026102601, 2026102601]
+
+
+def test_a_render_of_named_data_behind_named_keeps_named_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quick: None  # noqa: F811
+) -> None:
+    """The cap: named is ahead of the render (a move on an earlier apply) and
+    holds the same data. Served at named's own serial, not one past again —
+    or every structural apply moves it once more (D5: 03 to 12)."""
+    named = _DumpingNamed(tmp_path, _dump(2026102606), serving=2026102606, held=True)
+    drv = _setup(tmp_path, monkeypatch, named, staged=2026102605)
+
+    drv.swap_and_reload()
+
+    assert _soa_serial(tmp_path / "rendered" / "zones" / f"{ZONE}.db") == 2026102606
+    assert named.serving == 2026102606
+
+
+def test_a_signed_zone_is_reported_once_the_signer_has_caught_up(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live, the wire still answered the old signed serial straight after
+    the update (target 01, read 00, 01 a moment later)."""
+    named = _FakeNamed(2026102600, signed=2026102600)
+    named.sign_lag = 3
+    monkeypatch.setattr(dns.query, "tcp", named)
+    monkeypatch.setattr(bind9.shutil, "which", lambda n: f"/usr/sbin/{n}")
+    monkeypatch.setattr(subprocess, "run", named.zonestatus)
+    monkeypatch.setattr(bind9.time, "sleep", lambda _s: None)
+
+    driver.apply_record_op(_op(2026102601))
+
+    assert named.wire_serial == 2026102601
+    assert driver.reached_serial(ORIGIN) == 2026102601
+
+
+def test_a_signer_that_never_catches_up_is_unread(
+    driver: Bind9Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = _FakeNamed(2026102600, signed=2026102600)
+    named.sign_lag = 10**9
+    monkeypatch.setattr(dns.query, "tcp", named)
+    monkeypatch.setattr(bind9.shutil, "which", lambda n: f"/usr/sbin/{n}")
+    monkeypatch.setattr(subprocess, "run", named.zonestatus)
+    monkeypatch.setattr(bind9, "_SIGNED_SETTLE_TIMEOUT_S", 0.0)
+
+    driver.apply_record_op(_op(2026102601))
+
+    assert driver.reached_serial(ORIGIN) is SERIAL_UNREAD

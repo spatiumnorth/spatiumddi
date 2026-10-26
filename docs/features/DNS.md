@@ -847,7 +847,10 @@ carries the same RR twice.
   named serves exactly that number rather than counting updates itself (it is
   only sent when it is later than the served serial, so the served serial
   never goes backwards). The agent reports the serial named actually serves,
-  which is what the per-server zone sync state compares
+  which is what the per-server zone sync state compares. For an
+  inline-signed zone that is the signed serial on the wire, which BIND moves
+  on each re-signing, so a signed zone can read out of sync until the next
+  change carries a serial later than it
 
 **PowerDNS:**
 - Record add/modify/delete → `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch via the REST API

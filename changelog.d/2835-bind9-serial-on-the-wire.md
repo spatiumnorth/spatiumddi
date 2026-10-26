@@ -12,8 +12,16 @@
   (never lower); verified against BIND 9.20, named then serves exactly that
   serial. The agent reports the serial named serves after each op and after
   each reload, so a zone named numbered itself reads out of sync instead of
-  in sync. A re-render of records named already holds keeps its serial
-  rather than moving one past it. A new primary zone starts at today's
+  in sync. An inline-signed zone is compared and reported at its signed
+  serial, the one on the wire: when re-signing has moved it past the op's
+  serial, the zone reads out of sync rather than in sync at a raw serial
+  nothing answers with. An op that changes the apex NS set now also removes
+  the name servers the render will no longer write (the zone's first NS, or
+  the placeholder and its glue), which an RFC 2136 update otherwise leaves
+  beside the new ones, and deleting the last declared NS puts back the one
+  the render falls back to. A re-render of data named already holds keeps
+  named's serial rather than moving one past it, so a zone can no longer
+  climb one serial per structural apply. A new primary zone starts at today's
   `YYYYMMDD00` instead of 0, which named served as 1. In a fine-grained
   (`update-policy`) zone the group's own key is granted `ANY`, since BIND's
   default type list leaves out SOA (and NS); an operator key standing in
