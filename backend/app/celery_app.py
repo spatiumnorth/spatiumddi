@@ -364,7 +364,8 @@ celery_app.conf.update(
             "schedule": schedule(run_every=60.0),
         },
         # Every 5 min, sweep DHCP leases whose expires_at has passed the grace
-        # window and remove their mirrored IPAM rows (auto_from_lease=True).
+        # window and remove their mirrored IPAM rows (auto_from_lease=True);
+        # then hand any ``available`` row a live lease holds to it (#2580).
         "dhcp-lease-cleanup": {
             "task": "app.tasks.dhcp_lease_cleanup.sweep_expired_leases",
             "schedule": schedule(run_every=300.0),

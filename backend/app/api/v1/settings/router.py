@@ -21,8 +21,7 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
-from sqlalchemy import func, select, text
-from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -2164,17 +2163,11 @@ async def update_settings(
     # The legacy webhook's URL + Authorization header (#1502): same
     # encrypt-and-redact shape, so neither reaches the column in clear or the
     # ``platform_settings_updated`` log line below.
-    _legacy_webhook_written: list[str] = []
     for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
         if _field in changes:
             raw = changes.pop(_field)
             setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
             changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
-            _legacy_webhook_written.append(_field)
-    if _legacy_webhook_written:
-        # GHSA-g9gv-9qp2-3qwm: blank the plaintext leftovers too, in the
-        # same transaction, or the pre-upgrade value outlives the change.
-        await _blank_legacy_plaintext(db, "platform_settings", settings.id, _legacy_webhook_written)
 
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
@@ -3464,41 +3457,6 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
-async def _blank_legacy_plaintext(db: DB, table: str, row_id: Any, columns: list[str]) -> None:
-    """Blank the pre-#1506 plaintext leftovers for a written secret.
-
-    GHSA-g9gv-9qp2-3qwm: the ``*_encrypted`` migration kept the old
-    plaintext columns, unmapped and unread, holding the pre-upgrade
-    values. Clearing or replacing a secret changed only the encrypted
-    column, so the old value stayed readable in the DB and in full
-    backups. On any write of that secret, set its leftover column to
-    ``''`` in the same transaction — ``''`` is the column's server
-    default and the value the old application (which maps it as a
-    non-null string) reads as unset, so a rolling upgrade stays safe;
-    the migration's downgrade copies a still-encrypted value back, and
-    a cleared secret has none, so it stays ``''`` there too.
-
-    The columns are unmapped, so this is raw SQL, guarded by inspection:
-    a schema built from the models (tests, a fresh install before the
-    migration) may not have them at all, and the next release drops
-    them. Identifiers come only from the fixed call sites below, never
-    from request data.
-    """
-    if not columns:
-        return
-    conn = await db.connection()
-    existing = await conn.run_sync(
-        lambda c: {col["name"] for col in sa_inspect(c).get_columns(table)}
-    )
-    assignments = [f"{col} = ''" for col in columns if col in existing]
-    if not assignments:
-        return
-    await db.execute(
-        text(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
-        {"id": row_id},
-    )
-
-
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     from app.core.crypto import encrypt_str
 
@@ -3637,15 +3595,6 @@ async def create_audit_target(
     _apply_body(row, body)
     db.add(row)
     await db.flush()
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
@@ -3674,15 +3623,6 @@ async def update_audit_target(
     _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
     _apply_body(row, body)
-    await _blank_legacy_plaintext(
-        db,
-        "audit_forward_target",
-        row.id,
-        [
-            *(["url"] if body.url is not None else []),
-            *(["auth_header"] if body.auth_header is not None else []),
-        ],
-    )
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
