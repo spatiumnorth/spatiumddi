@@ -18,6 +18,7 @@ on any hand-written chain of these columns elsewhere in ``app/``.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
@@ -927,6 +928,101 @@ def move_stays_in_space(current_subnet_id: Any, space_subnet_ids: Collection[Any
     return current_subnet_id in space_subnet_ids
 
 
+# ── Kept subnets and address placement (#2601, #2790) ─────────────────────
+#
+# A mirror's subnet is kept with no owner when its network leaves the desired
+# set while an address in it survives (#1558), and when its target is deleted
+# while it holds operator content (#2287). A sync that wants that CIDR again
+# must reuse the kept subnet rather than put a second one with the same CIDR
+# beside it, and its address pass must not choose between two rows at one
+# CIDR by the order the database returned them in. The mirrors that create
+# their own subnets (Docker, Kubernetes, UniFi, Tailscale, NetBird) share
+# these two helpers.
+
+
+async def unowned_subnets_at(
+    db: AsyncSession, space_id: Any, networks: Iterable[str]
+) -> dict[str, Subnet]:
+    """The subnet that no integration owns at exactly each of ``networks`` in
+    ``space_id``, keyed by the network as given (#2601, #2790).
+
+    A mirror reuses such a subnet as it stands instead of creating a second
+    one at that CIDR: it neither claims nor renames it, as the Proxmox
+    (#177), Cloud and OPNsense reconcilers treat an operator's subnet.
+    Nothing on the row says whether #1558 or #2287 handed it back or an
+    operator made it, and claiming it would put an operator's subnet under
+    the mirror's lifecycle (renamed on sync, deleted with its network).
+    A network that does not parse is skipped. Where two un-owned subnets sit
+    at one CIDR, the one with the lowest id is returned."""
+    wanted: dict[str, list[str]] = {}
+    for given in networks:
+        try:
+            canonical = str(ipaddress.ip_network(given, strict=False))
+        except (ValueError, TypeError):
+            continue
+        wanted.setdefault(canonical, []).append(given)
+    if not wanted:
+        return {}
+    res = await db.execute(
+        select(Subnet).where(
+            Subnet.space_id == space_id,
+            Subnet.network.in_(list(wanted)),
+            *(getattr(Subnet, fk).is_(None) for fk in INTEGRATION_OWNERSHIP),
+        )
+    )
+    out: dict[str, Subnet] = {}
+    for subnet in sorted(res.scalars().all(), key=lambda s: str(s.id)):
+        for given in wanted.get(str(subnet.network), []):
+            out.setdefault(given, subnet)
+    return out
+
+
+def subnet_for_address(
+    subnets: Iterable[Subnet],
+    address: str,
+    own_fk: str,
+    target_id: Any,
+    *,
+    held: IPAddress | None = None,
+) -> Subnet | None:
+    """The subnet, among ``subnets`` (the target space's), that a mirror puts
+    or keeps its row for ``address`` in (#2601, #2790).
+
+    ``held`` is the target's current row at ``address``, if any. When an
+    operator has edited it (``user_modified_at``), it stays in its subnet,
+    as its status, hostname and description do. Otherwise the target's own
+    subnets come first, then the longest prefix. On a tie (two rows at one
+    CIDR) an un-owned subnet beats one another target or integration owns,
+    then the lowest id wins, so the choice never follows the order the
+    database returned the rows in."""
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    keep = held.subnet_id if held is not None and held.user_modified_at is not None else None
+    try:
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address | None = ipaddress.ip_address(address)
+    except ValueError:
+        addr = None
+    best: Subnet | None = None
+    best_key: tuple[bool, int, bool, str] | None = None
+    for subnet in subnets:
+        if keep is not None and subnet.id == keep:
+            return subnet
+        if addr is None:
+            continue
+        try:
+            net = ipaddress.ip_network(str(subnet.network), strict=False)
+        except (ValueError, TypeError):
+            continue
+        if addr not in net:
+            continue
+        own = target_id is not None and getattr(subnet, own_fk) == target_id
+        owned_elsewhere = not own and owning_integration(subnet) is not None
+        key = (not own, -net.prefixlen, owned_elsewhere, str(subnet.id))
+        if best_key is None or key < best_key:
+            best, best_key = subnet, key
+    return best
+
+
 __all__ = [
     "ACME_RECORD_TAG",
     "RELEASE_AUDIT_ACTION",
@@ -954,7 +1050,9 @@ __all__ = [
     "owning_integration",
     "release_integration_rows",
     "scope_addresses_to_space",
+    "subnet_for_address",
     "subnet_has_surviving_addresses",
     "subnet_operator_ref",
     "subnet_registry_ref",
+    "unowned_subnets_at",
 ]

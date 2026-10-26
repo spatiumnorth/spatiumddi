@@ -176,9 +176,8 @@ def save_appliance_id(state_dir: Path, appliance_id: uuid.UUID) -> None:
 
 
 def clear_appliance_id(state_dir: Path) -> None:
-    """Drop the cached appliance_id. Used when the control plane
-    returns 404 for our /supervisor/poll — meaning the operator
-    rejected/deleted us; we re-bootstrap from a fresh pairing code."""
+    """Drop the cached appliance_id. Used by the revoked re-register
+    path, which re-bootstraps from a fresh pairing code."""
     path = _identity_dir(state_dir) / APPLIANCE_ID_FILENAME
     path.unlink(missing_ok=True)
 
