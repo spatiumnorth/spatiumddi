@@ -154,8 +154,8 @@ def _self_bootstrap_or_skip(
 
 # #2789: how long the revoke recovery waits after an attempt that brought no fresh
 # pairing code back. The self-bootstrap refuses (409) while any live appliance row
-# exists, and a node whose own row is still there (registration switched off, or a
-# row revoked but not deleted) changes nothing by asking again a heartbeat later:
+# exists, and a node whose own row is still there (a row revoked but not deleted,
+# or any node of a multi-node cluster) changes nothing by asking again a heartbeat later:
 # each attempt writes and removes the self-bootstrap token file, holds the api
 # through its failure delay and logs four lines. So the next attempt waits a minute,
 # then two, then four, and every four minutes from then on. Four minutes caps the
@@ -266,8 +266,7 @@ def _maybe_register(
                 # #2696: mint the new code BEFORE clearing anything. The
                 # self-bootstrap mints only while no live appliance row
                 # exists (409 otherwise). This node's own row can still be
-                # there: its heartbeats 404 while registration is switched
-                # off, and a revoked row stays until it is deleted. Clearing
+                # there: a revoked row stays until it is deleted. Clearing
                 # first would then leave the node with no identity and no
                 # code, and nothing could bring it back. Kept, it is approved
                 # again on its own row as soon as its heartbeats are accepted.
@@ -533,7 +532,7 @@ def main() -> int:
             # process registered with earlier is spent, so the recovery asks
             # for a fresh one instead of presenting it again.
             # #2789: not on every tick. While a live row is left (this node's own,
-            # with registration switched off, or one revoked but not deleted) the
+            # revoked but not deleted, or a cluster peer's) the
             # self-bootstrap refuses, so an attempt that brought no code back
             # waits a minute, doubling to four, before the next.
             if reregister_retry.due():
