@@ -33,12 +33,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 import uuid
 from typing import Any
 
 import structlog
 from celery import shared_task
+from celery.signals import worker_shutting_down
 from redis.exceptions import RedisError
 from sqlalchemy import select
 
@@ -113,6 +115,23 @@ async def _async_drive(run_id: str, *, avoid_version: str | None = None) -> dict
             error=str(exc),
         )
         raise DriveDatabaseUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    except BaseException as exc:
+        # #2865 — the drive is being stopped: its worker is shutting down
+        # (``_stop_drives_on_worker_shutdown``; billiard's SIGTERM handler
+        # raises SystemExit in the pool process) and ``asyncio.run`` cancels
+        # it as that unwinds. The drive's Lease is of no use to anyone now;
+        # left held, the run waits out its 600 s before the orphan sweep
+        # re-drives it. Only this drive's (a compare-and-swap), so a drive
+        # that took the run over meanwhile keeps it.
+        released = mutex.release_if_held(holder=me)
+        logger.warning(
+            "upgrade_drive_stopped",
+            run_id=run_id,
+            holder=me,
+            stop=type(exc).__name__,
+            lease_released=released,
+        )
+        raise
 
 
 async def _drive_in_session(
@@ -320,6 +339,41 @@ def drive_upgrade_run(  # type: ignore[type-arg]
             countdown=_DB_RETRY_COUNTDOWNS_S[retries],
             max_retries=len(_DB_RETRY_COUNTDOWNS_S),
         ) from exc
+
+
+_DRIVE_TASK = "app.tasks.upgrade_orchestrator.drive_upgrade_run"
+
+
+@worker_shutting_down.connect
+def _stop_drives_on_worker_shutdown(**_: object) -> None:
+    """#2865 — main-process hook, as the worker's shutdown starts (the pod's
+    SIGTERM). A warm shutdown waits for every running task, and a drive runs
+    for as long as its run: it went on renewing the run's Lease through the
+    pod's grace period, was SIGKILLed at its end with the Lease held, and the
+    run waited out the Lease (600 s) for the orphan sweep. The pool process
+    running a drive gets SIGTERM now instead. billiard's handler there raises
+    SystemExit, which unwinds the drive; ``_async_drive`` releases its Lease
+    on the way out, and ``acks_late`` with ``reject_on_worker_lost`` puts the
+    drive back on the queue for a worker that is staying. Every drive step is
+    safe to run again (#2809), as for a drive that died."""
+    from celery.worker import state  # noqa: PLC0415
+
+    main = os.getpid()
+    for request in list(state.active_requests):
+        pid = getattr(request, "worker_pid", None)
+        if getattr(request, "name", None) != _DRIVE_TASK or not pid or pid == main:
+            # Not a drive, not yet in a pool process, or run by this process
+            # itself (the solo and threads pools): left to the warm shutdown.
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+        logger.warning(
+            "upgrade_drive_stopped_for_worker_shutdown",
+            task_id=getattr(request, "id", None),
+            pid=pid,
+        )
 
 
 async def _async_release_lingering_hold() -> dict[str, str] | None:
