@@ -1846,6 +1846,8 @@ class DHCPMetricReport(BaseModel):
     # un-upgraded fleet reads as a fleet that has never dropped a packet.
     receive_drop: int | None = None
     socket_drop: int | None = None
+    # #2889 — requests evicted from Kea's packet queue. Same NULL rule.
+    queue_evicted: int | None = None
     batch_id: BatchId = None
 
 
@@ -1895,6 +1897,7 @@ async def agent_metrics(
     nullable_values = {
         "receive_drop": None if body.receive_drop is None else max(0, body.receive_drop),
         "socket_drop": None if body.socket_drop is None else max(0, body.socket_drop),
+        "queue_evicted": None if body.queue_evicted is None else max(0, body.queue_evicted),
     }
     existing = await db.get(DHCPMetricSample, (server.id, body.bucket_at))
     if existing is None:

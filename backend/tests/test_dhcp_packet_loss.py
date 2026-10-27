@@ -527,9 +527,22 @@ def test_agent_metric_columns_match_the_ingest_model() -> None:
     assert stat_map, "could not find _STAT_MAP in the agent source"
 
     # Every column the agent computes a delta for must be a field the server
-    # stores. ``socket_drop`` is not in _STAT_MAP — it comes from procfs, not
-    # from Kea — so it is added here explicitly rather than being forgotten.
-    agent_columns = set(stat_map.values()) | {"socket_drop"}
+    # stores. ``socket_drop`` (procfs) and ``queue_evicted`` (#2889, derived)
+    # are not in _STAT_MAP: they are the literal keys of the body ``_report``
+    # builds, so those keys are read from the source rather than restated
+    # here — restating them would pin the test's spelling, not the agent's.
+    report_keys: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_report":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict):
+                    report_keys |= {
+                        k.value
+                        for k in sub.keys
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                    }
+    assert {"socket_drop", "queue_evicted"} <= report_keys, report_keys
+    agent_columns = set(stat_map.values()) | (report_keys - {"bucket_at"})
     # ``batch_id`` is the #1077 replay-dedupe envelope, stamped by the spool's
     # Shipper on every push rather than computed by the poller.
     model_fields = set(DHCPMetricReport.model_fields) - {"bucket_at", "batch_id"}
@@ -537,3 +550,177 @@ def test_agent_metric_columns_match_the_ingest_model() -> None:
         f"agent sends {sorted(agent_columns - model_fields)} the server ignores; "
         f"server expects {sorted(model_fields - agent_columns)} the agent never sends"
     )
+
+
+# ── #2889: requests evicted from Kea's packet queue ─────────────────────────
+#
+# ``queue_evicted`` is loss exactly like ``socket_drop`` (the same failure one
+# stage later), so the default-on rule fires on it, and it follows the same
+# NULL-means-unmeasured rule everywhere it is read.
+
+
+async def test_alert_fires_on_queue_eviction_alone(db_session: AsyncSession) -> None:
+    """THE GAP #2889 WAS FILED ABOUT: the kernel dropped nothing, Kea's own
+    counters are clean, and requests were still lost in its queue."""
+    srv = await _server_with_samples(
+        db_session, [{"socket_drop": 0, "receive_drop": 0, "queue_evicted": 403}]
+    )
+    matches = await _matching_dhcp_packets_dropped_subjects(db_session, _rule())
+    assert [m[0] for m in matches] == [str(srv.id)]
+    msg = matches[0][2]
+    assert "lost 403 packet(s)" in msg
+    assert "403 read and then evicted" in msg
+    assert "discarded by the kernel" not in msg
+
+
+async def test_alert_sums_kernel_drops_and_queue_evictions(db_session: AsyncSession) -> None:
+    await _server_with_samples(
+        db_session,
+        [
+            {"socket_drop": 64, "queue_evicted": 300},
+            {"socket_drop": 0, "queue_evicted": 103},
+        ],
+    )
+    matches = await _matching_dhcp_packets_dropped_subjects(db_session, _rule())
+    msg = matches[0][2]
+    assert "lost 467 packet(s)" in msg
+    assert "64 discarded by the kernel" in msg
+    assert "403 read and then evicted" in msg
+
+
+async def test_alert_is_silent_when_evictions_were_measured_as_zero(
+    db_session: AsyncSession,
+) -> None:
+    await _server_with_samples(db_session, [{"socket_drop": 0, "queue_evicted": 0}])
+    assert await _matching_dhcp_packets_dropped_subjects(db_session, _rule()) == []
+
+
+async def test_unmeasured_evictions_neither_fire_nor_void_kernel_drops(
+    db_session: AsyncSession,
+) -> None:
+    """A server without a raw socket reports ``queue_evicted`` NULL. That must
+    not stop its measured kernel drops firing the rule, and must not count."""
+    await _server_with_samples(db_session, [{"socket_drop": 9, "queue_evicted": None}])
+    matches = await _matching_dhcp_packets_dropped_subjects(db_session, _rule())
+    assert "lost 9 packet(s)" in matches[0][2]
+    assert "evicted" not in matches[0][2]
+
+
+async def test_alert_floor_counts_evictions(db_session: AsyncSession) -> None:
+    await _server_with_samples(db_session, [{"socket_drop": 2, "queue_evicted": 3}])
+    rule = _rule()
+    rule.min_free_addresses = 6
+    assert await _matching_dhcp_packets_dropped_subjects(db_session, rule) == []
+    rule.min_free_addresses = 5
+    assert len(await _matching_dhcp_packets_dropped_subjects(db_session, rule)) == 1
+
+
+async def test_queue_evicted_omitted_stores_null_and_zero_stores_zero(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    srv = await _committed_server(db_session)
+    sid = srv.id
+    a = datetime(2026, 10, 27, 10, 0, tzinfo=UTC)
+    b = datetime(2026, 10, 27, 10, 1, tzinfo=UTC)
+
+    r = await _post_metric(client, srv, bucket_at=a.isoformat(), discover=5, socket_drop=0)
+    assert r.status_code == 200, r.text
+    r = await _post_metric(
+        client, srv, bucket_at=b.isoformat(), discover=5, socket_drop=0, queue_evicted=0
+    )
+    assert r.status_code == 200, r.text
+
+    assert (await _sample(db_session, sid, a)).queue_evicted is None
+    assert (await _sample(db_session, sid, b)).queue_evicted == 0
+
+
+async def test_queue_evicted_accumulates_and_survives_an_unmeasured_poll(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    srv = await _committed_server(db_session)
+    sid = srv.id
+    at = datetime(2026, 10, 27, 10, 2, tzinfo=UTC)
+
+    await _post_metric(client, srv, bucket_at=at.isoformat(), discover=1, queue_evicted=40)
+    await _post_metric(client, srv, bucket_at=at.isoformat(), discover=1, queue_evicted=2)
+    await _post_metric(client, srv, bucket_at=at.isoformat(), discover=1, queue_evicted=None)
+
+    row = await _sample(db_session, sid, at)
+    assert row.queue_evicted == 42
+    assert row.discover == 3
+
+
+async def test_queue_evicted_negative_is_clamped_at_ingest(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    srv = await _committed_server(db_session)
+    sid = srv.id
+    at = datetime(2026, 10, 27, 10, 3, tzinfo=UTC)
+    await _post_metric(client, srv, bucket_at=at.isoformat(), discover=1, queue_evicted=-5)
+    assert (await _sample(db_session, sid, at)).queue_evicted == 0
+
+
+async def test_stats_endpoint_reports_queue_evicted_and_null(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _superadmin(db_session)
+    srv = await _group_with_server(db_session)
+    sid = srv.id
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    # Two samples in different 1h-range stats buckets: one whose eviction
+    # was measured, one whose agent could not measure it.
+    db_session.add(
+        DHCPMetricSample(
+            server_id=sid,
+            bucket_at=now - timedelta(minutes=10),
+            discover=5,
+            socket_drop=0,
+            queue_evicted=17,
+        )
+    )
+    db_session.add(
+        DHCPMetricSample(
+            server_id=sid, bucket_at=now - timedelta(minutes=20), discover=5, socket_drop=0
+        )
+    )
+    await db_session.commit()
+
+    r = await client.get(
+        f"/api/v1/dhcp/servers/{sid}/stats?range=1h",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    got = sorted(b["queue_evicted"] for b in r.json()["rate_buckets"] if b["queue_evicted"])
+    nulls = [b for b in r.json()["rate_buckets"] if b["queue_evicted"] is None]
+    assert got == [17]
+    assert len(nulls) == 1
+
+    r = await client.get(
+        "/api/v1/metrics/dhcp/timeseries?window=1h",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    assert sum(p["queue_evicted"] or 0 for p in r.json()["points"]) == 17
+
+
+async def test_mcp_stats_tool_reports_queue_evicted_with_its_own_null(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.tools.dhcp import FindDHCPServerStatsArgs, find_dhcp_server_stats
+
+    srv = await _server_with_samples(
+        db_session, [{"socket_drop": 1, "queue_evicted": 403}, {"socket_drop": 0}]
+    )
+    out = await find_dhcp_server_stats(
+        db_session, None, FindDHCPServerStatsArgs(server_id=str(srv.id), range="1h")  # type: ignore[arg-type]
+    )
+    assert out["packet_loss"]["queue_evicted"] == 403
+    assert out["packet_loss"]["socket_drop"] == 1
+
+    srv2 = await _server_with_samples(db_session, [{"socket_drop": 0}])
+    out2 = await find_dhcp_server_stats(
+        db_session, None, FindDHCPServerStatsArgs(server_id=str(srv2.id), range="1h")  # type: ignore[arg-type]
+    )
+    # Measured kernel loss, unmeasured eviction: null, never 0.
+    assert out2["packet_loss"]["measured"] is True
+    assert out2["packet_loss"]["queue_evicted"] is None

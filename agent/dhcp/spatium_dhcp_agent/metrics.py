@@ -53,6 +53,14 @@ Both are ``None`` — not 0 — when they could not be measured, so an agent
 that cannot read them, or one older than this change, is reported as
 UNKNOWN rather than as a server with no loss.
 
+A third, ``queue_evicted`` (#2889), covers the loss neither of those sees:
+requests Kea read and then evicted from its multi-threading packet queue
+when a burst outran its worker. Kea keeps no statistic for that, so it is
+derived — DHCPv4 arrivals at Kea's intake (counted in the kernel by
+:class:`.intake.ArrivalCounter`), less the DHCPv4 share of ``socket_drop``,
+less ``pkt4-received`` — by :class:`.intake.QueueEvictionEstimator`. It is
+``None`` whenever any of the three was not measured over the interval.
+
 Delivery (#1077): a bucket the control plane does not accept is kept in the
 ``metrics`` stream of the durable spool and replayed, oldest first, when it
 answers again. The baseline advances on every poll regardless of whether the
@@ -76,6 +84,7 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .intake import ArrivalCounter, QueueEvictionEstimator, kea_intake_config
 from .kea_ctrl import KeaCtrlError, send_command
 from .push import CPPoster, disabled_spool, drain_for, late_bound
 from .socket_drops import SocketDropCounter, kea_socket_type
@@ -113,6 +122,12 @@ _STAT_MAP = {
 # ``_compute_delta`` so a multi-stat → single-column mapping doesn't
 # re-diff the same column twice.
 _METRIC_COLUMNS = sorted(set(_STAT_MAP.values()))
+
+# #2889 — every DHCPv4 packet the worker took off the queue. Not a column of
+# its own: it is one of the three terms of ``queue_evicted``, and is kept in
+# the snapshot under a key ``_compute_delta`` does not ship.
+_RECEIVED4_STAT = "pkt4-received"
+_RECEIVED4_KEY = "_received4"
 
 METRICS_PATH = "/api/v1/dhcp/agents/metrics"
 # #1077 — how long one poll tick may spend replaying a backlog. A day-long
@@ -156,6 +171,12 @@ def _parse_snapshot(resp: dict[str, Any]) -> dict[str, int]:
         v = _extract_counter(args.get(stat_name))
         if v is not None:
             out[col] = out.get(col, 0) + v
+    # Present only when Kea published it: a v6-only server has no kea-dhcp4,
+    # and a missing term must make ``queue_evicted`` unknown, not 0.
+    if _RECEIVED4_STAT in args:
+        received = _extract_counter(args.get(_RECEIVED4_STAT))
+        if received is not None:
+            out[_RECEIVED4_KEY] = received
     return out
 
 
@@ -181,6 +202,14 @@ class MetricsPoller:
         self._socket = SocketDropCounter(
             socket_type=lambda: kea_socket_type(cfg.kea_config_path)
         )
+        # #2889 — the other two terms of ``queue_evicted``. Sampled on the
+        # same ticks as everything above, for the same reason.
+        self._arrivals = ArrivalCounter(lambda: kea_intake_config(cfg.kea_config_path))
+        self._evictions = QueueEvictionEstimator()
+        # Last ``pkt4-received`` seen, for its delta. Kept beside ``_prev``
+        # rather than in it so ``_compute_delta`` stays the one place the
+        # shipped columns are diffed.
+        self._prev_received: int | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -223,8 +252,26 @@ class MetricsPoller:
             return None
         return delta
 
+    def _received_delta(self, current: dict[str, int], baseline_ok: bool) -> int | None:
+        """``pkt4-received`` over this interval, or ``None`` if unknown.
+
+        ``baseline_ok`` is whether ``_compute_delta`` produced a bucket: on
+        the first poll and after a Kea restart it did not, and the received
+        delta over the same interval is no more meaningful than the rest.
+        """
+        now = current.get(_RECEIVED4_KEY)
+        prev = self._prev_received
+        self._prev_received = now
+        if not baseline_ok or now is None or prev is None or now < prev:
+            return None
+        return now - prev
+
     def _report(
-        self, bucket_at: datetime, delta: dict[str, int], socket_drop: int | None
+        self,
+        bucket_at: datetime,
+        delta: dict[str, int],
+        socket_drop: int | None,
+        queue_evicted: int | None = None,
     ) -> str:
         """Returns the spool outcome (``sent`` / ``retry`` / ``rejected``)."""
         # Sent now, or spooled (behind any backlog) for replay — never dropped
@@ -233,6 +280,7 @@ class MetricsPoller:
             {
                 "bucket_at": bucket_at.isoformat(),
                 "socket_drop": socket_drop,
+                "queue_evicted": queue_evicted,
                 **delta,
             }
         )
@@ -251,6 +299,16 @@ class MetricsPoller:
                 # into a bucket whose Kea counters exclude them, and the
                 # first comparison anyone makes is drops against DISCOVERs.
                 socket_drop = self._socket.sample()
+                # #2889 — read immediately after the other two, so the three
+                # terms of the eviction estimate cover the same interval to
+                # within a few syscalls. Whatever skew is left moves counts
+                # between adjacent buckets, which the estimator absorbs.
+                arrived = self._arrivals.sample()
+                queue_evicted = self._evictions.update(
+                    arrived,
+                    self._socket.last_v4 if socket_drop is not None else None,
+                    self._received_delta(current, delta is not None),
+                )
                 if delta is not None:
                     # Bucket timestamp is "now, rounded to the poll
                     # interval". The server ACCUMULATES per
@@ -259,7 +317,7 @@ class MetricsPoller:
                     # bucket being counted twice (#1077).
                     now = datetime.now(UTC).replace(microsecond=0)
                     bucket = now.replace(second=(now.second // 60) * 60)
-                    self._report(bucket, delta, socket_drop)
+                    self._report(bucket, delta, socket_drop, queue_evicted)
             # Replay whatever the spool still holds — covers a tick with no
             # bucket to report (first poll, Kea down) as well as a backlog
             # longer than the slice ``ship`` drains ahead of a live bucket.

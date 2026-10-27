@@ -321,3 +321,107 @@ def test_the_drop_counter_follows_the_rendered_socket_mode(tmp_path):
     doc["Dhcp4"]["interfaces-config"]["dhcp-socket-type"] = "raw"
     (tmp_path / "kea.conf").write_text(json.dumps(doc))
     assert p._socket._socket_type() == "raw"
+
+
+# ── #2889: requests evicted from Kea's packet queue ─────────────────────────
+
+
+def test_parse_snapshot_keeps_pkt4_received_out_of_the_shipped_columns():
+    """``pkt4-received`` is a term of ``queue_evicted``, not a column: it is
+    parsed, and ``_compute_delta`` must not put it on the wire."""
+    p = _parse_snapshot(_snapshot({"pkt4-received": 40, "pkt4-discover-received": 10}))
+    assert p["_received4"] == 40
+    assert "_received4" not in _parse_snapshot(_snapshot({"pkt6-solicit-received": 3}))
+
+
+def _drive(tmp_path, monkeypatch, kea, socket_drops, v4_drops, arrivals):
+    """Run the REAL ``run()`` for ``len(kea)`` ticks with scripted inputs and
+    return every body posted."""
+    p = _poller(tmp_path)
+    sink: list = []
+    monkeypatch.setattr(p, "_client", lambda: _FakeClient(sink))
+    kea_it = iter(kea)
+    monkeypatch.setattr(p, "_poll_kea", lambda: next(kea_it, None))
+    sd_it = iter(zip(socket_drops, v4_drops))
+
+    def _sample():
+        total, v4 = next(sd_it)
+        p._socket.last_v4 = v4
+        return total
+
+    monkeypatch.setattr(p._socket, "sample", _sample)
+    arr_it = iter(arrivals)
+    monkeypatch.setattr(p._arrivals, "sample", lambda: next(arr_it))
+    real_wait = p._stop.wait
+    ticks = {"n": 0}
+
+    def _wait(timeout=None):
+        ticks["n"] += 1
+        if ticks["n"] >= len(kea):
+            p._stop.set()
+        return real_wait(0)
+
+    monkeypatch.setattr(p._stop, "wait", _wait)
+    p.run()
+    return sink
+
+
+def test_run_reports_queue_evicted_from_the_three_terms(tmp_path, monkeypatch):
+    """1,000 arrive in one minute, the kernel drops 30 (all DHCPv4), the
+    worker takes 870: 100 were evicted. Reported by the sample after, and
+    the port-547 share of ``socket_drop`` is not subtracted from v4 arrivals."""
+    kea = [
+        {"discover": 0, "_received4": 0},
+        {"discover": 500, "_received4": 500},
+        {"discover": 1300, "_received4": 1370},
+        {"discover": 1400, "_received4": 1470},
+    ]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0, 35, 0],  # 5 of the 35 are DHCPv6
+        v4_drops=[None, 0, 30, 0],
+        arrivals=[None, 500, 1000, 100],
+    )
+    assert [b["queue_evicted"] for b in sink] == [0, 0, 100]
+    assert [b["socket_drop"] for b in sink] == [0, 35, 0]
+
+
+def test_run_reports_queue_evicted_none_when_arrivals_unmeasured(tmp_path, monkeypatch):
+    """No CAP_NET_RAW, a v6-only server: unmeasured, explicit null, never 0."""
+    kea = [{"discover": 0, "_received4": 0}, {"discover": 5, "_received4": 5}]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0],
+        v4_drops=[None, 0],
+        arrivals=[None, None],
+    )
+    assert len(sink) == 1
+    assert "queue_evicted" in sink[0]
+    assert sink[0]["queue_evicted"] is None
+
+
+def test_kea_restart_makes_the_bucket_after_it_unmeasured(tmp_path, monkeypatch):
+    """``pkt4-received`` going backwards is a Kea restart: its delta, and so
+    the eviction over that interval, is unknown — not a negative number and
+    not a fabricated eviction of everything that arrived."""
+    kea = [
+        {"discover": 0, "_received4": 900},
+        {"discover": 100, "_received4": 1000},
+        {"discover": 0, "_received4": 3},  # restarted
+        {"discover": 50, "_received4": 53},
+        {"discover": 100, "_received4": 103},
+    ]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0, 0, 0, 0],
+        v4_drops=[None, 0, 0, 0, 0],
+        arrivals=[None, 100, 1000, 50, 50],
+    )
+    # The restart bucket itself is not posted (``_compute_delta`` drops it).
+    assert [b["queue_evicted"] for b in sink] == [0, 0, 0]

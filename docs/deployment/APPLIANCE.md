@@ -156,7 +156,10 @@ not the operator's:
   only signals that name it — and note it is `socket_drop` specifically:
   Kea's own `pkt4-receive-drop` also counts deliberate drops (a blocklisted
   MAC, an HA standby declining an out-of-scope query) and is not a fault
-  signal. See [`DHCP.md` §4c](../features/DHCP.md).
+  signal. A burst deeper than Kea's 1,024-packet queue loses requests one
+  stage later, after Kea has read them; that is the `queue_evicted` metric
+  (#2889), which the same alert also fires on. See
+  [`DHCP.md` §4c](../features/DHCP.md).
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the
