@@ -76,8 +76,11 @@ class DriveDatabaseUnavailable(RuntimeError):
     an outage is not the upgrade failing."""
 
 
-async def _async_drive(run_id: str) -> dict[str, str]:
-    """Open a fresh async session + drive the run to terminal state."""
+async def _async_drive(run_id: str, *, avoid_version: str | None = None) -> dict[str, str]:
+    """Open a fresh async session + drive the run to terminal state.
+
+    ``avoid_version`` is the task's own, passed on so that the drive knows
+    whether it is a version hand-off's continuation (#2869)."""
     try:
         rid = uuid.UUID(run_id)
     except ValueError as exc:
@@ -89,7 +92,7 @@ async def _async_drive(run_id: str) -> dict[str, str]:
 
     me = mutex.drive_identity()
     try:
-        return await _drive_in_session(rid, run_id, me)
+        return await _drive_in_session(rid, run_id, me, avoid_version=avoid_version)
     except OrchestratorError:
         raise
     except Exception as exc:
@@ -112,12 +115,14 @@ async def _async_drive(run_id: str) -> dict[str, str]:
         raise DriveDatabaseUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
 
-async def _drive_in_session(rid: uuid.UUID, run_id: str, me: str) -> dict[str, str]:
+async def _drive_in_session(
+    rid: uuid.UUID, run_id: str, me: str, *, avoid_version: str | None = None
+) -> dict[str, str]:
     from app.services.upgrades import mutex  # noqa: PLC0415
 
     async with task_session() as db:
         try:
-            run = await drive_upgrade(db, rid, holder=me)
+            run = await drive_upgrade(db, rid, holder=me, avoid_version=avoid_version)
         except OrchestratorError:
             raise
         except Exception as exc:  # noqa: BLE001 — surface ANY error to the row
@@ -302,7 +307,7 @@ def drive_upgrade_run(  # type: ignore[type-arg]
         )
         return {"run_id": run_id, "state": "passed_on"}
     try:
-        return asyncio.run(_async_drive(run_id))
+        return asyncio.run(_async_drive(run_id, avoid_version=avoid_version))
     except DriveDatabaseUnavailable as exc:
         retries = int(getattr(self.request, "retries", 0) or 0)
         if retries >= len(_DB_RETRY_COUNTDOWNS_S):

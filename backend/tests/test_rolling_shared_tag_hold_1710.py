@@ -634,7 +634,7 @@ def test_the_rest_of_the_run_runs_on_a_new_version_worker_or_after_the_hops(
 
     ran: list[str] = []
 
-    async def _drive(rid: str) -> dict[str, str]:
+    async def _drive(rid: str, *, avoid_version: str | None = None) -> dict[str, str]:
         ran.append(rid)
         return {"run_id": rid, "state": "running"}
 
