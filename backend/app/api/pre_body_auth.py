@@ -96,6 +96,19 @@ def header_auth(check: AuthCheck) -> Callable[[_Dep], _Dep]:
     return mark
 
 
+def header_only[D: Callable[..., Any]](dependency: D) -> D:
+    """Mark ``dependency`` as an authorisation check that already reads
+    nothing but the request headers (it takes only ``request`` / ``db``),
+    so it is its own header-only check.
+
+    For a route that reads its body as a raw stream inside the handler
+    (``request.stream()``) and declares no body parameter, FastAPI reads
+    nothing before the dependencies have run; declaring the check as a
+    dependency rather than calling it in the handler is what lets
+    ``tests/test_pre_body_auth.py`` see that the caller is checked first."""
+    return header_auth(dependency)(dependency)
+
+
 def _is_auth_check(call: Any) -> bool:
     return (
         call is get_current_user
@@ -117,7 +130,7 @@ def _route_dependant(route: APIRoute) -> Any:
     return route.dependant
 
 
-def _auth_checks(route: APIRoute) -> list[AuthCheck]:
+def auth_checks(route: APIRoute) -> list[AuthCheck]:
     """The route's top-level authorisation dependencies, router-level ones
     included, in resolution order."""
     checks: list[AuthCheck] = []
@@ -194,7 +207,7 @@ class PreBodyAuthRoute(APIRoute):
         original = super().get_route_handler()
         if not self.dependant.body_params:
             return original
-        checks = _auth_checks(self)
+        checks = auth_checks(self)
         if not checks:
             raise RuntimeError(
                 f"{self.path}: takes a request body on a router that authorises "

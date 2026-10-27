@@ -82,6 +82,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.pre_body_auth import PreBodyAuthRoute
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
+from app.core.body_limit import UPGRADE_IMAGE_MAX_BYTES
 from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission
 from app.core.responses import OctetStreamResponse
@@ -181,7 +182,9 @@ SLOT_IMAGE_DIR = Path(os.environ.get("SPATIUM_SLOT_IMAGE_DIR", "/var/lib/spatium
 # compressed today; 4 GiB ceiling leaves headroom for kernel +
 # initramfs growth without letting an operator accidentally ship
 # a multi-GiB blob that's clearly wrong.
-MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+# Shared with the body-cap allowances for the upload route and the mirror
+# write (``app.core.body_limit``), so the three cannot disagree.
+MAX_UPLOAD_BYTES = UPGRADE_IMAGE_MAX_BYTES
 # Streaming-read chunk for upload / import / sha256 computation. 4 MiB
 # is small enough to keep the api event-loop responsive (asyncio
 # coroutine yields between chunks) + large enough to avoid syscall

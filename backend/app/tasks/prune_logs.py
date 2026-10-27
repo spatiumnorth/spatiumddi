@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import delete, select
@@ -72,39 +73,80 @@ async def log_retention_hours(db: AsyncSession) -> int:
     return DEFAULT_RETENTION_HOURS
 
 
-async def _sweep_with_session(db: AsyncSession) -> dict[str, int]:
+#: Reported in place of a count when a table's delete failed, so a caller can
+#: tell "could not prune" apart from "nothing to prune" (0).
+FAILED = -1
+
+
+async def _prune_table(db: AsyncSession, name: str, stmt: Any) -> int:
+    """Run one retention delete in its own transaction.
+
+    Commits on success. On any failure (a command timeout included) rolls
+    back this table only, logs it, and returns :data:`FAILED`; the rollback
+    also returns the session to a usable state, so the next table runs.
+    Every delete is a plain age cutoff, so a retry is safe (#9).
+    """
+    try:
+        result = await db.execute(stmt)
+        removed = int(result.rowcount or 0)
+        await db.commit()
+        return removed
+    except Exception as exc:
+        await db.rollback()
+        logger.error("log_prune_table_failed", table=name, error=repr(exc))
+        return FAILED
+
+
+async def _sweep_with_session(db: AsyncSession) -> dict[str, Any]:
     """Run the prune against an explicit session.
 
     Split out so tests can hand in their pytest-managed session
     against the test database — the celery wrapper opens its own
     against the prod ``DATABASE_URL``.
+
+    Each table is deleted and committed on its own (#2872): a timeout on
+    the big query-log delete must not roll back the others. A table that
+    failed reports :data:`FAILED` (-1) and is listed in ``failed_tables``.
     """
     retention_hours = await log_retention_hours(db)
     cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
-    dns_del = await db.execute(delete(DNSQueryLogEntry).where(DNSQueryLogEntry.ts < cutoff))
-    dhcp_del = await db.execute(delete(DHCPLogEntry).where(DHCPLogEntry.ts < cutoff))
     rpz_cutoff = datetime.now(UTC) - timedelta(days=RPZ_HIT_RETENTION_DAYS)
-    rpz_del = await db.execute(delete(DNSRPZHit).where(DNSRPZHit.ts < rpz_cutoff))
-    receipts_removed = await prune_receipts(db)
-    await db.commit()
+    counts = {
+        "dns_query_log_removed": await _prune_table(
+            db, "dns_query_log_entry", delete(DNSQueryLogEntry).where(DNSQueryLogEntry.ts < cutoff)
+        ),
+        "dhcp_log_removed": await _prune_table(
+            db, "dhcp_log_entry", delete(DHCPLogEntry).where(DHCPLogEntry.ts < cutoff)
+        ),
+        "dns_rpz_hit_removed": await _prune_table(
+            db, "dns_rpz_hit", delete(DNSRPZHit).where(DNSRPZHit.ts < rpz_cutoff)
+        ),
+    }
+    try:
+        receipts_removed = await prune_receipts(db)
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error("log_prune_table_failed", table="agent_ingest_receipt", error=repr(exc))
+        receipts_removed = FAILED
+    counts["agent_ingest_receipt_removed"] = receipts_removed
+    failed = [k.removesuffix("_removed") for k, v in counts.items() if v == FAILED]
     return {
-        "dns_query_log_removed": dns_del.rowcount or 0,
-        "dhcp_log_removed": dhcp_del.rowcount or 0,
-        "dns_rpz_hit_removed": rpz_del.rowcount or 0,
-        "agent_ingest_receipt_removed": receipts_removed,
+        **counts,
+        "failed_tables": failed,
         "retention_hours": retention_hours,
         "rpz_retention_days": RPZ_HIT_RETENTION_DAYS,
         "receipt_retention_days": RECEIPT_RETENTION_DAYS,
     }
 
 
-async def _sweep() -> dict[str, int]:
+async def _sweep() -> dict[str, Any]:
     async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         return await _sweep_with_session(db)
 
 
 @celery_app.task(name="app.tasks.prune_logs.prune_log_entries")
-def prune_log_entries() -> dict[str, int]:
+def prune_log_entries() -> dict[str, Any]:
     result = asyncio.run(_sweep())
     logger.info("log_entries_pruned", **result)
     return result
