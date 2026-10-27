@@ -493,13 +493,14 @@ image-upgrade-check:
 
 # Perf — Tests (#968): hermetic tests under perf/ (no network, no appliance).
 # PyYAML + dnspython are what the orchestrator and report tests import
-# (#1057); hdrhistogram has an x86_64 wheel only and builds a C extension
-# elsewhere, so it is taken as a wheel when one exists — the single assertion
-# that needs the HdrHistogram backend is gated on it in the test.
+# (#1057), httpx what the seeder's retry tests import (#2879); hdrhistogram
+# has an x86_64 wheel only and builds a C extension elsewhere, so it is taken
+# as a wheel when one exists — the single assertion that needs the
+# HdrHistogram backend is gated on it in the test.
 perf-test:
 	@echo "→ Perf — Tests (matches .github/workflows/ci.yml)"
 	docker run --rm -v "$(PWD):/repo" -w /repo python:3.12-slim sh -c \
-	  'pip -q install pytest pyyaml dnspython >/dev/null \
+	  'pip -q install pytest pyyaml dnspython httpx >/dev/null \
 	   && (pip -q install --only-binary=:all: hdrhistogram >/dev/null 2>&1 \
 	       || echo "hdrhistogram: no binary wheel for this arch; the .hdr assertion is gated") \
 	   && python -m pytest perf -q'

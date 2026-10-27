@@ -1,31 +1,50 @@
 #!/usr/bin/env python3
-"""spatium-clear-shutdown-pods — once the node is back, delete the pods its
-kubelet ended for the shutdown before (#1976).
+"""spatium-clear-shutdown-pods — what the API keeps of a node's pods across its
+shutdown: no pod left Ready while the node goes (#2848), and none left
+Completed once it is back (#1976).
 
 The kubelet's graceful node shutdown (kubelet.conf.d/50-spatium-graceful-
 shutdown.conf) stops every pod of the node before a reboot or power-off goes
 on, and leaves each one terminal: Succeeded when its containers exited 0,
 Failed otherwise, with the condition DisruptionTarget, reason
 TerminationByKubelet, "Pod was terminated in response to imminent node
-shutdown." Its controller replaces it. The DaemonSet and StatefulSet
-controllers then delete the old pod, and CloudNativePG re-creates its own; a
-ReplicaSet never does (it only stops counting it), and the pod GC keeps
+shutdown." Its controller replaces it.
+
+At shutdown (``--at-shutdown``, the unit's ExecStop): the kubelet writes those
+final statuses to the API on its own time, and releases its shutdown lock as
+soon as the last pods have stopped; the shutdown then stops k3s, and a status
+still queued is lost. Nothing else corrects it: the node controller marks a
+node's pods NotReady only when the node stops reporting Ready, and this node
+reported itself NotReady ("node is shutting down") when the shutdown began. So
+a pod stopped in the shutdown's last seconds (a CoreDNS pod, in the last
+group) could stay Ready in the API, an endpoint of its Service, until the node
+was back. Systemd stops this unit after the kubelet released its lock and
+before k3s (the unit is ordered After=k3s.service), so the local API still
+answers: this marks every pod of the node the API still reads Ready as
+NotReady (its Ready condition False, reason NodeShutdown), as the node
+controller does, each update carrying the listed resourceVersion as its
+precondition. Only while the system is stopping, bounded to
+SPATIUM_SHUTDOWN_BUDGET_S, and it always exits 0: it never holds the shutdown
+past that.
+
+At each boot (no argument, the unit's ExecStart): the DaemonSet and
+StatefulSet controllers delete a stopped pod, and CloudNativePG re-creates its
+own; a ReplicaSet never does (it only stops counting it), and the pod GC keeps
 terminal pods until there are 12,500 of them. So every reboot left the node's
 Deployment pods listed as Completed beside their running replacements (on a
 single node the api, worker and frontend pods, three a reboot), and anything
-that lists pods without reading their phase counted them.
+that lists pods without reading their phase counted them. Once the API
+answers, this deletes exactly those: the pods bound to this node that are
+terminal, not already being deleted, owned by a ReplicaSet, and whose
+DisruptionTarget condition says the kubelet ended them for a node shutdown. A
+pod the kubelet evicted under node pressure carries the same reason with the
+eviction's message, and stays for the operator to read. Each delete carries
+the pod's UID as a precondition, so a pod created since the list under the
+same name is never touched.
 
-At each boot, once the API answers, this deletes exactly those: the pods bound
-to this node that are terminal, not already being deleted, owned by a
-ReplicaSet, and whose DisruptionTarget condition says the kubelet ended them
-for a node shutdown. A pod the kubelet evicted under node pressure carries the
-same reason with the eviction's message, and stays for the operator to read.
-Each delete carries the pod's UID as a precondition, so a pod created since the
-list under the same name is never touched.
-
-Best effort: it never holds or fails the boot. It waits for the API (bounded),
-logs every pod it deleted or could not, and exits 0. Whatever it leaves, the
-next boot's run finds again.
+Best effort both ways: it never holds or fails a boot or a shutdown. It logs
+every pod it marked or deleted or could not, and exits 0. Whatever the boot
+run leaves, the next boot's finds again.
 
 Run by spatiumddi-clear-shutdown-pods.service (After=k3s.service, every boot).
 The SPATIUM_* variables below exist for appliance/tests.
@@ -33,23 +52,31 @@ The SPATIUM_* variables below exist for appliance/tests.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shlex
 import socket
 import subprocess
+import sys
 import time
 
 KUBECTL = shlex.split(os.environ.get("SPATIUM_KUBECTL", "/usr/local/bin/k3s kubectl"))
 KUBECONFIG = os.environ.get("SPATIUM_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
+SYSTEMCTL = shlex.split(os.environ.get("SPATIUM_SYSTEMCTL", "/usr/bin/systemctl"))
 API_WAIT_S = float(os.environ.get("SPATIUM_API_WAIT_S", "900"))
 API_POLL_S = float(os.environ.get("SPATIUM_API_POLL_S", "5"))
+#: The whole --at-shutdown run, every API call included. The unit's
+#: TimeoutStopSec is the backstop above it.
+SHUTDOWN_BUDGET_S = float(os.environ.get("SPATIUM_SHUTDOWN_BUDGET_S", "10"))
 
 TERMINAL = ("Succeeded", "Failed")
 #: Words of the kubelet's node-shutdown message (k8s pkg/kubelet/nodeshutdown,
 #: nodeShutdownMessage). The eviction manager sets the same condition reason
 #: with its own message.
 SHUTDOWN_WORDS = "node shutdown"
+NOT_READY_REASON = "NodeShutdown"
+NOT_READY_MESSAGE = "The node is shutting down."
 
 
 def log(msg: str) -> None:
@@ -92,6 +119,22 @@ def uptime_s() -> str:
         return "?"
 
 
+def system_state() -> str:
+    """`systemctl is-system-running`: "stopping" while the system shuts down. It
+    exits non-zero for every state but "running", so only its output counts."""
+    try:
+        res = subprocess.run(
+            [*SYSTEMCTL, "is-system-running"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return f"unknown ({type(ex).__name__})"
+    return (res.stdout or "").strip() or "unknown"
+
+
 def shutdown_condition(pod: dict) -> dict | None:
     """The DisruptionTarget condition the kubelet sets on a pod it ended for a
     node shutdown, or None."""
@@ -102,6 +145,13 @@ def shutdown_condition(pod: dict) -> dict | None:
             and cond.get("reason") == "TerminationByKubelet"
             and SHUTDOWN_WORDS in (cond.get("message") or "").lower()
         ):
+            return cond
+    return None
+
+
+def ready_condition(pod: dict) -> dict | None:
+    for cond in (pod.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "Ready":
             return cond
     return None
 
@@ -132,14 +182,47 @@ def leftovers(pods: list[dict], node: str) -> list[dict]:
     return out
 
 
+def still_ready(pods: list[dict], node: str) -> list[dict]:
+    """The pods of `node` the API still reads Ready, terminating ones included
+    (a terminating pod that reads Ready stays a serving endpoint)."""
+    out = []
+    for pod in pods:
+        if (pod.get("spec") or {}).get("nodeName") != node:
+            continue
+        if not (pod.get("metadata") or {}).get("resourceVersion"):
+            continue
+        cond = ready_condition(pod)
+        if cond is not None and cond.get("status") == "True":
+            out.append(pod)
+    return out
+
+
+def not_ready(pod: dict, now: str) -> dict:
+    """`pod` as the status update that marks it NotReady: its Ready condition
+    False since `now`, reason NodeShutdown; everything else as it was listed,
+    its resourceVersion included, which makes the update fail rather than
+    overwrite a newer status (k8s MarkPodsNotReady's update, the same way)."""
+    new = copy.deepcopy(pod)
+    new["apiVersion"], new["kind"] = "v1", "Pod"
+    for cond in new["status"]["conditions"]:
+        if cond.get("type") == "Ready":
+            cond.update(
+                status="False",
+                reason=NOT_READY_REASON,
+                message=NOT_READY_MESSAGE,
+                lastTransitionTime=now,
+            )
+    return new
+
+
 def api_ready() -> bool:
     rc, _, _ = kubectl("--request-timeout=5s", "get", "--raw=/readyz", timeout=30)
     return rc == 0
 
 
-def list_pods(node: str) -> list[dict] | None:
+def list_pods(node: str, request_timeout: str = "30s", timeout: float = 60) -> list[dict] | None:
     rc, out, err = kubectl(
-        "--request-timeout=30s",
+        f"--request-timeout={request_timeout}",
         "get",
         "pods",
         "--all-namespaces",
@@ -147,6 +230,7 @@ def list_pods(node: str) -> list[dict] | None:
         f"spec.nodeName={node}",
         "-o",
         "json",
+        timeout=timeout,
     )
     if rc != 0:
         log(f"could not list the pods of {node}: {last_line(err or out)}")
@@ -176,6 +260,31 @@ def delete(pod: dict) -> tuple[str, str]:
     return "failed", last_line(text)
 
 
+def mark_not_ready(pod: dict, now: str, timeout: float) -> tuple[str, str]:
+    """(outcome, kubectl's last line): marked, gone, changed (its status moved on
+    since the list) or failed."""
+    meta = pod["metadata"]
+    path = f"/api/v1/namespaces/{meta['namespace']}/pods/{meta['name']}/status"
+    rc, out, err = kubectl(
+        "--request-timeout=3s",
+        "replace",
+        "--raw",
+        path,
+        "-f",
+        "-",
+        stdin=json.dumps(not_ready(pod, now)),
+        timeout=timeout,
+    )
+    if rc == 0:
+        return "marked", ""
+    text = f"{out}\n{err}"
+    if "NotFound" in text or "not found" in text:
+        return "gone", last_line(text)
+    if "Conflict" in text or "has been modified" in text:
+        return "changed", last_line(text)
+    return "failed", last_line(text)
+
+
 def describe(pod: dict) -> str:
     meta, owner = pod["metadata"], controller_of(pod)
     cond = shutdown_condition(pod) or {}
@@ -185,7 +294,72 @@ def describe(pod: dict) -> str:
     )
 
 
-def main() -> int:
+def describe_ready(pod: dict) -> str:
+    meta, owner = pod["metadata"], controller_of(pod)
+    terminating = ", terminating" if meta.get("deletionTimestamp") else ""
+    return (
+        f"{meta['namespace']}/{meta['name']} ({(pod.get('status') or {}).get('phase')}, "
+        f"{owner.get('kind')}/{owner.get('name')}{terminating})"
+    )
+
+
+def at_shutdown() -> int:
+    """Mark NotReady every pod of this node the API still reads Ready (#2848)."""
+    node = node_name()
+    state = system_state()
+    if state != "stopping":
+        log(f"{node}: the system is {state}, not stopping: nothing marked")
+        return 0
+    started = time.monotonic()
+    deadline = started + SHUTDOWN_BUDGET_S
+
+    def left() -> float:
+        return deadline - time.monotonic()
+
+    outcomes: dict[str, str] = {}
+    # Two passes: a pod whose status moved on since the list (the kubelet's own
+    # write landed meanwhile) is read again, and marked if it still reads Ready.
+    for _ in range(2):
+        if left() <= 0:
+            break
+        pods = list_pods(node, request_timeout="3s", timeout=max(0.5, min(5.0, left())))
+        if pods is None:
+            break
+        ready = still_ready(pods, node)
+        if not ready:
+            break
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        changed = False
+        for pod in ready:
+            key = f"{pod['metadata'].get('namespace')}/{pod['metadata'].get('name')}"
+            if left() <= 0:
+                outcomes[key] = "unreached"
+                continue
+            outcome, detail = mark_not_ready(pod, now, timeout=max(0.5, min(5.0, left())))
+            outcomes[key] = outcome
+            if outcome == "marked":
+                log(f"marked NotReady: {describe_ready(pod)}")
+            elif outcome == "changed":
+                changed = True
+            elif outcome == "failed":
+                log(f"could not mark {describe_ready(pod)}: {detail}")
+        if not changed:
+            break
+    took = time.monotonic() - started
+    if not outcomes:
+        log(f"{node}: shutting down, no pod of it read Ready in the API ({took:.1f} s)")
+        return 0
+    counts: dict[str, int] = {}
+    for outcome in outcomes.values():
+        counts[outcome] = counts.get(outcome, 0) + 1
+    summary = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+    log(f"{node}: shutting down, {len(outcomes)} pod(s) still Ready in the API: {summary} "
+        f"({took:.1f} s)")
+    return 0
+
+
+def at_boot() -> int:
+    """Delete the pods the last shutdown left that nothing else will (#1976)."""
     node = node_name()
     started = time.monotonic()
     deadline = started + API_WAIT_S
@@ -227,6 +401,16 @@ def main() -> int:
         f"(API answered after {waited} s, uptime {uptime_s()} s)"
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if args == ["--at-shutdown"]:
+        return at_shutdown()
+    if args:
+        log(f"unknown arguments {args}; nothing done")
+        return 0
+    return at_boot()
 
 
 if __name__ == "__main__":
