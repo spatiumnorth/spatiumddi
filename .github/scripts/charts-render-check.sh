@@ -83,9 +83,11 @@
 #                      controls: each CNPG Cluster sets max_slot_wal_keep_size
 #                      and bounds pg_wal at half its volume (#2317), one with
 #                      replicas updates its primary by switchover while a
-#                      single instance renders no method at all (#2831), and
-#                      the supervisor's namespace Role grants what its re-clone
-#                      of a stuck instance needs, pods/log get + pods patch (#2132).
+#                      single instance renders no method at all (#2831),
+#                      every Cluster bounds its smart shutdown, one instance
+#                      included (#2878), and the supervisor's namespace Role
+#                      grants what its re-clone of a stuck instance needs,
+#                      pods/log get + pods patch (#2132).
 #   bind9 memory     — the appliance dns-bind9 container takes its memory from
 #                      ``dnsBind9.memory`` (sized from node RAM by the
 #                      supervisor, #2223) and an explicit memory in
@@ -492,6 +494,31 @@ if helm template one "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]
     failures=$((failures + 1))
 else
     echo "   ok: a one-instance Cluster leaves CNPG's default"
+fi
+# #2878: one instance is restarted in place by any rolling update (a demote to
+# one node moves the Postgres limit, #2156), and its smart shutdown refuses
+# every new connection until smartShutdownTimeout runs out: CNPG's default is
+# 180 s. The guard must refuse that, and a one-instance render must carry the
+# chart's bound.
+echo "── negative control: a smart shutdown left at CNPG's 180 s must fail (#2878)"
+out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.instances=1 --set postgresql.cnpg.smartShutdownTimeout=180 \
+    | python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster - 2>&1)" \
+    && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#2878"; then
+    echo "   ok: smartShutdownTimeout 180 on one instance refused by the #2878 guard"
+else
+    echo "   FAIL: expected the #2878 guard to refuse smartShutdownTimeout 180 (rc=$rc)" >&2
+    printf '%s\n' "$out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+echo "── one CNPG instance renders the chart's smart shutdown bound (#2878)"
+if helm template one "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.instances=1 | grep -q '^  smartShutdownTimeout: 15$'; then
+    echo "   ok: a one-instance Cluster renders smartShutdownTimeout: 15"
+else
+    echo "   FAIL: a one-instance Cluster did not render smartShutdownTimeout: 15" >&2
+    failures=$((failures + 1))
 fi
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"

@@ -119,6 +119,7 @@ backend/alembic/versions/a1f4c7e92b30_dhcp_scope_provider_refs.py:drop_column:38
 backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:48
 backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:49
 backend/alembic/versions/a2078c5e1d90_dns_server_agent_version.py:drop_column:38
+backend/alembic/versions/a2866c5e7d41_packet_capture_artifact_node.py:drop_column:37
 backend/alembic/versions/a2e7f31c9b48_influxdb_push_export.py:drop_table:99
 backend/alembic/versions/a3c7e91f2d58_retention_settings.py:drop_column:37
 backend/alembic/versions/a3c7e91f2d58_retention_settings.py:drop_column:38

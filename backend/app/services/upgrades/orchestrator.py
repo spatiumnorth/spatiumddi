@@ -1455,8 +1455,12 @@ async def _drive_loop(
             control_plane_release=release_name,
             control_plane_namespace=release_namespace,
             # #1709 — the node's preflight asks for /var room only on the
-            # nodes the run has still to upgrade.
-            remaining_nodes=[n for n in plan_order if n not in completed_nodes],
+            # nodes the run has still to upgrade. #2870 — in DRAIN order (this
+            # node first, the drive's own node last), which the Redis master
+            # move uses to pick the replica that drains last.
+            remaining_nodes=node_order.drain_order(
+                plan_order, completed_nodes, current=next_node, defer=own_node
+            ),
             resume=resume,
             checkpoint=_checkpoint_writer(db, run.id, holder),
         )

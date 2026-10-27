@@ -2631,13 +2631,15 @@ primary, as before.
 
 ---
 
-## 20. Encrypted transports — DoT / DoH + encrypted forwarding (issue #50)
+## 20. Encrypted transports — DoT / DoH / DoQ + encrypted forwarding (issues #50, #741)
 
 Two independent halves, each default-off so an existing install renders a
 byte-identical `named.conf` until an operator opts in:
 
 * **Inbound** — serve DNS-over-TLS (RFC 7858) and DNS-over-HTTPS
-  (RFC 8484) to local clients.
+  (RFC 8484) to local clients. DNS-over-QUIC (RFC 9250) is the third
+  listener, **Technitium-only today**; BIND9 and PowerDNS DoQ is tracked
+  in [#2886](https://github.com/spatiumnorth/spatiumddi/issues/2886).
 * **Outbound** — forward to upstream resolvers over TLS instead of
   plaintext port 53.
 
