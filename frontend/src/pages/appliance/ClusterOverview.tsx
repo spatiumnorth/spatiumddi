@@ -1103,6 +1103,25 @@ export function WorkloadHealth({
                     {w.restarts}
                   </span>
                 )}
+                {(w.findings?.length ?? 0) > 0 && (
+                  <span
+                    className="max-w-[16rem] truncate text-amber-600 dark:text-amber-400"
+                    title={(w.findings ?? [])
+                      .map(
+                        (f) =>
+                          `${f.instance}${f.node ? ` (${f.node})` : ""} ${f.detail}`,
+                      )
+                      .join("\n")}
+                  >
+                    {w.findings!.length === 1
+                      ? `${w.findings![0].instance} ${
+                          w.findings![0].kind === "not_ready"
+                            ? "not ready"
+                            : "not replicating"
+                        }`
+                      : `${w.findings!.length} instances unhealthy`}
+                  </span>
+                )}
                 {w.jobs_running > 0 && (
                   <span
                     className="text-amber-600 dark:text-amber-400"
