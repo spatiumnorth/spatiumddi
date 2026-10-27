@@ -2514,6 +2514,16 @@ back while the zone is frozen. And a zone an operator has frozen with `rndc
 freeze` refuses the agent's own freeze, so the first apply holds that zone
 back, and the reload's thaw then clears the operator's freeze.
 
+**A start does not move a serial backwards (#2864, BIND9).** With named
+stopped, nothing freezes the zone, and the render carries the control plane's
+`last_serial`. If named had served a later serial (because an RFC 2136 update or an
+earlier apply moved it), the agent reads it from the previous zone file and its
+journal, and from the signed copy for an inline-signed zone. The zone keeps
+that serial if its data is unchanged, and serves one past it otherwise, the
+same rule a running named's freeze applies. A secondary that already holds the
+higher serial keeps transferring. A serial that cannot be read leaves the
+render's.
+
 As with the ingest's own rule, the RRset is the unit. A third party's apex NS
 record is not carried, and neither is an extra value at a name and type the
 control plane manages. Records are carried per zone and per view, so renaming

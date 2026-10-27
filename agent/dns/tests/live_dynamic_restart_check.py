@@ -480,6 +480,59 @@ def races(state: Path) -> None:
     _stop(driver)
 
 
+def start_serial(state: Path) -> None:
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    for signed in (False, True):
+        kind = "inline-signed" if signed else "unsigned"
+        print(
+            f"\n=== {kind}: nothing to carry, the serial does not step back at a start (#2864) ==="
+        )
+        st = state / kind
+        st.mkdir()
+        _rndc_keys(st)
+
+        def bundle(records, signed=signed):
+            b = _bundle(records, learned=("dc01",))
+            b["zones"][0]["dnssec_enabled"] = signed
+            return b
+
+        driver = Bind9Driver(state_dir=st)
+        driver.apply_config(bundle([("www", "A", "192.0.2.1")]))
+        time.sleep(1)
+        check(
+            "a third party adds dc01",
+            _nsupdate(adds=[("dc01", 300, "A", "10.9.9.9")]) == "NOERROR",
+        )
+        time.sleep(1)
+        served = _serial()
+        _stop(driver)
+        # The ingest mirrored dc01, so the cached bundle carries it: the
+        # start has nothing to carry, and renders the control plane's serial.
+        mirrored = [("www", "A", "192.0.2.1"), ("dc01", "A", "10.9.9.9")]
+        driver = Bind9Driver(state_dir=st)
+        driver.apply_config(bundle(mirrored))
+        time.sleep(1)
+        check("dc01 served", _q("dc01") == "10.9.9.9", _q("dc01"))
+        check(
+            "the same data keeps named's serial",
+            _serial() == served,
+            f"{served} -> {_serial()}",
+        )
+        served = _serial()
+        _stop(driver)
+        driver = Bind9Driver(state_dir=st)
+        driver.apply_config(bundle([*mirrored, ("new1", "A", "192.0.2.4")]))
+        time.sleep(1)
+        check(
+            "new data serves past named's serial",
+            _serial() > served,
+            f"{served} -> {_serial()}",
+        )
+        check("new1 served", _q("new1") == "192.0.2.4", _q("new1"))
+        _stop(driver)
+
+
 def main() -> int:
     for tool in ("named", "rndc", "rndc-confgen", "named-compilezone"):
         if not shutil.which(tool):
@@ -494,6 +547,7 @@ def main() -> int:
         views,
         serial_stable,
         races,
+        start_serial,
     ]
     for case in cases:
         state = Path(tempfile.mkdtemp(prefix="ddns-restart-check-"))
