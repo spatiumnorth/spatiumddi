@@ -18,6 +18,16 @@ never pulling it in, never holding the boot) and run the real runner
 against a stub kubectl: what it deletes, what it never touches, and that it
 never fails the boot.
 
+The same unit's ExecStop runs it with --at-shutdown (#2848). The kubelet
+releases its shutdown lock once the node's pods have stopped, before every
+final status of theirs has reached the API, and k3s then stops: a pod whose
+last write was lost stays Ready (a Service endpoint) until the node is back,
+because the node controller marks a node's pods NotReady only when the node
+stops reporting Ready, and this one reported NotReady when its shutdown
+began. Systemd stops the unit after that lock and before k3s; the runner
+marks NotReady each pod of the node the API still reads Ready, only while
+the system is stopping, within a budget, never failing the shutdown.
+
     python3 -m pytest appliance/tests/test_clear_shutdown_pods.py -v
 
 No k3s, no appliance required.
@@ -79,6 +89,9 @@ if "--raw=/readyz" in args:
 if args[1:3] == ["get", "pods"]:
     node = args[args.index("--field-selector") + 1].split("=", 1)[1]
     save()
+    if st.get("list_fails"):
+        print("The connection to the server 127.0.0.1:6443 was refused", file=sys.stderr)
+        sys.exit(1)
     print(json.dumps({"kind": "PodList", "items": [p for p in st["pods"]
                       if p["spec"].get("nodeName") == node]}))
     sys.exit(0)
@@ -111,9 +124,49 @@ if args[1:3] == ["delete", "--raw"]:
     save()
     print(json.dumps({"kind": "Pod", "metadata": pod["metadata"]}))
     sys.exit(0)
+if args[1:3] == ["replace", "--raw"]:
+    url = args[3]
+    body = json.loads(sys.stdin.read())
+    st.setdefault("replaces", []).append({"path": url, "body": body})
+    if st.get("hang_replace_s"):
+        save()
+        import time
+        time.sleep(st["hang_replace_s"])
+        sys.exit(1)
+    ns, name = url.split("/")[4], url.split("/")[6]
+    pod = next((p for p in st["pods"] if (p["metadata"]["namespace"], p["metadata"]["name"]) == (ns, name)), None)
+    if pod is None:
+        save()
+        print('Error from server (NotFound): pods "%s" not found' % name, file=sys.stderr)
+        sys.exit(1)
+    key = ns + "/" + name
+    if key in st.get("written_before_replace", {}):
+        # the kubelet's own write lands between the list and this update
+        pod["status"] = st["written_before_replace"].pop(key)
+        pod["metadata"]["resourceVersion"] = str(int(pod["metadata"]["resourceVersion"]) + 1)
+    if body["metadata"].get("resourceVersion") != pod["metadata"]["resourceVersion"]:
+        save()
+        print('Error from server (Conflict): Operation cannot be fulfilled on pods "%s": the '
+              'object has been modified; please apply your changes to the latest version and '
+              'try again' % name, file=sys.stderr)
+        sys.exit(1)
+    pod["status"] = body["status"]
+    pod["metadata"]["resourceVersion"] = str(int(pod["metadata"]["resourceVersion"]) + 1)
+    save()
+    print(json.dumps(pod))
+    sys.exit(0)
 save()
 print("fake kubectl: unexpected call %r" % (args,), file=sys.stderr)
 sys.exit(2)
+'''
+
+# A stand-in for `systemctl is-system-running`: prints FAKE_SYSTEM_STATE and,
+# as systemctl does, exits non-zero for every state but "running".
+FAKE_SYSTEMCTL = r'''
+import os, sys
+state = os.environ.get("FAKE_SYSTEM_STATE", "running")
+print(state)
+sys.exit(0 if state == "running" else 1)
 '''
 
 
@@ -198,22 +251,28 @@ def _module():
     return mod
 
 
-def _run(tmp_path: Path, pods: list[dict], *, wait_s: float = 5.0,
+def _run(tmp_path: Path, pods: list[dict], *, wait_s: float = 5.0, argv: tuple = (),
+         system: str = "running", budget_s: float = 10.0,
          **state) -> tuple[subprocess.CompletedProcess, dict]:
     fake = tmp_path / "fake_kubectl.py"
     fake.write_text(FAKE_KUBECTL)
+    fake_systemctl = tmp_path / "fake_systemctl.py"
+    fake_systemctl.write_text(FAKE_SYSTEMCTL)
     state_file = tmp_path / "kubectl.json"
     state_file.write_text(json.dumps({"pods": pods, **state}))
     env = {
         **os.environ,
         "SPATIUM_KUBECTL": f'"{sys.executable}" "{fake}"',
         "SPATIUM_KUBECONFIG": str(tmp_path / "k3s.yaml"),
+        "SPATIUM_SYSTEMCTL": f'"{sys.executable}" "{fake_systemctl}"',
         "SPATIUM_NODE_NAME": NODE,
         "SPATIUM_API_WAIT_S": str(wait_s),
         "SPATIUM_API_POLL_S": "0.05",
+        "SPATIUM_SHUTDOWN_BUDGET_S": str(budget_s),
         "FAKE_KUBECTL_STATE": str(state_file),
+        "FAKE_SYSTEM_STATE": system,
     }
-    res = subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True,
+    res = subprocess.run([sys.executable, str(SCRIPT), *argv], env=env, capture_output=True,
                          text=True, check=False, timeout=120)
     return res, json.loads(state_file.read_text())
 
@@ -260,6 +319,24 @@ def test_unit_runs_where_k3s_runs() -> None:
 
     assert conditions(UNIT) == conditions(K3S_UNIT)
     assert _unit(UNIT)["Install"].get("WantedBy") == "multi-user.target"
+
+
+def test_unit_marks_the_nodes_pods_at_shutdown_before_k3s_stops() -> None:
+    """Systemd runs ExecStop only for a unit that is still active, and stops
+    units in the reverse of their start order: RemainAfterExit keeps the unit
+    active after the boot run exits, and After=k3s.service stops it before k3s,
+    while the local API still answers (#2848). It must never hold the shutdown
+    much past its own budget."""
+    unit = _unit(UNIT)
+    service = unit["Service"]
+    assert service.get("RemainAfterExit") == "yes"
+    assert service.get("ExecStop") == "/usr/local/bin/spatium-clear-shutdown-pods --at-shutdown"
+    assert "k3s.service" in unit["Unit"].get("After", "").split()
+    assert unit["Unit"].get("DefaultDependencies", "yes") != "no", (
+        "default dependencies are what stop the unit at shutdown"
+    )
+    mod = _module()
+    assert mod.SHUTDOWN_BUDGET_S + 5 <= int(service.get("TimeoutStopSec", "0")) <= 30
 
 
 # ---- what it deletes ----------------------------------------------------------
@@ -342,3 +419,122 @@ def test_a_clean_boot_deletes_nothing(tmp_path: Path) -> None:
     assert res.returncode == 0, res.stderr
     assert "deletes" not in st
     assert "was left by a shutdown" in res.stdout, res.stdout
+
+
+# ---- what it marks at shutdown (#2848) -----------------------------------------
+
+
+def _live(name: str, *, ns: str = "spatium", node: str = NODE, ready: str = "True",
+          owner: str | None = "ReplicaSet", phase: str = "Running", rv: str = "100",
+          deleting: bool = False) -> dict:
+    """A pod as the API lists it while its node shuts down: Ready as the kubelet
+    last wrote it."""
+    pod = _pod(name, ns=ns, node=node, phase=phase, owner=owner, deleting=deleting)
+    pod["metadata"]["resourceVersion"] = rv
+    pod["status"]["conditions"] = [
+        {"type": "PodScheduled", "status": "True"},
+        {"type": "ContainersReady", "status": ready},
+        {"type": "Ready", "status": ready, "lastTransitionTime": "2026-10-26T11:58:01Z"},
+    ]
+    return pod
+
+
+# What a member listed after its kubelet released the shutdown lock: the last
+# group's CoreDNS pod and a killed primary still Ready (2 of 6 reboots of a
+# 10-26 QA rig), the rest written NotReady in time, and another node's pods.
+STALE = [
+    _live("coredns-84f99c5dfc-wsgqz", ns="kube-system"),
+    _live("spatium-control-spatiumddi-postgresql-2", owner="Cluster", deleting=True),
+]
+CURRENT = [
+    _live("spatium-control-spatiumddi-api-64554b86fc-7dgmg", ready="False", phase="Succeeded"),
+    _live("dns-bind9-cr4nt", owner="DaemonSet", ready="False", phase="Failed"),
+    _live("coredns-84f99c5dfc-p247j", ns="kube-system", node="ddipg-member-1"),
+    _live("spatium-control-spatiumddi-api-64554b86fc-xsd2b", node="ddipg-member-1"),
+]
+
+
+def _ready(pod: dict) -> dict:
+    return next(c for c in pod["status"]["conditions"] if c["type"] == "Ready")
+
+
+def test_at_shutdown_it_marks_what_still_reads_ready_and_nothing_else(tmp_path: Path) -> None:
+    res, st = _run(tmp_path, STALE + CURRENT, argv=("--at-shutdown",), system="stopping")
+    assert res.returncode == 0, res.stderr
+    paths = [r["path"] for r in st["replaces"]]
+    assert paths == [
+        f"/api/v1/namespaces/{p['metadata']['namespace']}/pods/{p['metadata']['name']}/status"
+        for p in STALE
+    ]
+    for r, pod in zip(st["replaces"], STALE):
+        # the listed object, its resourceVersion the precondition, only Ready changed
+        assert r["body"]["metadata"]["resourceVersion"] == pod["metadata"]["resourceVersion"]
+        assert r["body"]["kind"] == "Pod" and r["body"]["apiVersion"] == "v1"
+        cond = _ready(r["body"])
+        assert (cond["status"], cond["reason"]) == ("False", "NodeShutdown")
+        assert cond["lastTransitionTime"] != _ready(pod)["lastTransitionTime"]
+        others = [c for c in r["body"]["status"]["conditions"] if c["type"] != "Ready"]
+        assert others == [c for c in pod["status"]["conditions"] if c["type"] != "Ready"]
+    by_name = {p["metadata"]["name"]: p for p in st["pods"]}
+    assert all(_ready(by_name[p["metadata"]["name"]])["status"] == "False" for p in STALE)
+    assert _ready(by_name["coredns-84f99c5dfc-p247j"])["status"] == "True"
+    assert "deletes" not in st
+    assert "marked NotReady: kube-system/coredns-84f99c5dfc-wsgqz" in res.stdout, res.stdout
+    assert "terminating" in res.stdout
+    assert "2 pod(s) still Ready in the API: 2 marked" in res.stdout, res.stdout
+
+
+def test_at_shutdown_it_does_nothing_unless_the_system_is_stopping(tmp_path: Path) -> None:
+    """`systemctl stop` or a restart of the unit on a running node must not
+    mark a live node's pods."""
+    res, st = _run(tmp_path, STALE + CURRENT, argv=("--at-shutdown",), system="running")
+    assert res.returncode == 0, res.stderr
+    assert "calls" not in st
+    assert "the system is running, not stopping: nothing marked" in res.stdout, res.stdout
+
+
+def test_a_status_the_kubelet_wrote_meanwhile_is_read_again(tmp_path: Path) -> None:
+    """The kubelet's own write can land between the list and the update: the
+    update's precondition fails, the pod is read again and marked only if it
+    still reads Ready."""
+    dns, pg = (f"{p['metadata']['namespace']}/{p['metadata']['name']}" for p in STALE)
+    written = {
+        dns: {"phase": "Succeeded", "conditions": [{"type": "Ready", "status": "False"}]},
+        pg: STALE[1]["status"],  # a write that left it Ready
+    }
+    res, st = _run(tmp_path, STALE + CURRENT, argv=("--at-shutdown",), system="stopping",
+                   written_before_replace=written)
+    assert res.returncode == 0, res.stderr
+    names = [r["path"].split("/")[6] for r in st["replaces"]]
+    assert names == ["coredns-84f99c5dfc-wsgqz", "spatium-control-spatiumddi-postgresql-2",
+                     "spatium-control-spatiumddi-postgresql-2"]
+    by_name = {p["metadata"]["name"]: p for p in st["pods"]}
+    assert _ready(by_name["coredns-84f99c5dfc-wsgqz"]).get("reason") is None
+    assert _ready(by_name["spatium-control-spatiumddi-postgresql-2"])["status"] == "False"
+    assert "2 pod(s) still Ready in the API: 1 changed, 1 marked" in res.stdout, res.stdout
+
+
+def test_at_shutdown_it_never_holds_the_shutdown(tmp_path: Path) -> None:
+    """An API that never answers costs the budget at most, and exits 0."""
+    import time
+
+    t0 = time.monotonic()
+    res, st = _run(tmp_path, STALE, argv=("--at-shutdown",), system="stopping",
+                   budget_s=1.0, hang_replace_s=30)
+    assert res.returncode == 0, res.stderr
+    assert time.monotonic() - t0 < 15
+    assert len(st["replaces"]) == 1
+    assert "1 failed, 1 unreached" in res.stdout, res.stdout
+
+
+def test_at_shutdown_with_no_api_it_marks_nothing_and_exits_0(tmp_path: Path) -> None:
+    res, st = _run(tmp_path, STALE, argv=("--at-shutdown",), system="stopping", list_fails=True)
+    assert res.returncode == 0, res.stderr
+    assert "replaces" not in st
+    assert "could not list the pods of ddipg-seed" in res.stdout, res.stdout
+
+
+def test_unknown_arguments_do_nothing(tmp_path: Path) -> None:
+    res, st = _run(tmp_path, STALE + LEFT, argv=("--now",), system="stopping")
+    assert res.returncode == 0, res.stderr
+    assert "calls" not in st and "unknown arguments" in res.stdout
