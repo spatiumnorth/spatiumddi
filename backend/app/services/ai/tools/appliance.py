@@ -52,6 +52,7 @@ from app.services.ai.tools.proposals import _persist_proposal, _proposal_result
 from app.services.appliance.network_mtu import (
     fleet_summary as mtu_fleet_summary,
 )
+from app.services.appliance.var_disk import var_disk_fields
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -125,6 +126,9 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         # set"), ``mtu_requested`` and the refusal reason rather than the
         # bare value.
         **mtu_fields(row.cluster_health),
+        # #2400 — /var headroom against kubelet eviction, judged by the
+        # evaluator behind the appliance_disk_usage alert and the Fleet row.
+        **var_disk_fields(row.cluster_health, row.last_seen_at),
         "last_seen_ip": row.last_seen_ip,
         "cert_serial": row.cert_serial,
         "cert_expires_at": (row.cert_expires_at.isoformat() if row.cert_expires_at else None),

@@ -127,6 +127,9 @@ UNGATED_BEAT_TASKS: Final[dict[str, str]] = {
         "not a feature module by decision (#889): off is enabled=false on the target row"
     ),
     "app.tasks.upgrade_orchestrator.resume_orphaned_runs": "core appliance upgrade orchestration",
+    "app.tasks.upgrade_image_reclaim.reclaim_upgrade_images": (
+        "core appliance upgrade orchestration: frees stored upgrade-image bytes on /var"
+    ),
     "app.tasks.upgrade_orchestrator.release_lingering_shared_tag_hold": (
         "core appliance upgrade orchestration"
     ),

@@ -292,6 +292,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 or 0
             )
             bl.last_synced_at = datetime.now(UTC)
+            bl.last_success_at = bl.last_synced_at
             bl.last_sync_status = "success"
             bl.last_sync_error = None
 
@@ -429,7 +430,18 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 
             healed_groups: list = []
             healed = await heal_primaryless_groups(db, healed_groups)
+            # #2654 — a re-enabled server's owed re-render, still waiting for
+            # ingest reports that never came, goes ahead now. The bump marks
+            # its bundle dirty; the render that follows wakes the agent.
+            from app.services.dns.server_resync import force_overdue_resyncs
+
+            resynced = await force_overdue_resyncs(db)
             await db.commit()
+            if resynced:
+                logger.info(
+                    "dns_zone_resync_ingest_wait_expired",
+                    servers=[str(s.id) for s in resynced],
+                )
             if healed_groups:
                 from app.core.agent_wake import dns_group_channel, publish_wake
 

@@ -80,6 +80,22 @@ def read_state(state_dir: Path) -> ApprovalState:
     return "pending"
 
 
+def role_services_hold(state_dir: Path) -> ApprovalState | None:
+    """The approval state that holds this node's role services down, or
+    ``None`` when the node is approved and they may run (#2808).
+
+    The one gate every path that brings role services up consults: the
+    watchdog's auto-heal and the heartbeat's role apply. Only ``approved``
+    lets them run. ``revoked`` is a node taken out of service (its teardown
+    deliberately keeps ``role-compose.env`` so a re-registration can restore
+    the roles, #2801, so the file alone says nothing about whether they should
+    be running); ``pending`` is a node not yet approved, including one that
+    re-registered after a revoke and is waiting for its new row's first
+    accepted heartbeat."""
+    state = read_state(state_dir)
+    return None if state == "approved" else state
+
+
 def read_strikes(state_dir: Path) -> int:
     """Read the consecutive-403/404 strike count. Missing / unreadable
     → 0 so a fresh supervisor starts with a clean counter."""

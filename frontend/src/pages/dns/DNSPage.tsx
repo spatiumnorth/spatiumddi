@@ -142,6 +142,7 @@ import {
   zoneTransportOptions,
 } from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
+import { feedChip, FEED_CHIP_CLS } from "@/lib/blocklist-feed";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
 import {
@@ -3521,9 +3522,13 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   // #2316 — a paused (maintenance) server is shown separately and left out
   // of the count; a server that is not active is counted, but never as in
   // sync, whatever serial it reported before it went away.
-  const paused = state.servers.filter((s) => s.freshness === "paused");
+  const paused = state.servers.filter(
+    (s) => s.freshness === "paused" || s.freshness === "disabled",
+  );
   const down = state.servers.filter((s) => s.freshness === "unreachable");
-  const counted = state.servers.filter((s) => s.freshness !== "paused");
+  const counted = state.servers.filter(
+    (s) => s.freshness !== "paused" && s.freshness !== "disabled",
+  );
   const total = counted.length;
   const reported = counted.filter((s) => s.current_serial !== null);
   // #2042 — a server with an unacknowledged op for the zone is not in sync,
@@ -3534,17 +3539,19 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   );
   const tooltip = state.servers
     .map((s) =>
-      s.freshness === "paused"
-        ? `${s.server_name}: paused (maintenance), not counted`
-        : s.freshness === "unreachable"
-          ? `${s.server_name}: ${s.server_status}, not counted as in sync`
-          : s.current_serial === null
-            ? `${s.server_name}: not reported`
-            : `${s.server_name}: serial ${s.current_serial}` +
-              (s.current_serial !== state.target_serial ? " (drift)" : "") +
-              (s.pending_ops
-                ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
-                : ""),
+      s.freshness === "disabled"
+        ? `${s.server_name}: disabled, not counted`
+        : s.freshness === "paused"
+          ? `${s.server_name}: paused (maintenance), not counted`
+          : s.freshness === "unreachable"
+            ? `${s.server_name}: ${s.server_status}, not counted as in sync`
+            : s.current_serial === null
+              ? `${s.server_name}: not reported`
+              : `${s.server_name}: serial ${s.current_serial}` +
+                (s.current_serial !== state.target_serial ? " (drift)" : "") +
+                (s.pending_ops
+                  ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+                  : ""),
     )
     .join("\n");
 
@@ -10307,6 +10314,20 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         feed
                       </span>
                     )}
+                    {(() => {
+                      const chip = feedChip(l);
+                      return chip ? (
+                        <span
+                          className={cn(
+                            "inline-flex items-center rounded px-1.5 py-0.5 text-xs",
+                            FEED_CHIP_CLS[chip.tone],
+                          )}
+                          title={chip.title}
+                        >
+                          {chip.label}
+                        </span>
+                      ) : null;
+                    })()}
                     {!l.enabled && (
                       <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600">
                         disabled

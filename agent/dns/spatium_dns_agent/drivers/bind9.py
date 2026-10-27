@@ -1066,6 +1066,8 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
 # ``_AGENT_NS_GLUE``) mirrors these values: keep the two in step.
 _PLACEHOLDER_NS_LABEL = "ns1"
 _PLACEHOLDER_NS_ADDRESS = "127.0.0.1"
+# Sidecar in the rendered tree naming the zones given the placeholder glue.
+PLACEHOLDER_GLUE_FILE = "placeholder-glue.json"
 _PLACEHOLDER_RNAME_LABEL = "admin"
 
 # Characters a master-file name cannot carry unescaped. The same set as the
@@ -2666,6 +2668,12 @@ class Bind9Driver(DriverBase):
                 conf += _rpz_stanza(bl, "")
 
         _log_apex_notes(apex_notes)
+        # Which zones were served the placeholder glue, kept in the tree so it
+        # swaps with the config it describes; the ingest worker reads it so
+        # it does not mirror the glue back as external data (#2841).
+        (new_dir / PLACEHOLDER_GLUE_FILE).write_text(
+            json.dumps(sorted({z for z, k, _ in apex_notes if k == "placeholder"}))
+        )
         (new_dir / "named.conf").write_text(conf)
 
         # TSIG keys — written to tsig/ddns.key (stable path). ALL keys in

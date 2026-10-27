@@ -581,6 +581,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dhcp_scope_uncoordinated_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # Stale blocklist feed alert rule — singleton, ENABLED by default
+    # (issue #2313). Silent unless a feed list stopped refreshing. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_blocklist_feed_stale_alert_rule,
+        )
+
+        await seed_dns_blocklist_feed_stale_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_blocklist_feed_stale_alert_rule_seed_skipped", reason=str(exc))
     # Stale DNS pool health alert rule — singleton, ENABLED by default
     # (issue #2312). Silent unless a pool's health checks stopped. Idempotent.
     try:

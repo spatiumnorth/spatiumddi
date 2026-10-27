@@ -15,3 +15,12 @@ def _node_memory_for_dns_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
     cluster (the 2Gi floor, the chart's own default). The sizing tests replace
     it with their own."""
     monkeypatch.setattr(k8s_api, "dns_sizing_memory_mib", lambda **_k: (8192, None))
+
+
+@pytest.fixture(autouse=True)
+def _no_apply_grace_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#2833 — ``watchdog.note_apply`` stamps module state, and a role apply in
+    one test must not put the next test's watchdog pass inside its grace."""
+    from spatium_supervisor import watchdog
+
+    monkeypatch.setattr(watchdog, "_last_apply_at", None, raising=False)

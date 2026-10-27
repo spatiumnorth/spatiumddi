@@ -221,6 +221,14 @@ async def resolve_slot_image_target(
         return SlotImageTarget(url=slot_image_url)
 
     assert slot_image_id is not None  # narrowed by the check above
+    # #2400 — held until the caller's transaction ends, so the reclaim sweep
+    # (and the delete endpoint) cannot remove the image between here and
+    # the schedule this resolves into being committed.
+    from app.services.appliance.upgrade_image_catalog import (  # noqa: PLC0415
+        lock_catalog_shared,
+    )
+
+    await lock_catalog_shared(db)
     image = await db.get(ApplianceUpgradeImage, slot_image_id)
     if image is None:
         raise SlotImageResolutionError(f"Upgrade image {slot_image_id} not found.")

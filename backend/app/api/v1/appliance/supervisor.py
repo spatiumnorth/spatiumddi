@@ -76,6 +76,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1.appliance.cluster import VarDiskFinding
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WAKE_TICK_SECONDS,
@@ -93,6 +94,7 @@ from app.core.auth_throttle import (
     claim_pairing_attempt,
     refund_pairing_attempt,
 )
+from app.core.db_transient import is_transient_db_error
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import upgrade_direction
@@ -112,6 +114,7 @@ from app.models.appliance import (
     DESIRED_CLUSTER_ROLE_MEMBER,
     DESIRED_CLUSTER_ROLE_NONE,
     Appliance,
+    ApplianceUpgradeImage,
     PairingClaim,
     PairingCode,
 )
@@ -179,6 +182,12 @@ from app.services.appliance.storage_health import (
 )
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
+from app.services.appliance.var_disk import (
+    reading_is_fresh,
+    staging_shortfall,
+    var_disk_fields,
+    var_disk_reading,
+)
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
 from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
@@ -2340,6 +2349,38 @@ async def supervisor_heartbeat(
     A deliberate refusal (revoked row, or no row the credential opens) is a
     403 carrying ``REVOCATION_HEADER``; see its comment.
     """
+    try:
+        return await _supervisor_heartbeat(body, request, db)
+    except Exception as exc:
+        # #2845 — a CNPG switchover drops the connection under whichever
+        # statement is in flight: most often the re-read after the long-poll
+        # hold, which runs a minute after the telemetry commit. That is the
+        # database being briefly away, not a bug, so answer it as one: 503,
+        # which the supervisor logs as a server error and retries on its next
+        # heartbeat — never a revocation strike (only a marked 403 is one).
+        # Nothing here reads the ORM row: the failed statement's rollback has
+        # expired every attribute, and loading one in an async session raises
+        # MissingGreenlet. ``body`` is plain pydantic data.
+        if not is_transient_db_error(exc):
+            raise
+        logger.info(
+            "supervisor_heartbeat_db_unavailable",
+            appliance_id=str(body.appliance_id),
+            error=str(exc)[:200],
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The database is briefly unavailable (a failover is likely in progress). Retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+async def _supervisor_heartbeat(
+    body: SupervisorHeartbeatRequest,
+    request: Request,
+    db: AsyncSession,
+) -> SupervisorHeartbeatResponse:
+    """The heartbeat itself; ``supervisor_heartbeat`` above is the route."""
 
     # #170 Wave D follow-up — cert auth takes precedence when the
     # supervisor presents X-Appliance-Cert + X-Appliance-Signature +
@@ -3796,6 +3837,10 @@ class ApplianceRow(BaseModel):
     storage_findings: list[dict[str, str]] = []
     storage_worst_severity: str | None = None
     storage_reported: bool = False
+    # #2400 — /var headroom against kubelet eviction, judged by the function
+    # behind the ``appliance_disk_usage`` alert. ``None`` = fine or unknown.
+    # The raw numbers are in ``cluster_health.host_disk_partitions``.
+    var_disk_finding: VarDiskFinding | None = None
     # #1017 — the interface MTU spatium-etc-render actually APPLIED at
     # this node's last boot, not what STATE asked for: the renderer drops
     # a value that is out of range, that would break a pinned IPv6
@@ -3884,6 +3929,15 @@ def _storage_findings(row: Appliance) -> list[StorageFinding]:
 
 def _storage_worst_severity(row: Appliance) -> str | None:
     return worst_severity(_storage_findings(row))
+
+
+def _var_disk_finding(row: Appliance) -> dict[str, Any] | None:
+    """#2400 — the /var finding for one appliance row (``None`` = fine or
+    unknown). A stale reading is not judged: it says nothing about now."""
+    finding: dict[str, Any] | None = var_disk_fields(row.cluster_health, row.last_seen_at)[
+        "var_disk_finding"
+    ]
+    return finding
 
 
 def mtu_fields(cluster_health: Any) -> dict[str, Any]:
@@ -3996,6 +4050,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ],
         storage_worst_severity=_storage_worst_severity(row),
         storage_reported=has_storage_report(row.cluster_health),
+        var_disk_finding=_var_disk_finding(row),
         **mtu_fields(row.cluster_health),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
@@ -6921,6 +6976,27 @@ class ApplianceUpgradeRequest(BaseModel):
     acknowledge_schema_rollback: bool = False
 
 
+async def _require_node_staging_headroom(
+    db: AsyncSession, row: Appliance, slot_image_id: uuid.UUID | None
+) -> None:
+    """422 when staging the image on ``row``'s /var would leave it under the
+    kubelet's eviction headroom (#2400). Silent when the node's reading is
+    absent or stale — unknown is not a refusal."""
+    if not reading_is_fresh(row.last_seen_at):
+        return
+    reading = var_disk_reading(row.cluster_health)
+    if reading is None:
+        return
+    image_bytes = 0
+    if slot_image_id is not None:
+        image = await db.get(ApplianceUpgradeImage, slot_image_id)
+        if image is not None:
+            image_bytes = int(image.size_bytes or 0)
+    message = staging_shortfall(reading, image_bytes, row.hostname)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
 @router.post(
     "/appliances/{appliance_id}/upgrade",
     response_model=ApplianceRow,
@@ -6977,6 +7053,16 @@ async def schedule_appliance_upgrade(
                 "for docker / k8s deployments."
             ),
         )
+
+    # #2400 — the node downloads the image onto its own /var before writing
+    # the slot. If that leaves under the kubelet's eviction headroom, the
+    # kubelet evicts the control plane mid-upgrade. The host runner refuses
+    # too (rc 7), but only after the operator has been told "scheduled";
+    # refuse here, with the numbers, while the request is still open. The
+    # size is the stored image's for an uploaded/imported one; an external
+    # URL's is unknown, so only the margin itself is checked. A missing or
+    # stale reading is UNKNOWN and does not refuse (the host check remains).
+    await _require_node_staging_headroom(db, row, body.slot_image_id)
 
     # #1227 — an "upgrade" to an older image on a control-plane node is a
     # downgrade of the release that runs on THE database, which that release
