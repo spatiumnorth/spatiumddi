@@ -29,7 +29,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from spatium_supervisor import heartbeat, k8s_api
 
@@ -57,7 +57,14 @@ def _name(cn: str) -> x509.Name:
     return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
 
 
-def _cert(subject_key, subject, issuer_key, issuer, *, ca: bool, sans=()):
+def _cert(subject_key, subject, issuer_key, issuer, *, ca: bool, sans=(), aki: bool = True):
+    """A certificate shaped like the ones CNPG 1.30.1 issues (pkg/certs,
+    through Go's x509.CreateCertificate): the CA carries basicConstraints
+    CA:TRUE, keyCertSign and a Subject Key Identifier; the server leaf
+    carries basicConstraints CA:FALSE, digitalSignature + keyEncipherment +
+    keyAgreement, serverAuth, its SANs and an Authority Key Identifier (Go
+    gives a non-CA leaf no SKI). ``aki=False`` leaves the AKI out, which the
+    supervisor's strict verification must refuse."""
     now = datetime.datetime.now(datetime.UTC)
     b = (
         x509.CertificateBuilder()
@@ -69,21 +76,42 @@ def _cert(subject_key, subject, issuer_key, issuer, *, ca: bool, sans=()):
         .not_valid_after(now + datetime.timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
     )
+    usage = {
+        "content_commitment": False,
+        "data_encipherment": False,
+        "encipher_only": False,
+        "decipher_only": False,
+        "crl_sign": False,
+    }
     if ca:
         b = b.add_extension(
             x509.KeyUsage(
-                digital_signature=True,
-                content_commitment=False,
+                digital_signature=False,
                 key_encipherment=False,
-                data_encipherment=False,
                 key_agreement=False,
                 key_cert_sign=True,
-                crl_sign=True,
-                encipher_only=False,
-                decipher_only=False,
+                **usage,
             ),
             critical=True,
+        ).add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(subject_key.public_key()), critical=False
         )
+    else:
+        b = b.add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=True,
+                key_agreement=True,
+                key_cert_sign=False,
+                **usage,
+            ),
+            critical=True,
+        ).add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        if aki:
+            b = b.add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+                critical=False,
+            )
     if sans:
         b = b.add_extension(
             x509.SubjectAlternativeName([x509.DNSName(n) for n in sans]), critical=False
@@ -102,9 +130,9 @@ class _CA:
         self.cert = _cert(self.key, self.name, self.key, self.name, ca=True)
         self.pem = _pem(self.cert)
 
-    def leaf(self, sans) -> tuple:
+    def leaf(self, sans, *, aki: bool = True) -> tuple:
         key = _key()
-        return key, _cert(key, _name(sans[0]), self.key, self.name, ca=False, sans=sans)
+        return key, _cert(key, _name(sans[0]), self.key, self.name, ca=False, sans=sans, aki=aki)
 
 
 CLUSTER_CA = _CA(CLUSTER)
@@ -152,6 +180,7 @@ def _status_server(tmp_path: Path, key, cert, doc: dict):
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(str(cert_file), str(key_file))
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -248,6 +277,36 @@ def test_a_certificate_for_another_name_is_refused(tmp_path, monkeypatch):
         kube = _TlsKube(ca_pem=CLUSTER_CA.pem, logs={P2: HEALTHY, P3: CASE4})
         out = _drive(monkeypatch, kube, port)
     _assert_held_unknown(out, kube, "did not verify against the cluster CA")
+
+
+def test_a_leaf_without_an_authority_key_identifier_is_refused(tmp_path, monkeypatch):
+    # The strict chain checks are pinned on every Python, not left to the
+    # interpreter's default (3.13+ only). CNPG's leaves carry the AKI, so
+    # this refuses nothing real; it pins that the check is on.
+    key, cert = CLUSTER_CA.leaf([RW], aki=False)
+    with _status_server(tmp_path, key, cert, _status_doc({P3: "lost"})) as port:
+        monkeypatch.setattr(k8s_api, "_CNPG_STATUS_PORT", port)
+        doc, why = k8s_api._cnpg_instance_status(
+            "127.0.0.1", ca_pem=CLUSTER_CA.pem, server_hostname=RW
+        )
+    assert doc is None and "did not verify" in why
+
+
+def test_the_status_client_pins_tls_1_2_and_strict_checks(monkeypatch):
+    seen = {}
+    real = ssl.create_default_context
+
+    def spy(*a, **kw):
+        seen["ctx"] = real(*a, **kw)
+        return seen["ctx"]
+
+    monkeypatch.setattr(k8s_api.ssl, "create_default_context", spy)
+    monkeypatch.setattr(k8s_api, "_CNPG_STATUS_PORT", 9)  # discard: refused fast
+    k8s_api._cnpg_instance_status("127.0.0.1", ca_pem=CLUSTER_CA.pem, server_hostname=RW)
+    ctx = seen["ctx"]
+    assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert ctx.verify_flags & ssl.VERIFY_X509_STRICT
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
 
 
 def test_a_missing_ca_certificate_is_unknown(tmp_path, monkeypatch):

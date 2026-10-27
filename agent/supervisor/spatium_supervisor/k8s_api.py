@@ -1488,6 +1488,14 @@ def _cnpg_instance_status(
         return None, f"the cluster CA certificate could not be loaded: {exc}"
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
+    # Pinned rather than left to the interpreter's defaults, so the check is
+    # the same on every Python the supervisor runs (the image ships 3.14;
+    # 3.13 made both the default): RFC 5280 strict chain checks, and TLS 1.2
+    # or later. CNPG's certificates pass the strict checks: Go's x509 gives
+    # its CA a Subject Key Identifier and the server leaf an Authority Key
+    # Identifier (verified live on a CNPG 1.30.1 cluster).
+    ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     conn = _NamedHTTPSConnection(
         pod_ip,
         _CNPG_STATUS_PORT,
