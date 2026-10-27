@@ -411,6 +411,7 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
 
             if file_size > 0:
                 cap_row.pcap_path = str(out_path)
+                cap_row.artifact_node = (settings.node_name or "").strip() or None
                 cap_row.pcap_size_bytes = file_size
                 with contextlib.suppress(OSError):
                     cap_row.pcap_sha256 = _sha256_file(out_path)

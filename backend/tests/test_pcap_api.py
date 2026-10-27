@@ -356,3 +356,91 @@ def test_tools_pcap_in_demo_restricted_modules() -> None:
     from app.core.demo_mode import DEMO_RESTRICTED_MODULES
 
     assert "tools.pcap" in DEMO_RESTRICTED_MODULES
+
+
+# ── #2866: artifact on another node's disk ───────────────────────────
+
+
+async def _download_missing(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    *,
+    artifact_node: str | None,
+    this_node: str,
+):
+    from app.config import settings
+
+    _, token = await _superadmin(db_session)
+    cap = await _make_capture(
+        db_session,
+        status="completed",
+        pcap_path="/nonexistent/x.pcap",
+        pcap_size_bytes=10,
+        artifact_node=artifact_node,
+    )
+    await db_session.commit()
+    with patch.object(settings, "node_name", this_node):
+        return await client.get(f"/api/v1/pcap/captures/{cap.id}/download", headers=_hdr(token))
+
+
+async def test_download_names_the_node_holding_the_artifact(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    r = await _download_missing(client, db_session, artifact_node="node-a", this_node="node-b")
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert "node-a" in detail and "node-b" in detail
+    assert "pruned" not in detail
+
+
+async def test_download_same_node_missing_keeps_pruned_message(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    r = await _download_missing(client, db_session, artifact_node="node-a", this_node="node-a")
+    assert r.status_code == 404
+    assert "pruned or volume drift" in r.json()["detail"]
+
+
+async def test_download_legacy_row_without_node_keeps_pruned_message(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    r = await _download_missing(client, db_session, artifact_node=None, this_node="node-b")
+    assert r.status_code == 404
+    assert "pruned or volume drift" in r.json()["detail"]
+
+
+async def test_artifact_node_is_exposed_on_the_read_model(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _superadmin(db_session)
+    cap = await _make_capture(
+        db_session,
+        status="completed",
+        pcap_path="/x.pcap",
+        pcap_size_bytes=10,
+        artifact_node="node-a",
+    )
+    await db_session.commit()
+    r = await client.get(f"/api/v1/pcap/captures/{cap.id}", headers=_hdr(token))
+    assert r.json()["artifact_node"] == "node-a"
+
+
+async def test_finalize_capture_records_this_node(db_session: AsyncSession) -> None:
+    from app.config import settings
+    from app.services.appliance import pcap_capture
+
+    cap = await _make_capture(db_session, status="running")
+    await db_session.commit()
+    with patch.object(settings, "node_name", "node-a"):
+        await pcap_capture.finalize_capture(
+            db_session,
+            cap.id,
+            pcap_path="/var/lib/spatiumddi/pcaps/x.pcap",
+            pcap_size_bytes=100,
+            pcap_sha256="0" * 64,
+            packet_count=3,
+            metadata=None,
+            error=None,
+        )
+    await db_session.refresh(cap)
+    assert cap.artifact_node == "node-a"
