@@ -541,7 +541,9 @@ suggestion, free-space treemap.
   field on the role assignment. Deferred: DoH-upstream (BIND has no
   client-side HTTP transport — needs the dnsdist path), per-forwarder TLS
   hostnames (one per group today, so mixed providers need one group each),
-  DoQ, and a k8s dnsdist front to unblock PowerDNS DoT/DoH off compose.
+  and a k8s dnsdist front to unblock PowerDNS DoT/DoH off compose. DoQ
+  shipped on Technitium (#741); on BIND9 / PowerDNS it is tracked in
+  [#2886](https://github.com/spatiumnorth/spatiumddi/issues/2886).
   Not to be confused with `PlatformSettings.resolver_dns_over_tls`, which
   is the appliance host's own systemd-resolved stub resolver.
 

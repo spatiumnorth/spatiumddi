@@ -1606,7 +1606,8 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Report which DNS server groups serve DNS-over-TLS (DoT) or "
-        "DNS-over-HTTPS (DoH) to clients, and which forward to their "
+        "DNS-over-HTTPS (DoH) to clients (and DNS-over-QUIC, DoQ, on "
+        "Technitium groups), and which forward to their "
         "upstream resolvers over TLS instead of plaintext port 53 "
         "(issue #50). Returns per group: the listener toggles + ports + "
         "DoH URL path, whether a usable TLS certificate is actually linked "
@@ -1665,6 +1666,8 @@ async def find_dns_encrypted_transports(
                 "doh_enabled": opts.doh_enabled,
                 "doh_port": opts.doh_port,
                 "doh_path": opts.doh_path,
+                "doq_enabled": opts.doq_enabled,
+                "doq_port": opts.doq_port,
                 "tls_certificate_name": cert_name,
                 "tls_certificate_usable": cert_usable,
                 # The honest answer to "is it actually serving?" — the agent

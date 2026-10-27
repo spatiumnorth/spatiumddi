@@ -437,3 +437,34 @@ async def test_delete_cert_linked_but_listeners_off_succeeds(
 
     r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
     assert r.status_code == 204, r.text
+
+
+# ── MCP read tool (#2887) ───────────────────────────────────────────────
+
+
+async def test_find_dns_encrypted_transports_reports_doq(db_session: AsyncSession) -> None:
+    """The copilot read must carry the DoQ toggle + port, like dot_* / doh_*."""
+    from app.services.ai.tools.dns import (  # noqa: PLC0415
+        FindDNSEncryptedTransportsArgs,
+        find_dns_encrypted_transports,
+    )
+
+    user = User(
+        username=f"sa-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@t.io",
+        display_name="sa",
+        hashed_password=hash_password("password123"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    group = await _group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, doq_enabled=True, doq_port=8853))
+    await db_session.flush()
+
+    out = await find_dns_encrypted_transports(
+        db_session, user, FindDNSEncryptedTransportsArgs(group_id=str(group.id))
+    )
+    assert out["count"] == 1
+    row = out["groups"][0]
+    assert row["doq_enabled"] is True
+    assert row["doq_port"] == 8853
