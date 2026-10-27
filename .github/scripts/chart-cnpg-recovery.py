@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Refuse a render whose CNPG WAL can fill the volume (#2317), whose
 replicated Cluster restarts its primary in place on a rolling update (#2831),
-or whose supervisor cannot re-clone a stuck instance (#2132).
+whose supervisor cannot re-clone a stuck instance (#2132), or whose smart
+shutdown is left unbounded (#2878).
 
-Three checks of one recovery story, on the rendered manifests:
+Four checks of one recovery story, on the rendered manifests:
 
 * **Every CloudNativePG ``Cluster`` bounds the WAL it keeps (#2317).** After a
   failover the new primary holds CNPG's HA replication slots for standbys that
@@ -42,6 +43,14 @@ Three checks of one recovery story, on the rendered manifests:
   database. ``switchover`` promotes an updated replica first. A Cluster of
   one instance has no replica and is not held to this.
 
+* **Every Cluster bounds its smart shutdown (#2878).** One instance has no
+  replica to switch over to, so a rolling update restarts it in place (a
+  demote to one node moves the Postgres limit, #2156), and nothing new
+  reaches the database until ``smartShutdownTimeout`` runs out. Left unset
+  that is CNPG's 180 s. The check asks for a whole number of seconds no
+  larger than ``SMART_SHUTDOWN_MAX_S``, at every instance count, so the
+  bound is already on the Cluster when a demote leaves it one instance.
+
 ``--require-cluster`` / ``--require-supervisor-role`` fail a render that has
 no Cluster / no such Role, so a render cannot pass by rendering nothing.
 
@@ -74,6 +83,9 @@ _K8S_UNITS = {
     "T": 1000**4 / 1024**2,
 }
 _DEFAULTS_MB = {"wal_keep_size": 512.0, "max_wal_size": 1024.0}
+# #2878: the longest smart shutdown a Cluster may render, in seconds. The
+# chart's own value is 15; CNPG's default (180) is what this refuses.
+SMART_SHUTDOWN_MAX_S = 30
 
 
 def pg_size_mb(value: Any) -> float | None:
@@ -112,12 +124,30 @@ def check_primary_update(doc: dict) -> list[str]:
     return []
 
 
+def check_smart_shutdown(doc: dict) -> list[str]:
+    """#2878: the smart shutdown of an instance restarted in place is bounded."""
+    name = (doc.get("metadata") or {}).get("name", "?")
+    raw = (doc.get("spec") or {}).get("smartShutdownTimeout")
+    if raw is None:
+        shown = "unset (CNPG's default, 180 s)"
+    elif isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw <= SMART_SHUTDOWN_MAX_S:
+        return []
+    else:
+        shown = repr(raw)
+    return [
+        f"Cluster/{name}: smartShutdownTimeout {shown}; it must be 0 to "
+        f"{SMART_SHUTDOWN_MAX_S} s, or an instance restarted in place (one instance: a "
+        "single node, or a cluster demoted to one) turns every new connection away "
+        "for that long while the services' pooled sessions hold it (#2878)"
+    ]
+
+
 def check_cluster(doc: dict) -> list[str]:
     name = (doc.get("metadata") or {}).get("name", "?")
     where = f"Cluster/{name}"
     spec = doc.get("spec") or {}
     params = ((spec.get("postgresql") or {}).get("parameters")) or {}
-    problems: list[str] = check_primary_update(doc)
+    problems: list[str] = check_primary_update(doc) + check_smart_shutdown(doc)
 
     raw_cap = params.get("max_slot_wal_keep_size")
     cap = pg_size_mb(raw_cap) if raw_cap is not None else None
@@ -218,8 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     for line in problems:
         print(f"FAIL: {line}", file=sys.stderr)
     if not problems and (clusters or roles):
-        print(f"   cnpg recovery: {clusters} Cluster(s) bound pg_wal and switch over a "
-              f"replicated primary, {roles} supervisor Role(s) may re-clone")
+        print(f"   cnpg recovery: {clusters} Cluster(s) bound pg_wal, switch over a "
+              f"replicated primary and bound the smart shutdown, {roles} supervisor "
+              "Role(s) may re-clone")
     return 1 if problems else 0
 
 

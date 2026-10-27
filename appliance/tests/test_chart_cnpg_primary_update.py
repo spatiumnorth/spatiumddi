@@ -39,6 +39,8 @@ UMBRELLA = ROOT / "charts" / "spatiumddi"
 
 def _cluster(instances: int, method: str | None) -> str:
     line = f"\n  primaryUpdateMethod: {method}" if method is not None else ""
+    # The smart-shutdown bound (#2878) is the same script's other rule; these
+    # Clusters meet it, so each test here reads the #2831 rule alone.
     return textwrap.dedent(
         f"""\
         apiVersion: postgresql.cnpg.io/v1
@@ -47,6 +49,7 @@ def _cluster(instances: int, method: str | None) -> str:
           name: x-spatiumddi-postgresql
         spec:
           instances: {instances}{{line}}
+          smartShutdownTimeout: 15
           storage:
             size: 8Gi
           postgresql:
