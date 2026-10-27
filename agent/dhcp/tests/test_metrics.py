@@ -350,7 +350,9 @@ def _drive(tmp_path, monkeypatch, kea, socket_drops, v4_drops, arrivals):
         return total
 
     monkeypatch.setattr(p._socket, "sample", _sample)
-    arr_it = iter(arrivals)
+    # One (before, after) pair per tick: arrivals are read on both sides of
+    # Kea's snapshot. A tick whose Kea poll fails takes only the first.
+    arr_it = iter([v for pair in arrivals for v in pair])
     monkeypatch.setattr(p._arrivals, "sample", lambda: next(arr_it))
     real_wait = p._stop.wait
     ticks = {"n": 0}
@@ -382,7 +384,7 @@ def test_run_reports_queue_evicted_from_the_three_terms(tmp_path, monkeypatch):
         kea,
         socket_drops=[None, 0, 35, 0],  # 5 of the 35 are DHCPv6
         v4_drops=[None, 0, 30, 0],
-        arrivals=[None, 500, 1000, 100],
+        arrivals=[(None, 0), (500, 0), (1000, 0), (100, 0)],
     )
     assert [b["queue_evicted"] for b in sink] == [0, 0, 100]
     assert [b["socket_drop"] for b in sink] == [0, 35, 0]
@@ -397,7 +399,7 @@ def test_run_reports_queue_evicted_none_when_arrivals_unmeasured(tmp_path, monke
         kea,
         socket_drops=[None, 0],
         v4_drops=[None, 0],
-        arrivals=[None, None],
+        arrivals=[(None, None), (None, None)],
     )
     assert len(sink) == 1
     assert "queue_evicted" in sink[0]
@@ -421,7 +423,31 @@ def test_kea_restart_makes_the_bucket_after_it_unmeasured(tmp_path, monkeypatch)
         kea,
         socket_drops=[None, 0, 0, 0, 0],
         v4_drops=[None, 0, 0, 0, 0],
-        arrivals=[None, 100, 1000, 50, 50],
+        arrivals=[(None, 0), (100, 0), (1000, 0), (50, 0), (50, 0)],
     )
     # The restart bucket itself is not posted (``_compute_delta`` drops it).
     assert [b["queue_evicted"] for b in sink] == [0, 0, 0]
+
+
+def test_arrivals_are_carried_across_a_failed_kea_poll(tmp_path, monkeypatch):
+    """Kea's control socket did not answer for a tick: the next good tick
+    diffs Kea's counters across both minutes, so the arrivals read before
+    the failed poll must be counted in it too — or the gap reads as Kea
+    receiving more than arrived, and a real eviction after it is hidden."""
+    kea = [
+        {"discover": 0, "_received4": 0},
+        {"discover": 100, "_received4": 100},
+        None,  # control socket timed out
+        {"discover": 300, "_received4": 300},
+        {"discover": 400, "_received4": 340},  # 60 evicted
+        {"discover": 500, "_received4": 440},
+    ]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0, 0, 0, 0],
+        v4_drops=[None, 0, 0, 0, 0],
+        arrivals=[(None, 0), (100, 0), (100,), (100, 0), (100, 0), (100, 0)],
+    )
+    assert [b["queue_evicted"] for b in sink] == [0, 0, 0, 60]

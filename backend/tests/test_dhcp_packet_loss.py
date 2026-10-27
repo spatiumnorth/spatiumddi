@@ -600,10 +600,22 @@ async def test_unmeasured_evictions_neither_fire_nor_void_kernel_drops(
 ) -> None:
     """A server without a raw socket reports ``queue_evicted`` NULL. That must
     not stop its measured kernel drops firing the rule, and must not count."""
-    await _server_with_samples(db_session, [{"socket_drop": 9, "queue_evicted": None}])
+    srv = await _server_with_samples(
+        db_session, [{"socket_drop": 9, "queue_evicted": None, "discover": 40}]
+    )
     matches = await _matching_dhcp_packets_dropped_subjects(db_session, _rule())
     assert "lost 9 packet(s)" in matches[0][2]
     assert "evicted" not in matches[0][2]
+    # Byte-identical to the #980 message: an agent that cannot measure
+    # evictions must not change what an existing alert says.
+    assert matches[0][2] == (
+        f"DHCP server {srv.name} lost 9 packet(s) in the last 15 min: "
+        "the kernel discarded them because the server's receive buffer was "
+        "full, so it never read them. Usually means the node is short of "
+        "CPU. It answered 40 DISCOVER(s) over the same window, so every "
+        "server-side counter reads healthy — the loss is upstream of them and "
+        "costs each affected client a full retransmit round."
+    )
 
 
 async def test_alert_floor_counts_evictions(db_session: AsyncSession) -> None:

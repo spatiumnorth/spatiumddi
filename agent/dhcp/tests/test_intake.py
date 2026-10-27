@@ -25,7 +25,9 @@ from spatium_dhcp_agent.intake import (
     Insn,
     IntakeConfig,
     QueueEvictionEstimator,
+    Resolved,
     _PacketCountingSocket,
+    _resolve_intake,
     build_filter,
     kea_intake_config,
 )
@@ -46,8 +48,11 @@ def _run_bpf(prog: list[Insn], pkt: bytes, pkttype: int, ifindex: int) -> int:
             a = pkt[i.k]
         elif i.code == 0x28:  # ld h [k]
             a = struct.unpack_from("!H", pkt, i.k)[0]
-        elif i.code == 0x20:  # ld w [k] — only ancillary loads are emitted
-            a = {0xFFFFF004: pkttype, 0xFFFFF008: ifindex}[i.k]
+        elif i.code == 0x20:  # ld w [k] — ancillary, or a packet word
+            if i.k >= 0x80000000:
+                a = {0xFFFFF004: pkttype, 0xFFFFF008: ifindex}[i.k]
+            else:
+                a = struct.unpack_from("!I", pkt, i.k)[0]
         elif i.code == 0xB1:  # ldx 4*([k]&0xf)
             x = 4 * (pkt[i.k] & 0xF)
         elif i.code == 0x48:  # ld h [x+k]
@@ -62,7 +67,14 @@ def _run_bpf(prog: list[Insn], pkt: bytes, pkttype: int, ifindex: int) -> int:
             raise AssertionError(f"unexpected opcode {i.code:#x}")
 
 
-def _ipv4(proto: int = 17, dport: int = 67, frag: int = 0, ihl: int = 5) -> bytes:
+# The address kea serves from in these tests, and its integer form.
+KEA_ADDR = "10.0.0.2"
+KEA = (0x0A000002,)
+
+
+def _ipv4(
+    proto: int = 17, dport: int = 67, frag: int = 0, ihl: int = 5, dst: str = KEA_ADDR
+) -> bytes:
     opts = b"\0" * (4 * (ihl - 5))
     head = struct.pack(
         "!BBHHHBBH4s4s",
@@ -75,7 +87,7 @@ def _ipv4(proto: int = 17, dport: int = 67, frag: int = 0, ihl: int = 5) -> byte
         proto,
         0,
         b"\x0a\0\0\x01",
-        b"\x0a\0\0\x02",
+        socket.inet_aton(dst),
     )
     return head + opts + struct.pack("!HHHH", 68, dport, 8, 0)
 
@@ -85,7 +97,7 @@ def _accepts(prog, pkt=None, pkttype=HOST, ifindex=2) -> bool:
 
 
 def test_raw_mode_counts_unicast_and_broadcast_dhcp4():
-    prog = build_filter("raw", (2,), None)
+    prog = build_filter("raw", (2,), None, KEA)
     assert _accepts(prog, pkttype=HOST)
     assert _accepts(prog, pkttype=BROADCAST)
     assert not _accepts(prog, pkttype=MULTICAST)
@@ -96,13 +108,13 @@ def test_udp_mode_does_not_count_broadcasts():
     """Kea's UDP sockets are bound to interface addresses and never see a
     broadcast. Counting them would report every directly-attached client's
     DISCOVER as an eviction on a relay-mode server."""
-    prog = build_filter("udp", (2,), None)
+    prog = build_filter("udp", (2,), None, KEA)
     assert _accepts(prog, pkttype=HOST)
     assert not _accepts(prog, pkttype=BROADCAST)
 
 
 def test_only_dhcp4_server_port_first_fragment_udp():
-    prog = build_filter("raw", (2,), None)
+    prog = build_filter("raw", (2,), None, KEA)
     assert not _accepts(prog, _ipv4(dport=68))  # client port
     assert not _accepts(prog, _ipv4(dport=547))  # DHCPv6
     assert not _accepts(prog, _ipv4(proto=6))  # TCP/67
@@ -112,14 +124,14 @@ def test_only_dhcp4_server_port_first_fragment_udp():
 
 
 def test_only_kea_interfaces():
-    prog = build_filter("raw", (2, 5), None)
+    prog = build_filter("raw", (2, 5), None, KEA)
     assert _accepts(prog, ifindex=2)
     assert _accepts(prog, ifindex=5)
     assert not _accepts(prog, ifindex=3)
 
 
 def test_star_is_every_interface_but_loopback():
-    prog = build_filter("raw", None, 1)
+    prog = build_filter("raw", None, 1, KEA)
     assert _accepts(prog, ifindex=2)
     assert _accepts(prog, ifindex=77)
     assert not _accepts(prog, ifindex=1)
@@ -128,8 +140,45 @@ def test_star_is_every_interface_but_loopback():
 def test_no_existing_interface_counts_nothing():
     """Kea told to listen on interfaces that do not exist receives nothing,
     so nothing must be counted as having arrived for it."""
-    prog = build_filter("raw", (), None)
+    prog = build_filter("raw", (), None, KEA)
     assert not _accepts(prog, ifindex=2)
+
+
+def test_only_the_addresses_kea_serves_from():
+    """Kea's own LPF filter admits 255.255.255.255 and the interface's address
+    and nothing else. A packet for another address — a MetalLB relay VIP this
+    node announces and forwards to another node's Kea, or traffic routed
+    through the host — would otherwise count as an eviction on every bucket."""
+    raw = build_filter("raw", (2,), None, KEA)
+    assert _accepts(raw, _ipv4(dst=KEA_ADDR))
+    assert _accepts(raw, _ipv4(dst="255.255.255.255"), pkttype=BROADCAST)
+    assert not _accepts(raw, _ipv4(dst="192.0.2.50"))  # the VIP, or forwarded
+    assert not _accepts(raw, _ipv4(dst="10.0.0.255"), pkttype=BROADCAST)  # directed
+    udp = build_filter("udp", (2,), None, KEA)
+    assert _accepts(udp, _ipv4(dst=KEA_ADDR))
+    assert not _accepts(udp, _ipv4(dst="192.0.2.50"))
+    assert not _accepts(udp, _ipv4(dst="255.255.255.255"), pkttype=BROADCAST)
+
+
+def test_no_address_counts_only_broadcast_in_raw_mode():
+    assert not _accepts(build_filter("raw", (2,), None, ()), _ipv4(dst=KEA_ADDR))
+    assert not _accepts(build_filter("udp", (2,), None, ()), _ipv4(dst=KEA_ADDR))
+
+
+def test_resolve_intake_uses_pinned_addresses_and_drops_missing_interfaces():
+    lo = socket.if_nametoindex("lo")
+    got = _resolve_intake(IntakeConfig("raw", ("lo", "nope0"), (("lo", "127.0.0.9"),)))
+    assert got == Resolved((lo,), (0x7F000009,))
+    # Unpinned: the interface's own primary address.
+    assert _resolve_intake(IntakeConfig("raw", ("lo",))) == Resolved((lo,), (0x7F000001,))
+    assert _resolve_intake(IntakeConfig("raw", ("nope0",))) == Resolved((), ())
+
+
+def test_resolve_intake_star_skips_loopback():
+    got = _resolve_intake(IntakeConfig("raw", ("*",)))
+    assert got is not None
+    assert socket.if_nametoindex("lo") not in got.ifindexes
+    assert 0x7F000001 not in got.addresses
 
 
 def test_real_kernel_counts_dhcp4_on_loopback():
@@ -137,7 +186,7 @@ def test_real_kernel_counts_dhcp4_on_loopback():
     socket cannot be opened (no CAP_NET_RAW — CI runs unprivileged)."""
     lo = socket.if_nametoindex("lo")
     try:
-        counter = _PacketCountingSocket(build_filter("raw", (lo,), None))
+        counter = _PacketCountingSocket(build_filter("raw", (lo,), None, (0x7F000001,)))
     except OSError as e:
         pytest.skip(f"AF_PACKET unavailable here: {e}")
     try:
@@ -174,7 +223,7 @@ def test_intake_config_defaults_and_address_suffix(tmp_path):
     got = kea_intake_config(
         _write(tmp_path, {"interfaces": ["eth0/192.0.2.1", "eth1"], "dhcp-socket-type": "udp"})
     )
-    assert got == IntakeConfig("udp", ("eth0", "eth1"))
+    assert got == IntakeConfig("udp", ("eth0", "eth1"), (("eth0", "192.0.2.1"),))
 
 
 def test_intake_config_unknown_is_none(tmp_path):
@@ -210,7 +259,9 @@ def test_arrivals_first_sample_after_open_is_unmeasured():
         opened.append(s)
         return s
 
-    c = ArrivalCounter(lambda: IntakeConfig("raw", ("eth0",)), opener, lambda n: (2,))
+    c = ArrivalCounter(
+        lambda: IntakeConfig("raw", ("eth0",)), opener, lambda cfg: Resolved((2,), KEA)
+    )
     assert c.sample() is None  # the window began part-way through
     assert c.sample() == 40
     assert c.sample() == 7
@@ -218,7 +269,7 @@ def test_arrivals_first_sample_after_open_is_unmeasured():
 
 
 def test_arrivals_reopen_when_interfaces_change():
-    ifaces = {"v": (2,)}
+    ifaces = {"v": Resolved((2,), KEA)}
     opened = []
 
     def opener(prog):
@@ -226,11 +277,14 @@ def test_arrivals_reopen_when_interfaces_change():
         opened.append(s)
         return s
 
-    c = ArrivalCounter(lambda: IntakeConfig("raw", ("eth0",)), opener, lambda n: ifaces["v"])
+    c = ArrivalCounter(lambda: IntakeConfig("raw", ("eth0",)), opener, lambda cfg: ifaces["v"])
     assert c.sample() is None
     assert c.sample() == 10
-    ifaces["v"] = (2, 3)
+    ifaces["v"] = Resolved((2, 3), KEA)
     assert c.sample() is None  # a different set of interfaces: a new window
+    assert c.sample() == 10
+    ifaces["v"] = Resolved((2, 3), (0x0A000003,))
+    assert c.sample() is None  # a renumbered interface: a new window
     assert opened[0].closed
     assert c.sample() == 10
 
@@ -239,7 +293,15 @@ def test_arrivals_without_net_raw_are_unmeasured_not_zero():
     def opener(prog):
         raise PermissionError(1, "Operation not permitted")
 
-    c = ArrivalCounter(lambda: IntakeConfig("raw", ("*",)), opener, lambda n: None, lambda: 1)
+    c = ArrivalCounter(lambda: IntakeConfig("raw", ("*",)), opener, lambda cfg: Resolved((2,), KEA))
+    assert c.sample() is None
+    assert c.sample() is None
+
+
+def test_arrivals_unresolvable_interfaces_are_unmeasured():
+    c = ArrivalCounter(
+        lambda: IntakeConfig("raw", ("*",)), lambda prog: _ScriptedSocket([1]), lambda cfg: None
+    )
     assert c.sample() is None
     assert c.sample() is None
 
@@ -252,7 +314,9 @@ def test_arrivals_without_kea4_config_are_unmeasured():
 def test_arrivals_read_failure_is_unmeasured_and_reopens():
     socks = [_ScriptedSocket([5, OSError("boom")]), _ScriptedSocket([9])]
     c = ArrivalCounter(
-        lambda: IntakeConfig("raw", ("eth0",)), lambda prog: socks.pop(0), lambda n: (2,)
+        lambda: IntakeConfig("raw", ("eth0",)),
+        lambda prog: socks.pop(0),
+        lambda cfg: Resolved((2,), KEA),
     )
     assert c.sample() is None
     assert c.sample() == 5
@@ -334,3 +398,77 @@ def test_a_baseline_taken_mid_backlog_does_not_hide_later_eviction():
     )
     assert out[-1] == 200
     assert sum(out) == 200
+
+
+# ── read skew: arrivals bracketed around Kea's snapshot ─────────────────────
+
+
+def _bracketed(true_x, lows, highs):
+    """Per-bucket inputs for a server whose cumulative remainder at Kea's
+    snapshot is ``true_x[k]``, read with ``lows[k]`` packets that arrived after
+    the first arrivals read already counted received, and ``highs[k]``
+    arriving between the snapshot and the second read."""
+    rows = []
+    prev_u = 0
+    for x, lo, hi in zip(true_x, lows, highs, strict=True):
+        lower = x - lo
+        upper = x + hi
+        received = 1000
+        rows.append((lower - prev_u + received, 0, received, upper - lower))
+        prev_u = upper
+    return rows
+
+
+def test_read_skew_is_never_loss_at_any_rate():
+    """The defect the single-read estimator had: with arrivals read on ONE
+    side of Kea's snapshot, the packets arriving in between are a bump or a
+    dip at every read, and a low-low-high-high run re-reported the bump after
+    the mark followed the lows down. Simulated at that time, a mean of 0.2
+    packets of skew per read raised the default-on alert in 35 of 96
+    15-minute windows a day. Bracketed, no amount of skew is loss."""
+    import random
+
+    rng = random.Random(2889)
+    for lam in (1, 5, 50, 500):
+        n = 1440
+        lows = [rng.randint(0, lam) for _ in range(n)]
+        highs = [rng.randint(0, lam) for _ in range(n)]
+        out = _feed(_bracketed([0] * n, lows, highs))
+        assert sum(out) == 0, lam
+
+
+def test_the_old_false_alarm_pattern_is_quiet():
+    """low, low, high, high, low, low, high, high — the shape that made the
+    one-sided estimator report the same few packets again on every cycle."""
+    lows = [0] * 12
+    highs = [0, 0, 3, 3, 0, 0, 3, 3, 0, 0, 3, 3]
+    assert sum(_feed(_bracketed([0] * 12, lows, highs))) == 0
+
+
+def test_eviction_under_read_skew_is_counted_once():
+    import random
+
+    rng = random.Random(7)
+    n = 60
+    true_x = [0] * 20 + [250] * 40  # 250 evicted at bucket 20
+    lows = [rng.randint(0, 20) for _ in range(n)]
+    highs = [rng.randint(0, 20) for _ in range(n)]
+    out = _feed(_bracketed(true_x, lows, highs))
+    assert 210 <= sum(out) <= 250  # skew can only make it lower
+    assert sum(out[:21]) == 0
+
+
+def test_uncounted_arrivals_only_lower_the_estimate():
+    """Kea reads 30 a minute the filter never sees (a path it does not
+    count): the remainder falls forever. That must never read as loss."""
+    out = _feed([(970, 0, 1000)] * 30)
+    assert sum(out) == 0
+    # ... and a real eviction during it is still not overstated.
+    out = _feed([(970, 0, 1000)] * 10 + [(1500, 0, 1000)] + [(970, 0, 1000)] * 10)
+    assert 0 <= sum(out) <= 500
+
+
+def test_unmeasured_during_read_is_unmeasured():
+    est = QueueEvictionEstimator()
+    assert est.update(100, 0, 100, 3) == 0
+    assert est.update(100, 0, 100, None) is None

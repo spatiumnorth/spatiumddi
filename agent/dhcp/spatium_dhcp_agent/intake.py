@@ -45,31 +45,39 @@ of Kea's counters, and works on every deployment where the agent has
 ``CAP_NET_RAW`` and sees the host's interfaces — not only on the appliance.
 
 **What is counted** (see :func:`build_filter`): IPv4 UDP to port 67, first
-fragment only, arriving (not sent) on an interface Kea serves, and
+fragment only, arriving (not sent) on an interface Kea serves, addressed to
+an address Kea serves from, and
 
-* ``raw`` mode (the default, #365): unicast to this host or broadcast —
-  Kea's AF_PACKET socket reads both;
-* ``udp`` mode: unicast to this host only. Kea's UDP sockets are bound to
-  interface addresses and never see a broadcast.
+* ``raw`` mode (the default, #365): unicast to one of those addresses, or to
+  255.255.255.255 — the two destinations Kea's own LPF filter admits (it
+  patches the interface address into its program, and drops anything else);
+* ``udp`` mode: unicast to one of those addresses only. Kea's UDP sockets
+  are bound to interface addresses and never see a broadcast.
 
-Unknown mode, or no kea-dhcp4 config at all, is unmeasured (``None``).
+The destination check matters on any host that receives udp/67 for an
+address Kea is not serving: with a MetalLB relay VIP (#272) and
+``externalTrafficPolicy: Cluster`` the announcing node receives every relayed
+request addressed to the VIP and forwards most of them to another node's
+Kea, so counting by MAC alone (``PACKET_HOST``) would report all of them as
+evicted on the node that only forwarded them.
 
-**Arithmetic** (see :class:`QueueEvictionEstimator`). A per-bucket
-``arrived - socket_drop - received`` is not the answer by itself, because
-the three are read at slightly different instants and because a packet
-still queued at the read is counted as arrived and not yet as anything
-else. Both effects move counts between ADJACENT buckets and cancel in the
-running sum; eviction is the part of that sum that never comes back down.
-So the estimator reports only increases of the running sum that the NEXT
-sample confirms, against a high-water mark: a transient dip is never
-reported as negative loss, a transient bump (a backlog in flight at the
-read) is never reported as loss, and nothing is reported twice. The price
-is that an eviction lands in the bucket after the one it happened in.
+Unknown mode, no kea-dhcp4 config at all, or interfaces that cannot be
+resolved, is unmeasured (``None``).
+
+**Arithmetic** (see :class:`QueueEvictionEstimator`). Kea's counters are one
+snapshot taken inside Kea at some instant ``t_s``; the arrivals cannot be read
+at that same instant. So they are read on BOTH sides of it — once before the
+``statistic-get-all`` command is sent, once after the reply (and the socket
+drops) are in — which brackets the true remainder at ``t_s`` between a lower
+and an upper bound. Read-ordering skew can then never be mistaken for an
+eviction, at any packet rate: evictions are confirmed only from the lower
+bound, the baseline is only ever lowered from the upper one.
 """
 
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import json
 import os
 import socket
@@ -104,9 +112,12 @@ _RET_K = 0x06
 _SKF_AD_PKTTYPE = (-0x1000 + 4) & 0xFFFFFFFF
 _SKF_AD_IFINDEX = (-0x1000 + 8) & 0xFFFFFFFF
 
-# One jump offset is a u8. An interface list longer than this cannot be
-# expressed as a chain of compares to one accept, and is treated as "*".
+# One jump offset is a u8, so neither the interface nor the address chain can
+# be longer than this. More than that (a host with hundreds of addressed
+# interfaces) is reported unmeasured rather than approximated.
 MAX_FILTER_IFACES = 200
+_IPV4_BROADCAST = 0xFFFFFFFF
+_SIOCGIFADDR = 0x8915
 
 _STATS = struct.Struct("=II")  # struct tpacket_stats: tp_packets, tp_drops
 
@@ -125,6 +136,9 @@ class IntakeConfig(NamedTuple):
 
     mode: str  # "raw" | "udp"
     interfaces: tuple[str, ...]  # names; ("*",) = every interface
+    # ``(iface, address)`` for the entries written as kea's ``iface/address``
+    # form: kea serves from exactly that address on that interface.
+    pinned: tuple[tuple[str, str], ...] = ()
 
 
 def kea_intake_config(path: str | os.PathLike[str]) -> IntakeConfig | None:
@@ -132,8 +146,9 @@ def kea_intake_config(path: str | os.PathLike[str]) -> IntakeConfig | None:
 
     ``None`` means unknown: no file (a v6-only server has no kea-dhcp4
     config), unparseable, or a mode kea does not have. Interface entries
-    may be ``"<iface>/<address>"`` (kea's per-address form); only the
-    interface name matters here. An absent list is ``*``, kea's default.
+    may be ``"<iface>/<address>"`` (kea's per-address form): the name goes in
+    ``interfaces``, the pair in ``pinned``. An absent list is ``*``, kea's
+    default.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -141,21 +156,30 @@ def kea_intake_config(path: str | os.PathLike[str]) -> IntakeConfig | None:
         iface = doc["Dhcp4"].get("interfaces-config") or {}
         mode = iface.get("dhcp-socket-type", "raw")
         raw_names = iface.get("interfaces") or ["*"]
-        names = tuple(str(n).split("/", 1)[0] for n in raw_names)
+        entries = [str(n).split("/", 1) for n in raw_names]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
     if mode not in ("raw", "udp"):
         return None
-    return IntakeConfig(mode, names)
+    names = tuple(e[0] for e in entries)
+    pinned = tuple((e[0], e[1]) for e in entries if len(e) == 2)
+    return IntakeConfig(mode, names, pinned)
 
 
-def build_filter(mode: str, ifindexes: tuple[int, ...] | None, loopback: int | None) -> list[Insn]:
+def build_filter(
+    mode: str,
+    ifindexes: tuple[int, ...] | None,
+    loopback: int | None,
+    addresses: tuple[int, ...],
+) -> list[Insn]:
     """The classic-BPF program counting DHCPv4 server-bound arrivals.
 
     Runs on an ``AF_PACKET``/``SOCK_DGRAM`` socket, so offset 0 is the IPv4
     header. ``ifindexes=None`` means every interface except ``loopback``;
     a tuple means exactly those interfaces (possibly none: kea was told to
     listen on interfaces that do not exist, so nothing can reach it).
+    ``addresses`` are the IPv4 destinations kea serves from, as integers; a
+    packet to any other address is not counted (see the module docstring).
     """
     prog: list[tuple[int, object, object, int]] = []  # jt/jf: int or label
 
@@ -171,11 +195,18 @@ def build_filter(mode: str, ifindexes: tuple[int, ...] | None, loopback: int | N
     emit(_JEQ_K, DHCP4_SERVER_PORT, 0, "reject")
     emit(_LD_W_ABS, _SKF_AD_PKTTYPE)
     if mode == "raw":
-        emit(_JEQ_K, _PACKET_HOST, "iface", 0)
-        emit(_JEQ_K, _PACKET_BROADCAST, "iface", "reject")
+        emit(_JEQ_K, _PACKET_HOST, "dst", 0)
+        emit(_JEQ_K, _PACKET_BROADCAST, "dst", "reject")
     else:
-        emit(_JEQ_K, _PACKET_HOST, "iface", "reject")
-    labels = {"iface": len(prog)}
+        emit(_JEQ_K, _PACKET_HOST, "dst", "reject")
+    labels = {"dst": len(prog)}
+    emit(_LD_W_ABS, 16)  # IPv4 destination address
+    if mode == "raw":
+        emit(_JEQ_K, _IPV4_BROADCAST, "iface", 0)
+    for addr in addresses:
+        emit(_JEQ_K, addr, "iface", 0)
+    emit(_RET_K, 0)
+    labels["iface"] = len(prog)
     emit(_LD_W_ABS, _SKF_AD_IFINDEX)
     if ifindexes is None:
         if loopback is None:
@@ -255,31 +286,66 @@ class _PacketCountingSocket:
         self._sock.close()
 
 
-def _resolve_ifindexes(names: tuple[str, ...]) -> tuple[int, ...] | None:
-    """Interface names -> ifindexes; ``None`` for ``*`` (all but loopback).
+def _ipv4_of(name: str) -> int | None:
+    """The primary IPv4 address of interface ``name`` (``SIOCGIFADDR``).
 
-    A listed interface that does not exist is left out, which is right: kea
-    cannot listen on it either. The tuple is sorted so a re-resolve that
-    finds the same interfaces compares equal.
+    The primary address is the one kea's raw socket serves from when the
+    config does not pin one. ``None`` when the interface has none — kea does
+    not open a DHCPv4 socket on such an interface at all.
     """
-    if "*" in names:
-        return None
-    found: set[int] = set()
-    for name in names:
-        try:
-            found.add(socket.if_nametoindex(name))
-        except OSError:
-            continue
-    if len(found) > MAX_FILTER_IFACES:
-        return None
-    return tuple(sorted(found))
-
-
-def _loopback_ifindex() -> int | None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        return socket.if_nametoindex("lo")
+        req = struct.pack("256s", name.encode()[:15])
+        res = fcntl.ioctl(sock.fileno(), _SIOCGIFADDR, req)
     except OSError:
         return None
+    finally:
+        sock.close()
+    return int(struct.unpack_from("!I", res, 20)[0])
+
+
+class Resolved(NamedTuple):
+    ifindexes: tuple[int, ...]
+    addresses: tuple[int, ...]
+
+
+def _resolve_intake(cfg: IntakeConfig) -> Resolved | None:
+    """Kea's interfaces -> the ifindexes and addresses it serves on.
+
+    ``*`` is every non-loopback interface that has an IPv4 address. A listed
+    interface that does not exist, or has no IPv4 address, is left out,
+    which is right: kea cannot serve DHCPv4 on it either. ``None`` (so:
+    unmeasured) when there are more of either than a filter can express.
+    Both tuples are sorted so a re-resolve that finds the same interfaces
+    compares equal.
+    """
+    pinned = dict(cfg.pinned)
+    if "*" in cfg.interfaces:
+        names = [n for _i, n in socket.if_nameindex() if n != "lo"]
+    else:
+        names = list(dict.fromkeys(cfg.interfaces))
+    found: set[int] = set()
+    addrs: set[int] = set()
+    for name in names:
+        try:
+            idx = socket.if_nametoindex(name)
+        except OSError:
+            continue
+        addr: int | None
+        if name in pinned:
+            try:
+                addr = int.from_bytes(socket.inet_aton(pinned[name]), "big")
+            except OSError:
+                addr = None
+        else:
+            addr = _ipv4_of(name)
+        if addr is None:
+            continue
+        found.add(idx)
+        addrs.add(addr)
+    if len(found) > MAX_FILTER_IFACES or len(addrs) > MAX_FILTER_IFACES:
+        return None
+    return Resolved(tuple(sorted(found)), tuple(sorted(addrs)))
 
 
 class ArrivalCounter:
@@ -287,8 +353,8 @@ class ArrivalCounter:
 
     ``config`` returns kea-dhcp4's intake as rendered (re-read every
     sample). The counting socket is (re)opened whenever that — or the
-    interfaces it resolves to — changes, and the sample that opens it is
-    ``None``: the window it would cover started part-way through.
+    interfaces and addresses it resolves to — changes, and the sample that
+    opens it is ``None``: the window it would cover started part-way through.
 
     ``None`` throughout when the socket cannot be opened, which is the
     normal answer on a deployment that does not grant ``CAP_NET_RAW``: it
@@ -300,13 +366,11 @@ class ArrivalCounter:
         self,
         config: Callable[[], IntakeConfig | None],
         opener: Callable[[list[Insn]], _CountingSocket] = _PacketCountingSocket,
-        resolve: Callable[[tuple[str, ...]], tuple[int, ...] | None] = _resolve_ifindexes,
-        loopback: Callable[[], int | None] = _loopback_ifindex,
+        resolve: Callable[[IntakeConfig], Resolved | None] = _resolve_intake,
     ) -> None:
         self._config = config
         self._opener = opener
         self._resolve = resolve
-        self._loopback = loopback
         self._sock: _CountingSocket | None = None
         self._key: tuple[object, ...] | None = None
         self._open_failed_key: tuple[object, ...] | None = None
@@ -325,12 +389,11 @@ class ArrivalCounter:
 
     def sample(self) -> int | None:
         cfg = self._config()
-        if cfg is None:
+        resolved = None if cfg is None else self._resolve(cfg)
+        if cfg is None or resolved is None:
             self._close()
             return None
-        ifindexes = self._resolve(cfg.interfaces)
-        loopback = self._loopback() if ifindexes is None else None
-        key = (cfg.mode, ifindexes, loopback)
+        key = (cfg.mode, resolved.ifindexes, resolved.addresses)
         if self._sock is not None and key == self._key:
             try:
                 return self._sock.read_and_clear()
@@ -340,7 +403,9 @@ class ArrivalCounter:
                 return None
         self._close()
         try:
-            self._sock = self._opener(build_filter(cfg.mode, ifindexes, loopback))
+            self._sock = self._opener(
+                build_filter(cfg.mode, resolved.ifindexes, None, resolved.addresses)
+            )
         except OSError as e:
             # Logged once per configuration, not every minute: on a
             # deployment without CAP_NET_RAW this is the steady state.
@@ -356,60 +421,90 @@ class ArrivalCounter:
 class QueueEvictionEstimator:
     """Per-bucket requests evicted from Kea's packet queue (#2889).
 
-    Fed one bucket at a time with the three DHCPv4 deltas over the same
-    interval. Any of them ``None`` (unmeasured, a Kea restart, the counting
-    socket reopened) returns ``None`` and restarts the baseline, because the
-    running sum below is only meaningful over an unbroken run of intervals.
+    Fed once per bucket with the DHCPv4 deltas over the same interval:
+    ``arrived`` (arrivals read just BEFORE Kea's counters were requested),
+    ``socket_drop`` and ``received`` (Kea's snapshot, at some instant
+    ``t_s``), and ``arrived_during`` (arrivals between that first read and
+    one taken just AFTER the reply). Any of them ``None`` (unmeasured, a Kea
+    restart, the counting socket reopened) returns ``None`` and restarts the
+    baseline, because the sums below are only meaningful over an unbroken
+    run of intervals.
 
-    ``e = arrived - socket_drop - received`` for one bucket is eviction plus
-    noise that moves between adjacent buckets: a packet read by the worker
-    a moment before the arrivals were read is counted in this bucket's
-    ``received`` and the next bucket's ``arrived``, and a packet still
-    queued at the read is counted in this bucket's ``arrived`` and the next
-    bucket's ``received``. In the running sum ``S`` that noise is a dip or a
-    bump at one sample which the next sample undoes; eviction is a step
-    that stays. So:
+    Let ``X(t)`` be arrivals - socket drops - received, cumulatively: every
+    eviction so far, plus whatever is in flight (queued, or in Kea's socket
+    buffer) at ``t``. It is never read at one instant, but it is bracketed:
 
-    * ``settled = min(S[prev], S[now])`` — a value the next sample has
-      confirmed. A bump present at only one sample never gets into it.
-    * Only ``settled`` above the high-water mark of everything already
-      reported is reported. A dip followed by its recovery reports nothing,
-      so nothing is counted twice and nothing is ever negative.
-    * If the sum stays below the mark for two samples in a row it is not
-      a one-sample dip but a level shift — the baseline started with a
-      backlog in flight, or arrivals are counted that Kea never reads — and
-      the mark follows it down. Otherwise every later eviction up to the
-      size of the shift would be absorbed silently.
+    * ``L`` (arrivals as of the first read) ``<= X(t_s)`` — a packet that
+      arrived after that read may already be counted received;
+    * ``U`` (arrivals as of the second read) ``>= X(t_s)`` — every packet
+      Kea had received by ``t_s`` arrived before the second read, and a
+      socket drop is only ever of a packet arriving in the same window.
 
-    The cost is a one-bucket lag: an eviction is reported by the sample
-    after the one that first saw it. Under a backlog that outlasts two
-    samples in a row the in-flight count is confirmed with it, overstating
-    by at most the queue's depth once — under exactly the sustained
-    overload in which the queue is evicting anyway.
+    Evictions only ever rise. So:
+
+    * an eviction is confirmed from the LOWER bound held at two reads in a
+      row (``min(L[prev], L[now])``), so a backlog in flight at one read is
+      never loss and read skew can only make the estimate lower;
+    * the zero point is the lowest UPPER bound held at two reads in a row,
+      which is never below the true baseline (``U`` never is), so a baseline
+      taken mid-backlog is corrected as the backlog drains without any
+      packet of read skew ever being turned into loss;
+    * the reported total is a high-water mark: reported once, never
+      negative, and never re-reported when the inputs move down and back.
+
+    That bounds the false part of the total, over the whole baseline, by the
+    largest backlog still in flight at two consecutive reads (a minute
+    apart), which needs sustained overload. A delivery path that counts
+    fewer arrivals than Kea receives (traffic Kea reads that the filter does
+    not see) only ever lowers the estimate. The cost is a one-bucket lag: an
+    eviction is reported by the sample after the one that first saw it.
     """
 
     def __init__(self) -> None:
-        self._sum: int | None = None
-        self._mark = 0
+        self._u: int | None = None  # last upper bound; None = no baseline
+        self._prev_l: int | None = None
+        self._prev_u = 0
+        self._zero = 0
+        self._confirmed: int | None = None
+        self._reported = 0
 
     def update(
-        self, arrived: int | None, socket_drop: int | None, received: int | None
+        self,
+        arrived: int | None,
+        socket_drop: int | None,
+        received: int | None,
+        arrived_during: int | None = 0,
     ) -> int | None:
-        if arrived is None or socket_drop is None or received is None:
-            self._sum = None
+        if arrived is None or socket_drop is None or received is None or arrived_during is None:
+            self._u = None
             return None
-        if self._sum is None:
-            self._sum = 0
-            self._mark = 0
-        prev = self._sum
-        now = prev + arrived - socket_drop - received
-        self._sum = now
-        settled = min(prev, now)
-        out = max(0, settled - self._mark)
-        if settled > self._mark:
-            self._mark = settled
-        elif prev < self._mark and now < self._mark:
-            self._mark = max(prev, now)
+        if self._u is None:
+            # The previous read is the zero point. It is an upper-bound
+            # read, so it can only overstate the baseline.
+            self._u = 0
+            self._prev_l = None
+            self._prev_u = 0
+            self._zero = 0
+            self._confirmed = None
+            self._reported = 0
+        lower = self._u + arrived - socket_drop - received
+        upper = lower + arrived_during
+        self._zero = min(self._zero, max(self._prev_u, upper))
+        if self._prev_l is not None:
+            pair = min(self._prev_l, lower)
+            self._confirmed = pair if self._confirmed is None else max(self._confirmed, pair)
+        if self._confirmed is not None and upper < self._confirmed:
+            # Nothing is evicted after the fact: an upper bound below what
+            # was confirmed means the confirmation was a backlog, or traffic
+            # Kea reads that is not counted. Either way the confirmed level
+            # was too high, and holding it would turn the gap into loss.
+            self._confirmed = upper
+        self._prev_l = lower
+        self._prev_u = upper
+        self._u = upper
+        total = 0 if self._confirmed is None else max(0, self._confirmed - self._zero)
+        out = max(0, total - self._reported)
+        self._reported = max(self._reported, total)
         return out
 
 
@@ -419,6 +514,7 @@ __all__ = [
     "Insn",
     "IntakeConfig",
     "QueueEvictionEstimator",
+    "Resolved",
     "build_filter",
     "kea_intake_config",
     "pack_filter",

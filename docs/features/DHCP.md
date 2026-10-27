@@ -1124,10 +1124,16 @@ fingerprint sniffer, so nothing new is granted. The filter counts:
 
 - IPv4, UDP, destination port 67, first fragment only;
 - received, not sent, on an interface in Kea's `interfaces` (`*` = every
-  interface except loopback);
-- in `raw` mode, unicast to this host **and** broadcast. In `udp` mode
-  (`dhcp_socket_mode: relay`) unicast only, because Kea's UDP sockets are
-  bound to interface addresses and never see a broadcast.
+  interface except loopback) that has an IPv4 address;
+- addressed to the address Kea serves from on those interfaces (the
+  interface's primary address, or the one pinned as `iface/address`) —
+  in `raw` mode also to 255.255.255.255. Those are the only destinations
+  Kea's own raw-socket filter admits. Without this check, a node that
+  announces a MetalLB relay VIP (#272) and forwards most of the relayed
+  requests to another node's Kea would count every one of them as
+  evicted;
+- in `udp` mode (`dhcp_socket_mode: relay`) unicast only, because Kea's
+  UDP sockets are bound to interface addresses and never see a broadcast.
 
 > **Why not an nftables counter.** The issue proposed one on the
 > appliance. Reading it needs `CAP_NET_ADMIN`, which neither the DHCP pod
@@ -1141,24 +1147,32 @@ fingerprint sniffer, so nothing new is granted. The filter counts:
 > agent avoids all of that, works on Compose and Kubernetes as well as on
 > the appliance, and reads within microseconds of Kea's counters.
 
-*The arithmetic.* The three counters are read one after the other, so
-the per-bucket remainder also carries two kinds of noise. A request still
-waiting in the queue at the moment of the read counts as arrived but not
-yet as received. A request served just before the arrivals were read
-lands in the next bucket's arrivals. Both move counts between
-**adjacent** buckets and cancel in the running sum. An eviction is the
-part of the sum that never comes back down. So the agent reports only a
-rise in that sum that the next sample confirms, against a high-water mark
-of what it has already reported. The effects:
+*The arithmetic.* Kea's counters are one snapshot, taken inside Kea at
+some instant, and the arrivals cannot be read at that same instant. A
+single read on one side of it is not good enough: on a server with steady
+traffic the packets that arrive in between make the remainder wobble by a
+few packets at every read, and an estimator fed that wobble reports some
+of it as eviction. Simulated, a mean of 0.2 packets of skew per read was
+enough to raise the default-on alert in a third of the day's 15-minute
+windows. So the agent reads the arrivals **twice**, once before it sends
+`statistic-get-all` and once after the reply and the socket drops are in.
+That brackets the remainder at Kea's snapshot between a lower and an
+upper bound:
 
-- a backlog in flight at one read is never reported as loss, so the
-  default-on alert does not fire on a burst Kea absorbed;
-- the count is never negative and never reported twice;
-- an eviction lands in the bucket **after** the one it happened in.
+- an eviction is confirmed only from the **lower** bound, and only once it
+  has held at two reads in a row, so a backlog in flight at one read is
+  never loss and read skew can only make the count lower;
+- the zero point is moved down only from the **upper** bound, so a
+  baseline taken while a backlog was in flight is corrected as it drains,
+  without any skew turning into loss;
+- what is reported is a high-water mark: never negative, never reported
+  twice, and an eviction lands in the bucket **after** the one it happened
+  in.
 
-Under a backlog that is still there at two reads in a row, up to one
-queue's depth can be confirmed with it, once. That only happens under
-sustained overload, while the queue is evicting anyway.
+The only way left to over-report is a backlog still in flight at two reads
+a minute apart, which needs sustained overload, and that is bounded by one
+queue's depth for the life of the baseline. A delivery path on which Kea
+receives packets the filter does not count can only lower the estimate.
 
 *NULL is unmeasured, as everywhere above.* `queue_evicted` is NULL when
 the agent cannot open the raw socket (no `CAP_NET_RAW`), on a DHCPv6-only
@@ -1169,12 +1183,17 @@ was (re)opened because Kea's interfaces or socket mode changed. It is never
 
 *Where the identity can be wrong.* Each of these counts as an eviction:
 
-- a DHCPv4 packet that Kea's sockets do not accept but the filter does —
-  in `raw` mode, unicast to an address of this host that is not on the
-  interface it arrived on, or to a MetalLB VIP (Kea's raw socket admits
-  only broadcast and the interface's own address);
+- a DHCPv4 packet that Kea's sockets do not accept but the filter does.
+  In `raw` mode: unicast to the address of one Kea interface arriving on
+  another (asymmetric routing), or a frame carrying an 802.1p priority tag
+  (VLAN ID 0) — the kernel strips that tag before the filter sees the
+  packet, while Kea's raw socket drops any tagged frame;
 - in `udp` mode, a packet the host firewall drops before Kea's socket.
   The appliance accepts UDP/67 unconditionally.
+
+Each of these goes the safe way, and is under-counted instead: traffic Kea
+serves on an address other than the interface's primary one, and traffic
+it receives on an interface outside its `interfaces` list.
 
 ## 4d. An OOM-killed Kea is reported (#2023)
 

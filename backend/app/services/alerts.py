@@ -2311,25 +2311,37 @@ async def _matching_dhcp_packets_dropped_subjects(
     matches: list[tuple[str, str, str]] = []
     for sid, (sock, evicted, recv, disc) in hits.items():
         name = names.get(sid) or str(sid)
-        parts = []
-        if sock:
-            parts.append(
-                f"{sock} discarded by the kernel because the server's receive "
-                "buffer was full, so it never read them"
+        if not evicted:
+            # Kernel drops only — the #980 message, byte for byte, so a server
+            # whose evictions are unmeasured (NULL) or measured at zero reads
+            # exactly as it did before #2889.
+            message = (
+                f"DHCP server {name} lost {sock} packet(s) in the last {win_min} min: "
+                "the kernel discarded them because the server's receive buffer was "
+                "full, so it never read them. Usually means the node is short of "
+                f"CPU. It answered {disc} DISCOVER(s) over the same window, so every "
+                "server-side counter reads healthy — the loss is upstream of them and "
+                "costs each affected client a full retransmit round."
             )
-        if evicted:
+        else:
+            parts = []
+            if sock:
+                parts.append(
+                    f"{sock} discarded by the kernel because the server's receive "
+                    "buffer was full, so it never read them"
+                )
             parts.append(
                 f"{evicted} read and then evicted from the server's full packet "
                 "queue during a burst, before its worker reached them"
             )
-        message = (
-            f"DHCP server {name} lost {sock + evicted} packet(s) in the last "
-            f"{win_min} min: {'; '.join(parts)}. Usually means the node is short "
-            f"of CPU for the load's bursts. It answered {disc} DISCOVER(s) over "
-            "the same window, so every server-side counter reads healthy — the "
-            "loss is upstream of them and costs each affected client a full "
-            "retransmit round."
-        )
+            message = (
+                f"DHCP server {name} lost {sock + evicted} packet(s) in the last "
+                f"{win_min} min: {'; '.join(parts)}. Usually means the node is short "
+                f"of CPU for the load's bursts. It answered {disc} DISCOVER(s) over "
+                "the same window, so every server-side counter reads healthy — the "
+                "loss is upstream of them and costs each affected client a full "
+                "retransmit round."
+            )
         if recv:
             # Reported, never alerted on: this number legitimately includes
             # MAC-blocklist and HA out-of-scope drops.

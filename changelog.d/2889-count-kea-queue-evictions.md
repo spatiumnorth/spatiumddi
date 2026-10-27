@@ -8,10 +8,13 @@
   rounds. The DHCP agent now counts DHCPv4 arrivals at Kea's intake with
   a BPF-filtered `AF_PACKET` socket of its own (the `CAP_NET_RAW` it
   already holds, no new privilege) and reports `queue_evicted` =
-  arrivals − DHCPv4 `socket_drop` − `pkt4-received` per bucket. It
-  reports only an eviction the next sample confirms, so a backlog that
-  is merely in flight at one read is never counted, and an eviction
-  lands one bucket late. The Stats tab's DROPPED line and chip, the
+  arrivals − DHCPv4 `socket_drop` − `pkt4-received` per bucket. The
+  filter counts only packets to the addresses Kea serves from, and the
+  arrivals are read on both sides of Kea's counter snapshot, so the
+  skew between the reads can never be counted as eviction. It reports
+  only an eviction the next sample confirms, so a backlog that is merely
+  in flight at one read is never counted, and an eviction lands one
+  bucket late. The Stats tab's DROPPED line and chip, the
   InfluxDB export, `find_dhcp_server_stats`'s `packet_loss` block and
   the default-on `dhcp_packets_dropped` alert include it. NULL means
   unmeasured: no raw socket, a DHCPv6-only server, or the bucket after a

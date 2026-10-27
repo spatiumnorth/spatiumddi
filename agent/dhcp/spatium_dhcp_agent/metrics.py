@@ -206,6 +206,11 @@ class MetricsPoller:
         # same ticks as everything above, for the same reason.
         self._arrivals = ArrivalCounter(lambda: kea_intake_config(cfg.kea_config_path))
         self._evictions = QueueEvictionEstimator()
+        # Arrivals read before Kea's counters but not yet handed to the
+        # estimator: carried over a tick whose Kea poll failed, because the
+        # next successful one diffs Kea's counters across both. ``None``
+        # once a read in that span was unmeasured.
+        self._arrivals_pending: int | None = 0
         # Last ``pkt4-received`` seen, for its delta. Kept beside ``_prev``
         # rather than in it so ``_compute_delta`` stays the one place the
         # shipped columns are diffed.
@@ -288,6 +293,13 @@ class MetricsPoller:
     def run(self) -> None:
         while not self._stop.is_set():
             self._shipper.last_send_outcome = None
+            # #2889 — arrivals are read on both sides of Kea's snapshot, so
+            # the estimator can bracket the remainder at the instant Kea took
+            # it. A single read on one side turns read-ordering skew into
+            # spurious "evictions" on any server with steady traffic.
+            before = self._arrivals.sample()
+            pending = self._arrivals_pending
+            self._arrivals_pending = None if pending is None or before is None else pending + before
             current = self._poll_kea()
             if current is not None:
                 delta = self._compute_delta(current)
@@ -299,16 +311,17 @@ class MetricsPoller:
                 # into a bucket whose Kea counters exclude them, and the
                 # first comparison anyone makes is drops against DISCOVERs.
                 socket_drop = self._socket.sample()
-                # #2889 — read immediately after the other two, so the three
-                # terms of the eviction estimate cover the same interval to
-                # within a few syscalls. Whatever skew is left moves counts
-                # between adjacent buckets, which the estimator absorbs.
-                arrived = self._arrivals.sample()
+                # #2889 — the second arrivals read, after Kea's snapshot and
+                # the socket drops. What arrived between the two reads
+                # belongs to the next interval.
+                during = self._arrivals.sample()
                 queue_evicted = self._evictions.update(
-                    arrived,
+                    self._arrivals_pending,
                     self._socket.last_v4 if socket_drop is not None else None,
                     self._received_delta(current, delta is not None),
+                    during,
                 )
+                self._arrivals_pending = 0
                 if delta is not None:
                     # Bucket timestamp is "now, rounded to the poll
                     # interval". The server ACCUMULATES per
