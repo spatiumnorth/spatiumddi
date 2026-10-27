@@ -102,7 +102,7 @@ from app.services.dns.soa_timers import (
     reconcile_soa_timers,
     renders_soa_timers,
 )
-from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import log_retention_hours
@@ -1508,6 +1508,12 @@ class IngestedRecordsReport(BaseModel):
 
     zone_name: str
     records: list[IngestedRecord] = []
+    # The view whose copy of the zone the agent read, when it could address
+    # one (a BIND9 agent signs each view's transfer with that view's own
+    # transfer key, which selects exactly that view). None from an agent that
+    # read the zone without naming a view: an agent built before this field,
+    # a PowerDNS agent, or a group whose views carry no transfer key.
+    view_name: str | None = None
 
 
 @router.post("/ingested-records")
@@ -1527,37 +1533,45 @@ async def agent_ingested_records(
     with several agent servers a learned record is also queued to the
     other servers, and the report is read as a change since that server's
     previous one rather than as the zone's whole truth (#2654; see
-    ``app.services.dns.ingest``).
+    ``app.services.dns.ingest``). Under split-horizon a report is filed only
+    under the zone row whose copy it read (``_ingest_target_zone``).
     """
     from app.services.dns.ingest import IncomingRecord  # noqa: PLC0415
 
     server, _ = auth
     zone_name = body.zone_name.rstrip(".")
     # Match either stored form (with/without trailing dot). Under split-horizon
-    # the same name can exist once per view, so we can't use
-    # ``scalar_one_or_none`` (it raises MultipleResultsFound): prefer the global
-    # zone (``view_id IS NULL``) and take the first — loopback AXFR is
-    # inherently view-ambiguous, and the global copy is the common case.
-    zone = (
+    # the same name can exist once per view, each copy its own zone row with
+    # its own records, so which row a report belongs to is decided by the view
+    # whose copy the agent read, never by row order.
+    candidates = list(
         (
             await db.execute(
-                select(DNSZone)
-                .where(
+                select(DNSZone).where(
                     DNSZone.group_id == server.group_id,
                     DNSZone.name.in_([zone_name + ".", zone_name]),
                     DNSZone.deleted_at.is_(None),
                 )
-                .order_by(DNSZone.view_id.nulls_first())
-                .limit(1)
             )
         )
         .scalars()
-        .first()
+        .all()
     )
-    if zone is None:
+    if not candidates:
         # Zone unknown to the control plane (deleted, or agent serving a
         # stale bundle). Silently accept — the next bundle drops it.
         return {"zone": zone_name, "skipped": "unknown_zone"}
+    zone, skipped = await _ingest_target_zone(db, candidates, body.view_name)
+    if zone is None:
+        logger.info(
+            "dns_ingest_report_not_filed",
+            server_id=str(server.id),
+            zone=zone_name,
+            view=body.view_name,
+            candidates=len(candidates),
+            reason=skipped,
+        )
+        return {"zone": zone_name, "skipped": skipped}
     if not zone.dynamic_update_enabled:
         return {"zone": zone_name, "skipped": "dynamic_update_disabled"}
 
@@ -1581,6 +1595,39 @@ async def agent_ingested_records(
     async with collecting_wakes():
         summary = await _reconcile_and_audit(db, server, zone, zone_name, incoming)
     return {"zone": zone_name, **summary}
+
+
+async def _ingest_target_zone(
+    db: AsyncSession, candidates: list[DNSZone], view_name: str | None
+) -> tuple[DNSZone | None, str | None]:
+    """The zone row an ingest report is filed under, or ``(None, reason)``.
+
+    A report that names no view is filed only when the group holds one row of
+    that name, so every copy the agent could have read is a copy of that row.
+    With two or more rows (the name in several views) an unnamed report could
+    be any view's copy: filing it under one of them would mirror one view's
+    records into another view's zone, where that view's clients are answered
+    them. So it is not filed at all.
+
+    A report that names a view is filed under the row whose copy the control
+    plane reads from that view (``transfer_view_name``, the rule drift and
+    sync-with-servers use). That is at most one row, because a view holds one
+    copy of a name. A shared zone is rendered into several views; only the
+    report from its one read view is filed, so the views' copies do not take
+    turns overwriting its mirror rows. A report naming any other view, or a
+    view the group no longer renders, is not filed, and neither is one that
+    two rows would claim.
+    """
+    if view_name is None:
+        if len(candidates) == 1:
+            return candidates[0], None
+        return None, "view_ambiguous"
+    read_here = [z for z in candidates if await transfer_view_name(db, z) == view_name]
+    if len(read_here) == 1:
+        return read_here[0], None
+    # Two rows read from one view is a placement the #2275 guard refuses; a
+    # row stored before it is not guessed between either.
+    return None, ("view_ambiguous" if read_here else "view_not_read")
 
 
 async def _reconcile_and_audit(

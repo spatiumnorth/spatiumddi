@@ -770,6 +770,20 @@ postgresql:
     # refused apply fails the helm upgrade (#1313): move the Postgres image
     # in a release that changes no parameter (versions.json says so too).
     primaryUpdateMethod: switchover   # switchover | restart
+    # #2878: the seconds an instance's smart shutdown may refuse new
+    # connections before the instance manager fast-shuts it (CNPG's
+    # ``spec.smartShutdownTimeout``; its default is 180). A smart shutdown
+    # lets the sessions already open keep committing, but the services'
+    # pooled sessions never end on their own, so it always runs to this
+    # timeout. With one instance (a single node, or a cluster demoted to
+    # one) nothing switches over: a spec change that rolls it, such as the
+    # Postgres limit a demote moves (#2156), restarts it in place, and the
+    # api and worker reach no database until the new pod is up. 15 s lets
+    # a transaction already running commit, then the instance stops fast.
+    # A switchover is not affected (it fast-shuts the old primary under
+    # its own ``switchoverDelay``). Not part of the instance pods' spec,
+    # so changing it rolls nothing.
+    smartShutdownTimeout: 15
     # #590 — instance spreading. CNPG defaults to anti-affinity ON but
     # ``preferred`` (best effort), which on a 1→3 promote let two of three
     # instances land on the seed: losing that node would have taken the

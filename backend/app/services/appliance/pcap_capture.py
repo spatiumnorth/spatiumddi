@@ -33,6 +33,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.pcap import PacketCapture
 
 
@@ -162,6 +163,8 @@ async def finalize_capture(
         row.pcap_path = pcap_path
         row.pcap_size_bytes = pcap_size_bytes
         row.pcap_sha256 = pcap_sha256
+        # #2866 — the file is on THIS pod's node disk; record which.
+        row.artifact_node = (settings.node_name or "").strip() or None
         if packet_count is not None:
             row.packets_captured = packet_count
         row.bytes_captured = pcap_size_bytes

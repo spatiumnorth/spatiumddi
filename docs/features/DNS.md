@@ -2461,6 +2461,24 @@ only: RFC 2136 records written to a PowerDNS zone never appeared in
 SpatiumDDI, and an external value sharing a `(name, record_type)` with a
 managed rrset was silently REPLACEd away by the next reconcile.
 
+**Split-horizon: a report is filed under the view it read.** With views,
+one zone name can be one zone row per view, each with its own records, and
+BIND answers a transfer from the first view whose `match-clients` take it.
+So a loopback transfer signed with the group key reads whichever view
+admits the loopback address. The BIND9 agent therefore reads each view's
+copy with that view's own transfer key (the key from #920 that selects
+exactly one view) and names the view in the report. The control plane files
+it under the zone row the control plane itself reads from that view (the
+same rule drift and Sync with servers use); a shared zone rendered into
+several views is filed only from its first operator view, so the views'
+copies do not take turns rewriting its mirror rows. A report that names no
+view (an older agent, PowerDNS, or a group whose views carry no transfer
+key) is filed only when the group holds a single row of that name. In every
+other case nothing is filed and the endpoint answers
+`skipped: view_ambiguous` or `view_not_read`: the control plane never
+guesses a view, because a guess mirrors one view's records into another
+view's zone, where that view's clients are answered them.
+
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
@@ -2623,13 +2641,15 @@ primary, as before.
 
 ---
 
-## 20. Encrypted transports — DoT / DoH + encrypted forwarding (issue #50)
+## 20. Encrypted transports — DoT / DoH / DoQ + encrypted forwarding (issues #50, #741)
 
 Two independent halves, each default-off so an existing install renders a
 byte-identical `named.conf` until an operator opts in:
 
 * **Inbound** — serve DNS-over-TLS (RFC 7858) and DNS-over-HTTPS
-  (RFC 8484) to local clients.
+  (RFC 8484) to local clients. DNS-over-QUIC (RFC 9250) is the third
+  listener, **Technitium-only today**; BIND9 and PowerDNS DoQ is tracked
+  in [#2886](https://github.com/spatiumnorth/spatiumddi/issues/2886).
 * **Outbound** — forward to upstream resolvers over TLS instead of
   plaintext port 53.
 

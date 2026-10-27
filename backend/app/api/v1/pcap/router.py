@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
+from app.config import settings
 from app.core.celery_dispatch import dispatch
 from app.core.permissions import require_permission
 from app.core.responses import PcapResponse
@@ -111,6 +112,7 @@ def _to_read(row: PacketCapture) -> PcapCaptureRead:
         bytes_captured=row.bytes_captured,
         pcap_size_bytes=row.pcap_size_bytes,
         pcap_sha256=row.pcap_sha256,
+        artifact_node=row.artifact_node,
         has_artifact=_has_artifact(row),
         metadata_json=row.metadata_json,
         created_by_user_id=row.created_by_user_id,
@@ -456,6 +458,19 @@ async def download_capture(
     if not _has_artifact(row):
         raise HTTPException(status_code=404, detail="Capture has no downloadable artifact yet")
     if not row.pcap_path or not Path(row.pcap_path).exists():
+        holder = (row.artifact_node or "").strip()
+        here = (settings.node_name or "").strip()
+        if holder and here and holder != here:
+            # #2866 — the artifact is on another node's disk, not gone. The
+            # same status #1901 uses for a backup archive held elsewhere.
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"This capture is stored on node {holder}; this request was served "
+                    f"by node {here}, whose disk does not have it. Download it again "
+                    f"through node {holder} (open the Web UI at that node's address)."
+                ),
+            )
         raise HTTPException(
             status_code=404,
             detail="capture artifact no longer on disk (pruned or volume drift)",
