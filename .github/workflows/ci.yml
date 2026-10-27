@@ -957,7 +957,9 @@ jobs:
   # orchestrator FSM and the report against them (#1057) import-skip without
   # the first two, and with pytest alone that skip let a reverted fix pass
   # this job green (review of #1063). hdrhistogram ships a wheel for x86_64
-  # only, which this runner is.
+  # only, which this runner is. httpx is the seeder's own import
+  # (perf/seeder/_api.py): its bulk-load retry tests (#2879) drive the real
+  # client over httpx's MockTransport, and they import it rather than skip.
   #
   # Tests only, like the agent + appliance jobs: ``perf/`` is outside the
   # Backend Lint scope and carries pre-existing ruff/black drift (25 findings,
@@ -974,7 +976,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pytest pyyaml dnspython hdrhistogram
+        run: pip install pytest pyyaml dnspython hdrhistogram httpx
 
       - name: Run tests
         run: python -m pytest perf -q

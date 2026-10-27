@@ -193,7 +193,7 @@ def test_pdns_worker_sweep_ships_dynamic_zones(
     shipped: list[tuple[str, list]] = []
     monkeypatch.setattr(worker, "_read_live_zone", lambda zone, key: [{"name": "ws1"}])
     monkeypatch.setattr(
-        worker, "_ship", lambda zone, records: shipped.append((zone, records))
+        worker, "_ship", lambda zone, records, view=None: shipped.append((zone, records))
     )
     worker._sweep()
     assert shipped == [("example.com", [{"name": "ws1"}])]
