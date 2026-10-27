@@ -158,6 +158,14 @@ Cluster (`postgres`):
 
 `DATABASE_URL` in `k8s/base/` uses `postgres-rw`.
 
+The Cluster sets `primaryUpdateMethod: switchover` (#2831): a rolling update
+promotes an already-updated replica before it touches the primary, so new
+connections wait seconds. CNPG's default, `restart`, restarts the primary
+under its pooled sessions and refuses new connections for over three minutes
+(the 180 s `smartShutdownTimeout`, then the restart). Change `imageName` and
+`postgresql.parameters` in separate applies: the operator's webhook refuses an
+update that changes both.
+
 ### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
 `ha/postgres-docker-compose.yaml` does **not** work. Patroni never starts,
