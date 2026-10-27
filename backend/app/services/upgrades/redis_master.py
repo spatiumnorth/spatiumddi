@@ -24,7 +24,10 @@ drive). So when the roll order is known, the replica on the node that drains
 last (or on one the roll has already finished) gets ``replica-priority 1``
 with ``CONFIG SET`` for the length of the failover and is restored in a
 ``finally``. Sentinel only reads a replica's priority from its periodic
-``INFO``, so the step waits until Sentinel reports the new value. Any problem
+``INFO``, so the step waits until Sentinel reports the new value. The value
+restored is the one read from the replica itself, with its process ``run_id``,
+so a restore never lands on a restarted pod or on another pod that took the
+address (#2870). Any problem
 steering falls back to a plain ``SENTINEL FAILOVER``. Priority 0 ("never
 promote") is never written, so the steering cannot leave no eligible replica.
 Every replica runs on another node (the StatefulSet's anti-affinity is
@@ -75,6 +78,9 @@ _STEER_PRIORITY = 1
 # so a drive that died before its ``finally`` can be cleaned up by the next
 # run of this step.
 PRIORITY_ORIGINALS_KEY = "spatium:upgrade:redis-replica-priority-originals"
+# A day: longer than any wait between two nodes' steps (a redelivered drive
+# can sit an hour, #1449), short enough that a record nothing can apply dies.
+_RECORD_TTL_S = 24 * 3600
 
 
 @dataclass
@@ -200,41 +206,102 @@ async def _sentinel_replicas(url: str, master_name: str) -> list[dict[str, str]]
     return None
 
 
-async def _data_command(url: str, host: str, port: int, *args: Any) -> Any:
-    """One command straight to a Redis data node (not a Sentinel)."""
-    password = _parse_sentinel_url(url)[2]
-    client = aioredis.Redis(
+def _data_client(url: str, host: str, port: int) -> aioredis.Redis:
+    """A client straight to one Redis data node (not a Sentinel), with the
+    data password ``make_async_redis`` uses for the master."""
+    return aioredis.Redis(
         host=host,
         port=port,
-        password=password or None,
+        password=_parse_sentinel_url(url)[2] or None,
         socket_connect_timeout=_SENTINEL_TIMEOUT_S,
         socket_timeout=_SENTINEL_TIMEOUT_S,
         decode_responses=True,
     )
+
+
+async def _replica_state(url: str, host: str, port: int) -> tuple[str, int]:
+    """The node's process ``run_id`` and its live ``replica-priority``, read
+    from the node itself: Sentinel's copy of the priority lags by up to one
+    INFO period, and the value recorded for the restore must be the real one."""
+    client = _data_client(url, host, port)
     try:
-        return await client.execute_command(*args)
+        info = await client.info("server")
+        reply = await client.config_get("replica-priority")
+    finally:
+        await client.aclose()
+    return str(info["run_id"]), int(reply["replica-priority"])
+
+
+async def _set_priority(url: str, host: str, port: int, value: int) -> None:
+    client = _data_client(url, host, port)
+    try:
+        await client.config_set("replica-priority", str(value))
     finally:
         await client.aclose()
 
 
-async def _set_priority(url: str, host: str, port: int, value: int) -> None:
-    await _data_command(url, host, port, "CONFIG", "SET", "replica-priority", str(value))
+async def _record_client(url: str) -> aioredis.Redis:
+    """A client to the master the Sentinels NAME, for the originals record.
+
+    Not ``make_async_redis``: redis-py finds the master through ``SENTINEL
+    MASTERS``, which keeps the OLD address until ``+switch-master`` closes the
+    failover, while ``GET-MASTER-ADDR-BY-NAME`` (what the move waits on) names
+    the promoted replica from ``+promoted-slave`` on. Measured against
+    redis:8.10.2 (#2870): the step's ``finally`` ran in that gap, its DEL went
+    to the old master, and the old master's later resync from the new one
+    brought the record back. So the record goes straight to the named master.
+    No Sentinel answering falls back to the app's usual routing."""
+    hosts, password = _endpoints(url)
+    for host, port in hosts:
+        try:
+            reply = await _sentinel_command(
+                host,
+                port,
+                password,
+                "SENTINEL",
+                "GET-MASTER-ADDR-BY-NAME",
+                settings.redis_sentinel_master,
+            )
+        except Exception as exc:  # noqa: BLE001 — try the next Sentinel
+            logger.debug("upgrade_redis_sentinel_unreachable", sentinel=host, error=str(exc))
+            continue
+        if isinstance(reply, (list, tuple)) and len(reply) >= 2:
+            return _data_client(url, str(reply[0]), int(reply[1]))
+    return make_async_redis(url)
 
 
 async def _store_originals(url: str, entries: list[dict[str, Any]]) -> None:
-    client = make_async_redis(url)
+    client = await _record_client(url)
     try:
-        await client.set(PRIORITY_ORIGINALS_KEY, json.dumps(entries))
+        # Expires on its own: a record no step ever gets to (the cluster was
+        # rebuilt, the replica is gone for good) must not be retried forever.
+        await client.set(PRIORITY_ORIGINALS_KEY, json.dumps(entries), ex=_RECORD_TTL_S)
     finally:
         await client.aclose()
 
 
 async def _clear_originals(url: str) -> None:
-    client = make_async_redis(url)
+    client = await _record_client(url)
     try:
         await client.delete(PRIORITY_ORIGINALS_KEY)
     finally:
         await client.aclose()
+
+
+async def _restore_one(url: str, entry: dict[str, Any]) -> None:
+    """Put one recorded priority back, on the same Redis process only. A
+    ``run_id`` that changed means the pod restarted (its rendered redis.conf
+    sets no priority, so it is back at the default and there is nothing to
+    undo) or another pod now answers at that address (#2870: an install that
+    announces pod IPs); either way it is left alone."""
+    host, port = str(entry["host"]), int(entry["port"])
+    run_id = entry.get("run_id")
+    if run_id:
+        current, _prio = await _replica_state(url, host, port)
+        if current != run_id:
+            logger.info("upgrade_redis_priority_restore_skipped", replica=host, reason="restarted")
+            return
+    await _set_priority(url, host, port, int(entry["priority"]))
 
 
 async def restore_priorities(url: str, entries: list[dict[str, Any]]) -> bool:
@@ -243,7 +310,7 @@ async def restore_priorities(url: str, entries: list[dict[str, Any]]) -> bool:
     ok = True
     for e in entries:
         try:
-            await _set_priority(url, e["host"], int(e["port"]), int(e["priority"]))
+            await _restore_one(url, e)
         except Exception as exc:  # noqa: BLE001 — restore the rest regardless
             ok = False
             logger.warning(
@@ -260,7 +327,7 @@ async def restore_priorities(url: str, entries: list[dict[str, Any]]) -> bool:
 async def _restore_leftover(url: str) -> None:
     """Undo steering a drive that died before its ``finally`` left behind."""
     try:
-        client = make_async_redis(url)
+        client = await _record_client(url)
         try:
             raw = await client.get(PRIORITY_ORIGINALS_KEY)
         finally:
@@ -335,18 +402,19 @@ async def _steer_replicas(
         worse = [c for c in candidates if _drain_position(c[3], remaining) < t_pos]
         if not worse:
             return  # every eligible replica drains no earlier than the target
-        lowest_worse = min(c[2] for c in worse)
-        if target[2] < lowest_worse:
-            out.detail["steered_to"] = target[3]  # already preferred, nothing to change
-            return
-        if lowest_worse <= _STEER_PRIORITY:
+        # Sentinel's view, which is what it will choose by. The target's own
+        # value in that view is not used: it can lag the live one by an INFO
+        # period (a leftover restored a moment ago still reads 1), and setting
+        # 1 on a replica already preferred costs at most one INFO period.
+        if min(c[2] for c in worse) <= _STEER_PRIORITY:
             logger.info(
                 "upgrade_redis_steer_skipped",
                 reason="a replica that drains sooner already has the lowest priority",
             )
             return
-        host, port, original, node = target
-        record = [{"host": host, "port": port, "priority": original}]
+        host, port, _seen_prio, node = target
+        run_id, original = await _replica_state(url, host, port)
+        record = [{"host": host, "port": port, "priority": original, "run_id": run_id}]
         await _store_originals(url, record)
         steering.changed = list(record)  # from here a failure still restores
         await _set_priority(url, host, port, _STEER_PRIORITY)
@@ -485,9 +553,13 @@ async def _move_loop(
                     out.reason = "the Redis master has no healthy replica to fail over to"
                     return out
                 if remaining_nodes and (replicas is None or replicas > 1):
+                    steer_started = time.monotonic()
                     await _steer_replicas(
                         url, master_name, node_name, list(remaining_nodes), namespace, out, steering
                     )
+                    # The wait for Sentinel to read the priority is not time
+                    # the failover had: ``timeout_s`` stays the switch's own.
+                    deadline += time.monotonic() - steer_started
                 error = await _sentinel_failover(url, master_name)
                 if error is not None:
                     out.warning = f"SENTINEL FAILOVER refused: {error}"

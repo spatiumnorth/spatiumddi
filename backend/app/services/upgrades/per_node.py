@@ -1652,8 +1652,12 @@ async def single_node_upgrade(
         control_plane_namespace: namespace those Deployments live in;
             defaults to the api's own namespace.
         remaining_nodes: the run's nodes still to upgrade, this one
-            included; the preflight judges ``/var`` headroom on those only.
-            None judges every approved appliance, as Plan does.
+            included, in the order they will drain
+            (``node_order.drain_order``); the preflight judges ``/var``
+            headroom on those only, and the Redis master move steers the
+            failover to the replica on the last of them (#2870). None judges
+            every approved appliance, as Plan does, and leaves the failover
+            unsteered.
         resume: where an earlier drive's chain for this node stopped
             (#2809). Takes precedence over ``start_step``. The step it names
             is run again, and the steps before it are taken as done, so a

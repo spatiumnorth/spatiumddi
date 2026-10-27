@@ -8,8 +8,13 @@
   1 (`CONFIG SET`) on the replica of the node that drains last, or of
   a node the roll has finished, waits for Sentinel to read it, sends
   `SENTINEL FAILOVER`, and restores the priority in a `finally`. The
-  original is recorded in Redis first, so a drive that dies mid-step
-  is cleaned up by the next run of the step. If the priority cannot be
-  set or seen (a replica unreachable, `CONFIG` refused, fewer than
-  two eligible replicas) the failover is sent as before. Priority 0 is
-  never written.
+  node that drains last is the drive's own node, which the roll defers
+  to the end whatever its place in the plan, so the step is now handed
+  the nodes in drain order rather than plan order. The original value
+  is read from the replica itself and recorded in Redis, with the
+  replica's `run_id`, before the change, so a drive that dies mid-step
+  is cleaned up by the next run of the step and a restore never lands
+  on a restarted pod or another pod at that address. If the priority
+  cannot be set or seen (a replica unreachable, `CONFIG` refused, fewer
+  than two eligible replicas) the failover is sent as before. Priority 0
+  is never written.
