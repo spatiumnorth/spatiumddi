@@ -524,6 +524,53 @@ the reference topologies are in
   BestEffort operator restart triggers a watched-volume reconciliation
   storm (issue #315). Its startup probe is also loosened to a 60s window
   for slow VMs. Budget ~128 MiB for it when sizing a control node.
+  - **WAL retention and stuck instances (#2132, #2317).** No WAL archive
+    is configured, so WAL lives only in each instance's `pg_wal` on the
+    node's `/var` (local-path does not enforce the PVC's 8Gi). The Cluster
+    keeps `wal_keep_size: 2GB` so a former primary can `pg_rewind` after a
+    failover, and caps what a replication slot may hold back at
+    `max_slot_wal_keep_size: 3GB`. PostgreSQL keeps the larger of the two,
+    plus up to `max_wal_size` (1GB) since the last checkpoint, so `pg_wal`
+    stays near 4GB even when a slot's standby never follows a new primary;
+    before the cap, one primary's `pg_wal` reached 26 GB while CNPG read
+    healthy. A standby past the cap loses its slot and needs a re-clone, as
+    does a former primary whose rewind needs WAL that is gone. CNPG retries
+    those for ever, so the seed supervisor watches each non-primary
+    instance's log for the loops that never end on their own (`pg_rewind`
+    failing, "Refusing to restore future timeline history file", "requested
+    WAL segment … has already been removed", an invalidated slot). A loop
+    counts only while it repeats (at least three lines in the last 90 s),
+    so a replica that logs a refusal or two while it joins and then streams
+    is never counted. A repeating loop is logged once at info
+    (`supervisor.heartbeat.postgres_instance_looping`), at warning once it
+    has held for 2 minutes (`supervisor.heartbeat.postgres_instance_stuck`),
+    and after 10 minutes of the same loop under the same primary the
+    supervisor annotates the pod `alpha.cnpg.io/unrecoverable`, CNPG's documented request to delete
+    the instance's pod and PVCs and join a fresh copy from the primary
+    (`supervisor.heartbeat.postgres_instance_reclone`). One instance at a
+    time, never the primary, never during a failover or switchover, and
+    only while the primary is Ready. And only with proof the WAL the
+    instance needs is gone, because a re-clone copies the whole database:
+    the supervisor reads the primary's replication slots from CNPG's
+    instance status (`/pg/status` on port 8000 of the primary pod), with
+    the endpoint's TLS verified against the cluster CA under the name
+    `<cluster>-rw` (the certificate names the cluster's services, never a
+    pod IP). The CA reaches the supervisor as its public certificate only,
+    in the ConfigMap `<cluster>-ca-crt` that the control chart's
+    `cnpg-ca-publisher` CronJob copies from the CA secret every 10 minutes;
+    the supervisor is never granted the secret, which also holds the CA
+    private key. It re-clones when the instance's slot is `lost` or gone, when its
+    log shows the WAL-removed or invalidated-slot line, or when `pg_rewind`
+    keeps failing. A standby that only cannot reach the primary logs the
+    future-timeline refusal too, but its slot still reads `reserved`: it is
+    held (`supervisor.heartbeat.postgres_instance_reclone_held`, with the
+    reason) and catches up once it reconnects. If the primary's status
+    cannot be read, or its certificate does not verify, or the CA ConfigMap
+    is missing, nothing is re-cloned
+    (`supervisor.heartbeat.postgres_slot_state_unknown`, once per reason). While it runs, the database row on the
+    cluster-health page reads `degraded` (`readyInstances` below
+    `instances`). The manual equivalent is `kubectl cnpg destroy <cluster>
+    <n>`, or deleting the instance's PVC and then its pod.
 - **Redis HA = Sentinel.** Each member pairs a redis-server + a sentinel
   sidecar; app / worker / beat resolve the master via a `sentinel://`
   URL. `sentinel.replicas` scales with the member count.

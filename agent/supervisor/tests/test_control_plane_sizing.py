@@ -328,7 +328,12 @@ def test_an_unreadable_memtotal_renders_no_postgres_fragment_and_stays_valid() -
     values = _render_control_values_at(None, None)
     assert values["postgresql"] == {
         "kind": "cnpg",
-        "cnpg": {"instances": 1, "podAntiAffinityType": "required"},
+        "cnpg": {
+            "instances": 1,
+            "podAntiAffinityType": "required",
+            # #2132 — the CA publisher the supervisor's verified slot read needs.
+            "caPublisher": {"enabled": True},
+        },
     }
     assert "resources" not in values["api"] and "resources" not in values["worker"]
 
