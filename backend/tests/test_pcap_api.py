@@ -409,6 +409,16 @@ async def test_download_legacy_row_without_node_keeps_pruned_message(
     assert "pruned or volume drift" in r.json()["detail"]
 
 
+async def test_download_on_a_pod_without_a_node_name_keeps_pruned_message(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # Compose / plain k8s: no NODE_NAME on the serving pod. A recorded holder
+    # must not turn the miss into a 502 that names "" as this node.
+    r = await _download_missing(client, db_session, artifact_node="node-a", this_node="")
+    assert r.status_code == 404
+    assert "pruned or volume drift" in r.json()["detail"]
+
+
 async def test_artifact_node_is_exposed_on_the_read_model(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
