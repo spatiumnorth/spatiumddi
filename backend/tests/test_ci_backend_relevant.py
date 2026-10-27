@@ -57,6 +57,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_seed_demo_templates.py": "scripts/seed_demo.py",
     "test_merge_test_durations.py": "scripts/merge_test_durations.py",
     "test_test_impact_selection.py": ".github/scripts/select_impacted_tests.py",
+    # #2815: the worker liveness probe must agree between the chart and k8s/base.
+    "test_rolling_upgrade_redis_master_2815.py": (
+        "charts/spatiumddi/templates/worker.yaml",
+        "k8s/base/worker.yaml",
+    ),
     "test_ci_tested_on_pr_head.py": (
         ".github/scripts/ci-tested-on-pr-head.sh",
         ".github/scripts/ci-full-suite-passed.sh",

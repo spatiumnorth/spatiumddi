@@ -52,7 +52,8 @@ anything that is not application/grpc. So:
   IDs are uint64s, which Python's json keeps exact;
 - a removal is the etcd gRPC call itself, etcdserverpb.Cluster/MemberRemove,
   framed here (one uint64 field) and sent by curl over HTTP/2 with k3s's etcd
-  client certificate;
+  client certificate. --leave-self's hand-off of the lead is sent the same way
+  (etcdserverpb.Maintenance/MoveLeader);
 - what etcd lists afterwards is the verdict, not what the call answered.
 """
 
@@ -107,6 +108,14 @@ LEAVE_POLL_S = float(os.environ.get("SPATIUM_LEAVE_POLL_S", "3"))
 # next k3s start finds it and rejoins as a new member (k3s v1.36.4+k3s1:
 # pkg/executor/embed/etcd/etcd.go, and pkg/etcd/etcd.go's tombstone check).
 TOMBSTONE = K3S_SERVER_DIR / "db" / "etcd" / "tombstone"
+# --leave-self hands the etcd lead to the survivor before this node removes its
+# own member (#2874). It waits at most LEAD_HANDOFF_S for that. Whether the
+# cluster has a leader at all is etcd's etcd_server_has_leader gauge, on the
+# metrics listener k3s binds on the loopback (spatium-console reads it too).
+LEAD_HANDOFF_S = float(os.environ.get("SPATIUM_LEAD_HANDOFF_S", "30"))
+METRICS_URL = os.environ.get("SPATIUM_ETCD_METRICS_URL", "http://127.0.0.1:2381/metrics")
+# appliance/tests replace the MoveLeader call as they replace the removal.
+MOVE_LEADER_CMD = os.environ.get("SPATIUM_ETCD_MOVE_LEADER_CMD", "")
 
 
 def log(msg: str) -> None:
@@ -254,7 +263,8 @@ def _varint(n: int) -> bytes:
 
 
 def remove_frame(member_id: int) -> bytes:
-    """A gRPC frame carrying MemberRemoveRequest{ID: member_id} (field 1, varint)."""
+    """A gRPC frame carrying MemberRemoveRequest{ID: member_id} (field 1, varint).
+    MoveLeaderRequest{targetID} has the same one field, so it is framed alike."""
     msg = b"\x08" + _varint(int(member_id))
     return b"\x00" + len(msg).to_bytes(4, "big") + msg
 
@@ -267,13 +277,35 @@ def remove_member(member_id: int) -> str:
         r = subprocess.run(["sh", "-c", REMOVE_CMD, "remove", str(member_id)],
                            capture_output=True, text=True, timeout=30, check=False)
         return "" if r.returncode == 0 else (r.stdout or r.stderr).strip()[:200]
+    return etcd_call("/etcdserverpb.Cluster/MemberRemove", member_id)
+
+
+def move_leader(target_id: int) -> str:
+    """etcdserverpb.Maintenance/MoveLeader on this node's etcd: '' once the
+    member ``target_id`` leads (etcd answers only after it has taken over), else
+    etcd's error. Only the leader takes the call. Any other member answers
+    "etcdserver: not leader" and moves nothing."""
+    if MOVE_LEADER_CMD:
+        r = subprocess.run(["sh", "-c", MOVE_LEADER_CMD, "move-leader", str(target_id)],
+                           capture_output=True, text=True, timeout=30, check=False)
+        return "" if r.returncode == 0 else (r.stdout or r.stderr).strip()[:200]
+    # etcd waits for the transferee with no limit of its own. The deadline makes
+    # it answer ("leader transfer took too long") before curl's --max-time cuts in.
+    return etcd_call("/etcdserverpb.Maintenance/MoveLeader", target_id, "grpc-timeout: 10S")
+
+
+def etcd_call(method: str, member_id: int, *headers: str) -> str:
+    """One etcd gRPC call whose request is a member ID alone (remove_frame), sent
+    by curl over HTTP/2 with k3s's etcd client certificate: '' on grpc-status 0,
+    else what went wrong (grpc_error, or curl's own failure)."""
     tls = K3S_SERVER_DIR / "tls" / "etcd"
     cmd = ["curl", "-sS", "--http2", "--max-time", "15",
            "--cacert", str(tls / "server-ca.crt"),
            "--cert", str(tls / "client.crt"), "--key", str(tls / "client.key"),
            "-H", "content-type: application/grpc", "-H", "te: trailers",
+           *(arg for h in headers for arg in ("-H", h)),
            "--data-binary", "@-", "-D", "-", "-o", "/dev/null",
-           f"{ETCD_URL}/etcdserverpb.Cluster/MemberRemove"]
+           f"{ETCD_URL}{method}"]
     try:
         r = subprocess.run(cmd, input=remove_frame(member_id), capture_output=True,
                            timeout=30, check=False)
@@ -450,6 +482,18 @@ def answer(request_id: str, nodes: list[tuple[str, list[str]]]) -> int:
 # member's data could try to re-join), and then asks a survivor whether the
 # member is gone. The banner above still holds for every other mode: only this
 # mode, called only by the leave runner, touches this node's own member.
+#
+# A node whose etcd leads hands the lead to the survivor first (#2874). A leader
+# that removes itself leaves the cluster without one: it stops leading once the
+# removal applies, and the rest elect a new leader only after an election
+# timeout (about 5 s on ddi-pg's rigs). With both members of three leaving at
+# once, the other member's removal waits through that election. When that
+# member wins it, its removal commits at once with itself as the leader, and the
+# seed is left the only voter, again without a leader. The seed's
+# controller-manager lost its lease within seconds and k3s exited. k3s came back
+# counting the removed member as a voter, so the seed never elected itself again
+# and its API server stayed down. Neither demoted row settled (ddi-pg's
+# ha/demoted_members_settle_left, nightly-20261026).
 
 
 def survivor_url() -> str:
@@ -480,6 +524,71 @@ def tombstoned(members: list[dict]) -> bool:
     return bool(name) and TOMBSTONE.exists() and all(m.get("name") == name for m in members)
 
 
+def has_leader() -> bool | None:
+    """Whether this node's etcd knows of a leader (its etcd_server_has_leader
+    gauge); None when its metrics cannot be read."""
+    try:
+        with urllib.request.urlopen(METRICS_URL, timeout=5) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — unreadable is "cannot tell"
+        return None
+    m = re.search(r"(?m)^etcd_server_has_leader\s+(\S+)\s*$", text)
+    try:
+        return float(m.group(1)) == 1 if m else None
+    except ValueError:
+        return None
+
+
+def lead_target(members: list[dict], server: str) -> dict | None:
+    """The member to hand the lead to: the survivor's, the voter with a peer URL
+    on the host this node joined (``server:``, the seed's node IP); else any
+    other voter. None when there is no other voter."""
+    mine = {m.get("ID") for m in own_members(members)}
+    voters = [m for m in members if m.get("ID") not in mine and not m.get("isLearner")]
+    host = peer_host(server)
+    for m in voters:
+        if host and any(peer_host(u) == host for u in (m.get("peerURLs") or [])):
+            return m
+    return voters[0] if voters else None
+
+
+def hand_off_lead(members: list[dict], server: str) -> str:
+    """See that this node's etcd does not lead when its member is removed: ''
+    once it does not, else why it may still lead after LEAD_HANDOFF_S.
+
+    A leader hands the lead to the survivor (MoveLeader). A follower has nothing
+    to hand off, unless the cluster has no leader at all. Its removal would then
+    wait through the election and commit at once if this node won it, so it
+    waits for a leader and asks again."""
+    target = lead_target(members, server)
+    if target is None:
+        return ""
+    if peer_host(server) not in {peer_host(u) for u in (target.get("peerURLs") or [])}:
+        log(f"leave-self: no voter has a peer URL on {server}; the lead goes to "
+            f"{describe(target)} if this node holds it")
+    deadline = time.monotonic() + LEAD_HANDOFF_S
+    while True:
+        err = move_leader(int(target["ID"]))
+        if not err:
+            log(f"leave-self: handed the etcd lead to {describe(target)} before removing "
+                "this node's member")
+            return ""
+        curl = re.match(r"curl exit (\d+):", err)
+        if curl and int(curl.group(1)) in CURL_NEVER_SENT:
+            # This node's etcd cannot be reached, so the removal cannot be sent
+            # either; it refuses on its own (refused_before_proposing).
+            return ""
+        if "etcdserver: not leader" in err:
+            if has_leader() is not False:
+                return ""
+            why = "the cluster has no leader: an election is running"
+        else:
+            why = err
+        if time.monotonic() >= deadline:
+            return why
+        time.sleep(LEAVE_POLL_S)
+
+
 def leave_self() -> int:
     """0: this node's etcd member is gone and k3s is stopped. 2: this node
     joined nobody, so there is no member to remove. 1: the removal did not
@@ -504,15 +613,28 @@ def leave_self() -> int:
     (found by ddi-pg's walk of #1659). After an error answer, an unreachable
     survivor lets the leave go on only when k3s left its tombstone
     (tombstoned). With nothing to show the member gone, a wipe could leave a
-    voter nobody answers for (the #1541 harm), so the leave is refused."""
+    voter nobody answers for (the #1541 harm), so the leave is refused.
+
+    Before any removal this node sees that its etcd does not lead
+    (hand_off_lead, #2874): a leader that removes itself leaves the cluster
+    without one for an election timeout, and with both members leaving at once
+    that cost the seed its quorum for good. When the lead cannot be handed off
+    within LEAD_HANDOFF_S the leave is refused at once, with k3s left running,
+    as for a removal etcd refused."""
     server = survivor_url()
     if not server:
         log("leave-self: no server: in the join drop-in; not a joined member, nothing to remove")
         return 2
     try:
-        mine = own_members(list_members())
+        members = list_members()
+        mine = own_members(members)
     except Exception as exc:  # noqa: BLE001 — reported, and the wipe is refused
         log(f"leave-self: this node's etcd member list is unreadable: {exc}")
+        return 1
+    why = hand_off_lead(members, server) if mine else ""
+    if why:
+        log(f"leave-self: this node's etcd may still lead ({why}); not removing its member "
+            "while it may lead, k3s left running (#2874)"[:400])
         return 1
     unsure: list[dict] = []  # members whose removal etcd answered with an error
     for m in mine:

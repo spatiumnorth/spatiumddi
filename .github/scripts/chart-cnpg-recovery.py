@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Refuse a render whose CNPG WAL can fill the volume (#2317), or whose
-replicated Cluster restarts its primary in place on a rolling update (#2831).
+"""Refuse a render whose CNPG WAL can fill the volume (#2317), whose
+replicated Cluster restarts its primary in place on a rolling update (#2831),
+whose supervisor cannot re-clone a stuck instance (#2132), or whose smart
+shutdown is left unbounded (#2878).
 
-Checked on the rendered manifests:
+Four checks of one recovery story, on the rendered manifests:
 
 * **Every CloudNativePG ``Cluster`` bounds the WAL it keeps (#2317).** After a
   failover the new primary holds CNPG's HA replication slots for standbys that
@@ -22,6 +24,14 @@ Checked on the rendered manifests:
   1GB. ``max_slot_wal_keep_size`` has no acceptable default and must be set
   to a size.
 
+* **The supervisor may re-clone a stuck instance (#2132).** The seed
+  supervisor re-clones a CNPG instance that loops on WAL it can never get
+  (``k8s_api.reclone_stuck_postgres_instances``): it reads the instance pods'
+  logs and annotates the stuck pod ``alpha.cnpg.io/unrecoverable``. Without
+  ``get`` on ``pods/log`` and ``patch`` on ``pods`` in the
+  ``spatium-supervisor-namespace`` Role, both are 403s and the cap above
+  leaves a standby that lost its slot out of the cluster for good.
+
 * **A Cluster with replicas updates its primary by switchover (#2831).** A
   spec change that rolls the instances (a resources or parameter change, on
   an upgrade, a resize or a promote) reaches the primary last. Under CNPG's
@@ -33,10 +43,19 @@ Checked on the rendered manifests:
   database. ``switchover`` promotes an updated replica first. A Cluster of
   one instance has no replica and is not held to this.
 
-``--require-cluster`` fails a render that has no Cluster, so a render cannot
-pass by rendering nothing.
+* **Every Cluster bounds its smart shutdown (#2878).** One instance has no
+  replica to switch over to, so a rolling update restarts it in place (a
+  demote to one node moves the Postgres limit, #2156), and nothing new
+  reaches the database until ``smartShutdownTimeout`` runs out. Left unset
+  that is CNPG's 180 s. The check asks for a whole number of seconds no
+  larger than ``SMART_SHUTDOWN_MAX_S``, at every instance count, so the
+  bound is already on the Cluster when a demote leaves it one instance.
 
-Usage: chart-cnpg-recovery.py [--require-cluster] <manifest.yaml> [...]
+``--require-cluster`` / ``--require-supervisor-role`` fail a render that has
+no Cluster / no such Role, so a render cannot pass by rendering nothing.
+
+Usage: chart-cnpg-recovery.py [--require-cluster] [--require-supervisor-role]
+       <manifest.yaml> [...]
 """
 
 from __future__ import annotations
@@ -47,6 +66,8 @@ import sys
 from typing import Any
 
 import yaml
+
+_SUPERVISOR_ROLE = "spatium-supervisor-namespace"
 
 # PostgreSQL memory units are powers of 1024 (kB, MB, GB, TB); Kubernetes
 # quantities use Ki/Mi/Gi/Ti for those and k/M/G/T for powers of 1000.
@@ -62,6 +83,9 @@ _K8S_UNITS = {
     "T": 1000**4 / 1024**2,
 }
 _DEFAULTS_MB = {"wal_keep_size": 512.0, "max_wal_size": 1024.0}
+# #2878: the longest smart shutdown a Cluster may render, in seconds. The
+# chart's own value is 15; CNPG's default (180) is what this refuses.
+SMART_SHUTDOWN_MAX_S = 30
 
 
 def pg_size_mb(value: Any) -> float | None:
@@ -100,12 +124,30 @@ def check_primary_update(doc: dict) -> list[str]:
     return []
 
 
+def check_smart_shutdown(doc: dict) -> list[str]:
+    """#2878: the smart shutdown of an instance restarted in place is bounded."""
+    name = (doc.get("metadata") or {}).get("name", "?")
+    raw = (doc.get("spec") or {}).get("smartShutdownTimeout")
+    if raw is None:
+        shown = "unset (CNPG's default, 180 s)"
+    elif isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw <= SMART_SHUTDOWN_MAX_S:
+        return []
+    else:
+        shown = repr(raw)
+    return [
+        f"Cluster/{name}: smartShutdownTimeout {shown}; it must be 0 to "
+        f"{SMART_SHUTDOWN_MAX_S} s, or an instance restarted in place (one instance: a "
+        "single node, or a cluster demoted to one) turns every new connection away "
+        "for that long while the services' pooled sessions hold it (#2878)"
+    ]
+
+
 def check_cluster(doc: dict) -> list[str]:
     name = (doc.get("metadata") or {}).get("name", "?")
     where = f"Cluster/{name}"
     spec = doc.get("spec") or {}
     params = ((spec.get("postgresql") or {}).get("parameters")) or {}
-    problems: list[str] = check_primary_update(doc)
+    problems: list[str] = check_primary_update(doc) + check_smart_shutdown(doc)
 
     raw_cap = params.get("max_slot_wal_keep_size")
     cap = pg_size_mb(raw_cap) if raw_cap is not None else None
@@ -144,9 +186,30 @@ def check_cluster(doc: dict) -> list[str]:
     return problems
 
 
-def check(docs: list[Any]) -> tuple[list[str], int]:
+def _grants(rules: list[dict], resource: str, verb: str) -> bool:
+    for rule in rules or []:
+        if "" not in (rule.get("apiGroups") or []):
+            continue
+        if resource in (rule.get("resources") or []) and verb in (rule.get("verbs") or []):
+            return True
+    return False
+
+
+def check_supervisor_role(doc: dict) -> list[str]:
+    rules = doc.get("rules") or []
+    problems = []
+    for resource, verb in (("pods/log", "get"), ("pods", "patch")):
+        if not _grants(rules, resource, verb):
+            problems.append(
+                f"Role/{_SUPERVISOR_ROLE}: no {verb!r} on {resource!r}; the supervisor "
+                "cannot re-clone a CNPG instance stuck on missing WAL (#2132)"
+            )
+    return problems
+
+
+def check(docs: list[Any]) -> tuple[list[str], int, int]:
     problems: list[str] = []
-    clusters = 0
+    clusters = roles = 0
     for doc in docs:
         if not isinstance(doc, dict):
             continue
@@ -154,30 +217,40 @@ def check(docs: list[Any]) -> tuple[list[str], int]:
         if doc.get("kind") == "Cluster" and group == "postgresql.cnpg.io":
             clusters += 1
             problems += check_cluster(doc)
-    return problems, clusters
+        elif doc.get("kind") == "Role" and (doc.get("metadata") or {}).get(
+            "name"
+        ) == _SUPERVISOR_ROLE:
+            roles += 1
+            problems += check_supervisor_role(doc)
+    return problems, clusters, roles
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--require-cluster", action="store_true")
+    ap.add_argument("--require-supervisor-role", action="store_true")
     ap.add_argument("manifests", nargs="+")
     args = ap.parse_args(argv)
 
     problems: list[str] = []
-    clusters = 0
+    clusters = roles = 0
     for path in args.manifests:
         with (sys.stdin if path == "-" else open(path, encoding="utf-8")) as fh:
             docs = list(yaml.safe_load_all(fh))
-        p, c = check(docs)
+        p, c, r = check(docs)
         problems += [f"{path}: {line}" for line in p]
         clusters += c
+        roles += r
     if args.require_cluster and not clusters:
         problems.append("no CloudNativePG Cluster rendered (--require-cluster)")
+    if args.require_supervisor_role and not roles:
+        problems.append(f"no Role/{_SUPERVISOR_ROLE} rendered (--require-supervisor-role)")
     for line in problems:
         print(f"FAIL: {line}", file=sys.stderr)
-    if not problems and clusters:
-        print(f"   cnpg wal cap + primary update: {clusters} Cluster(s) bound pg_wal and "
-              "switch over a replicated primary")
+    if not problems and (clusters or roles):
+        print(f"   cnpg recovery: {clusters} Cluster(s) bound pg_wal, switch over a "
+              f"replicated primary and bound the smart shutdown, {roles} supervisor "
+              "Role(s) may re-clone")
     return 1 if problems else 0
 
 

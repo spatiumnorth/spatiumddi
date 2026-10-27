@@ -176,3 +176,9 @@ frontend/src/lib/bulk-allocate-template.vectors.json
 frontend/40-tls-reload-watch.sh
 frontend/Dockerfile
 charts/spatiumddi/templates/frontend.yaml
+
+# test_rolling_upgrade_redis_master_2815.py (#2815) reads the worker's
+# liveness probe from both manifests: it must run app.worker_liveness with a
+# broker grace that stays bounded, and the two must agree.
+charts/spatiumddi/templates/worker.yaml
+k8s/base/worker.yaml

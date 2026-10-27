@@ -112,6 +112,11 @@ class PacketCapture(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     pcap_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     pcap_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     pcap_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The k8s node whose pod stored the artifact (#2866). ``pcap_path`` is
+    # the per-node ``pcaps`` hostPath on a multi-node appliance, so the file
+    # exists only on that node's disk. NULL is unknown (a capture from before
+    # #2866, or Compose, which has no node name).
+    artifact_node: Mapped[str | None] = mapped_column(String(253), nullable=True)
     # Set when the row outlives its file (restore drift / pruned) so the
     # UI hides the Download button instead of offering a 404.
     artifact_missing: Mapped[bool] = mapped_column(

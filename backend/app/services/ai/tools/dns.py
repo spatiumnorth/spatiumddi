@@ -1606,7 +1606,8 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Report which DNS server groups serve DNS-over-TLS (DoT) or "
-        "DNS-over-HTTPS (DoH) to clients, and which forward to their "
+        "DNS-over-HTTPS (DoH) to clients (and DNS-over-QUIC, DoQ, on "
+        "Technitium groups), and which forward to their "
         "upstream resolvers over TLS instead of plaintext port 53 "
         "(issue #50). Returns per group: the listener toggles + ports + "
         "DoH URL path, whether a usable TLS certificate is actually linked "
@@ -1650,12 +1651,30 @@ async def find_dns_encrypted_transports(
         except ValueError:
             return {"error": f"group_id is not a valid UUID: {args.group_id}"}
 
+    rows = (await db.execute(stmt.order_by(DNSServerGroup.name))).all()
+
+    # DoQ is served by the Technitium driver only (#741). The API refuses
+    # doq_enabled on a group with any other driver, but a row stored before
+    # that gate (or a server moved in later) can still carry it, so a
+    # stored flag counts only when every server in the group can serve it.
+    drivers_by_group: dict[uuid.UUID, set[str]] = {}
+    if rows:
+        for gid, driver in (
+            await db.execute(
+                select(DNSServer.group_id, DNSServer.driver).where(
+                    DNSServer.group_id.in_([r[0].group_id for r in rows])
+                )
+            )
+        ).all():
+            drivers_by_group.setdefault(gid, set()).add(driver)
+
     groups: list[dict[str, Any]] = []
-    for opts, group, cert_name, has_pem in (
-        await db.execute(stmt.order_by(DNSServerGroup.name))
-    ).all():
+    for opts, group, cert_name, has_pem in rows:
         cert_usable = bool(has_pem)
-        listeners_effective = cert_usable and (opts.dot_enabled or opts.doh_enabled)
+        group_drivers = drivers_by_group.get(group.id, set())
+        doq_capable = bool(group_drivers) and group_drivers <= {"technitium"}
+        doq_wanted = bool(opts.doq_enabled) and doq_capable
+        listeners_effective = cert_usable and (opts.dot_enabled or opts.doh_enabled or doq_wanted)
         groups.append(
             {
                 "group_id": str(group.id),
@@ -1665,6 +1684,11 @@ async def find_dns_encrypted_transports(
                 "doh_enabled": opts.doh_enabled,
                 "doh_port": opts.doh_port,
                 "doh_path": opts.doh_path,
+                "doq_enabled": opts.doq_enabled,
+                "doq_port": opts.doq_port,
+                # Stored flag AND a driver that can serve it; False on a
+                # BIND9 / PowerDNS group carrying a stale doq_enabled.
+                "doq_wanted": doq_wanted,
                 "tls_certificate_name": cert_name,
                 "tls_certificate_usable": cert_usable,
                 # The honest answer to "is it actually serving?" — the agent
@@ -1687,7 +1711,8 @@ async def find_dns_encrypted_transports(
             "groups_with_broken_listener": sum(
                 1
                 for g in groups
-                if (g["dot_enabled"] or g["doh_enabled"]) and not g["tls_certificate_usable"]
+                if (g["dot_enabled"] or g["doh_enabled"] or g["doq_wanted"])
+                and not g["tls_certificate_usable"]
             ),
         },
     }

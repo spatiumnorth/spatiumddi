@@ -97,8 +97,8 @@ rules:
     # list and the PV read granted below). Without the reclaim the
     # missing replica's sentinel silently halves the failover quorum and
     # the next node loss strands the Redis master for good. delete on
-    # pods+PVCs (and create on PVCs, #1541) — everything else in this
-    # Role stays read-only.
+    # pods+PVCs (and create on PVCs, #1541; patch on pods, #2132) —
+    # everything else in this Role stays read-only.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     # #1541 — create: the slot-image mirror's claim is a plain Helm-owned
@@ -107,7 +107,21 @@ rules:
     verbs: ["get", "list", "delete", "create"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["delete"]
+    # #2132 — patch: the seed supervisor re-clones a CloudNativePG instance
+    # that loops on WAL it can never get (a former primary whose pg_rewind
+    # needs an archive the appliance does not have, or a standby whose slot
+    # #2317's cap invalidated) by annotating its pod
+    # ``alpha.cnpg.io/unrecoverable``, CNPG's documented way to have the
+    # operator delete the pod and its PVCs and join a fresh copy from the
+    # primary (k8s_api.reclone_stuck_postgres_instances). CNPG ignores the
+    # annotation on the current or target primary. The patch only ever sets
+    # that one annotation.
+    verbs: ["delete", "patch"]
+    # #2132 — the stuck-instance check reads the CNPG instance pods' recent
+    # log lines for the loops that never heal on their own. Read-only.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
     # #2190/#2403 — the role-label gate reads each role DaemonSet's pod
     # template (k8s_api.daemonset_template_env) to hold a node's role label
     # until the template carries the node's assigned group. Without this a

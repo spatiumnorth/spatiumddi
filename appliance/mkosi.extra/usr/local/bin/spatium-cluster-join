@@ -898,7 +898,10 @@ do_leave() {
     # gave the seed a voter nobody would ever answer for, and demoting both
     # non-seed members of a three-node cluster (the only demote the odd-count
     # rule allows there) cost the seed its quorum. The runner removes this
-    # node's own member while it still votes and stops k3s. It returns 0 once
+    # node's own member while it still votes and stops k3s; a node whose etcd
+    # leads hands the lead to the seed first (#2874: a leader that removes
+    # itself leaves the cluster without one, and with both members leaving at
+    # once that cost the seed its quorum for good). It returns 0 once
     # the member is gone: either a survivor no longer lists it, or no survivor
     # could be reached to confirm it in time and etcd accepted the removal
     # (bfbf79d: etcd's acceptance is the removal, so waiting on an unreachable
