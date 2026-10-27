@@ -42,6 +42,11 @@ def fqdn(i: int) -> str:
 # call that answers>]"; a host with no file does not resolve. Every call is logged.
 FAKE_REDIS_CLI = r"""#!/bin/sh
 echo "$*" >> "$FAKE/calls"
+# #2873: a sentinel with requirepass refuses a client that does not send it.
+if [ -n "${FAKE_REQUIRE_AUTH:-}" ] && [ "${REDISCLI_AUTH:-}" != "$FAKE_REQUIRE_AUTH" ]; then
+    echo "NOAUTH Authentication required." >&2
+    exit 1
+fi
 n=$(( $(cat "$FAKE/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$FAKE/count"
 host="$2"; sub="$6"
@@ -87,7 +92,8 @@ def pod(tmp_path):
         line = f"{host} {epoch}" + (f" {from_call}" if from_call else "")
         (fake / "answers" / fqdn(peer)).write_text(line + "\n")
 
-    def run(ordinal: int, wait: str = "0", password: str = "", replicas: str = "3"):
+    def run(ordinal: int, wait: str = "0", password: str = "", replicas: str = "3",
+            require_auth: str = ""):
         (tmpl / "replicas").write_text(replicas)
         env = {
             "PATH": f"{fakebin}{os.pathsep}{os.environ['PATH']}",
@@ -96,6 +102,8 @@ def pod(tmp_path):
             "REDIS_PASSWORD": password, "REDIS_DISCOVERY_SECONDS": wait,
             "TMPL_DIR": str(tmpl), "DATA_DIR": str(data), "FAKE": str(fake),
         }
+        if require_auth:
+            env["FAKE_REQUIRE_AUTH"] = require_auth
         r = subprocess.run(["sh", str(SCRIPT)], env=env, capture_output=True, text=True,
                            timeout=60)
         assert r.returncode == 0, r.stderr
@@ -211,3 +219,32 @@ def test_the_chart_runs_this_script_and_renders_no_fixed_topology():
     assert 'echo "replicaof' not in text
     assert "replicas: {{ $replicas | quote }}" in text
     assert SCRIPT.read_text().startswith("#!/bin/sh\n")
+
+
+def test_peer_queries_send_the_password_to_auth_required_sentinels(pod):
+    """#2873: with auth on, the sentinels have requirepass, so the discovery
+    queries must carry it (via REDISCLI_AUTH, never argv) or a re-created
+    master pod falls back to the ordinal rule and the #1442 cycle returns."""
+    pod.answer(1, 1)
+    pod.answer(2, 1)
+    out = pod(0, password="s3cretPw9x", require_auth="s3cretPw9x")
+    assert "the sentinels name it" in out["log"], out["log"]
+    assert not any("s3cretPw9x" in c for c in out["calls"]), out["calls"]
+
+
+def test_without_the_password_an_auth_required_sentinel_is_not_heard(pod):
+    """The negative control: same sentinels, no password sent."""
+    pod.answer(1, 1)
+    pod.answer(2, 1)
+    out = pod(0, password="", require_auth="s3cretPw9x")
+    assert "the sentinels name it" not in out["log"]
+
+
+def test_sentinel_template_requires_the_password_when_auth_is_on():
+    """#2873: the shipped template, not the fixture, must carry both lines
+    inside the auth gate."""
+    text = TEMPLATE.read_text()
+    sent = text.split("sentinel.conf.tmpl: |", 1)[1].split("\n---", 1)[0]
+    gate = sent.split("{{- if $authEnabled }}", 1)[1].split("{{- end }}", 1)[0]
+    assert "requirepass __PASSWORD__" in gate
+    assert "sentinel sentinel-pass __PASSWORD__" in gate
