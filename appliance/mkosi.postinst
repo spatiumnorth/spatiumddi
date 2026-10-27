@@ -213,6 +213,15 @@ if [ -f "$BUILDROOT/etc/systemd/system/etc.mount" ]; then
         "$BUILDROOT/etc/systemd/system/local-fs.target.wants/etc.mount"
 fi
 
+# spatium-etc-premount runs between var.mount and etc.mount, so it is
+# wanted by local-fs.target like etc.mount itself (the multi-user loop
+# above would be far too late).
+if [ -f "$BUILDROOT/etc/systemd/system/spatium-etc-premount.service" ]; then
+    mkdir -p "$BUILDROOT/etc/systemd/system/local-fs.target.wants"
+    ln -sfn /etc/systemd/system/spatium-etc-premount.service \
+        "$BUILDROOT/etc/systemd/system/local-fs.target.wants/spatium-etc-premount.service"
+fi
+
 # Phase 8a — /home + /root bind-mount units (issue #138). These ship
 # in every image slot so they're immune to fstab being reset to
 # image vanilla on slot swap. Operator home dirs persist via the var
@@ -418,6 +427,7 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console@.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-premount.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-render"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-state"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-render.service"

@@ -2847,10 +2847,18 @@ same step removes `/etc/sudoers.d/live` when its whole content is the
 one line Debian's live-config writes during the live ISO session
 (`user ALL=(ALL) NOPASSWD: ALL`), and live-config's
 `/var/lib/live/config` markers: installers before this change copied
-both from the live session onto the disk. A file at that path with any
-other content is left alone. The image no longer ships live-config's
-account components, and the installer excludes both paths from the
-live-root copy.
+both from the live session onto the disk, into the `/etc` baseline of
+**both** slots. A slot upgrade replaces only one slot's baseline, so a
+second step, `spatium-etc-premount.service` (`spatium-etc-reconcile
+--before-mount`), runs after `/var` is mounted and before `etc.mount`,
+and writes an overlay whiteout for `sudoers.d/live` into
+`/var/persist/etc`. Both slots mount that upper, so neither slot's
+baseline can show the file, including after a rollback. It runs only
+while `/etc` is not mounted, since overlayfs does not define changes to
+an upper under a live mount. A file of the upper's own at that path
+(an operator's `/etc/sudoers.d/live`) is left alone by both steps. The
+image no longer ships live-config's account components, and the
+installer excludes both paths from the live-root copy.
 
 **Slot upgrade flow:**
 

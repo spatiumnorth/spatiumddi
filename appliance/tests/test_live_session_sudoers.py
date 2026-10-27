@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -264,7 +265,7 @@ def test_reconcile_main_logs_what_it_removed(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(mod, "LIVE_CONFIG_STATE", state)
     # main() calls basicConfig; let caplog see the records anyway.
     caplog.set_level("INFO")
-    assert mod.main() == 0
+    assert mod.main([]) == 0
     assert not (etc / "sudoers.d" / "live").exists()
     msgs = " ".join(r.getMessage() for r in caplog.records)
     assert "removed live-session leftover" in msgs
@@ -335,3 +336,233 @@ def test_both_validators_reserve_the_same_names():
     fn = _code(extract_fn("_assert_admin_user_available"))
     in_bash = set(re.findall(r'"\$ADMIN_USER" = "([^"]+)"', fn))
     assert names == in_bash == {"user", "debian"}
+
+
+# ── both slots: the whiteout in the shared upper (before etc.mount) ────
+#
+# Installers before this change put the rule in /usr/lib/etc.image of
+# BOTH slots. A slot upgrade replaces one slot's lower and leaves the
+# other's, so the merged-view removal above cannot reach the slot that is
+# not running, and a rollback brings the rule back. The pre-mount step
+# writes an overlay whiteout into the upper both slots share.
+
+_FAKE_WHITEOUT = "<overlay whiteout>\n"
+
+
+def _fake_whiteouts(monkeypatch, mod):
+    """An unprivileged runner cannot mknod a character device, so stand
+    a marker file in for the whiteout. The real mknod is exercised by
+    test_real_whiteout_device when the runner can create one."""
+
+    def make(path):
+        Path(path).write_text(_FAKE_WHITEOUT)
+
+    def is_wo(path):
+        p = Path(path)
+        return p.is_file() and p.read_text() == _FAKE_WHITEOUT
+
+    monkeypatch.setattr(mod, "_make_whiteout", make)
+    monkeypatch.setattr(mod, "_is_whiteout", is_wo)
+    return is_wo
+
+
+def _merged_has(rel: str, lower: Path, upper: Path, is_wo) -> str | None:
+    """What an overlay of ``upper`` over ``lower`` shows at ``rel``."""
+    u = upper / rel
+    if os.path.lexists(u):
+        return None if is_wo(u) else u.read_text()
+    lo = lower / rel
+    return lo.read_text() if lo.is_file() else None
+
+
+def _slot_lower(root: Path, with_rule: bool) -> Path:
+    lower = root / "usr" / "lib" / "etc.image"
+    (lower / "sudoers.d").mkdir(parents=True)
+    (lower / "sudoers.d" / "README").write_text("readme\n")
+    if with_rule:
+        (lower / "sudoers.d" / "live").write_text(LIVE_LINE + "\n")
+    return lower
+
+
+def test_rollback_after_upgrade_does_not_bring_the_rule_back(tmp_path, monkeypatch):
+    """Upgrade then rollback: the old slot's lower still holds the rule."""
+    mod = _reconcile()
+    is_wo = _fake_whiteouts(monkeypatch, mod)
+    old_lower = _slot_lower(tmp_path / "root_A", with_rule=True)
+    new_lower = _slot_lower(tmp_path / "root_B", with_rule=False)
+    upper = tmp_path / "persist" / "etc"
+    upper.mkdir(parents=True)
+    rel = "sudoers.d/live"
+
+    # Before the upgrade: the old slot shows the rule.
+    assert _merged_has(rel, old_lower, upper, is_wo) == LIVE_LINE + "\n"
+
+    # First boot of the new slot: pre-mount step against ITS lower.
+    assert mod.before_mount(upper, new_lower, tmp_path / "etc-not-mounted") == 0
+    assert _merged_has(rel, new_lower, upper, is_wo) is None
+
+    # Rollback: the old slot mounts the same upper over its own lower.
+    assert _merged_has(rel, old_lower, upper, is_wo) is None
+    # README still merges through from either lower.
+    assert (upper / "sudoers.d").is_dir()
+    assert _merged_has("sudoers.d/README", old_lower, upper, is_wo) == "readme\n"
+
+
+def test_premount_is_idempotent_and_logs(tmp_path, monkeypatch, caplog):
+    mod = _reconcile()
+    _fake_whiteouts(monkeypatch, mod)
+    lower = _slot_lower(tmp_path / "root", with_rule=False)
+    upper = tmp_path / "upper"
+    upper.mkdir()
+    caplog.set_level("INFO")
+    mod.before_mount(upper, lower, tmp_path / "etc")
+    assert "created an overlay whiteout" in caplog.text
+    first = (upper / "sudoers.d" / "live").read_text()
+    caplog.clear()
+    mod.before_mount(upper, lower, tmp_path / "etc")
+    assert caplog.text == ""
+    assert (upper / "sudoers.d" / "live").read_text() == first
+
+
+def test_premount_new_upper_dir_copies_the_lower_dir_mode(tmp_path, monkeypatch):
+    mod = _reconcile()
+    _fake_whiteouts(monkeypatch, mod)
+    lower = _slot_lower(tmp_path / "root", with_rule=False)
+    os.chmod(lower / "sudoers.d", 0o750)
+    upper = tmp_path / "upper"
+    upper.mkdir()
+    mod.before_mount(upper, lower, tmp_path / "etc")
+    assert (upper / "sudoers.d").stat().st_mode & 0o777 == 0o750
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["netops ALL=(ALL) ALL\n", LIVE_LINE + "\nnetops ALL=(ALL) ALL\n", ""],
+)
+def test_premount_keeps_an_operator_file_in_the_upper(tmp_path, monkeypatch, content):
+    """Case 5: the operator's own file lives in the upper and survives,
+    over either slot's lower."""
+    mod = _reconcile()
+    is_wo = _fake_whiteouts(monkeypatch, mod)
+    old_lower = _slot_lower(tmp_path / "root_A", with_rule=True)
+    new_lower = _slot_lower(tmp_path / "root_B", with_rule=False)
+    upper = tmp_path / "upper"
+    (upper / "sudoers.d").mkdir(parents=True)
+    (upper / "sudoers.d" / "live").write_text(content)
+    mod.before_mount(upper, new_lower, tmp_path / "etc")
+    assert (upper / "sudoers.d" / "live").read_text() == content
+    for lower in (old_lower, new_lower):
+        assert _merged_has("sudoers.d/live", lower, upper, is_wo) == content
+
+
+def test_premount_replaces_an_upper_copy_of_the_rule(tmp_path, monkeypatch):
+    mod = _reconcile()
+    is_wo = _fake_whiteouts(monkeypatch, mod)
+    lower = _slot_lower(tmp_path / "root", with_rule=True)
+    upper = tmp_path / "upper"
+    (upper / "sudoers.d").mkdir(parents=True)
+    (upper / "sudoers.d" / "live").write_text(LIVE_LINE + "\n")
+    mod.before_mount(upper, lower, tmp_path / "etc")
+    assert is_wo(upper / "sudoers.d" / "live")
+
+
+def test_premount_leaves_a_symlinked_sudoers_d_alone(tmp_path, monkeypatch):
+    mod = _reconcile()
+    _fake_whiteouts(monkeypatch, mod)
+    lower = _slot_lower(tmp_path / "root", with_rule=True)
+    upper = tmp_path / "upper"
+    upper.mkdir()
+    (upper / "sudoers.d").symlink_to(tmp_path)
+    mod.before_mount(upper, lower, tmp_path / "etc")
+    assert not (tmp_path / "live").exists()
+
+
+def test_premount_refuses_a_mounted_etc(tmp_path, monkeypatch):
+    """Changing an upper under a live overlay mount is undefined."""
+    mod = _reconcile()
+    _fake_whiteouts(monkeypatch, mod)
+    lower = _slot_lower(tmp_path / "root", with_rule=True)
+    upper = tmp_path / "upper"
+    upper.mkdir()
+    monkeypatch.setattr(mod.os.path, "ismount", lambda p: True)
+    mod.before_mount(upper, lower, tmp_path / "etc")
+    assert not (upper / "sudoers.d").exists()
+
+
+def test_main_dispatches_before_mount(tmp_path, monkeypatch):
+    mod = _reconcile()
+    _fake_whiteouts(monkeypatch, mod)
+    lower = _slot_lower(tmp_path / "root", with_rule=True)
+    upper = tmp_path / "upper"
+    upper.mkdir()
+    monkeypatch.setattr(mod, "LOWER", lower)
+    monkeypatch.setattr(mod, "UPPER", upper)
+    monkeypatch.setattr(mod, "ETC", tmp_path / "etc")
+    assert mod.main(["--before-mount"]) == 0
+    assert (upper / "sudoers.d" / "live").exists()
+    assert mod.main(["--bogus"]) == 2
+
+
+def test_real_whiteout_device(tmp_path):
+    """The real _make_whiteout / _is_whiteout pair, where mknod is allowed."""
+    mod = _reconcile()
+    path = tmp_path / "live"
+    try:
+        mod._make_whiteout(path)
+    except PermissionError:
+        pytest.skip("this runner cannot create character devices")
+    assert mod._is_whiteout(path)
+    assert not mod._is_whiteout(tmp_path)
+
+
+def test_premount_unit_runs_between_var_and_etc_mount():
+    unit = (
+        EXTRA / "etc" / "systemd" / "system" / "spatium-etc-premount.service"
+    ).read_text()
+    assert "DefaultDependencies=no" in unit
+    assert re.search(r"^After=.*\bvar\.mount\b", unit, re.M)
+    assert re.search(r"^Before=.*\betc\.mount\b", unit, re.M)
+    assert "ConditionPathIsMountPoint=!/etc" in unit
+    assert "spatium-etc-reconcile --before-mount" in unit
+    post = _code(POSTINST.read_text(encoding="utf-8"))
+    assert "local-fs.target.wants/spatium-etc-premount.service" in post
+    assert (
+        'chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-premount.service"'
+        in post
+    )
+
+
+def test_rollback_on_a_real_overlay(tmp_path):
+    """Case 4 end to end on a real overlayfs, where the runner may mount.
+
+    Skipped unprivileged (CI); run in a privileged container to see the
+    kernel honour the whiteout over the OLD slot's lower.
+    """
+    mod = _reconcile()
+    upper = tmp_path / "upper"
+    work = tmp_path / "work"
+    merged = tmp_path / "merged"
+    for d in (upper, work, merged):
+        d.mkdir()
+    old_lower = _slot_lower(tmp_path / "root_A", with_rule=True)
+    new_lower = _slot_lower(tmp_path / "root_B", with_rule=False)
+    try:
+        mod._make_whiteout(tmp_path / "probe")
+    except PermissionError:
+        pytest.skip("this runner cannot create character devices")
+    os.unlink(tmp_path / "probe")
+
+    mod.before_mount(upper, new_lower, merged)  # first boot of the new slot
+    opts = f"lowerdir={old_lower},upperdir={upper},workdir={work}"
+    r = subprocess.run(
+        ["mount", "-t", "overlay", "overlay", "-o", opts, str(merged)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        pytest.skip(f"cannot mount overlayfs here: {r.stderr.strip()}")
+    try:  # the rollback: the old slot's lower under the shared upper
+        assert not os.path.lexists(merged / "sudoers.d" / "live")
+        assert (merged / "sudoers.d" / "README").read_text() == "readme\n"
+    finally:
+        subprocess.run(["umount", str(merged)], check=False)
