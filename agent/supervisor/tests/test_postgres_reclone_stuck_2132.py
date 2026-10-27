@@ -615,6 +615,43 @@ def test_heartbeat_is_quiet_for_a_follower_across_a_switchover(monkeypatch):
     assert len(_events(log, "postgres_instance_looping")) == 1
 
 
+def test_a_planned_switchover_demotion_is_not_a_loop(monkeypatch):
+    # #2831 / #2861: with ``primaryUpdateMethod: switchover`` every rolling
+    # update demotes the old primary, which pg_rewinds and follows the new
+    # one. The rewind succeeds, and the demoted instance logs a short burst
+    # of future-timeline refusals while it finds the new timeline, then
+    # streams. That is the path the former-primary re-clone watches, so it
+    # must log nothing and re-clone nothing, before, during or after.
+    demotion = _stamped(
+        '{"level":"info","msg":"pg_rewind: servers diverged at WAL location 0/9000028 on timeline 4"}\n'
+        '{"level":"info","msg":"pg_rewind: rewinding from last common checkpoint at 0/8000060 on timeline 4"}\n'
+        '{"level":"info","msg":"pg_rewind: Done!"}\n' + FUTURE_ONCE * 4,
+        0,
+    ) + _stamped(HEALTHY, 20)
+    kube = _Kube(
+        current=P1,
+        target=P2,  # the switchover is under way
+        pods=[_pod(P1, ready=False), _pod(P2), _pod(P3)],
+        logs={P1: demotion, P3: HEALTHY},
+    )
+    monkeypatch.setattr(k8s_api, "_request", kube)
+    monkeypatch.setattr(k8s_api, "_cnpg_instance_status", kube.status)
+    _fresh_heartbeat_state(monkeypatch)
+    log = _Log()
+    heartbeat._reclone_stuck_postgres(log, now=0)
+    # Done: P2 is primary, P1 a Ready follower whose burst stays in the window.
+    kube.cr["status"].update(currentPrimary=P2, targetPrimary=P2)
+    kube.pods = [_pod(P1), _pod(P2), _pod(P3)]
+    kube.logs = {P1: demotion, P3: HEALTHY}
+    for now in (30, 60, 90):
+        out = heartbeat._reclone_stuck_postgres(log, now=now)
+        assert out.marked == [] and not any(s["confirmed"] for s in out.stuck.values())
+    kube.logs[P1] = _stamped(HEALTHY, 120)  # the burst leaves the window
+    for now in range(120, 1800, 30):
+        heartbeat._reclone_stuck_postgres(log, now=now)
+    assert log.events == [] and kube.patches == []
+
+
 def test_heartbeat_logs_the_clock_reset_and_why_a_loop_is_held(monkeypatch):
     kube = _Kube(
         pods=[_pod(P1), _pod(P2), _pod(P3)],
