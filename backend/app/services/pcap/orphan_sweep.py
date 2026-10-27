@@ -110,7 +110,12 @@ def _unlink_orphans(
                 continue  # another pod on this node got there first
             except OSError as exc:
                 result["kept"] += 1
-                logger.warning("pcap_orphan_unlink_failed", path=str(path), error=str(exc))
+                logger.warning(
+                    "pcap_orphan_unlink_failed",
+                    path=str(path),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
 
 async def sweep_orphans(
@@ -141,7 +146,7 @@ async def sweep_orphans(
             .all()
         )
     except Exception as exc:  # noqa: BLE001 — fail closed: delete nothing
-        logger.warning("pcap_orphan_sweep_db_error", error=str(exc))
+        logger.warning("pcap_orphan_sweep_db_error", error=str(exc), error_type=type(exc).__name__)
         result["kept"] = result["scanned"]
         return result
 
@@ -164,7 +169,12 @@ def run_worker_sweep_once() -> dict[str, int] | None:
     try:
         return asyncio.run(_sweep_with_task_session())
     except Exception as exc:  # noqa: BLE001 — a background pass must not die
-        logger.warning("pcap_orphan_sweep_failed", where="worker", error=str(exc))
+        logger.warning(
+            "pcap_orphan_sweep_failed",
+            where="worker",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         return None
 
 
