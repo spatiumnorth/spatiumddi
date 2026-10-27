@@ -1420,6 +1420,12 @@ ${POSTGRES_PARAMETERS_YAML}
         # labelled yet), so a single node loss would have taken the
         # primary and a replica together. Inert at instances: 1.
         podAntiAffinityType: required
+        # #2132 — copy the cluster CA's public certificate into a ConfigMap
+        # the supervisor reads, so it verifies the TLS of CNPG's status
+        # endpoint before trusting the primary's slot state, with no grant
+        # on the CA secret (which holds the private key).
+        caPublisher:
+          enabled: true
     # #272 Phase 3 — Redis runs under Sentinel on every appliance so the
     # cache/queue layer is HA like postgres: each replica pairs a
     # redis-server with a redis-sentinel that elects a master + fails

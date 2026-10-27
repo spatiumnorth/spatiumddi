@@ -76,6 +76,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pre_body_auth import header_only
 from app.api.v1.appliance.cluster import VarDiskFinding
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
@@ -7615,11 +7616,16 @@ class K8sProxyReplyRequest(BaseModel):
     body_b64: str = ""
 
 
+@header_only
 async def _require_cert_auth(request: Request, db: DB) -> Appliance:
     """Shared cert-auth gate for the proxy endpoints. Returns the
     authenticated appliance row. Raises 403 on failure — no fallback
     to session-token here since the proxy channel only exists for
     approved appliances with mTLS certs.
+
+    Reads only the request headers, so a route that streams its body
+    (the pcap upload) takes it as a dependency and the caller is checked
+    before any of the body is read.
     """
     from app.services.appliance.cert_auth import (  # noqa: PLC0415
         CertAuthFailed,
@@ -8463,7 +8469,12 @@ async def pcap_progress(
     "/supervisor/pcap/upload/{capture_id}",
     summary="Stream the finished .pcap back (or finalize as failed via ?error=)",
 )
-async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[str, str]:
+async def pcap_upload(
+    capture_id: uuid.UUID,
+    request: Request,
+    db: DB,
+    appliance: Annotated[Appliance, Depends(_require_cert_auth)],
+) -> dict[str, str]:
     """Cert-authed. Streams the host-captured ``.pcap`` to the shared
     PCAP_DIR (``.partial`` → atomic rename + sha256), capped at
     ``max_bytes`` + margin. ``?error=`` (empty body) finalizes a failed
@@ -8476,7 +8487,9 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
     from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
     from app.services.pcap.runner import HARD_MAX_BYTES, pcap_dir  # noqa: PLC0415
 
-    appliance = await _require_cert_auth(request, db)
+    # ``appliance`` is resolved by the ``_require_cert_auth`` dependency,
+    # before the handler reads the body: the route carries a body-cap
+    # allowance above the app-wide cap (``app.core.body_limit``).
     row = await _pcap_capture_for_appliance(db, capture_id, appliance)
 
     error = request.query_params.get("error")

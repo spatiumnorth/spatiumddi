@@ -45,6 +45,14 @@ pod_fqdn() {
 POD_FQDN="$(pod_fqdn "$HOSTNAME")"
 ORDINAL_MASTER="$(pod_fqdn "${REDIS_STS}-0")"
 
+# #2873 — with auth on, every sentinel requires the password, so the peer
+# queries below must send it. redis-cli reads REDISCLI_AUTH from the
+# environment, which keeps it out of argv (and so out of ``ps``).
+if [ -n "${REDIS_PASSWORD:-}" ]; then
+    REDISCLI_AUTH="$REDIS_PASSWORD"
+    export REDISCLI_AUTH
+fi
+
 # One peer sentinel's answer, as "<config epoch> <master address>", or nothing.
 ask() {
     T=""
