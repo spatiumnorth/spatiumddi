@@ -46,6 +46,11 @@ data:
     sentinel announce-hostnames yes
     sentinel monitor mymaster redis-0.redis-headless.spatiumddi.svc.cluster.local 6379 2
     sentinel auth-pass mymaster __PASSWORD__
+    # #2873 — api / worker send REDIS_SENTINEL_PASSWORD to every Sentinel
+    # hop; a Sentinel with no requirepass rejects that AUTH and the master
+    # is never found. sentinel-pass is what Sentinels send to each other.
+    requirepass __PASSWORD__
+    sentinel sentinel-pass __PASSWORD__
     sentinel down-after-milliseconds mymaster 5000
     sentinel failover-timeout mymaster 60000
     sentinel parallel-syncs mymaster 1

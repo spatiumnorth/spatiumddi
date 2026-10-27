@@ -1224,6 +1224,622 @@ def reclaim_stranded_postgres_storage(
                            terminating)
 
 
+# #2132 — re-clone a CloudNativePG instance stuck on WAL it can never get.
+#
+# A former primary that cannot ``pg_rewind`` (the WAL it needs was recycled,
+# or cut short by the kill that made it a former primary, and the appliance
+# has no WAL archive to restore it from), or a standby whose replication slot
+# #2317's ``max_slot_wal_keep_size`` invalidated, loops for ever: CNPG retries,
+# never re-clones, and the cluster runs one copy short until someone deletes
+# the PVC by hand. CNPG documents one way to ask it for that re-clone, the
+# ``alpha.cnpg.io/unrecoverable`` pod annotation: the operator deletes the pod
+# and its PVCs and joins a fresh instance from the primary, and ignores the
+# annotation on the current or target primary.
+_CNPG_UNRECOVERABLE_ANNOTATION = "alpha.cnpg.io/unrecoverable"
+_CNPG_JOB_ROLE_LABEL = "cnpg.io/jobRole"
+
+# The loops that never end on their own while no WAL archive is configured,
+# MOST SPECIFIC FIRST: when several repeat in one window, the earliest here
+# names the loop. Each is a substring of a line CNPG's instance manager or
+# PostgreSQL writes to the instance pod's log; a hit only counts once it has
+# held for STUCK_INSTANCE_AFTER_S, so one transient line (a pg_rewind
+# attempted while the new primary was still promoting) is never enough.
+_STUCK_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # #2132's first signature: pg_rewind asks the (absent) archive for a
+    # segment the former primary no longer has.
+    ("pg_rewind_archive", ("could not restore file", "from archive")),
+    # #2132's fourth occurrence: the segment is the instance's own, cut short
+    # ("could not read file ... read 0 of 8192"); every pg_rewind failure
+    # ends in this line.
+    ("pg_rewind_failed", ("Failed to execute pg_rewind",)),
+    # A standby whose slot the #2317 cap invalidated, or asking for WAL the
+    # primary has recycled.
+    ("slot_invalidated", ("can no longer get changes from replication slot",)),
+    ("wal_removed", ("has already been removed",)),
+    # #2132's second and third occurrences. LAST, because it is the least
+    # specific: CNPG's restore_command logs it on every walreceiver retry once
+    # the cluster is past timeline 1, so it rides along with each of the loops
+    # above (case 4 of the #2765 walk logged it once per wal_removed line, and
+    # a count-based pick named every such run future_timeline) and with a
+    # standby that merely cannot connect to the primary, which heals.
+    ("future_timeline", ("Refusing to restore future timeline history file",)),
+)
+
+# Signatures that prove on their own that the WAL the instance needs is gone:
+# a failed pg_rewind (the former primary's own WAL from the divergence point,
+# which no slot on the new primary covers), or the primary saying it has
+# removed the segment / invalidated the slot the standby asks for.
+# ``future_timeline`` is not one: a standby cut off from the primary logs it
+# just the same, and catches up once it reconnects (#2765's walk re-cloned
+# exactly such a standby, its slot ``reserved`` 32 MB behind).
+_REWIND_SIGNATURES = frozenset({"pg_rewind_archive", "pg_rewind_failed"})
+_WAL_GONE_SIGNATURES = frozenset({"slot_invalidated", "wal_removed"})
+
+# How long a signature must keep appearing before the instance is re-cloned.
+# The QA desk's drill gate is 15 minutes; a rewind that is going to work does
+# so within a minute or two of the instance coming back.
+STUCK_INSTANCE_AFTER_S = 600
+# The log window read per instance per tick: three heartbeats (30 s each), and
+# room for the slowest loop above (pg_rewind every 10-20 s) to repeat.
+_STUCK_LOG_WINDOW_S = 90
+_STUCK_LOG_LIMIT_BYTES = 256 * 1024
+# A signature counts only when it REPEATS in the window, i.e. the instance is
+# looping now. A replica joining a forming cluster logs "Refusing to restore
+# future timeline history file" once or twice in its first seconds (the
+# Cluster's recorded timeline lags the history file it was cloned with) and
+# then streams; the walk on #2765 saw exactly one such line per joiner, 11 s
+# and 24 s after start. Every real loop repeats far faster than this needs:
+# pg_rewind fails every 10-20 s (4-9 lines in the window), the future-timeline
+# refusal and the WAL-removed / slot-invalidated walreceiver errors every 1-5 s.
+STUCK_MIN_REPEATS = 3
+# A loop that has held this long across ticks is reported as stuck (a
+# warning). Before that it is only "looping" (info): one tick is not evidence.
+STUCK_REPORT_AFTER_S = 120
+
+# CNPG's instance manager serves its own status, including the primary's
+# ``pg_replication_slots`` (``replicationSlotsInfo``: slot name, walStatus),
+# on this port of every instance pod. ``kubectl cnpg status`` reads the same
+# document. Reading it straight off the pod IP needs no grant on the pods
+# themselves, where the alternatives each need one much wider than the
+# question: pods/exec (a shell in any pod of the namespace) or pods/proxy.
+#
+# The endpoint presents the cluster's server certificate, signed by the
+# cluster CA (``<cluster>-ca``) with the cluster's service names as SANs
+# (``<cluster>-rw``, ``-r``, ``-ro`` and their namespace / svc forms; never
+# the pod IP or the pod name). So the read connects to the pod IP and checks
+# the certificate against the CA under the name ``<cluster>-rw``, which every
+# instance's certificate carries. The CA reaches the supervisor as its public
+# certificate only, in the ConfigMap ``<cluster>-ca-crt`` the control chart's
+# publisher CronJob keeps in step with the CA secret
+# (charts/spatiumddi/templates/cnpg-ca-publisher.yaml): the secret also holds
+# the CA private key, so the supervisor is never granted it.
+_CNPG_STATUS_PORT = 8000
+_CNPG_STATUS_PATH = "/pg/status"
+_CNPG_STATUS_TIMEOUT_S = 4.0
+# The ConfigMap (and its key) the control chart publishes the cluster CA's
+# public certificate into.
+_CNPG_CA_CONFIGMAP_SUFFIX = "-ca-crt"
+_CNPG_CA_CONFIGMAP_KEY = "ca.crt"
+# The SAN the status endpoint's certificate is checked against.
+_CNPG_STATUS_NAME_SUFFIX = "-rw"
+# The slot name CNPG gives each instance's HA slot on the primary is
+# ``<prefix><instance name with - as _>``, prefix ``_cnpg_`` by default.
+_CNPG_SLOT_PREFIX = "_cnpg_"
+# walStatus values under which the WAL from the slot's restart_lsn is still
+# on the primary (``unreserved``: past max_wal_size, kept until the next
+# checkpoint): the standby can stream it once it reconnects.
+_SLOT_WAL_PRESENT = frozenset({"reserved", "extended", "unreserved"})
+
+
+def repeating_signatures(log_text: str) -> list[str]:
+    """Every never-heals signature that repeats at least
+    :data:`STUCK_MIN_REPEATS` times in ``log_text`` (one match per line),
+    most specific first (the order of :data:`_STUCK_SIGNATURES`)."""
+    counts: dict[str, int] = {}
+    for line in log_text.splitlines():
+        for name, parts in _STUCK_SIGNATURES:
+            if all(part in line for part in parts):
+                counts[name] = counts.get(name, 0) + 1
+                break
+    return [name for name, _ in _STUCK_SIGNATURES if counts.get(name, 0) >= STUCK_MIN_REPEATS]
+
+
+def stuck_signature(log_text: str) -> str | None:
+    """The most specific never-heals signature that repeats in ``log_text``,
+    or None. Specificity, not line count, picks it: ``future_timeline`` is
+    logged alongside every other loop, so it only names a loop that shows
+    nothing else."""
+    repeating = repeating_signatures(log_text)
+    return repeating[0] if repeating else None
+
+
+def _newest_match_stamp(log_text: str) -> str:
+    """The kubelet timestamp (``timestamps=true``) of the newest line in
+    ``log_text`` that matches any signature, or "" when the lines carry
+    none. Two ticks reporting the same newest line mean the loop logged
+    nothing new between them."""
+    newest = ""
+    for line in log_text.splitlines():
+        if any(all(part in line for part in parts) for _, parts in _STUCK_SIGNATURES):
+            stamp, _, _ = line.partition(" ")
+            if stamp[:1].isdigit() and "T" in stamp:
+                newest = stamp
+    return newest
+
+
+@dataclass
+class StuckSighting:
+    """An instance first seen looping at ``since`` (the caller's clock),
+    under ``primary``. A change of primary starts the clock again: the
+    instance may be able to follow the new one.
+
+    ``confirmed`` is set once a later tick finds the loop still logging new
+    lines (a newer matching line than the first tick saw): a healthy follower
+    that logs a burst of future-timeline refusals across a switchover leaves
+    those lines in the next two windows, but logs no new ones.
+    ``evidence`` collects every repeating signature seen in this sighting."""
+
+    primary: str
+    since: float
+    signature: str
+    first_stamp: str = ""
+    confirmed: bool = False
+    evidence: set[str] = field(default_factory=set)
+
+
+@dataclass
+class PostgresReclone:
+    """What one :func:`reclone_stuck_postgres_instances` call did.
+
+    ``stuck`` maps each looping instance to ``{"signature", "seconds",
+    "confirmed", "slot"}``; ``marked`` names the instance annotated for a
+    re-clone this call (at most one); ``deferred_reason`` says why a due
+    instance was not; ``held`` maps a due instance to why it is NOT being
+    re-cloned at all (its WAL still exists, or that cannot be told);
+    ``clock_reset`` maps an instance whose stuck clock restarted this call
+    to why."""
+
+    stuck: dict[str, dict[str, Any]] = field(default_factory=dict)
+    marked: list[str] = field(default_factory=list)
+    deferred_reason: str = ""
+    held: dict[str, str] = field(default_factory=dict)
+    clock_reset: dict[str, str] = field(default_factory=dict)
+    # Set on a call that read the primary's slots: ``slot_state_error`` says
+    # why they could not be read (so every stuck instance reads ``unknown``
+    # and none is re-cloned), "" when they were, with the endpoint's TLS
+    # verified against the cluster CA (``slot_state_read``).
+    slot_state_read: bool = False
+    slot_state_error: str = ""
+    error: str | None = None
+
+
+def _pod_ready(pod: dict) -> bool:
+    for cond in (pod.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "Ready":
+            return str(cond.get("status")) == "True"
+    return False
+
+
+def cnpg_ca_configmap_name(cluster_name: str = _CNPG_DEFAULT_CLUSTER) -> str:
+    """The ConfigMap the control chart publishes ``cluster_name``'s CA
+    certificate (public part only) into."""
+    return cluster_name + _CNPG_CA_CONFIGMAP_SUFFIX
+
+
+def _cnpg_status_ca(namespace: str, cluster_name: str) -> tuple[str | None, str]:
+    """The cluster CA certificate (PEM) the status endpoint is verified
+    against, read from :func:`cnpg_ca_configmap_name`, or ``(None, why)``.
+    Never the CA secret: that holds the private key too."""
+    name = cnpg_ca_configmap_name(cluster_name)
+    try:
+        status, resp = _request(
+            "GET", f"/api/v1/namespaces/{quote(namespace)}/configmaps/{quote(name)}"
+        )
+    except RuntimeError as exc:
+        return None, f"the CA ConfigMap {name} could not be read: {exc}"
+    if status == 404:
+        return None, (
+            f"the CA ConfigMap {name} does not exist (the control chart's "
+            "CA publisher has not run yet, or is not enabled)"
+        )
+    if status != 200:
+        return None, f"the CA ConfigMap {name} could not be read: kubeapi status {status}"
+    try:
+        data = json.loads(resp).get("data") or {}
+    except (ValueError, AttributeError):
+        return None, f"the CA ConfigMap {name} is unparseable"
+    pem = data.get(_CNPG_CA_CONFIGMAP_KEY) if isinstance(data, dict) else None
+    if not isinstance(pem, str) or "-----BEGIN CERTIFICATE-----" not in pem:
+        return None, f"the CA ConfigMap {name} carries no {_CNPG_CA_CONFIGMAP_KEY} certificate"
+    return pem, ""
+
+
+class _NamedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to an address, with the certificate checked against
+    ``server_hostname`` (also sent as SNI) rather than the address: the
+    status endpoint's certificate names the cluster's services, not pods."""
+
+    def __init__(
+        self, host: str, port: int, *, server_hostname: str, context: ssl.SSLContext, timeout: float
+    ) -> None:
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._server_hostname = server_hostname
+        self._verify_context = context
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._verify_context.wrap_socket(
+            self.sock, server_hostname=self._server_hostname
+        )
+
+
+def _cnpg_instance_status(
+    pod_ip: str, *, ca_pem: str, server_hostname: str
+) -> tuple[dict | None, str]:
+    """GET CNPG's instance-manager status document off ``pod_ip``, with its
+    TLS certificate verified against ``ca_pem`` (the cluster CA) under the
+    name ``server_hostname``. ``(doc, "")``, or ``(None, why)`` when it
+    cannot be read or the certificate does not verify. Nothing is read from
+    an endpoint whose certificate fails: a forged slot state is then no
+    better than none, and none holds every re-clone."""
+    try:
+        ctx = ssl.create_default_context(cadata=ca_pem)
+    except (ssl.SSLError, ValueError) as exc:
+        return None, f"the cluster CA certificate could not be loaded: {exc}"
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    # Pinned rather than left to the interpreter's defaults, so the check is
+    # the same on every Python the supervisor runs (the image ships 3.14;
+    # 3.13 made both the default): RFC 5280 strict chain checks, and TLS 1.2
+    # or later. CNPG's certificates pass the strict checks: Go's x509 gives
+    # its CA a Subject Key Identifier and the server leaf an Authority Key
+    # Identifier (verified live on a CNPG 1.30.1 cluster).
+    ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    conn = _NamedHTTPSConnection(
+        pod_ip,
+        _CNPG_STATUS_PORT,
+        server_hostname=server_hostname,
+        context=ctx,
+        timeout=_CNPG_STATUS_TIMEOUT_S,
+    )
+    try:
+        conn.request("GET", _CNPG_STATUS_PATH, headers={"Accept": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 200:
+            return None, f"the primary's status endpoint answered {resp.status}"
+        doc = json.loads(body)
+        if not isinstance(doc, dict):
+            return None, "the primary's status document is not an object"
+        return doc, ""
+    except ssl.SSLCertVerificationError as exc:
+        return None, (
+            "the primary's status endpoint certificate did not verify against the "
+            f"cluster CA as {server_hostname}: {exc.verify_message or exc}"
+        )
+    except ssl.SSLError as exc:
+        return None, f"TLS to the primary's status endpoint failed: {exc}"
+    except (OSError, http.client.HTTPException) as exc:
+        return None, f"the primary's status endpoint could not be read: {exc}"
+    except ValueError:
+        return None, "the primary's status document is unparseable"
+    finally:
+        conn.close()
+
+
+def _slot_states(
+    primary_pod: dict | None,
+    *,
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+) -> tuple[dict[str, str] | None, str]:
+    """``{slot_name: walStatus}`` for the primary's replication slots (a
+    NULL walStatus, a slot that never reserved WAL, reads ``"unset"``), and
+    ``""``; or ``(None, why)`` when the primary's status cannot be read, or
+    its certificate cannot be verified against the cluster CA."""
+    if primary_pod is None:
+        return None, "the primary's pod is not listed"
+    pod_ip = str((primary_pod.get("status") or {}).get("podIP") or "")
+    if not pod_ip:
+        return None, "the primary's pod has no IP yet"
+    ca_pem, why = _cnpg_status_ca(namespace, cluster_name)
+    if ca_pem is None:
+        return None, why
+    doc, why = _cnpg_instance_status(
+        pod_ip, ca_pem=ca_pem, server_hostname=cluster_name + _CNPG_STATUS_NAME_SUFFIX
+    )
+    if doc is None:
+        return None, why
+    if not doc.get("isPrimary"):
+        # Not (or no longer) the primary: its slots say nothing about the
+        # standby's WAL on the primary that counts.
+        return None, "the instance read is no longer the primary"
+    slots = doc.get("replicationSlotsInfo") or []
+    if not isinstance(slots, list):
+        return None, "the primary's status document carries no slot list"
+    out: dict[str, str] = {}
+    for slot in slots:
+        if isinstance(slot, dict) and slot.get("slotName"):
+            out[str(slot["slotName"])] = str(slot.get("walStatus") or "unset")
+    return out, ""
+
+
+def _instance_slot(instance: str, slots: dict[str, str] | None) -> str:
+    """The walStatus of ``instance``'s HA slot on the primary: a walStatus
+    value, ``"unset"``, ``"absent"`` (the primary has slots, none of them
+    this instance's), ``"none"`` (the primary has no slots at all, so HA
+    slots are off and nothing can be told from them), or ``"unknown"``."""
+    if slots is None:
+        return "unknown"
+    if not slots:
+        return "none"
+    suffix = instance.replace("-", "_")
+    exact = slots.get(_CNPG_SLOT_PREFIX + suffix)
+    if exact is not None:
+        return exact
+    for name, wal_status in slots.items():
+        if name.endswith(suffix):
+            return wal_status
+    return "absent"
+
+
+def reclone_blocker(signature: str, evidence: set[str], slot: str) -> str | None:
+    """Why an instance that has looped for STUCK_INSTANCE_AFTER_S must NOT be
+    re-cloned, or None when there is positive evidence it can never recover.
+
+    A re-clone destroys the instance's volume and copies the whole database,
+    so it needs proof the WAL the instance needs is gone, not just a loop:
+
+    * the slot state could not be read: hold (fail towards keeping data);
+    * a pg_rewind failure loop: re-clone. The former primary needs its own
+      WAL from the divergence point, which no slot on the new primary covers;
+    * the slot on the primary is ``lost`` or gone: re-clone;
+    * the slot still holds the WAL (``reserved`` / ``extended`` /
+      ``unreserved``): hold, it streams once it reconnects;
+    * no slot speaks for it (never reserved WAL, or HA slots off): re-clone
+      only when its log shows the primary removed the WAL it asks for;
+      ``future_timeline`` alone is what a standby that merely cannot
+      connect logs too.
+    """
+    if slot == "unknown":
+        return (
+            "the primary's replication-slot state could not be read, and a "
+            "re-clone needs proof the WAL this instance needs is gone"
+        )
+    if evidence & _REWIND_SIGNATURES:
+        return None
+    if slot in ("lost", "absent"):
+        return None
+    if slot in _SLOT_WAL_PRESENT:
+        return (
+            f"its replication slot on the primary is {slot}: the WAL it needs "
+            "still exists, so it catches up once it reconnects"
+        )
+    if evidence & _WAL_GONE_SIGNATURES:
+        return None
+    return (
+        f"its log shows only {signature} and no slot on the primary says its "
+        f"WAL is gone (slot {slot}); a standby that cannot reach the primary "
+        "logs the same and heals once it reconnects"
+    )
+
+
+def reclone_stuck_postgres_instances(
+    tracker: dict[str, StuckSighting],
+    *,
+    now: float,
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+    stuck_after_s: float = STUCK_INSTANCE_AFTER_S,
+) -> PostgresReclone:
+    """Find CNPG instances looping on WAL they can never get, and have CNPG
+    re-clone one of them. ``tracker`` is the caller's state across ticks
+    (mutated in place); ``now`` is a monotonic clock.
+
+    An instance counts as stuck when one of :data:`_STUCK_SIGNATURES`
+    repeats (:data:`STUCK_MIN_REPEATS` lines) in its pod's last
+    ``_STUCK_LOG_WINDOW_S`` of log on every call for ``stuck_after_s``, under
+    the same primary, and a later call has seen it log new lines
+    (``confirmed``). A call where it does not repeat resets the clock, so a
+    replica that logs a line or two while it joins and then streams is never
+    counted (#2765's walk). Readiness is deliberately not a condition: a
+    former primary looping on ``pg_rewind`` is not ready, but a standby that
+    lost its slot (#2317) runs as a hot standby and reads Ready while it
+    streams nothing.
+
+    A due instance is annotated ``alpha.cnpg.io/unrecoverable`` only when:
+
+    * the Cluster names one primary (``currentPrimary == targetPrimary``), so
+      no failover or switchover is under way, and the instance is not it;
+    * the primary's pod is Ready, since the re-clone copies from it;
+    * no other re-clone is in flight: no instance pod already carries the
+      annotation or is terminating, and no CNPG ``join`` Job pod is running.
+      One copy is rebuilt at a time, as a person doing it by hand would, so
+      a primary left alone (#2132's fourth occurrence: six stuck at once)
+      is never asked for six base backups together;
+    * there is positive evidence its WAL is gone (:func:`reclone_blocker`,
+      read against the primary's ``pg_replication_slots``). An instance that
+      fails it is reported in ``held`` and keeps its clock.
+
+    Kubeapi errors are returned, never guessed around; a 403 on the log read
+    means the supervisor Role predates #2132 and nothing is marked.
+    """
+    cr_path = (
+        f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
+        f"/clusters/{quote(cluster_name)}"
+    )
+    try:
+        status, resp = _request("GET", cr_path)
+    except RuntimeError as exc:
+        return PostgresReclone(error=str(exc))
+    if status == 404:
+        tracker.clear()
+        return PostgresReclone()  # not a cnpg deployment / Cluster not up yet
+    if status != 200:
+        return PostgresReclone(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        cr_status = json.loads(resp).get("status") or {}
+    except (ValueError, AttributeError):
+        return PostgresReclone(error="unparseable Cluster CR")
+    current = str(cr_status.get("currentPrimary") or "")
+    target = str(cr_status.get("targetPrimary") or "")
+    if not current or current != target:
+        # A failover or switchover is under way, or the primary is unknown:
+        # nothing seen now says anything about the next primary.
+        reason = "the Cluster names no single primary (failover or switchover under way)"
+        out = PostgresReclone(
+            deferred_reason=reason,
+            clock_reset={instance: reason for instance in tracker},
+        )
+        tracker.clear()
+        return out
+
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    selector = quote(f"{_CNPG_CLUSTER_LABEL}={cluster_name}", safe="")
+    try:
+        status, resp = _request("GET", f"{base}/pods?labelSelector={selector}")
+    except RuntimeError as exc:
+        return PostgresReclone(error=str(exc))
+    if status != 200:
+        return PostgresReclone(error=f"kubeapi status {status}: {resp[:200]!r}")
+    try:
+        pods = json.loads(resp).get("items", [])
+    except (ValueError, AttributeError):
+        return PostgresReclone(error="unparseable pod list")
+
+    instances: dict[str, dict] = {}
+    rebuilding: list[str] = []
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        name = str(meta.get("name") or "")
+        if labels.get(_CNPG_JOB_ROLE_LABEL):
+            phase = (pod.get("status") or {}).get("phase")
+            if labels.get(_CNPG_JOB_ROLE_LABEL) == "join" and phase in ("Pending", "Running"):
+                rebuilding.append(name)
+            continue
+        instance = str(labels.get(_CNPG_INSTANCE_LABEL) or "")
+        if not instance:
+            continue
+        instances[instance] = pod
+        if (meta.get("annotations") or {}).get(_CNPG_UNRECOVERABLE_ANNOTATION) or meta.get(
+            "deletionTimestamp"
+        ):
+            rebuilding.append(instance)
+
+    out = PostgresReclone()
+    for gone in set(tracker) - (set(instances) - {current}):
+        tracker.pop(gone, None)
+    for instance, pod in sorted(instances.items()):
+        if instance == current:
+            continue
+        name = str((pod.get("metadata") or {}).get("name") or instance)
+        path = (
+            f"{base}/pods/{quote(name)}/log?container=postgres"
+            f"&sinceSeconds={_STUCK_LOG_WINDOW_S}&limitBytes={_STUCK_LOG_LIMIT_BYTES}"
+            "&timestamps=true"
+        )
+        try:
+            status, resp = _request("GET", path)
+        except RuntimeError as exc:
+            out.error = f"pod {name} log: {exc}"
+            continue
+        if status == 403:
+            out.error = f"pod {name} log: kubeapi status 403 (pods/log not granted): {resp[:200]!r}"
+            return out
+        if status != 200:
+            # A container not started yet (400) or a pod gone between the
+            # list and the read: no evidence either way, so the clock is
+            # neither advanced nor reset.
+            continue
+        text = resp.decode("utf-8", "replace")
+        repeating = repeating_signatures(text)
+        seen = tracker.get(instance)
+        if not repeating:
+            tracker.pop(instance, None)
+            continue
+        signature = repeating[0]
+        stamp = _newest_match_stamp(text)
+        if seen is not None and seen.primary != current:
+            out.clock_reset[instance] = f"the primary changed from {seen.primary} to {current}"
+            seen = None
+        if seen is None:
+            seen = tracker[instance] = StuckSighting(current, now, signature, first_stamp=stamp)
+        elif not seen.confirmed and now > seen.since and (not stamp or stamp != seen.first_stamp):
+            # Still repeating on a later tick, with lines newer than the
+            # first tick's (or no timestamps to tell): a live loop.
+            seen.confirmed = True
+        seen.signature = signature
+        seen.evidence.update(repeating)
+        out.stuck[instance] = {
+            "signature": signature,
+            "seconds": int(now - seen.since),
+            "confirmed": seen.confirmed,
+        }
+
+    if any(s["confirmed"] for s in out.stuck.values()):
+        # One read of the primary's slots per tick, and only while something
+        # loops; it rides on every stuck report so the journal can say why a
+        # loop will not be re-cloned before it is due.
+        slots, why = _slot_states(
+            instances.get(current), namespace=namespace, cluster_name=cluster_name
+        )
+        out.slot_state_read = slots is not None
+        out.slot_state_error = why
+        for instance, seen_out in out.stuck.items():
+            seen_out["slot"] = _instance_slot(instance, slots)
+
+    due = sorted(
+        (i for i, s in out.stuck.items() if s["confirmed"] and s["seconds"] >= stuck_after_s),
+        key=lambda i: -out.stuck[i]["seconds"],
+    )
+    if not due:
+        return out
+    if out.error:
+        out.deferred_reason = "a log read failed this tick; retrying next tick"
+        return out
+    primary_pod = instances.get(current)
+    if primary_pod is None or not _pod_ready(primary_pod):
+        out.deferred_reason = f"the primary {current} is not Ready; a re-clone copies from it"
+        return out
+    if rebuilding:
+        out.deferred_reason = f"a re-clone is already in flight ({', '.join(sorted(rebuilding))})"
+        return out
+    eligible = []
+    for instance in due:
+        blocker = reclone_blocker(
+            out.stuck[instance]["signature"],
+            tracker[instance].evidence,
+            out.stuck[instance].get("slot", "unknown"),
+        )
+        if blocker:
+            out.held[instance] = blocker
+        else:
+            eligible.append(instance)
+    if not eligible:
+        return out
+    instance = eligible[0]
+    name = str((instances[instance].get("metadata") or {}).get("name") or instance)
+    patch = {"metadata": {"annotations": {_CNPG_UNRECOVERABLE_ANNOTATION: "true"}}}
+    try:
+        status, resp = _request(
+            "PATCH",
+            f"{base}/pods/{quote(name)}",
+            body=json.dumps(patch).encode(),
+            content_type="application/merge-patch+json",
+        )
+    except RuntimeError as exc:
+        out.error = f"pod {name} annotate: {exc}"
+        return out
+    if status not in (200, 201):
+        out.error = f"pod {name} annotate: kubeapi status {status}: {resp[:200]!r}"
+        return out
+    out.marked.append(instance)
+    tracker.pop(instance, None)
+    return out
+
+
 # #272 — durable control-plane state via k3s HelmChartConfig.
 #
 # The seed supervisor reflects cluster state (control-plane member count,

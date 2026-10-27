@@ -941,6 +941,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         cert_deploy_task = asyncio.create_task(_cert_deploy_loop())
 
+    # #2868 — orphan sweep of THIS pod's pcaps directory. A capture file
+    # sits on the node (hostPath) or in the pod (no hostPath) that wrote
+    # it, while delete / prune unlink only where they happen to run, so a
+    # file held elsewhere outlives its row. The api writes appliance-vantage
+    # uploads; the worker runs its own pass for the captures it writes
+    # (``start_worker_sweep``). Not appliance-gated: the sweep only deletes
+    # files no packet_capture row names, which is correct on every shape.
+    async def _pcap_orphan_loop() -> None:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services.pcap.orphan_sweep import (  # noqa: PLC0415
+            INITIAL_DELAY_SECONDS,
+            SWEEP_INTERVAL_SECONDS,
+            sweep_orphans,
+        )
+
+        await asyncio.sleep(INITIAL_DELAY_SECONDS)
+        while True:
+            try:
+                async with AsyncSessionLocal() as sweep_db:
+                    await sweep_orphans(sweep_db)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("pcap_orphan_sweep_failed", where="api", error=str(exc))
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+
+    pcap_orphan_task: asyncio.Task[None] = asyncio.create_task(_pcap_orphan_loop())
+
     yield
 
     if cert_reconcile_task is not None:
@@ -951,6 +979,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cert_deploy_task.cancel()
         with suppress(asyncio.CancelledError):
             await cert_deploy_task
+    pcap_orphan_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await pcap_orphan_task
     from app.services import after_commit_dispatch  # noqa: PLC0415
 
     await after_commit_dispatch.shutdown()

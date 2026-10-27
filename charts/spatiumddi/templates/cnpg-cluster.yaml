@@ -105,6 +105,15 @@ spec:
   primaryUpdateMethod: {{ .Values.postgresql.cnpg.primaryUpdateMethod | default "switchover" | quote }}
   {{- end }}
 
+  # #2878: how long an instance's smart shutdown may turn new connections
+  # away before the instance manager fast-shuts it. One instance has no
+  # replica to switch to, so a spec change that rolls it (the Postgres
+  # limit a demote to one node moves, #2156) restarts it in place, and
+  # CNPG's default 180 s was the whole outage: the services' pooled
+  # sessions never end on their own. Rendered at every instance count, so
+  # a Cluster already carries it when a demote leaves it one instance.
+  smartShutdownTimeout: {{ .Values.postgresql.cnpg.smartShutdownTimeout }}
+
   postgresql:
     parameters:
       {{- toYaml .Values.postgresql.cnpg.parameters | nindent 6 }}

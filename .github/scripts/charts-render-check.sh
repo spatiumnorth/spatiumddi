@@ -79,11 +79,15 @@
 #                      container whose liveness probe checks :53 carries a
 #                      startup probe of at least 30 min (#2223), or a cold
 #                      start at scale is killed before the daemon listens.
-#   cnpg-recovery    — every render, plus --require-cluster and negative
+#   cnpg-recovery    — every render, plus --require passes and negative
 #                      controls: each CNPG Cluster sets max_slot_wal_keep_size
-#                      and bounds pg_wal at half its volume (#2317), and one
-#                      with replicas updates its primary by switchover, while
-#                      a single instance renders no method at all (#2831).
+#                      and bounds pg_wal at half its volume (#2317), one with
+#                      replicas updates its primary by switchover while a
+#                      single instance renders no method at all (#2831),
+#                      every Cluster bounds its smart shutdown, one instance
+#                      included (#2878), and the supervisor's namespace Role
+#                      grants what its re-clone of a stuck instance needs,
+#                      pods/log get + pods patch (#2132).
 #   bind9 memory     — the appliance dns-bind9 container takes its memory from
 #                      ``dnsBind9.memory`` (sized from node RAM by the
 #                      supervisor, #2223) and an explicit memory in
@@ -186,7 +190,8 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-slot-image-mirror.py" "$file" \
         || failures=$((failures + 1))
-    # #2317 — CNPG WAL bounded at half its volume.
+    # #2317 / #2132 — CNPG WAL bounded at half its volume; the supervisor may
+    # re-clone a stuck instance.
     python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" "$file" \
         || failures=$((failures + 1))
     # #590 / #1541 — required anti-affinity with a surge-first rollout
@@ -234,7 +239,14 @@ UMBRELLA_ALL_ON=(
 UMBRELLA_HA=(
     --set postgresql.kind=cnpg
     --set postgresql.cnpg.backup.enabled=true
+    --set postgresql.cnpg.caPublisher.enabled=true
     --set redis.kind=sentinel
+)
+# #2873 — HA topology with Redis auth ON: the Sentinel config must require the
+# password the clients send. Neither set above flips both together.
+UMBRELLA_HA_AUTH=(
+    "${UMBRELLA_HA[@]}"
+    --set redis.auth.enabled=true
 )
 UMBRELLA_EXTERNAL=(
     --set postgresql.enabled=false --set externalDatabase.host=pg.example
@@ -255,9 +267,25 @@ UMBRELLA_POSTURE=(
 lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
+lint "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
 render umbrella-defaults "$UMBRELLA"
 render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
+render umbrella-ha-auth "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
+# #2873 — the Sentinel set must carry requirepass + sentinel-pass in the same
+# render whose clients are handed REDIS_SENTINEL_PASSWORD.
+python3 - "$OUT/umbrella-ha-auth.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+tmpl = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"].endswith("redis-sentinel-tmpl"))
+conf = tmpl["data"]["sentinel.conf.tmpl"]
+need = ["requirepass __PASSWORD__", "sentinel sentinel-pass __PASSWORD__", "sentinel auth-pass"]
+missing = [n for n in need if n not in conf]
+if missing:
+    print("FAIL #2873: sentinel.conf.tmpl lacks", missing)
+    sys.exit(1)
+print("ok #2873: sentinel.conf.tmpl requires the password")
+PYEOF
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
 # #1174 — the shape the slot-image mirror actually runs in: an appliance
@@ -467,6 +495,31 @@ if helm template one "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]
 else
     echo "   ok: a one-instance Cluster leaves CNPG's default"
 fi
+# #2878: one instance is restarted in place by any rolling update (a demote to
+# one node moves the Postgres limit, #2156), and its smart shutdown refuses
+# every new connection until smartShutdownTimeout runs out: CNPG's default is
+# 180 s. The guard must refuse that, and a one-instance render must carry the
+# chart's bound.
+echo "── negative control: a smart shutdown left at CNPG's 180 s must fail (#2878)"
+out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.instances=1 --set postgresql.cnpg.smartShutdownTimeout=180 \
+    | python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster - 2>&1)" \
+    && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#2878"; then
+    echo "   ok: smartShutdownTimeout 180 on one instance refused by the #2878 guard"
+else
+    echo "   FAIL: expected the #2878 guard to refuse smartShutdownTimeout 180 (rc=$rc)" >&2
+    printf '%s\n' "$out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+echo "── one CNPG instance renders the chart's smart shutdown bound (#2878)"
+if helm template one "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.instances=1 | grep -q '^  smartShutdownTimeout: 15$'; then
+    echo "   ok: a one-instance Cluster renders smartShutdownTimeout: 15"
+else
+    echo "   FAIL: a one-instance Cluster did not render smartShutdownTimeout: 15" >&2
+    failures=$((failures + 1))
+fi
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
 
@@ -601,6 +654,26 @@ python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
 echo "── DNS startup probe (appliance, #2223)"
 python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" --require \
     "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── supervisor may re-clone a stuck Postgres instance (appliance, #2132)"
+python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-supervisor-role \
+    "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── negative control: a supervisor Role without pods/log must fail"
+if python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-supervisor-role \
+    <(python3 - "$OUT/appliance-all-on.yaml" <<'PYEOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d.get("kind") == "Role" and d["metadata"]["name"] == "spatium-supervisor-namespace":
+        for rule in d["rules"]:
+            rule["resources"] = [r for r in rule["resources"] if r != "pods/log"]
+print(yaml.safe_dump_all(docs))
+PYEOF
+) >/dev/null 2>&1; then
+    echo "   FAIL: chart-cnpg-recovery.py passed a supervisor Role without pods/log" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: supervisor Role without pods/log refused"
+fi
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true

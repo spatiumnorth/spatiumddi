@@ -17,6 +17,7 @@ from celery.signals import (
     task_prerun,
     worker_init,
     worker_process_shutdown,
+    worker_ready,
     worker_shutdown,
 )
 from celery.worker.consumer import Consumer
@@ -1234,6 +1235,32 @@ def _close_after_commit_dispatch_in_child(**_: object) -> None:
     never reaches. Drain the child's in-flight dispatches (bounded) and
     dispose its engine instead of leaving its sockets to the server's reaper."""
     _drain_after_commit_dispatch()
+
+
+@worker_ready.connect
+def _start_pcap_orphan_sweep(**_: object) -> None:
+    """#2868 — sweep THIS worker's pcaps directory for capture files no
+    ``packet_capture`` row names. Captures are written by the worker that
+    ran them, onto its own node's hostPath (or its own container layer
+    without one), and delete / prune unlink only where they run, so a file
+    held elsewhere outlives its row. A thread in the main process rather
+    than a beat task, because beat would run it on one worker on one node.
+    ``worker_ready`` fires once, in the main process, after the pool has
+    started. Never blocks or breaks worker start."""
+    try:
+        importlib.import_module("app.services.pcap.orphan_sweep").start_worker_sweep()
+    except Exception:  # noqa: BLE001 — the sweep is housekeeping
+        structlog.get_logger(__name__).warning("pcap_orphan_sweep_not_started", exc_info=True)
+
+
+@worker_shutdown.connect
+def _stop_pcap_orphan_sweep(**_: object) -> None:
+    """Ask the sweep thread to exit, waiting briefly for a pass in flight.
+    It is a daemon, and a pass cut short deletes nothing it should not."""
+    try:
+        importlib.import_module("app.services.pcap.orphan_sweep").stop_worker_sweep()
+    except Exception:  # noqa: BLE001 — shutdown must never be blocked
+        structlog.get_logger(__name__).warning("pcap_orphan_sweep_stop_failed", exc_info=True)
 
 
 @beat_init.connect
