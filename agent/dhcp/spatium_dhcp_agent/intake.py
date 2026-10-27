@@ -245,9 +245,11 @@ def pack_filter(prog: list[Insn]) -> bytes:
 
 
 class _CountingSocket(Protocol):
-    def read_and_clear(self) -> int: ...
+    def read_and_clear(self) -> int:
+        """Packets the filter matched since the last call (the kernel clears the count)."""
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Release the socket."""
 
 
 class _PacketCountingSocket:
