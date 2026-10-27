@@ -1525,6 +1525,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 "name": group_key.name,
                 "secret": group_key.secret,
                 "algorithm": group_key.algorithm,
+                # #2835 — marks the product's own key, so the BIND9 agent
+                # grants it (and only it) the SOA its record ops carry. When
+                # a group has no legacy key, ``tsig_keys[0]`` is an operator
+                # key external clients hold, and it keeps its old grant.
+                "loopback": True,
             }
         )
 

@@ -5846,7 +5846,7 @@ export interface ZoneServerStateEntry {
   pending_ops: number;
   // #2316 — `ok` counts; `unreachable` (server not active) never counts as in
   // sync; `paused` (maintenance) is excluded from the count.
-  freshness: "ok" | "unreachable" | "paused";
+  freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
 }
 
@@ -14070,6 +14070,35 @@ export interface ClusterWorkloadHealth {
   /** #1387 — database row only: "cnpg" when ready / total are the CNPG
    *  Cluster's ready / wanted instances, "pods" when it is a pod count. */
   source?: string | null;
+  /** #2856 — database row only: one entry per PostgreSQL instance. */
+  instances?: ClusterPostgresInstance[] | null;
+  current_primary?: string | null;
+  target_primary?: string | null;
+  /** Instances that are not Ready, or standbys not streaming from the
+   *  primary. CNPG counts a Ready standby that is not replicating as
+   *  healthy, so these — not ready / total — are why the row is degraded. */
+  findings?: ClusterPostgresFinding[] | null;
+  /** Whether streaming was checked against pg_stat_replication. */
+  replication_checked?: boolean | null;
+}
+
+export interface ClusterPostgresInstance {
+  name: string;
+  node: string | null;
+  role: string;
+  ready: boolean;
+  ready_since: string | null;
+  /** Standbys only. null = not checked / not visible — never "healthy". */
+  streaming: boolean | null;
+}
+
+export interface ClusterPostgresFinding {
+  instance: string;
+  node: string | null;
+  /** "not_ready" | "not_streaming" | "supervisor_reported" */
+  kind: string;
+  detail: string;
+  since: string | null;
 }
 
 /** The resolve probe's verdict (#985). */

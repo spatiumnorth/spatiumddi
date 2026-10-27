@@ -53,11 +53,13 @@ mv -f "$TRIGGER" "${TRIGGER}.done" || true
 log "operator-triggered reboot accepted (agent stamp: ${TRIGGER_PAYLOAD:-unknown})"
 log "scheduling reboot in ${GRACE_SECONDS}s"
 
-# systemd-shutdown sends SIGTERM (then SIGKILL) to running services;
-# pod shutdown happens via k3s.service's stop sequence (kubelet
-# evicts pods cleanly with their terminationGracePeriodSeconds), so
-# in-flight queries get a chance to drain. The grace window above
-# is in addition to that.
+# ``systemctl reboot`` goes through logind, which first lets the
+# kubelet's graceful node shutdown run (#1976): the kubelet holds a
+# delay lock, reports the node NotReady, stops its pods within their
+# grace period (up to 60 s, kubelet.conf.d/50-spatium-graceful-shutdown
+# .conf) so the cluster moves their traffic and replaces them, and
+# then releases the lock. Only after that does systemd stop the
+# services. The grace window above is in addition to that.
 sleep "$GRACE_SECONDS"
 
 log "issuing systemctl reboot"

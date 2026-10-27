@@ -29,6 +29,7 @@ it resolved.
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -399,6 +400,26 @@ RULE_TYPE_APPLIANCE_STORAGE_DEGRADED = "appliance_storage_degraded"
 #     question, so a threshold set above it does not silence it.
 RULE_TYPE_APPLIANCE_DISK_USAGE = "appliance_disk_usage"
 
+# Issue #2856: a PostgreSQL instance of the control plane's CNPG cluster that
+# is not Ready, or a standby that is not streaming from the current primary.
+# Subject = the instance (its pod name), since an instance has no row here
+# and the pod name is what CNPG, kubectl and the Cluster screen call it.
+#
+# Nothing alarmed on the database. In a three-node failover drill a standby
+# was not Ready for 12 minutes and standbys looped on removed WAL for more
+# than 10, while CNPG reported "Cluster in healthy state" 3/3 (its readiness
+# probe passes for a standby that is up but not replicating) and every alert
+# stayed quiet. A standby that is not streaming is a cluster one failure away
+# from losing writes it believes are replicated.
+#
+# The verdict is ``postgres_instances.evaluate`` — the same function behind
+# the Cluster screen's database row, so the two cannot disagree. Opens after
+# the condition has held for 5 minutes (a switchover or a pod restart is
+# shorter), WARNING then CRITICAL at 15. The clock survives an instance
+# changing finding (not Ready, then Ready but looping) because it is per
+# instance, not per finding.
+RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY = "postgres_instance_unhealthy"
+
 
 class AlertDataUnavailable(Exception):
     """A rule could not be evaluated because its input is temporarily gone.
@@ -444,6 +465,12 @@ RULE_TYPE_APPLIANCE_HEARTBEAT_STALE = "appliance_heartbeat_stale"
 _APPLIANCE_HEARTBEAT_STALE_AFTER = timedelta(minutes=5)
 _APPLIANCE_HEARTBEAT_CRITICAL_AFTER = timedelta(minutes=30)
 _APPLIANCE_HEARTBEAT_RULE_NAME = "Appliance heartbeat lost"
+
+# #2856 — fixed, like the heartbeat rule: long enough that a switchover, a
+# pod restart or a node reboot (each well under 5 min) does not page anyone.
+_POSTGRES_INSTANCE_WARN_AFTER = timedelta(minutes=5)
+_POSTGRES_INSTANCE_CRITICAL_AFTER = timedelta(minutes=15)
+_POSTGRES_INSTANCE_RULE_NAME = "PostgreSQL instance not Ready or not streaming"
 
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
@@ -739,6 +766,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
         RULE_TYPE_APPLIANCE_DISK_USAGE,
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
+        RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -2704,6 +2732,27 @@ async def _matching_server_subjects(
 _SEVERITY_ORDER = ("info", "warning", "critical")
 
 
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def _message_numbers(message: str) -> tuple[str, list[str]]:
+    """Split a message into its digit-free skeleton and its numeric tokens."""
+    return _NUM_RE.sub("#", message), _NUM_RE.findall(message)
+
+
+def _compose_peak_and_now(peak: str, current: str) -> str:
+    """The message of an open event whose reading has moved off its peak (#2839)."""
+    if current == peak:
+        return peak
+    cur_skel, cur_nums = _message_numbers(current)
+    peak_skel, peak_nums = _message_numbers(peak)
+    if cur_skel == peak_skel and len(cur_nums) == len(peak_nums):
+        now = " / ".join(c for c, p in zip(cur_nums, peak_nums, strict=True) if c != p)
+    else:
+        now = current
+    return f"{peak} [now: {now}]"
+
+
 def _severity_rank(severity: str) -> int:
     """Ordinal rank for an alert severity: ``info < warning < critical``.
 
@@ -4486,6 +4535,106 @@ async def _matching_appliance_heartbeat_stale_subjects(
     return out
 
 
+async def _matching_postgres_instance_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """``postgres_instance_unhealthy`` — CNPG instances not Ready, or standbys
+    not streaming from the primary, for at least
+    :data:`_POSTGRES_INSTANCE_WARN_AFTER` (#2856).
+
+    Reads the same snapshot the Cluster screen renders and runs the same
+    ``postgres_instances.evaluate``, so a degraded database row and this
+    rule describe one fact. Inert off the appliance and on a cluster with no
+    CNPG instances (the compose / plain-Helm Postgres shapes); a single-node
+    appliance has one instance, the primary, and can only match on it not
+    being Ready.
+
+    Unknown is never a match and never a recovery: a cluster whose pods
+    cannot be listed, a primary whose ``pg_stat_replication`` cannot be read
+    while standbys exist, or an unreadable clock all raise
+    :class:`AlertDataUnavailable`, which holds open events open.
+
+    The duration clock lives in Redis (``postgres_instances``), per instance:
+    a pod's own Ready transition time is used when it is earlier, and an
+    instance with an open event keeps matching even if the clock was lost,
+    so a Redis restart cannot resolve and re-open an event.
+    """
+    from app.services.appliance import postgres_instances as pgi  # noqa: PLC0415
+
+    snap = await _cluster_health_snapshot()
+    if snap is None:
+        return []
+    row = pgi.database_row(snap)
+    if row is None:
+        if not snap.get("pods_total"):
+            # No pod could be listed (RBAC or a blip): we cannot tell "no
+            # CNPG here" from "cannot see it".
+            raise AlertDataUnavailable("cluster pods not listable; database instances unknown")
+        return []
+    walsenders = await pgi.read_walsenders(db)
+    has_standby = any(i.get("role") == "standby" for i in row.get("instances") or [])
+    if walsenders is None and has_standby:
+        raise AlertDataUnavailable("pg_stat_replication unreadable on the primary")
+    supervisor = await pgi.read_supervisor_verdicts(db, now)
+    pgi.apply(row, walsenders, supervisor)
+    findings = row.get("findings") or []
+
+    try:
+        clocks = await pgi.load_unhealthy_since()
+    except Exception as exc:  # noqa: BLE001 - an unreadable clock is "unknown"
+        raise AlertDataUnavailable(f"postgres instance clock unreadable: {exc}") from exc
+
+    open_ids = set(
+        (
+            await db.execute(
+                select(AlertEvent.subject_id).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    new_clocks: dict[str, datetime] = {}
+    out: list[tuple[str, str, str, str]] = []
+    for f in findings:
+        name = f["instance"]
+        since = clocks.get(name, now)
+        if f.get("since"):
+            try:
+                since = min(since, pgi.parse_ts(f["since"]))
+            except (TypeError, ValueError):
+                pass  # an unparseable kube timestamp just leaves our own clock
+        new_clocks[name] = since
+        held = now - since
+        if held < _POSTGRES_INSTANCE_WARN_AFTER and name not in open_ids:
+            continue
+        sev = "critical" if held >= _POSTGRES_INSTANCE_CRITICAL_AFTER else "warning"
+        node = f.get("node") or "an unknown node"
+        minutes = max(0, int(held.total_seconds() // 60))
+        out.append(
+            (
+                name[:128],
+                f"{name} ({node})",
+                f"PostgreSQL instance {name} on node {node} {f['detail']}, for "
+                f"{minutes} min (since {since.isoformat()}). The database row on "
+                "Cluster → Overview shows the same finding. A standby that is not "
+                "replicating leaves the cluster one failure from losing writes.",
+                sev,
+            )
+        )
+
+    try:
+        await pgi.save_unhealthy_since(new_clocks)
+    except Exception as exc:  # noqa: BLE001 - the verdict stands; the clock retries next tick
+        logger.info("postgres_instance_clock_save_failed", error=str(exc)[:200])
+    return out
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -5790,6 +5939,46 @@ async def seed_appliance_storage_alert_rule() -> None:
                     "state. Auto-resolves when redundancy is restored."
                 ),
                 rule_type=RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+                severity="warning",
+                enabled=True,
+            )
+        )
+        await session.commit()
+
+
+async def seed_postgres_instance_alert_rule() -> None:
+    """Seed the #2856 rule, ENABLED by default.
+
+    Safe on everywhere: it needs no configuration, is inert off the
+    appliance and on any Postgres that is not a CNPG cluster, and a healthy
+    cluster has no findings. Severity is decided by the matcher from how
+    long the finding has held, so the rule's own severity is only the floor.
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _POSTGRES_INSTANCE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_POSTGRES_INSTANCE_RULE_NAME,
+                description=(
+                    "Fires when an instance of the appliance's PostgreSQL cluster "
+                    "has not been Ready, or a standby has not been streaming WAL "
+                    "from the primary, for 5 minutes; critical after 15. CNPG "
+                    "counts a standby that is up but not replicating as healthy, "
+                    "so this reads the primary's own list of standbys "
+                    "(pg_stat_replication). Names the instance and its node. "
+                    "Silent off the appliance. Auto-resolves when the instance "
+                    "recovers."
+                ),
+                rule_type=RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,
                 severity="warning",
                 enabled=True,
             )
@@ -7977,6 +8166,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 silent_nodes = await _matching_appliance_heartbeat_stale_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in silent_nodes]
                 subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY:
+                pg_hits = await _matching_postgres_instance_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in pg_hits]
+                # The CNPG instance (pod) name: an instance has no row here.
+                subject_type = "postgres_instance"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stalled]
@@ -8161,6 +8355,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         existing.message = message
+                        existing.last_observed_value = {
+                            **(existing.last_observed_value or {}),
+                            "peak_message": message,
+                        }
                         ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
                         # stay flagged even if a later escalation skips it.
@@ -8173,6 +8371,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                             delivered_webhook += 1
                         if dm:
                             delivered_smtp += 1
+                    else:
+                        # #2839 — severity did not rise, but the reading may
+                        # have moved. The peak is the message stored when the
+                        # event fired or last escalated (severity is the only
+                        # measure of "worst" that holds for every rule type;
+                        # nothing is inferred from numbers). Show the current
+                        # reading beside it. Text only: delivery is triggered
+                        # above, by severity alone.
+                        lov = existing.last_observed_value or {}
+                        peak = lov.get("peak_message") or existing.message
+                        composed = _compose_peak_and_now(peak, message)
+                        if composed != existing.message or lov.get("peak_message") != peak:
+                            existing.message = composed
+                            existing.last_observed_value = {**lov, "peak_message": peak}
                     continue
                 event = AlertEvent(
                     rule_id=rule.id,

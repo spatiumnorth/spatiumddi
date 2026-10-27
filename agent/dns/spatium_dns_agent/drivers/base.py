@@ -24,6 +24,13 @@ from ..config_apply import (
 # branches off before any of the record machinery runs.
 RRSET_OP_KINDS = frozenset({"create", "update", "delete"})
 
+# #2835 — what a driver's ``reached_serial`` returns when an op applied but the
+# serial the daemon now serves could not be read. The sync loop then reports
+# nothing for the zone rather than the op's ``target_serial``: claiming the
+# target is the unverified "in sync" this hook exists to replace. ``None``
+# keeps its old meaning (the driver has nothing to say; report the target).
+SERIAL_UNREAD: object = object()
+
 
 class HeldZone(NamedTuple):
     """A zone the last apply left off the new config, and why (#1403)."""

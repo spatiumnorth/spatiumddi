@@ -34,6 +34,7 @@ with a managed rrset, the next reconcile REPLACEd it away silently.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -428,7 +429,37 @@ class IngestWorker:
         zone has no records". The BIND9 implementation AXFRs from
         loopback; PowerDNS overrides this to read its REST API (#1524).
         """
-        return self._axfr(zone, key)
+        records = self._axfr(zone, key)
+        if records is None:
+            return None
+        return self._drop_placeholder_glue(zone, records)
+
+    def _drop_placeholder_glue(
+        self, zone: str, records: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Leave out the glue the renderer wrote beside its placeholder NS.
+
+        Only when the live render says it wrote it for this zone (#2841): a
+        zone with a real NS naming ``ns1`` keeps its own ``ns1 A 127.0.0.1``.
+        """
+        from .drivers.bind9 import PLACEHOLDER_GLUE_FILE
+
+        try:
+            raw = (self.cfg.state_dir / "rendered" / PLACEHOLDER_GLUE_FILE).read_text()
+            zones = {str(z).rstrip(".").lower() for z in json.loads(raw)}
+        except (OSError, ValueError, TypeError):
+            return records  # no sidecar: the control plane's guard covers it
+        if zone.rstrip(".").lower() not in zones:
+            return records
+        return [
+            r
+            for r in records
+            if not (
+                r.get("name", "").lower() == "ns1"
+                and r.get("record_type") == "A"
+                and r.get("value") == "127.0.0.1"
+            )
+        ]
 
     def _ship(self, zone: str, records: list[dict[str, Any]]) -> None:
         try:
