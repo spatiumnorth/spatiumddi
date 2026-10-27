@@ -17,8 +17,10 @@
   bucket late. The Stats tab's DROPPED line and chip, the
   InfluxDB export, `find_dhcp_server_stats`'s `packet_loss` block and
   the default-on `dhcp_packets_dropped` alert include it. NULL means
-  unmeasured: no raw socket, a DHCPv6-only server, or the bucket after a
-  Kea restart. Kea's queue size, worker count and per-packet logging are
+  unmeasured: no raw socket, a DHCPv6-only server, the bucket after a
+  Kea restart, or the bucket in which the counting socket reopened
+  because Kea's interfaces or their addresses changed. The filter runs
+  on every inbound IPv4 packet the host receives, not only DHCP. Kea's queue size, worker count and per-packet logging are
   unchanged.
 
 ### Migrations

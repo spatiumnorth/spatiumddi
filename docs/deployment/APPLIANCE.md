@@ -138,8 +138,8 @@ not the operator's:
   nor drops at a sustained 12,000 pkt/s, because that queue sits behind the
   receive thread and the problem is the receive thread not being scheduled.
   Short bursts are different (spatiumddi#1283). Kea's default queue of 64
-  evicts the oldest requests, counted nowhere, when a burst outruns the
-  worker, so SpatiumDDI renders `packet-queue-size: 1024`. See
+  evicts the oldest requests when a burst outruns the worker (counted, since
+  #2889, as `queue_evicted`), so SpatiumDDI renders `packet-queue-size: 1024`. See
   [`DHCP.md`](../features/DHCP.md#keas-packet-queue).
 - Kea's own packet-worker pool is sized from the **machine's** CPU count, not
   from the container's cgroup share, so on a 4 vCPU appliance it starts four

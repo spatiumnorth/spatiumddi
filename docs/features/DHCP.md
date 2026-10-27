@@ -1117,9 +1117,13 @@ to the packet over five measured runs.
 *Counting the arrivals.* The agent holds an `AF_PACKET` socket of its own
 with a classic-BPF filter and reads `PACKET_STATISTICS` from it every
 minute. The kernel counts every packet the filter accepts, and the socket
-is never read, so the cost is a filter run and an increment per DHCP
-packet. It taps the same point Kea's own raw socket does, ahead of
-netfilter. It needs `CAP_NET_RAW`, which the agent already holds for the
+is never read, so a counted packet costs an increment, not a copy. The
+socket is bound to no interface, so the filter itself (about 20
+instructions) runs on **every** inbound IPv4 packet on the host, not only
+on DHCP; on a node that also carries heavy unrelated traffic that is a
+measurable, if small, per-packet cost. It taps the receive path ahead of
+netfilter, as Kea's own raw socket does, though after VLAN untagging and
+bridge handling (one consequence is the 802.1p case below). It needs `CAP_NET_RAW`, which the agent already holds for the
 fingerprint sniffer, so nothing new is granted. The filter counts:
 
 - IPv4, UDP, destination port 67, first fragment only;
@@ -1145,7 +1149,7 @@ fingerprint sniffer, so nothing new is granted. The filter counts:
 > a flow never reaches it. And `/etc/nftables.conf` re-creates its table
 > whole on every firewall apply, which resets the counter. Counting in the
 > agent avoids all of that, works on Compose and Kubernetes as well as on
-> the appliance, and reads within microseconds of Kea's counters.
+> the appliance, and reads on both sides of Kea's own counter snapshot.
 
 *The arithmetic.* Kea's counters are one snapshot, taken inside Kea at
 some instant, and the arrivals cannot be read at that same instant. A
@@ -1178,8 +1182,10 @@ receives packets the filter does not count can only lower the estimate.
 the agent cannot open the raw socket (no `CAP_NET_RAW`), on a DHCPv6-only
 server (it counts DHCPv4 only), when `socket_drop` was not measured, for the
 bucket after Kea restarts, and for the bucket in which the counting socket
-was (re)opened because Kea's interfaces or socket mode changed. It is never
-0 in those cases.
+was (re)opened because Kea's interfaces, their addresses or the socket mode
+changed. It is also NULL when Kea's interfaces resolve to more than 200
+interfaces or addresses, which one filter cannot express. It is never 0 in
+those cases.
 
 *Where the identity can be wrong.* Each of these counts as an eviction:
 

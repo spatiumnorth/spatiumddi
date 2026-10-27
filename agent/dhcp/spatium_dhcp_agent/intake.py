@@ -24,10 +24,13 @@ held to the packet over five runs.
 of its own with a classic-BPF filter matching what Kea's sockets admit, and
 reads ``PACKET_STATISTICS`` from it. The kernel counts every packet the
 filter accepts — queued or dropped, ``tp_packets`` includes ``tp_drops`` —
-and the socket is never read, so its tiny receive buffer stays full and each
-match costs a filter run and a counter increment, not a copy. The socket taps
-the same point in the receive path Kea's own raw socket does (the protocol
-handlers, ahead of netfilter), and it needs ``CAP_NET_RAW``, which this agent
+and the socket is never read, so its tiny receive buffer stays full and a
+match costs a counter increment, not a copy. The socket is bound to no
+interface, so the filter itself runs on EVERY inbound IPv4 packet on the host
+(about 20 instructions each), not only on DHCP. It taps the receive path
+ahead of netfilter, as Kea's own raw socket does — though one step later:
+after VLAN untagging and bridge handling, where Kea's sees the frame on the
+device first (see the 802.1p note in ``docs/features/DHCP.md``). It needs ``CAP_NET_RAW``, which this agent
 already holds for the fingerprint sniffer and the rogue-DHCP probe (#370,
 #383). Nothing new is granted.
 
@@ -40,8 +43,8 @@ counters. A counter on the existing ``udp dport 67 accept`` rule would also
 miss most of the traffic: ``ct state established,related accept`` sits ahead
 of it, and every relay packet after the first in a flow is ESTABLISHED. And
 the base ruleset is re-created whole on every firewall apply, resetting the
-counter. Counting in the agent avoids all of that, reads within microseconds
-of Kea's counters, and works on every deployment where the agent has
+counter. Counting in the agent avoids all of that, reads either side of Kea's
+own snapshot within one command round trip, and works on every deployment where the agent has
 ``CAP_NET_RAW`` and sees the host's interfaces — not only on the appliance.
 
 **What is counted** (see :func:`build_filter`): IPv4 UDP to port 67, first
