@@ -240,6 +240,12 @@ UMBRELLA_HA=(
     --set postgresql.cnpg.caPublisher.enabled=true
     --set redis.kind=sentinel
 )
+# #2873 — HA topology with Redis auth ON: the Sentinel config must require the
+# password the clients send. Neither set above flips both together.
+UMBRELLA_HA_AUTH=(
+    "${UMBRELLA_HA[@]}"
+    --set redis.auth.enabled=true
+)
 UMBRELLA_EXTERNAL=(
     --set postgresql.enabled=false --set externalDatabase.host=pg.example
     --set redis.enabled=false --set externalRedis.host=redis.example
@@ -259,9 +265,25 @@ UMBRELLA_POSTURE=(
 lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
+lint "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
 render umbrella-defaults "$UMBRELLA"
 render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
+render umbrella-ha-auth "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
+# #2873 — the Sentinel set must carry requirepass + sentinel-pass in the same
+# render whose clients are handed REDIS_SENTINEL_PASSWORD.
+python3 - "$OUT/umbrella-ha-auth.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+tmpl = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"].endswith("redis-sentinel-tmpl"))
+conf = tmpl["data"]["sentinel.conf.tmpl"]
+need = ["requirepass __PASSWORD__", "sentinel sentinel-pass __PASSWORD__", "sentinel auth-pass"]
+missing = [n for n in need if n not in conf]
+if missing:
+    print("FAIL #2873: sentinel.conf.tmpl lacks", missing)
+    sys.exit(1)
+print("ok #2873: sentinel.conf.tmpl requires the password")
+PYEOF
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
 # #1174 — the shape the slot-image mirror actually runs in: an appliance

@@ -113,6 +113,14 @@ data:
     sentinel parallel-syncs {{ $master }} 1
     {{- if $authEnabled }}
     sentinel auth-pass {{ $master }} __PASSWORD__
+    # #2873 — the clients (api, worker, beat, and this chart's own
+    # render-config peer queries) send the same password to every Sentinel
+    # hop, and a Sentinel with no ``requirepass`` answers that AUTH with an
+    # error, so master discovery failed and Redis was unreachable.
+    # ``sentinel-pass`` is what a Sentinel sends to its PEERS, which now
+    # require it.
+    requirepass __PASSWORD__
+    sentinel sentinel-pass __PASSWORD__
     {{- end }}
 ---
 apiVersion: apps/v1
