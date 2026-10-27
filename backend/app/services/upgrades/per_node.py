@@ -28,6 +28,10 @@ Step shape (one row per step in the issue body; ``CHAIN`` is the order):
     7. cordon                         — cordon_node (triggers auto-
                                         switchover if primary's here)
     8. verify primary moved off       — poll Cluster.status.currentPrimary
+   8b. move Redis master off          — SENTINEL FAILOVER when the master is
+                                        on this node, then confirm it landed
+                                        elsewhere; never fails the node
+                                        (#2815, redis_master.py)
     9. drain                          — eviction loop (DS skip + terminal-
                                         pod skip + mirror-pod skip);
                                         --force NOT supported
@@ -108,7 +112,7 @@ from app.services.appliance.slot_image_target import (
     desired_slot_image_url,
     stamp_desired_slot_image,
 )
-from app.services.upgrades import chart_bump, preflight, safety
+from app.services.upgrades import chart_bump, preflight, redis_master, safety
 
 # The classifier moved to kubeapi_retry (#2767) so the plan path shares it.
 from app.services.upgrades.kubeapi_retry import _kubeapi_transient
@@ -125,6 +129,7 @@ StepName = Literal[
     "cnpg_maintenance_on",
     "cordon",
     "verify_primary_moved",
+    "move_redis_master",
     "drain",
     "reboot",
     "health_gate",
@@ -135,7 +140,8 @@ StepName = Literal[
 ]
 
 # The chain's order, once. ``single_node_upgrade`` runs it and resolves a
-# ``start_step`` against it; the CNPG steps are skipped without a cluster name.
+# ``start_step`` against it; the CNPG steps are skipped without a cluster name,
+# and ``move_redis_master`` without a Sentinel-fronted Redis (#2815).
 CHAIN: tuple[StepName, ...] = (
     "preflight",
     "etcd_snapshot",
@@ -145,6 +151,7 @@ CHAIN: tuple[StepName, ...] = (
     "cnpg_maintenance_on",
     "cordon",
     "verify_primary_moved",
+    "move_redis_master",
     "drain",
     "reboot",
     "health_gate",
@@ -701,6 +708,39 @@ async def _step_verify_primary_moved(
             f"primary still on {node_name} after {timeout_s:.0f}s " f"(last seen: {last_primary})"
         ),
     )
+
+
+# ── Step 8b: move the Redis master off (#2815) ────────────────────────
+
+
+async def _step_move_redis_master(
+    node_name: str,
+    namespace: str | None,
+    *,
+    timeout_s: float = redis_master.DEFAULT_REDIS_SWITCH_TIMEOUT_S,
+) -> StepResult:
+    """Fail the Redis master over to another node before the drain evicts it,
+    so the broker never waits out a split Sentinel vote (~128 s) with the
+    worker driving this upgrade cut off from it.
+
+    Always ``ok``: a master that could not be moved is a ``warning`` in the
+    detail and a log line, and the drain goes ahead, as it did before #2815.
+    ``redis_master``'s docstring says why that beats failing the node."""
+    step = StepResult(name="move_redis_master", started_at=_now_iso(), detail={"node": node_name})
+    try:
+        outcome = await redis_master.move_master_off_node(
+            node_name, namespace=namespace, timeout_s=timeout_s
+        )
+    except Exception as exc:  # noqa: BLE001 — an optimisation must not fail the node
+        logger.warning("upgrade_redis_master_move_crashed", node=node_name, error=str(exc))
+        return step.finish(True, warning=f"moving the Redis master crashed: {exc}")
+    detail: dict[str, Any] = dict(outcome.detail)
+    if outcome.skipped:
+        detail.update(skipped=True, reason=outcome.reason)
+    if outcome.warning:
+        detail["warning"] = outcome.warning
+        logger.warning("upgrade_redis_master_not_moved", node=node_name, warning=outcome.warning)
+    return step.finish(True, **detail)
 
 
 # ── Step 9: drain ─────────────────────────────────────────────────────
@@ -1844,6 +1884,13 @@ async def single_node_upgrade(
             lambda: _step_verify_primary_moved(cnpg_cluster_name, node_name, cnpg_namespace),
         ):
             return await _fail("verify_primary_moved")
+    # #2815 — before the drain evicts the Redis master, so the broker moves
+    # by a manual failover instead of a Sentinel election that can split.
+    if redis_master.sentinel_configured():
+        await _run(
+            "move_redis_master",
+            lambda: _step_move_redis_master(node_name, control_plane_namespace),
+        )
     if not await _run("drain", lambda: _step_drain(node_name)):
         return await _fail("drain")
     if not await _run(

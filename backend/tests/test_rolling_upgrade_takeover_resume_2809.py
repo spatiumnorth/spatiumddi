@@ -553,7 +553,9 @@ async def test_the_chain_checkpoints_before_each_step(monkeypatch: pytest.Monkey
     ):
         result = await _run_chain(checkpoint=_checkpoint)
     assert result.ok is True
-    assert [e["step"] for e in entries] == list(per_node.CHAIN)
+    # ``move_redis_master`` runs only when Redis is behind Sentinel (#2815),
+    # which the test environment's plain ``redis://`` URL is not.
+    assert [e["step"] for e in entries] == [s for s in per_node.CHAIN if s != "move_redis_master"]
     assert all(e["node"] == NODE for e in entries)
     by_step = {e["step"]: e for e in entries}
     assert "was_unschedulable" not in by_step["cordon"]

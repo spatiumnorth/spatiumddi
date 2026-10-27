@@ -15,7 +15,10 @@ auth — no JWT / RBAC / session):
 * ``PUT  /internal/slot-images/{image_id}``  — stream body bytes to
   ``<slot_image_dir>/{image_id}.raw.xz`` via a ``.partial`` rename so
   a crashed mid-upload doesn't expose half-written bytes. No size
-  cap here — the main api already enforced one before forwarding.
+  cap of its own: the main api enforces one while it forwards, and the
+  app-wide body cap (``app.core.body_limit``) carries an allowance of
+  that size for this route. The X-Mirror-Auth header is checked (a
+  dependency) before any of the body is read.
 
 * ``GET  /internal/slot-images/{image_id}``  — stream bytes back.
   StreamingResponse so a 4 GiB download doesn't load into memory.
@@ -47,10 +50,11 @@ from hashlib import sha256
 from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
+from app.api.pre_body_auth import header_only
 from app.config import settings
 
 logger = structlog.get_logger(__name__)
@@ -169,6 +173,30 @@ def _verify_auth(operation: str, image_id: uuid.UUID, header: str | None) -> Non
         )
 
 
+@header_only
+async def require_put_auth(request: Request) -> None:
+    """The PUT's ``X-Mirror-Auth`` check, as a dependency.
+
+    The PUT takes an image of up to 4 GiB as a raw body (its body-cap
+    allowance in ``app.core.body_limit``), so the mirror checks the caller
+    before reading any of it. The handler reads ``request.stream()`` itself
+    and declares no body parameter, so FastAPI reads nothing before its
+    dependencies have run; a dependency, rather than a call at the top of the
+    handler, is what ``tests/test_pre_body_auth.py`` can see."""
+    header = request.headers.get(_AUTH_HEADER)
+    if not header:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Missing {_AUTH_HEADER} header.")
+    try:
+        image_id = uuid.UUID(str(request.path_params.get("image_id", "")))
+    except ValueError:
+        # No token can be valid for an id that is not a UUID.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Invalid {_AUTH_HEADER} header.",
+        ) from None
+    _verify_auth("put", image_id, header)
+
+
 def _ensure_dir() -> None:
     d = _image_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -189,9 +217,9 @@ def _ensure_dir() -> None:
     "/{image_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="(mirror) write slot image bytes from the api",
+    dependencies=[Depends(require_put_auth)],
 )
 async def put_image(image_id: uuid.UUID, request: Request) -> None:
-    _verify_auth("put", image_id, request.headers.get(_AUTH_HEADER))
     _ensure_dir()
     target = _image_path(image_id)
     # Append ".partial" to the full ``<id>.raw.xz`` name — NOT
