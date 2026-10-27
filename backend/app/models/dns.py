@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -79,6 +80,48 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     current_serial: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class DNSIngestSnapshot(Base):
+    """What one agent last reported for one dynamic zone's external records (#2654).
+
+    The ingest-back loop (#641) mirrors records an RFC 2136 writer injected
+    into a live daemon. In a group with several agent servers each one is an
+    independent primary and the writer usually talks to only one of them, so
+    "absent from this server's report" cannot mean "the writer withdrew it":
+    the other servers may simply not have it yet. The reconcile therefore
+    works on CHANGE (what appeared on or vanished from a server since its
+    previous report), and this row is that previous report: the external
+    ``(name, type, value)`` keys the server held, after the managed-name and
+    daemon-owned filters. See ``app.services.dns.ingest``.
+
+    One row per ``(server, zone)``, replaced on every report from an enabled
+    server (a paused one keeps its pre-pause row). Purged with the other
+    per-server zone state when a server or zone changes group. Never aged
+    out: however long a server was away, what it held when it left is the
+    right baseline for what changed on it since.
+    """
+
+    __tablename__ = "dns_ingest_snapshot"
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    # ``[[name_lower, TYPE, value], ...]``: the ingest ``_key`` of each record.
+    record_keys: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=sa_text("'[]'::jsonb")
+    )
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -515,6 +558,17 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # never re-enabled keeps the structural etag it had.
     zone_resync_seq: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    # #2654 — set instead of bumping ``zone_resync_seq`` when a server that
+    # reads dynamic zones back (BIND9 / PowerDNS agent ingest) is re-enabled:
+    # the re-render would replace each zone with the database's copy and drop
+    # whatever an RFC 2136 writer added on it while it was disabled, before
+    # its next ingest report could mirror it. The bump happens once that
+    # server has reported every dynamic zone of its group since this time
+    # (``server_resync.complete_deferred_resync``), or after
+    # ``RESYNC_INGEST_WAIT`` regardless. Never rendered. NULL = nothing owed.
+    zone_resync_pending_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
@@ -1045,6 +1099,23 @@ DNS_TTL_MAX = 2**31 - 1
 ZONE_DEFAULT_TTL = 3600
 
 
+def _initial_zone_serial(context: Any) -> int:
+    """A new zone's first ``last_serial`` (#2835).
+
+    A primary zone starts at today's ``YYYYMMDD00``, like every later serial.
+    At 0 the agents served it at their placeholder 1 (``serial or 1``) until
+    its first change. A secondary / stub / forward zone's serial is not ours
+    to number and stays 0 (``_zone_state_in_sync``). Imported here, not at the
+    top, so the models stay importable without the service layer.
+    """
+    zone_type = context.get_current_parameters().get("zone_type") or "primary"
+    if zone_type != "primary":
+        return 0
+    from app.services.dns.serial import compute_next_serial
+
+    return compute_next_serial(0)
+
+
 def servable_ttl(ttl: int | None) -> int | None:
     """``ttl`` when a server can serve it, else ``None``.
 
@@ -1165,7 +1236,10 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("dnssec_policy.id", ondelete="SET NULL"),
         nullable=True,
     )
-    last_serial: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # #2835 — a primary zone is numbered from the moment it exists.
+    last_serial: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=_initial_zone_serial
+    )
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # #1932 — set when SpatiumDDI auto-created this zone (a subnet's reverse
     # zone) in a group with agentless servers and has not yet confirmed the

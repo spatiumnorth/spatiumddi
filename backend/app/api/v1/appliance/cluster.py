@@ -35,7 +35,7 @@ from app.core.permissions import require_permission
 from app.core.responses import EventStreamResponse
 from app.db import AsyncSessionLocal
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.services.appliance import k8s
+from app.services.appliance import k8s, postgres_instances
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
 from app.services.appliance.ownership import k8s_node_name
 from app.services.appliance.storage_health import evaluate_storage, worst_severity
@@ -288,6 +288,34 @@ class PodSummary(BaseModel):
     memory_working_set_bytes: int | None = None
 
 
+class PostgresInstance(BaseModel):
+    """One CNPG instance on the database row (#2856)."""
+
+    name: str
+    node: str | None = None
+    #: ``primary`` or ``standby``.
+    role: str
+    ready: bool
+    #: When the pod's Ready condition last changed.
+    ready_since: str | None = None
+    #: Standbys only. True = the primary has a streaming WAL sender for it;
+    #: False = it has none, or one in another state; None = not checked (the
+    #: primary could not be queried, a switchover is under way, or the
+    #: sender's state is hidden from the app's role). None is never healthy.
+    streaming: bool | None = None
+
+
+class PostgresInstanceFinding(BaseModel):
+    """Why the database row is degraded although CNPG may count it healthy."""
+
+    instance: str
+    node: str | None = None
+    #: ``not_ready`` | ``not_streaming`` | ``supervisor_reported``.
+    kind: str
+    detail: str
+    since: str | None = None
+
+
 class WorkloadHealth(BaseModel):
     component: str
     kind: str | None = None
@@ -303,6 +331,16 @@ class WorkloadHealth(BaseModel):
     # Cluster's readyInstances / spec.instances, "pods" when it could not be
     # read and they are a pod count. None for every other component.
     source: str | None = None
+    # #2856 — database row only. Per-instance view, and what made the row
+    # degraded: CNPG counts a standby that is Ready but not streaming as a
+    # healthy instance, so ready / total alone read 3/3 healthy through a
+    # ten-minute replication loop.
+    instances: list[PostgresInstance] | None = None
+    current_primary: str | None = None
+    target_primary: str | None = None
+    findings: list[PostgresInstanceFinding] | None = None
+    #: Whether the streaming half was checked against pg_stat_replication.
+    replication_checked: bool | None = None
 
 
 class ClusterDnsProbe(BaseModel):
@@ -487,6 +525,8 @@ async def cluster_health(db: DB) -> ClusterHealth:
             "kubeapi unreachable from api; retry shortly.",
         ) from exc
     await _merge_host_state_best_effort(db, snap)
+    # #2856 — the database row's streaming half (pg_stat_replication).
+    await postgres_instances.enrich_snapshot_best_effort(db, snap)
     return ClusterHealth(**snap)
 
 
@@ -529,6 +569,7 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
                 # kube frame into an "unavailable" one (#1083).
                 async with AsyncSessionLocal() as db:
                     await _merge_host_state_best_effort(db, snap)
+                    await postgres_instances.enrich_snapshot_best_effort(db, snap)
             except k8s.KubeapiUnavailableError as exc:
                 # Log detail server-side; keep the client-facing reason generic
                 # so an exception message can't leak internals to the browser

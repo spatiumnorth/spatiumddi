@@ -65,13 +65,20 @@ told to fetch an uploaded image, ``mirror ready`` waits until the mirror has
 a Ready replica: the next node's stamp would otherwise land in that gap, and
 its fetch would answer 502.
 
-Resumability: each step is idempotent in itself (cordon-already-
-cordoned is a 200, evict-already-gone is 404 treated as success,
-etc.). The orchestrator records ``progress.current_step`` on the
-SystemUpgradeRun row; on resume the function reads the row, fast-
-forwards past completed steps, and continues. Phase C v0 doesn't
-implement the fast-forward — the caller passes ``start_step`` to
-resume; Phase D will add the read-from-row-and-continue logic.
+Resumability (#2809): each step is idempotent in itself (cordon-already-
+cordoned is a 200, evict-already-gone is 404 treated as success, a stamp
+already on the row is not stamped again, etc.). Before each step runs, the
+chain hands a checkpoint to the caller's ``checkpoint`` callback: the step
+about to run, plus what a later invocation cannot re-learn (this run's stamp
+time, and whether the node was unschedulable before this run cordoned it).
+The orchestrator stores it on the run as ``progress.in_flight``. A drive that
+takes the run over while a node is in flight passes it back as ``resume``,
+and the chain re-runs the step that was running and continues from there.
+
+Restarting such a node at ``preflight`` instead could never succeed: its
+CNPG wait counts the node's own instance, which the earlier drive's drain
+evicted and the cordon keeps Pending, so it timed out after 900 s and failed
+the node with the cordon and the window still held (#2809).
 """
 
 from __future__ import annotations
@@ -222,6 +229,75 @@ class StepResult:
         if detail:
             self.detail.update(detail)
         return self
+
+
+@dataclass
+class NodeResume:
+    """Where a node's chain was when the drive running it stopped (#2809).
+
+    ``step`` is the step that was running, or about to run, and is run again:
+    every step is idempotent. Built by the orchestrator from the checkpoint
+    the chain reported (``progress.in_flight``); see ``resume_from_checkpoint``.
+    """
+
+    step: StepName
+    # This run's stamp time, for the stage / reboot / health-gate reads of a
+    # ``done`` or ``failed`` written before it. None: a re-driven node's stamp.
+    stamped_at: datetime | None = None
+    # The node's schedulability before this run cordoned it, from the cordon
+    # step's own read. Re-reading it now would see this run's cordon.
+    was_unschedulable: bool | None = None
+    pre_cordon_known: bool = False
+
+
+def checkpoint_entry(
+    node_name: str,
+    step: StepName,
+    *,
+    stamped_at: datetime | None,
+    pre_cordon: dict[str, bool | None],
+) -> dict[str, Any]:
+    """The JSON the chain reports before running ``step`` (#2809)."""
+    entry: dict[str, Any] = {
+        "node": node_name,
+        "step": step,
+        "stamped_at": stamped_at.isoformat() if stamped_at is not None else None,
+        "at": _now_iso(),
+    }
+    if "was_unschedulable" in pre_cordon:
+        entry["was_unschedulable"] = pre_cordon["was_unschedulable"]
+    return entry
+
+
+def resume_from_checkpoint(entry: Any, node_name: str) -> NodeResume | None:
+    """The resume point for ``node_name`` from a stored checkpoint, or None
+    when there is none for it (the node starts at ``preflight``).
+
+    A checkpoint naming another node, or a step this code does not know, is
+    not a resume point for this one."""
+    if not isinstance(entry, dict) or entry.get("node") != node_name:
+        return None
+    step = entry.get("step")
+    if step not in CHAIN or step == "preflight":
+        return None
+    stamped_at: datetime | None = None
+    raw = entry.get("stamped_at")
+    if isinstance(raw, str):
+        try:
+            stamped_at = _aware(datetime.fromisoformat(raw))
+        except ValueError:
+            stamped_at = None
+    known = "was_unschedulable" in entry
+    was = entry.get("was_unschedulable") if known else None
+    return NodeResume(
+        step=step,
+        stamped_at=stamped_at,
+        was_unschedulable=was if isinstance(was, bool) else None,
+        pre_cordon_known=known,
+    )
+
+
+Checkpoint = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 @dataclass
@@ -429,7 +505,10 @@ async def _step_preflight(
     # instance, or none. The previous node's cluster_verify already waited
     # for this; waiting again here also covers a run that resumed or was
     # taken over between nodes. Nothing is held yet, so a timeout fails
-    # cleanly with nothing to release.
+    # cleanly with nothing to release. A drive that takes over in the MIDDLE
+    # of a node does not come back here: it resumes at the step the earlier
+    # drive was in (#2809), since this wait would count the node's own
+    # instance, evicted by that drive's drain and held Pending by its cordon.
     ok, cnpg_detail = await _wait_cnpg_instances_ready(
         cnpg_cluster_name, cnpg_namespace, timeout_s=cnpg_timeout_s
     )
@@ -1497,6 +1576,8 @@ async def single_node_upgrade(
     control_plane_release: str | None = None,
     control_plane_namespace: str | None = None,
     remaining_nodes: list[str] | None = None,
+    resume: NodeResume | None = None,
+    checkpoint: Checkpoint | None = None,
 ) -> SingleNodeResult:
     """Drive one node through the 12-step rolling-upgrade primitive.
 
@@ -1532,8 +1613,19 @@ async def single_node_upgrade(
         remaining_nodes: the run's nodes still to upgrade, this one
             included; the preflight judges ``/var`` headroom on those only.
             None judges every approved appliance, as Plan does.
+        resume: where an earlier drive's chain for this node stopped
+            (#2809). Takes precedence over ``start_step``. The step it names
+            is run again, and the steps before it are taken as done, so a
+            failure releases what they took.
+        checkpoint: called before each step with ``checkpoint_entry``'s
+            JSON, for the caller to store on ``db``. A connection error is
+            retried after a rollback, as a step's is (``_store_checkpoint``);
+            any other exception, or one outlasting the budget, is logged and
+            the chain goes on.
     """
     steps_in_order: list[StepName] = list(CHAIN)
+    if resume is not None:
+        start_step = resume.step
     if start_step is not None:
         # Review polish — surface a typo'd / future-removed step name
         # loudly instead of silently restarting from step 0 (which would
@@ -1560,14 +1652,54 @@ async def single_node_upgrade(
     # earlier invocation already did it, so seed the flags from
     # start_index; the step runs below flip them as they complete in this
     # invocation.
-    cordon_done = start_index > steps_in_order.index("cordon")
-    window_set = bool(cnpg_cluster_name) and start_index > steps_in_order.index(
-        "cnpg_maintenance_on"
-    )
+    #
+    # #2809 — a ``resume`` re-runs the step the earlier drive was IN, which
+    # may have landed before that drive died: a window patch or a cordon
+    # that took effect with nobody left to record it. So the step being
+    # resumed counts as taken too (``>=``): clearing a window that is not set
+    # and uncordoning a node this run cordoned are both safe.
+    if resume is not None:
+        cordon_done = start_index >= steps_in_order.index("cordon")
+        window_set = bool(cnpg_cluster_name) and start_index >= steps_in_order.index(
+            "cnpg_maintenance_on"
+        )
+    else:
+        cordon_done = start_index > steps_in_order.index("cordon")
+        window_set = bool(cnpg_cluster_name) and start_index > steps_in_order.index(
+            "cnpg_maintenance_on"
+        )
     released = start_index > steps_in_order.index("uncordon")
     # Set from the cordon step's pre-cordon read. A resumed run did not
-    # read it, so it falls back to uncordoning, as before.
-    pre_cordoned = False
+    # read it, so it falls back to uncordoning, as before — unless the
+    # checkpoint carried the earlier drive's read (#2809).
+    pre_cordoned = bool(resume is not None and resume.was_unschedulable)
+    # #2449 — shared across the cordon step's retries; see ``_step_cordon``.
+    # #2809 — on a resume at or past the cordon, the earlier drive may
+    # already have cordoned the node, so a fresh read would take this run's
+    # own cordon for an operator's. Carry the earlier read, or "unknown".
+    pre_cordon: dict[str, bool | None] = {}
+    if resume is not None and start_index >= steps_in_order.index("cordon"):
+        pre_cordon["was_unschedulable"] = (
+            resume.was_unschedulable if resume.pre_cordon_known else None
+        )
+    # The stamp time of THIS run, for the stage / reboot / health-gate reads.
+    stamped_at: datetime | None = (
+        resume.stamped_at
+        if resume is not None and start_index > steps_in_order.index("trigger_slot_apply")
+        else None
+    )
+
+    async def _report(step: StepName) -> None:
+        """Hand the caller a checkpoint before ``step`` runs (#2809)."""
+        if checkpoint is None:
+            return
+        await _store_checkpoint(
+            db,
+            checkpoint,
+            checkpoint_entry(node_name, step, stamped_at=stamped_at, pre_cordon=pre_cordon),
+            node_name=node_name,
+            step=step,
+        )
 
     async def _fail(step: StepName) -> SingleNodeResult:
         """Fail the chain, first releasing what this run holds (#1542):
@@ -1614,6 +1746,7 @@ async def single_node_upgrade(
     async def _run(step: StepName, make: Callable[[], Awaitable[StepResult]]) -> bool:
         if steps_in_order.index(step) < start_index:
             return True
+        await _report(step)
         r = await _run_step_riding_db_failover(db, step, node_name, make)
         results.append(r)
         return r.ok
@@ -1658,9 +1791,9 @@ async def single_node_upgrade(
             disk_nodes=remaining_nodes,
         ),
     ):
-        return _failed(node_name, target_version, "preflight", results)
+        return await _fail("preflight")
     if not await _run("etcd_snapshot", _step_etcd_snapshot):
-        return _failed(node_name, target_version, "etcd_snapshot", results)
+        return await _fail("etcd_snapshot")
     if not await _run(
         "mirror_ready",
         lambda: _step_mirror_ready(
@@ -1672,10 +1805,9 @@ async def single_node_upgrade(
             or slot_image_mirror_deployment(chart_bump.DEFAULT_CHART_NAME),
         ),
     ):
-        return _failed(node_name, target_version, "mirror_ready", results)
+        return await _fail("mirror_ready")
     if not await _run("trigger_slot_apply", _trigger_and_commit):
-        return _failed(node_name, target_version, "trigger_slot_apply", results)
-    stamped_at: datetime | None = None
+        return await _fail("trigger_slot_apply")
     if start_index <= steps_in_order.index("trigger_slot_apply"):
         if results and results[-1].detail.get("fresh_stamp"):
             stamped_at = fresh_stamp_sent_at or datetime.now(UTC)
@@ -1684,7 +1816,7 @@ async def single_node_upgrade(
     if not await _run(
         "stage", lambda: _step_stage(db, node_name, target_version, stamped_at=stamped_at)
     ):
-        return _failed(node_name, target_version, "stage", results)
+        return await _fail("stage")
     # End the stage's read before the node leaves service. Cordoning the node
     # that runs the CNPG primary switches it over, and the switchover closes
     # every connection the old primary held; the reboot after the drain has
@@ -1697,10 +1829,8 @@ async def single_node_upgrade(
             "cnpg_maintenance_on",
             lambda: _step_cnpg_maintenance_on(cnpg_cluster_name, cnpg_namespace),
         ):
-            return _failed(node_name, target_version, "cnpg_maintenance_on", results)
+            return await _fail("cnpg_maintenance_on")
         window_set = True
-    # #2449 — shared across the cordon step's retries; see ``_step_cordon``.
-    pre_cordon: dict[str, bool | None] = {}
     if not await _run("cordon", lambda: _step_cordon(node_name, pre_cordon=pre_cordon)):
         # The window may already be set — release it (#1542). The node is
         # not uncordoned: this run did not cordon it.
@@ -1754,6 +1884,66 @@ async def single_node_upgrade(
         failed_at=None,
         steps=results,
     )
+
+
+async def _store_checkpoint(
+    db: AsyncSession,
+    checkpoint: Checkpoint,
+    entry: dict[str, Any],
+    *,
+    node_name: str,
+    step: StepName,
+    budget_s: float | None = None,
+) -> None:
+    """Store one checkpoint, riding out a Postgres failover (#2809).
+
+    The checkpoints before ``verify_primary_moved``, ``drain`` and ``reboot``
+    fall inside the CNPG switchover the cordon of the primary's node starts,
+    so a refused connect there is expected, not exceptional. It is retried
+    after a rollback, on a fresh connection (the engine pings on checkout),
+    with the same backoff and budget a step gets: a checkpoint lost there
+    would make a later takeover resume at the step before, which every step
+    tolerates, but the drive the walk found crashing (#2809) lost it to the
+    switchover on every roll of the primary's node.
+
+    The rollback expires every object the session holds, the run row among
+    them; the drive reads that row back only through ``_fence``, which never
+    loads an expired attribute (#2809). Anything else, and a database still
+    unreachable once the budget is spent, is logged and the node goes on:
+    bookkeeping never fails a node."""
+    budget = DB_FAILOVER_BUDGET_S if budget_s is None else budget_s
+    first_failure: float | None = None
+    attempt = 0
+    while True:
+        try:
+            await checkpoint(entry)
+            return
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never fails the node
+            await _rollback_quietly(db)
+            if is_transient_db_error(exc):
+                now = _db_retry_clock()
+                if first_failure is None:
+                    first_failure = now
+                delay = _DB_RETRY_BACKOFF_S[min(attempt, len(_DB_RETRY_BACKOFF_S) - 1)]
+                if now - first_failure + delay <= budget:
+                    attempt += 1
+                    logger.warning(
+                        "single_node_upgrade_checkpoint_db_unavailable",
+                        node=node_name,
+                        step=step,
+                        attempt=attempt,
+                        retry_in_s=delay,
+                        error=str(exc),
+                    )
+                    await _db_retry_sleep(delay)
+                    continue
+            logger.warning(
+                "single_node_upgrade_checkpoint_failed",
+                node=node_name,
+                step=step,
+                error=str(exc),
+            )
+            return
 
 
 async def _rollback_quietly(db: AsyncSession) -> None:
