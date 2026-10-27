@@ -15,6 +15,10 @@ The guard is ``.github/scripts/chart-cnpg-recovery.py`` in the Charts job
 controls, the way ``test_chart_pod_posture.py`` pins its gate: a guard that
 fails open ships the defect green.
 
+``k8s/ha/postgres-cluster.yaml``, the plain-Kubernetes Cluster with its own
+CloudNativePG 1.24 pin, is no chart render, so that guard never reads it: the
+last test here holds it to the same method.
+
 HOW TO RUN (from the repo root):
     python3 -m pytest appliance/tests/test_chart_cnpg_primary_update.py -v
 """
@@ -105,3 +109,16 @@ def test_the_chart_defaults_to_switchover_for_replicated_clusters() -> None:
     template = (UMBRELLA / "templates" / "cnpg-cluster.yaml").read_text(encoding="utf-8")
     assert "if gt (int .Values.postgresql.cnpg.instances) 1" in template
     assert "primaryUpdateMethod: {{ .Values.postgresql.cnpg.primaryUpdateMethod" in template
+
+
+def test_the_plain_kubernetes_ha_cluster_switches_over_too() -> None:
+    # The plain-Kubernetes HA Cluster (k8s/README.md) has three instances
+    # too, so a rolling update must hand the primary to an updated replica
+    # rather than restart it under its clients.
+    path = ROOT / "k8s" / "ha" / "postgres-cluster.yaml"
+    docs = [doc for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")) if doc]
+    clusters = [doc for doc in docs if doc.get("kind") == "Cluster"]
+    assert len(clusters) == 1, [doc.get("kind") for doc in docs]
+    spec = clusters[0]["spec"]
+    assert int(spec["instances"]) > 1
+    assert spec.get("primaryUpdateMethod") == "switchover", spec.get("primaryUpdateMethod")

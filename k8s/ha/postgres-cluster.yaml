@@ -20,6 +20,23 @@ spec:
   instances: 3
   imageName: ghcr.io/cloudnative-pg/postgresql:16
 
+  # #2831: how CNPG updates the PRIMARY once a change has rolled the
+  # replicas (a new image, a resources change, a parameter that needs a
+  # restart, or `kubectl cnpg restart`). `switchover` promotes an
+  # already-updated replica first and fast-shuts the old primary, so a new
+  # connection waits seconds. CNPG's own default, `restart`, restarts the
+  # primary (in place, or by deleting its pod) while it still serves: its
+  # smart shutdown turns every new connection away for the whole
+  # `smartShutdownTimeout` (180 s), because the services' pooled sessions
+  # never end on their own. Not part of the instance pods' spec, so adding
+  # it rolls nothing.
+  #
+  # CNPG's admission webhook refuses an update that changes `imageName` and
+  # any `postgresql.parameters` key together. Operator 1.24 (up to 1.27)
+  # refuses it whatever the method, 1.28 and later only under `switchover`:
+  # move the image in one apply and the parameters in another.
+  primaryUpdateMethod: switchover
+
   # #983 — CNPG owns the instance pods, so the seccomp profile is a field on
   # the Cluster rather than a pod-template securityContext. The CRD already
   # defaults it to RuntimeDefault; stating it makes the posture readable
