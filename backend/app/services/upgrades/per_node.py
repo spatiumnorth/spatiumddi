@@ -718,6 +718,7 @@ async def _step_move_redis_master(
     namespace: str | None,
     *,
     timeout_s: float = redis_master.DEFAULT_REDIS_SWITCH_TIMEOUT_S,
+    remaining_nodes: list[str] | None = None,
 ) -> StepResult:
     """Fail the Redis master over to another node before the drain evicts it,
     so the broker never waits out a split Sentinel vote (~128 s) with the
@@ -729,7 +730,7 @@ async def _step_move_redis_master(
     step = StepResult(name="move_redis_master", started_at=_now_iso(), detail={"node": node_name})
     try:
         outcome = await redis_master.move_master_off_node(
-            node_name, namespace=namespace, timeout_s=timeout_s
+            node_name, namespace=namespace, timeout_s=timeout_s, remaining_nodes=remaining_nodes
         )
     except Exception as exc:  # noqa: BLE001 — an optimisation must not fail the node
         logger.warning("upgrade_redis_master_move_crashed", node=node_name, error=str(exc))
@@ -1889,7 +1890,9 @@ async def single_node_upgrade(
     if redis_master.sentinel_configured():
         await _run(
             "move_redis_master",
-            lambda: _step_move_redis_master(node_name, control_plane_namespace),
+            lambda: _step_move_redis_master(
+                node_name, control_plane_namespace, remaining_nodes=remaining_nodes
+            ),
         )
     if not await _run("drain", lambda: _step_drain(node_name)):
         return await _fail("drain")
