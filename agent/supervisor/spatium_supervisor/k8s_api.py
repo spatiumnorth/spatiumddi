@@ -2143,9 +2143,11 @@ def apply_control_plane_overrides(
 
     #2156 — the Postgres limit follows ``cp_size``, so a promote or demote
     that moves it is also one CloudNativePG rolling restart (replicas first,
-    then the primary restarted in place: the chart leaves CNPG's default
-    ``primaryUpdateMethod: restart``), and a promote past four nodes is one
-    api rollout for the smaller pool.
+    then, with two or more instances, a switchover to an updated replica, so
+    the primary moves to another node: the chart sets
+    ``primaryUpdateMethod: switchover``, #2831; a single instance is still
+    restarted in place), and a promote past four nodes is one api rollout
+    for the smaller pool.
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
     ``patch_cnpg_instances`` left on the Cluster this tick

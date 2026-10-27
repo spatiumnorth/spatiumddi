@@ -1264,7 +1264,10 @@ authoritative renderer on an appliance. It picks ONE clause per zone:
 2. **Fine-grained** — `_render_update_policy(zone, group_key)` builds an
    `update-policy { … }` when `_zone_needs_update_policy` sees any
    `name_scope` / `record_types` / `deny` entry. Renders
-   `grant <groupkey> zonesub;` (loopback) + one
+   `grant <groupkey> zonesub ANY;` (loopback; `ANY` because the default
+   type list leaves out the SOA a record op carries, #2835 — only for the
+   group's own key, which the bundle marks `loopback`; an operator key
+   standing in for a group without one keeps a bare `zonesub`) + one
    `<grant|deny> <keyname> <ruletype> [<name>] [<types>];` per operator
    entry. IP entries are skipped (rejected upstream).
 3. Every TSIG key in the bundle renders a `key { … }` block (not just

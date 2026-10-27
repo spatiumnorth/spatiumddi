@@ -49,7 +49,7 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
-from .drivers.base import DriverBase, HeldZone
+from .drivers.base import SERIAL_UNREAD, DriverBase, HeldZone
 from .fetch import get_config
 from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch, is_oom_status
@@ -92,6 +92,12 @@ def _touch_ready_marker(state_dir: Path) -> None:
 # structural reloads. BIND's key-state transitions run on TTL-scale timers
 # (an hour and up on the default policy), so minutes are plenty.
 DNSSEC_REFRESH_SECONDS = 300.0
+# #2835 — how often a driver that can read back what its daemon serves
+# (``periodic_served_serials``) is asked between changes. Named also moves a
+# zone's serial through updates this agent never sent (a third party's RFC
+# 2136 client, a DNSSEC key event on a signed zone); nothing else reports
+# those, and the zone would read in sync at a serial no longer served.
+SERVED_REPORT_SECONDS = 120.0
 
 # #1934 — the re-read interval while a signed zone's key set is still
 # settling: right after a structural reload or pod start (BIND generates the
@@ -245,6 +251,9 @@ class SyncLoop:
         # the top of the next polls until it lands.
         self._boot_report_bundle = None
         self._boot_report_attempts = 0
+        # #2835 — the next periodic served-serial read; the first one waits a
+        # full interval, since startup and every apply report on their own.
+        self._served_report_at = time.monotonic() + SERVED_REPORT_SECONDS
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
         # whose apply failed so we stop re-applying it every poll;
         # ``apply_status`` is what the heartbeat reports upward.
@@ -1196,13 +1205,19 @@ class SyncLoop:
                     zone=op.get("zone_name"),
                 )
                 _note_reached(reached, op)
-                # A driver that moves a zone to a serial of its own (PowerDNS
-                # never goes backwards from the one it serves, #1968) reports
-                # THAT serial, not the op's target.
+                # A driver that can serve a zone at a serial of its own
+                # (PowerDNS never goes backwards from the one it serves,
+                # #1968; BIND9 numbers an update itself when the op's serial
+                # is not later than the served one, #2835) reports THAT
+                # serial, not the op's target.
                 actual_hook = getattr(self.driver, "reached_serial", None)
                 if callable(actual_hook):
                     actual = actual_hook(str(op.get("zone_name") or ""))
-                    if isinstance(actual, int) and not isinstance(actual, bool):
+                    if actual is SERIAL_UNREAD:
+                        # Applied, but what it serves is unknown: say nothing
+                        # rather than claim the op's target (#2835).
+                        reached.pop(_zone_key(op.get("zone_name")), None)
+                    elif isinstance(actual, int) and not isinstance(actual, bool):
                         reached[_zone_key(op.get("zone_name"))] = actual
                 # PowerDNS DNSSEC ops return the DS rrset so we can ship
                 # it back to the control plane in one batched POST below.
@@ -1608,6 +1623,37 @@ class SyncLoop:
         if entries:
             self._post_zone_state(entries)
 
+    def _report_served_serials(self) -> None:
+        """Report each zone whose served serial changed since it was last
+        reported (#2835), from the driver's own read of its daemon.
+
+        Only a change is posted, so a quiet estate costs the reads and no
+        control-plane write. A zone the driver could not read is left out
+        (never reported at a serial it was not seen serving), and so is a zone
+        the last apply held back or left partly refused.
+        """
+        self._served_report_at = time.monotonic() + SERVED_REPORT_SECONDS
+        hook = getattr(self.driver, "periodic_served_serials", None)
+        if not callable(hook):
+            return
+        try:
+            served = hook()
+        except Exception as e:  # noqa: BLE001 — reporting is best-effort
+            log.warning("served_serials_read_failed", error=str(e))
+            return
+        if not served:
+            return
+        reported = {k.lower(): v for k, v in self._reported_serials.items()}
+        skip = self._unconverged_zone_keys()
+        entries = [
+            {"zone_name": zone, "serial": serial}
+            for zone, serial in sorted(served.items())
+            if zone not in skip and reported.get(zone) != serial
+        ]
+        if entries:
+            log.info("zone_state_served_serial_changed", zones=len(entries))
+            self._post_zone_state(entries)
+
     def _post_zone_state(self, entries: list[dict[str, Any]]) -> bool:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         try:
@@ -1724,3 +1770,5 @@ class SyncLoop:
             self._poll_once()
             if time.monotonic() >= self._dnssec_refresh_at:
                 self._refresh_dnssec_state()
+            if time.monotonic() >= self._served_report_at:
+                self._report_served_serials()

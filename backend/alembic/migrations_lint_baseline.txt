@@ -353,6 +353,7 @@ backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:2
 backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:290
 backend/alembic/versions/c2e6a89d4b15_platform_settings_timezone.py:drop_column:40
 backend/alembic/versions/c2f7a94e1d58_dhcp_client_class_address_family.py:drop_column:66
+backend/alembic/versions/c34ff60a954f_dns_server_zone_resync_pending_since.py:drop_column:35
 backend/alembic/versions/c3a1f9d24b80_appliance_host_interfaces.py:drop_column:35
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:72
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:73
@@ -371,6 +372,7 @@ backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rena
 backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rename_table:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:46
+backend/alembic/versions/c3f8a2d61e94_dns_ingest_snapshot.py:drop_table:64
 backend/alembic/versions/c4a8e1f26d93_subnet_show_free_ranges.py:drop_column:31
 backend/alembic/versions/c4a8e2f7b913_dns_blocklist_last_success_at.py:drop_column:39
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:127

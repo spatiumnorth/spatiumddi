@@ -33,7 +33,10 @@ Resumability: the celery task wrapper in ``app/tasks/upgrade_
 orchestrator.py`` is idempotent. Re-enqueuing the same ``run_id`` (e.g.
 after the celery worker dies mid-run) picks up from the row's
 ``progress.per_node`` map — completed nodes are skipped, the next
-incomplete node is driven.
+incomplete node is driven. A node a drive was in the middle of when it died
+is driven first, whatever the plan order, and resumed at the step it was in,
+from ``progress.in_flight`` (#2809): the checkpoint its chain wrote before
+each step.
 """
 
 from __future__ import annotations
@@ -48,7 +51,8 @@ from typing import Any
 
 import structlog
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
+from sqlalchemy import literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -674,7 +678,23 @@ def _release_lease(run: SystemUpgradeRun, holder: str | None) -> None:
     expires (#1449). Only ``holder``'s lease — this drive's own identity
     (#1512) — is released, never another drive's."""
     if not mutex.release_if_held(holder=holder, attempts=_LEASE_RELEASE_ATTEMPTS):
-        logger.warning("upgrade_lease_release_failed", run_id=str(run.id))
+        logger.warning("upgrade_lease_release_failed", run_id=str(_run_pk(run)))
+
+
+def _run_pk(run: SystemUpgradeRun) -> uuid.UUID:
+    """``run.id`` without loading anything (#2809).
+
+    A rollback expires every attribute of every object the session holds, the
+    primary key included, and reading an expired attribute loads it with a
+    lazy SELECT, which an async session cannot run outside ``await``: it
+    raises ``MissingGreenlet``. The chain rolls the drive's session back
+    whenever a statement meets a Postgres failover (#2177, #2809), so after a
+    node the drive's ``run`` may well be expired. The identity key is kept
+    through an expiry, and is what the session itself looks the row up by."""
+    state = sa_inspect(run, raiseerr=False)
+    if state is not None and state.identity:
+        return uuid.UUID(str(state.identity[0]))
+    return run.id
 
 
 def _own_node() -> str | None:
@@ -707,7 +727,7 @@ async def _locked_reread(db: AsyncSession, run: SystemUpgradeRun) -> SystemUpgra
     record, a ``progress`` key) would otherwise be written back over the
     operator's Halt or Abort by the very read meant to protect it. Callers
     that need such a change re-apply it to the fresh row."""
-    run_id = run.id
+    run_id = _run_pk(run)
     db.expire(run)
     return (
         await db.execute(
@@ -746,7 +766,16 @@ async def _fence(
     aborted too, since they record a change already made to the cluster
     (the shared-tag hold's pins) that the beat task or the next run must be
     able to find; only after a takeover are they dropped."""
-    carried = {k: run.progress[k] for k in carry if k in (run.progress or {})}
+    # An expired ``progress`` (the session was rolled back) holds no change of
+    # this drive's: the rollback discarded it. Reading it would load it, which
+    # an async session cannot do here (#2809).
+    state = sa_inspect(run, raiseerr=False)
+    progress_loaded = state is None or "progress" not in state.unloaded
+    carried = (
+        {k: run.progress[k] for k in carry if k in (run.progress or {})}
+        if carry and progress_loaded
+        else {}
+    )
     fresh = await _locked_reread(db, run)
     if fresh is None:
         return "gone"
@@ -774,6 +803,64 @@ async def _bail(db: AsyncSession, run: SystemUpgradeRun, holder: str | None, why
         logger.warning("upgrade_lease_release_failed", run_id=run_id)
 
 
+# ``progress`` key holding the checkpoint of the node being driven (#2809).
+IN_FLIGHT_KEY = "in_flight"
+
+
+def _without_in_flight(progress: dict[str, Any] | None) -> dict[str, Any]:
+    """``progress`` with the node checkpoint dropped: the node has ended, so
+    a later drive must not resume it (#2809)."""
+    return {k: v for k, v in (progress or {}).items() if k != IN_FLIGHT_KEY}
+
+
+def _in_flight_node(
+    progress: dict[str, Any] | None, plan_order: list[str], completed_nodes: list[str]
+) -> str | None:
+    """The node an earlier drive was in the middle of, if it is one to resume
+    (#2809): named by ``progress.in_flight``, in this run's plan, not yet
+    completed, and past ``preflight``. A node checkpointed AT ``preflight``
+    holds nothing (no stamp, no window, no cordon), so it waits its turn in
+    plan order like any other."""
+    entry = (progress or {}).get(IN_FLIGHT_KEY)
+    if not isinstance(entry, dict):
+        return None
+    node = entry.get("node")
+    if not isinstance(node, str) or node not in plan_order or node in completed_nodes:
+        return None
+    if per_node.resume_from_checkpoint(entry, node) is None:
+        return None
+    return node
+
+
+def _checkpoint_writer(
+    db: AsyncSession, run_id: uuid.UUID, holder: str | None
+) -> per_node.Checkpoint:
+    """Store the per-node chain's checkpoints on the run as
+    ``progress.in_flight`` (#2809).
+
+    One UPDATE merging the key into the stored JSON, never a write of the
+    whole ``progress``: the drive's copy of the row is as it was when the
+    node started, and writing it back would undo an operator's Halt event or
+    a takeover's. Only while the run is still this drive's: after a takeover
+    the other drive owns the checkpoint."""
+
+    async def _write(entry: dict[str, Any]) -> None:
+        stmt = (
+            update(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .values(
+                progress=SystemUpgradeRun.progress.op("||")(literal({IN_FLIGHT_KEY: entry}, JSONB))
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if holder:
+            stmt = stmt.where(SystemUpgradeRun.lease_holder == holder)
+        await db.execute(stmt)
+        await db.commit()
+
+    return _write
+
+
 async def _record_node_after_stop(
     db: AsyncSession,
     run: SystemUpgradeRun,
@@ -786,7 +873,7 @@ async def _record_node_after_stop(
     the operator's state alone (#1702). A halted run resumes from here."""
     per_node_progress = dict((run.progress or {}).get("per_node") or {})
     per_node_progress[node] = entry
-    run.progress = {**run.progress, "per_node": per_node_progress}
+    run.progress = {**_without_in_flight(run.progress), "per_node": per_node_progress}
     await _record_event(
         db,
         run,
@@ -1026,7 +1113,7 @@ async def _drive_loop(
             # take-over will pick up. Don't flip to failed; that'd
             # mis-attribute a transient kubeapi blip as a real
             # upgrade failure.
-            logger.warning("upgrade_drive_exit_lease_lost", run_id=str(run.id))
+            logger.warning("upgrade_drive_exit_lease_lost", run_id=str(_run_pk(run)))
             if holder and lease_ok is not None and lease_ok.is_set():
                 # #1713 — the renewal gave up, then landed again while the
                 # node in flight finished: the Lease is still this drive's.
@@ -1077,13 +1164,24 @@ async def _drive_loop(
         ]
         own_node = _own_node()
         next_node = node_order.next_node_to_upgrade(plan_order, completed_nodes, defer=own_node)
+        # #2809 — a node an earlier drive was in the middle of comes first,
+        # whatever the plan order and this worker's node say. It may be
+        # stamped, cordoned, drained and in the CNPG window; starting another
+        # node instead would run that node's preflight, whose CNPG wait
+        # counts the instance the in-flight node's drain evicted, and a
+        # failure there releases nothing the earlier drive took.
+        in_flight = _in_flight_node(run.progress, plan_order, completed_nodes)
+        if in_flight is not None:
+            next_node = in_flight
         if next_node is not None and next_node == own_node and len(plan_order) > 1:
-            # Every other node is done and the one left is the node this
-            # worker runs on. Draining it would evict this drive mid-chain,
-            # and the run would sit in ``running`` with nothing driving it
-            # until Celery redelivers the task an hour later (#1449). Hand
-            # the drive to a worker on another node instead: release the
-            # lease, enqueue the drive asking to be run elsewhere, and stop.
+            # The node to drive is the one this worker runs on: every other
+            # node is done, or it is the node in flight (#2809), which no
+            # other node may start before. Draining it would evict this
+            # drive mid-chain, and the run would sit in ``running`` with
+            # nothing driving it until Celery redelivers the task an hour
+            # later (#1449). Hand the drive to a worker on another node
+            # instead: release the lease, enqueue the drive asking to be run
+            # elsewhere, and stop.
             # The new drive takes the lease over and resumes at this node.
             why = await _fence(db, run, holder)
             if why is not None:
@@ -1332,8 +1430,18 @@ async def _drive_loop(
             await _bail(db, run, holder, why)
             return
 
-        # Drive Phase C for this node.
-        await _record_event(db, run, "node_started", node=next_node)
+        # Drive Phase C for this node. #2809 — a node an earlier drive was in
+        # the middle of resumes at the step it was in, not at ``preflight``:
+        # by then it may be cordoned and drained, and the preflight's CNPG
+        # wait would wait for the instance that drain evicted.
+        resume = per_node.resume_from_checkpoint((run.progress or {}).get(IN_FLIGHT_KEY), next_node)
+        if resume is not None:
+            await _record_event(db, run, "node_started", node=next_node, resumed_at=resume.step)
+            logger.info(
+                "upgrade_node_resumed", run_id=str(run.id), node=next_node, step=resume.step
+            )
+        else:
+            await _record_event(db, run, "node_started", node=next_node)
         await db.commit()
         result = await per_node.single_node_upgrade(
             db,
@@ -1349,12 +1457,15 @@ async def _drive_loop(
             # #1709 — the node's preflight asks for /var room only on the
             # nodes the run has still to upgrade.
             remaining_nodes=[n for n in plan_order if n not in completed_nodes],
+            resume=resume,
+            checkpoint=_checkpoint_writer(db, run.id, holder),
         )
 
         per_node_progress[next_node] = {
             "ok": result.ok,
             "failed_at": result.failed_at,
             "error": result.error,
+            **({"resumed_at": resume.step} if resume is not None else {}),
             "steps": [
                 {
                     "name": s.name,
@@ -1380,7 +1491,7 @@ async def _drive_loop(
             **dict(run.progress.get("per_node") or {}),
             next_node: per_node_progress[next_node],
         }
-        run.progress = {**run.progress, "per_node": per_node_progress}
+        run.progress = {**_without_in_flight(run.progress), "per_node": per_node_progress}
 
         if not result.ok:
             run.last_error = (

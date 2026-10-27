@@ -94,6 +94,16 @@ spec:
   # treats ``false`` as falsy and would emit ``true``, so we read the
   # value directly and require the user to set it in values.yaml.
   enablePDB: {{ .Values.postgresql.cnpg.enablePDB }}
+  {{- if gt (int .Values.postgresql.cnpg.instances) 1 }}
+
+  # #2831: a rolling update reaches the primary last. With replicas,
+  # promote an updated one first instead of deleting the primary's pod
+  # under its clients (CNPG's default ``restart``: the smart shutdown
+  # refuses every new connection for the full ``smartShutdownTimeout``
+  # while the services' pooled sessions hold it). One instance keeps
+  # CNPG's default; see values.yaml.
+  primaryUpdateMethod: {{ .Values.postgresql.cnpg.primaryUpdateMethod | default "switchover" | quote }}
+  {{- end }}
 
   postgresql:
     parameters:
