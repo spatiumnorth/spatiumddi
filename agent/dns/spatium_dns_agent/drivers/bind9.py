@@ -2135,6 +2135,46 @@ def _named_zone_state(
     return _NamedZoneState(text, records, serial)
 
 
+def _signed_serial(zname: str, signed: Path, scratch: Path) -> int | None:
+    """The serial of an inline-signed zone's signed copy (raw format), its
+    journal applied, or None when it cannot be read."""
+    fd, tmp_name = tempfile.mkstemp(prefix=".signed-", suffix=".tmp", dir=scratch)
+    os.close(fd)
+    out = Path(tmp_name)
+    try:
+        for journal in (["-j"], []):
+            res = subprocess.run(
+                [
+                    "named-compilezone",
+                    "-q",
+                    "-i",
+                    "none",
+                    "-k",
+                    "ignore",
+                    "-f",
+                    "raw",
+                    "-s",
+                    "full",
+                    *journal,
+                    "-o",
+                    str(out),
+                    zname,
+                    str(signed),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_CHECK_TIMEOUT_S,
+            )
+            if res.returncode == 0:
+                return _soa_serial(out)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        out.unlink(missing_ok=True)
+    return None
+
+
 def _record_set(state: _NamedZoneState) -> frozenset[str]:
     """A zone's records for comparison, the SOA serial aside."""
     out: set[str] = set()
@@ -2578,6 +2618,9 @@ class Bind9Driver(DriverBase):
         if new_dir.exists():
             shutil.rmtree(new_dir)
         (new_dir / "zones").mkdir(parents=True)
+        # The zone files this render wrote for primary zones (#2864): the
+        # ones whose serial an agent start must keep from going backwards.
+        self._primary_rels: set[str] = set()
 
         opts = bundle.get("options", {})
         forwarders = opts.get("forwarders") or []
@@ -2853,6 +2896,7 @@ class Bind9Driver(DriverBase):
             if zone.get("dnssec_enabled"):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
+            self._primary_rels.add(rel_zfile)
             for kind, detail in self._write_zone_file(new_dir / rel_zfile, zone):
                 apex_notes.append((zname.rstrip("."), kind, detail))
             return (
@@ -3892,6 +3936,13 @@ class Bind9Driver(DriverBase):
                 self._carry_dynamic_updates(
                     new_dir, prev_tree, unfrozen, frozen, hold=hold
                 )
+            # No running named decided these zones' serials (the freeze does
+            # on a running one): every zone at a start, and the zones a
+            # running named would not freeze (#2864).
+            if not running:
+                self._settle_unfrozen_serials(new_dir, prev_tree, None)
+            elif unfrozen:
+                self._settle_unfrozen_serials(new_dir, prev_tree, unfrozen - set(hold))
             # The serial each changed zone has to be served under: the
             # render's, read before the swap, so nothing written to the live
             # file afterwards can stand in for it.
@@ -4125,21 +4176,8 @@ class Bind9Driver(DriverBase):
                 + (_CARRY_BLOCK + "\n" + "\n".join(lines) + "\n" if lines else "")
             ).encode(),
         )
-        if not frozen and state.serial is not None:
-            # No running named decided this zone's serial (``_freeze_and_wait``
-            # does on a running one), so do it here, by the same rule. A render
-            # not later than named's serial is served at named's serial when
-            # it holds exactly what named served, so a restart does not move
-            # it (#2835, D5), and one past it otherwise: new data must not
-            # come back under a serial a secondary already holds.
-            serial = _soa_serial(staged)
-            if serial is None or not _serial_later(serial, state.serial):
-                merged = _named_zone_state(zname, staged, new_dir)
-                same = isinstance(merged, _NamedZoneState) and (
-                    _record_set(merged) == _record_set(state)
-                )
-                target = state.serial if same else (state.serial + 1) % 2**32 or 1
-                _set_rendered_serial(staged, target)
+        # Its serial is decided with every other zone's: by the freeze on a
+        # running named, else by ``_settle_unfrozen_serials`` (#2864).
         reason = self._checkzone(new_dir, zv)
         if reason is not None:
             self._stage_named_copy(staged, live, state)
@@ -4197,6 +4235,110 @@ class Bind9Driver(DriverBase):
             for key in mirrors
             if key in staged_keys and key not in held and key in evidence
         }
+
+    def _settle_unfrozen_serials(
+        self,
+        new_dir: Path,
+        prev: Path,
+        only: Collection[tuple[str, str | None]] | None,
+    ) -> None:
+        """Keep each primary zone's served serial from going backwards where
+        no running named decided it (#2864).
+
+        A running named freezes a changed zone and ``_freeze_and_wait`` moves
+        the render past the serial named serves. At a start nothing is
+        running, and the render's serial is the control plane's
+        ``last_serial``. named may have served a later one: an RFC 2136
+        update moved it, or an earlier apply moved it past. Started on the
+        render, the zone went backwards, and a secondary already holding the
+        later serial does not transfer it again until the primary passes it.
+
+        So the serial named last served is read from the previous live copy
+        (its file, the journal applied, and the signed copy for an
+        inline-signed zone), and the rule is the freeze's: a render not later
+        than that is served at it when the data is what named served (a
+        restart moves nothing), and one past it otherwise. A serial that
+        cannot be read leaves the render's, logged: it says nothing about
+        the zone's data, so it is no reason to hold the zone back.
+
+        ``only``: the zones to settle; None, every primary zone of the render.
+        """
+        primary = getattr(self, "_primary_rels", set())
+        zones = [
+            zv
+            for zv in _zone_views_under(new_dir)
+            if _zone_rel(*zv) in primary
+            and (only is None or zv in only)
+            and (prev / _zone_rel(*zv)).is_file()
+        ]
+        _parallel_map(lambda zv: self._settle_serial(new_dir, prev, zv), zones)
+
+    def _settle_serial(
+        self, new_dir: Path, prev: Path, zv: tuple[str, str | None]
+    ) -> None:
+        zname, view = zv
+        rel = _zone_rel(zname, view)
+        staged = new_dir / rel
+        live = prev / rel
+        rendered = _soa_serial(staged)
+        state: _NamedZoneState | None = None
+        if live.with_name(live.name + ".jnl").exists():
+            read = _named_zone_state(zname, live, new_dir)
+            state = read if isinstance(read, _NamedZoneState) else None
+            served = state.serial if state is not None else None
+        else:
+            served = _soa_serial(live)
+        signed = live.with_name(live.name + ".signed")
+        if served is not None and signed.is_file():
+            # An inline-signed zone serves the signed copy's serial, which
+            # re-signing moves on its own; the swap sets that copy aside and
+            # named signs afresh from the raw serial.
+            signed_serial = _signed_serial(zname, signed, new_dir)
+            if signed_serial is None:
+                log.warning(
+                    "bind9_signed_serial_unknown",
+                    zone=zname,
+                    view=view,
+                    detail="kept from going back below the raw serial only",
+                )
+            elif _serial_later(signed_serial, served):
+                served = signed_serial
+        if served is None:
+            log.warning(
+                "bind9_served_serial_unknown",
+                zone=zname,
+                view=view,
+                detail="the serial named last served could not be read; the "
+                "render's serial is used",
+            )
+            return
+        if rendered is not None and _serial_later(rendered, served):
+            return
+        if rendered == served:
+            # Not read back to compare: every zone of a start lands here
+            # (record ops carry the serial, #2835), and a third party's
+            # change to named's data moves named's serial past the render's.
+            return
+        if state is None:
+            read = _named_zone_state(zname, live, new_dir)
+            state = read if isinstance(read, _NamedZoneState) else None
+        merged = _named_zone_state(zname, staged, new_dir)
+        same = (
+            state is not None
+            and isinstance(merged, _NamedZoneState)
+            and _record_set(merged) == _record_set(state)
+        )
+        target = served if same else (served + 1) % 2**32 or 1
+        if _set_rendered_serial(staged, target):
+            log.info(
+                "bind9_zone_serial_kept_from_going_back",
+                zone=zname,
+                view=view,
+                rendered=rendered,
+                served=served,
+                serial=target,
+                same_data=same,
+            )
 
     def _zone_served(self, base: list[str], zv: tuple[str, str | None]) -> bool:
         zname, view = zv

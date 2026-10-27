@@ -259,7 +259,9 @@ def test_a_static_zone_is_never_read_back(
     driver.render(_bundle([("www", "A", "192.0.2.1")], dynamic=False))
     driver.swap_and_reload()
 
-    assert named.tool_calls("named-compilezone") == []
+    # Nothing is carried into a static zone (its serial may still be read
+    # back, #2864, so the compilezone count is not the test).
+    assert "dc01" not in (live / "zones" / f"{ZONE}.db").read_text()
     assert not (live / "zones" / f"{ZONE}.db.owned").exists()
 
 
