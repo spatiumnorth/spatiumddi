@@ -1,0 +1,175 @@
+{{- if and .Values.postgresql.enabled (eq (.Values.postgresql.kind | default "standalone") "cnpg") .Values.postgresql.cnpg.caPublisher.enabled }}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $clusterName := printf "%s-postgresql" $fullname -}}
+{{- $caSecret := printf "%s-ca" $clusterName -}}
+{{- $caConfigMap := printf "%s-ca-crt" $clusterName -}}
+{{- $name := printf "%s-cnpg-ca-publisher" $fullname -}}
+{{- $cfg := .Values.postgresql.cnpg.caPublisher -}}
+{{- /* #2132 — the CloudNativePG cluster CA, public certificate only.
+
+       CNPG's instance-manager status endpoint (port 8000 on every instance
+       pod) presents the cluster's server certificate, signed by the cluster
+       CA in the Secret ``<cluster>-ca``. That Secret holds ``ca.key`` as
+       well, so granting a reader ``get`` on it (even pinned by
+       resourceNames) hands the reader the key that signs the database's
+       server AND client certificates. This CronJob is the one holder of
+       that grant: it copies ``ca.crt`` alone into the ConfigMap
+       ``<cluster>-ca-crt``, which the appliance supervisor reads (its Role
+       already carries ``get`` on configmaps in this namespace) to verify
+       the endpoint's TLS before it trusts the primary's replication-slot
+       state.
+
+       The ConfigMap is rendered here WITHOUT ``data``: Helm's three-way
+       merge then never touches the key the job writes, and the job needs
+       only get + patch on that one named object, not create. A renewed CA
+       reaches it within one ``schedule`` interval; before that, and before
+       the first run, the reader reports the slot state unknown, which
+       re-clones nothing. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $caConfigMap }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "cnpg-ca-publisher") .) | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "cnpg-ca-publisher") .) | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "cnpg-ca-publisher") .) | nindent 4 }}
+rules:
+  # The CA Secret CNPG generates for this cluster, and nothing else.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $caSecret | quote }}]
+    verbs: ["get"]
+  # The one ConfigMap it writes. No ``create``: the chart renders it.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ $caConfigMap | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "cnpg-ca-publisher") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "cnpg-ca-publisher") .) | nindent 4 }}
+spec:
+  schedule: {{ $cfg.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "cnpg-ca-publisher") .) | nindent 12 }}
+        spec:
+          serviceAccountName: {{ $name }}
+          restartPolicy: Never
+          {{- with (include "spatiumddi.priorityClassName" (dict "component" $cfg.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+          priorityClassName: {{ . | quote }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            {{- with (include "spatiumddi.seccompProfileType" $) }}
+            seccompProfile:
+              type: {{ . }}
+            {{- end }}
+          {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" $cfg.nodeSelector) .) | nindent 10 }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: publish
+              # The api image for its Python; the script is stdlib only and
+              # imports nothing from the application.
+              image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: CA_SECRET
+                  value: {{ $caSecret | quote }}
+                - name: CA_CONFIGMAP
+                  value: {{ $caConfigMap | quote }}
+              command: ["python3", "-I", "-c"]
+              args:
+                - |
+                  import base64, json, os, ssl, sys, urllib.error, urllib.request
+                  sa = "/var/run/secrets/kubernetes.io/serviceaccount/"
+                  ns = open(sa + "namespace").read().strip()
+                  token = open(sa + "token").read().strip()
+                  host = os.environ["KUBERNETES_SERVICE_HOST"]
+                  if ":" in host:
+                      host = "[" + host + "]"
+                  api = "https://" + host + ":" + os.environ["KUBERNETES_SERVICE_PORT"]
+                  ctx = ssl.create_default_context(cafile=sa + "ca.crt")
+                  def call(method, path, body=None):
+                      req = urllib.request.Request(api + path, data=body, method=method)
+                      req.add_header("Authorization", "Bearer " + token)
+                      if body is not None:
+                          req.add_header("Content-Type", "application/merge-patch+json")
+                      with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                          return json.loads(resp.read())
+                  base = "/api/v1/namespaces/" + ns
+                  try:
+                      secret = call("GET", base + "/secrets/" + os.environ["CA_SECRET"])
+                  except urllib.error.HTTPError as exc:
+                      # 404 before CNPG has created the cluster: try next run.
+                      print("cnpg-ca-publisher: CA secret not readable: HTTP %d" % exc.code)
+                      sys.exit(0 if exc.code == 404 else 1)
+                  # Only ca.crt is taken; the rest of the Secret is dropped here.
+                  raw = (secret.get("data") or {}).get("ca.crt") or ""
+                  del secret
+                  pem = base64.b64decode(raw).decode("ascii") if raw else ""
+                  if "-----BEGIN CERTIFICATE-----" not in pem or "PRIVATE KEY" in pem:
+                      print("cnpg-ca-publisher: the CA secret carries no ca.crt certificate")
+                      sys.exit(1)
+                  path = base + "/configmaps/" + os.environ["CA_CONFIGMAP"]
+                  if (call("GET", path).get("data") or {}).get("ca.crt") == pem:
+                      print("cnpg-ca-publisher: ca.crt unchanged")
+                      sys.exit(0)
+                  call("PATCH", path, json.dumps({"data": {"ca.crt": pem}}).encode())
+                  print("cnpg-ca-publisher: ca.crt published")
+              resources:
+                {{- toYaml $cfg.resources | nindent 16 }}
+{{- end }}
