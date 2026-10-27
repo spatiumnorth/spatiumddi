@@ -1197,6 +1197,12 @@ class SyncLoop:
         for op in bundle.get("pending_record_ops", []):
             try:
                 result = self.driver.apply_record_op(op)
+                # #2850 — what the op gave the control plane (or took from
+                # it), so a later render tells its deletions from records a
+                # third party wrote by RFC 2136.
+                note = getattr(self.driver, "note_record_op_applied", None)
+                if callable(note):
+                    note(op)
                 self.heartbeat.pending_acks.append(_ack(op, "ok"))
                 log.info(
                     "record_op_applied",

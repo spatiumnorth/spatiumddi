@@ -2466,6 +2466,59 @@ whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
 NS, RRSIG/NSEC*/DNSKEY/CDS/CDNSKEY, private-type 65534) are never ingested.
 
+**A re-render keeps what named holds (#2850, BIND9).** The mirror protects a
+record only once it exists and the agent has fetched a bundle carrying it,
+which is at least one sweep after the update. Every agent start renders each
+zone from the cached bundle, and every structural apply re-renders it, and the
+swap sets named's own zone file and its journal aside. So before the swap the
+BIND9 agent reads each dynamic zone back as named would load it (its file with
+the journal applied, `named-compilezone -j`; on a running named, after the
+freeze that writes the zone out) and appends to the staged file every RRset
+the control plane does not account for. "Accounts for" means the render has
+that name and type (its copy wins, as in the conflict rule above), or the
+control plane once shipped it to this server and has stopped: each dynamic
+zone's file has a `<zone>.db.owned` sidecar listing what the render wrote,
+which applied record ops then update. That second half is what keeps a record
+the control plane deleted while the agent was down from coming back. A name
+the render holds a CNAME for, or a third-party CNAME at a name the render
+uses, is left out and logged (`bind9_dynamic_records_not_carried`). The
+agent fails closed. If `named-checkzone` refuses the merge, if named's copy
+cannot be read back, or if a running named refuses to freeze a zone it still
+serves, the zone is held back on named's own copy (#1403) rather than losing
+the records. A zone file the checker reads and refuses is the exception:
+named cannot load it either, so the render replaces it, as it did before
+#2850, and `bind9_dynamic_records_lost` names the zone whose RFC 2136 records
+went with it. A zone whose live file is still exactly a render, with no
+journal, is not read back.
+
+**A mirror the third party deleted stays deleted.** The reverse also happens
+inside that window: a third party deletes a record the ingest has already
+mirrored, and the mirror row stays in the bundle until the next sweep reports
+the zone without it. Rendered over named's copy at a start, the record was
+served again, the next sweep read it back off named, and the row was never
+swept. So the bundle marks each mirror row `learned`, and for a learned RRset
+named's copy wins: one named no longer holds, and is known to have held, is
+left out of the staged file (`bind9_deleted_mirrors_withdrawn`) and dropped
+from the `.owned` sidecar, and the next sweep then removes the row. "Known to
+have held" is this agent's last ingest sweep having read it (kept in
+`ingest-seen/<zone>.keys` under the agent's state directory; not consulted for
+a zone in views, since a sweep reads one view) or the agent having shipped it
+here (`.owned`). A learned record named never held is one a peer server
+learned, on its way here, and is rendered as before; a managed record is
+never withdrawn, and keeps "the render wins". Same unit as above: a value
+deleted from an RRset that keeps others comes back from the mirror.
+
+Two costs of failing closed. A zone whose read-back times out is held, and on
+every later apply it spends up to the 300 s checker timeout reading the zone
+back while the zone is frozen. And a zone an operator has frozen with `rndc
+freeze` refuses the agent's own freeze, so the first apply holds that zone
+back, and the reload's thaw then clears the operator's freeze.
+
+As with the ingest's own rule, the RRset is the unit. A third party's apex NS
+record is not carried, and neither is an extra value at a name and type the
+control plane manages. Records are carried per zone and per view, so renaming
+a view loses its zones' third-party records.
+
 **Audit.** Every batch that adds or removes mirror records writes one
 `dns.record.external_ingest` audit row on the zone (not one per record, so
 a churning writer cannot flood the log): the added records in `new_value`,
