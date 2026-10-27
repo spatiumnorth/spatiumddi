@@ -81,9 +81,11 @@
 #                      start at scale is killed before the daemon listens.
 #   cnpg-recovery    — every render, plus --require passes and negative
 #                      controls: each CNPG Cluster sets max_slot_wal_keep_size
-#                      and bounds pg_wal at half its volume (#2317), and the
-#                      supervisor's namespace Role grants what its re-clone of
-#                      a stuck instance needs, pods/log get + pods patch (#2132).
+#                      and bounds pg_wal at half its volume (#2317), one with
+#                      replicas updates its primary by switchover while a
+#                      single instance renders no method at all (#2831), and
+#                      the supervisor's namespace Role grants what its re-clone
+#                      of a stuck instance needs, pods/log get + pods patch (#2132).
 #   bind9 memory     — the appliance dns-bind9 container takes its memory from
 #                      ``dnsBind9.memory`` (sized from node RAM by the
 #                      supervisor, #2223) and an explicit memory in
@@ -444,6 +446,31 @@ neg2317() { # label [helm --set args...]
 neg2317 "max_slot_wal_keep_size -1" \
     --set-string postgresql.cnpg.parameters.max_slot_wal_keep_size=-1
 neg2317 "a 3GB cap on a 4Gi volume" --set postgresql.persistence.size=4Gi
+# #2831: the same guard holds a replicated Cluster to primaryUpdateMethod
+# switchover: CNPG's default restart deletes the primary's pod under its
+# clients, and its smart shutdown refuses new connections for 180 s.
+echo "── negative control: a replicated Cluster restarting its primary in place must fail"
+out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.primaryUpdateMethod=restart \
+    | python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster - 2>&1)" \
+    && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#2831"; then
+    echo "   ok: primaryUpdateMethod restart on three instances refused by the #2831 guard"
+else
+    echo "   FAIL: expected the #2831 guard to refuse primaryUpdateMethod restart (rc=$rc)" >&2
+    printf '%s\n' "$out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+# One instance has no replica to switch over to: the chart leaves the field
+# out there, so a single node keeps CNPG's in-place restart exactly as before.
+echo "── one CNPG instance renders no primaryUpdateMethod (#2831)"
+if helm template one "$UMBRELLA" --kube-version "$K8S_VERSION" "${UMBRELLA_HA[@]}" \
+    --set postgresql.cnpg.instances=1 | grep -q 'primaryUpdateMethod'; then
+    echo "   FAIL: a one-instance Cluster rendered primaryUpdateMethod" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: a one-instance Cluster leaves CNPG's default"
+fi
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
 

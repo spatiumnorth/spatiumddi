@@ -753,6 +753,23 @@ postgresql:
     # clusters. CNPG enforces odd counts implicitly via its leader-
     # election layer.
     instances: 3
+    # #2831: how CNPG updates the PRIMARY once a spec change has rolled the
+    # replicas (a resources or parameter change, on an upgrade, a resize or
+    # a promote). ``switchover`` promotes an already-updated replica first
+    # and fast-shuts the old primary, so a new connection waits seconds.
+    # CNPG's own default, ``restart``, deletes the primary's pod while it
+    # still serves: its smart shutdown turns every new connection away for
+    # the whole ``smartShutdownTimeout`` (180 s), because the services'
+    # pooled sessions never end on their own. Rendered only with two or more
+    # instances: one instance has no replica to switch to and keeps CNPG's
+    # default. Not part of the instance pods' spec, so changing it rolls
+    # nothing.
+    #
+    # Under ``switchover`` CNPG's admission webhook refuses an update that
+    # changes ``imageName`` and any ``parameters`` key together, and a
+    # refused apply fails the helm upgrade (#1313): move the Postgres image
+    # in a release that changes no parameter (versions.json says so too).
+    primaryUpdateMethod: switchover   # switchover | restart
     # #590 — instance spreading. CNPG defaults to anti-affinity ON but
     # ``preferred`` (best effort), which on a 1→3 promote let two of three
     # instances land on the seed: losing that node would have taken the
