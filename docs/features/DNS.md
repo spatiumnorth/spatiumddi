@@ -2478,6 +2478,23 @@ named cannot load it either, so the render replaces it, as it did before
 went with it. A zone whose live file is still exactly a render, with no
 journal, is not read back.
 
+**A mirror the third party deleted stays deleted.** The reverse also happens
+inside that window: a third party deletes a record the ingest has already
+mirrored, and the mirror row stays in the bundle until the next sweep reports
+the zone without it. Rendered over named's copy at a start, the record was
+served again, the next sweep read it back off named, and the row was never
+swept. So the bundle marks each mirror row `learned`, and for a learned RRset
+named's copy wins: one named no longer holds, and is known to have held, is
+left out of the staged file (`bind9_deleted_mirrors_withdrawn`) and dropped
+from the `.owned` sidecar, and the next sweep then removes the row. "Known to
+have held" is this agent's last ingest sweep having read it (kept in
+`ingest-seen/<zone>.keys` under the agent's state directory; not consulted for
+a zone in views, since a sweep reads one view) or the agent having shipped it
+here (`.owned`). A learned record named never held is one a peer server
+learned, on its way here, and is rendered as before; a managed record is
+never withdrawn, and keeps "the render wins". Same unit as above: a value
+deleted from an RRset that keeps others comes back from the mirror.
+
 Two costs of failing closed. A zone whose read-back times out is held, and on
 every later apply it spends up to the 300 s checker timeout reading the zone
 back while the zone is frozen. And a zone an operator has frozen with `rndc

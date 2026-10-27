@@ -38,6 +38,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ..ingest import read_seen_keys as _read_seen_keys
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
 from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
 from ._forwarders import bind_zone_tls_statement as _bind_zone_tls_statement
@@ -1902,22 +1903,24 @@ def _canon_owner(owner: str, origin: str) -> str:
         return typed
 
 
+def _render_line_key(line: str, origin: str) -> str | None:
+    """``"<owner> <TYPE>"`` of a record line ``_write_zone_file`` wrote,
+    ``<owner> [<ttl>] IN <type> <rdata>``; None for any other line."""
+    if not line or line[0] in "$;":
+        return None
+    tokens = line.split(None, 4)
+    if len(tokens) >= 3 and tokens[1] == "IN":
+        rtype = tokens[2]
+    elif len(tokens) >= 4 and tokens[2] == "IN":
+        rtype = tokens[3]
+    else:
+        return None
+    return f"{_canon_owner(tokens[0], origin)} {rtype.upper()}"
+
+
 def _rendered_rrset_keys(lines: Iterable[str], origin: str) -> set[str]:
-    """``"<owner> <TYPE>"`` for every record line ``_write_zone_file`` wrote:
-    ``<owner> [<ttl>] IN <type> <rdata>``."""
-    keys: set[str] = set()
-    for line in lines:
-        if not line or line[0] in "$;":
-            continue
-        tokens = line.split(None, 4)
-        if len(tokens) >= 3 and tokens[1] == "IN":
-            rtype = tokens[2]
-        elif len(tokens) >= 4 and tokens[2] == "IN":
-            rtype = tokens[3]
-        else:
-            continue
-        keys.add(f"{_canon_owner(tokens[0], origin)} {rtype.upper()}")
-    return keys
+    """``"<owner> <TYPE>"`` for every record line ``_write_zone_file`` wrote."""
+    return {k for k in (_render_line_key(line, origin) for line in lines) if k}
 
 
 _OWNED_LINE = re.compile(r"^[+-]\S+ [A-Z0-9-]+$")
@@ -2456,11 +2459,16 @@ class Bind9Driver(DriverBase):
     #: Records the current render left out because their rdata does not parse
     #: (#2510), one ``"<zone>: …"`` line each; surfaced via ``refused_zones``.
     _skipped_records: set[str] | None = None
+    #: Per staged dynamic zone file, the RRsets of its render that are all
+    #: ingest mirrors (``learned`` in the bundle, #2850): for these named's
+    #: copy wins at the carry (``_carry_zone``).
+    _learned_rrsets: dict[str, set[str]] | None = None
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
     def render(self, bundle: dict[str, Any]) -> None:
         self._skipped_records = set()
+        self._learned_rrsets = {}
         try:
             self._render(bundle)
         finally:
@@ -3053,6 +3061,9 @@ class Bind9Driver(DriverBase):
         ]
         if apex.placeholder_glue:
             lines.append(f"{_PLACEHOLDER_NS_LABEL} IN A {_PLACEHOLDER_NS_ADDRESS}")
+        origin = (zone.get("name") or "").rstrip(".").lower() + "."
+        # #2850 — RRset key -> whether every row of it is an ingest mirror.
+        learned: dict[str, bool] = {}
         for rec in zone.get("records", []) or []:
             # A record's own TTL wins, 0 included (#1382): 0 is how an operator
             # says "do not cache this" through a cut-over, and ``or`` served it
@@ -3128,11 +3139,17 @@ class Bind9Driver(DriverBase):
                 )
                 continue
             lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
+            key = f"{_canon_owner(name_field, origin)} {rtype}"
+            learned[key] = learned.get(key, True) and bool(rec.get("learned"))
         path.write_text("\n".join(lines) + "\n")
         if zone.get("dynamic_update_enabled"):
             # What the control plane owns in this zone, for the next render to
             # tell its deletions from a third party's records (#2850).
-            origin = (zone.get("name") or "").rstrip(".").lower() + "."
+            mirrors = {k for k, all_learned in learned.items() if all_learned}
+            if mirrors:
+                if self._learned_rrsets is None:
+                    self._learned_rrsets = {}
+                self._learned_rrsets[str(path)] = mirrors
             owned = sorted(_rendered_rrset_keys(lines, origin))
             _write_durable(
                 _owned_sidecar(path), "".join(f"+{k}\n" for k in owned).encode()
@@ -3946,6 +3963,10 @@ class Bind9Driver(DriverBase):
                 detail="read what the control plane owns from the previous "
                 "render instead",
             )
+        withdrawn = self._withdrawn_mirrors(
+            staged, zname, view, state, staged_keys, owned
+        )
+        staged_keys -= withdrawn
         lines, conflicts = _carried_records(state, origin, staged_keys, owned)
         if conflicts:
             log.warning(
@@ -3956,19 +3977,41 @@ class Bind9Driver(DriverBase):
                 sample=conflicts[:5],
                 detail="a record the control plane manages owns this name",
             )
-        if not lines:
+        if not lines and not withdrawn:
             return None
         rendered = staged.read_text()
+        if withdrawn:
+            rendered = "".join(
+                line + "\n"
+                for line in rendered.splitlines()
+                if _render_line_key(line, origin) not in withdrawn
+            )
+            # Named's copy wins for these: not the control plane's to keep, so
+            # a third party that adds one back is carried, not dropped.
+            with _owned_sidecar(staged).open("a") as fh:
+                fh.write("".join(f"-{k}\n" for k in sorted(withdrawn)))
+                fh.flush()
+                os.fsync(fh.fileno())
+            log.info(
+                "bind9_deleted_mirrors_withdrawn",
+                zone=zname,
+                view=view,
+                rrsets=len(withdrawn),
+                sample=sorted(withdrawn)[:5],
+                detail="a record the ingest mirrored was deleted from named "
+                "by RFC 2136 since; named's copy wins, so it is not served "
+                "again from the mirror",
+            )
+        # The marker even with nothing carried: a file missing a withdrawn
+        # mirror is not a bare render of the bundle, so the next start reads
+        # it back again rather than rendering the mirror over it.
         _write_new_inode(
             staged,
             (
                 _CARRY_MARKER
                 + "\n"
                 + rendered
-                + _CARRY_BLOCK
-                + "\n"
-                + "\n".join(lines)
-                + "\n"
+                + (_CARRY_BLOCK + "\n" + "\n".join(lines) + "\n" if lines else "")
             ).encode(),
         )
         if not frozen and state.serial is not None:
@@ -4006,6 +4049,43 @@ class Bind9Driver(DriverBase):
             owned_known=owned is not None,
         )
         return None
+
+    def _withdrawn_mirrors(
+        self,
+        staged: Path,
+        zname: str,
+        view: str | None,
+        state: _NamedZoneState,
+        staged_keys: set[str],
+        owned: set[str] | None,
+    ) -> set[str]:
+        """The ingest-mirror RRsets of the render to leave out: named held
+        them and no longer does (#2850).
+
+        A mirror row (``learned``) is the control plane's copy of a record a
+        third party wrote; it is swept only once an ingest sweep reports the
+        zone without it. A third party that deletes the record inside that
+        window leaves the row in the bundle, and rendered over named's copy
+        the record is served again, read back by the next sweep, and the row
+        is never swept. So for a mirror named's copy wins, when named is
+        known to have held it: this agent's last ingest sweep read it (only
+        without views: the sweep reads one view), or the agent shipped it
+        here (``.owned``). A mirror named never held is one a peer server
+        learned, on its way here, and is rendered as before. Managed records
+        are never withdrawn: for them the render wins.
+        """
+        mirrors = (self._learned_rrsets or {}).get(str(staged))
+        if not mirrors:
+            return set()
+        held = {key for key, _line in state.records}
+        evidence: set[str] = set(owned or ())
+        if view is None:
+            evidence |= _read_seen_keys(self.state_dir, zname) or set()
+        return {
+            key
+            for key in mirrors
+            if key in staged_keys and key not in held and key in evidence
+        }
 
     def _zone_served(self, base: list[str], zv: tuple[str, str | None]) -> bool:
         zname, view = zv

@@ -15,3 +15,8 @@
   `.owned` sidecar of what the control plane rendered or sent by
   record op. A merge `named-checkzone` refuses holds the zone back on
   named's own copy instead of dropping the records.
+  A record a third party deleted after the ingest had mirrored it is
+  not brought back either: the bundle marks each mirror row `learned`,
+  and at a start or re-render the agent leaves out a mirrored record
+  named held and no longer does, so the next sweep removes the mirror
+  instead of reading the record back and keeping it forever.

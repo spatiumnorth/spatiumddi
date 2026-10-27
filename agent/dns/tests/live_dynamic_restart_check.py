@@ -19,7 +19,9 @@ named did the same through the freeze it takes before the swap. Here:
 * a record the control plane DELETED while the agent was down (one it
   rendered, and one it added by record op) is not brought back, and a
   record the third party deleted stays deleted;
-* where the control plane takes over a name, its record wins.
+* where the control plane takes over a name, its record wins;
+* a record the ingest mirrored and the third party then deleted is not
+  brought back from the mirror row by a start before the next sweep.
 
 Exits non-zero on the first failed expectation. Never skips.
 """
@@ -51,6 +53,7 @@ def _bundle(
     ttl: int = 3600,
     view: str | None = None,
     other: str | None = None,
+    learned: tuple[str, ...] = (),
 ) -> dict:
     zone = {
         "name": _ZONE,
@@ -67,6 +70,11 @@ def _bundle(
             {"name": n, "type": t, "value": v, "ttl": 300} for n, t, v in records
         ],
     }
+    for rec in zone["records"]:
+        # An ingest mirror of a third party's record (#641), as the control
+        # plane marks it (#2850).
+        if rec["name"] in learned:
+            rec["learned"] = True
     bundle = {
         "options": {
             "forwarders": [],
@@ -278,6 +286,52 @@ def flat(state: Path, sig: int) -> None:
     _stop(driver)
 
 
+def mirror_deleted(state: Path) -> None:
+    """The walk's case 5: a record the ingest mirrored, deleted by the third
+    party, and the agent restarting before the next sweep removes the mirror
+    row from the cached bundle. It must stay deleted: served again, the next
+    sweep reads it back and the mirror is never swept."""
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+    from spatium_dns_agent.ingest import write_seen_keys
+
+    print("\n=== a mirrored record the third party deleted, then a restart ===")
+    driver = Bind9Driver(state_dir=state)
+    driver.apply_config(_bundle([("www", "A", "192.0.2.1")]))
+    check(
+        "a third party adds dc05",
+        _nsupdate(adds=[("dc05", 600, "A", "10.9.9.5")]) == "NOERROR",
+    )
+    # The ingest sweep reads it, and the control plane mirrors it.
+    write_seen_keys(
+        state,
+        _ZONE,
+        [
+            {"name": "www", "record_type": "A", "value": "192.0.2.1"},
+            {"name": "dc05", "record_type": "A", "value": "10.9.9.5"},
+        ],
+    )
+    check("a third party deletes dc05", _nsupdate(deletes=[("dc05", "A")]) == "NOERROR")
+    _stop(driver)
+
+    print("--- agent start, from a cached bundle still holding dc05's mirror")
+    mirrored = [("www", "A", "192.0.2.1"), ("dc05", "A", "10.9.9.5")]
+    driver = Bind9Driver(state_dir=state)
+    driver.apply_config(_bundle(mirrored, learned=("dc05",)))
+    check("dc05 stays deleted", _q("dc05") == "NXDOMAIN", _q("dc05"))
+    check("the render is served", _q("www") == "192.0.2.1", _q("www"))
+    _stop(driver)
+    driver = Bind9Driver(state_dir=state)
+    driver.apply_config(_bundle(mirrored, learned=("dc05",)))
+    check("dc05 stays deleted at a second start", _q("dc05") == "NXDOMAIN", _q("dc05"))
+
+    print("--- a mirror named never held (a peer server's) is rendered")
+    driver.apply_config(
+        _bundle([*mirrored, ("dc06", "A", "10.9.9.6")], learned=("dc05", "dc06"))
+    )
+    check("dc06 is served", _q("dc06") == "10.9.9.6", _q("dc06"))
+    _stop(driver)
+
+
 def views(state: Path) -> None:
     from spatium_dns_agent.drivers.bind9 import Bind9Driver
 
@@ -436,6 +490,7 @@ def main() -> int:
     cases = [
         lambda s: flat(s, signal.SIGTERM),
         lambda s: flat(s, signal.SIGKILL),
+        mirror_deleted,
         views,
         serial_stable,
         races,
