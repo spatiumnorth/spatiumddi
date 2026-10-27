@@ -44,12 +44,25 @@ def _verify_arg() -> Any:
 
 
 class ApiError(RuntimeError):
-    """Raised on a non-2xx response, carrying status + body for the caller's log."""
+    """Raised on a non-2xx response, carrying status + body for the caller's log.
 
-    def __init__(self, method: str, url: str, status_code: int, body: str) -> None:
+    ``retry_after`` is the response's ``Retry-After`` header as sent, or None:
+    the API's 503 for a database that did not answer in time and nginx's
+    502/504 for an api it could not reach both carry one (#2879).
+    """
+
+    def __init__(
+        self,
+        method: str,
+        url: str,
+        status_code: int,
+        body: str,
+        retry_after: str | None = None,
+    ) -> None:
         super().__init__(f"{method} {url} -> {status_code}: {body[:500]}")
         self.status_code = status_code
         self.body = body
+        self.retry_after = retry_after
 
 
 class ApiClient:
@@ -127,7 +140,9 @@ class ApiClient:
     def request(self, method: str, path: str, *, ok: tuple[int, ...] = (200, 201, 204), **kw: Any) -> httpx.Response:
         resp = self._client.request(method, path, **kw)
         if resp.status_code not in ok:
-            raise ApiError(method, path, resp.status_code, resp.text)
+            raise ApiError(
+                method, path, resp.status_code, resp.text, resp.headers.get("Retry-After")
+            )
         return resp
 
     def get(self, path: str, *, ok: tuple[int, ...] = (200,), **kw: Any) -> httpx.Response:

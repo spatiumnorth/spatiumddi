@@ -47,9 +47,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import email.utils
 import ipaddress
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -77,6 +79,73 @@ RECORD_CHUNK = 200          # records logged per progress line
 RECORD_WORKERS = 16         # concurrent POSTs for the per-record fallback load
 BULK_BATCH = 1000           # records per records/bulk-create call (endpoint cap is 2000)
 BULK_WORKERS = 6            # concurrent bulk-create batches (perf #454 fast-path)
+
+# #2879: a records/bulk-create batch answered 502, 503 or 504 is sent again
+# before it counts failed. The API answers 503 with Retry-After when the
+# database did not answer in time (a statement past asyncpg's 30 s
+# command_timeout, a connect past 5 s, a pool wait that timed out:
+# backend/app/main.py); nginx in front of it answers 502 when no api endpoint
+# is ready and 504 past its 60 s proxy_read_timeout, with Retry-After too
+# (frontend/default.conf.template, @api_unavailable). One such answer used to
+# cost the whole 1000-record batch and, past the 1% bound, the seed (rc 3).
+# Waits of 2, 2, 4, 8, 16, 20, 20 s (with the API's Retry-After: 2) cover
+# about 70-90 s, the 60-90 s a CNPG promotion took (backend/app/main.py).
+BULK_RETRY_STATUSES = frozenset({502, 503, 504})
+BULK_MAX_ATTEMPTS = 8  # the first send + up to 7 retries
+BULK_BACKOFF_BASE_S = 1.0  # 1, 2, 4, 8, 16, 20, 20 s between sends ...
+BULK_BACKOFF_CAP_S = 20.0  # ... each wait at most this, unless Retry-After asks more
+BULK_RETRY_AFTER_CAP_S = 30.0  # a Retry-After is honoured up to this
+BULK_AFTER_504_S = 30.0  # the least wait after a 504 (see _retry_wait_s)
+BULK_RETRY_BUDGET_S = 120.0  # total wait one batch may spend before it counts failed
+# records/bulk-create's reason for a record the zone already holds (#1230).
+BULK_SKIP_IDENTICAL = "identical record already exists"
+
+
+def _retry_after_s(value: str | None) -> float | None:
+    """The wait a ``Retry-After`` header asks for, in seconds, or None.
+
+    Both RFC 9110 forms: delta-seconds (what the API and nginx send, ``2``)
+    and an HTTP-date. A date already past asks for no wait.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        secs = float(text)
+    except ValueError:
+        parsed = email.utils.parsedate_tz(text)
+        if parsed is None:
+            return None
+        secs = email.utils.mktime_tz(parsed) - time.time()
+    if secs != secs:  # NaN
+        return None
+    return max(0.0, secs)
+
+
+def _retry_wait_s(
+    attempt: int, status: int, retry_after: float | None, rng: random.Random
+) -> float:
+    """How long to wait before sending a batch again after its ``attempt``-th send.
+
+    Exponential backoff, never less than the server's Retry-After (capped),
+    plus up to 25% jitter, so concurrent batches that failed together do not
+    all come back at the same instant.
+
+    After a 504 the wait is at least ``BULK_AFTER_504_S``. nginx stopped
+    waiting there, but the api may still be working on the batch and commit
+    it. Sending it again is safe once that attempt has ended:
+    records/bulk-create skips a record the zone already holds (#1230), so a
+    batch that did land comes back as ``skipped``, not as a second copy. Two
+    attempts in flight at once could each miss the other's rows, so the wait
+    outlasts the api's own 30 s statement timeout. A 502 or a 503 is answered
+    once the attempt has ended.
+    """
+    wait = min(BULK_BACKOFF_CAP_S, BULK_BACKOFF_BASE_S * 2 ** (attempt - 1))
+    if retry_after is not None:
+        wait = max(wait, min(retry_after, BULK_RETRY_AFTER_CAP_S))
+    if status == 504:
+        wait = max(wait, BULK_AFTER_504_S)
+    return wait * rng.uniform(1.0, 1.25)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +399,16 @@ class _BulkLoader:
         self.failed = 0
         self._first_errors: list[str] = []
         self.aborted = False   # tripped on an auth failure so we fast-fail, not silently skip
+        # #2879: every resend of a 502/503/504 batch is counted (and logged), so a
+        # load that only completed on retries says so in the seed manifest.
+        self.retries = 0
+        self.retries_by_status: dict[str, int] = {}
+        self.batches_retried = 0
+        # Records bulk-create skipped because the zone already held them (#1230):
+        # in a fresh zone, a batch whose earlier send landed but lost its answer.
+        self.already_present = 0
+        self._sleep = time.sleep
+        self._rng = random.Random()
 
     def _post_one(self, zone_id: str, rec: dict[str, Any]) -> None:
         if self.aborted:
@@ -357,28 +436,93 @@ class _BulkLoader:
     def _bulk_post(self, zone_id: str, batch: list[dict[str, Any]]) -> int | None:
         """POST one ``records/bulk-create`` batch. Returns the created count, or
         ``None`` if the endpoint is absent (404 — appliance predates perf #454),
-        signalling the caller to fall back to the per-record path."""
+        signalling the caller to fall back to the per-record path.
+
+        A 502, 503 or 504 is sent again (#2879), after ``_retry_wait_s``, up to
+        ``BULK_MAX_ATTEMPTS`` sends and ``BULK_RETRY_BUDGET_S`` of waiting; each
+        resend is logged (``bulk_create_retry``) and counted. A batch counts
+        failed when its sends run out, or at once on any other answer. Records
+        the response lists as already in the zone count in ``already_present``."""
         # POST /v1/dns/groups/{gid}/zones/{zid}/records/bulk-create — dns/router.py
         path = f"/v1/dns/groups/{self.group_id}/zones/{zone_id}/records/bulk-create"
         body = {"records": [
             {"name": r["name"], "record_type": r["record_type"], "value": r["value"]}
             for r in batch
         ]}
-        try:
-            resp = self.api.json("POST", path, json=body, ok=(201,))
-            return int(resp.get("created", 0))
-        except ApiError as exc:
-            if exc.status_code == 404:
-                return None  # endpoint not deployed — fall back to per-record
-            msg = str(exc)
-            with self._lock:
-                self.failed += len(batch)
-                if len(self._first_errors) < 5:
-                    self._first_errors.append(msg[:200])
-                if not self.aborted and exc.status_code in (401, 403):
-                    self.aborted = True
-                    log_event(self.log, 40, "bulk_load_auth_abort", error=msg[:200])
-            return 0
+        attempt = 0
+        waited = 0.0
+        while True:
+            attempt += 1
+            try:
+                resp = self.api.json("POST", path, json=body, ok=(201,))
+            except ApiError as exc:
+                if exc.status_code == 404:
+                    return None  # endpoint not deployed — fall back to per-record
+                if exc.status_code in BULK_RETRY_STATUSES and not self.aborted:
+                    wait = _retry_wait_s(
+                        attempt, exc.status_code, _retry_after_s(exc.retry_after), self._rng
+                    )
+                    if attempt < BULK_MAX_ATTEMPTS and waited + wait <= BULK_RETRY_BUDGET_S:
+                        with self._lock:
+                            self.retries += 1
+                            key = str(exc.status_code)
+                            self.retries_by_status[key] = self.retries_by_status.get(key, 0) + 1
+                            if attempt == 1:
+                                self.batches_retried += 1
+                        log_event(
+                            self.log,
+                            logging.WARNING,
+                            "bulk_create_retry",
+                            status=exc.status_code,
+                            attempt=attempt,
+                            wait_s=round(wait, 2),
+                            retry_after=exc.retry_after,
+                            records=len(batch),
+                            path=path,
+                            error=str(exc)[:200],
+                        )
+                        self._sleep(wait)
+                        waited += wait
+                        continue
+                    log_event(
+                        self.log,
+                        logging.ERROR,
+                        "bulk_create_gave_up",
+                        status=exc.status_code,
+                        attempts=attempt,
+                        waited_s=round(waited, 2),
+                        records=len(batch),
+                        path=path,
+                    )
+                msg = str(exc)
+                with self._lock:
+                    self.failed += len(batch)
+                    if len(self._first_errors) < 5:
+                        self._first_errors.append(msg[:200])
+                    if not self.aborted and exc.status_code in (401, 403):
+                        self.aborted = True
+                        log_event(self.log, 40, "bulk_load_auth_abort", error=msg[:200])
+                return 0
+            created = int(resp.get("created", 0))
+            present = sum(
+                1 for s in resp.get("skipped") or () if s.get("reason") == BULK_SKIP_IDENTICAL
+            )
+            if present:
+                with self._lock:
+                    self.already_present += present
+            if attempt > 1:
+                log_event(
+                    self.log,
+                    logging.INFO,
+                    "bulk_create_recovered",
+                    attempts=attempt,
+                    waited_s=round(waited, 2),
+                    created=created,
+                    already_present=present,
+                    records=len(batch),
+                    path=path,
+                )
+            return created
 
     def load(self, items: list[tuple[str, dict[str, Any]]]) -> None:
         """Load ``(zone_id, record)`` pairs with progress logging.
@@ -417,7 +561,7 @@ class _BulkLoader:
             self.created += probe
         done += len(batch0)
         log_event(self.log, logging.INFO, "bulk_record_progress", done=done, total=total,
-                  created=self.created, failed=self.failed,
+                  created=self.created, failed=self.failed, retries=self.retries,
                   rate_per_s=round(done / max(1e-6, time.time() - t0), 1))
 
         # Remaining batches concurrently.
@@ -433,6 +577,7 @@ class _BulkLoader:
                 if done % max(BULK_BATCH, RECORD_CHUNK) < n or done == total:
                     log_event(self.log, logging.INFO, "bulk_record_progress", done=done,
                               total=total, created=self.created, failed=self.failed,
+                              retries=self.retries,
                               rate_per_s=round(done / max(1e-6, time.time() - t0), 1))
 
     def _load_per_record(self, items: list[tuple[str, dict[str, Any]]]) -> None:
@@ -719,6 +864,11 @@ def run(rp: RunPaths, m: manifest_mod.Manifest, log: logging.Logger) -> int:
                 "failed": loader.failed,
                 "skipped_no_zone": skipped_no_zone,
                 "first_errors": loader._first_errors,
+                # #2879: a load that completed only on retries shows it here.
+                "retries": loader.retries,
+                "retries_by_status": dict(loader.retries_by_status),
+                "batches_retried": loader.batches_retried,
+                "already_present": loader.already_present,
             })
         _flush()
 
@@ -736,6 +886,7 @@ def run(rp: RunPaths, m: manifest_mod.Manifest, log: logging.Logger) -> int:
               subnets=len(created["subnets"]),
               records_created=created["authoritative_records"].get("created", 0),
               records_failed=created["authoritative_records"].get("failed", 0),
+              records_retries=created["authoritative_records"].get("retries", 0),
               t1_renew_s=canonical.T1_RENEW_S)
     if loader is not None:
         # Auth failed mid-load → the dataset is incomplete by an unknowable amount; fail
