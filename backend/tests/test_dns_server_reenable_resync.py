@@ -210,3 +210,186 @@ async def test_an_update_that_does_not_re_enable_leaves_the_structural_etag(
     await db_session.refresh(server)
     after = await build_config_bundle(db_session, server)
     assert after["structural_etag"] == before["structural_etag"]
+
+
+# ── #2654: a dynamic zone's re-render waits for the server's ingest report ──
+
+
+async def _ingest(
+    client: AsyncClient, server: DNSServer, zone_name: str, live: dict[str, str]
+) -> dict[str, object]:
+    """``server``'s agent posts what its daemon serves in ``zone_name``."""
+    from app.api.v1.dns.agents import _auth_agent  # noqa: PLC0415
+    from app.main import app  # noqa: PLC0415
+
+    app.dependency_overrides[_auth_agent] = lambda: (server, {})
+    try:
+        resp = await client.post(
+            "/api/v1/dns/agents/ingested-records",
+            json={
+                "zone_name": zone_name,
+                "records": [
+                    {"name": n, "record_type": "A", "value": v, "ttl": 300}
+                    for n, v in sorted(live.items())
+                ],
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(_auth_agent, None)
+    assert resp.status_code == 200, resp.text
+    return dict(resp.json())
+
+
+class _Agent:
+    """What ``server``'s daemon serves in one zone, driven the way the agent
+    drives it: a poll whose structural etag moved re-renders the zone from the
+    bundle body (the database's copy), replacing whatever the daemon held."""
+
+    def __init__(self, db: AsyncSession, server: DNSServer, zone_id: str) -> None:
+        self.db, self.server, self.zone_id = db, server, zone_id
+        self.live: dict[str, str] = {}
+        self.etag: object = None
+
+    async def poll(self) -> bool:
+        await self.db.refresh(self.server)
+        bundle = await build_config_bundle(self.db, self.server)
+        await self.db.commit()
+        rendered = bundle["structural_etag"] != self.etag
+        if rendered:
+            self.live = _records(bundle, self.zone_id)
+            self.etag = bundle["structural_etag"]
+        return rendered
+
+
+async def _dynamic_setup(
+    client: AsyncClient, db: AsyncSession
+) -> tuple[dict[str, str], DNSServerGroup, DNSServer, DNSServer, str, str]:
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    headers, grp, ns1, ns2, zone_id = await _setup(client, db)
+    zone = await db.get(DNSZone, uuid.UUID(zone_id))
+    assert zone is not None
+    zone.dynamic_update_enabled = True
+    await db.commit()
+    return headers, grp, ns1, ns2, zone_id, zone.name.rstrip(".")
+
+
+@pytest.mark.asyncio
+async def test_a_record_learned_while_disabled_survives_the_re_enable_re_render(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The ddi-pg walk's case 8. A writer adds W on ns2 while ns2 is disabled;
+    ns2 is enabled again. The agent's next poll after the PUT used to come
+    back with the #2281 forced re-render, which replaced the zone with the
+    database's copy (no W) a second or two later, before ns2's ingest report
+    could mirror W. W was gone from ns2 and never reached ns1."""
+    from app.models.dns import DNSRecord, DNSRecordOp  # noqa: PLC0415
+
+    headers, grp, ns1, ns2, zone_id, zone_name = await _dynamic_setup(client, db_session)
+    agent = _Agent(db_session, ns2, zone_id)
+    await agent.poll()
+    await _ingest(client, ns1, zone_name, {})
+    await _ingest(client, ns2, zone_name, agent.live)
+
+    await _set_enabled(client, headers, grp, ns2, False)
+    agent.live["laptop7"] = "10.0.0.77"  # nsupdate straight to ns2
+    assert (await _ingest(client, ns2, zone_name, agent.live))["skipped"] == "server_disabled"
+
+    await _set_enabled(client, headers, grp, ns2, True)
+    # The poll right after the PUT: no re-render yet, W still served.
+    assert await agent.poll() is False
+    assert agent.live.get("laptop7") == "10.0.0.77"
+
+    # ns2's next sweep mirrors W and releases the owed re-render.
+    r = await _ingest(client, ns2, zone_name, agent.live)
+    assert r["added"] == 1 and r["zone_resync"] == "released"
+    mirror = (
+        (await db_session.execute(select(DNSRecord).where(DNSRecord.name == "laptop7")))
+        .scalars()
+        .all()
+    )
+    assert [(m.import_source, m.value) for m in mirror] == [("ddns_external", "10.0.0.77")]
+    to_ns1 = (
+        (
+            await db_session.execute(
+                select(DNSRecordOp).where(
+                    DNSRecordOp.server_id == ns1.id, DNSRecordOp.op == "create"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [o.record["name"] for o in to_ns1] == ["laptop7"]
+
+    # The re-render now happens, and the database's copy keeps W.
+    assert await agent.poll() is True
+    assert agent.live.get("laptop7") == "10.0.0.77"
+
+
+@pytest.mark.asyncio
+async def test_a_dynamic_zone_server_still_catches_up_on_re_enable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The #2281 guarantee (walk case 4) with the re-render deferred: records
+    added and deleted while the server was off reach it once it reports."""
+    headers, grp, _ns1, ns2, zone_id, zone_name = await _dynamic_setup(client, db_session)
+    gone = await _record(client, headers, grp, zone_id, "gone")
+    agent = _Agent(db_session, ns2, zone_id)
+    await agent.poll()
+    assert "gone" in agent.live
+    await _ingest(client, ns2, zone_name, agent.live)
+
+    await _set_enabled(client, headers, grp, ns2, False)
+    await _record(client, headers, grp, zone_id, "added")
+    resp = await client.delete(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone_id}/records/{gone}", headers=headers
+    )
+    assert resp.status_code == 204, resp.text
+    await _set_enabled(client, headers, grp, ns2, True)
+
+    assert await agent.poll() is False  # still the pre-disable copy
+    await _ingest(client, ns2, zone_name, agent.live)
+    assert await agent.poll() is True
+    assert "added" in agent.live and "gone" not in agent.live
+
+
+@pytest.mark.asyncio
+async def test_the_re_render_goes_ahead_when_no_ingest_report_arrives(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A server whose reports never come (broken transfer, no ``dig``) is not
+    left stale: the agent stale sweep releases the re-render after the wait.
+    And disabling a server drops a re-render still owed from an earlier
+    re-enable; the next re-enable owes a fresh one."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from app.services.dns.server_resync import (  # noqa: PLC0415
+        RESYNC_INGEST_WAIT,
+        force_overdue_resyncs,
+    )
+
+    headers, grp, _ns1, ns2, zone_id, _zone_name = await _dynamic_setup(client, db_session)
+    agent = _Agent(db_session, ns2, zone_id)
+    await agent.poll()
+    await _set_enabled(client, headers, grp, ns2, False)
+    await _set_enabled(client, headers, grp, ns2, True)
+    await db_session.refresh(ns2)
+    assert ns2.zone_resync_pending_since is not None
+
+    assert await force_overdue_resyncs(db_session) == []  # not overdue yet
+    await db_session.commit()
+    assert await agent.poll() is False
+
+    ns2.zone_resync_pending_since = datetime.now(UTC) - RESYNC_INGEST_WAIT * 2
+    await db_session.commit()
+    assert [s.id for s in await force_overdue_resyncs(db_session)] == [ns2.id]
+    await db_session.commit()
+    assert await agent.poll() is True
+    assert ns2.zone_resync_pending_since is None
+
+    await _set_enabled(client, headers, grp, ns2, False)
+    await _set_enabled(client, headers, grp, ns2, True)
+    await _set_enabled(client, headers, grp, ns2, False)
+    await db_session.refresh(ns2)
+    assert ns2.zone_resync_pending_since is None

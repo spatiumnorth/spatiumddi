@@ -84,6 +84,14 @@ class _Driver(Bind9Driver):
     def swap_and_reload(self) -> None:
         return None
 
+    def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
+        # No named to read back from (#2835): it would serve the render.
+        return {
+            str(z["name"]).rstrip(".").lower(): int(z["serial"])
+            for z in bundle.get("zones") or []
+            if z.get("name") and z.get("serial") is not None
+        }
+
 
 class _Heartbeat:
     def __init__(self) -> None:

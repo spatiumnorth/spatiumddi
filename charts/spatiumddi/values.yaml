@@ -753,6 +753,23 @@ postgresql:
     # clusters. CNPG enforces odd counts implicitly via its leader-
     # election layer.
     instances: 3
+    # #2831: how CNPG updates the PRIMARY once a spec change has rolled the
+    # replicas (a resources or parameter change, on an upgrade, a resize or
+    # a promote). ``switchover`` promotes an already-updated replica first
+    # and fast-shuts the old primary, so a new connection waits seconds.
+    # CNPG's own default, ``restart``, deletes the primary's pod while it
+    # still serves: its smart shutdown turns every new connection away for
+    # the whole ``smartShutdownTimeout`` (180 s), because the services'
+    # pooled sessions never end on their own. Rendered only with two or more
+    # instances: one instance has no replica to switch to and keeps CNPG's
+    # default. Not part of the instance pods' spec, so changing it rolls
+    # nothing.
+    #
+    # Under ``switchover`` CNPG's admission webhook refuses an update that
+    # changes ``imageName`` and any ``parameters`` key together, and a
+    # refused apply fails the helm upgrade (#1313): move the Postgres image
+    # in a release that changes no parameter (versions.json says so too).
+    primaryUpdateMethod: switchover   # switchover | restart
     # #590 — instance spreading. CNPG defaults to anti-affinity ON but
     # ``preferred`` (best effort), which on a 1→3 promote let two of three
     # instances land on the seed: losing that node would have taken the
@@ -795,22 +812,23 @@ postgresql:
       # rewinds the old primary onto the new timeline: ``pg_rewind`` needs
       # the old primary's own WAL back to the last checkpoint before the
       # point where the two diverged, and the rewound instance then streams
-      # the new primary's WAL from there. The new primary holds no
-      # replication slot for it (CNPG's HA slots cover the standbys the
-      # primary already had), so plain retention, on both, is all that keeps
-      # that WAL. With CNPG's 512MB default a
-      # loaded cluster recycled it within minutes and the old primary looped
-      # for ever ("requested WAL segment ... has already been removed", then
-      # ``pg_rewind`` "could not restore file ... from archive") until it was
-      # re-cloned by hand. 2GB covers that much write traffic during the
-      # partition; a longer or heavier one still needs the re-clone.
+      # the new primary's WAL from there. The new primary may or may not hold
+      # a replication slot for it (CNPG synchronises its HA slots to the
+      # standbys, #2317), so plain retention, on both, is what reliably keeps
+      # that WAL. With CNPG's 512MB default a loaded cluster recycled it
+      # within minutes and the old primary looped for ever ("requested WAL
+      # segment ... has already been removed", then ``pg_rewind`` "could not
+      # restore file ... from archive"). 2GB covers that much write traffic
+      # during the partition. A longer or heavier one still outruns it, and
+      # so can a former primary whose own WAL was cut short by a kill; on the
+      # appliance the seed supervisor then re-clones that instance from the
+      # primary once it has looped for 10 minutes (#2132,
+      # ``k8s_api.reclone_stuck_postgres_instances``).
       #
-      # Disk: every instance keeps at least this much WAL in pg_wal on its
-      # own volume (on the appliance, local-path on /var), on top of what
-      # checkpoints keep. A reload, not a restart: CNPG applies a change to a
-      # formed cluster without a rolling restart. The supervisor's
-      # HelmChartConfig sets only ``shared_buffers`` in this map (#1115) and
-      # Helm merges maps key by key, so this default stays beside it.
+      # A reload, not a restart: CNPG applies a change to a formed cluster
+      # without a rolling restart. The supervisor's HelmChartConfig sets only
+      # ``shared_buffers`` in this map (#1115) and Helm merges maps key by
+      # key, so this default stays beside it.
       wal_keep_size: "2GB"
       # #2317 — the most WAL a replication slot may hold back. CNPG keeps an
       # HA slot per standby on the primary and synchronises them to every
@@ -819,10 +837,8 @@ postgresql:
       # keep WAL without limit: a lab primary's pg_wal reached 26 GB on its
       # node's /var while CNPG read healthy 7/7. Past this cap PostgreSQL
       # invalidates the slot at the next checkpoint (``wal_status = lost``),
-      # the WAL goes, and that standby can never rejoin by streaming: it needs
-      # a re-clone. Until the automatic one lands (#2132) that is manual:
-      # delete the instance's PVC, then its pod, and CNPG joins a fresh copy
-      # (docs/TROUBLESHOOTING.md).
+      # the WAL goes, and that standby needs a re-clone, which the supervisor
+      # does (#2132) when the standby keeps failing on the missing WAL.
       #
       # Sizing. PostgreSQL keeps the LARGER of this cap and ``wal_keep_size``
       # (the two do not add), plus up to ``max_wal_size`` (PostgreSQL's 1GB
@@ -859,6 +875,26 @@ postgresql:
     backup:
       enabled: false
       retentionPolicy: "30d"
+    # #2132 — publish the cluster CA's PUBLIC certificate into the ConfigMap
+    # ``<cluster>-ca-crt``, so a reader can verify the TLS of CNPG's
+    # instance-manager status endpoint without a grant on the CA secret
+    # (which also holds the CA private key). The appliance's supervisor reads
+    # the primary's replication slots from that endpoint before it re-clones
+    # a stuck instance. A CronJob, so a renewed CA reaches the ConfigMap
+    # within one ``schedule`` interval; until then (and before its first run)
+    # the reader treats the slot state as unknown and re-clones nothing.
+    # Off by default: only the appliance has a reader. The appliance overlay
+    # (spatiumddi-firstboot) turns it on.
+    caPublisher:
+      enabled: false
+      schedule: "*/10 * * * *"
+      # Per-workload PriorityClass override; unset inherits
+      # ``global.priorityClassName``, "" means none (see the helper).
+      priorityClassName: null
+      nodeSelector: {}
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits:   { cpu: 200m, memory: 96Mi }
 
 # Used when postgresql.enabled=false.
 externalDatabase:

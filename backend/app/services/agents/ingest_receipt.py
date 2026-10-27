@@ -128,7 +128,7 @@ def duplicate_response(**extra: Any) -> dict[str, Any]:
 async def prune_receipts(db: AsyncSession, *, now: datetime | None = None) -> int:
     """Delete receipts older than :data:`RECEIPT_RETENTION_DAYS`. Idempotent.
 
-    Does not commit; the nightly log sweep commits it with the rest.
+    Does not commit; the nightly log sweep commits it in its own transaction (#2872).
     """
     cutoff = (now or datetime.now(UTC)) - timedelta(days=RECEIPT_RETENTION_DAYS)
     result = await db.execute(

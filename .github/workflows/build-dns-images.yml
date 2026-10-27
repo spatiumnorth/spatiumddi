@@ -127,6 +127,20 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_query_log_check.py
 
+      # Issue #2850 — a record a third party added by RFC 2136 must outlive
+      # an agent start (the boot-from-cache apply used to render the zone
+      # afresh and set named's file and journal aside) and a structural
+      # re-render, while a record the control plane deleted stays deleted.
+      # Drives the real driver against a real named, stopped by SIGTERM and
+      # by SIGKILL, with and without views. Runs as `spatium`, like the agent.
+      - name: Dynamic-update restart check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_dynamic_restart_check.py
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:

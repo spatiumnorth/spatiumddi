@@ -29,7 +29,7 @@ from app.main import app
 from app.models.settings import BRANDING_ASSET_MAX_BYTES
 from app.services.e911.held import MAX_REQUEST_BYTES as HELD_MAX_REQUEST_BYTES
 from app.services.pcap.runner import HARD_MAX_BYTES as PCAP_HARD_MAX_BYTES
-from tests.test_pre_body_auth import _effective_routes
+from tests.test_pre_body_auth import _deployed_routes
 from tests.test_upgrade_images import _hdr, _token
 
 upgrade_images = importlib.import_module("app.api.v1.appliance.upgrade_images")
@@ -206,7 +206,7 @@ def _sample(path: str) -> str:
 def test_every_allowance_has_a_reason_and_matches_a_route() -> None:
     routes = [
         (method, _sample(path))
-        for path, route in _effective_routes(app.routes)
+        for path, route in _deployed_routes()
         if isinstance(route, APIRoute)
         for method in route.methods
     ]
@@ -223,6 +223,11 @@ def test_every_allowance_has_a_reason_and_matches_a_route() -> None:
     ("method", "path", "own_limit"),
     [
         ("POST", "/api/v1/appliance/upgrade-images", upgrade_images.MAX_UPLOAD_BYTES),
+        (
+            "PUT",
+            "/api/v1/appliance/internal/slot-images/x",
+            upgrade_images.MAX_UPLOAD_BYTES,
+        ),
         ("POST", "/api/v1/backup/restore", backup_router._MAX_UPLOAD_BYTES),
         ("POST", "/api/v1/backup/manifest-preview", backup_router._MAX_UPLOAD_BYTES),
         ("POST", "/api/v1/dns/import/bind9/preview", dns_import_router._MAX_UPLOAD_BYTES),

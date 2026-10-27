@@ -128,16 +128,28 @@ spec:
               command:
                 - sh
                 - -c
-                - celery -A app.celery_app inspect ping -d "celery@${HOSTNAME}" --timeout 5 >/dev/null 2>&1
+                # #2815 — app.worker_liveness wraps the same ping, but a failure
+                # while the probe cannot reach the broker either is the
+                # broker's (a Sentinel failover; a split vote left no master
+                # for ~128 s) and is not counted for --grace seconds after the
+                # last good ping. A worker that does not answer on a healthy
+                # broker still fails at once. Bound: grace + 5 x 30 s = 7.5
+                # min after the last good ping, whatever the broker does.
+                - python -m app.worker_liveness --grace 300 >/dev/null
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 10
+            # 15, not 10: the probe is the app import (~1.3 s) plus a bounded
+            # broker connect (5 s) plus the ping (5 s). One that overruns
+            # counts as a failure whatever the broker is doing.
+            timeoutSeconds: 15
             # 5 x 30 s (was 3): the ping is a broker round trip, so it fails
             # after a Redis master is lost with its node until Sentinel has
             # promoted a replica AND the worker has noticed its dead sockets
             # (kernel keepalive, ~25 s; celery_app.py) and reconnected: about
             # 30-60 s in a blackholed-master test (#1669). 3 misses (60-90 s)
             # left little margin; 150 s still catches a wedged worker.
+            # #2815 — counted only once the broker grace above is spent, or
+            # at once when the broker answers and the worker does not.
             failureThreshold: 5
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

@@ -60,6 +60,7 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
+from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
     UPDATE_POLICY_NAMED_SCOPES,
@@ -1212,6 +1213,7 @@ def _records_query(where: Any) -> Any:
             DNSRecord.port,
             DNSRecord.view_id,
             DNSRecord.pool_member_id,
+            DNSRecord.import_source,
         )
         .where(where)
         .order_by(
@@ -1225,6 +1227,7 @@ def _records_query(where: Any) -> Any:
             DNSRecord.port,
             DNSRecord.view_id,
             DNSRecord.pool_member_id,
+            DNSRecord.import_source,
         )
     )
 
@@ -1329,7 +1332,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             records_by_zone.setdefault(rec.zone_id, []).append(rec)
 
     def _rec_dict(r: Any) -> dict[str, Any]:
-        return {
+        rec = {
             "name": r.name,
             "type": r.record_type,
             # #2073 — a TTL stored negative before the API bounded it would
@@ -1340,6 +1343,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             "weight": r.weight,
             "port": r.port,
         }
+        # #2850 — an ingest mirror of a record a third party wrote by RFC
+        # 2136. The BIND9 agent lets named's own copy win for these at a
+        # start, so one the third party has since deleted is not served
+        # again from a mirror row the next sweep has not removed yet. Only
+        # on mirrors, so every other bundle (and its ETag) is unchanged.
+        if getattr(r, "import_source", None) == EXTERNAL_IMPORT_SOURCE:
+            rec["learned"] = True
+        return rec
 
     # DNSSEC policies (issue #49) — resolve each signed zone's policy name +
     # ship the referenced custom policy definitions so the BIND9 agent can
@@ -1514,6 +1525,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 "name": group_key.name,
                 "secret": group_key.secret,
                 "algorithm": group_key.algorithm,
+                # #2835 — marks the product's own key, so the BIND9 agent
+                # grants it (and only it) the SOA its record ops carry. When
+                # a group has no legacy key, ``tsig_keys[0]`` is an operator
+                # key external clients hold, and it keeps its old grant.
+                "loopback": True,
             }
         )
 

@@ -648,6 +648,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
             seed_node_pressure_alert_rule,
+            seed_postgres_instance_alert_rule,
         )
 
         await seed_node_pressure_alert_rule()
@@ -660,6 +661,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_appliance_disk_usage_alert_rule()
         # Silent supervisor (#2259) — cannot fire with no appliances.
         await seed_appliance_heartbeat_alert_rule()
+        # PostgreSQL instance not Ready / not streaming (#2856) — inert off
+        # the appliance and on a healthy cluster.
+        await seed_postgres_instance_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue

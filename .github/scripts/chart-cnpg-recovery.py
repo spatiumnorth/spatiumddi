@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Refuse a render whose CNPG WAL can fill the volume (#2317).
+"""Refuse a render whose CNPG WAL can fill the volume (#2317), whose
+replicated Cluster restarts its primary in place on a rolling update (#2831),
+or whose supervisor cannot re-clone a stuck instance (#2132).
 
-Checked on the rendered manifests:
+Three checks of one recovery story, on the rendered manifests:
 
 * **Every CloudNativePG ``Cluster`` bounds the WAL it keeps (#2317).** After a
   failover the new primary holds CNPG's HA replication slots for standbys that
@@ -21,10 +23,30 @@ Checked on the rendered manifests:
   1GB. ``max_slot_wal_keep_size`` has no acceptable default and must be set
   to a size.
 
-``--require-cluster`` fails a render that has no Cluster, so a render cannot
-pass by rendering nothing.
+* **The supervisor may re-clone a stuck instance (#2132).** The seed
+  supervisor re-clones a CNPG instance that loops on WAL it can never get
+  (``k8s_api.reclone_stuck_postgres_instances``): it reads the instance pods'
+  logs and annotates the stuck pod ``alpha.cnpg.io/unrecoverable``. Without
+  ``get`` on ``pods/log`` and ``patch`` on ``pods`` in the
+  ``spatium-supervisor-namespace`` Role, both are 403s and the cap above
+  leaves a standby that lost its slot out of the cluster for good.
 
-Usage: chart-cnpg-recovery.py [--require-cluster] <manifest.yaml> [...]
+* **A Cluster with replicas updates its primary by switchover (#2831).** A
+  spec change that rolls the instances (a resources or parameter change, on
+  an upgrade, a resize or a promote) reaches the primary last. Under CNPG's
+  default ``primaryUpdateMethod: restart`` the operator deletes the
+  primary's pod while it still serves, and the instance manager's smart
+  shutdown turns every new connection away for the whole
+  ``smartShutdownTimeout`` (180 s) because the services' pooled sessions
+  never end: about three and a half minutes in which nothing new reaches the
+  database. ``switchover`` promotes an updated replica first. A Cluster of
+  one instance has no replica and is not held to this.
+
+``--require-cluster`` / ``--require-supervisor-role`` fail a render that has
+no Cluster / no such Role, so a render cannot pass by rendering nothing.
+
+Usage: chart-cnpg-recovery.py [--require-cluster] [--require-supervisor-role]
+       <manifest.yaml> [...]
 """
 
 from __future__ import annotations
@@ -35,6 +57,8 @@ import sys
 from typing import Any
 
 import yaml
+
+_SUPERVISOR_ROLE = "spatium-supervisor-namespace"
 
 # PostgreSQL memory units are powers of 1024 (kB, MB, GB, TB); Kubernetes
 # quantities use Ki/Mi/Gi/Ti for those and k/M/G/T for powers of 1000.
@@ -69,12 +93,31 @@ def k8s_size_mb(value: Any) -> float | None:
     return int(m.group(1)) * _K8S_UNITS[m.group(2)]
 
 
+def check_primary_update(doc: dict) -> list[str]:
+    """#2831: with replicas, the primary is updated by a switchover."""
+    name = (doc.get("metadata") or {}).get("name", "?")
+    spec = doc.get("spec") or {}
+    try:
+        instances = int(spec.get("instances") or 1)
+    except (TypeError, ValueError):
+        return [f"Cluster/{name}: instances {spec.get('instances')!r} is not a count"]
+    method = spec.get("primaryUpdateMethod")
+    if instances > 1 and method != "switchover":
+        shown = repr(method) if method is not None else "unset (CNPG's default, restart)"
+        return [
+            f"Cluster/{name}: {instances} instances with primaryUpdateMethod {shown}; a "
+            "rolling update would delete the primary's pod under its clients and its smart "
+            "shutdown refuses every new connection for smartShutdownTimeout (#2831)"
+        ]
+    return []
+
+
 def check_cluster(doc: dict) -> list[str]:
     name = (doc.get("metadata") or {}).get("name", "?")
     where = f"Cluster/{name}"
     spec = doc.get("spec") or {}
     params = ((spec.get("postgresql") or {}).get("parameters")) or {}
-    problems: list[str] = []
+    problems: list[str] = check_primary_update(doc)
 
     raw_cap = params.get("max_slot_wal_keep_size")
     cap = pg_size_mb(raw_cap) if raw_cap is not None else None
@@ -113,9 +156,30 @@ def check_cluster(doc: dict) -> list[str]:
     return problems
 
 
-def check(docs: list[Any]) -> tuple[list[str], int]:
+def _grants(rules: list[dict], resource: str, verb: str) -> bool:
+    for rule in rules or []:
+        if "" not in (rule.get("apiGroups") or []):
+            continue
+        if resource in (rule.get("resources") or []) and verb in (rule.get("verbs") or []):
+            return True
+    return False
+
+
+def check_supervisor_role(doc: dict) -> list[str]:
+    rules = doc.get("rules") or []
+    problems = []
+    for resource, verb in (("pods/log", "get"), ("pods", "patch")):
+        if not _grants(rules, resource, verb):
+            problems.append(
+                f"Role/{_SUPERVISOR_ROLE}: no {verb!r} on {resource!r}; the supervisor "
+                "cannot re-clone a CNPG instance stuck on missing WAL (#2132)"
+            )
+    return problems
+
+
+def check(docs: list[Any]) -> tuple[list[str], int, int]:
     problems: list[str] = []
-    clusters = 0
+    clusters = roles = 0
     for doc in docs:
         if not isinstance(doc, dict):
             continue
@@ -123,29 +187,39 @@ def check(docs: list[Any]) -> tuple[list[str], int]:
         if doc.get("kind") == "Cluster" and group == "postgresql.cnpg.io":
             clusters += 1
             problems += check_cluster(doc)
-    return problems, clusters
+        elif doc.get("kind") == "Role" and (doc.get("metadata") or {}).get(
+            "name"
+        ) == _SUPERVISOR_ROLE:
+            roles += 1
+            problems += check_supervisor_role(doc)
+    return problems, clusters, roles
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--require-cluster", action="store_true")
+    ap.add_argument("--require-supervisor-role", action="store_true")
     ap.add_argument("manifests", nargs="+")
     args = ap.parse_args(argv)
 
     problems: list[str] = []
-    clusters = 0
+    clusters = roles = 0
     for path in args.manifests:
         with (sys.stdin if path == "-" else open(path, encoding="utf-8")) as fh:
             docs = list(yaml.safe_load_all(fh))
-        p, c = check(docs)
+        p, c, r = check(docs)
         problems += [f"{path}: {line}" for line in p]
         clusters += c
+        roles += r
     if args.require_cluster and not clusters:
         problems.append("no CloudNativePG Cluster rendered (--require-cluster)")
+    if args.require_supervisor_role and not roles:
+        problems.append(f"no Role/{_SUPERVISOR_ROLE} rendered (--require-supervisor-role)")
     for line in problems:
         print(f"FAIL: {line}", file=sys.stderr)
-    if not problems and clusters:
-        print(f"   cnpg wal cap: {clusters} Cluster(s) bound pg_wal")
+    if not problems and (clusters or roles):
+        print(f"   cnpg recovery: {clusters} Cluster(s) bound pg_wal and switch over a "
+              f"replicated primary, {roles} supervisor Role(s) may re-clone")
     return 1 if problems else 0
 
 

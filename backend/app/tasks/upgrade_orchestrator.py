@@ -155,12 +155,28 @@ async def _drive_in_session(rid: uuid.UUID, run_id: str, me: str) -> dict[str, s
                     and row.state in ("planned", "running")
                     and row.lease_holder in (None, me)
                 ):
+                    in_flight_node, in_flight_step, held = _in_flight_hold(
+                        getattr(row, "progress", None)
+                    )
                     row.state = "failed"
-                    row.last_error = f"orchestrator crashed: {exc}"
+                    last_error = f"orchestrator crashed: {exc}"
+                    if held:
+                        last_error += (
+                            f"; node {in_flight_node} was at step {in_flight_step} and may "
+                            f"still hold: {', '.join(held)}"
+                        )
+                    row.last_error = last_error
                     from datetime import UTC, datetime  # noqa: PLC0415
 
                     row.finished_at = datetime.now(UTC)
                     await db.commit()
+                    # #2809 — a crash is a failed run like any other, and the
+                    # operator hears of it the same way: the walk's two crashed
+                    # runs ended ``failed`` with the cluster-upgrade-failed
+                    # rule on and raised nothing, because only the drive's own
+                    # failure paths called the alert. Best-effort: the row is
+                    # already marked, and a delivery error must not undo that.
+                    await _alert_crashed_run(db, row, in_flight_node, in_flight_step)
                 else:
                     await db.commit()  # ends the row lock; nothing to write
             finally:
@@ -173,6 +189,61 @@ async def _drive_in_session(rid: uuid.UUID, run_id: str, me: str) -> dict[str, s
             return {"run_id": run_id, "state": "failed", "error": str(exc)}
 
     return {"run_id": str(run.id), "state": run.state}
+
+
+def _in_flight_hold(progress: dict[str, Any] | None) -> tuple[str | None, str | None, list[str]]:
+    """The node a crashed drive was in the middle of, the step it was at,
+    and what that node may still hold (#2809), from ``progress.in_flight``.
+
+    Read, not released: the crash handler cannot tell what the dead chain
+    finished, and an operator resuming the node from where it was (a new run,
+    or a re-drive) needs the node exactly as it was left."""
+    from app.services.upgrades import per_node  # noqa: PLC0415
+    from app.services.upgrades.orchestrator import IN_FLIGHT_KEY  # noqa: PLC0415
+
+    entry = progress.get(IN_FLIGHT_KEY) if isinstance(progress, dict) else None
+    if not isinstance(entry, dict):
+        return None, None, []
+    node = entry.get("node") if isinstance(entry.get("node"), str) else None
+    step = entry.get("step") if entry.get("step") in per_node.CHAIN else None
+    if node is None or step is None:
+        return node, step, []
+    chain = list(per_node.CHAIN)
+    at = chain.index(step)
+    held: list[str] = []
+    # The step being run counts: it may have landed before the drive died,
+    # as ``single_node_upgrade`` assumes on a resume.
+    if chain.index("cordon") <= at < chain.index("cluster_verify"):
+        held.append("cordon")
+    if chain.index("cnpg_maintenance_on") <= at < chain.index("cluster_verify"):
+        held.append("maintenance_window")
+    return node, step, held
+
+
+async def _alert_crashed_run(
+    db: Any, row: Any, failed_node: str | None, failed_at_step: str | None
+) -> None:
+    """Raise the cluster-upgrade-failed alert for a run the crash handler
+    marked failed (#2809). Never raises."""
+    from app.services.upgrades import alerts as upgrade_alerts  # noqa: PLC0415
+
+    # Read before anything can roll the session back and expire the row.
+    run_id = str(getattr(row, "id", None))
+    try:
+        await upgrade_alerts.emit_upgrade_failed_alert(
+            db,
+            row,
+            failed_node=failed_node,
+            failed_at_step=failed_at_step or "orchestrator",
+            category=upgrade_alerts.CATEGORY_OTHER,
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001 — the row is marked; the alert is extra
+        logger.exception("upgrade_crash_alert_failed", run_id=run_id)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001 — the connection is gone; nothing to keep
+            logger.debug("upgrade_crash_alert_rollback_failed", exc_info=True)
 
 
 @shared_task(
