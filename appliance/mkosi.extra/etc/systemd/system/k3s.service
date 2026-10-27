@@ -100,6 +100,21 @@ ExecStartPre=-/usr/local/bin/spatium-k3s-images clear-ingests
 # on an earlier boot (a slot upgraded from a build without the marker).
 # ``-``: never keeps k3s down; the worst case is one more revert.
 ExecStartPre=-/usr/local/bin/spatium-tls-manifest-skip
+# #1976 — kubelet graceful node shutdown. KillMode=process (above) is right
+# for a k3s restart: the pods keep running while the kubelet is away. A node
+# shutdown is different: systemd then stopped every container at once while
+# the kubelet died with k3s, so nothing told the cluster, and the node's pods
+# stayed Ready in their Services until node-lifecycle noticed the silence
+# about 70 s later. With a shutdown grace period the kubelet holds a logind
+# delay lock, reports the node NotReady, stops its pods and only then lets
+# the shutdown go on (the drop-in's header has the detail). The drop-in
+# ships in the slot's /usr and is copied, on every start, into the
+# directory k3s hands the kubelet as --config-dir (it writes its own
+# 00-k3s-defaults.conf there), so an upgrade carrying a new value applies it
+# on the next start. ``-``: a failed copy never keeps k3s down; the node
+# then reboots the old way.
+ExecStartPre=-/usr/bin/install -d -m 0700 /var/lib/rancher/k3s/agent/etc/kubelet.conf.d
+ExecStartPre=-/usr/bin/install -m 0600 /usr/lib/spatiumddi/kubelet.conf.d/50-spatium-graceful-shutdown.conf /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/50-spatium-graceful-shutdown.conf
 # ``server`` boots an all-in-one node (control plane + agent). Single
 # node — no joining a cluster. All other flags live in /etc/rancher/
 # k3s/config.yaml so they're operator-editable without touching the

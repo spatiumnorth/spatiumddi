@@ -48,6 +48,7 @@ from app.core.agent_wake import (
     dns_server_channel,
 )
 from app.models.dns import (
+    DNSIngestSnapshot,
     DNSRecordOp,
     DNSServer,
     DNSServerGroup,
@@ -356,6 +357,10 @@ async def move_server_to_group(
             sa_delete(DNSServerZoneState).where(DNSServerZoneState.server_id == server.id)
         )
     ).rowcount or 0
+    # #2654 — the server's last DDNS ingest report per zone describes the OLD
+    # group's zones; compared against later, it would read as records the
+    # writer withdrew.
+    await db.execute(sa_delete(DNSIngestSnapshot).where(DNSIngestSnapshot.server_id == server.id))
     # ``in_flight`` as well as ``pending``: an op already shipped in a bundle
     # is not finished with. ``ack_op`` resets a NACKed one back to ``pending``
     # (fewer than 5 attempts), and that ack can arrive AFTER the move — which
