@@ -2705,7 +2705,9 @@ be a reserved system account that already exists in the image (`root`,
 `useradd` *after* the disk was already wiped — or, with a colon in it,
 split the `user:password` line piped to `chpasswd`. Since #995 item 4
 the interactive prompt calls the same rule, via
-`spatium-preseed-parse --check-field admin_user <name>`.
+`spatium-preseed-parse --check-field admin_user <name>`. `user` and
+`debian` are refused too, as names reserved by the live installer:
+they are the names Debian's live tooling gives its live-session account.
 
 **`timezone` shape (#995 item 3).** Three tests, in order: the name
 must look like an IANA zone (`[A-Za-z0-9+_-]` segments joined by `/`),
@@ -2840,7 +2842,15 @@ config, ssh host keys, user accounts — land in the upper on the
 persistent `/var` partition, so they survive a slot swap
 verbatim. A `spatium-etc-reconcile` boot step merges system uid
 /gid/shadow entries from lower → upper so new system users
-introduced by an upgrade don't clobber operator-created ones.
+introduced by an upgrade don't clobber operator-created ones. The
+same step removes `/etc/sudoers.d/live` when its whole content is the
+one line Debian's live-config writes during the live ISO session
+(`user ALL=(ALL) NOPASSWD: ALL`), and live-config's
+`/var/lib/live/config` markers: installers before this change copied
+both from the live session onto the disk. A file at that path with any
+other content is left alone. The image no longer ships live-config's
+account components, and the installer excludes both paths from the
+live-root copy.
 
 **Slot upgrade flow:**
 

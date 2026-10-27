@@ -168,6 +168,33 @@ for plym_unit in plymouth-start.service plymouth-quit.service \
     ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/$plym_unit"
 done
 
+# live-config's account components never run on the live ISO.
+#
+# The ISO boots ``boot=live components`` (scripts/wrap-iso.sh), which runs
+# every script under /lib/live/config. Three of them are about a desktop
+# "live user" this appliance does not have:
+#
+#   0030-user-setup              creates the account ``user`` (password
+#                                ``live``) when the user-setup package is
+#                                installed
+#   0030-live-debconfig_passwd   the same, through live-debconfig
+#   0040-sudo                    writes /etc/sudoers.d/live, a passwordless
+#                                sudo rule for that account
+#
+# The live session needs none of them: spatium-live-bootstrap sets its own
+# random root password for SSH. And the installer copies the live root onto
+# the target disk, so whatever these write in the live session would land
+# on every installed appliance. They are removed from the image rather than
+# filtered on the kernel command line, which keeps the components the live
+# session does use (hostname, locales, keyboard, openssh-server, ...) as
+# Debian ships them. /lib is merged into /usr/lib on trixie; both spellings
+# are listed so an image without usrmerge is covered too.
+for live_cfg_dir in "$BUILDROOT/usr/lib/live/config" "$BUILDROOT/lib/live/config"; do
+    rm -f "$live_cfg_dir/0030-user-setup" \
+          "$live_cfg_dir/0030-live-debconfig_passwd" \
+          "$live_cfg_dir/0040-sudo"
+done
+
 # Template-unit instance for the serial console (Phase 4h, issue #134).
 # Template units are loaded from `<name>@.service` with %i substituted
 # at activation, so the symlink target is the bare template file but

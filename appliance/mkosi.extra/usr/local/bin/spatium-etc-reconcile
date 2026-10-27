@@ -21,17 +21,31 @@ copy-up on a write to /etc/passwd from a process, but we want a
 purely additive merge with no in-line semantics — so write directly.
 
 Idempotent: re-runs are no-ops once the entries already exist.
+
+It also removes the live ISO session's sudoers rule from installs whose
+installer copied it across (see remove_live_session_sudoers).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
 LOWER = Path("/usr/lib/etc.image")
 UPPER = Path("/var/persist/etc")
+
+# The merged /etc view (etc.mount) and live-config's run markers.
+ETC = Path("/etc")
+LIVE_CONFIG_STATE = Path("/var/lib/live/config")
+
+# What live-config's 0040-sudo component writes on every live-ISO boot.
+# Installers before this change copied the live root, this file included,
+# onto the target, and then into /usr/lib/etc.image — the overlay lower of
+# both slots.
+LIVE_SUDOERS_LINE = "user ALL=(ALL) NOPASSWD: ALL"
 
 # System uid/gid range. Debian convention: 0-999 reserved for system
 # users; >= 1000 for regular accounts that the operator manages.
@@ -119,6 +133,41 @@ def ensure_shadow_rows(passwd_path: Path, shadow_path: Path) -> int:
     return len(appended)
 
 
+def remove_live_session_sudoers(etc: Path, live_config_state: Path) -> list[str]:
+    """Remove the live session's sudoers rule and live-config markers.
+
+    ``etc`` is the MERGED /etc. Unlinking there removes a copy in the
+    upper layer (/var/persist/etc) and, for a copy in the lower layer
+    (/usr/lib/etc.image), leaves an overlay whiteout in the upper. The
+    upper is shared by both slots, so one removal covers the slot that
+    is not running too, without writing to either slot's root.
+
+    The file is removed only when its whole content is the single line
+    live-config writes. Anything else at that path is treated as the
+    operator's own and kept. Returns the paths it removed.
+    """
+    removed: list[str] = []
+    sudoers = etc / "sudoers.d" / "live"
+    if sudoers.is_file() and not sudoers.is_symlink():
+        try:
+            content = sudoers.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            logging.warning("could not read %s, leaving it: %s", sudoers, exc)
+        else:
+            if content.rstrip("\n") == LIVE_SUDOERS_LINE:
+                sudoers.unlink()
+                removed.append(str(sudoers))
+            else:
+                logging.info(
+                    "%s does not hold the live-session rule, leaving it", sudoers
+                )
+
+    if live_config_state.is_dir() and not live_config_state.is_symlink():
+        shutil.rmtree(live_config_state)
+        removed.append(str(live_config_state))
+    return removed
+
+
 def main() -> int:
     logging.basicConfig(
         format="spatium-etc-reconcile: %(message)s",
@@ -158,6 +207,14 @@ def main() -> int:
         logging.info("merged system accounts: %s", " ".join(parts))
     else:
         logging.info("no changes (overlay already matches image baseline)")
+
+    try:
+        for path in remove_live_session_sudoers(ETC, LIVE_CONFIG_STATE):
+            logging.info("removed live-session leftover: %s", path)
+    except OSError as exc:
+        # Never fail the boot over this; the account merge above is what
+        # the rest of sysinit depends on. The next boot tries again.
+        logging.warning("could not remove live-session leftovers: %s", exc)
     return 0
 
 
