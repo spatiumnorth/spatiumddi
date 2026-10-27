@@ -95,7 +95,12 @@ _MAX_ERROR = 2000
 #   of the entry, so it is inside ``rpz_sha256`` too.
 # 14 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
 #   (the agent now renders ``allow-query-cache``); unchanged for default groups.
-RENDERER_REVISION = 14
+# 15 (#2835): the legacy group key in ``tsig_keys`` carries ``loopback: true``,
+#   which the BIND9 agent reads to grant that key (alone) the SOA its record ops
+#   now carry under ``update-policy``. Unchanged for a group without that key;
+#   for one with it the ETag moves once, so every agent re-renders at the
+#   upgrade instead of at the group's first change.
+RENDERER_REVISION = 15
 
 
 def _serves(revision: int | None) -> bool:
