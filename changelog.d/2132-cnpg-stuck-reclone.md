@@ -21,5 +21,17 @@
     `reserved`, is reported but never re-cloned; it catches up once it
     reconnects. If the slot state cannot be read, nothing is re-cloned. The
     `postgres_instance_reclone_held` line says why a loop is held back.
+  - **The slot state is read over verified TLS:** the supervisor checks the
+    status endpoint's certificate against the cluster CA, under the name
+    `<cluster>-rw`. A new `cnpg-ca-publisher` CronJob in the control chart
+    copies only the CA's public certificate into the ConfigMap
+    `<cluster>-ca-crt` every 10 minutes, so the supervisor never needs the
+    CA secret, which also holds the private key. If the ConfigMap is
+    missing or the certificate does not verify, the slot state is unknown
+    and nothing is re-cloned (`postgres_slot_state_unknown`, logged once per
+    reason).
   - **Upgrade:** the appliance chart grants the supervisor `get` on
-    `pods/log` and `patch` on `pods` in the `spatium` namespace.
+    `pods/log` and `patch` on `pods` in the `spatium` namespace. The control
+    chart's `postgresql.cnpg.caPublisher.enabled` (on for the appliance)
+    adds the CronJob, a ServiceAccount whose Role is `get` on the one CA
+    secret and `get`/`patch` on the one ConfigMap, and that ConfigMap.

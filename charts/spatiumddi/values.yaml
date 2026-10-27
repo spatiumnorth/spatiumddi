@@ -858,6 +858,26 @@ postgresql:
     backup:
       enabled: false
       retentionPolicy: "30d"
+    # #2132 — publish the cluster CA's PUBLIC certificate into the ConfigMap
+    # ``<cluster>-ca-crt``, so a reader can verify the TLS of CNPG's
+    # instance-manager status endpoint without a grant on the CA secret
+    # (which also holds the CA private key). The appliance's supervisor reads
+    # the primary's replication slots from that endpoint before it re-clones
+    # a stuck instance. A CronJob, so a renewed CA reaches the ConfigMap
+    # within one ``schedule`` interval; until then (and before its first run)
+    # the reader treats the slot state as unknown and re-clones nothing.
+    # Off by default: only the appliance has a reader. The appliance overlay
+    # (spatiumddi-firstboot) turns it on.
+    caPublisher:
+      enabled: false
+      schedule: "*/10 * * * *"
+      # Per-workload PriorityClass override; unset inherits
+      # ``global.priorityClassName``, "" means none (see the helper).
+      priorityClassName: null
+      nodeSelector: {}
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits:   { cpu: 200m, memory: 96Mi }
 
 # Used when postgresql.enabled=false.
 externalDatabase:

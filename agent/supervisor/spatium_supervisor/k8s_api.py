@@ -1299,13 +1299,29 @@ STUCK_REPORT_AFTER_S = 120
 # CNPG's instance manager serves its own status, including the primary's
 # ``pg_replication_slots`` (``replicationSlotsInfo``: slot name, walStatus),
 # on this port of every instance pod. ``kubectl cnpg status`` reads the same
-# document. Reading it straight off the pod IP needs no RBAC at all, where
-# the alternatives each need a grant much wider than the question: pods/exec
-# (a shell in any pod of the namespace), pods/proxy, or the cluster CA secret
-# (which holds the CA private key).
+# document. Reading it straight off the pod IP needs no grant on the pods
+# themselves, where the alternatives each need one much wider than the
+# question: pods/exec (a shell in any pod of the namespace) or pods/proxy.
+#
+# The endpoint presents the cluster's server certificate, signed by the
+# cluster CA (``<cluster>-ca``) with the cluster's service names as SANs
+# (``<cluster>-rw``, ``-r``, ``-ro`` and their namespace / svc forms; never
+# the pod IP or the pod name). So the read connects to the pod IP and checks
+# the certificate against the CA under the name ``<cluster>-rw``, which every
+# instance's certificate carries. The CA reaches the supervisor as its public
+# certificate only, in the ConfigMap ``<cluster>-ca-crt`` the control chart's
+# publisher CronJob keeps in step with the CA secret
+# (charts/spatiumddi/templates/cnpg-ca-publisher.yaml): the secret also holds
+# the CA private key, so the supervisor is never granted it.
 _CNPG_STATUS_PORT = 8000
 _CNPG_STATUS_PATH = "/pg/status"
 _CNPG_STATUS_TIMEOUT_S = 4.0
+# The ConfigMap (and its key) the control chart publishes the cluster CA's
+# public certificate into.
+_CNPG_CA_CONFIGMAP_SUFFIX = "-ca-crt"
+_CNPG_CA_CONFIGMAP_KEY = "ca.crt"
+# The SAN the status endpoint's certificate is checked against.
+_CNPG_STATUS_NAME_SUFFIX = "-rw"
 # The slot name CNPG gives each instance's HA slot on the primary is
 # ``<prefix><instance name with - as _>``, prefix ``_cnpg_`` by default.
 _CNPG_SLOT_PREFIX = "_cnpg_"
@@ -1388,6 +1404,12 @@ class PostgresReclone:
     deferred_reason: str = ""
     held: dict[str, str] = field(default_factory=dict)
     clock_reset: dict[str, str] = field(default_factory=dict)
+    # Set on a call that read the primary's slots: ``slot_state_error`` says
+    # why they could not be read (so every stuck instance reads ``unknown``
+    # and none is re-cloned), "" when they were, with the endpoint's TLS
+    # verified against the cluster CA (``slot_state_read``).
+    slot_state_read: bool = False
+    slot_state_error: str = ""
     error: str | None = None
 
 
@@ -1398,59 +1420,141 @@ def _pod_ready(pod: dict) -> bool:
     return False
 
 
-def _cnpg_instance_status(pod_ip: str) -> dict | None:
-    """GET CNPG's instance-manager status document off ``pod_ip``, or None
-    when it cannot be read (unreachable, refused, unparseable).
+def cnpg_ca_configmap_name(cluster_name: str = _CNPG_DEFAULT_CLUSTER) -> str:
+    """The ConfigMap the control chart publishes ``cluster_name``'s CA
+    certificate (public part only) into."""
+    return cluster_name + _CNPG_CA_CONFIGMAP_SUFFIX
 
-    TLS is not verified against the cluster CA: the supervisor cannot read
-    the CA without a grant on the secret that also holds its private key.
-    What bounds that: the address comes from the authenticated kubeapi pod
-    list, no credential is sent, the document is only read, and the only
-    decision it feeds is whether an instance whose own log has shown a
-    never-heals loop for 10 minutes may be re-cloned (never the primary,
-    one at a time). A forged ``reserved`` only holds a re-clone back."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    conn = http.client.HTTPSConnection(
-        pod_ip, _CNPG_STATUS_PORT, timeout=_CNPG_STATUS_TIMEOUT_S, context=ctx
+
+def _cnpg_status_ca(namespace: str, cluster_name: str) -> tuple[str | None, str]:
+    """The cluster CA certificate (PEM) the status endpoint is verified
+    against, read from :func:`cnpg_ca_configmap_name`, or ``(None, why)``.
+    Never the CA secret: that holds the private key too."""
+    name = cnpg_ca_configmap_name(cluster_name)
+    try:
+        status, resp = _request(
+            "GET", f"/api/v1/namespaces/{quote(namespace)}/configmaps/{quote(name)}"
+        )
+    except RuntimeError as exc:
+        return None, f"the CA ConfigMap {name} could not be read: {exc}"
+    if status == 404:
+        return None, (
+            f"the CA ConfigMap {name} does not exist (the control chart's "
+            "CA publisher has not run yet, or is not enabled)"
+        )
+    if status != 200:
+        return None, f"the CA ConfigMap {name} could not be read: kubeapi status {status}"
+    try:
+        data = json.loads(resp).get("data") or {}
+    except (ValueError, AttributeError):
+        return None, f"the CA ConfigMap {name} is unparseable"
+    pem = data.get(_CNPG_CA_CONFIGMAP_KEY) if isinstance(data, dict) else None
+    if not isinstance(pem, str) or "-----BEGIN CERTIFICATE-----" not in pem:
+        return None, f"the CA ConfigMap {name} carries no {_CNPG_CA_CONFIGMAP_KEY} certificate"
+    return pem, ""
+
+
+class _NamedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to an address, with the certificate checked against
+    ``server_hostname`` (also sent as SNI) rather than the address: the
+    status endpoint's certificate names the cluster's services, not pods."""
+
+    def __init__(
+        self, host: str, port: int, *, server_hostname: str, context: ssl.SSLContext, timeout: float
+    ) -> None:
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._server_hostname = server_hostname
+        self._verify_context = context
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._verify_context.wrap_socket(
+            self.sock, server_hostname=self._server_hostname
+        )
+
+
+def _cnpg_instance_status(
+    pod_ip: str, *, ca_pem: str, server_hostname: str
+) -> tuple[dict | None, str]:
+    """GET CNPG's instance-manager status document off ``pod_ip``, with its
+    TLS certificate verified against ``ca_pem`` (the cluster CA) under the
+    name ``server_hostname``. ``(doc, "")``, or ``(None, why)`` when it
+    cannot be read or the certificate does not verify. Nothing is read from
+    an endpoint whose certificate fails: a forged slot state is then no
+    better than none, and none holds every re-clone."""
+    try:
+        ctx = ssl.create_default_context(cadata=ca_pem)
+    except (ssl.SSLError, ValueError) as exc:
+        return None, f"the cluster CA certificate could not be loaded: {exc}"
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    conn = _NamedHTTPSConnection(
+        pod_ip,
+        _CNPG_STATUS_PORT,
+        server_hostname=server_hostname,
+        context=ctx,
+        timeout=_CNPG_STATUS_TIMEOUT_S,
     )
     try:
         conn.request("GET", _CNPG_STATUS_PATH, headers={"Accept": "application/json"})
         resp = conn.getresponse()
         body = resp.read()
         if resp.status != 200:
-            return None
+            return None, f"the primary's status endpoint answered {resp.status}"
         doc = json.loads(body)
-        return doc if isinstance(doc, dict) else None
-    except (OSError, ssl.SSLError, http.client.HTTPException, ValueError):
-        return None
+        if not isinstance(doc, dict):
+            return None, "the primary's status document is not an object"
+        return doc, ""
+    except ssl.SSLCertVerificationError as exc:
+        return None, (
+            "the primary's status endpoint certificate did not verify against the "
+            f"cluster CA as {server_hostname}: {exc.verify_message or exc}"
+        )
+    except ssl.SSLError as exc:
+        return None, f"TLS to the primary's status endpoint failed: {exc}"
+    except (OSError, http.client.HTTPException) as exc:
+        return None, f"the primary's status endpoint could not be read: {exc}"
+    except ValueError:
+        return None, "the primary's status document is unparseable"
     finally:
         conn.close()
 
 
-def _slot_states(primary_pod: dict | None) -> dict[str, str] | None:
+def _slot_states(
+    primary_pod: dict | None,
+    *,
+    namespace: str = "spatium",
+    cluster_name: str = _CNPG_DEFAULT_CLUSTER,
+) -> tuple[dict[str, str] | None, str]:
     """``{slot_name: walStatus}`` for the primary's replication slots (a
-    NULL walStatus, a slot that never reserved WAL, reads ``"unset"``), or
-    None when the primary's status cannot be read."""
+    NULL walStatus, a slot that never reserved WAL, reads ``"unset"``), and
+    ``""``; or ``(None, why)`` when the primary's status cannot be read, or
+    its certificate cannot be verified against the cluster CA."""
     if primary_pod is None:
-        return None
+        return None, "the primary's pod is not listed"
     pod_ip = str((primary_pod.get("status") or {}).get("podIP") or "")
     if not pod_ip:
-        return None
-    doc = _cnpg_instance_status(pod_ip)
-    if doc is None or not doc.get("isPrimary"):
+        return None, "the primary's pod has no IP yet"
+    ca_pem, why = _cnpg_status_ca(namespace, cluster_name)
+    if ca_pem is None:
+        return None, why
+    doc, why = _cnpg_instance_status(
+        pod_ip, ca_pem=ca_pem, server_hostname=cluster_name + _CNPG_STATUS_NAME_SUFFIX
+    )
+    if doc is None:
+        return None, why
+    if not doc.get("isPrimary"):
         # Not (or no longer) the primary: its slots say nothing about the
         # standby's WAL on the primary that counts.
-        return None
+        return None, "the instance read is no longer the primary"
     slots = doc.get("replicationSlotsInfo") or []
     if not isinstance(slots, list):
-        return None
+        return None, "the primary's status document carries no slot list"
     out: dict[str, str] = {}
     for slot in slots:
         if isinstance(slot, dict) and slot.get("slotName"):
             out[str(slot["slotName"])] = str(slot.get("walStatus") or "unset")
-    return out
+    return out, ""
 
 
 def _instance_slot(instance: str, slots: dict[str, str] | None) -> str:
@@ -1670,7 +1774,11 @@ def reclone_stuck_postgres_instances(
         # One read of the primary's slots per tick, and only while something
         # loops; it rides on every stuck report so the journal can say why a
         # loop will not be re-cloned before it is due.
-        slots = _slot_states(instances.get(current))
+        slots, why = _slot_states(
+            instances.get(current), namespace=namespace, cluster_name=cluster_name
+        )
+        out.slot_state_read = slots is not None
+        out.slot_state_error = why
         for instance, seen_out in out.stuck.items():
             seen_out["slot"] = _instance_slot(instance, slots)
 

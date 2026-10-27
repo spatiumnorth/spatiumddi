@@ -26,6 +26,8 @@ PODS_PATH = "/api/v1/namespaces/spatium/pods?labelSelector=" + quote(
     f"cnpg.io/cluster={CLUSTER}", safe=""
 )
 P1, P2, P3 = (f"{CLUSTER}-{n}" for n in (1, 2, 3))
+CA_CM_PATH = f"/api/v1/namespaces/spatium/configmaps/{CLUSTER}-ca-crt"
+FAKE_CA = "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
 
 # Lines as the issue's evidence has them (#2132 first, second and fourth
 # occurrences; #2317's standbys), each ONE attempt. A real loop repeats them:
@@ -144,11 +146,13 @@ class _Kube:
         self.status_readable = status_readable
         self.status_reads: list[str] = []
 
-    def status(self, pod_ip):
-        """Stand-in for k8s_api._cnpg_instance_status (CNPG's /pg/status)."""
+    def status(self, pod_ip, *, ca_pem, server_hostname):
+        """Stand-in for k8s_api._cnpg_instance_status (CNPG's /pg/status).
+        The real one, with its TLS check, is in test_cnpg_status_tls_2132."""
+        assert ca_pem == FAKE_CA and server_hostname == f"{CLUSTER}-rw"
         self.status_reads.append(pod_ip)
         if not self.status_readable:
-            return None
+            return None, "the primary's status endpoint could not be read: refused"
         primary = self.cr["status"].get("currentPrimary")
         return {
             "isPrimary": bool(primary) and pod_ip == _ip(primary),
@@ -157,7 +161,7 @@ class _Kube:
                 for i, w in self.slots.items()
                 if i != primary and w is not False
             ],
-        }
+        }, ""
 
     def __call__(self, method, path, body=None, content_type=None, timeout=None):
         if method == "PATCH":
@@ -170,6 +174,8 @@ class _Kube:
             return self.cr_status, json.dumps(self.cr).encode()
         if path == PODS_PATH:
             return 200, json.dumps({"items": self.pods}).encode()
+        if path == CA_CM_PATH:
+            return 200, json.dumps({"data": {"ca.crt": FAKE_CA}}).encode()
         for pod, text in self.logs.items():
             if path == _log_path(pod):
                 return self.log_status.get(pod, 200), text.encode()
@@ -401,6 +407,7 @@ def _fresh_heartbeat_state(monkeypatch):
     monkeypatch.setattr(heartbeat, "_stuck_postgres", {})
     monkeypatch.setattr(heartbeat, "_stuck_postgres_reported", {})
     monkeypatch.setattr(heartbeat, "_stuck_postgres_held", {})
+    monkeypatch.setattr(heartbeat, "_slot_state_logged", set())
 
 
 def test_heartbeat_logs_info_then_warning_once_and_the_reclone(monkeypatch):
@@ -551,7 +558,9 @@ def test_slot_state_unknown_is_never_recloned(monkeypatch):
     # (a stale IP, a restarted pod) is no answer either.
     kube = _Kube(pods=[_pod(P1), _pod(P2), _pod(P3)], logs={P2: HEALTHY, P3: CASE4})
     real = kube.status
-    monkeypatch.setattr(kube, "status", lambda ip: {**real(ip), "isPrimary": False})
+    monkeypatch.setattr(
+        kube, "status", lambda ip, **kw: ({**real(ip, **kw)[0], "isPrimary": False}, "")
+    )
     _held_for_an_hour(monkeypatch, kube)
 
 

@@ -357,6 +357,11 @@ _stuck_postgres_reported: dict[str, str] = {}
 # The held reason last logged per due instance that is NOT re-cloned (its WAL
 # still exists, or that cannot be told), so each reason is logged once.
 _stuck_postgres_held: dict[str, str] = {}
+# Why the primary's slot state could not be read (the CA ConfigMap missing,
+# the status endpoint's certificate not verifying against the cluster CA, the
+# endpoint unreachable), each logged once until a read succeeds; "ok" once a
+# verified read has been logged.
+_slot_state_logged: set[str] = set()
 
 # #1541 — slot-image mirror claims the seed deleted off an evicted node and
 # still owes the cluster a fresh copy of (``{claim_name: manifest}``). Nothing
@@ -462,13 +467,33 @@ def _reclone_stuck_postgres(log: Any, now: float | None = None) -> k8s_api.Postg
     ``postgres_instance_reclone_held`` (info) is logged once per reason when a
     due loop is NOT re-cloned because nothing proves its WAL is gone.
     ``postgres_instance_stuck_clock_reset`` (info) is logged when a reported
-    loop's clock restarts under a new primary. ``postgres_instance_reclone``
+    loop's clock restarts under a new primary. ``postgres_slot_state_unknown``
+    (warning) is logged once per reason the primary's slot state could not
+    be read or its TLS did not verify against the cluster CA (every loop is
+    then held), and ``postgres_slot_state_read`` (info) once when a verified
+    read succeeds again. ``postgres_instance_reclone``
     is logged when CNPG is asked to rebuild one."""
     from . import k8s_api  # noqa: PLC0415
 
     result = k8s_api.reclone_stuck_postgres_instances(
         _stuck_postgres, now=time.monotonic() if now is None else now
     )
+    if result.slot_state_error and result.slot_state_error not in _slot_state_logged:
+        _slot_state_logged.discard("ok")
+        _slot_state_logged.add(result.slot_state_error)
+        log.warning(
+            "supervisor.heartbeat.postgres_slot_state_unknown",
+            reason=result.slot_state_error,
+            effect="no instance is re-cloned while its slot state is unknown",
+        )
+    elif result.slot_state_read and "ok" not in _slot_state_logged:
+        _slot_state_logged.clear()
+        _slot_state_logged.add("ok")
+        log.info(
+            "supervisor.heartbeat.postgres_slot_state_read",
+            tls="verified against the cluster CA",
+            ca_configmap=k8s_api.cnpg_ca_configmap_name(),
+        )
     for instance, reason in result.clock_reset.items():
         if instance in _stuck_postgres_reported:
             log.info(

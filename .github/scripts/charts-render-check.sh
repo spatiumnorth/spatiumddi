@@ -235,6 +235,7 @@ UMBRELLA_ALL_ON=(
 UMBRELLA_HA=(
     --set postgresql.kind=cnpg
     --set postgresql.cnpg.backup.enabled=true
+    --set postgresql.cnpg.caPublisher.enabled=true
     --set redis.kind=sentinel
 )
 UMBRELLA_EXTERNAL=(

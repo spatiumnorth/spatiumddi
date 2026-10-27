@@ -552,14 +552,22 @@ the reference topologies are in
     only while the primary is Ready. And only with proof the WAL the
     instance needs is gone, because a re-clone copies the whole database:
     the supervisor reads the primary's replication slots from CNPG's
-    instance status (`/pg/status` on port 8000 of the primary pod, no extra
-    RBAC) and re-clones when the instance's slot is `lost` or gone, when its
+    instance status (`/pg/status` on port 8000 of the primary pod), with
+    the endpoint's TLS verified against the cluster CA under the name
+    `<cluster>-rw` (the certificate names the cluster's services, never a
+    pod IP). The CA reaches the supervisor as its public certificate only,
+    in the ConfigMap `<cluster>-ca-crt` that the control chart's
+    `cnpg-ca-publisher` CronJob copies from the CA secret every 10 minutes;
+    the supervisor is never granted the secret, which also holds the CA
+    private key. It re-clones when the instance's slot is `lost` or gone, when its
     log shows the WAL-removed or invalidated-slot line, or when `pg_rewind`
     keeps failing. A standby that only cannot reach the primary logs the
     future-timeline refusal too, but its slot still reads `reserved`: it is
     held (`supervisor.heartbeat.postgres_instance_reclone_held`, with the
     reason) and catches up once it reconnects. If the primary's status
-    cannot be read, nothing is re-cloned. While it runs, the database row on the
+    cannot be read, or its certificate does not verify, or the CA ConfigMap
+    is missing, nothing is re-cloned
+    (`supervisor.heartbeat.postgres_slot_state_unknown`, once per reason). While it runs, the database row on the
     cluster-health page reads `degraded` (`readyInstances` below
     `instances`). The manual equivalent is `kubectl cnpg destroy <cluster>
     <n>`, or deleting the instance's PVC and then its pod.
