@@ -52,7 +52,7 @@ def lease(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     release = MagicMock(return_value=True)
     monkeypatch.setattr(mutex, "release_if_held", release)
     monkeypatch.setattr(mutex, "drive_identity", lambda: ME)
-    monkeypatch.setattr(task, "task_session", lambda: _Session())
+    monkeypatch.setattr(task, "task_session", _Session)
     return release
 
 
