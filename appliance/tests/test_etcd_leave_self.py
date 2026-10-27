@@ -43,6 +43,10 @@ else:
     mid = int(sys.argv[2])
     log = os.environ["FAKE_LOG"]
     open(log, "a").write(f"remove {mid}\n")
+    if os.environ.get("FAKE_LEAD"):
+        st = json.load(open(os.environ["FAKE_LEAD"]))
+        st["removed_under"].append(st["leader"])
+        json.dump(st, open(os.environ["FAKE_LEAD"], "w"))
     if os.environ.get("FAKE_REFUSE"):
         print("grpc-status 9: etcdserver: unhealthy cluster"); sys.exit(1)
     if not os.environ.get("FAKE_NOT_APPLIED"):
@@ -73,9 +77,50 @@ sys.stderr.write(os.environ["FAKE_CURL_ERROR"] + "\n")
 sys.exit(int(os.environ["FAKE_CURL_EXIT"]))
 """
 
-SEED ={"ID": 8674559146448320794, "name": "ddipg-seed-964d1931"}
-ME = {"ID": 12000000000000000002, "name": "ddipg-member-1-7f072fd9"}
-OTHER = {"ID": 18446744073709551557, "name": "ddipg-member-2-7d1c4ad1"}
+# This node's etcd answering MoveLeader (#2874), with the member to hand the lead
+# to as $1. FAKE_LEAD holds the leader's ID (0 while an election runs) and writes
+# the etcd_server_has_leader gauge the metrics file serves. Only the leader takes
+# the call, and it hands the lead over unless it is "stuck". A running election
+# ends at the next call, won by "winner". FAKE's `remove` notes who led then.
+FAKE_MOVE = r"""
+import json, os, sys
+path = os.environ["FAKE_LEAD"]
+st = json.load(open(path))
+target = int(sys.argv[1])
+if not st["leader"] and st["calls"]:
+    st["leader"] = st["winner"]
+if st["leader"] != st["me"]:
+    answer = "grpc-status 9: etcdserver: not leader"
+elif st["stuck"]:
+    answer = "grpc-status 14: etcdserver: request timed out, leader transfer took too long"
+else:
+    answer = ""
+    st["leader"] = target
+st["calls"].append([target, answer])
+json.dump(st, open(path, "w"))
+if st["metrics"]:
+    open(st["metrics"], "w").write(f"etcd_server_has_leader {1 if st['leader'] else 0}\n")
+if answer:
+    print(answer); sys.exit(1)
+"""
+
+SEED = {
+    "ID": 8674559146448320794,
+    "name": "ddipg-seed-964d1931",
+    "peerURLs": ["https://192.168.122.245:2380"],
+}
+ME = {
+    "ID": 12000000000000000002,
+    "name": "ddipg-member-1-7f072fd9",
+    "peerURLs": ["https://192.168.122.161:2380"],
+}
+OTHER = {
+    "ID": 18446744073709551557,
+    "name": "ddipg-member-2-7d1c4ad1",
+    "peerURLs": ["https://192.168.122.134:2380"],
+}
+LEADS = {"seed": SEED["ID"], "me": ME["ID"], "other": OTHER["ID"], "": 0}
+NOT_LEADER = "grpc-status 9: etcdserver: not leader"
 
 # What MemberRemove answered when a member removed itself and its etcd shut down
 # first (#2394): etcd's ErrStopped, after the change was proposed.
@@ -94,16 +139,42 @@ def _run(
     applied: bool = True,
     tombstone: bool = False,
     curl: tuple[int, str] | None = None,
+    lead: str = "seed",
+    winner: str = "seed",
+    stuck: bool = False,
+    gauge: bool = True,
+    server: str = "https://192.168.122.245:6443",
 ) -> tuple[int, list[str], bool, str]:
+    """`lead` names the member whose etcd leads when the leave starts ("" while an
+    election runs, which `winner` wins); `stuck` keeps this node's etcd from
+    handing the lead over; `gauge` False makes etcd's metrics unreadable. What
+    MoveLeader was asked and who led at each removal: _lead(tmp_path)."""
     k3s = tmp_path / "k3s-server"
     (k3s / "db" / "etcd").mkdir(parents=True)
     (k3s / "db" / "etcd" / "config").write_text(f"name: {ME['name']}\n")
     dropin = tmp_path / "config.yaml.d"
     dropin.mkdir()
     if joined:
-        (dropin / "spatium-cluster.yaml").write_text(
-            "server: https://192.168.122.245:6443\ntoken: K10::server:x\n"
+        (dropin / "spatium-cluster.yaml").write_text(f"server: {server}\ntoken: K10::server:x\n")
+    metrics = tmp_path / "metrics"
+    if gauge:
+        metrics.write_text(f"etcd_server_has_leader {1 if LEADS[lead] else 0}\n")
+    lead_state = tmp_path / "lead.json"
+    lead_state.write_text(
+        json.dumps(
+            {
+                "leader": LEADS[lead],
+                "winner": LEADS[winner],
+                "me": ME["ID"],
+                "stuck": stuck,
+                "metrics": str(metrics) if gauge else "",
+                "calls": [],
+                "removed_under": [],
+            }
         )
+    )
+    move = tmp_path / "fake_move.py"
+    move.write_text(FAKE_MOVE)
     members = [SEED, ME, OTHER]
     local = tmp_path / "local.json"
     local.write_text(json.dumps({"members": members, "unreadable": local_unreadable}))
@@ -125,8 +196,12 @@ def _run(
         "SPATIUM_ETCD_SURVIVOR_MEMBERS_CMD": f'"{sys.executable}" "{fake}" list "{survivor}"',
         "SPATIUM_ETCD_REMOVE_CMD": f'"{sys.executable}" "{fake}" remove "$1"',
         "SPATIUM_STOP_K3S_CMD": f'touch "{stopped}"',
+        "SPATIUM_ETCD_MOVE_LEADER_CMD": f'"{sys.executable}" "{move}" "$1"',
+        "SPATIUM_ETCD_METRICS_URL": metrics.as_uri(),
         "SPATIUM_LEAVE_CONFIRM_S": "1",
+        "SPATIUM_LEAD_HANDOFF_S": "1",
         "SPATIUM_LEAVE_POLL_S": "0.2",
+        "FAKE_LEAD": str(lead_state),
         "FAKE_LOCAL": str(local),
         "FAKE_SURVIVOR": str(survivor),
         "FAKE_LOG": str(removals),
@@ -158,6 +233,12 @@ def _run(
     log = (tmp_path / "log" / "etcd-evict.log").read_text() if (tmp_path / "log").exists() else ""
     done = removals.read_text().split() if removals.exists() else []
     return r.returncode, done, stopped.exists(), log
+
+
+def _lead(tmp_path: Path) -> dict:
+    """What the fake etcd saw: `calls` ([member asked to lead, answer] per
+    MoveLeader) and `removed_under` (who led at each removal, 0 for nobody)."""
+    return json.loads((tmp_path / "lead.json").read_text())
 
 
 def test_removes_only_its_own_member_then_stops_k3s_and_confirms(tmp_path: Path) -> None:
@@ -344,3 +425,78 @@ def test_a_curl_that_failed_after_sending_the_removal_still_asks_the_survivor(
     assert stopped
     assert f"curl exit {code}:" in log
     assert "no longer lists" in log
+
+
+# ---- the etcd lead (#2874) ---------------------------------------------------------
+#
+# A leader that removes itself leaves the cluster without one until an election
+# timeout. With both members of three leaving at once, the other member's removal
+# waited through that election, won it, and committed at once with itself as the
+# leader: the seed, alone and still leaderless, lost its controller-manager lease,
+# k3s exited, and it came back counting the removed member as a voter for good.
+
+
+def test_a_leader_hands_the_lead_to_the_seed_before_it_removes_itself(tmp_path: Path) -> None:
+    rc, removed, stopped, log = _run(tmp_path, lead="me")
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    lead = _lead(tmp_path)
+    assert lead["calls"] == [[SEED["ID"], ""]]
+    assert lead["removed_under"] == [SEED["ID"]]
+    assert f"handed the etcd lead to {SEED['ID']} {SEED['name']}" in log
+
+
+@pytest.mark.parametrize("leader", ["seed", "other"])
+def test_a_follower_has_no_lead_to_hand_off(tmp_path: Path, leader: str) -> None:
+    rc, removed, stopped, log = _run(tmp_path, lead=leader)
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    lead = _lead(tmp_path)
+    assert lead["calls"] == [[SEED["ID"], NOT_LEADER]]
+    assert lead["removed_under"] == [LEADS[leader]]
+    assert "handed the etcd lead" not in log
+
+
+def test_the_lead_goes_to_the_member_on_the_host_this_node_joined(tmp_path: Path) -> None:
+    """The survivor is found by the join's ``server:`` host, not by list order."""
+    rc, _, _, log = _run(tmp_path, lead="me", server="https://192.168.122.134:6443")
+    assert rc == 0, log
+    lead = _lead(tmp_path)
+    assert lead["calls"] == [[OTHER["ID"], ""]]
+    assert lead["removed_under"] == [OTHER["ID"]]
+
+
+@pytest.mark.parametrize("winner", ["seed", "me"])
+def test_with_no_leader_the_removal_waits_for_the_election(tmp_path: Path, winner: str) -> None:
+    """Proposed into an election, the removal would commit at once if this node
+    won it, with this node the leader. It waits for a leader instead, and hands
+    the lead to the seed if this node won."""
+    rc, removed, stopped, log = _run(tmp_path, lead="", winner=winner)
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    lead = _lead(tmp_path)
+    assert lead["calls"][0] == [SEED["ID"], NOT_LEADER]
+    assert lead["calls"][-1] == [SEED["ID"], "" if winner == "me" else NOT_LEADER]
+    assert lead["removed_under"] == [SEED["ID"]]
+
+
+def test_a_leader_that_cannot_hand_off_keeps_its_member_and_k3s(tmp_path: Path) -> None:
+    rc, removed, stopped, log = _run(tmp_path, lead="me", stuck=True)
+    assert rc == 1
+    assert removed == []
+    assert not stopped
+    assert "leader transfer took too long" in log
+    assert "not removing its member" in log
+
+
+def test_an_unreadable_leader_gauge_does_not_hold_the_leave(tmp_path: Path) -> None:
+    """Without the gauge the runner cannot tell an election from another member's
+    lead, and goes on as before the hand-off existed."""
+    rc, removed, stopped, log = _run(tmp_path, lead="", gauge=False)
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    assert _lead(tmp_path)["calls"] == [[SEED["ID"], NOT_LEADER]]
