@@ -50,6 +50,7 @@ def _row_summary(r: PacketCapture) -> dict[str, Any]:
         "finished_at": r.finished_at.isoformat() if r.finished_at else None,
         "duration_seconds": r.duration_seconds,
         "error_message": r.error_message,
+        "artifact_node": r.artifact_node,
         "has_artifact": bool(
             r.status == "completed" and r.pcap_path and (r.pcap_size_bytes or 0) > 0
         ),

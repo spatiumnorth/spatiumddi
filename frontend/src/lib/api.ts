@@ -16903,6 +16903,8 @@ export interface PcapCaptureRead {
   bytes_captured: number;
   pcap_size_bytes: number | null;
   pcap_sha256: string | null;
+  // Node whose disk holds the artifact (#2866); null when unknown.
+  artifact_node: string | null;
   has_artifact: boolean;
   metadata_json: Record<string, unknown> | null;
   created_by_user_id: string | null;
@@ -16972,9 +16974,25 @@ export const pcapApi = {
    *  Uses the axios instance so the Bearer token rides the
    *  Authorization header (no `?token=` in the URL). */
   downloadCapture: async (id: string): Promise<void> => {
-    const res = await api.get<Blob>(`/pcap/captures/${id}/download`, {
-      responseType: "blob",
-    });
+    let res;
+    try {
+      res = await api.get<Blob>(`/pcap/captures/${id}/download`, {
+        responseType: "blob",
+      });
+    } catch (err) {
+      // responseType "blob" turns the JSON error body into a Blob, which
+      // formatApiError cannot read; decode it so the operator sees the
+      // server's sentence (e.g. which node holds the capture, #2866).
+      const e = err as { response?: { data?: unknown } };
+      if (e?.response?.data instanceof Blob) {
+        try {
+          e.response.data = JSON.parse(await e.response.data.text());
+        } catch {
+          // Not JSON; leave the generic message.
+        }
+      }
+      throw err;
+    }
     const disposition = (res.headers as Record<string, string>)[
       "content-disposition"
     ];

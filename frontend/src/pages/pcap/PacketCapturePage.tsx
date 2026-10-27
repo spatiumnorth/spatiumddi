@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Download, Loader2, Trash2 } from "lucide-react";
 import {
   applianceApprovalApi,
+  formatApiError,
   type PcapCaptureCreate,
   type PcapCaptureRead,
   pcapApi,
@@ -687,6 +688,9 @@ function ResultTab({ captureId }: { captureId: string | null }) {
       <div className="grid grid-cols-2 gap-2">
         <Stat label="Packets" value={String(data.packets_captured)} />
         <Stat label="Size" value={fmtBytes(data.pcap_size_bytes)} />
+        {data.artifact_node && (
+          <Stat label="Stored on node" value={data.artifact_node} />
+        )}
       </div>
       {meta?.stop_reason && (
         <p className="text-[11px] text-muted-foreground">
@@ -712,6 +716,11 @@ function ResultTab({ captureId }: { captureId: string | null }) {
           No downloadable artifact (capture produced no bytes, failed, or was
           pruned). A stopped capture still downloads whatever was captured
           before Stop.
+        </p>
+      )}
+      {download.isError && (
+        <p className="text-[11px] text-rose-600">
+          {formatApiError(download.error, "Download failed")}
         </p>
       )}
     </div>
@@ -807,6 +816,11 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
           </button>
         </div>
       )}
+      {download.isError && (
+        <p className="text-xs text-rose-600">
+          {formatApiError(download.error, "Download failed")}
+        </p>
+      )}
       <div className="overflow-x-auto rounded-md border">
         <table className="w-full min-w-[560px] text-xs">
           <thead>
@@ -872,7 +886,11 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
                   {s.has_artifact && (
                     <button
                       type="button"
-                      title="Download .pcap"
+                      title={
+                        s.artifact_node
+                          ? `Download .pcap (stored on node ${s.artifact_node})`
+                          : "Download .pcap"
+                      }
                       onClick={() => download.mutate(s.id)}
                       className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
                     >
