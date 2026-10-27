@@ -113,3 +113,31 @@ async def test_the_payload_and_etag_are_stable_across_polls(db_session: AsyncSes
     assert first["zones"] == second["zones"]
     assert first["etag"] == second["etag"]
     assert first["structural_etag"] == second["structural_etag"]
+
+
+@pytest.mark.asyncio
+async def test_an_ingest_mirror_ships_marked_learned(db_session: AsyncSession) -> None:
+    """#2850 — the BIND9 agent lets named's copy win for an ingest mirror at a
+    start, so a record a third party deleted is not served again from a mirror
+    row the next sweep has not removed yet. Only mirrors carry the mark, so
+    every other record (and bundle) is shipped exactly as before."""
+    server = await _group_with_zones(db_session, zones=1, per_zone=2)
+    zone = (await db_session.execute(DNSZone.__table__.select())).first()
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="dc01",
+            fqdn=f"dc01.{zone.name}",
+            record_type="A",
+            value="10.9.9.9",
+            import_source="ddns_external",
+        )
+    )
+    await db_session.commit()
+
+    bundle = await build_config_bundle(db_session, server)
+
+    by_name = {r["name"]: r for r in bundle["zones"][0]["records"]}
+    assert by_name["dc01"]["learned"] is True
+    assert "learned" not in by_name["h000"]
+    assert set(by_name["h000"]) == {"name", "type", "ttl", "value", "priority", "weight", "port"}

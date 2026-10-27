@@ -48,6 +48,7 @@ import re
 import shutil
 import subprocess
 import threading
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
@@ -261,6 +262,43 @@ def _saw_soa(text: str) -> bool:
         if len(parts) >= 4 and parts[3].upper() == "SOA":
             return True
     return False
+
+
+# What the last sweep read off each zone (#2850): ``"<owner> <TYPE>"`` per
+# RRset, one per line, owner absolute and lowercase as ``named-compilezone``
+# spells it. It is the evidence the BIND9 driver needs that named HELD a
+# record the control plane learned from it: such a record named no longer
+# holds was deleted by the third party since, and a start inside the window
+# before the next sweep must not render it back from the mirror row.
+_SEEN_DIR = "ingest-seen"
+
+
+def seen_keys_path(state_dir: Path, zone: str) -> Path:
+    return state_dir / _SEEN_DIR / f"{zone.rstrip('.').lower()}.keys"
+
+
+def write_seen_keys(state_dir: Path, zone: str, records: list[dict[str, Any]]) -> None:
+    """Record the RRsets one sweep read off ``zone``, replacing the last."""
+    origin = zone.rstrip(".").lower() + "."
+    keys: set[str] = set()
+    for rec in records:
+        name = str(rec.get("name") or "@").lower()
+        owner = origin if name in ("@", "") else f"{name}.{origin}"
+        keys.add(f"{owner} {str(rec.get('record_type') or '').upper()}")
+    path = seen_keys_path(state_dir, zone)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(f"{k}\n" for k in sorted(keys)))
+    os.replace(tmp, path)
+
+
+def read_seen_keys(state_dir: Path, zone: str) -> set[str] | None:
+    """What the last sweep read off ``zone``, or None when nothing is known."""
+    try:
+        text = seen_keys_path(state_dir, zone).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return {line for line in text.splitlines() if line}
 
 
 class IngestWorker:
@@ -502,6 +540,16 @@ class IngestWorker:
             records = self._read_live_zone(target.zone, target.key)
             if records is None:
                 continue
+            if target.view is None:
+                # The seen file is keyed by zone name and read only for a zone
+                # rendered without views (#2850); a read of one view's copy
+                # would overwrite it with that view's records.
+                try:
+                    write_seen_keys(self.cfg.state_dir, target.zone, records)
+                except OSError as exc:
+                    log.warning(
+                        "dns_ingest_seen_write_failed", zone=target.zone, error=str(exc)
+                    )
             self._ship(target.zone, records, target.view)
 
     def run(self) -> None:
@@ -589,4 +637,7 @@ __all__ = [
     "PowerDNSIngestWorker",
     "parse_axfr",
     "parse_pdns_zone",
+    "read_seen_keys",
+    "seen_keys_path",
+    "write_seen_keys",
 ]

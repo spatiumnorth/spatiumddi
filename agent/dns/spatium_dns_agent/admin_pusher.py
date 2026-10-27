@@ -49,8 +49,11 @@ _SKIP_FILE_NAMES: frozenset[str] = frozenset()
 # not config, and their NUL bytes still decode as UTF-8, so the control plane
 # could not store them. ``_walk_rendered`` also drops any file holding a NUL
 # byte, which catches binary files whatever they are called.
+# And a dynamic zone's ``.owned`` sidecar: the RRsets the control plane owns
+# in it, bookkeeping for carrying RFC 2136 records across a render (#2850).
 _SKIP_FILE_SUFFIXES: tuple[str, ...] = (
     ".sha256",
+    ".owned",
     ".tmp",
     ".jnl",
     ".jbk",
