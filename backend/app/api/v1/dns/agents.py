@@ -30,6 +30,7 @@ from app.api.pre_body_auth import PreBodyAuthRoute, header_auth
 from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    collecting_wakes,
     dns_wake_channels,
     wake_subscription,
 )
@@ -1090,7 +1091,9 @@ async def agent_heartbeat(
     await lock_heartbeat_ops(db, server.id, body.ops_ack, now)
     server.last_seen_at = now
     server.last_health_check_at = now
-    server.status = "active"
+    # #2853 — a disabled server stays ``disabled`` (the health task's verdict):
+    # its agent is still checking in, which is liveness, not re-enablement.
+    server.status = "active" if server.is_enabled else "disabled"
     if not displaced:
         # Capture the source IP so the operator can identify which host
         # this agent is running on — the operator-set ``host`` column is
@@ -1517,13 +1520,13 @@ async def agent_ingested_records(
     journal; the agent AXFRs them and posts them here so they become
     UI/IPAM-visible + survive a full re-render. Gated on the zone actually
     having ``dynamic_update_enabled`` (defense-in-depth against a
-    misbehaving agent) and scoped to the posting server's group.
+    misbehaving agent) and scoped to the posting server's group. In a group
+    with several agent servers a learned record is also queued to the
+    other servers, and the report is read as a change since that server's
+    previous one rather than as the zone's whole truth (#2654; see
+    ``app.services.dns.ingest``).
     """
-    from app.services.dns.ingest import (  # noqa: PLC0415
-        IncomingRecord,
-        reconcile_external_records,
-        to_summary,
-    )
+    from app.services.dns.ingest import IncomingRecord  # noqa: PLC0415
 
     server, _ = auth
     zone_name = body.zone_name.rstrip(".")
@@ -1567,8 +1570,38 @@ async def agent_ingested_records(
         )
         for r in body.records
     ]
-    result = await reconcile_external_records(db, zone, incoming)
-    summary = to_summary(result)
+    # #2654 — in a group with several agent servers the reconcile also queues
+    # record ops to the reporter's peers (or to the reporter, when it is
+    # behind). The agent router has no ``wake_publishing`` dependency, so open
+    # a collector here: the wake goes out after the commit below, and the
+    # peers apply the op on their next poll instead of the 12 s safety tick.
+    async with collecting_wakes():
+        summary = await _reconcile_and_audit(db, server, zone, zone_name, incoming)
+    return {"zone": zone_name, **summary}
+
+
+async def _reconcile_and_audit(
+    db: AsyncSession,
+    server: DNSServer,
+    zone: DNSZone,
+    zone_name: str,
+    incoming: list[Any],
+) -> dict[str, Any]:
+    from app.services.dns.ingest import (  # noqa: PLC0415
+        reconcile_external_records,
+        to_summary,
+    )
+    from app.services.dns.server_resync import complete_deferred_resync  # noqa: PLC0415
+
+    result = await reconcile_external_records(db, zone, incoming, server=server)
+    summary: dict[str, Any] = dict(to_summary(result))
+    # #2654 — a re-enabled server's #2281 re-render waits for this: once it
+    # has reported every dynamic zone, what it learned while disabled is in
+    # the database, and the re-render keeps it instead of wiping it.
+    if await complete_deferred_resync(db, server):
+        summary["zone_resync"] = "released"
+    if result.mode == "disabled_reporter":
+        summary["skipped"] = "server_disabled"
     if summary["added"] or summary["removed"]:
         # One summarising row per batch (not per record): an external writer
         # churning records would otherwise flood audit_log. Names are capped.
@@ -1587,6 +1620,7 @@ async def agent_ingested_records(
                 new_value={
                     "server_id": str(server.id),
                     "server": server.name,
+                    "mode": result.mode,
                     **summary,
                     "added_records": result.added_records[:cap],
                     "truncated": max(result.added, result.removed) > cap,
@@ -1601,7 +1635,7 @@ async def agent_ingested_records(
             **summary,
         )
     await db.commit()
-    return {"zone": zone_name, **summary}
+    return summary
 
 
 @router.post("/dnssec-state")
@@ -2099,7 +2133,14 @@ async def agent_rendered_config(
     files = body.files[:_RENDERED_FILES_MAX]
     total = 0
     sanitised: list[dict[str, str]] = []
+    skipped_binary: list[str] = []
     for f in files:
+        # PostgreSQL JSONB cannot store NUL (\u0000), and one such file would
+        # refuse the whole snapshot (#2842). A NUL means binary, not config
+        # (BIND's journals and signed-zone files): drop it, keep the rest.
+        if "\x00" in f.content or "\x00" in f.path:
+            skipped_binary.append(f.path.replace("\x00", ""))
+            continue
         if len(f.content) > _RENDERED_FILE_SIZE_MAX:
             # Truncate rather than reject — operator wants to *see*
             # something even if a single file blew the cap.
@@ -2110,6 +2151,14 @@ async def agent_rendered_config(
         if total > _RENDERED_TOTAL_SIZE_MAX:
             break
         sanitised.append({"path": f.path, "content": content})
+
+    if skipped_binary:
+        logger.warning(
+            "rendered_config_skipped_binary",
+            server_id=str(server.id),
+            paths=skipped_binary[:50],
+            count=len(skipped_binary),
+        )
 
     now = datetime.now(UTC)
     state = await db.get(DNSServerRuntimeState, server.id)
