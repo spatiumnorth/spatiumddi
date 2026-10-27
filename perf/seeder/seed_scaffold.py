@@ -50,6 +50,7 @@ import concurrent.futures as cf
 import email.utils
 import ipaddress
 import logging
+import math
 import os
 import random
 import sys
@@ -117,7 +118,7 @@ def _retry_after_s(value: str | None) -> float | None:
         if parsed is None:
             return None
         secs = email.utils.mktime_tz(parsed) - time.time()
-    if secs != secs:  # NaN
+    if math.isnan(secs):
         return None
     return max(0.0, secs)
 
