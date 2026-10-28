@@ -29,7 +29,7 @@ from app.core.agent_wake import collect_wake
 from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
-    name_in_zone_error,
+    host_in_zone_error,
     publishable_host_owner_error,
     validate_fqdn,
     validate_host_label,
@@ -1791,7 +1791,9 @@ async def _assert_alias_names_fit(
     aliases: list[Any],
     zone_id: uuid.UUID | None,
 ) -> None:
-    """422 an alias whose name inside its zone passes 253 characters.
+    """422 an alias whose name inside its zone passes 253 characters, or
+    whose full owner the record API's check-names rule refuses (#2918: an
+    A alias under a zone whose own name carries an underscore label).
 
     ``AliasInput`` checks the alias on its own; only here is the zone known.
     A name longer than a DNS name can carry makes BIND refuse the whole zone
@@ -1818,6 +1820,11 @@ async def _assert_alias_names_fit(
                     "the server applying its configuration."
                 ),
             )
+        names_err = bind_check_names_error(
+            al.record_type, f"{fqdn}.", None, origin=zone_domain, check_target=False
+        )
+        if names_err is not None:
+            raise HTTPException(status_code=422, detail=f"alias '{al.name}': {names_err}")
 
 
 async def _create_alias_records(
@@ -2263,14 +2270,20 @@ async def _operator_ptr_twin(
 
 
 def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bool:
-    """True when ``<hostname>.<zone>`` is not a legal DNS name (#2072).
+    """True when ``<hostname>.<zone>`` is not a publishable DNS name (#2072, #2918).
+
+    Past 253 characters, or an owner the record API's check-names rule refuses
+    in that zone (an underscore label in the zone's own name).
 
     ``strict`` raises the 422 instead (the request paths); otherwise the
     caller skips the zone, and this logs why.
     """
-    err = name_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
+    err = host_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
     if err is None:
         return False
+    # Read by importers that report what they published (#2921); not a
+    # mapped column, lives for this request.
+    ip._dns_skip_reason = err  # type: ignore[attr-defined]
     if strict:
         raise HTTPException(status_code=422, detail=err)
     logger.warning(
@@ -2278,6 +2291,7 @@ def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bo
         ip=str(ip.address),
         zone=zone_domain,
         hostname_length=len(ip.hostname or ""),
+        reason=err,
     )
     return True
 
@@ -2537,6 +2551,7 @@ async def _sync_dns_record(
     if owner_err is not None:
         if strict:
             raise HTTPException(status_code=422, detail=owner_err)
+        ip._dns_skip_reason = owner_err  # type: ignore[attr-defined]
         logger.warning(
             "ipam_dns_hostname_unpublishable",
             ip=str(ip.address),
@@ -9884,7 +9899,23 @@ async def update_address(
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
         zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
-        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
+        try:
+            await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
+        except HTTPException as exc:
+            # The Edit dialog sends its hostname on every Save, so the sync
+            # runs on an edit of an unrelated field too. A name a later rule
+            # refuses (#2918: an underscore label in the zone's own name;
+            # #2072: past 253 characters) must not block such an edit (the
+            # #1228 / #2467 changed-fields rule): the refusal comes before
+            # anything is written, so the address's DNS is left as it was.
+            # Changing the hostname, the zone or the extras is still refused.
+            if exc.status_code != 422 or (hostname_changed or zone_changed or extra_zones_touched):
+                raise
+            logger.warning(
+                "ipam_dns_unchanged_name_not_republished",
+                ip=str(ip.address),
+                reason=exc.detail,
+            )
     elif subnet and restoring:
         await _sync_dns_record(
             db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
@@ -10832,7 +10863,21 @@ async def bulk_allocate_preview(
         except ValueError:
             return True
 
-    items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
+    items, warnings, preview_zone_id = await _build_bulk_allocate_candidates(db, subnet, body)
+    # #2920 — the commit publishes each row it creates with the strict sync,
+    # which refuses (422) a name that does not fit its zone and aborts the
+    # batch. Name that here, with the commit's own rule and words, for the
+    # rows the commit would actually publish.
+    if body.create_dns_records and preview_zone_id is not None:
+        preview_zone = await db.get(DNSZone, preview_zone_id)
+        if preview_zone is not None and preview_zone.deleted_at is None:
+            zone_domain = preview_zone.name.rstrip(".")
+            for i in items:
+                if i.in_use or i.in_dynamic_pool or i.fqdn_collision or _no_perm(i.address):
+                    continue
+                name_err = host_in_zone_error(i.hostname, zone_domain, field="hostname")
+                if name_err is not None:
+                    raise HTTPException(status_code=422, detail=name_err)
     in_use = sum(1 for i in items if i.in_use)
     in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
     fqdn_coll = sum(1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision)
