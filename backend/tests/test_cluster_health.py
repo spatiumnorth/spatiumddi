@@ -768,3 +768,58 @@ async def test_host_state_merge_failure_is_logged_not_raised(monkeypatch) -> Non
     assert snap["nodes"][0]["host_storage"] is None
     assert events and events[0][0] == "cluster_health_host_state_unavailable"
     assert events[0][1]["error_class"] == "TimeoutError"
+
+
+# ── #2945 — recent vs lifetime restarts ────────────────────────────────────
+
+
+def _restarted_pod(name: str, finished_ago_s: float | None, *, restarts: int = 1) -> dict:
+    from datetime import timedelta
+
+    p = _pod(name, restarts=restarts)
+    if finished_ago_s is not None:
+        ts = (datetime.now(UTC) - timedelta(seconds=finished_ago_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        p["status"]["containerStatuses"][0]["lastState"] = {
+            "terminated": {"finishedAt": ts, "exitCode": 0}
+        }
+    return p
+
+
+def test_a_restart_inside_the_window_is_recent(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_restarted_pod("a", 120)])["api"]
+    assert api["restarts"] == 1
+    assert api["recent_restarts"] == 1
+    assert api["last_restart_at"] is not None
+
+
+def test_an_old_restart_is_lifetime_only(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_restarted_pod("a", 3 * 3600, restarts=7)])["api"]
+    assert api["restarts"] == 7
+    assert api["recent_restarts"] == 0
+    assert api["last_restart_at"] is None
+
+
+def test_a_restart_with_no_finished_time_is_not_recent(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_restarted_pod("a", None)])["api"]
+    assert api["restarts"] == 1
+    assert api["recent_restarts"] == 0
+
+
+def test_a_never_restarted_pod_has_no_recent_restarts(monkeypatch) -> None:
+    api = _rollup_with(monkeypatch, [_pod("a")])["api"]
+    assert api["recent_restarts"] == 0
+    assert api["last_restart_at"] is None
+
+
+def test_recent_restarts_sum_across_pods_and_skip_a_far_future_stamp(monkeypatch) -> None:
+    api = _rollup_with(
+        monkeypatch,
+        [
+            _restarted_pod("a", 60),
+            _restarted_pod("b", 600),
+            _restarted_pod("c", 7200),
+            _restarted_pod("d", -3600),  # clock a long way ahead: ignored
+        ],
+    )["api"]
+    assert api["restarts"] == 4
+    assert api["recent_restarts"] == 2
