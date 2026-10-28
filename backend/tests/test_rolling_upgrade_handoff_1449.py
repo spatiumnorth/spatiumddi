@@ -193,7 +193,7 @@ def test_a_handed_off_drive_runs_on_any_other_node(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("NODE_NAME", "node-b")
     ran: list[str] = []
 
-    async def _drive(rid: str) -> dict[str, str]:
+    async def _drive(rid: str, *, avoid_version: str | None = None) -> dict[str, str]:
         ran.append(rid)
         return {"run_id": rid, "state": "running"}
 
@@ -214,7 +214,7 @@ def test_after_the_hop_limit_the_drive_runs_where_it_landed(
     monkeypatch.setenv("NODE_NAME", "node-a")
     ran: list[str] = []
 
-    async def _drive(rid: str) -> dict[str, str]:
+    async def _drive(rid: str, *, avoid_version: str | None = None) -> dict[str, str]:
         ran.append(rid)
         return {"run_id": rid, "state": "running"}
 

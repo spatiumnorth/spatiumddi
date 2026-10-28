@@ -321,7 +321,9 @@ async def test_a_drive_that_loses_the_database_releases_its_lease_and_does_not_f
     used: list[str | None] = []
     released: list[str | None] = []
 
-    async def _drive(_db: Any, _rid: Any, *, holder: str | None = None) -> Any:
+    async def _drive(
+        _db: Any, _rid: Any, *, holder: str | None = None, avoid_version: str | None = None
+    ) -> Any:
         used.append(holder)
         raise _refused()
 
@@ -350,7 +352,9 @@ async def test_the_crash_handler_releases_the_lease_when_it_cannot_write_the_row
     used: list[str | None] = []
     released: list[str | None] = []
 
-    async def _drive(_db: Any, _rid: Any, *, holder: str | None = None) -> Any:
+    async def _drive(
+        _db: Any, _rid: Any, *, holder: str | None = None, avoid_version: str | None = None
+    ) -> Any:
         used.append(holder)
         raise RuntimeError("loop crashed")
 
@@ -379,7 +383,9 @@ async def test_a_real_crash_still_fails_the_run_and_releases_the_lease(
     released: list[str | None] = []
     row = SimpleNamespace(state="running", lease_holder=None, last_error=None, finished_at=None)
 
-    async def _drive(_db: Any, _rid: Any, *, holder: str | None = None) -> Any:
+    async def _drive(
+        _db: Any, _rid: Any, *, holder: str | None = None, avoid_version: str | None = None
+    ) -> Any:
         used.append(holder)
         row.lease_holder = holder
         raise KeyError("node_order")
@@ -418,7 +424,7 @@ def test_the_task_retries_a_lost_database_on_its_own_countdown(
         retried.append(kw)
         return _Retry()
 
-    async def _drive(_rid: str) -> dict[str, str]:
+    async def _drive(_rid: str, *, avoid_version: str | None = None) -> dict[str, str]:
         raise task.DriveDatabaseUnavailable("ConnectionRefusedError: refused")
 
     monkeypatch.setattr(task, "_async_drive", _drive)
@@ -624,7 +630,9 @@ async def test_a_bare_socket_error_from_outside_the_database_fails_the_run(
     released: list[str | None] = []
     row = SimpleNamespace(state="running", lease_holder=None, last_error=None, finished_at=None)
 
-    async def _drive(_db: Any, _rid: Any, *, holder: str | None = None) -> Any:
+    async def _drive(
+        _db: Any, _rid: Any, *, holder: str | None = None, avoid_version: str | None = None
+    ) -> Any:
         used.append(holder)
         row.lease_holder = holder
         raise _raised_in("app.services.appliance.k8s", ConnectionRefusedError(111, "kubeapi"))
