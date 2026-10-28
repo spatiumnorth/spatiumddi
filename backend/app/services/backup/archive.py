@@ -704,18 +704,50 @@ def resolve_dump_format(manifest: dict[str, Any], names: set[str]) -> str | None
     return None
 
 
-def preview_backup_archive(archive_bytes: bytes) -> tuple[dict[str, Any], str | None]:
-    """``(manifest, dump_format)`` without inflating the dump. For the
-    restore preview: the manifest as :func:`read_backup_manifest` reads
-    it, plus the dump format the restore will act on (None when the
-    archive does not say — the restore then refuses it outright)."""
+def archive_member_refusal(manifest: dict[str, Any], names: set[str]) -> str | None:
+    """Why the restore refuses an archive for what it lacks, or None.
+
+    ``secrets.enc`` must be present and the dump must be resolvable and
+    present under the member the resolved format names. The restore
+    (:func:`extract_archive_members`) and the manifest preview both answer
+    through here (#2949), so the console never offers a restore the API
+    then refuses.
+    """
+    if "secrets.enc" not in names:
+        return "archive is missing required member: secrets.enc"
+    resolved = resolve_dump_format(manifest, names)
+    if resolved is None:
+        return (
+            "archive is missing the database dump member "
+            "(neither database.dump nor database.sql present)"
+        )
+    dump_member = "database.dump" if resolved == "custom" else "database.sql"
+    if dump_member not in names:
+        return f"archive declares dump_format={resolved!r} but member {dump_member!r} is missing"
+    return None
+
+
+def preview_backup_archive(
+    archive_bytes: bytes,
+) -> tuple[dict[str, Any], str | None, str | None]:
+    """``(manifest, dump_format, refusal)`` without inflating the dump. For
+    the restore preview: the manifest as :func:`read_backup_manifest` reads
+    it, the dump format the restore will act on (None when the archive does
+    not say), and the reason the restore would refuse the archive for a
+    missing member or an unsupported ``format_version`` (None when it would
+    go ahead). The restore's own checks, not a parallel copy (#2949)."""
     manifest = read_backup_manifest(archive_bytes)
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
             names = set(zf.namelist())
     except _MALFORMED_MANIFEST_ERRORS as exc:
         raise BackupArchiveError(f"archive is malformed: {exc}") from exc
-    return manifest, resolve_dump_format(manifest, names)
+    from app.services.backup.restore import format_version_refusal  # noqa: PLC0415
+
+    refusal = archive_member_refusal(manifest, names) or format_version_refusal(
+        manifest.get("format_version")
+    )
+    return manifest, resolve_dump_format(manifest, names), refusal
 
 
 def extract_archive_members(
@@ -742,22 +774,16 @@ def extract_archive_members(
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
             if not isinstance(manifest, dict):
                 raise BackupArchiveError("manifest.json is not a JSON object")
-            # Format detection — manifest field if present,
-            # otherwise fall back to member-name sniffing.
+            # Format detection — manifest field if present, otherwise
+            # member-name sniffing. The same rule the manifest preview
+            # applies (#2949), so the two cannot disagree.
+            reason = archive_member_refusal(manifest, names)
+            if reason is not None:
+                raise BackupArchiveError(reason)
             resolved = resolve_dump_format(manifest, names)
-            if resolved is not None:
-                dump_format = resolved
-            else:
-                raise BackupArchiveError(
-                    "archive is missing the database dump member "
-                    "(neither database.dump nor database.sql present)"
-                )
+            assert resolved is not None  # archive_member_refusal covered None
+            dump_format = resolved
             dump_member = "database.dump" if dump_format == "custom" else "database.sql"
-            if dump_member not in names:
-                raise BackupArchiveError(
-                    f"archive declares dump_format={dump_format!r} but "
-                    f"member {dump_member!r} is missing"
-                )
             # Refuse on the DECLARED size before inflating anything
             # (#1568): the archive is untrusted until the passphrase
             # check passes, and ``zf.read`` would materialise the

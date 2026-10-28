@@ -2970,6 +2970,11 @@ export interface BackupManifestPreviewResponse {
   /** True only for a custom-format dump — the one shape the API accepts
    *  a selective restore of. */
   selective_restore_supported?: boolean;
+  /** False when the restore itself would refuse this archive (no dump, no
+   *  secrets.enc, a newer format_version); `restore_refusal` says why.
+   *  Absent from a server older than #2949. */
+  restorable?: boolean;
+  restore_refusal?: string | null;
 }
 
 export const backupApi = {
