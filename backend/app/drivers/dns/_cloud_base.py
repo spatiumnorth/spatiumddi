@@ -212,12 +212,12 @@ def split_structured_rdata(
     raw = (rdata or "").strip()
     if rtype == "MX":
         head, sep, rest = raw.partition(" ")
-        if sep and head.isdigit() and rest.strip():
+        if sep and head.isascii() and head.isdigit() and rest.strip():
             return rest.strip(), int(head), None, None
         return raw, None, None, None
     if rtype == "SRV":
         parts = raw.split(None, 3)
-        if len(parts) == 4 and all(p.isdigit() for p in parts[:3]):
+        if len(parts) == 4 and all(p.isascii() and p.isdigit() for p in parts[:3]):
             return parts[3].strip(), int(parts[0]), int(parts[1]), int(parts[2])
         return raw, None, None, None
     return raw, None, None, None
