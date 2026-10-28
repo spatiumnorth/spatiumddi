@@ -513,6 +513,46 @@ async def _safe_rollback(db: AsyncSession) -> None:
         logger.warning("change_request.rollback_failed", error=str(exc))
 
 
+async def _relock_after_failed_apply(
+    db: AsyncSession, cr_id: UUID, *, approver: User
+) -> tuple[ChangeRequest, bool]:
+    """Re-lock the row after the spine rolled back a failed ``apply()``.
+
+    Returns ``(cr, approval_committed)``. The row is normally ``pending``
+    again: the ``approved`` stamp was rolled back with ``apply()``. But
+    ``apply()`` runs its own ``db.commit()``, and that commit persists the
+    stamp too — so an ``apply()`` that committed and THEN raised leaves the
+    row ``approved`` by this approver, never executed. That is this
+    approval's own failure, not another actor's decision, and reporting it as
+    "changed state mid-apply" would strand the row ``approved``: the expiry
+    sweep only touches ``pending`` and nobody can decide it (#2911).
+
+    Any other state means another actor decided the row between the rollback
+    (which released our ``FOR UPDATE``) and this re-lock — a concurrent
+    reject, cancel, expiry or approve. That is a :class:`DecisionConflict`,
+    and the row is left exactly as they left it.
+    """
+    # The caller's rollback expired every loaded object, the signed-in
+    # approver's ``User`` included. Reading ``approver.id`` on an expired
+    # instance triggers a synchronous refresh, which raises MissingGreenlet
+    # under asyncpg (#2911). Refresh it here, awaited, so the stamp (and the
+    # caller's own reference to the user) reads loaded values again. A user
+    # not attached to this session was never expired by its rollback.
+    if approver in db:
+        await db.refresh(approver)
+    cr = await get_change_request(db, cr_id, for_update=True)
+    if cr is None:
+        raise DecisionConflict("Change request vanished mid-apply — investigate")
+    if cr.state == "pending":
+        return cr, False
+    if cr.state == "approved" and cr.decided_by_user_id == approver.id and cr.executed_at is None:
+        return cr, True
+    raise DecisionConflict(
+        f"Change request was decided by someone else while it was being applied "
+        f"(state={cr.state!r})"
+    )
+
+
 async def _stamp_apply_failed(
     db: AsyncSession,
     cr_id: UUID,
@@ -526,19 +566,37 @@ async def _stamp_apply_failed(
 
     Shared by the approve spine's 5xx and generic-exception paths. The
     approval transition was rolled back alongside ``apply()``, so replay it
-    before ``mark_failed``. Raises :class:`DecisionError` if the row vanished
-    or another actor flipped it mid-apply."""
-    # The caller's rollback expired every loaded object, the signed-in
-    # approver's ``User`` included. Reading ``approver.id`` on an expired
-    # instance triggers a synchronous refresh, which raises MissingGreenlet
-    # under asyncpg (#2911). Refresh it here, awaited, so the stamp (and the
-    # caller's own reference to the user) reads loaded values again.
-    await db.refresh(approver)
-    cr = await get_change_request(db, cr_id, for_update=True)
-    if cr is None or cr.state != "pending":
-        raise DecisionError("Change request vanished or changed state mid-apply — investigate")
+    before ``mark_failed`` — unless ``apply()`` had already committed it, in
+    which case only the failure is stamped (one ``approved`` audit row, not
+    two). Raises :class:`DecisionConflict` if the row vanished or another
+    actor decided it mid-apply."""
+    cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
+    return await _stamp_failed_locked(
+        db,
+        cr,
+        approver=approver,
+        request=request,
+        note=note,
+        error=error,
+        approval_committed=approval_committed,
+    )
+
+
+async def _stamp_failed_locked(
+    db: AsyncSession,
+    cr: ChangeRequest,
+    *,
+    approver: User,
+    request: Request | None,
+    note: str | None,
+    error: str,
+    approval_committed: bool,
+) -> ChangeRequest:
+    """Stamp a row :func:`_relock_after_failed_apply` locked as ``failed``,
+    replaying ``approved`` first unless ``apply()`` already committed it."""
     requester_id = cr.requested_by_user_id
-    await mark_approved(db, cr, approver=approver, request=request, note=note)
+    if not approval_committed:
+        await mark_approved(db, cr, approver=approver, request=request, note=note)
     await mark_failed(
         db, cr, approver=approver, requester_id=requester_id, request=request, error=error
     )
@@ -821,6 +879,25 @@ async def approve_change_request(
         sc = exc.status_code
         if 400 <= sc < 500:
             detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            # Leaving it pending is only possible while it IS pending. If
+            # apply() committed (persisting the approved stamp) before it
+            # raised, the row is approved and nothing would ever move it
+            # again — record the refusal as this approval's failure instead.
+            cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
+            if approval_committed:
+                return await _stamp_failed_locked(
+                    db,
+                    cr,
+                    approver=approver,
+                    request=request,
+                    note=note,
+                    error=detail,
+                    approval_committed=True,
+                )
+            # Release the re-lock. Nothing changed, and committing (rather
+            # than rolling back again) keeps the refreshed approver loaded
+            # for whatever the caller reads next.
+            await db.commit()
             logger.info(
                 "change_request.apply_precondition",
                 change_request_id=str(cr_id),

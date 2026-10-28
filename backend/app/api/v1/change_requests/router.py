@@ -568,7 +568,9 @@ async def approve_request(
        ``executed`` row carries the approver as actor and the requester id
        in ``old_value.requested_by``. A client 4xx raised by ``apply()``
        leaves the row ``pending`` and surfaces the status; a server fault
-       marks it ``failed``.
+       or any other exception marks it ``failed`` (200, with ``error``), as
+       does a 4xx raised after ``apply()`` already committed the approval
+       (#2911).
     """
     await _assert_gate_row(db, cr_id)
     note = body.decision_note if body is not None else None
