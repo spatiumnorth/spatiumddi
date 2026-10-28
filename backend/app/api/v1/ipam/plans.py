@@ -29,6 +29,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
+from app.services.ipam.subnet_placeholders import create_placeholder_rows
 
 _V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
 _V6_MULTICAST = ipaddress.ip_network("ff00::/8")
@@ -763,36 +764,13 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             is_v6 = isinstance(node_net, ipaddress.IPv6Network)
             gw_row: IPAddress | None = None
             if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
-                db.add(
-                    IPAddress(
-                        subnet_id=subnet.id,
-                        address=str(node_net.network_address),
-                        status="network",
-                        description="Network address",
-                        created_by_user_id=current_user.id,
-                    )
-                )
-                if not is_v6:
-                    db.add(
-                        IPAddress(
-                            subnet_id=subnet.id,
-                            address=str(node_net.broadcast_address),
-                            status="broadcast",
-                            description="Broadcast address",
-                            created_by_user_id=current_user.id,
-                        )
-                    )
-                gw_addr = gateway or str(node_net.network_address + 1)
-                gw_row = IPAddress(
-                    subnet_id=subnet.id,
-                    address=gw_addr,
-                    status="reserved",
-                    description="Gateway",
-                    hostname="gateway",
+                _, gw_row = await create_placeholder_rows(
+                    db,
+                    subnet,
+                    node_net,
+                    gateway=gateway,
                     created_by_user_id=current_user.id,
                 )
-                db.add(gw_row)
-                subnet.gateway = gw_addr
                 await db.flush()
             # spatiumddi#1150 — the two DNS steps create_subnet runs, so a
             # planned subnet is in sync with DNS from apply rather than from
@@ -819,6 +797,19 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
     await db.flush()
     for bid in reversed(created_blocks):
         await _update_block_utilization(db, uuid.UUID(bid))
+    # A plan anchored to an existing block that creates no block of its own
+    # still changes that block's subnets: recount the block each created subnet
+    # sits in, which walks up the chain (the anchor included) (#2981).
+    if created_subnets:
+        parent_ids = (
+            await db.execute(
+                select(Subnet.block_id).where(
+                    Subnet.id.in_([uuid.UUID(sid) for sid in created_subnets])
+                )
+            )
+        ).scalars()
+        for bid in {str(b) for b in parent_ids}:
+            await _update_block_utilization(db, uuid.UUID(bid))
 
     plan.applied_at = datetime.now(UTC)
     plan.applied_resource_ids = {

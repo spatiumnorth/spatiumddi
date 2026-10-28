@@ -39,15 +39,41 @@ def assert_static_dhcp_has_mac(addr_status: str | None, mac_address: str | None)
 
 
 async def assert_address_unallocated(db: AsyncSession, subnet_id: uuid.UUID, address: str) -> None:
-    """The address must not already be held in the subnet (409)."""
+    """The address must not already be held in the subnet (409).
+
+    A row with status ``available`` is a free slot the counters already call
+    free (#2980), so it does not hold the address; the create reclaims it with
+    ``reclaim_available_row``.
+    """
     existing = await db.scalar(
         select(func.count())
         .select_from(IPAddress)
         .where(IPAddress.subnet_id == subnet_id)
         .where(IPAddress.address == address)
+        .where(IPAddress.status != "available")
     )
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Address {address} is already allocated in this subnet",
         )
+
+
+async def reclaim_available_row(
+    db: AsyncSession, subnet_id: uuid.UUID, address: str
+) -> IPAddress | None:
+    """Remove the ``available`` placeholder row at ``address`` (#2980) so the
+    create can insert the new row under the (subnet, address) unique key.
+    Returns the removed row (``None`` when the address had none)."""
+    row = (
+        await db.execute(
+            select(IPAddress)
+            .where(IPAddress.subnet_id == subnet_id)
+            .where(IPAddress.address == address)
+            .where(IPAddress.status == "available")
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        await db.delete(row)
+        await db.flush()
+    return row

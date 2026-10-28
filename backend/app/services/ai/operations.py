@@ -410,6 +410,7 @@ async def _apply_create_ip_address(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet.id,
                 IPAddress.address == args.address,
+                IPAddress.status != "available",  # a free slot (#2980)
             )
         )
     ).scalar_one_or_none()
@@ -471,7 +472,9 @@ async def _apply_create_ip_address(
         _update_utilization,
     )
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+    from app.services.ipam.address_create_rules import reclaim_available_row  # noqa: PLC0415
 
+    await reclaim_available_row(db, subnet.id, args.address)  # a free slot (#2980)
     row = IPAddress(
         subnet_id=subnet.id,
         address=args.address,

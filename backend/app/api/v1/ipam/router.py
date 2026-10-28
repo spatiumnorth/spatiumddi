@@ -93,6 +93,7 @@ from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
     assert_static_dhcp_has_mac,
     assert_subnet_takes_addresses,
+    reclaim_available_row,
 )
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
@@ -112,6 +113,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
+from app.services.ipam.subnet_placeholders import create_placeholder_rows
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
@@ -1305,7 +1307,12 @@ async def _pick_next_available_ip(
     """
     net = _parse_network(str(subnet.network))
     used_result = await db.execute(
-        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
+        select(IPAddress.address).where(
+            IPAddress.subnet_id == subnet.id,
+            # An ``available`` row is free (#2980): the counters say so and the
+            # create reclaims it.
+            IPAddress.status != "available",
+        )
     )
     used: set[str] = {str(row[0]) for row in used_result}
 
@@ -6040,44 +6047,13 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         and not body.skip_auto_addresses
         and subnet_kind != "multicast"
     ):
-        # Network address (e.g. 10.0.1.0 / 2001:db8::)
-        db.add(
-            IPAddress(
-                subnet_id=subnet.id,
-                address=str(net.network_address),
-                status="network",
-                description="Network address",
-                created_by_user_id=current_user.id,
-            )
-        )
-        auto_created.append(str(net.network_address))
-
-        if not is_v6:
-            # Broadcast address (IPv4 only — IPv6 has no broadcast)
-            db.add(
-                IPAddress(
-                    subnet_id=subnet.id,
-                    address=str(net.broadcast_address),
-                    status="broadcast",
-                    description="Broadcast address",
-                    created_by_user_id=current_user.id,
-                )
-            )
-            auto_created.append(str(net.broadcast_address))
-
-        # Gateway — use provided or default to first usable host
-        gw_addr = body.gateway or str(net.network_address + 1)
-        gw_row = IPAddress(
-            subnet_id=subnet.id,
-            address=gw_addr,
-            status="reserved",
-            description="Gateway",
-            hostname="gateway",
+        auto_created, gw_row = await create_placeholder_rows(
+            db,
+            subnet,
+            net,
+            gateway=body.gateway,
             created_by_user_id=current_user.id,
         )
-        db.add(gw_row)
-        subnet.gateway = gw_addr
-        auto_created.append(gw_addr)
 
     db.add(
         _audit(
@@ -9357,6 +9333,8 @@ async def create_address(
         address=body.address,
         zone_id=explicit_zone,
     )
+    # An ``available`` row at this address is a free slot (#2980): replaced.
+    await reclaim_available_row(db, subnet_id, body.address)
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
@@ -11248,6 +11226,7 @@ async def allocate_next_ip(
         address=chosen,
         zone_id=explicit_zone,
     )
+    await reclaim_available_row(db, subnet_id, str(chosen))
     ip = IPAddress(
         subnet_id=subnet_id,
         address=str(chosen),

@@ -36,6 +36,7 @@ from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam.resize import _total_ips
+from app.services.ipam.subnet_placeholders import create_placeholder_rows, takes_placeholder_rows
 from app.services.ipam_io.parser import ParsedPayload
 
 logger = structlog.get_logger(__name__)
@@ -377,6 +378,12 @@ async def commit_import(
 
     existing_blocks = await _load_existing_blocks(db, space.id)
     existing_subnets = await _load_existing_subnets(db, space.id)
+    # Blocks that gained a subnet, recounted once at the end (#2981).
+    touched_blocks: set[uuid.UUID] = set()
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _update_block_utilization,
+        _update_utilization,
+    )
 
     # Pre-flight: if fail-strategy and any subnet conflicts, bail out early —
     # BEFORE the mutation loop runs any side effects. Catches both pre-existing
@@ -434,6 +441,16 @@ async def commit_import(
                 continue
             if gw_addr not in subnet_net:
                 result_obj.errors.append(f"{canonical}: gateway {gateway} is not within the subnet")
+                continue
+            if takes_placeholder_rows(subnet_net) and (
+                gw_addr == subnet_net.network_address
+                or (subnet_net.version == 4 and gw_addr == subnet_net.broadcast_address)
+            ):
+                # The subnet gets a network / broadcast row at those addresses
+                # (#2979); a gateway there would collide with it.
+                result_obj.errors.append(
+                    f"{canonical}: gateway {gateway} is the subnet's network or broadcast address"
+                )
                 continue
             gateway = str(gw_addr)
         custom_fields = row.get("custom_fields") or {}
@@ -565,6 +582,21 @@ async def commit_import(
         db.add(subnet)
         await db.flush()
         existing_subnets[canonical] = subnet
+        # The rows New Subnet makes (network, broadcast, gateway), so the
+        # counters and Next available never depend on which path created the
+        # subnet (#2979).
+        if takes_placeholder_rows(subnet_net):
+            await create_placeholder_rows(
+                db,
+                subnet,
+                subnet_net,
+                gateway=gateway,
+                created_by_user_id=current_user.id,
+            )
+            await db.flush()
+            await _update_utilization(db, subnet.id)
+            await db.flush()
+        touched_blocks.add(parent.id)
         db.add(
             _audit_entry(
                 current_user,
@@ -582,6 +614,12 @@ async def commit_import(
             )
         )
         result_obj.created_subnets += 1
+
+    # The block rollup follows the subnets just made (#2412 / #2981): recount
+    # each parent block, which walks up the chain.
+    await db.flush()
+    for block_id in touched_blocks:
+        await _update_block_utilization(db, block_id)
 
     logger.info(
         "ipam_import_committed",
@@ -957,7 +995,11 @@ async def commit_address_import(
     mutated. ``None`` means "no per-IP gate" (caller already proved
     subnet-wide write).
     """
-    from app.api.v1.ipam.router import _sync_dns_record
+    from app.api.v1.ipam.router import (
+        _sync_dns_record,
+        _update_block_utilization,
+        _update_utilization,
+    )
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
     from app.services.dns.sync_check import address_own_forward_zone_id
 
@@ -1014,7 +1056,6 @@ async def commit_address_import(
                 )
             seen_addr.add(canonical)
 
-    allocated_delta = 0
     for row in payload.addresses:
         canonical, fields, err = _row_address_fields(row)
         if err or canonical is None:
@@ -1126,7 +1167,6 @@ async def commit_address_import(
         db.add(new_ip)
         await db.flush()
         existing[canonical] = new_ip
-        allocated_delta += 1
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -1163,16 +1203,15 @@ async def commit_address_import(
             "the subnet or any address set you can write — nothing was imported."
         )
 
-    # Keep the subnet's utilization counters roughly honest by applying the
-    # net delta here — users expect the UI to reflect the new row count
-    # immediately. This is an estimate (a re-imported existing row bumps the
-    # delta but not the true count); the hourly
-    # ``app.tasks.ipam_utilization_recount.recount_ipam_utilization`` sweep
-    # reconciles any resulting drift against the live row count.
-    if allocated_delta:
-        subnet.allocated_ips = (subnet.allocated_ips or 0) + allocated_delta
-        if subnet.total_ips:
-            subnet.utilization_percent = round(100.0 * subnet.allocated_ips / subnet.total_ips, 2)
+    # Recount from the rows with the product's own rule (#2411), then roll the
+    # change up every block on the chain (#2981). A created ``available`` row is
+    # free and an overwritten status can move a row in or out of the count, so
+    # a running delta is not the answer.
+    if result_obj.created or result_obj.updated:
+        await db.flush()
+        await _update_utilization(db, subnet.id)
+        await db.flush()
+        await _update_block_utilization(db, subnet.block_id)
 
     logger.info(
         "ipam_address_import_committed",
