@@ -27,7 +27,7 @@ the formatter handles the rest.
 
 ## 1.0.0-beta.2 — 2026-10-28
 
-**The second 1.0.0 beta.** 417 commits since 1.0.0-beta.1, almost all
+**The second 1.0.0 beta.** 418 commits since 1.0.0-beta.1, almost all
 of them fixes found by the QA proving ground, the scale lab and the
 first beta installs. Like beta.1 it is a GitHub pre-release: no
 install is offered it in-product, and `:latest` stays where it is
@@ -489,6 +489,14 @@ under credential-shaped keys (#2015).
   each one. The code that blanked the plaintext copy on every write is gone with them.
 
 ### Fixed
+
+- **`LICENSE` now carries the Apache License 2.0 text (#2897).** It held
+  only the licence's short appendix notice, so neither the repository nor
+  anything built from it gave recipients the licence itself, as
+  Apache-2.0 §4(a) requires. It is now the verbatim text from
+  apache.org. The copyright line in `NOTICE` now reads
+  `Copyright 2026 Spatium North Inc.`; it said 2024 and named only the
+  contributors.
 
 - **Encrypted-transport text and the copilot read no longer misstate
   DoQ and PowerDNS support (#2887).** The DoQ toggle in a DNS group's
