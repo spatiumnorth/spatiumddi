@@ -24,6 +24,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 
 from app.core.dns_names import strip_control_chars
 from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._caa import caa_presentation
 from app.drivers.dns._forwarders import bind_zone_forwarders, bind_zone_tls_statement
 from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
@@ -68,6 +69,8 @@ def _render_record(zone: ZoneData, r: RecordData) -> str:
 
     if rtype == "TXT":
         rdata = _quote_txt(value)
+    elif rtype == "CAA":
+        rdata = caa_presentation(value)
     elif rtype == "MX":
         prio = r.priority if r.priority is not None else 10
         rdata = f"{prio} {value}"
@@ -468,6 +471,8 @@ class BIND9Driver(DNSDriver):
                 rdata = f"{rr.priority or 0} {rr.weight or 0} {rr.port or 0} {rr.value}"
             elif rr.record_type.upper() == "TXT":
                 rdata = _quote_txt(rr.value)
+            elif rr.record_type.upper() == "CAA":
+                rdata = caa_presentation(rr.value)
             update.add(rel_name, rr.ttl or 3600, rr.record_type, rdata)
 
         # Atomic SOA bump within the same update.

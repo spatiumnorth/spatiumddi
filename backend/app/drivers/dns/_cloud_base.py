@@ -43,6 +43,7 @@ from typing import Any
 import structlog
 
 from app.core.crypto import decrypt_dict
+from app.drivers.dns._caa import caa_presentation
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -189,6 +190,10 @@ def compose_structured_rdata(record: RecordData) -> str:
         weight = record.weight if record.weight is not None else 0
         port = record.port if record.port is not None else 0
         return f"{prio} {weight} {port} {record.value}"
+    if rtype == "CAA":
+        # Route 53 and Cloud DNS take the quoted presentation form; a bare
+        # stored value would be refused, or stored without its quotes (#2943).
+        return caa_presentation(record.value)
     return record.value
 
 

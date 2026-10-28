@@ -43,6 +43,7 @@ from typing import Any
 import structlog
 
 from app.core.dns_names import strip_control_chars
+from app.drivers.dns._caa import caa_presentation
 from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
@@ -104,6 +105,10 @@ def _record_content(rr: RecordData) -> str:
     value = strip_control_chars(rr.value)
     if rtype == "TXT":
         return _quote_txt(value)
+    if rtype == "CAA":
+        # A bare value is quoted and escaped (#2943); a zone-file reader takes
+        # the ``;`` in ``ca.org; account=1`` as a comment.
+        return caa_presentation(value)
     if rtype == "MX":
         prio = rr.priority if rr.priority is not None else 10
         return f"{prio} {value}"

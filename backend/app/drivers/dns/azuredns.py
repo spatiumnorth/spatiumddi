@@ -31,6 +31,7 @@ from typing import Any
 
 import structlog
 
+from app.drivers.dns._caa import parse_caa
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -579,8 +580,23 @@ class AzureDNSDriver(CloudDNSDriverBase):
         elif rtype == "PTR":
             params["ptr_records"] = [{"ptrdname": value}]
         elif rtype == "CAA":
-            flags, tag, caa_value = (value.split(None, 2) + ["", "", ""])[:3]
-            params["caa_records"] = [{"flags": int(flags), "tag": tag, "value": caa_value.strip()}]
+            # Azure takes the value itself, never its quoted presentation
+            # form: a stored ``0 issue "ca.org"`` would otherwise be served
+            # with the literal quotes (#2943).
+            parsed = parse_caa(value)
+            if parsed is None:
+                flags, tag, caa_value = (value.split(None, 2) + ["", "", ""])[:3]
+                params["caa_records"] = [
+                    {"flags": int(flags), "tag": tag, "value": caa_value.strip()}
+                ]
+            else:
+                params["caa_records"] = [
+                    {
+                        "flags": parsed[0],
+                        "tag": parsed[1],
+                        "value": parsed[2].decode("utf-8", errors="replace"),
+                    }
+                ]
         else:
             raise CloudDNSError(f"azure_dns: unsupported record type {rtype!r}")
         return params

@@ -50,6 +50,7 @@ import ipaddress
 import shlex
 from typing import Any
 
+from app.drivers.dns._caa import caa_text, parse_caa
 from app.drivers.dns._txt import txt_strings, txt_value
 
 # Record types both directions model. Technitium-proprietary types
@@ -597,9 +598,12 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
         extra["port"] = int_or(rdata.get("port"), 0)
         return _dotted_target(rdata.get("target")), extra
     if rtype == "CAA":
+        # Escaped: a value holding a quote or backslash must keep keying as
+        # the stored record does (#2943).
         return (
-            f"{int_or(rdata.get('flags'), 0)} {rdata.get('tag') or 'issue'} "
-            f"\"{rdata.get('value') or ''}\"",
+            caa_text(
+                int_or(rdata.get("flags"), 0), rdata.get("tag") or "issue", rdata.get("value") or ""
+            ),
             extra,
         )
     if rtype == "TLSA":
@@ -742,6 +746,13 @@ def record_params(
         }
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
+        parsed = parse_caa(value)
+        if parsed is not None:
+            return {
+                "flags": parsed[0],
+                "tag": parsed[1],
+                "value": parsed[2].decode("utf-8", errors="replace"),
+            }
         tokens = shlex.split(value)
         flags = int(tokens[0]) if tokens and tokens[0].isdigit() else 0
         tag = tokens[1] if len(tokens) > 1 else "issue"
