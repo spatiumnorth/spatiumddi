@@ -2,23 +2,38 @@
 # spatium-power-action — the one entry point for an operator-initiated
 # reboot or poweroff of an appliance node that is not the Fleet reboot
 # (#2974): the web-UI local reboot (spatiumddi-reboot.service) and the
-# console's F5 / F6.
+# console's F5 / F6 (spatium-power-action@reboot|poweroff.service, so that
+# systemd owns the run and not the console process).
 #
 # Usage: spatium-power-action reboot|poweroff
 #
 # On a cluster node holding the PostgreSQL primary, spatium-reboot-handoff
 # first hands the primary off to another node (#2849), bounded by its own
 # budgets, always exiting 0: a handoff that cannot be done never holds the
-# reboot or poweroff. Then systemctl runs. If systemctl fails the node stays
-# up, so the handoff's cordon is undone. If this script is stopped meanwhile
-# (the console's "cancel pending reboot" stops the web-UI unit) the cordon is
-# undone too. After a poweroff the cordon stays until the node is next
-# booted, where spatiumddi-reboot-handoff.service uncordons it.
+# reboot or poweroff. Those budgets add up to about 3.5 min at worst (an
+# API that answers nothing), so the handoff is also capped here, at
+# HANDOFF_CAP_S; past the cap it is stopped and the reboot or poweroff goes
+# on. A unit start timeout would not do: it stops this script, which is a
+# cancel, and a cancel does not reboot. Then systemctl runs. If systemctl
+# fails the node stays up, so the handoff's cordon is undone. If this script
+# is stopped before systemctl ran (the console's F9 "cancel reboot" stops
+# the unit) the cordon is undone too. A stop that comes once systemctl has
+# been issued is the shutdown itself stopping this unit: the cordon must
+# then stay, or the node would take pods back while it goes down. After a
+# reboot or poweroff the cordon stays until the node next boots, where
+# spatiumddi-reboot-handoff.service uncordons it; a node powered off for
+# good stays cordoned in the cluster until it is removed from it.
+#
+# While it runs, MARKER holds "<pid> <action>", so the console shows the
+# reboot or poweroff as under way and F9 can cancel it. /run is a tmpfs:
+# nothing of it outlives the reboot.
 # The Fleet path (spatiumddi-reboot-agent) does the same steps itself.
 
 set -uo pipefail
 
 HANDOFF="${SPATIUM_REBOOT_HANDOFF:-/usr/local/bin/spatium-reboot-handoff}"
+HANDOFF_CAP_S="${SPATIUM_POWER_ACTION_HANDOFF_CAP_S:-240}"
+MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -39,21 +54,52 @@ undo() {
     fi
 }
 
-stopped() {
+clear_marker() {
+    rm -f "$MARKER" 2>/dev/null || true
+}
+
+child=""
+issued=0
+
+on_signal() {
+    if [ "$issued" = 1 ]; then
+        # systemctl has been issued: this is the shutdown stopping us (or a
+        # cancel that came too late). Undoing the cordon now would hand the
+        # node pods back while it goes down, so it is left for the next boot.
+        log "stopped after systemctl $ACTION was issued: the cordon stays for the next boot"
+        return
+    fi
     log "stopped before systemctl $ACTION: the handoff's cordon is undone"
+    if [ -n "$child" ]; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
     undo
+    clear_marker
     exit 1
 }
-trap stopped TERM INT HUP
+trap on_signal TERM INT HUP
+
+printf '%s %s\n' "$$" "$ACTION" > "$MARKER" 2>/dev/null || true
 
 if [ -x "$HANDOFF" ]; then
-    "$HANDOFF" --before-reboot 2>&1 || true
+    # In the background and waited for, so a stop is acted on at once: bash
+    # runs a trap only once a foreground command has finished.
+    timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 &
+    child=$!
+    wait "$child"
+    rc=$?
+    child=""
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        log "the handoff did not finish within ${HANDOFF_CAP_S} s: stopped, going on with $ACTION"
+    fi
 fi
 
+issued=1
 log "issuing systemctl $ACTION"
-trap - TERM INT HUP
 if ! systemctl "$ACTION"; then
     log "systemctl $ACTION failed: the node stays up, so the handoff's cordon is undone"
     undo
+    clear_marker
     exit 1
 fi

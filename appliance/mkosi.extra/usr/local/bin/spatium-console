@@ -3473,7 +3473,30 @@ def reboot_pending() -> bool:
     return (
         (_RELEASE_STATE_DIR / "reboot-pending-fleet").exists()
         or (_RELEASE_STATE_DIR / "reboot-pending").exists()
+        or power_action_in_progress() is not None
     )
+
+
+#: #2974 — spatium-power-action writes "<pid> <action>" here while it runs
+#: (the handoff of the PostgreSQL primary, then systemctl). /run is a tmpfs.
+POWER_ACTION_MARKER = Path("/run/spatium-power-action")
+
+
+def power_action_in_progress() -> str | None:
+    """#2974 — "reboot" or "poweroff" while spatium-power-action runs (from
+    the web UI or F5 / F6), else None. The web-UI unit renames its trigger
+    before the handoff, so without this the console would show nothing
+    pending for the up to few minutes the handoff takes, and F9 would say
+    there is nothing to cancel. A marker whose process is gone (a wrapper
+    killed outright) counts as nothing under way. One small read, no
+    subprocess."""
+    try:
+        pid, action = POWER_ACTION_MARKER.read_text().split()[:2]
+    except (OSError, ValueError):
+        return None
+    if not pid.isdigit() or action not in ("reboot", "poweroff"):
+        return None
+    return action if os.path.exists(f"/proc/{pid}") else None
 
 
 def upgrade_status() -> tuple[str, str] | None:
@@ -4419,6 +4442,13 @@ def render_kpi_slot(state: "DashboardState") -> Panel:
             t.append(f" · {step}", style="dim")
         rows.append(t)
         border = "yellow"
+    elif (power := power_action_in_progress()) is not None:
+        # #2974 — the handoff of the PostgreSQL primary runs first (up to a
+        # few minutes on the primary's node); F9 still cancels it.
+        what = "REBOOT" if power == "reboot" else "POWER-OFF"
+        rows.append(Text(f"{what} under way — handing off DB primary · F9 cancel",
+                         style="bold bright_yellow"))
+        border = "yellow"
     elif reboot_pending():
         # #556 — F5 acks (reboots now), F9 aborts the queued reboot.
         rows.append(Text("REBOOT pending — F5 now · F9 cancel",
@@ -5042,23 +5072,45 @@ def do_login(tty_path: str) -> None:
         os.execvp("login", ["login"])
 
 
-# #2974 — reboot / poweroff go through one wrapper that hands the PostgreSQL
-# primary off to another node first (same as the web-UI and Fleet reboots).
-POWER_ACTION = "/usr/local/bin/spatium-power-action"
+# #2974 — reboot / poweroff go through one wrapper, spatium-power-action,
+# that hands the PostgreSQL primary off to another node first (as the web-UI
+# and Fleet reboots do). It runs as a systemd unit, started without waiting:
+# the handoff can take a few minutes, during which the dashboard keeps
+# rendering (the banner shows it under way, F9 cancels it), and the run
+# belongs to systemd, so a console restart cannot kill it mid-handoff and
+# leave the node cordoned with no reboot.
+POWER_ACTION_UNIT = "spatium-power-action@{}.service"
 
 
-def do_reboot(console: Console) -> None:
+def _start_power_action(console: Console, state: "DashboardState | None", action: str,
+                        label: str) -> None:
+    unit = POWER_ACTION_UNIT.format(action)
+    try:
+        res = subprocess.run(["systemctl", "start", "--no-block", unit],
+                             capture_output=True, text=True, timeout=15,
+                             check=False)
+        ok, why = res.returncode == 0, (res.stderr or res.stdout).strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        ok, why = False, str(exc)
+    if ok:
+        msg = (f"{label}: handing off the database primary first "
+               "(up to a few minutes) · F9 cancels")
+    else:
+        msg = f"{label} could not be started: {why.splitlines()[-1] if why else 'no output'}"
+    if state is not None:
+        state.flash(msg, ttl=20 if ok else 10)
+    else:
+        console.print(f"\n\n[bold yellow]{msg}[/bold yellow]\n")
+
+
+def do_reboot(console: Console, state: "DashboardState | None" = None) -> None:
     if confirm_modal(console, "Reboot the appliance now?"):
-        console.clear()
-        console.print("\n\n[bold yellow]Rebooting…[/bold yellow]\n")
-        subprocess.run([POWER_ACTION, "reboot"], check=False)
+        _start_power_action(console, state, "reboot", "Rebooting")
 
 
-def do_shutdown(console: Console) -> None:
+def do_shutdown(console: Console, state: "DashboardState | None" = None) -> None:
     if confirm_modal(console, "Power off the appliance now?"):
-        console.clear()
-        console.print("\n\n[bold yellow]Powering off…[/bold yellow]\n")
-        subprocess.run([POWER_ACTION, "poweroff"], check=False)
+        _start_power_action(console, state, "poweroff", "Powering off")
 
 
 def do_cancel_reboot(console: Console) -> None:
@@ -5073,9 +5125,14 @@ def do_cancel_reboot(console: Console) -> None:
     sleep before the reboot ExecStart) + remove the trigger so the edge-
     triggered ``.path`` unit has nothing to re-fire on.
 
-    Best-effort: if the grace already elapsed there's nothing to stop and
-    the box reboots anyway — same as before this key existed. Stopping an
-    inactive unit is a harmless no-op."""
+    #2974 — the web-UI unit and the console's F5 / F6 unit then hand the
+    PostgreSQL primary off before ``systemctl reboot`` (up to a few
+    minutes); stopping them during that makes ``spatium-power-action``
+    undo the handoff's cordon, and nothing reboots.
+
+    Best-effort: if ``systemctl reboot`` has already been issued there's
+    nothing to stop and the box reboots anyway — same as before this key
+    existed. Stopping an inactive unit is a harmless no-op."""
     if not reboot_pending():
         console.clear()
         console.print("\n\n[dim]No reboot is currently pending.[/dim]\n")
@@ -5087,9 +5144,12 @@ def do_cancel_reboot(console: Console) -> None:
     console.print("\n\n[bold yellow]Cancelling pending reboot…[/bold yellow]\n")
     # Stop both reboot services — one owns the web-UI path, the other the
     # fleet path; only one is active, and stopping the idle one is a no-op.
+    # #2974 — and the console's own F5 / F6 runs; stopping one mid-handoff
+    # makes spatium-power-action undo the handoff's cordon.
     subprocess.run(
         ["systemctl", "stop",
-         "spatiumddi-reboot.service", "spatiumddi-reboot-agent.service"],
+         "spatiumddi-reboot.service", "spatiumddi-reboot-agent.service",
+         POWER_ACTION_UNIT.format("reboot"), POWER_ACTION_UNIT.format("poweroff")],
         check=False,
     )
     # Remove the trigger(s) so reboot_pending() clears and the .path units
@@ -6267,9 +6327,9 @@ def main() -> int:
                                     _prepare_tty_for_subprocess(args.tty)
                                     do_login(args.tty)  # noreturn
                                 elif action == "reboot":
-                                    do_reboot(console)
+                                    do_reboot(console, state)
                                 elif action == "shutdown":
-                                    do_shutdown(console)
+                                    do_shutdown(console, state)
                                 elif action == "cancel_reboot":
                                     do_cancel_reboot(console)
                                 elif action == "monitor":

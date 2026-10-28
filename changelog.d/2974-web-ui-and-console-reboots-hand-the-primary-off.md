@@ -7,7 +7,13 @@
   fix removes. The web-UI local reboot and the console's F5 / F6 now run
   one wrapper, `spatium-power-action`, which runs the same handoff
   (same budgets, and a handoff that cannot be done never holds the
-  reboot or power-off), then `systemctl reboot` or `poweroff`. If that
-  fails, or the pending reboot is cancelled, the cordon is undone; after
-  a power-off the node uncordons itself at its next boot. The Fleet
-  reboot is unchanged.
+  reboot or power-off), then `systemctl reboot` or `poweroff`. On the
+  primary's node that takes up to a few minutes longer; the handoff is
+  capped at 240 s, after which the reboot goes on. The console starts
+  it as a systemd unit rather than waiting on it, so the dashboard keeps
+  rendering, shows `REBOOT under way — handing off DB primary`, and F9
+  cancels it; a cancel, or a failed `systemctl`, undoes the handoff's
+  cordon, while the stop that the shutdown itself sends does not. After
+  a reboot or power-off the node uncordons itself at its next boot; a
+  node powered off for good stays cordoned in the cluster until it is
+  removed. The Fleet reboot is unchanged.
