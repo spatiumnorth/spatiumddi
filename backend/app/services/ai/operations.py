@@ -395,6 +395,15 @@ async def _apply_create_ip_address(
     if addr_obj not in net:
         raise ValueError(f"Address {args.address} is not within subnet {subnet.network}")
 
+    # #2905 — the REST create's multicast refusal. A hostname-bearing apply
+    # reaches it through ``create_address``; this one inserts directly, so a
+    # request queued before submit learned the rule must still not land.
+    if subnet.kind == "multicast":
+        raise ValueError(
+            f"Subnet {subnet.network} is a multicast subnet — addresses are stream "
+            "identities. Create a multicast group under /multicast/groups instead."
+        )
+
     # Re-check for existing allocation under the apply transaction.
     existing = (
         await db.execute(
@@ -2247,7 +2256,7 @@ async def _preview_create_dns_record(
                 DNSRecord.deleted_at.is_(None),
             )
         )
-    ).scalar_one_or_none()
+    ).first()
     suffix = " — note: an identical record already exists" if existing else ""
 
     parts = [
@@ -2263,6 +2272,40 @@ async def _preview_create_dns_record(
     if args.port is not None:
         parts.append(f"port={args.port}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_dns_record(
+    db: AsyncSession, user: User, args: CreateDNSRecordArgs
+) -> None:
+    """Request-portal submit check: the identical-record 409 the REST create
+    and this operation's apply both make (#1230), refused while the requester
+    is still present rather than at approve (#2903)."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
+
+    rtype = args.record_type.strip().upper()
+    existing = await find_identical_record(
+        db,
+        UUID(args.zone_id),
+        view_id=None,
+        name=args.name.strip(),
+        record_type=rtype,
+        value=args.value,
+        priority=args.priority,
+        weight=args.weight if rtype == "SRV" else None,
+        port=args.port if rtype == "SRV" else None,
+    )
+    if existing is not None:
+        # The REST wording minus the existing row's id (``describe_identical``
+        # names it): the requester need not hold read on the zone's records.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An identical {existing.record_type} record {existing.fqdn} -> "
+                f"{existing.value} already exists."
+            ),
+        )
 
 
 async def _apply_create_dns_record(
@@ -2435,6 +2478,7 @@ register(
         args_model=CreateDNSRecordArgs,
         preview=_preview_create_dns_record,
         apply=_apply_create_dns_record,
+        validate_submit=_validate_submit_create_dns_record,
         category="dns",
         required_permission=("write", "dns_record"),
     )
@@ -3054,7 +3098,9 @@ async def _validate_submit_create_dhcp_static(
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:  # preview already refused; defensive
         return
-    await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
+    await check_static_conflicts(
+        db, scope, args.ip_address, args.mac_address.lower(), name_other_scope=False
+    )
 
 
 async def _apply_create_dhcp_static(

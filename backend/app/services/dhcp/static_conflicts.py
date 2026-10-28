@@ -4,7 +4,8 @@ One home for the rules the REST ``statics`` router enforces, so the
 operation apply path (request portal + copilot, #2901 / #2902) and a
 submit-time pre-check (#2903) call the same code instead of copies.
 ``check_static_conflicts`` raises a 4xx ``HTTPException`` (409 for a
-duplicate MAC in the group, 422 for a bad or out-of-subnet IP).
+duplicate MAC in the group or a duplicate IP in the scope, 422 for a bad or
+out-of-subnet IP).
 """
 
 from __future__ import annotations
@@ -21,9 +22,21 @@ from app.models.ipam import Subnet
 
 
 async def check_static_conflicts(
-    db: AsyncSession, scope: DHCPScope, ip: str, mac: str, exclude_id: uuid.UUID | None = None
+    db: AsyncSession,
+    scope: DHCPScope,
+    ip: str,
+    mac: str,
+    exclude_id: uuid.UUID | None = None,
+    *,
+    name_other_scope: bool = True,
 ) -> None:
-    """Conflict: same MAC on same group (across scopes), IP inside a reserved/dynamic pool on another scope+group."""
+    """Conflict: same MAC in the group (across scopes), same IP in the scope,
+    a malformed IP, or an IP outside the scope's subnet.
+
+    ``name_other_scope=False`` keeps the id of the scope already holding the
+    MAC out of the 409: the request portal's submitter holds read on THIS
+    scope only, and the holding scope may be one they cannot see (#2903).
+    """
     # MAC dup across every scope served by the same group
     same_mac = await db.execute(
         select(DHCPStaticAssignment)
@@ -36,18 +49,26 @@ async def check_static_conflicts(
     for row in same_mac.scalars().all():
         if exclude_id is not None and row.id == exclude_id:
             continue
+        where = f" in scope {row.scope_id}" if name_other_scope else ""
         raise HTTPException(
             status_code=409,
-            detail=f"MAC {mac} already reserved in this group in scope {row.scope_id}",
+            detail=f"MAC {mac} already reserved in this group{where}",
         )
 
+    try:
+        ip_addr = ipaddress.ip_address(ip)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid IP: {e}") from e
+
     # The same IP twice in one scope — the partial unique index
-    # ``uq_dhcp_static_scope_ip`` would refuse it anyway; naming it here gives
-    # the submit pre-check (#2903) and every other caller one legible 409.
+    # ``uq_dhcp_static_scope_ip`` (scope_id, ip_address) would refuse it
+    # anyway; naming it here gives the submit pre-check (#2903) and every
+    # other caller one legible 409. After the parse, so a malformed IP keeps
+    # its "Invalid IP" 422 instead of reaching the INET comparison.
     same_ip = await db.execute(
         select(DHCPStaticAssignment).where(
             DHCPStaticAssignment.scope_id == scope.id,
-            DHCPStaticAssignment.ip_address == ip,
+            DHCPStaticAssignment.ip_address == str(ip_addr),
         )
     )
     for row in same_ip.scalars().all():
@@ -57,11 +78,6 @@ async def check_static_conflicts(
             status_code=409,
             detail=f"IP {ip} is already reserved in this scope",
         )
-
-    try:
-        ip_addr = ipaddress.ip_address(ip)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=f"Invalid IP: {e}") from e
 
     # The reservation's IP must fall inside the scope's subnet. Kea renders the
     # reservation *nested inside* that subnet's stanza
