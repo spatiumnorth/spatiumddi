@@ -77,7 +77,7 @@ function ExtLink({ href, children }: { href: string; children: string }) {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="inline-flex items-center gap-1 text-primary hover:underline"
+      className="inline-flex min-w-0 items-center gap-1 text-primary [overflow-wrap:anywhere] hover:underline"
     >
       {children}
       <ExternalLink className="h-3 w-3" aria-hidden />
@@ -128,7 +128,10 @@ export function AboutPage() {
           <p className="text-sm text-muted-foreground">
             Open-source DNS, DHCP and IP address management, by Spatium North.
           </p>
-          <p className="font-mono text-sm" data-testid="about-version">
+          <p
+            className="break-all font-mono text-sm"
+            data-testid="about-version"
+          >
             Version {version}
           </p>
         </header>

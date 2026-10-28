@@ -408,6 +408,24 @@ data:
             proxy_set_header Host $http_host;
         }
 
+        # #2895 — the About page's legal files (NOTICE, LICENSE, the npm notice
+        # list). Labelled UTF-8 because NOTICE is not ASCII (em dashes, box
+        # drawing) and an unlabelled text/plain opened in its own tab is decoded
+        # as the browser's locale default. Exact / ``^~`` matches, never a
+        # ``\.txt$`` regex: a regex would beat the ``/api/`` prefix location and
+        # serve /api/v1/firewall-feeds/…/blocklist.txt from disk. ``=404`` rather
+        # than the SPA fallback, so a missing file is a 404, not index.html.
+        # Static files need no api, so no boot-gate sub-request either. No
+        # add_header here, so the server-level security headers still apply.
+        location = /third-party-licenses.txt {
+            charset utf-8;
+            try_files $uri =404;
+        }
+        location ^~ /legal/ {
+            charset utf-8;
+            try_files $uri =404;
+        }
+
         # Boot gate for the SPA fallback (issue #767). Mirrors
         # frontend/default.conf.template — the two must not diverge.
         # ``location /`` serves index.html off local disk, so it has no
