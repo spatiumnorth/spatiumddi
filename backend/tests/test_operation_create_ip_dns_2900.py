@@ -16,9 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
+from app.models.change_request import ChangeRequest
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
 from app.models.feature_module import FeatureModule
-from app.models.ipam import IPAddress, IPBlock, IPSpace
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services import feature_modules
 from app.services.ai.operations import CreateIPAddressArgs, get_operation
 
@@ -82,11 +83,11 @@ async def _subnet_with_zone(db: AsyncSession, client: AsyncClient, admin: User):
     return resp.json()["id"], zone, hdr
 
 
-async def _a_records(db: AsyncSession, zone: DNSZone) -> list[DNSRecord]:
+async def _a_records(db: AsyncSession, zone_id: uuid.UUID) -> list[DNSRecord]:
     return list(
         (
             await db.execute(
-                select(DNSRecord).where(DNSRecord.zone_id == zone.id, DNSRecord.record_type == "A")
+                select(DNSRecord).where(DNSRecord.zone_id == zone_id, DNSRecord.record_type == "A")
             )
         )
         .scalars()
@@ -100,6 +101,7 @@ async def test_apply_with_hostname_creates_a_record(
 ) -> None:
     admin = await _user(db_session, "admin")
     sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
+    zone_id = zone.id
     op = get_operation("create_ip_address")
     assert op is not None
     args = CreateIPAddressArgs(subnet_id=sid, address="10.98.5.10", hostname="web01")
@@ -108,7 +110,7 @@ async def test_apply_with_hostname_creates_a_record(
     assert preview.ok and f"A web01.{zone.name.rstrip('.')}" in preview.preview_text
 
     await op.apply(db_session, admin, args)
-    recs = await _a_records(db_session, zone)
+    recs = await _a_records(db_session, zone_id)
     assert [(r.name, r.value) for r in recs] == [("web01", "10.98.5.10")]
     ip = (
         await db_session.execute(
@@ -117,7 +119,7 @@ async def test_apply_with_hostname_creates_a_record(
             )
         )
     ).scalar_one()
-    assert ip.forward_zone_id == zone.id
+    assert ip.forward_zone_id == zone_id
 
 
 @pytest.mark.asyncio
@@ -126,10 +128,17 @@ async def test_apply_without_hostname_creates_no_record(
 ) -> None:
     admin = await _user(db_session, "admin")
     sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
+    zone_id = zone.id
     op = get_operation("create_ip_address")
     assert op is not None
+    subnet = await db_session.get(Subnet, uuid.UUID(sid))
+    assert subnet is not None
+    before = subnet.allocated_ips
     await op.apply(db_session, admin, CreateIPAddressArgs(subnet_id=sid, address="10.98.5.11"))
-    assert await _a_records(db_session, zone) == []
+    assert await _a_records(db_session, zone_id) == []
+    # The no-hostname insert still runs REST's utilisation update.
+    await db_session.refresh(subnet)
+    assert subnet.allocated_ips == before + 1
 
 
 @pytest.mark.asyncio
@@ -138,6 +147,7 @@ async def test_approved_portal_request_creates_a_record(
 ) -> None:
     admin = await _user(db_session, "admin")
     sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
+    zone_id = zone.id
     db_session.add(FeatureModule(id="governance.requests", enabled=True))
     await db_session.flush()
     feature_modules.invalidate_cache()
@@ -177,5 +187,47 @@ async def test_approved_portal_request_creates_a_record(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "executed"
-    recs = await _a_records(db_session, zone)
+    recs = await _a_records(db_session, zone_id)
+    assert [(r.name, r.value) for r in recs] == [("app01", "10.98.5.20")]
+    # The record op that carries it to the agent is queued, not just the row.
+    ops = (
+        (await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.zone_id == zone_id)))
+        .scalars()
+        .all()
+    )
+    assert any(o.op == "create" and (o.record or {}).get("name") == "app01" for o in ops), [
+        (o.op, o.record) for o in ops
+    ]
+
+    # A second request for the same name collides with the first (the REST
+    # FQDN check). The approve refuses, and the transaction boundary holds:
+    # no address row, no record, and the request stays pending.
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=req_hdr,
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": sid, "address": "10.98.5.21", "hostname": "app01"},
+            "justification": "Second host with a clashing name.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    rid2 = resp.json()["id"]
+    resp = await client.post(
+        f"/api/v1/requests/{rid2}/approve", headers=appr_hdr, json={"decision_note": "ok"}
+    )
+    assert resp.status_code == 409, resp.text
+    cr = await db_session.get(ChangeRequest, uuid.UUID(rid2))
+    assert cr is not None
+    await db_session.refresh(cr)
+    assert cr.state == "pending"
+    clash = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == uuid.UUID(sid), IPAddress.address == "10.98.5.21"
+            )
+        )
+    ).scalar_one_or_none()
+    assert clash is None
+    recs = await _a_records(db_session, zone_id)
     assert [(r.name, r.value) for r in recs] == [("app01", "10.98.5.20")]

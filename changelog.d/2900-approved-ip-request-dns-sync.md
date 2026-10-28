@@ -13,3 +13,7 @@
   with the reason. The preview now names the record it will publish.
   Applying a named address now also needs write on the subnet, as
   the REST create does.
+  An address without a hostname, which has no DNS to publish, now
+  also records its MAC history, gets its static-DHCP reservation
+  and updates the subnet and block utilisation, which it skipped
+  before.

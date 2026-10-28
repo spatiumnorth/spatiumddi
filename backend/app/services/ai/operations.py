@@ -417,13 +417,27 @@ async def _apply_create_ip_address(
             user,
             db,
         )
-        return {
+        named: dict[str, Any] = {
             "id": str(created.id),
             "address": args.address,
             "subnet_id": str(subnet.id),
             "status": args.status,
             "hostname": args.hostname,
         }
+        # A ``static_dhcp`` row whose reservation could not be created (an
+        # ambiguous scope, or no ``dhcp_static`` write) carries the reason;
+        # keep it on the executed request / proposal instead of dropping it.
+        warning = getattr(created, "dhcp_static_warning", None)
+        if warning:
+            named["dhcp_static_warning"] = warning
+        return named
+
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _record_mac_history,
+        _update_block_utilization,
+        _update_utilization,
+    )
+    from app.services.dhcp.static_ipam import sync_static_for_ipam_row
 
     row = IPAddress(
         subnet_id=subnet.id,
@@ -433,9 +447,17 @@ async def _apply_create_ip_address(
         fqdn=args.fqdn,
         mac_address=args.mac_address,
         description=args.description or "",
+        created_by_user_id=user.id,
     )
     db.add(row)
     await db.flush()
+
+    # #2900 — the downstream work the REST create runs that needs no
+    # hostname: MAC history, the DHCP reservation a ``static_dhcp`` row owns
+    # (#1628; gated on the acting user's ``dhcp_static`` write, warning
+    # otherwise), and the subnet / block utilisation counters.
+    await _record_mac_history(db, row.id, args.mac_address)
+    dhcp_sync = await sync_static_for_ipam_row(db, row, user=user)
 
     # Audit the apply path so the audit log captures the outcome (the
     # propose step doesn't audit — proposals can be discarded). The
@@ -457,15 +479,21 @@ async def _apply_create_ip_address(
             "via": "ai_proposal",
         },
     )
+    await db.flush()
+    await _update_utilization(db, subnet.id)
+    await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(row)
-    return {
+    result: dict[str, Any] = {
         "id": str(row.id),
         "address": args.address,
         "subnet_id": str(subnet.id),
         "status": args.status,
         "hostname": args.hostname,
     }
+    if dhcp_sync.warning:
+        result["dhcp_static_warning"] = dhcp_sync.warning
+    return result
 
 
 # ── run_nmap_scan operation ────────────────────────────────────────────
