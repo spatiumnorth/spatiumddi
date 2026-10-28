@@ -1263,7 +1263,7 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
             raise ValueError(
                 f"master {entry!r} must be a bare IPv4/IPv6 address (optionally 'ip@port')"
             ) from exc
-        if sep and (not port.isdigit() or not (1 <= int(port) <= 65535)):
+        if sep and (not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535)):
             raise ValueError(f"master {entry!r}: port must be an integer in 1..65535")
         cleaned.append(entry)
     return cleaned
@@ -4098,7 +4098,7 @@ def _plain_port_forwarders(entries: list[str] | None) -> list[str]:
     out = []
     for entry in entries or []:
         port = str(entry).partition("@")[2].strip()
-        if port.isdigit() and int(port) == 53:
+        if port.isascii() and port.isdigit() and int(port) == 53:
             out.append(entry)
     return out
 
