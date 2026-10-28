@@ -32,6 +32,7 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/docs": "OpenAPI viewer shell, no install data; fetches the spec signed in (#2935)",
     "/api/redoc": "OpenAPI viewer shell, no install data; fetches the spec signed in (#2935)",
     "/api/openapi.json": "the API schema, any signed-in caller (#2935); no install data",
+    "/api/v1/auth/openapi.json": "the API schema for the docs pages, by refresh cookie (#2935)",
     "/api/v1/auth/password-policy": f"{_PUBLIC}: the change-password screen renders the policy",
     "/api/v1/auth/providers": f"{_PUBLIC}: the login page lists sign-in buttons",
     "/api/v1/auth/{provider_id}/authorize": f"{_PUBLIC}: OIDC / SAML redirect",

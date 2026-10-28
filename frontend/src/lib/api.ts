@@ -11856,10 +11856,11 @@ export interface VersionInfo {
   product: string;
   api_level: number;
   // True for an anonymous caller: the version, release-check and appliance
-  // identity fields below are then withheld (null / false). The console only
-  // asks while signed in, so it always sees ``restricted: false``.
+  // identity fields below are then withheld (null / false), and ``version`` is
+  // the placeholder "restricted", which parseRelease reads as unknown. The
+  // console only asks while signed in, so it always sees ``restricted: false``.
   restricted: boolean;
-  version: string | null;
+  version: string;
   latest_version: string | null;
   update_available: boolean;
   latest_release_url: string | null;

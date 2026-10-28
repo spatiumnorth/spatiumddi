@@ -1170,8 +1170,11 @@ ask_role() {
 #
 # #2935 — an anonymous caller (this probe has no credential) now gets only
 # ``"product": "SpatiumDDI"`` and ``api_level``; the version itself is for
-# signed-in users. So the product name is the match, and a version string
-# is shown only when an older control plane, which still sends one, does.
+# signed-in users, and ``version`` carries the placeholder ``restricted``.
+# So the product name is the match, and a real version string is shown only
+# when an older control plane, which still sends one, does. (The placeholder
+# is what keeps an OLDER installer, which matches on ``version`` alone,
+# reporting this control plane as reachable.)
 #
 # The pairing code deliberately is NOT probed. It can only be validated
 # by claiming it, and an unauthenticated "is this code valid" endpoint
@@ -1224,7 +1227,7 @@ _probe_control_plane() {
         printf '%s' "Reachable, but the reply carries no version string. Is this the right host?"
         return 1
     fi
-    if [ -n "$ver" ]; then
+    if [ -n "$ver" ] && [ "$ver" != "restricted" ]; then
         printf 'SpatiumDDI %s%s' "$ver" "$insecure"
     else
         printf 'SpatiumDDI control plane%s' "$insecure"

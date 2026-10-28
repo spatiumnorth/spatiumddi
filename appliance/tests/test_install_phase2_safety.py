@@ -196,7 +196,13 @@ def _probe(body: str) -> str:
 @pytest.mark.parametrize(
     "body, verdict",
     [
-        # What a current control plane tells an anonymous caller (#2935).
+        # What a current control plane tells an anonymous caller (#2935):
+        # the placeholder is not presented as a version.
+        (
+            '{"product":"SpatiumDDI","api_level":1,"restricted":true,"version":"restricted"}',
+            "SpatiumDDI control plane rc=0",
+        ),
+        # Without the placeholder, the product name alone still matches.
         (
             '{"product":"SpatiumDDI","api_level":1,"restricted":true,"version":null}',
             "SpatiumDDI control plane rc=0",

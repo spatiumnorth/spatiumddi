@@ -23,14 +23,23 @@ Signed-in only (#2935). The OpenAPI document names every route and carries
 which advisories apply. ``/api/openapi.json`` is therefore served here
 behind ``CurrentUser`` rather than by FastAPI (which serves it to anyone).
 The two HTML pages stay public shells: they carry nothing but the product
-title, and they cannot authenticate on their own, because the console keeps
-its access token in memory only (#484). So ``api-docs-auth.js`` asks
-``/api/v1/auth/refresh`` for a token, which the browser's HttpOnly refresh
-cookie answers for a signed-in user — the same silent refresh a second
-console tab performs on load — and fetches the spec with it. Without a
-session the page says so and links to the sign-in page. The release asset
-``openapi.json`` (#903) is generated from ``app.openapi()`` directly and is
-unaffected; it stays the contract for client generators.
+title, and they cannot present a Bearer, because the console keeps its access
+token in memory only (#484). What a docs tab DOES share with the console is
+the HttpOnly refresh cookie, path-scoped to ``/api/v1/auth``. So the pages
+fetch the document from ``/api/v1/auth/openapi.json``, which accepts that
+cookie as the credential and **reads it without rotating it**.
+
+Not ``POST /auth/refresh``, deliberately. A refresh rotates: it revokes the
+session the console's in-memory access token is bound to, so opening the docs
+would make the console's next request 401 and refresh in turn (which then
+revokes the token the docs tab was just given), and a console refresh racing
+the docs tab's — both presenting the same cookie — loses and is bounced to
+``/login``. A read that rotates nothing has neither effect. Swagger UI's "Try
+it out" therefore carries no token until the operator uses Authorize, which is
+how it behaved before this change. Without a live session the page says so
+and links to the sign-in page. The release asset ``openapi.json`` (#903) is
+generated from ``app.openapi()`` directly and is unaffected; it stays the
+contract for client generators.
 """
 
 from __future__ import annotations
@@ -38,11 +47,13 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.deps import CurrentUser
+from app.api.deps import DB, CurrentUser
+from app.api.v1.auth.router import REFRESH_COOKIE, live_refresh_session
+from app.models.auth import User
 
 #: URL prefix of the vendored assets. The web tier routes it to the api with
 #: a ``^~`` location in both nginx configs. Without that, the static-asset
@@ -55,8 +66,14 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "api-docs"
 #: anyone at this path.
 OPENAPI_URL = "/api/openapi.json"
 
-#: The console's silent-refresh endpoint, which the pages use to get a token.
-REFRESH_URL = "/api/v1/auth/refresh"
+#: Where the docs pages fetch the document: under the refresh cookie's path
+#: (``/api/v1/auth``), so the browser sends that cookie, which this route reads
+#: without rotating (#2935).
+DOCS_SPEC_URL = "/api/v1/auth/openapi.json"
+
+#: Never cached: the document is per-session now, and a browser cache would
+#: hand it to whoever uses the machine after sign-out.
+_NO_STORE = {"Cache-Control": "no-store"}
 
 # FastAPI's get_swagger_ui_html() page, minus its inline initializer: the
 # options now live in swagger-ui-init.js, which reads the spec URL from its
@@ -75,7 +92,7 @@ _SWAGGER_UI_HTML = """<!DOCTYPE html>
 <div id="swagger-ui"></div>
 <script src="{static}/swagger-ui/swagger-ui-bundle.js"></script>
 <script src="{static}/api-docs-auth.js"></script>
-<script src="{static}/swagger-ui-init.js" data-openapi-url="{openapi_url}" data-refresh-url="{refresh_url}" data-login-url="{login_url}"></script>
+<script src="{static}/swagger-ui-init.js" data-openapi-url="{openapi_url}" data-login-url="{login_url}"></script>
 </body>
 </html>
 """
@@ -96,7 +113,7 @@ _REDOC_HTML = """<!DOCTYPE html>
 <div id="redoc-container"></div>
 <script src="{static}/redoc/redoc.standalone.js"></script>
 <script src="{static}/api-docs-auth.js"></script>
-<script src="{static}/redoc-init.js" data-openapi-url="{openapi_url}" data-refresh-url="{refresh_url}" data-login-url="{login_url}"></script>
+<script src="{static}/redoc-init.js" data-openapi-url="{openapi_url}" data-login-url="{login_url}"></script>
 </body>
 </html>
 """
@@ -115,8 +132,7 @@ def _page(request: Request, template: str, title: str) -> HTMLResponse:
         template.format(
             static=escape(root + STATIC_PATH),
             title=escape(f"{request.app.title} - {title}"),
-            openapi_url=escape(root + OPENAPI_URL),
-            refresh_url=escape(root + REFRESH_URL),
+            openapi_url=escape(root + DOCS_SPEC_URL),
             login_url=escape(root + "/login"),
         )
     )
@@ -139,11 +155,38 @@ async def openapi_document(request: Request, _: CurrentUser) -> JSONResponse:
     The same document FastAPI would serve (``app.openapi()``, including the
     generator fixes ``create_app`` wraps it with), just not to anyone.
     """
-    return JSONResponse(request.app.openapi())
+    return JSONResponse(request.app.openapi(), headers=_NO_STORE)
+
+
+@router.get(DOCS_SPEC_URL)
+async def openapi_document_for_docs_pages(request: Request, db: DB) -> JSONResponse:
+    """The OpenAPI document for ``/api/docs`` and ``/api/redoc`` (#2935).
+
+    Authenticated by the HttpOnly refresh cookie, which the browser sends
+    because this path sits under the cookie's ``/api/v1/auth`` path, and read
+    WITHOUT rotating it (see the module docstring for why that matters). The
+    session must be live by the same rule ``/auth/refresh`` applies
+    (``live_refresh_session``), and the account active and not under a
+    must-change-password gate, which every other signed-in read enforces.
+    Nothing is written: not a rotation, and not ``last_seen_at``, since
+    reading the docs is not the console being used. The cookie is
+    ``SameSite=Strict``, so another site cannot make the browser send it, and
+    a GET that only returns a document the same-origin policy keeps from
+    other origins is not a CSRF target.
+    """
+    raw = request.cookies.get(REFRESH_COOKIE)
+    session = await live_refresh_session(db, raw) if raw else None
+    user = await db.get(User, session.user_id) if session is not None else None
+    if user is None or not user.is_active or user.password_change_required:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sign in to view the API documentation",
+        )
+    return JSONResponse(request.app.openapi(), headers=_NO_STORE)
 
 
 def install_api_docs(app: FastAPI) -> None:
-    """Serve ``/api/docs``, ``/api/redoc`` and ``/api/openapi.json``.
+    """Serve ``/api/docs``, ``/api/redoc`` and the OpenAPI document routes.
 
     Create the app with ``docs_url=None, redoc_url=None, openapi_url=None``
     so FastAPI's CDN pages and its anonymous spec route are not registered

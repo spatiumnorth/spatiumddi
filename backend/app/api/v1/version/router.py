@@ -37,6 +37,17 @@ _SINGLETON_ID = 1
 #: The product name every SpatiumDDI control plane reports, signed in or not.
 PRODUCT = "SpatiumDDI"
 
+#: What ``version`` carries for an anonymous caller (#2935). A placeholder
+#: rather than null, for two readers that predate the change: an installer ISO
+#: built before it matches ``"version": "<non-empty string>"`` to decide the URL
+#: is a SpatiumDDI control plane, and with null it reports a perfectly good
+#: control plane as "NOT reachable … Is this the right host?"; and a client
+#: generated from an older ``openapi.json`` types ``version`` as a non-optional
+#: string. Not a release, so every version parser here reads it as an unknown
+#: version, never an old one (``app.core.versions`` / ``lib/versions.ts``).
+#: ``restricted`` is the machine-readable signal; this is only compatibility.
+RESTRICTED_VERSION = "restricted"
+
 #: The major version of the REST surface (the ``/api/v1`` prefix). Coarse on
 #: purpose: it changes only when a client built against v1 can no longer talk
 #: to this server, so it tells an anonymous caller nothing about patch level.
@@ -53,8 +64,8 @@ class VersionResponse(BaseModel):
     # client tell "withheld" from "no data" without guessing.
     restricted: bool
     # The running version (the image tag / env var the operator set).
-    # Null for an anonymous caller (#2935).
-    version: str | None
+    # ``RESTRICTED_VERSION`` for an anonymous caller (#2935).
+    version: str
     # GitHub release-check result. All nullable so a deployment with
     # the release check disabled (or that's never successfully checked)
     # reports a clean "no data yet" state rather than misleading zeros.
@@ -80,19 +91,21 @@ class VersionResponse(BaseModel):
 
 
 def _appliance_fields(authenticated: bool) -> dict[str, str | bool | None]:
-    """Appliance-mode signals.
+    """Appliance-mode signals, for a signed-in caller only.
 
-    SECURITY (#400 / L6): ``appliance_mode`` is a harmless boolean the
-    login page needs to decide whether to even hint at the appliance
-    surface, so it's always returned. ``appliance_version`` and
-    ``appliance_hostname`` disclose the host identity / patch level and
-    are returned ONLY to authenticated callers; anonymous callers get
-    ``None`` for both.
+    SECURITY (#400 / L6, #2935): ``appliance_version`` and
+    ``appliance_hostname`` disclose the host identity and patch level, and
+    ``appliance_mode`` the deployment shape (an OS appliance, so a Debian +
+    k3s stack). #400 L6 kept ``appliance_mode`` public on the belief that the
+    login page reads it; nothing outside the signed-in console does, so an
+    anonymous caller now gets ``False`` / ``None`` for all three.
     """
+    if not authenticated:
+        return {"appliance_mode": False, "appliance_version": None, "appliance_hostname": None}
     return {
         "appliance_mode": settings.appliance_mode,
-        "appliance_version": (settings.appliance_version or None) if authenticated else None,
-        "appliance_hostname": (settings.appliance_hostname or None) if authenticated else None,
+        "appliance_version": settings.appliance_version or None,
+        "appliance_hostname": settings.appliance_hostname or None,
     }
 
 
@@ -105,7 +118,7 @@ async def get_version(db: DB, current_user: OptionalUser) -> VersionResponse:
             product=PRODUCT,
             api_level=API_LEVEL,
             restricted=True,
-            version=None,
+            version=RESTRICTED_VERSION,
             latest_version=None,
             update_available=False,
             latest_release_url=None,

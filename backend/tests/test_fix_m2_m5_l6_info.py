@@ -238,11 +238,12 @@ async def test_version_hides_appliance_fields_when_anonymous(
     r = await client.get("/api/v1/version")
     assert r.status_code == 200, r.text
     body = r.json()
-    # Only the coarse handshake + appliance_mode flag stay public (#2935)...
+    # Only the coarse handshake stays public (#2935)...
     assert body["product"] == "SpatiumDDI"
     assert body["restricted"] is True
-    assert body["version"] is None
-    assert body["appliance_mode"] is True
+    assert body["version"] == "restricted"
+    # ...not even the deployment shape...
+    assert body["appliance_mode"] is False
     # ...but the host identity / patch level is withheld from anonymous callers.
     assert body["appliance_hostname"] is None
     assert body["appliance_version"] is None

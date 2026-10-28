@@ -83,12 +83,14 @@ feature area.
 exact running version in `info.version`, so `/api/openapi.json` needs a
 session or an API token (`Authorization: Bearer …`) and answers 401
 otherwise. The two HTML pages still load for anyone, but they carry only
-the page title: each fetches the schema with a token it gets from the
-browser's sign-in cookie (`POST /api/v1/auth/refresh`, the same silent
-refresh a second console tab makes on load). Signed in, the docs work as
-before, and "Try it out" sends that token. Signed out, the page says so and
-links to the sign-in page. From a script, fetch the schema with an API
-token:
+the page title. Each fetches the schema from `/api/v1/auth/openapi.json`,
+which accepts the browser's sign-in cookie and reads it **without rotating
+it**: a refresh (`POST /api/v1/auth/refresh`) would revoke the session the
+console tab's token belongs to, and a console refresh racing the docs
+page's would log the operator out. Signed in, the docs render as before;
+"Try it out" carries no token until you use **Authorize**, as before.
+Signed out, the page says so and links to the sign-in page. From a script,
+fetch the schema with an API token:
 
 ```bash
 curl -H "Authorization: Bearer $SPATIUM_TOKEN" https://ddi.example.com/api/openapi.json
@@ -624,14 +626,18 @@ the secret was set. Both endpoints need `read` on `audit_log`.
 for signed-in users only (#2935). An anonymous caller gets a coarse
 handshake: enough to know it reached a SpatiumDDI control plane, and
 nothing about which release. `restricted: true` says the other fields
-were withheld rather than empty:
+were withheld rather than empty. `version` carries the placeholder
+`"restricted"` rather than null, so an installer ISO built before this
+change, which checks only for a non-empty `version` string, still reports
+the control plane as reachable; it is not a release, and SpatiumDDI's own
+version parsers read it as an unknown version:
 
 ```json
 {
   "product": "SpatiumDDI",
   "api_level": 1,
   "restricted": true,
-  "version": null,
+  "version": "restricted",
   "latest_version": null,
   "update_available": false,
   "latest_release_url": null,

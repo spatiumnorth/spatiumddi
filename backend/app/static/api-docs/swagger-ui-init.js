@@ -7,9 +7,10 @@
 // (fastapi.openapi.docs.swagger_ui_default_parameters); the URLs come from
 // the page (app/api/docs.py).
 //
-// #2935 — the spec is signed-in only, so api-docs-auth.js fetches it with a
-// Bearer and it is handed to Swagger UI as an object. "Try it out" sends the
-// same token unless the operator authorises with another one.
+// #2935 — the spec is signed-in only, so api-docs-auth.js fetches it with
+// the session's refresh cookie (read, not rotated) and it is handed to
+// Swagger UI as an object. "Try it out" carries no token until the operator
+// uses Authorize, as before: this page never holds the console's token.
 (async function () {
   const script = document.currentScript;
   const target = document.getElementById("swagger-ui");
@@ -26,11 +27,5 @@
     showExtensions: true,
     showCommonExtensions: true,
     presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
-    requestInterceptor: function (req) {
-      if (!req.headers.Authorization) {
-        req.headers.Authorization = "Bearer " + loaded.token;
-      }
-      return req;
-    },
   });
 })();
