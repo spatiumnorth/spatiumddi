@@ -508,7 +508,7 @@ postgres/redis exporter** (kube-state-metrics + node-exporter are in the chart
 but `enabled: false` with nothing to scrape them). The native surfaces that
 already back the product dashboards:
 
-- `GET /health/platform` (unauth) — api/postgres/redis/celery-workers/celery-beat
+- `GET /health/platform` (with the admin token; anonymous gets the rollup `status` only, #2935) — api/postgres/redis/celery-workers/celery-beat
   dots + flags. Best always-on heartbeat.
 - `GET /api/v1/admin/postgres/{overview,connections,tables,slow-queries,schema-health}`
   (superadmin) — conns/max, cache-hit, WAL, longest-txn, by-state breakdown,

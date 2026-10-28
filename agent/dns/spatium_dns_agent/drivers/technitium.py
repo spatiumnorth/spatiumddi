@@ -4270,7 +4270,7 @@ class TechnitiumDriver(DriverBase):
         soa_changed = False
         desired_soa = apex.get("soa") or {}
         ttl = apex.get("ttl")
-        if soa is not None and (desired_soa or ttl):
+        if soa is not None and (desired_soa or ttl is not None):
             current = soa.get("rData") or {}
             current_fields: dict[str, Any] = {
                 key: str(current.get(key) or "").rstrip(".").lower()
@@ -4278,7 +4278,7 @@ class TechnitiumDriver(DriverBase):
             }
             current_fields.update({f: current.get(f) for f in _SOA_TIMERS})
             differs = any(current_fields.get(k) != v for k, v in desired_soa.items())
-            if ttl and soa.get("ttl") != ttl:
+            if ttl is not None and soa.get("ttl") != ttl:
                 differs = True
             if differs:
                 params: dict[str, Any] = {
@@ -4286,7 +4286,7 @@ class TechnitiumDriver(DriverBase):
                     "domain": zone,
                     "type": "SOA",
                     "serial": current.get("serial"),
-                    "ttl": ttl or soa.get("ttl"),
+                    "ttl": ttl if ttl is not None else soa.get("ttl"),
                     **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
                     **{f: current.get(f) for f in _SOA_TIMERS},
                 }
@@ -4345,7 +4345,7 @@ class TechnitiumDriver(DriverBase):
                         "zone": zone,
                         "domain": zone,
                         "type": "NS",
-                        "ttl": ns_ttl if ns_ttl is not None else (ttl or 3600),
+                        "ttl": ns_ttl if ns_ttl is not None else (ttl if ttl is not None else 3600),
                         "nameServer": target,
                     },
                 ).json()

@@ -286,3 +286,11 @@ def test_vultr_value_refusal_accepts_plain_values() -> None:
 def test_digitalocean_value_refusal() -> None:
     assert DigitalOceanDNSDriver.record_value_refusal("CAA", "garbage") is not None
     assert DigitalOceanDNSDriver.record_value_refusal("CAA", '128 issue "ca.org"') is None
+
+
+@pytest.mark.parametrize("stored", STORED)
+def test_drift_keys_caa_with_the_drivers_key(stored: str) -> None:
+    """Drift / Sync (#2925) and these drivers share one CAA key."""
+    from app.services.dns.pull_from_server import caa_canonical
+
+    assert caa_canonical(stored) == caa_key(stored)
