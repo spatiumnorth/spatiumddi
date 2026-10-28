@@ -1,9 +1,9 @@
 """CAA values round-trip through every driver's write and pull (#2943).
 
 store -> the driver's write payload -> the pull path -> the same key. The
-key is :func:`app.drivers.dns._caa.caa_key`, which reads a value the way
-``caa_canonical`` (#2925) does, and a test below pins the two together once
-both are on the branch.
+key is :func:`app.drivers.dns._caa.caa_key`, which ``caa_canonical`` (#2925)
+calls, so drift / Sync and the drivers share one CAA key; a test below pins
+the two together.
 """
 
 from __future__ import annotations
@@ -62,13 +62,12 @@ def test_unparseable_is_left_alone() -> None:
     assert parse_caa('0 issue "unterminated') is None
 
 
-def test_matches_caa_canonical_when_present() -> None:
-    pull = pytest.importorskip("app.services.dns.pull_from_server")
-    canonical = getattr(pull, "caa_canonical", None)
-    if canonical is None:
-        pytest.skip("caa_canonical (#2925) is not on this branch")
+def test_matches_caa_canonical() -> None:
+    """Drift / Sync (#2925) and the drivers key CAA one way."""
+    from app.services.dns.pull_from_server import caa_canonical
+
     for stored, _ in CASES:
-        assert caa_key(stored) == canonical(stored), stored
+        assert caa_key(stored) == caa_canonical(stored), stored
 
 
 # ── Azure ────────────────────────────────────────────────────────────────

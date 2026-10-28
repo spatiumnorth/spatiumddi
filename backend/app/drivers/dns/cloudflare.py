@@ -85,6 +85,15 @@ _PER_PAGE = 50
 # "let the provider decide" rather than a literal 1-second TTL.
 _TTL_AUTO = 1
 
+# Cloudflare CANNOT represent a TTL of 0 (#2942): the API accepts 1 (auto)
+# or 60-86400 (30 on Enterprise) and rejects anything else. A stored 0 is
+# therefore sent as 0, not mapped to ``_TTL_AUTO`` or a floor: only ``None``
+# means "let the provider decide", and substituting a different TTL would
+# publish a value the database does not hold. The record API refuses such a
+# TTL up front for a Cloudflare group (``PROVIDER_TTL_RANGES`` in
+# ``app.drivers.dns``), so it only reaches here from a row stored before that
+# gate or moved in from another group, and Cloudflare then refuses the write.
+
 # Types whose priority is part of the record's identity (two MX with the
 # same exchange and different preferences are two records).
 _PRIORITY_TYPES = frozenset({"MX", "SRV", "URI"})

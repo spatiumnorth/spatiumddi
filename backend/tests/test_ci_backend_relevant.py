@@ -138,6 +138,13 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/Dockerfile",
         "charts/spatiumddi/templates/frontend.yaml",
     ),
+    # #2895 — the About page's legal files sit outside the web root and both
+    # nginx configs serve them only behind the api's session check.
+    "test_about_files_gated_2895.py": (
+        "frontend/Dockerfile",
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
 }
 
 # ``parents[2]`` from backend/tests/x.py is the repo root; anything at that

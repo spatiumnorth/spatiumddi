@@ -932,6 +932,24 @@ async def preview_address_import(
     return preview
 
 
+def _count_dns_sync(result_obj: Any, canonical: str, ip: Any, published: bool) -> None:
+    """Count a row in ``dns_synced`` only when its DNS sync published something.
+
+    ``_sync_dns_record`` returns False when there is no zone to publish into
+    or the name was skipped (over 253 characters in its zone, or an owner
+    BIND's check-names refuses). Those rows are not "DNS records published"
+    (#2921); a name skipped for a reason an operator can act on is reported in
+    ``errors``, as a sync that raised is. A subnet with no zone is the normal
+    case and says nothing.
+    """
+    if published:
+        result_obj.dns_synced += 1
+        return
+    reason = getattr(ip, "_dns_skip_reason", None)
+    if reason:
+        result_obj.errors.append(f"{canonical}: DNS record not published: {reason}")
+
+
 async def commit_address_import(
     db: AsyncSession,
     payload: ParsedPayload,
@@ -1079,27 +1097,35 @@ async def commit_address_import(
                 if existing_ip.hostname and not had_hostname:
                     # Hostname was just assigned — publish new DNS record.
                     try:
-                        await _sync_dns_record(
-                            db,
+                        _count_dns_sync(
+                            result_obj,
+                            canonical,
                             existing_ip,
-                            subnet,
-                            zone_id=await address_own_forward_zone_id(db, existing_ip),
-                            action="create",
+                            await _sync_dns_record(
+                                db,
+                                existing_ip,
+                                subnet,
+                                zone_id=await address_own_forward_zone_id(db, existing_ip),
+                                action="create",
+                            ),
                         )
-                        result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
                 elif had_hostname and "hostname" in fields:
                     # Hostname changed — republish (sync handles update via re-create).
                     try:
-                        await _sync_dns_record(
-                            db,
+                        _count_dns_sync(
+                            result_obj,
+                            canonical,
                             existing_ip,
-                            subnet,
-                            zone_id=await address_own_forward_zone_id(db, existing_ip),
-                            action="create",
+                            await _sync_dns_record(
+                                db,
+                                existing_ip,
+                                subnet,
+                                zone_id=await address_own_forward_zone_id(db, existing_ip),
+                                action="create",
+                            ),
                         )
-                        result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
                 await _sync_dhcp(existing_ip, canonical)
@@ -1142,8 +1168,12 @@ async def commit_address_import(
         )
         if new_ip.hostname:
             try:
-                await _sync_dns_record(db, new_ip, subnet, action="create")
-                result_obj.dns_synced += 1
+                _count_dns_sync(
+                    result_obj,
+                    canonical,
+                    new_ip,
+                    await _sync_dns_record(db, new_ip, subnet, action="create"),
+                )
             except Exception as exc:  # noqa: BLE001
                 # Don't fail the whole import — user can re-run DNS Sync after.
                 result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")

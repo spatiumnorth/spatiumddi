@@ -473,7 +473,7 @@ class BIND9Driver(DNSDriver):
                 rdata = _quote_txt(rr.value)
             elif rr.record_type.upper() == "CAA":
                 rdata = caa_presentation(rr.value)
-            update.add(rel_name, rr.ttl or 3600, rr.record_type, rdata)
+            update.add(rel_name, rr.ttl if rr.ttl is not None else 3600, rr.record_type, rdata)
 
         # Atomic SOA bump within the same update.
         update.delete("@", dns.rdatatype.SOA)
