@@ -39,8 +39,13 @@ let bootstrapPromise: Promise<void> | null = null;
 
 function bootstrapAuth(): Promise<void> {
   if (bootstrapPromise) return bootstrapPromise;
-  // Shared across tabs (#2960): reloading several tabs makes one refresh.
-  bootstrapPromise = sharedRefresh(() => authApi.refresh(), null)
+  // Shared across tabs (#2960): reloading several tabs makes one refresh,
+  // which supersedes the tradeoff above wherever Web Locks + BroadcastChannel
+  // exist. A boot refresh may adopt a token another tab already minted: it is
+  // what this tab's own refresh would return from the shared cookie.
+  bootstrapPromise = sharedRefresh((signal) => authApi.refresh(signal), null, {
+    allowAdoptWithoutToken: true,
+  })
     .then((resp) => {
       // Only adopt the refreshed token if nothing else set one meanwhile.
       // An explicit login() racing this boot refresh always wins — its token
