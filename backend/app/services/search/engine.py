@@ -8,6 +8,8 @@ HTTP one, and would have missed the permission filtering added here too.
 
 from __future__ import annotations
 
+from collections import Counter
+
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -172,7 +174,10 @@ async def execute(
             # the isolation this block is here to provide.
             async with db.begin_nested():
                 got = await provider.fn(db, shape, per_type)
-                if len(got) >= per_type:
+                # Per emitted type: the custom-field pass runs one LIMITed
+                # query per type and returns them together, so its combined
+                # length can reach the cap with no single type truncated.
+                if any(n >= per_type for n in Counter(r.type for r in got).values()):
                     capped = True
                 results.extend(got)
         except Exception:  # noqa: BLE001 — one broken type must not blank the palette

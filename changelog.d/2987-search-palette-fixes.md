@@ -11,6 +11,12 @@
   `GET /search` no longer lets `total` follow `limit`: each type is fetched up
   to a fixed cap of 100, `total` counts the matches within it and the new
   `total_capped` says when it is a floor, shown as "100+ results" in the
-  palette. The IPAM address search (`q`, `hostname`, `mac`) now reuses the
-  global search's LIKE escaping and MAC normalisation, so "Select all" no
-  longer hands a widened set to the bulk actions.
+  palette; `total` is therefore a count of matches up to that cap, not of the
+  rows returned, and an API client showing "N of `total`" should show "N+"
+  when `total_capped` is set. The IPAM address search (`q`, `hostname`, `mac`)
+  now reuses the global search's LIKE escaping, so "Select all" no longer
+  hands a widened set to the bulk actions, and finds a MAC typed in any
+  notation (dashed, bare, Cisco dotted, or a partial in whole octets such as
+  `aa-bb-cc`). The match stays octet-aligned, so a hostname or address
+  fragment such as `cafe`, `123` or `10.0.5` does not also match every MAC
+  that happens to hold those digits across two octets.

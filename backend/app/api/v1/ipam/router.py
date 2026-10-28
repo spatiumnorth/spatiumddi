@@ -9070,16 +9070,46 @@ _ADDRESS_SORT_KEYS = {"address", "hostname", "status", "mac", "last_seen", "desc
 _SEARCH_IDS_CAP = 5000
 
 
-def _could_be_mac(shape: Any) -> bool:
-    if shape.is_ip or shape.is_cidr or not shape.mac_normalized:
-        return False
-    return re.fullmatch(r"[0-9a-f]+", shape.mac_normalized) is not None and bool(
-        re.fullmatch(r"[0-9a-fA-F:.\-]+", shape.raw)
-    )
+_MAC_GROUPED_RE = re.compile(r"[0-9a-f]{2}(?:([:-])[0-9a-f]{2})(?:\1[0-9a-f]{2}){0,4}")
+_MAC_CISCO_RE = re.compile(r"[0-9a-f]{4}(?:\.[0-9a-f]{4}){1,2}")
+
+
+def _mac_colon_form(q: str) -> str | None:
+    """The stored (colon) spelling of a MAC-shaped query, or None (#2991).
+
+    Only a query written the way a MAC is written counts: a full MAC in any
+    notation, or a partial one in whole octets with ``:`` / ``-`` (``aa-bb-cc``)
+    or Cisco 4-hex groups (``aabb.cc00``). Matching that colon form against
+    ``CAST(mac_address AS text)`` keeps the match octet-aligned. Bare hex and
+    digit-and-dot queries (``cafe``, ``123``, ``10.0.5``) are hostname or
+    address fragments, so they keep the plain substring match, where a colon
+    MAC can only hold them within one octet; normalising them instead would
+    match across octet boundaries and widen the set "Select all" hands to the
+    bulk actions.
+    """
+    s = q.strip().lower()
+    shape = shape_of(s)
+    if shape.is_ip or shape.is_cidr:
+        return None
+    if shape.is_mac:
+        hexs = shape.mac_normalized
+    elif _MAC_GROUPED_RE.fullmatch(s) or _MAC_CISCO_RE.fullmatch(s):
+        hexs = re.sub(r"[:\-.]", "", s)
+    else:
+        return None
+    return ":".join(hexs[i : i + 2] for i in range(0, len(hexs), 2))
 
 
 def _mac_like_condition(value: str) -> Any:
-    """Separator-insensitive, wildcard-safe MAC substring match (#2991)."""
+    """Wildcard-safe MAC substring match for the ``mac`` filter (#2991).
+
+    Octet-aligned when the value is written as a MAC; otherwise (bare hex
+    such as an OUI ``aabbcc``) separator-insensitive, since the field says
+    the operator means a MAC.
+    """
+    colon = _mac_colon_form(value)
+    if colon:
+        return sa_cast(IPAddress.mac_address, String).ilike(like_pattern(colon), escape="\\")
     norm = shape_of(value.strip()).mac_normalized
     return text(f"{IP_MAC_NORMALIZED_SQL} ILIKE :mac_norm").bindparams(
         mac_norm=f"%{escape_like(norm)}%"
@@ -9115,14 +9145,13 @@ def _address_search_conditions(
             IPAddress.fqdn.ilike(pat, escape="\\"),
             IPAddress.description.ilike(pat, escape="\\"),
         ]
-        # MAC in any separator style, as the global search does (#2991). Only
-        # for a query that can be a (partial) MAC: hex plus ``:-.`` separators
-        # and not an IP, or "10.0.0.1" would match a MAC holding "10001".
-        shape = shape_of(q.strip())
-        if _could_be_mac(shape):
-            alternatives.append(_mac_like_condition(q))
-        else:
-            alternatives.append(sa_cast(IPAddress.mac_address, String).ilike(pat, escape="\\"))
+        # A MAC in any notation, octet-aligned (#2991); see _mac_colon_form.
+        mac_q = _mac_colon_form(q)
+        alternatives.append(
+            sa_cast(IPAddress.mac_address, String).ilike(
+                like_pattern(mac_q) if mac_q else pat, escape="\\"
+            )
+        )
         conds.append(or_(*alternatives))
     return conds
 

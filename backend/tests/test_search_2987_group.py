@@ -190,3 +190,90 @@ async def test_ipam_address_search_ip_not_taken_for_mac(client, db_session):
     body = r.json()
     rows = body["items"]
     assert {x["hostname"] for x in rows} == {"a"}
+
+
+# ── #2991 review: a query that is not MAC-shaped must not widen to MACs ──
+
+
+@pytest.mark.parametrize(
+    "q,want",
+    [
+        # A partial IP: digits and dots are not a MAC, so "10.0.5" must not
+        # match a MAC whose bare hex holds "1005".
+        ("10.0.5", {"in-net"}),
+        # Bare hex that is a hostname fragment, not a MAC: across an octet
+        # boundary ("ca:fe") it is not the MAC the operator typed.
+        ("cafe", {"cafe-printer"}),
+        # Digits only: the per-subnet filter's commonest query.
+        ("123", {"h123"}),
+    ],
+)
+async def test_ipam_address_search_non_mac_query_does_not_widen(client, db_session, q, want):
+    h = await _admin(db_session)
+    sn = await _net(db_session, "10.0.0.0/16", "10.0.5.0/24")
+    other = await _net(db_session, "10.1.0.0/16", "10.1.0.0/24")
+    await _ip(db_session, sn, "10.0.5.9", host="in-net", mac="00:00:00:00:00:01")
+    await _ip(db_session, other, "10.1.0.1", host="mac-1005", mac="aa:10:05:bb:cc:dd")
+    await _ip(db_session, other, "10.1.0.2", host="cafe-printer", mac="00:00:00:00:00:02")
+    await _ip(db_session, other, "10.1.0.3", host="m-two", mac="0a:ca:fe:00:00:03")
+    await _ip(db_session, other, "10.1.0.4", host="h123", mac="00:00:00:00:00:04")
+    await _ip(db_session, other, "10.1.0.5", host="m-three", mac="0a:b1:23:00:00:05")
+    r = await client.get("/api/v1/ipam/addresses/search", params={"q": q}, headers=h)
+    assert r.status_code == 200
+    assert {x["hostname"] for x in r.json()["items"]} == want
+
+
+@pytest.mark.parametrize("q", ["aa-10-05", "aa:10:05", "AA10.05BB", "aa10.05bb.ccdd"])
+async def test_ipam_address_search_grouped_partial_mac_matches_octets(client, db_session, q):
+    h = await _admin(db_session)
+    sn = await _net(db_session, "10.1.0.0/16", "10.1.0.0/24")
+    await _ip(db_session, sn, "10.1.0.1", host="mac-1005", mac="aa:10:05:bb:cc:dd")
+    await _ip(db_session, sn, "10.1.0.2", host="shifted", mac="0a:a1:00:5b:00:00")
+    r = await client.get("/api/v1/ipam/addresses/search", params={"q": q}, headers=h)
+    assert r.status_code == 200
+    assert {x["hostname"] for x in r.json()["items"]} == {"mac-1005"}
+
+
+# ── #2987 review: the cap is per type, not per provider ──────────────────
+
+
+async def test_total_capped_counts_per_type_not_per_provider(db_session, monkeypatch):
+    """The custom-field pass returns blocks and subnets from separately
+    LIMITed queries; 60 + 60 rows is two types under the cap, not one over."""
+    from app.services.search import engine
+    from app.services.search.providers import SearchProvider
+    from app.services.search.schemas import SearchResult
+
+    async def two_types(_db, _s, limit):
+        return [
+            SearchResult(type=t, id=f"{t}-{i}", display=f"{t} {i}")
+            for t in ("block", "subnet")
+            for i in range(min(60, limit))
+        ]
+
+    async def _nothing(_db, _s, _limit):
+        return []
+
+    async def one_type_full(_db, _s, limit):
+        return [SearchResult(type="space", id=f"sp-{i}", display=f"sp {i}") for i in range(limit)]
+
+    user = User(username="cap-test", is_superadmin=True, is_active=True)
+
+    monkeypatch.setattr(
+        engine,
+        "PROVIDERS",
+        [
+            SearchProvider("block", "B", "ipam", ("ip_block",), two_types),
+            SearchProvider("subnet", "S", "ipam", ("subnet",), _nothing),
+        ],
+    )
+    resp = await engine.execute(db_session, user, "anything")
+    assert resp.total == 120
+    assert resp.total_capped is False
+
+    monkeypatch.setattr(
+        engine, "PROVIDERS", [SearchProvider("space", "S", "ipam", ("ip_space",), one_type_full)]
+    )
+    resp = await engine.execute(db_session, user, "anything")
+    assert resp.total == engine.FETCH_CAP
+    assert resp.total_capped is True
