@@ -231,8 +231,8 @@ services:
   frontend:
     image: spatiumddi-frontend:dev
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend/Dockerfile
     restart: unless-stopped
     networks:
       - spatiumddi

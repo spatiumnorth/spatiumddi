@@ -2970,6 +2970,11 @@ export interface BackupManifestPreviewResponse {
   /** True only for a custom-format dump — the one shape the API accepts
    *  a selective restore of. */
   selective_restore_supported?: boolean;
+  /** False when the restore itself would refuse this archive (no dump, no
+   *  secrets.enc, a newer format_version); `restore_refusal` says why.
+   *  Absent from a server older than #2949. */
+  restorable?: boolean;
+  restore_refusal?: string | null;
 }
 
 export const backupApi = {
@@ -5845,7 +5850,8 @@ export interface ZoneServerStateEntry {
   // #2042 — ops for this zone the server has not acknowledged yet.
   pending_ops: number;
   // #2316 — `ok` counts; `unreachable` (server not active) never counts as in
-  // sync; `paused` (maintenance) is excluded from the count.
+  // sync; `paused` (maintenance) and `disabled` (is_enabled false, #2927) are
+  // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
 }
@@ -9046,6 +9052,10 @@ export interface DHCPRateBucket {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPServerStatsResponse {
@@ -11819,6 +11829,10 @@ export interface DHCPMetricsPoint {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPMetricsSeries {
@@ -14062,7 +14076,11 @@ export interface ClusterWorkloadHealth {
   kind: string | null;
   ready: number;
   total: number;
+  /** Lifetime total: informational only. */
   restarts: number;
+  /** #2945 — containers restarted in the last 15 min; drives the amber. */
+  recent_restarts?: number;
+  last_restart_at?: string | null;
   /** Job pods still running for this component (#1213), e.g. a CNPG
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;

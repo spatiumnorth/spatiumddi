@@ -272,6 +272,25 @@ def test_an_edit_elsewhere_does_not_move_this_image(repo: Path):
     assert after == before
 
 
+def test_a_notice_edit_moves_the_frontend_image(repo: Path):
+    """#2895 — the frontend image copies the root NOTICE and LICENSE into the
+    About page, so an edit to either is a frontend input like any file under
+    ``frontend/``, and must not move the api image."""
+    (repo / "NOTICE").write_text("v1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add NOTICE")
+    fe_before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-frontend")
+    api_before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
+    time.sleep(1.1)
+    (repo / "NOTICE").write_text("v2\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "touch NOTICE")
+    fe_after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-frontend")
+    api_after, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/spatiumddi-api")
+    assert fe_after > fe_before
+    assert api_after == api_before
+
+
 def test_a_bind9_only_change_does_not_move_powerdns(repo: Path):
     before, _ = _inputs_mtime(repo, "ghcr.io/spatiumnorth/dns-powerdns")
     time.sleep(1.1)
