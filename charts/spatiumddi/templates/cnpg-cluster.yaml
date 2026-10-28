@@ -159,8 +159,9 @@ spec:
     storageClass: {{ . | quote }}
     {{- end }}
 
+  # #2955 — the memory limit holds the derived max_connections.
   resources:
-    {{- toYaml .Values.postgresql.resources | nindent 4 }}
+    {{- include "spatiumddi.postgresResources" . | nindent 4 }}
 
   {{- /* CNPG nests nodeSelector + tolerations + pod anti-affinity under
          spec.affinity. Inline the standard control-plane label merge from

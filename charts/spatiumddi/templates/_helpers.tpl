@@ -807,3 +807,83 @@ Postgres StatefulSet and by the CNPG Cluster whenever the operator leaves
 {{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" }}{{ $senders = sub (int .Values.postgresql.cnpg.instances) 1 }}{{ end -}}
 {{- add $api $worker 3 $senders 10 -}}
 {{- end }}
+
+{{/*
+#2955 — Postgres ``shared_buffers`` in MiB: the CNPG parameter (kB / MB / GB /
+TB, or a bare count of 8 kB pages, as Postgres reads it), else the image's
+own 128MB, which the standalone StatefulSet does not override.
+*/}}
+{{- define "spatiumddi.postgresSharedBuffersMiB" -}}
+{{- $sb := 128 -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" -}}
+{{- $raw := toString ((.Values.postgresql.cnpg.parameters | default dict).shared_buffers | default "128MB") | trim -}}
+{{- $n := regexFind "^[0-9]+" $raw | int -}}
+{{- $unit := regexFind "[A-Za-z]+$" $raw -}}
+{{- if eq $unit "kB" }}{{ $sb = div $n 1024 }}
+{{- else if eq $unit "MB" }}{{ $sb = $n }}
+{{- else if eq $unit "GB" }}{{ $sb = mul $n 1024 }}
+{{- else if eq $unit "TB" }}{{ $sb = mul $n 1048576 }}
+{{- else if eq $unit "" }}{{ $sb = div (mul $n 8) 1024 }}
+{{- else }}{{ fail (printf "postgresql.cnpg.parameters.shared_buffers %q: use kB, MB, GB or TB" $raw) }}
+{{- end -}}
+{{- end -}}
+{{- $sb -}}
+{{- end }}
+
+{{/*
+#2955 — a Kubernetes memory quantity in MiB (rounded down), or -1 when it is
+not one this helper reads (an exponent form, say), in which case the caller
+leaves the operator's value alone.
+*/}}
+{{- define "spatiumddi.quantityMiB" -}}
+{{- $q := toString . | trim -}}
+{{- $n := regexFind "^[0-9]+" $q | int64 -}}
+{{- $unit := trimPrefix (regexFind "^[0-9]+" $q) $q -}}
+{{- $mib := -1 -}}
+{{- if eq $unit "Ki" }}{{ $mib = div $n 1024 }}
+{{- else if eq $unit "Mi" }}{{ $mib = $n }}
+{{- else if eq $unit "Gi" }}{{ $mib = mul $n 1024 }}
+{{- else if eq $unit "Ti" }}{{ $mib = mul $n 1048576 }}
+{{- else if eq $unit "k" }}{{ $mib = div (mul $n 1000) 1048576 }}
+{{- else if eq $unit "M" }}{{ $mib = div (mul $n 1000000) 1048576 }}
+{{- else if eq $unit "G" }}{{ $mib = div (mul $n 1000000000) 1048576 }}
+{{- else if eq $unit "" }}{{ $mib = div $n 1048576 }}
+{{- end -}}
+{{- $mib -}}
+{{- end }}
+
+{{/*
+#2955 — ``postgresql.resources`` with the memory LIMIT raised, when needed, to
+hold the connections the chart derived. Postgres' shared memory per slot is
+small; what a limit has to carry is the backends themselves, ~14 MiB of
+private memory each under load (measured, #2156, with transparent huge pages)
+plus the page tables mapping shared_buffers (shared_buffers / 512). So the
+limit is never below shared_buffers + 256 MiB + max_connections x
+(14 + shared_buffers / 512) MiB: the rule the appliance's supervisor applies
+(``k8s_api.control_plane_sizing``). Only RAISED, only when the chart derived
+max_connections (an operator or the appliance that sets max_connections owns
+the memory too), never added where no limit is set, and the request is left
+alone (scheduling is unchanged: a limit is a ceiling, not a reservation).
+Args: the root context.
+*/}}
+{{- define "spatiumddi.postgresResources" -}}
+{{- $res := deepCopy (.Values.postgresql.resources | default dict) -}}
+{{- $derived := false -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" -}}
+{{- $derived = not (.Values.postgresql.cnpg.parameters | default dict).max_connections -}}
+{{- else -}}
+{{- $derived = not .Values.postgresql.maxConnections -}}
+{{- end -}}
+{{- $limits := $res.limits | default dict -}}
+{{- if and $derived $limits.memory -}}
+{{- $sb := include "spatiumddi.postgresSharedBuffersMiB" . | int -}}
+{{- $conns := include "spatiumddi.postgresMaxConnections" . | int -}}
+{{- $need := add $sb 256 (mul $conns (add 14 (div (add $sb 511) 512))) -}}
+{{- $have := include "spatiumddi.quantityMiB" $limits.memory | int -}}
+{{- if and (ge $have 0) (lt $have $need) -}}
+{{- $_ := set $limits "memory" (printf "%dMi" $need) -}}
+{{- $_ := set $res "limits" $limits -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $res -}}
+{{- end }}

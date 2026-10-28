@@ -92,8 +92,9 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
+          # #2955 — the memory limit holds the derived max_connections.
           resources:
-            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+            {{- include "spatiumddi.postgresResources" . | nindent 12 }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.postgresql.nodeSelector) .) | nindent 6 }}
       {{- with .Values.postgresql.tolerations }}
       tolerations:

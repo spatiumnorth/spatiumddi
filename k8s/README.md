@@ -57,7 +57,7 @@ kubectl run postgres --image=postgres:16-alpine -n spatiumddi \
   --env=POSTGRES_USER=spatiumddi \
   --env=POSTGRES_PASSWORD=CHANGEME \
   --env=POSTGRES_DB=spatiumddi \
-  -- postgres -c max_connections=371   # see "Postgres connection budget" below
+  -- postgres -c max_connections=369   # see "Postgres connection budget" below
 # Give it a Service under the name DATABASE_URL expects. In the HA
 # path CNPG creates `postgres-rw` itself; here the expose creates it
 # (#1547 — a bare `kubectl run` pod has no Service at all).
@@ -187,10 +187,17 @@ The api count is the HPA's `maxReplicas` (10). Defaults: 10 x (30 + 3) = 330,
 worker 2 x (4 x 3 + 1) = 26, beat 3, 2 WAL senders, 10 reserve = **371**,
 which is what `k8s/ha/postgres-cluster.yaml` sets (it was 200, under the 330
 the api alone can open at the HPA maximum). Changing `max_connections` on
-CloudNativePG rolls the instances; on a standalone Postgres it restarts it.
-Postgres reserves memory per connection, so check the instance's memory limit
-if you raise it further. The CI chart gate (`chart-postgres-connections.py`)
-holds the Helm chart to this rule.
+CloudNativePG rolls the instances; on a standalone Postgres it restarts it. A
+single Postgres with no WAL senders (the `kubectl run` above) needs 369.
+
+Memory: a busy backend costs ~14 MiB of private memory (measured, #2156), so a
+Postgres that can hold 371 connections needs shared_buffers + 256 MiB + 371 x
+(14 + shared_buffers / 512) MiB, about 6 GiB at 256MB of shared_buffers, when
+all of them are in use. `k8s/ha/postgres-cluster.yaml` sets no `resources`, so
+the instances are bounded only by their node; if you add a memory limit, size
+it from that formula (the umbrella chart raises its own limit this way while it
+derives `max_connections`). The CI chart gate (`chart-postgres-connections.py`)
+holds the Helm chart to both.
 
 ### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
