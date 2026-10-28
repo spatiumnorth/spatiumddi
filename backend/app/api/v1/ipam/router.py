@@ -89,6 +89,11 @@ from app.services.dns.sync_check import (
     resolve_reverse_zone,
 )
 from app.services.feature_modules import is_module_enabled, require_module
+from app.services.ipam.address_create_rules import (
+    assert_address_unallocated,
+    assert_static_dhcp_has_mac,
+    assert_subnet_takes_addresses,
+)
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -9257,15 +9262,7 @@ async def create_address(
     # Multicast subnets don't allocate per-IP endpoint rows. Use the
     # multicast group registry under ``/multicast/groups`` instead —
     # the address there is a stream identity, not an endpoint.
-    if subnet.kind == "multicast":
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "This is a multicast subnet — addresses are stream identities. "
-                "Create a multicast group under /multicast/groups instead of an "
-                "IPAM address row."
-            ),
-        )
+    assert_subnet_takes_addresses(subnet)
 
     # Validate address belongs to subnet
     try:
@@ -9298,24 +9295,10 @@ async def create_address(
         )
 
     # MAC address required for static_dhcp
-    if body.status == "static_dhcp" and not body.mac_address:
-        raise HTTPException(
-            status_code=422,
-            detail="mac_address is required when status is 'static_dhcp'",
-        )
+    assert_static_dhcp_has_mac(body.status, body.mac_address)
 
     # Check address not already in use
-    existing = await db.scalar(
-        select(func.count())
-        .select_from(IPAddress)
-        .where(IPAddress.subnet_id == subnet_id)
-        .where(IPAddress.address == body.address)
-    )
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Address {body.address} is already allocated in this subnet",
-        )
+    await assert_address_unallocated(db, subnet_id, body.address)
 
     # GHSA-875w — a zone named in the body must be one the token may write.
     await _enforce_zone_token_scope(
