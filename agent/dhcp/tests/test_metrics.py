@@ -16,9 +16,12 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-import spatium_dhcp_agent.metrics as m
 from spatium_dhcp_agent.config import AgentConfig
-from spatium_dhcp_agent.metrics import MetricsPoller, _parse_snapshot
+from spatium_dhcp_agent.metrics import (
+    MetricsPoller,
+    _parse_snapshot,
+    arrival_age_seconds,
+)
 
 
 def _snapshot(values: dict[str, int]) -> dict:
@@ -519,7 +522,7 @@ def _simulate(tmp_path, monkeypatch, sim, minutes, age=None):
     p = _poller(tmp_path)
     sink: list = []
     monkeypatch.setattr(p, "_client", lambda: _FakeClient(sink))
-    monkeypatch.setattr(m.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr("spatium_dhcp_agent.metrics.random.uniform", lambda a, b: 0.0)
     if age is not None:
         monkeypatch.setattr(p, "_arrival_age", lambda: age)
     opened = {"done": False}
@@ -572,7 +575,7 @@ def test_case3_packets_in_flight_at_two_reads_are_not_evictions(tmp_path, monkey
     """The walk's case 3: a serving node at ~100 requests/s, Kea stalls
     253 ms just before consecutive snapshots, so ~25 packets are still
     waiting each time. Nothing is evicted; the bucket must read 0."""
-    age = m.arrival_age_seconds(1024)
+    age = arrival_age_seconds(1024)
     sim = _SimKea(rate=100, service=700, stalls=_stalls_before_reads(age, n=8))
     out = _simulate(tmp_path, monkeypatch, sim, minutes=8)
     assert sim.evicted == 0
