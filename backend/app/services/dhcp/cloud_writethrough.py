@@ -27,6 +27,7 @@ from app.drivers.dhcp._cloud_base import CloudDHCPAdoptionError
 from app.drivers.dhcp.base import PoolDef, ScopeDef, StaticAssignmentDef
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.ipam import Subnet
+from app.services.dhcp.option_validation import canonical_domain_options
 
 logger = structlog.get_logger(__name__)
 
@@ -119,7 +120,7 @@ async def build_scope_def(
             name=p.name or "",
             class_restriction=p.class_restriction,
             lease_time_override=p.lease_time_override,
-            options_override=p.options_override or None,
+            options_override=canonical_domain_options(p.options_override) or None,
         )
         for p in pool_rows
     )
@@ -129,7 +130,7 @@ async def build_scope_def(
             mac_address=str(s.mac_address),
             hostname=s.hostname or "",
             client_id=s.client_id,
-            options_override=s.options_override or None,
+            options_override=canonical_domain_options(s.options_override) or None,
         )
         for s in static_rows
     )
@@ -138,7 +139,7 @@ async def build_scope_def(
         lease_time=scope.lease_time,
         min_lease_time=scope.min_lease_time,
         max_lease_time=scope.max_lease_time,
-        options=dict(scope.options or {}),
+        options=canonical_domain_options(scope.options),
         pools=pools,
         statics=statics,
         is_active=scope.is_active,

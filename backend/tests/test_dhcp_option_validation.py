@@ -480,3 +480,70 @@ async def test_a_kea_scope_refuses_opt_nn_on_every_write_path(
         resp = await getattr(client, method)(url, headers=h, json=body)
         assert resp.status_code == 422, (url, resp.text)
         assert "use code:252" in str(resp.json()["detail"]), (url, resp.text)
+
+
+# ── #2924: the domain options are stored and served in DNS form ──────────────
+
+
+def test_domain_options_take_validate_fqdns_dns_form() -> None:
+    from app.services.dhcp.option_validation import canonical_domain_options, normalize_options
+
+    got = normalize_options(
+        {"domain-name": "Cafe-é.example.test.", "domain-search": ["Cafe-é.test.", "XP.Test."]}
+    )
+    assert got["domain-name"] == "xn--cafe--fsa.example.test"
+    assert got["domain-search"] == ["xn--cafe--fsa.test", "xp.test"]
+    # the list form of the editor, and a comma-separated string, both normalise
+    listed = normalize_options([{"code": 15, "name": "domain-name", "value": "A.Test."}])
+    assert listed["domain-name"] == "a.test"
+    assert canonical_domain_options({"domain-search": "A.Test., B.Test"})["domain-search"] == (
+        "a.test, b.test"
+    )
+    # idempotent; other options and unusable values are untouched (positive controls)
+    again = canonical_domain_options(got)
+    assert again == got
+    odd = {"domain-name": "bad name!", "routers": ["192.0.2.1"], "mtu": 1500}
+    assert canonical_domain_options(odd) == odd
+
+
+async def test_scope_domain_options_are_stored_in_dns_form_and_rendered_so(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.services.dhcp.config_bundle import build_config_bundle
+
+    h = await _headers(db_session)
+    subnet, grp = await _subnet_and_group(db_session)
+    legacy = DHCPScope(
+        subnet_id=subnet.id,
+        group_id=grp.id,
+        name="legacy",
+        options={"domain-name": "Cafe-é.example.test."},
+    )
+    srv = DHCPServer(
+        name=f"s-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host="127.0.0.1",
+        port=67,
+        server_group_id=grp.id,
+    )
+    db_session.add_all([legacy, srv])
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet.id}/dhcp-scopes",
+        headers=h,
+        json={
+            "group_id": str(grp.id),
+            "options": {"domain-name": "Cafe-é.example.test.", "domain-search": ["Cafe-é.test."]},
+        },
+    )
+    assert resp.status_code in (201, 409), resp.text
+    if resp.status_code == 201:
+        got = (await client.get(f"/api/v1/dhcp/scopes/{resp.json()['id']}", headers=h)).json()
+        assert got["options"]["domain-name"] == "xn--cafe--fsa.example.test"
+        assert got["options"]["domain-search"] == ["xn--cafe--fsa.test"]
+
+    # a row stored before the fix is still served in DNS form
+    bundle = await build_config_bundle(db_session, srv)
+    names = [sc.options.get("domain-name") for sc in bundle.scopes if sc.options]
+    assert names and all(n == "xn--cafe--fsa.example.test" for n in names)

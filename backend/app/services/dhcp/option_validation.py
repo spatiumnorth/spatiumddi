@@ -268,7 +268,59 @@ def _describe_code(code: int) -> str:
     return f"option {code} ({known.name})" if known else f"option {code}"
 
 
+_FQDN_OPTION_KEYS = ("domain-name", "domain-search")
+
+
+def _canonical_fqdn(value: Any) -> Any:
+    """``validate_fqdn``'s DNS form of one value, or the value untouched.
+
+    Lenient on purpose: a value ``validate_fqdn`` refuses (stored before the
+    write check existed, #597) is returned as it is, so this never raises at
+    render time and a round-tripped grandfathered value still compares equal.
+    A list stays a list; a comma-separated string stays one string.
+    """
+    if isinstance(value, list):
+        return [_canonical_fqdn(v) for v in value]
+    if not isinstance(value, str):
+        return value
+    parts = [p.strip() for p in value.split(",")] if "," in value else [value]
+    out: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            out.append(validate_fqdn(part, field="value"))
+        except ValueError:
+            return value
+    return ", ".join(out) if out else value
+
+
+def canonical_domain_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Copy of ``options`` with ``domain-name`` / ``domain-search`` in the DNS
+    form ``validate_fqdn`` returns (IDNA A-labels, lower case, no root dot, #2924).
+
+    Kea and Windows serve these strings to clients verbatim, and the zones the
+    product stores for the same name are A-labels, so the two must agree. Used
+    at write time (``normalize_options``) and again at render time, so rows
+    stored before the fix are served in the same form without a migration.
+    """
+    out = dict(options or {})
+    for key in _FQDN_OPTION_KEYS:
+        if key in out and not _is_unset(out[key]):
+            out[key] = _canonical_fqdn(out[key])
+    return out
+
+
 def normalize_options(raw: Any, *, raw_codes: str = "code") -> dict[str, Any]:
+    """Accept ``{name: value}`` or ``[{code, name, value}, …]``; return a mapping.
+
+    The domain options come back in their DNS form (see
+    ``canonical_domain_options``).
+    """
+    return canonical_domain_options(_normalize_options_raw(raw, raw_codes=raw_codes))
+
+
+def _normalize_options_raw(raw: Any, *, raw_codes: str = "code") -> dict[str, Any]:
     """Accept ``{name: value}`` or ``[{code, name, value}, …]``; return a mapping.
 
     Does not validate. A list entry is keyed by its name when that name is one

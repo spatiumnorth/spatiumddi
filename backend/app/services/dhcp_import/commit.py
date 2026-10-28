@@ -44,7 +44,7 @@ from app.models.dhcp import (
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.class_refs import reserved_name_reason
 from app.services.dhcp.option_spelling import group_raw_codes
-from app.services.dhcp.option_validation import rekey_raw_options
+from app.services.dhcp.option_validation import canonical_domain_options, rekey_raw_options
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 from app.services.import_savepoint import entity_savepoint
 
@@ -293,7 +293,7 @@ def _scope_kwargs(
         lease_time=parsed.lease_time,
         min_lease_time=parsed.min_lease_time,
         max_lease_time=parsed.max_lease_time,
-        options=dict(parsed.options or {}),
+        options=canonical_domain_options(parsed.options),
         ddns_enabled=parsed.ddns_enabled,
         ddns_hostname_policy=parsed.ddns_hostname_policy or "client",
         import_source=source,
@@ -405,7 +405,7 @@ async def _commit_one_scope(
                 mac_address=r.mac_address,
                 hostname=r.hostname or "",
                 client_id=r.client_id,
-                options_override=dict(r.options) if r.options else None,
+                options_override=canonical_domain_options(r.options) if r.options else None,
                 import_source=source,
                 imported_at=now,
             )
@@ -495,7 +495,7 @@ async def _commit_client_classes(
                     match_expression=cc.match_expression or "",
                     description=cc.description or "",
                     address_family=cc.address_family or "ipv4",
-                    options=dict(cc.options or {}),
+                    options=canonical_domain_options(cc.options),
                     import_source=source,
                     imported_at=now,
                 )
