@@ -25,6 +25,19 @@
 #                             specific IP by setting this env var
 #                             explicitly.
 
+# ── /health + /metrics rate limit (#2944) ─────────────────────────
+# /health/ready and /health/platform are unauthenticated and each call runs
+# database and Redis checks; /health/ready has a single database connection
+# of its own, so a flood through this proxy could queue the kubelet's probe
+# behind it. One bucket per client address: $binary_remote_addr is read
+# after the real_ip module has rewritten it, so behind a proxy listed in
+# FRONTEND_TRUSTED_PROXY_CIDRS each end client gets its own bucket (an
+# unlisted proxy shares one bucket for everyone behind it). 5 r/s with a
+# burst of 20 is far above any poller: the dashboard asks every 30 s and a
+# Prometheus scrape is usually every 15 s. The kubelet probes the api
+# pod directly, not through here.
+limit_req_zone $binary_remote_addr zone=spatium_health:1m rate=5r/s;
+
 # ── Reverse proxy in front of this nginx (#1868) ───────────────────
 # FRONTEND_TRUSTED_PROXY_CIDRS (rendered into the two ${...} blocks below by
 # 16-trusted-proxies.envsh) names the TCP peers that are an operator's
@@ -435,6 +448,9 @@ ${SPATIUM_REAL_IP_FROM}
 
     # Proxy health and metrics endpoints to api for admin probes.
     location ~ ^/(health|metrics) {
+        # #2944 — see limit_req_zone at the top of this file.
+        limit_req zone=spatium_health burst=20 nodelay;
+        limit_req_status 429;
         set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass $api_upstream;
         proxy_set_header Host $http_host;
