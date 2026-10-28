@@ -9,7 +9,9 @@ re-registration never moves a row, by design; #1565).
 
 The checks are the ones the DHCP server PUT applies to a group change: Kea and
 Windows DHCP cannot share a group, and a Windows server cannot take a group
-that holds v6 scopes. They raise ``HTTPException`` (the Fleet PUT lets it
+that holds v6 scopes. Plus one of its own: a Kea pod on an appliance node joins
+the MetalLB relay VIP Service, so it cannot join a ``direct``-mode group while a
+relay VIP is set (#2899). They raise ``HTTPException`` (the Fleet PUT lets it
 through unchanged); the Copilot turns it into a refusal of the whole proposal.
 """
 
@@ -19,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,6 +70,15 @@ async def move_appliance_dhcp_servers(
         _assert_driver_mix_allowed,
         _assert_no_v6_scopes_for_windows,
     )
+    from app.services.dhcp.relay_vip import appliance_join_refusal  # noqa: PLC0415
+
+    # #2899 — before the per-server loop, which an appliance whose agent has
+    # not registered yet never enters: the pointer alone puts its Kea pod
+    # behind the relay VIP Service.
+    if appliance.assigned_dhcp_group_id != dhcp_group.id:
+        refusal = await appliance_join_refusal(db, appliance, dhcp_group, roles)
+        if refusal is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
 
     result = DhcpMoveResult()
     for dserver in await appliance_own_dhcp_servers(db, appliance, roles):

@@ -623,7 +623,9 @@ class FindControlPlaneVipArgs(BaseModel):
         "#272). Returns whether MetalLB is enabled, the L2 address pool, "
         "the floating control-plane VIP that fronts the Web UI across "
         "control-plane nodes, and the data-plane resolver VIPs (DNS :53 "
-        "and DHCP relay :67). Read-only — changing a VIP "
+        "and DHCP relay :67), plus any DHCP server group the relay VIP "
+        "fronts that is still in direct (raw socket) mode — those lose "
+        "relays landing on the announcing node. Read-only — changing a VIP "
         "is a high-blast-radius operation (it can sever Web UI / agent / "
         "resolver reachability) and is done in Fleet → Control plane, "
         "not via the Copilot."
@@ -649,13 +651,19 @@ async def find_control_plane_vip(
             "control_plane_vip": "",
             "dns_vip": "",
             "dhcp_relay_vip": "",
+            "dhcp_relay_vip_direct_groups": [],
         }
+    from app.services.dhcp.relay_vip import direct_groups_behind_relay_vip
+
     return {
         "enabled": bool(row.metallb_enabled),
         "pool_addresses": list(row.metallb_pool_addresses or []),
         "control_plane_vip": row.control_plane_vip or "",
         "dns_vip": row.dns_vip or "",
         "dhcp_relay_vip": row.dhcp_relay_vip or "",
+        # #2899 — groups the relay VIP fronts that still read raw sockets;
+        # relays landing on the announcing node get no answer from them.
+        "dhcp_relay_vip_direct_groups": [g.name for g in await direct_groups_behind_relay_vip(db)],
     }
 
 

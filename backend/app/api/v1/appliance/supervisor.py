@@ -6658,6 +6658,11 @@ class MetalLBConfigResponse(BaseModel):
     # :53; ``dhcp_relay_vip`` fronts the Kea relay→server :67 forward.
     dns_vip: str = ""
     dhcp_relay_vip: str = ""
+    # #2899 — DHCP server groups behind the relay VIP that are still in
+    # ``direct`` (raw socket) mode, by name. Relays whose flows land on the
+    # node announcing the VIP get no answer from such a group, and no counter
+    # shows it. Empty when no relay VIP is set or every group is ``relay``.
+    dhcp_relay_vip_direct_groups: list[str] = Field(default_factory=list)
     # issue #566 decision D1 — BGP mode (export path: advertise the VIP
     # to upstream routers). Layered on top of the same MetalLB install;
     # requires ``enabled=True``.
@@ -6713,14 +6718,18 @@ def _metallb_pod_status() -> tuple[bool, int, int]:
     return (controller_ready, speakers_ready, speakers_total)
 
 
-def _metallb_response(row: PlatformSettings) -> MetalLBConfigResponse:
+async def _metallb_response(db: DB, row: PlatformSettings) -> MetalLBConfigResponse:
+    from app.services.dhcp.relay_vip import direct_groups_behind_relay_vip  # noqa: PLC0415
+
     controller_ready, speakers_ready, speakers_total = _metallb_pod_status()
+    direct_groups = await direct_groups_behind_relay_vip(db)
     return MetalLBConfigResponse(
         enabled=row.metallb_enabled,
         pool_addresses=list(row.metallb_pool_addresses or []),
         control_plane_vip=row.control_plane_vip or "",
         dns_vip=row.dns_vip or "",
         dhcp_relay_vip=row.dhcp_relay_vip or "",
+        dhcp_relay_vip_direct_groups=[g.name for g in direct_groups],
         bgp_enabled=row.metallb_bgp_enabled,
         bgp_peers=row.metallb_bgp_peers or [],
         bgp_advertisements=row.metallb_bgp_advertisements or [],
@@ -6864,7 +6873,7 @@ async def get_metallb_config(
     db: DB,
 ) -> MetalLBConfigResponse:
     row = await _get_or_create_settings(db)
-    return _metallb_response(row)
+    return await _metallb_response(db, row)
 
 
 @router.put(
@@ -6898,6 +6907,27 @@ async def put_metallb_config(
         "bgp_peers": list(row.metallb_bgp_peers or []),
         "bgp_advertisements": list(row.metallb_bgp_advertisements or []),
     }
+    # #2899 — refuse to START fronting DHCP groups with the relay VIP while
+    # any of them reads raw sockets: kube-proxy keeps about one relay in N on
+    # the announcing node's own Kea, whose raw socket drops the VIP-addressed
+    # frame, so those relays get no answer and nothing counts the loss.
+    # Only when the VIP is being turned on: a later edit to an unrelated field
+    # (a BGP peer, the pool) is not blocked on a state the operator already
+    # has, which the ``dhcp_relay_vip_direct_socket`` alert reports instead.
+    from app.services.dhcp.relay_vip import (  # noqa: PLC0415
+        direct_groups_behind_relay_vip,
+        effective_relay_vip,
+        refusal_for_groups,
+    )
+
+    new_relay_vip = body.dhcp_relay_vip if body.enabled else ""
+    if new_relay_vip and not effective_relay_vip(row):
+        direct = await direct_groups_behind_relay_vip(db, new_relay_vip)
+        if direct:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                refusal_for_groups(new_relay_vip, [g.name for g in direct]),
+            )
     row.metallb_enabled = body.enabled
     row.metallb_pool_addresses = body.pool_addresses
     row.control_plane_vip = body.control_plane_vip
@@ -6938,7 +6968,7 @@ async def put_metallb_config(
         vip=body.control_plane_vip,
         user=current_user.username,
     )
-    return _metallb_response(row)
+    return await _metallb_response(db, row)
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────

@@ -707,8 +707,10 @@ state on its heartbeat:
   selects every engine's pods, so the VIP follows an engine switch,
   #1510) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
-  relay→server unicast forward — Kea keeps `hostNetwork` for
-  direct-attached broadcast). Both live on the same `platform_settings`
+  relay→server unicast forward — Kea keeps `hostNetwork`, but every DHCP
+  group behind the VIP must use `relay` client reachability, or relays
+  landing on the announcing node get no answer; see
+  [DHCP.md](../features/DHCP.md) §Client reachability, #2899). Both live on the same `platform_settings`
   singleton + the `…/control-plane/metallb` endpoint; the seed merges
   them into the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
   `dns.vip` / `dhcpKea.relayVIP`) via

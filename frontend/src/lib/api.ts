@@ -12570,6 +12570,10 @@ export interface MetalLBConfig {
   // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
   dns_vip?: string;
   dhcp_relay_vip?: string;
+  // #2899 — DHCP server groups the relay VIP fronts that are still in
+  // direct (raw socket) mode. Relays landing on the node announcing the
+  // VIP get no answer from them. Read-only; not sent on PUT.
+  dhcp_relay_vip_direct_groups?: string[];
   // issue #566 decision D1 — BGP mode. Layered on top of the same
   // MetalLB install; requires `enabled: true`. bgp_advertisements is
   // auto-derived server-side when omitted (see the backend cross-field
