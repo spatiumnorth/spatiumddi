@@ -2736,10 +2736,14 @@ export function ZoneModal({
   const [customerId, setCustomerId] = useState<string | null>(
     zone?.customer_id ?? null,
   );
+  // The route takes read on 'manage_domains': a user without it is not asked
+  // (#2926), and the select says the list is not available.
+  const canReadDomains = usePermissions().can("read", "manage_domains");
   const { data: domainList } = useQuery({
     queryKey: ["domains-picker"],
     queryFn: () => domainsApi.list({ page_size: 500 }),
     staleTime: 60_000,
+    enabled: canReadDomains,
   });
   const [error, setError] = useState("");
   // #2075 — a Primary NS that is not a host name is refused, as the API does.
@@ -3097,6 +3101,7 @@ export function ZoneModal({
             className={inputCls}
             value={domainId ?? ""}
             onChange={(e) => setDomainId(e.target.value || null)}
+            disabled={!canReadDomains}
           >
             <option value="">— Auto-match by zone name —</option>
             {(domainList?.items ?? []).map((d) => (
@@ -3110,6 +3115,8 @@ export function ZoneModal({
             Pin to a tracked domain registration so the Domain detail page
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
+            {!canReadDomains &&
+              " The domain list is not available to your account (it needs read on domains), so only auto-match is offered."}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -3522,9 +3529,15 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   // #2316 — a paused (maintenance) server is shown separately and left out
   // of the count; a server that is not active is counted, but never as in
   // sync, whatever serial it reported before it went away.
-  const paused = state.servers.filter(
-    (s) => s.freshness === "paused" || s.freshness === "disabled",
-  );
+  const paused = state.servers.filter((s) => s.freshness === "paused");
+  const disabled = state.servers.filter((s) => s.freshness === "disabled");
+  const notActive = paused.length + disabled.length;
+  const notActiveText = [
+    paused.length > 0 ? `${paused.length} paused` : "",
+    disabled.length > 0 ? `${disabled.length} disabled` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const down = state.servers.filter((s) => s.freshness === "unreachable");
   const counted = state.servers.filter(
     (s) => s.freshness !== "paused" && s.freshness !== "disabled",
@@ -3558,7 +3571,7 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   let cls = "bg-muted/40 text-muted-foreground";
   let label = "not reported";
   if (total === 0) {
-    label = `${paused.length} paused`;
+    label = notActiveText;
   } else if (reported.length === 0 && down.length === 0) {
     // noop — keep muted
   } else if (state.in_sync) {
@@ -3571,7 +3584,7 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
     label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
     if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
-  if (total > 0 && paused.length > 0) label += ` · ${paused.length} paused`;
+  if (total > 0 && notActive > 0) label += ` · ${notActiveText}`;
   return (
     <span
       className={cn(
