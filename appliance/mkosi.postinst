@@ -459,6 +459,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-clear-shutdown-pods.service
 # off first (spatiumddi-reboot-agent); this uncordons the node at its boot.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-reboot-handoff"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-handoff.service"
+# #2865: releases the control chart firstboot held back during a cluster
+# Rolling Upgrade, once the run's hold ends. Started by firstboot only.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-control-release"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-control-release.service"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user
