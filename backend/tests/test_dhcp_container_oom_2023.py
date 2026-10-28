@@ -46,7 +46,6 @@ def _role_health(
     running_since: datetime | None,
     reason: str = "OOMKilled",
     service: str = "dhcp-kea",
-    restarts: int = 4,
 ) -> dict[str, Any]:
     """The supervisor watchdog's report for a role container, in the shape
     ``watchdog.container_runtime`` produces from the pod status."""
@@ -57,7 +56,7 @@ def _role_health(
             "since": _iso(killed_at),
             "container_id": f"{service}-abcde",
             "container": {
-                "restart_count": restarts,
+                "restart_count": 4,
                 "running_since": _iso(running_since) if running_since else None,
                 "last_termination": {
                     "reason": reason,
@@ -234,10 +233,7 @@ async def test_a_container_that_ended_for_another_reason_is_not_an_oom(
     await db_session.commit()
 
     rh = _role_health(
-        killed_at=datetime.now(UTC) - timedelta(minutes=2),
-        running_since=None,
-        reason="Error",
-        restarts=1,
+        killed_at=datetime.now(UTC) - timedelta(minutes=2), running_since=None, reason="Error"
     )
     await _supervisor_hb(client, appliance, token, rh)
     await _agent_hb(client, headers, {"status": "ok"})

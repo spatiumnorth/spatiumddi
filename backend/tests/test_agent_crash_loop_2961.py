@@ -20,9 +20,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPServer
 from app.services.agents.container_oom import (
+    RESTART_HISTORY_KEY,
     agent_silent_report,
+    carry_restart_history,
     container_crash_loop_report,
+    container_verdict,
+    daemon_reported_by,
     reason_source,
+    restarts_in_window,
 )
 from app.services.agents.daemon_state import (
     STATUS_DEGRADED,
@@ -44,53 +49,119 @@ from tests.test_dhcp_container_oom_2023 import (
 _RULE = SimpleNamespace(severity="critical")
 
 
+def _history(*points: tuple[datetime, int]) -> list[dict[str, Any]]:
+    return [{"at": _iso(at), "n": n} for at, n in points]
+
+
 def _loop(
     now: datetime,
     *,
-    restarts: int = 6,
+    restarts: int = 7,
     ended_ago: timedelta = timedelta(minutes=1),
     status: str = "unhealthy",
     running_since: datetime | None = None,
     reason: str = "Error",
+    history: list[tuple[datetime, int]] | None = None,
 ) -> dict[str, Any]:
-    rh = _role_health(
-        killed_at=now - ended_ago,
-        running_since=running_since,
-        reason=reason,
-        restarts=restarts,
-    )
-    rh["dhcp-kea"]["status"] = status
-    rh["dhcp-kea"]["since"] = _iso(now - timedelta(minutes=6))
+    """A role_health entry as stored after the backend has watched it.
+    ``history`` defaults to the #2188 drill: count 1 before the window, then
+    six restarts in four minutes."""
+    rh = _role_health(killed_at=now - ended_ago, running_since=running_since, reason=reason)
+    entry = rh["dhcp-kea"]
+    entry["status"] = status
+    entry["since"] = _iso(now - timedelta(minutes=6))
+    entry["container"]["restart_count"] = restarts
+    if history is None:
+        history = [
+            (now - timedelta(minutes=20), 1),
+            (now - timedelta(minutes=5), 3),
+            (now - timedelta(minutes=4), 4),
+            (now - timedelta(minutes=2), restarts),
+        ]
+    entry[RESTART_HISTORY_KEY] = _history(*history)
     return rh
 
 
+async def _seed(db: AsyncSession, appliance: Any, rh: dict[str, Any]) -> None:
+    """Store ``rh`` (with its history) as the appliance's last role_health,
+    as earlier supervisor heartbeats would have left it."""
+    appl = await db.get(type(appliance), appliance.id)
+    assert appl is not None
+    appl.role_health = rh
+    await db.commit()
+
+
 def test_a_crash_loop_names_its_evidence() -> None:
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
     got = container_crash_loop_report(_loop(now), "kea", now)
     assert got is not None
     report, since = got
     assert report["status"] == STATUS_DEGRADED
     reason = report["reason"]
     assert reason.startswith("crash_loop:")
-    assert "restarted 6 times" in reason
+    assert "6 restarts in the last 15 min" in reason
+    assert "lifetime restart count 7" in reason
     assert "reason Error" in reason and "exit code 137" in reason
-    assert since == (now - timedelta(minutes=6)).replace(microsecond=0)
+    # The grace runs from when it became a loop (the third restart seen).
+    assert since == now - timedelta(minutes=4)
     assert reason_source(reason) == "supervisor"
 
 
 @pytest.mark.parametrize(
     "kw",
     [
-        {"restarts": 1},  # one restart is not a loop
-        {"restarts": 2},
-        {"ended_ago": timedelta(hours=2)},  # old history
+        # One restart in the window, whatever the lifetime count: a node
+        # reboot / slot upgrade restarts every container on the node once.
+        {"history": "reboot"},
+        {"history": "two"},  # two restarts in the window
+        {"history": "old"},  # three restarts, but before the window
+        {"history": "first_sight"},  # never watched before: no baseline
         {"status": "healthy"},  # settled pod
         {"reason": "OOMKilled"},  # the OOM verdict's, not this one's
     ],
 )
 def test_it_is_not_a_crash_loop(kw: dict[str, Any]) -> None:
     now = datetime.now(UTC)
+    shapes = {
+        "reboot": [(now - timedelta(minutes=40), 6), (now - timedelta(minutes=1), 7)],
+        "two": [(now - timedelta(minutes=20), 5), (now - timedelta(minutes=3), 7)],
+        "old": [(now - timedelta(minutes=40), 4), (now - timedelta(minutes=20), 7)],
+        "first_sight": [(now - timedelta(minutes=1), 7)],
+    }
+    if "history" in kw:
+        kw = {"history": shapes[kw["history"]]}
     assert container_crash_loop_report(_loop(now, **kw), "kea", now) is None
+
+
+def test_a_reboot_of_a_container_with_a_high_lifetime_count_is_not_a_loop() -> None:
+    """#2928 / #2945: lifetime restartCount grows with every reboot. Just after
+    one, the container is restarted, recently ended and not yet ready (a big
+    RPZ zone set may hold it in its startup probe for many minutes), with a
+    lifetime count well above 3. That is one restart, not a loop."""
+    now = datetime.now(UTC)
+    rh = _loop(
+        now,
+        restarts=12,
+        status="starting",
+        running_since=now - timedelta(seconds=40),
+        ended_ago=timedelta(minutes=1),
+        history=[(now - timedelta(hours=3), 11), (now - timedelta(seconds=30), 12)],
+    )
+    for minutes in (0, 3, 6, 9):
+        assert container_crash_loop_report(rh, "kea", now + timedelta(minutes=minutes)) is None
+    # Nor is the agent "silent": its container started 40 s ago.
+    assert container_verdict(rh, "kea", now - timedelta(minutes=5), now) is None
+
+
+def test_an_oom_with_many_restarts_stays_an_oom() -> None:
+    """A loop whose last termination the kubelet calls OOMKilled is the OOM
+    verdict's, with its own advice, never a generic crash loop."""
+    now = datetime.now(UTC)
+    rh = _loop(now, reason="OOMKilled")
+    got = container_verdict(rh, "kea", now - timedelta(minutes=10), now)
+    assert got is not None
+    assert got[0]["reason"].startswith("oom_killed:")
+    assert container_crash_loop_report(rh, "kea", now) is None
 
 
 def test_a_container_that_has_stayed_up_is_not_a_crash_loop() -> None:
@@ -100,16 +171,64 @@ def test_a_container_that_has_stayed_up_is_not_a_crash_loop() -> None:
     assert container_crash_loop_report(_loop(now), "windows_dhcp", now) is None
 
 
+def test_restart_history_is_measured_across_heartbeats() -> None:
+    t0 = datetime.now(UTC).replace(microsecond=0)
+
+    def hb(count: int, *, pod: str = "dhcp-kea-abcde") -> dict[str, Any]:
+        rh = _role_health(killed_at=t0, running_since=None, reason="Error")
+        rh["dhcp-kea"]["container"]["restart_count"] = count
+        rh["dhcp-kea"]["container_id"] = pod
+        # Whatever the supervisor sends under the backend's key is dropped.
+        rh["dhcp-kea"][RESTART_HISTORY_KEY] = _history((t0 - timedelta(hours=1), 0))
+        return rh
+
+    stored = carry_restart_history(None, hb(1), t0)
+    assert stored["dhcp-kea"][RESTART_HISTORY_KEY] == _history((t0, 1))
+    # An unchanged count (the watchdog snapshot is cached) adds nothing.
+    stored = carry_restart_history(stored, hb(1), t0 + timedelta(seconds=30))
+    assert len(stored["dhcp-kea"][RESTART_HISTORY_KEY]) == 1
+    # The drill: six restarts in four minutes.
+    for i, n in enumerate((3, 4, 7), start=1):
+        stored = carry_restart_history(stored, hb(n), t0 + timedelta(minutes=i))
+    stored["dhcp-kea"]["status"] = "unhealthy"
+    assert restarts_in_window(stored, "kea", t0 + timedelta(minutes=3)) == (
+        6,
+        t0 + timedelta(minutes=2),
+    )
+    # Twenty minutes later the old points fall out of the window, the last
+    # one before it kept as the baseline.
+    later = t0 + timedelta(minutes=25)
+    stored = carry_restart_history(stored, hb(7), later)
+    assert restarts_in_window(stored, "kea", later) == (0, None)
+    assert len(stored["dhcp-kea"][RESTART_HISTORY_KEY]) == 1
+    # A new pod starts its own history (its count starts again at 0).
+    stored = carry_restart_history(stored, hb(0, pod="dhcp-kea-fghij"), later)
+    assert stored["dhcp-kea"][RESTART_HISTORY_KEY] == _history((later, 0))
+
+
 def test_a_silent_agent_needs_the_threshold_and_a_manager() -> None:
     now = datetime.now(UTC)
-    rh = _loop(now, status="healthy", restarts=1)
+    rh = _loop(now, status="healthy", restarts=1, history=[])
     assert agent_silent_report(rh, "kea", now - timedelta(seconds=60), now) is None
     assert agent_silent_report(rh, "kea", None, now) is None  # never reported: unknown
     assert agent_silent_report({}, "kea", now - timedelta(hours=1), now) is None
     got = agent_silent_report(rh, "kea", now - timedelta(minutes=4), now)
     assert got is not None
     assert got[0]["reason"].startswith("agent_unreachable:")
-    assert "restarted 1 time," in got[0]["reason"]
+    assert "lifetime restart count 1," in got[0]["reason"]
+    # The grace runs from when the supervisor saw it, not the last heartbeat.
+    assert got[1] == now
+
+
+def test_a_just_restarted_container_gets_the_whole_silence_threshold() -> None:
+    """After a reboot or slot upgrade the agent's last heartbeat is from before
+    the node went down; the restarted container's agent must get the whole
+    threshold, counted from the container's start."""
+    now = datetime.now(UTC)
+    rh = _loop(now, status="starting", restarts=5, running_since=now - timedelta(seconds=90))
+    assert agent_silent_report(rh, "kea", now - timedelta(minutes=12), now) is None
+    rh2 = _loop(now, status="starting", restarts=5, running_since=now - timedelta(minutes=4))
+    assert agent_silent_report(rh2, "kea", now - timedelta(minutes=12), now) is not None
 
 
 async def test_a_crash_loop_fires_after_the_grace_and_recovery_resolves(
@@ -120,27 +239,33 @@ async def test_a_crash_loop_fires_after_the_grace_and_recovery_resolves(
     await db_session.commit()
     now = datetime.now(UTC).replace(microsecond=0)
 
+    # What the control plane has already watched: the drill's six restarts.
+    await _seed(db_session, appliance, _loop(now))
     await _supervisor_hb(client, appliance, token, _loop(now))
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_DEGRADED
     assert (row.daemon_reason or "").startswith("crash_loop:")
     assert is_not_serving(row.daemon_status, row.daemon_reason) is True
-    assert row.daemon_status_since == now - timedelta(minutes=6)
+    assert daemon_reported_by(row.daemon_status, row.daemon_reason) == "supervisor"
+    assert row.daemon_status_since == now - timedelta(minutes=4)
 
     # The restarted agent saying ``ok`` between crashes does not hide it.
     await _agent_hb(client, headers, {"status": "ok"})
     assert (await _reload(db_session, server.id)).daemon_status == STATUS_DEGRADED
 
-    matches = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, now)
+    matches = await _matching_agent_daemon_degraded_subjects(
+        db_session, _RULE, now + timedelta(minutes=2)
+    )
     hit = [m for m in matches if m[0] == f"dhcp_server:{server.id}"]
     assert len(hit) == 1
     msg = hit[0][2]
     assert "Supervisor reported: crash_loop:" in msg
     assert "The agent is heartbeating" not in msg and "Agent reported" not in msg
 
-    # Not before the grace: a loop first seen 2 minutes ago is not yet an alert.
+    # Not before the grace: a loop established 4 minutes ago is not an alert
+    # one minute earlier.
     early = await _matching_agent_daemon_degraded_subjects(
-        db_session, _RULE, now - timedelta(minutes=4)
+        db_session, _RULE, now - timedelta(minutes=1)
     )
     assert f"dhcp_server:{server.id}" not in {m[0] for m in early}
 
@@ -157,26 +282,84 @@ async def test_a_crash_loop_fires_after_the_grace_and_recovery_resolves(
     await _agent_hb(client, headers, {"status": "ok"})
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_OK and row.daemon_reason is None
-    after = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, now)
+    after = await _matching_agent_daemon_degraded_subjects(
+        db_session, _RULE, now + timedelta(minutes=2)
+    )
     assert f"dhcp_server:{server.id}" not in {m[0] for m in after}
 
 
 async def test_a_single_restart_raises_nothing(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    """The reboot shape over HTTP: a container with a lifetime count of 6 is
+    restarted once (the node rebooted), ended a minute ago and is not ready
+    yet. Nothing is stamped, whatever the lifetime count."""
     appliance, token = await _appliance(db_session, "ddi-loop-2")
     server, headers = await _kea_server(db_session, host="ddi-loop-2", appliance_id=appliance.id)
     await db_session.commit()
     now = datetime.now(UTC)
-
-    await _supervisor_hb(client, appliance, token, _loop(now, restarts=1))
+    before = _loop(now, restarts=6, history=[(now - timedelta(hours=2), 6)])
+    await _seed(db_session, appliance, before)
+    after = _loop(now, restarts=7, status="starting", running_since=now - timedelta(seconds=50))
+    await _supervisor_hb(client, appliance, token, after)
     await _agent_hb(client, headers, {"status": "ok"})
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_OK
+    appl = await db_session.get(type(appliance), appliance.id)
+    assert appl is not None
+    await db_session.refresh(appl)
+    # The heartbeat recorded the one restart it saw (and dropped the history
+    # the "supervisor" sent).
+    hist = appl.role_health["dhcp-kea"][RESTART_HISTORY_KEY]
+    assert [h["n"] for h in hist] == [6, 7]
     matches = await _matching_agent_daemon_degraded_subjects(
         db_session, _RULE, now + timedelta(minutes=30)
     )
     assert f"dhcp_server:{server.id}" not in {m[0] for m in matches}
+
+
+async def test_the_drill_over_successive_heartbeats(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2188 case 4 as the control plane sees it: supervisor heartbeats whose
+    restartCount climbs 1 -> 3 -> 4 -> 7. The third restart observed makes it
+    a loop; the stamp is not written before it."""
+    appliance, token = await _appliance(db_session, "ddi-loop-8")
+    server, headers = await _kea_server(db_session, host="ddi-loop-8", appliance_id=appliance.id)
+    await db_session.commit()
+    now = datetime.now(UTC).replace(microsecond=0)
+    await _seed(
+        db_session, appliance, _loop(now, restarts=1, history=[(now - timedelta(minutes=20), 1)])
+    )
+
+    seen: list[str | None] = []
+    for n in (3, 4, 7):
+        await _supervisor_hb(
+            client, appliance, token, _loop(now, restarts=n, status="unhealthy", history=[])
+        )
+        seen.append((await _reload(db_session, server.id)).daemon_reason)
+    assert not (seen[0] or "").startswith("crash_loop:")  # two restarts
+    assert (seen[1] or "").startswith("crash_loop:")  # three
+    assert "6 restarts in the last 15 min" in (seen[2] or "")
+
+
+async def test_an_oom_loop_with_many_restarts_reads_as_an_oom(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    appliance, token = await _appliance(db_session, "ddi-loop-9")
+    server, headers = await _kea_server(db_session, host="ddi-loop-9", appliance_id=appliance.id)
+    await db_session.commit()
+    now = datetime.now(UTC).replace(microsecond=0)
+    await _seed(db_session, appliance, _loop(now, reason="OOMKilled"))
+    await _supervisor_hb(client, appliance, token, _loop(now, reason="OOMKilled"))
+    await _agent_hb(client, headers, {"status": "ok"})
+    row = await _reload(db_session, server.id)
+    assert row.daemon_status == STATUS_DEGRADED
+    assert (row.daemon_reason or "").startswith("oom_killed:")
+    # A later termination the kubelet calls Error does not demote it.
+    await _supervisor_hb(client, appliance, token, _loop(now, restarts=8))
+    row = await _reload(db_session, server.id)
+    assert (row.daemon_reason or "").startswith("oom_killed:")
 
 
 async def test_unreachable_under_a_live_supervisor_fires_after_the_threshold(
@@ -191,7 +374,7 @@ async def test_unreachable_under_a_live_supervisor_fires_after_the_threshold(
         last_seen_at=now - timedelta(seconds=60),
     )
     await db_session.commit()
-    rh = _loop(now, status="healthy", restarts=0)
+    rh = _loop(now, status="healthy", restarts=0, history=[])
 
     # 60 s of silence is a blip: nothing is written.
     await _supervisor_hb(client, appliance, token, rh)
@@ -208,22 +391,23 @@ async def test_unreachable_under_a_live_supervisor_fires_after_the_threshold(
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_DEGRADED
     assert (row.daemon_reason or "").startswith("agent_unreachable:")
-    assert row.daemon_status_since == silent_since
-
-    # The alert's grace runs from the start of the silence, and its wording
-    # says the agent is NOT heartbeating.
-    matches = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, now)
-    hit = [m for m in matches if m[0] == f"dhcp_server:{server.id}"]
-    assert len(hit) == 1 and "The agent is not heartbeating" in hit[0][2]
-    young = await _matching_agent_daemon_degraded_subjects(
-        db_session, _RULE, silent_since + timedelta(minutes=4)
-    )
+    # The grace runs from when the supervisor first SAW the silence, not from
+    # the agent's last heartbeat: a supervisor that was itself down (a
+    # rebooting node) must not stamp a silence whose grace is already spent.
+    since = row.daemon_status_since
+    assert since is not None and since >= now
+    young = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, since)
     assert f"dhcp_server:{server.id}" not in {m[0] for m in young}
+    late = since + timedelta(minutes=6)
+    matches = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, late)
+    hit = [m for m in matches if m[0] == f"dhcp_server:{server.id}"]
+    # Its wording says the agent is NOT heartbeating.
+    assert len(hit) == 1 and "The agent is not heartbeating" in hit[0][2]
 
     # The agent coming back says ``ok`` and the alert resolves.
     await _agent_hb(client, headers, {"status": "ok"})
     assert (await _reload(db_session, server.id)).daemon_status == STATUS_OK
-    after = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, now)
+    after = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, late)
     assert f"dhcp_server:{server.id}" not in {m[0] for m in after}
 
 
@@ -240,7 +424,7 @@ async def test_a_paused_server_is_never_called_silent(
     server.maintenance_mode = True
     await db_session.commit()
     await _supervisor_hb(
-        client, appliance, token, _loop(datetime.now(UTC), status="healthy", restarts=0)
+        client, appliance, token, _loop(datetime.now(UTC), status="healthy", restarts=0, history=[])
     )
     assert (await _reload(db_session, server.id)).daemon_status == STATUS_OK
 
@@ -342,3 +526,52 @@ async def test_the_health_sweeps_no_longer_leave_a_stale_ok(
     assert kea2 is not None and dns2 is not None
     assert kea2.status == "unreachable" and kea2.daemon_status is None
     assert dns2.status == "unreachable" and dns2.daemon_status is None
+
+
+@pytest.mark.parametrize(
+    ("reason", "source"),
+    [
+        # The agents' own records (agent/dns oom_watch, agent/dhcp oom_watch).
+        ("oom_killed: named was killed for exceeding 512Mi (once, last at x)", "agent"),
+        (
+            "oom_killed: Kea was killed by the OOM killer in the DHCP container for "
+            "exceeding 1Gi",
+            "agent",
+        ),
+        (
+            "oom_killed: the OOM killer fired in the DHCP container (Kea, almost "
+            "certainly) for exceeding 1Gi",
+            "agent",
+        ),
+        ("start deferred, no bundle yet", "agent"),
+        ("config_apply_reverted: named-checkconf failed", "agent"),
+        ("", "agent"),
+        # The supervisor's verdicts.
+        ("crash_loop: the dhcp-kea container (Kea ...) is crash-looping", "supervisor"),
+        ("agent_unreachable: the agent in the dns-bind9 container ...", "supervisor"),
+    ],
+)
+def test_reason_source_reads_every_prefix(reason: str, source: str) -> None:
+    assert reason_source(reason) == source
+
+
+@pytest.mark.parametrize(
+    ("driver", "service"),
+    [
+        ("bind9", "dns-bind9"),
+        ("powerdns", "dns-powerdns"),
+        ("technitium", "dns-technitium"),
+        ("kea", "dhcp-kea"),
+    ],
+)
+def test_every_kubelet_oom_reads_as_the_supervisor(driver: str, service: str) -> None:
+    from app.services.agents.container_oom import container_oom_report
+
+    now = datetime.now(UTC)
+    rh = _role_health(killed_at=now - timedelta(minutes=1), running_since=None, service=service)
+    rep = container_oom_report(rh, driver, now)
+    assert rep is not None
+    assert reason_source(rep[0]["reason"]) == "supervisor"
+    assert daemon_reported_by(STATUS_DEGRADED, rep[0]["reason"]) == "supervisor"
+    assert daemon_reported_by(STATUS_OK, None) is None
+    assert daemon_reported_by(None, None) is None

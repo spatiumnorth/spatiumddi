@@ -124,6 +124,7 @@ from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
 from app.services.agents.container_oom import (
     apply_container_oom,
+    carry_restart_history,
     verdict_needs_write,
 )
 from app.services.appliance.apt import apt_bundle
@@ -2630,7 +2631,13 @@ async def _supervisor_heartbeat(
         # entries when the operator removes a role, and the
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
-        row.role_health = dict(body.role_health)
+        # #2961 — the kubelet's restartCount is lifetime, so the restarts
+        # inside the crash-loop window are measured across heartbeats: each
+        # container's observed counts are carried forward from the stored
+        # row (a backend-owned key; one the supervisor sends is dropped).
+        row.role_health = carry_restart_history(
+            row.role_health, dict(body.role_health), datetime.now(UTC)
+        )
         # #2018 — the kubelet's OOMKilled for a DNS role container, onto the
         # server row. The agent died in the same group kill and cannot say
         # it; while the container crash-loops this is the only report.

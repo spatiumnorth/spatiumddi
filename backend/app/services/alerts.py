@@ -4433,6 +4433,7 @@ async def _matching_agent_daemon_degraded_subjects(
     """
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.container_oom import reason_source  # noqa: PLC0415
     from app.services.agents.daemon_state import (  # noqa: PLC0415
         STATUS_OK,
         is_not_serving,
@@ -4461,8 +4462,14 @@ async def _matching_agent_daemon_degraded_subjects(
                 continue
             reason = (row.daemon_reason or "").strip()
             minutes = int((now - since).total_seconds() // 60)
+            # #2962 — "reports" only when the agent said it.
+            verb = (
+                "reads its daemon as"
+                if reason_source(reason) == "supervisor"
+                else ("reports its daemon is")
+            )
             message = (
-                f"{kind} server '{row.name}' reports its daemon is "
+                f"{kind} server '{row.name}' {verb} "
                 f"{str(row.daemon_status).replace('_', ' ')} and has for {minutes} min "
                 f"(since {since.isoformat(timespec='seconds')}). "
                 + _daemon_degraded_source_text(reason)
