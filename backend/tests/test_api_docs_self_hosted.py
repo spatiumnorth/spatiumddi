@@ -19,14 +19,20 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.docs import STATIC_DIR, STATIC_PATH
+from app.api.docs import DOCS_SPEC_URL, OPENAPI_URL, STATIC_DIR, STATIC_PATH
+from app.core.security import hash_password
 from app.main import app
+from app.models.auth import User
+
+from ._signed_in import signed_in_headers
 
 PAGES = ("/api/docs", "/api/redoc")
 
@@ -122,16 +128,49 @@ async def test_every_asset_a_docs_page_asks_for_is_served(client: AsyncClient, p
 
 
 @pytest.mark.asyncio
-async def test_swagger_ui_is_pointed_at_the_spec(client: AsyncClient) -> None:
-    """The initializer takes the spec URL from its script tag; it must be the
-    app's own openapi_url, and that document must be served."""
-    _, page = await _page(client, "/api/docs")
-    init = [s for s in page.scripts if s["src"].endswith("/swagger-ui-init.js")]
+@pytest.mark.parametrize(
+    ("path", "init_js"), [("/api/docs", "swagger-ui-init.js"), ("/api/redoc", "redoc-init.js")]
+)
+async def test_docs_page_is_pointed_at_the_spec(
+    client: AsyncClient, db_session: AsyncSession, path: str, init_js: str
+) -> None:
+    """The initializer takes the spec URL from its script tag; it must be
+    the docs pages' spec route, and that document must be served — to a
+    signed-in caller (#2935), which here means the refresh cookie a login
+    sets, since these pages never hold a Bearer. The helper that fetches it
+    loads before the initializer."""
+    _, page = await _page(client, path)
+    srcs = [s["src"] for s in page.scripts]
+    init = [s for s in page.scripts if s["src"].endswith("/" + init_js)]
     assert len(init) == 1, page.scripts
-    assert init[0].get("data-openapi-url") == app.openapi_url == "/api/openapi.json"
+    auth = [i for i, src in enumerate(srcs) if src.endswith("/api-docs-auth.js")]
+    assert auth and auth[0] < srcs.index(init[0]["src"]), srcs
+    assert init[0].get("data-openapi-url") == DOCS_SPEC_URL == "/api/v1/auth/openapi.json"
+    assert init[0].get("data-login-url") == "/login"
+    # Under the refresh cookie's path, or the browser would not send it.
+    assert DOCS_SPEC_URL.startswith("/api/v1/auth/")
+    user = User(
+        username=f"docs-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@x.com",
+        display_name="Docs reader",
+        hashed_password=hash_password("Sup3r-secret!"),
+        auth_source="local",
+        is_active=True,
+        is_superadmin=False,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    login = await client.post(
+        "/api/v1/auth/login", json={"username": user.username, "password": "Sup3r-secret!"}
+    )
+    assert login.status_code == 200, login.text
     spec = await client.get(init[0]["data-openapi-url"])
     assert spec.status_code == 200
     assert spec.json()["openapi"].startswith("3.")
+    # The Bearer route serves the same document to an API client.
+    bearer = await client.get(OPENAPI_URL, headers=await signed_in_headers(db_session))
+    assert bearer.status_code == 200
+    assert bearer.json() == spec.json()
 
 
 @pytest.mark.asyncio

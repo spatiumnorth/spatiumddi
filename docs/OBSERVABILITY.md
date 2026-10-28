@@ -771,13 +771,13 @@ The control plane stores deltas in two small tables —
 `dns_metric_sample(server_id, bucket_at, queries_total, noerror,
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
-inform, receive_drop, socket_drop)`. Retention is enforced by the
+inform, receive_drop, socket_drop, queue_evicted)`. Retention is enforced by the
 `prune_metric_samples` Celery task (daily), which deletes samples older
 than `metric_retention_days` (default 7 days, 1–365, Settings → Data
 Retention).
 
-Two of those DHCP columns are about packets *not* handled, and they do not
-come from the same place or mean the same thing (issue #980).
+Three of those DHCP columns are about packets *not* handled, and they do not
+come from the same place or mean the same thing (issues #980, #2889).
 `socket_drop` is the kernel's per-socket `sk_drops` on the sockets Kea
 serves from, read by the agent directly. Normally those are the DHCP-port
 UDP sockets in `/proc/net/udp`. With `dhcp-socket-type: raw`, kea-dhcp4
@@ -789,13 +789,24 @@ report them.
 On a node short of CPU only this one moves, and it is the one the alert
 and the dashboard treat as loss.
 
+`queue_evicted` (#2889) is loss as well: DHCPv4 requests Kea read and then
+evicted from its full multi-threading packet queue during a burst. Kea keeps
+no statistic for it, so the agent derives it from DHCPv4 arrivals at Kea's
+intake (counted by a BPF-filtered `AF_PACKET` socket of its own), less the
+DHCPv4 share of `socket_drop`, less `pkt4-received`. The alert and the
+dashboard add it to `socket_drop`. See
+[`DHCP.md` §4c](features/DHCP.md#counting-what-the-queue-evicts-2889).
+
 `receive_drop` is Kea's own `pkt4/6-receive-drop` — packets it read and then
 discarded — and is **context, not a fault**: it counts deliberate drops too.
 Verified against kea-dhcp4 3.0.3, a client matching a `DROP` client-class
 increments it once per packet, and a `DROP` class is exactly what the shipped
 DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
-**Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
+**All three are nullable, and NULL means UNMEASURED.** `queue_evicted` is
+also NULL when the agent cannot open a raw socket, on a DHCPv6-only server,
+and for the bucket in which its counting socket reopened. (The minute in
+which the agent starts or Kea restarts has no bucket at all, for any counter.) An agent older than #980,
 or one whose runtime cannot read `/proc/net/udp` (or, in raw mode, Kea's
 AF_PACKET sockets), reports no `socket_drop`.
 Readers must render that as unknown — a 0 would say "this server has dropped
@@ -971,7 +982,9 @@ All services expose:
 - Unlike `/health/ready` (which returns a single binary verdict for
   orchestrator probes), this endpoint enumerates each control-plane
   piece so the UI can show a per-component status dot.
-- Response: `200 {"status": "ok"|"degraded", "components": [...]}`.
+- Response: `200 {"status": "ok"|"degraded", "components": [...]}` to a
+  signed-in caller. An anonymous caller gets `{"status": ...}` only —
+  enough for an uptime monitor, and nothing about the stack (#2935).
   Individual component failures **never** make the endpoint itself
   fail — the caller always gets a 200 with the rollup so a single
   flaky component doesn't blank the dashboard card.

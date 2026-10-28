@@ -72,3 +72,57 @@ describe("Application title (#2205)", () => {
     expect(screen.queryByText(/Failed to save settings/)).toBeNull();
   });
 });
+
+describe("Logo size (#2951)", () => {
+  const renderPage = () =>
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <SettingsPage />
+      </QueryClientProvider>,
+    );
+
+  it("refuses an oversized PNG client-side and names the limit", async () => {
+    const upload = vi.spyOn(
+      (await import("@/lib/api")).settingsApi,
+      "uploadLogo",
+    );
+    const { container } = renderPage();
+    await screen.findByDisplayValue("SpatiumDDI");
+    const input = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    const big = new File([new Uint8Array(1_572_817)], "big.png", {
+      type: "image/png",
+    });
+    fireEvent.change(input, { target: { files: [big] } });
+    await waitFor(() =>
+      expect(screen.getByText("Logo must be 512 KB or smaller")).toBeTruthy(),
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it("reads nginx's bodiless 413 as too large", async () => {
+    const api = await import("@/lib/api");
+    vi.spyOn(api.settingsApi, "uploadLogo").mockRejectedValue(
+      Object.assign(new Error("x"), {
+        response: { status: 413, data: "<html>413</html>" },
+      }),
+    );
+    const { container } = renderPage();
+    await screen.findByDisplayValue("SpatiumDDI");
+    const input = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    const small = new File([new Uint8Array(10)], "s.png", {
+      type: "image/png",
+    });
+    fireEvent.change(input, { target: { files: [small] } });
+    await waitFor(() =>
+      expect(screen.getByText("Logo must be 512 KB or smaller")).toBeTruthy(),
+    );
+  });
+});

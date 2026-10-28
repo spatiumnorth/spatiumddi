@@ -103,6 +103,13 @@ async def submit_request(
             detail=preview.detail,
         )
 
+    # Refuse what the REST create would refuse (#2903): the preview is shared
+    # with the copilot and only hints at conflicts, so the portal runs the
+    # operation's own submit check, whose 4xx reaches the requester as-is and
+    # queues nothing.
+    if op.validate_submit is not None:
+        await op.validate_submit(db, user, parsed)
+
     # Length is enforced HERE rather than only on the request schema so every
     # caller gets the same rule + the same readable message — the HTTP body
     # model deliberately does not carry a ``max_length``, which would 422

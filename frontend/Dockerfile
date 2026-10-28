@@ -18,10 +18,19 @@ ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
+# The build context is the REPO ROOT (not ``frontend/``): the About page serves
+# NOTICE and LICENSE (#2895), and a file outside the context cannot be copied.
+# They stay single-sourced at the root; the Vite build copies them into
+# ``dist-legal/`` (see ``legalFiles`` in vite.config.ts). The
+# ``Dockerfile.dockerignore`` beside this file is an allowlist (frontend/,
+# NOTICE, LICENSE) so nothing else at the root, a developer's .env included,
+# is sent to the builder. BuildKit only — the legacy builder ignores a
+# per-Dockerfile ignore file and would upload the whole repo.
+COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install --prefer-offline
 
-COPY . .
+COPY frontend/ .
+COPY NOTICE LICENSE ./legal/
 RUN npm run build
 
 
@@ -52,23 +61,28 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && apk upgrade --no-cache
 
 COPY --from=builder /app/dist /usr/share/nginx/html
+# #2895 — NOTICE, LICENSE and the npm notice list, OUTSIDE the web root: they
+# are for signed-in users only, and nginx serves them at /legal/ behind an
+# auth_request to the api (default.conf.template, and the chart's TLS config).
+# Kept out of /usr/share/nginx/html so no other location can hand them out.
+COPY --from=builder /app/dist-legal /usr/share/spatiumddi/legal
 # Issue #176: the API upstream + DNS resolver are now templated so the
 # same image works on Docker Compose (defaults below) and Kubernetes
 # (Helm chart overrides API_UPSTREAM_HOST to ``{{ fullname }}-api`` via
 # env). The official nginx image's entrypoint renders
 # /etc/nginx/templates/*.template → /etc/nginx/conf.d/* via envsubst.
-COPY default.conf.template /etc/nginx/templates/default.conf.template
+COPY frontend/default.conf.template /etc/nginx/templates/default.conf.template
 # Replacement for the upstream 15-local-resolvers.envsh — ours
 # respects an operator-supplied NGINX_LOCAL_RESOLVERS so the resolver
 # IP can be pinned via env var. See the script's header comment.
-COPY 15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.envsh
+COPY frontend/15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.envsh
 # Renders FRONTEND_TRUSTED_PROXY_CIDRS into nginx's set_real_ip_from lines + the
 # X-Forwarded-Proto trust map (#1868). Unset = trust no proxy.
-COPY 16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.envsh
+COPY frontend/16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.envsh
 # Reloads nginx in place when the mounted TLS certificate changes, so a new
 # Web UI certificate never needs the frontend pods replaced (#1173). Without a
 # mounted certificate (Docker Compose) it exits and watches nothing.
-COPY 40-tls-reload-watch.sh /docker-entrypoint.d/40-tls-reload-watch.sh
+COPY frontend/40-tls-reload-watch.sh /docker-entrypoint.d/40-tls-reload-watch.sh
 
 # Sensible defaults that keep Docker Compose working without operator
 # config — Compose's service-discovery puts the api at ``api:8000``.

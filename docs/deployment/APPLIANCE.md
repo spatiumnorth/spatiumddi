@@ -138,8 +138,8 @@ not the operator's:
   nor drops at a sustained 12,000 pkt/s, because that queue sits behind the
   receive thread and the problem is the receive thread not being scheduled.
   Short bursts are different (spatiumddi#1283). Kea's default queue of 64
-  evicts the oldest requests, counted nowhere, when a burst outruns the
-  worker, so SpatiumDDI renders `packet-queue-size: 1024`. See
+  evicts the oldest requests when a burst outruns the worker (counted, since
+  #2889, as `queue_evicted`), so SpatiumDDI renders `packet-queue-size: 1024`. See
   [`DHCP.md`](../features/DHCP.md#keas-packet-queue).
 - Kea's own packet-worker pool is sized from the **machine's** CPU count, not
   from the container's cgroup share, so on a 4 vCPU appliance it starts four
@@ -156,7 +156,10 @@ not the operator's:
   only signals that name it — and note it is `socket_drop` specifically:
   Kea's own `pkt4-receive-drop` also counts deliberate drops (a blocklisted
   MAC, an HA standby declining an out-of-scope query) and is not a fault
-  signal. See [`DHCP.md` §4c](../features/DHCP.md).
+  signal. A burst deeper than Kea's 1,024-packet queue loses requests one
+  stage later, after Kea has read them; that is the `queue_evicted` metric
+  (#2889), which the same alert also fires on. See
+  [`DHCP.md` §4c](../features/DHCP.md).
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the

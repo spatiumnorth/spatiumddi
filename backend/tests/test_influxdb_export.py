@@ -667,6 +667,27 @@ async def test_dhcp_export_carries_the_loss_counters(db_session: AsyncSession) -
 
 
 @pytest.mark.asyncio
+async def test_dhcp_export_carries_queue_evicted_in_line_protocol(
+    db_session: AsyncSession,
+) -> None:
+    """#2889 — the third loss counter reaches InfluxDB as an integer field,
+    and is omitted (not zero-filled) when the agent did not measure it."""
+    from app.services.influxdb.collect import collect_dhcp_points
+    from app.services.influxdb.line_protocol import render_point
+
+    base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    await _dhcp_sample(db_session, base, socket_drop=0, queue_evicted=403)
+    await _dhcp_sample(db_session, base + timedelta(minutes=1), socket_drop=0, queue_evicted=None)
+
+    points, _ = await collect_dhcp_points(db_session, None)
+    assert len(points) == 2
+    lines = sorted(render_point(p) for p in points)
+    measured = [ln for ln in lines if "queue_evicted" in ln]
+    assert len(measured) == 1
+    assert "queue_evicted=403i" in measured[0]
+
+
+@pytest.mark.asyncio
 async def test_dhcp_export_omits_an_unmeasured_counter(db_session: AsyncSession) -> None:
     """Line protocol has no null, so an unmeasured counter must be OMITTED.
 
@@ -685,6 +706,7 @@ async def test_dhcp_export_omits_an_unmeasured_counter(db_session: AsyncSession)
     assert len(points) == 1
     assert "socket_drop" not in points[0].fields
     assert "receive_drop" not in points[0].fields
+    assert "queue_evicted" not in points[0].fields
     # The traffic counters are unaffected — the point is still emitted.
     assert points[0].fields["discover"] == 5
 

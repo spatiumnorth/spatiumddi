@@ -909,11 +909,13 @@ Three counters, and only one of them moves:
 | per-socket `sk_drops` of the sockets Kea serves from (`/proc/net/udp`; with `dhcp-socket-type: raw`, kea-dhcp4's AF_PACKET sockets, #1283) | the kernel found the receive buffer full and discarded the datagram | **yes** |
 | `pkt4-receive-drop` / `pkt6-receive-drop` | Kea read the packet and discarded it (unparseable, `DROP` class, no subnet) | no |
 | `pkt4-discover-received` vs `pkt4-offer-sent` | Kea answering what it read | always equal |
+| DHCPv4 arrivals − `socket_drop` − `pkt4-received` (#2889) | Kea read the request and then evicted it from its full packet queue | under bursts deeper than the queue — see [the queue below](#keas-packet-queue) |
 
 Verified against kea-dhcp4 3.0.3: a run that lost **9,700** datagrams to
 buffer overflow reported `pkt4-receive-drop = 0` for its entire duration.
-Both are reported per 60 s bucket on `dhcp_metric_sample` as `socket_drop`
-and `receive_drop`, but only the first is treated as loss.
+All three are reported per 60 s bucket on `dhcp_metric_sample` as
+`socket_drop`, `queue_evicted` and `receive_drop`. The first two are
+treated as loss; `receive_drop` is not.
 
 > **`receive_drop` is context, not a fault.** Kea counts a packet there when
 > it reads one and throws it away — *including on purpose*. Verified against
@@ -921,15 +923,16 @@ and `receive_drop`, but only the first is treated as loss.
 > per packet, and a `DROP` class is exactly what the shipped
 > [DHCP MAC blocklist](#4a-dhcp-mac-blocklist) renders; Kea's HA hook drops
 > out-of-scope queries in `hot-standby` the same way. So the *DROPPED* line,
-> the `N dropped` chip and the alert rule all read `socket_drop` **alone** —
-> a rule that counted `receive_drop` would fire permanently, and never
-> auto-resolve, on any install with a blocklisted MAC or an HA pair.
+> the `N dropped` chip and the alert rule read `socket_drop` +
+> `queue_evicted` and **never** `receive_drop` — a rule that counted it
+> would fire permanently, and never auto-resolve, on any install with a
+> blocklisted MAC or an HA pair.
 > `receive_drop` is still surfaced beside it, labelled as what it is.
 
 The server detail modal's **Stats** tab draws a dashed *DROPPED* line and a
-red `N dropped` chip from `socket_drop`, and the default-on
-**`dhcp_packets_dropped`** alert rule fires on any confirmed kernel-side loss
-over a 15-minute window (raise the rule's minimum-count threshold to alert
+red `N dropped` chip from `socket_drop` + `queue_evicted`, and the default-on
+**`dhcp_packets_dropped`** alert rule fires on any confirmed loss of either
+kind over a 15-minute window (raise the rule's minimum-count threshold to alert
 only past a number of packets).
 
 > **`NULL` is not zero, anywhere in this chain.** An agent older than #980,
@@ -1092,6 +1095,137 @@ drain the queue faster.
 *What is left.* The re-sends at 1024 and 4096 match the kernel's drops on
 Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
 they are `socket_drop` (above).
+
+#### Counting what the queue evicts (#2889)
+
+A burst deeper than the queue still evicts. On the gate load (12 relays,
+~4,000 devices, each minute's new devices released in a 2-4 s burst) a
+burst of 2,521 devices lost 690 requests that way, with `socket_drop`,
+`receive_drop` and `pkt4-received` all silent about them. The size of the
+queue, the worker count and Kea's per-packet logging were left as they
+are (#980 made those calls); the loss is **counted** instead, as
+`queue_evicted`:
+
+```
+queue_evicted = DHCPv4 arrivals − DHCPv4 socket_drop − pkt4-received
+```
+
+Kea 3.0 keeps no statistic for the eviction, so it is the remainder once
+everything that accounts for an arrival is taken out. That identity held
+to the packet over five measured runs.
+
+*Counting the arrivals.* The agent holds an `AF_PACKET` socket of its own
+with a classic-BPF filter and reads `PACKET_STATISTICS` from it every
+minute. The kernel counts every packet the filter accepts, and the socket
+is never read, so a counted packet costs an increment, not a copy. The
+socket is bound to no interface, so the filter itself (about 20
+instructions) runs on **every** inbound IPv4 packet on the host, not only
+on DHCP; on a node that also carries heavy unrelated traffic that is a
+measurable, if small, per-packet cost. It taps the receive path ahead of
+netfilter, as Kea's own raw socket does, though after VLAN untagging and
+bridge handling (one consequence is the 802.1p case below). It needs `CAP_NET_RAW`, which the agent already holds for the
+fingerprint sniffer, so nothing new is granted. The filter counts:
+
+- IPv4, UDP, destination port 67, first fragment only;
+- received, not sent, on an interface in Kea's `interfaces` (`*` = every
+  interface except loopback) that has an IPv4 address;
+- addressed to the address Kea serves from on those interfaces (the
+  interface's primary address, or the one pinned as `iface/address`) —
+  in `raw` mode also to 255.255.255.255. Those are the only destinations
+  Kea's own raw-socket filter admits. Without this check, a node that
+  announces a MetalLB relay VIP (#272) and forwards most of the relayed
+  requests to another node's Kea would count every one of them as
+  evicted;
+- in `udp` mode (`dhcp_socket_mode: relay`) unicast only, because Kea's
+  UDP sockets are bound to interface addresses and never see a broadcast.
+
+> **Why not an nftables counter.** The issue proposed one on the
+> appliance. Reading it needs `CAP_NET_ADMIN`, which neither the DHCP pod
+> nor the supervisor pod holds, so a root host runner would have had to
+> copy the value into a file on a timer, seconds out of step with Kea's
+> own counters. A counter on the existing `udp dport 67 accept` rule would
+> also miss most relayed traffic: `ct state established,related accept`
+> sits ahead of it in the chain, so every relay packet after the first in
+> a flow never reaches it. And `/etc/nftables.conf` re-creates its table
+> whole on every firewall apply, which resets the counter. Counting in the
+> agent avoids all of that, works on Compose and Kubernetes as well as on
+> the appliance, and reads on both sides of Kea's own counter snapshot.
+
+*The arithmetic.* Kea's counters are one snapshot, taken inside Kea at
+some instant, and the arrivals cannot be read at that same instant. A
+single read on one side of it is not good enough: on a server with steady
+traffic the packets that arrive in between make the remainder wobble by a
+few packets at every read, and an estimator fed that wobble reports some
+of it as eviction. Simulated, a mean of 0.2 packets of skew per read was
+enough to raise the default-on alert in a third of the day's 15-minute
+windows. So the agent reads the arrivals **twice**, once before it sends
+`statistic-get-all` and once after the reply and the socket drops are in.
+That brackets the remainder at Kea's snapshot between a lower and an
+upper bound.
+
+The first read is also **aged**. The agent waits `packet-queue-size` ÷
+100 seconds between it and the snapshot (10 s for the rendered 1,024,
+clamped to 2-15 s). Kea's queue never holds more than its depth, so in a
+queue that is not full every packet is taken by the worker within depth ÷
+service rate seconds, and 100 packets a second is far below any measured
+Kea rate. A packet counted by the first read and still not received at
+the snapshot is therefore one Kea evicted, not one waiting behind a backlog.
+Without the wait, a few packets still queued at two consecutive reads
+(after a 253 ms Kea stall, in the QA walk) were confirmed as an eviction.
+The wait is taken off the minute, so the poll period is unchanged.
+
+From those two bounds:
+
+- an eviction is confirmed only from the **lower** bound, and only once it
+  has held at two reads in a row, so a backlog in flight at one read is
+  never loss and read skew can only make the count lower;
+- the zero point is moved down only from the **upper** bound, so a
+  baseline taken while a backlog was in flight is corrected as it drains,
+  without any skew turning into loss;
+- what is reported is a high-water mark: never negative, never reported
+  twice, and an eviction lands in the bucket **after** the one it happened
+  in.
+
+The only way left to over-report is a packet that waited longer than the
+aging wait at two reads a minute apart, without being evicted: Kea serving
+under 100 packets a second, or stalled for most of the wait, with a backlog
+at both reads. A backlog below the queue's depth, however long it lasts,
+is not enough.
+
+The wait has a price, and it is paid in the safe direction. A request that
+arrives during the wait and is served before the snapshot is counted as
+received but not yet as arrived, so it pulls the remainder down. Under
+continuous background traffic the count can therefore read LOW, by up to
+the requests served during the wait (about 10 s of traffic), until a read
+whose wait was quieter. It never reads high. On bursty load (bursts with
+quiet between them, like the gate load) an eviction is counted exactly,
+one bucket after it happened. A delivery path on which Kea
+receives packets the filter does not count can only lower the estimate.
+
+*NULL is unmeasured, as everywhere above.* `queue_evicted` is NULL when
+the agent cannot open the raw socket (no `CAP_NET_RAW`), on a DHCPv6-only
+server (it counts DHCPv4 only), when `socket_drop` was not measured, and for
+the bucket in which the counting socket was (re)opened because Kea's interfaces, their addresses or the socket mode
+changed. It is also NULL when Kea's interfaces resolve to more than 200
+interfaces or addresses, which one filter cannot express. It is never 0 in
+those cases. The minute in which the agent starts, or Kea restarts, has **no
+bucket at all**, for every counter, as since #980: it is the baseline the
+next minute is diffed against. Counting resumes in the next bucket, against
+a fresh baseline, so on the Stats tab that minute is a gap, not a NULL.
+
+*Where the identity can be wrong.* Each of these counts as an eviction:
+
+- a DHCPv4 packet that Kea's sockets do not accept but the filter does.
+  In `raw` mode: unicast to the address of one Kea interface arriving on
+  another (asymmetric routing), or a frame carrying an 802.1p priority tag
+  (VLAN ID 0) — the kernel strips that tag before the filter sees the
+  packet, while Kea's raw socket drops any tagged frame;
+- in `udp` mode, a packet the host firewall drops before Kea's socket.
+  The appliance accepts UDP/67 unconditionally.
+
+Each of these goes the safe way, and is under-counted instead: traffic Kea
+serves on an address other than the interface's primary one, and traffic
+it receives on an interface outside its `interfaces` list.
 
 ## 4d. An OOM-killed Kea is reported (#2023)
 

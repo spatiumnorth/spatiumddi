@@ -322,6 +322,11 @@ class WorkloadHealth(BaseModel):
     ready: int
     total: int
     restarts: int
+    # #2945 — containers whose previous instance ended in the last 15 min,
+    # and the latest such end time. ``restarts`` is the lifetime total and
+    # only informational; the UI goes amber on ``recent_restarts`` alone.
+    recent_restarts: int = 0
+    last_restart_at: str | None = None
     # Job pods still running for this component (#1213) — e.g. a CNPG
     # replica join. Not counted in ready / total; while non-zero the
     # component reads "degraded" even at ready == total.
