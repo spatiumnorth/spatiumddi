@@ -29,9 +29,13 @@ RUN mkdir -p app && touch app/__init__.py && \
 # reaches the runtime image. It blanks PYTHONPATH before it asks the interpreter
 # named by ``--python`` for its search path, so ``/opt/py-install`` is a
 # two-line wrapper that puts ``/install`` back; the builder's own pip /
-# setuptools / wheel are left out (the runtime removes pip, #1392). A list that
-# came out empty would look like a clean pass, so the build fails if it does not
-# name a package we know is there.
+# setuptools / wheel are left out (the runtime removes pip, #1392).
+# ``--with-system`` is required, not cosmetic: without it pip-licenses drops
+# the names of its OWN dependencies (prettytable, wcwidth, …) from the report
+# even when they come from the inspected interpreter, so ``wcwidth`` — a real
+# runtime dependency — went missing from the list. A list that is short looks
+# exactly like a clean pass, so the build fails unless every distribution in
+# ``/install`` (bar the excluded four) is named in it.
 ARG PIP_LICENSES_VERSION=5.5.5
 RUN python -m venv /opt/pip-licenses \
     && /opt/pip-licenses/bin/pip install --no-cache-dir "pip-licenses==${PIP_LICENSES_VERSION}" \
@@ -39,11 +43,12 @@ RUN python -m venv /opt/pip-licenses \
     && chmod +x /opt/py-install \
     && mkdir -p /install/share/spatiumddi \
     && /opt/pip-licenses/bin/pip-licenses --python=/opt/py-install \
-         --format=plain-vertical --with-urls --with-authors --with-license-file \
-         --no-license-path --ignore-packages pip setuptools wheel spatiumddi \
+         --format=plain-vertical --with-system --with-urls --with-authors \
+         --with-license-file --no-license-path \
+         --ignore-packages pip setuptools wheel spatiumddi \
          --output-file=/install/share/spatiumddi/third-party-python.txt \
-    && grep -q '^fastapi$' /install/share/spatiumddi/third-party-python.txt \
-    && test "$(wc -c < /install/share/spatiumddi/third-party-python.txt)" -gt 50000
+    && python -c "import importlib.metadata as m, re, sys; n = lambda s: re.sub(r'[-_.]+', '-', s).lower(); listed = {n(l.strip()) for l in open(sys.argv[1], encoding='utf-8')}; want = {n(d.metadata['Name']) for d in m.distributions(path=[sys.argv[2]])} - {'pip', 'setuptools', 'wheel', 'spatiumddi'}; miss = sorted(want - listed); assert len(want) > 50 and not miss, f'third-party-python.txt is missing {miss} ({len(want)} installed)'" \
+         /install/share/spatiumddi/third-party-python.txt /install/lib/python3.12/site-packages
 
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────

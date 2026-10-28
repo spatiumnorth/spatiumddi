@@ -4,7 +4,7 @@ import { defineConfig } from "vitest/config";
 import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "fs";
-import license from "rollup-plugin-license";
+import license, { type Dependency } from "rollup-plugin-license";
 
 const pkg = JSON.parse(
   readFileSync(new URL("./package.json", import.meta.url), "utf-8"),
@@ -24,8 +24,13 @@ const appVersion = process.env.VITE_APP_VERSION || pkg.version;
 // ``npm run dev`` serves nothing for them and the page says so.
 // Published with a ``.txt`` suffix: nginx types an extension-less file
 // ``application/octet-stream`` and the browser would download it instead of
-// showing it, and a ``location`` block just to retype it would have to be
-// mirrored into the chart's and the appliance's copies of the nginx config.
+// showing it. (Both nginx configs label these paths ``charset utf-8`` —
+// NOTICE is not ASCII.)
+//
+// A build that cannot find them FAILS rather than shipping an About page
+// whose NOTICE says "not available in this build": that is the page the
+// Apache-2.0 §4(d) obligation rests on, and a missing file must not look
+// like a successful build.
 const LEGAL_FILES = ["NOTICE", "LICENSE"];
 
 function legalFiles(): Plugin {
@@ -43,10 +48,76 @@ function legalFiles(): Plugin {
         const src = roots
           .map((r) => `${r}/${name}`)
           .find((candidate) => existsSync(candidate));
-        if (src) copyFileSync(src, `${out}/${name}.txt`);
+        if (!src) {
+          throw new Error(
+            `#2895: ${name} not found in ${roots.join(" or ")}; the About ` +
+              "page needs it. Build the image from the repo root " +
+              "(docker build -f frontend/Dockerfile .).",
+          );
+        }
+        copyFileSync(src, `${out}/${name}.txt`);
       }
     },
   };
+}
+
+// Some packages declare a licence in package.json but publish no LICENSE
+// file (qrcode-generator, react-remove-scroll-bar and victory-vendor at the
+// time of writing), so the plugin has no text to copy and the list would name
+// the licence without carrying the permission notice MIT requires to travel
+// with the copy. For those, the standard text of the declared licence is
+// appended, marked as such, after the package's own author line.
+const STANDARD_TEXT: Record<string, string> = {
+  MIT: `Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`,
+  ISC: `Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.`,
+};
+
+function thirdPartyText(dependencies: Dependency[]): string {
+  return dependencies
+    .map((dep) => {
+      const own = dep.text();
+      if (dep.licenseText) return own;
+      const ids = (dep.license ?? "")
+        .replace(/[()]/g, " ")
+        .split(/\s+/)
+        .filter((id) => id in STANDARD_TEXT);
+      if (ids.length === 0) return own;
+      const appended = ids
+        .map(
+          (id) =>
+            `Standard ${id} licence text (the package publishes no licence ` +
+            `file):\n===\n\n${STANDARD_TEXT[id]}`,
+        )
+        .join("\n\n");
+      return `${own}\n${appended}`;
+    })
+    .join("\n\n---\n\n");
 }
 
 export default defineConfig({
@@ -59,10 +130,21 @@ export default defineConfig({
     license({
       thirdParty: {
         includePrivate: false,
+        // A bundled package that declares no licence at all is a decision
+        // for a human, not a line to skip.
+        // (``test`` must reject them: the plugin only consults
+        // ``failOnUnlicensed`` for a dependency its test has refused.)
+        allow: {
+          test: (dep) =>
+            Boolean(dep.license?.trim()) &&
+            dep.license?.trim().toUpperCase() !== "UNLICENSED",
+          failOnUnlicensed: true,
+        },
         output: {
           file: fileURLToPath(
             new URL("./dist/third-party-licenses.txt", import.meta.url),
           ),
+          template: thirdPartyText,
         },
       },
     }),
