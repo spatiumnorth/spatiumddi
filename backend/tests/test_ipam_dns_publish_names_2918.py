@@ -364,9 +364,9 @@ async def test_kea_import_drops_hostname_static_form_refuses(
     )
     assert r.status_code == 200, r.text
     assert r.json()["total_reservations_created"] == 2
-    assert any(
-        "192.0.2.140" in w and "'under_score'" in w for w in r.json()["warnings"]
-    ), r.json()["warnings"]
+    assert any("192.0.2.140" in w and "'under_score'" in w for w in r.json()["warnings"]), r.json()[
+        "warnings"
+    ]
     rows = (await db_session.execute(select(DHCPStaticAssignment))).scalars().all()
     by_ip = {str(x.ip_address): x.hostname for x in rows}
     assert by_ip["192.0.2.140"] == ""
