@@ -148,9 +148,6 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/login/callback" element={<LoginCallbackPage />} />
-      {/* #2895 — public on purpose: licence text must reach anyone who is
-          handed the software, so it sits outside ProtectedRoute. */}
-      <Route path="/about" element={<AboutPage />} />
       <Route path="/change-password" element={<ChangePasswordPage />} />
       <Route
         path="/"
@@ -161,6 +158,9 @@ export default function App() {
         }
       >
         <Route index element={<Navigate to="/dashboard" replace />} />
+        {/* #2895 — signed-in only: the version, the libraries and the
+            third-party tools are not for someone probing from outside. */}
+        <Route path="about" element={<AboutPage />} />
         <Route path="account" element={<AccountPage />} />
         <Route path="appliance" element={<AppliancePage />} />
         <Route path="appliance/setup" element={<SetupWizardPage />} />

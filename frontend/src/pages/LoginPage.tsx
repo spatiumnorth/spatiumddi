@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 import { authApi, type PublicAuthProvider } from "@/lib/api";
 import { KeyRound, ShieldCheck } from "lucide-react";
@@ -435,12 +435,6 @@ export function LoginPage() {
           )}
         </div>
       </div>
-      {/* #2895 — licence + notices must be reachable before sign-in. */}
-      <footer className="pb-4 text-center text-xs text-muted-foreground">
-        <Link to="/about" className="hover:text-foreground hover:underline">
-          About &amp; licences
-        </Link>
-      </footer>
       <EnvironmentBanner edge="bottom" />
     </div>
   );

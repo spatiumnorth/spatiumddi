@@ -9,6 +9,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -18,10 +19,6 @@ import {
 
 const navigate = vi.fn();
 vi.mock("react-router-dom", () => ({
-  // The footer's About link (#2895) is a router <Link>.
-  Link: ({ to, children }: { to: string; children: React.ReactNode }) => (
-    <a href={to}>{children}</a>
-  ),
   useNavigate: () => navigate,
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));
@@ -91,5 +88,22 @@ describe("LoginPage sign-in errors", () => {
     await waitFor(() =>
       expect(screen.getByText(/invalid username or password/i)).toBeTruthy(),
     );
+  });
+});
+
+describe("LoginPage before sign-in (#2895)", () => {
+  it("does not link to the About page", async () => {
+    // The About page names the version, the libraries and the third-party
+    // tools; it is for signed-in users, so nothing on the sign-in screen
+    // points at it.
+    const { container } = render(<LoginPage />);
+    // Let the provider list settle, so the whole page is on screen.
+    await act(async () => {});
+    const hrefs = Array.from(container.querySelectorAll("a")).map((a) =>
+      a.getAttribute("href"),
+    );
+    expect(hrefs.some((h) => h?.includes("/about"))).toBe(false);
+    expect(hrefs.some((h) => h?.includes("/legal/"))).toBe(false);
+    expect(screen.queryByText(/about/i)).toBeNull();
   });
 });

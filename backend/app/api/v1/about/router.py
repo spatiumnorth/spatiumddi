@@ -1,19 +1,23 @@
-"""Unauthenticated third-party notices for the About page (#2895).
+"""The About page's data sources, signed-in callers only (#2895).
 
-The Apache-2.0 NOTICE text and the MIT / BSD / ISC notices of everything we
-redistribute have to reach whoever receives the software, not only an admin
-who can log in — so this router has no auth dependency, like the About page
-that links to it.
+The About page carries the licence, the NOTICE and the third-party notice
+lists. All of it is behind a session: someone probing the server from outside
+must not learn which version, libraries or third-party tools it runs. So every
+source the page reads needs a signed-in user:
 
-It serves ONE static file, baked into the image at build time by the builder
-stage of ``backend/Dockerfile`` (``pip-licenses`` over the packages the runtime
-stage receives). Nothing here reads the database or the request, and the body
-is the same for every caller: it names Python packages and their licences,
-which are the image's own contents and carry no install detail. The matching
-npm list, ``NOTICE`` and ``LICENSE`` are static files in the web tier.
+* ``GET /about/third-party/python`` — the Python list, one static file baked
+  into the image at build time by the builder stage of ``backend/Dockerfile``
+  (``pip-licenses`` over the packages the runtime stage receives).
+* ``GET /about/session`` — 204 for a signed-in caller, 401 otherwise. It
+  carries no data. The web tier's nginx calls it as an ``auth_request`` before
+  serving the other three files (NOTICE, LICENSE and the npm list), which the
+  Vite build generates and the frontend image keeps outside its web root. That
+  keeps the files where they are produced and still refuses them to anyone
+  without a session, on every deployment shape: compose and the Helm chart
+  both route browser traffic through that nginx.
 
-A checkout run outside the image (``make dev`` hot-reload) has no baked file;
-that is a 404 naming the reason, not an empty 200, so the page can say
+A checkout run outside the image (``make dev`` hot-reload) has no baked Python
+list; that is a 404 naming the reason, not an empty 200, so the page can say
 "not available in this build" rather than show a blank list as if it were the
 real one.
 """
@@ -23,9 +27,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response, status
 from fastapi.responses import FileResponse
 
+from app.api.deps import CurrentUser
 from app.core.responses import PlainTextStreamResponse
 
 router = APIRouter(tags=["about"])
@@ -36,11 +41,24 @@ THIRD_PARTY_PYTHON = Path(sys.prefix) / "share" / "spatiumddi" / "third-party-py
 
 
 @router.get(
+    "/session",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    summary="Whether the caller is signed in (the web tier's gate for the About files)",
+)
+async def about_session(_: CurrentUser) -> Response:
+    # ``CurrentUser`` does the work: no credential or a bad one is a 401, a
+    # disabled account or a pending password change a 403. nginx passes
+    # either straight back to the browser and serves the file only on a 2xx.
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
     "/third-party/python",
     response_class=PlainTextStreamResponse,
     summary="Python third-party licence list (plain text)",
 )
-async def python_third_party_licenses() -> FileResponse:
+async def python_third_party_licenses(_: CurrentUser) -> FileResponse:
     path = THIRD_PARTY_PYTHON
     if not path.is_file():
         raise HTTPException(
@@ -51,7 +69,8 @@ async def python_third_party_licenses() -> FileResponse:
     return FileResponse(
         path,
         media_type="text/plain",
-        # Content only changes with the image, and a stale copy for an hour
-        # after an upgrade is harmless.
-        headers={"Cache-Control": "public, max-age=3600"},
+        # Content only changes with the image, so a browser may keep it for an
+        # hour. ``private``: it is an authenticated response, and a shared
+        # cache must not hand it to the next, anonymous, caller.
+        headers={"Cache-Control": "private, max-age=3600"},
     )

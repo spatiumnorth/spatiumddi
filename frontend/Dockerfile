@@ -21,7 +21,7 @@ WORKDIR /app
 # The build context is the REPO ROOT (not ``frontend/``): the About page serves
 # NOTICE and LICENSE (#2895), and a file outside the context cannot be copied.
 # They stay single-sourced at the root; the Vite build copies them into
-# ``dist/legal/`` (see ``legalFiles`` in vite.config.ts). The
+# ``dist-legal/`` (see ``legalFiles`` in vite.config.ts). The
 # ``Dockerfile.dockerignore`` beside this file is an allowlist (frontend/,
 # NOTICE, LICENSE) so nothing else at the root, a developer's .env included,
 # is sent to the builder. BuildKit only — the legacy builder ignores a
@@ -61,6 +61,11 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && apk upgrade --no-cache
 
 COPY --from=builder /app/dist /usr/share/nginx/html
+# #2895 — NOTICE, LICENSE and the npm notice list, OUTSIDE the web root: they
+# are for signed-in users only, and nginx serves them at /legal/ behind an
+# auth_request to the api (default.conf.template, and the chart's TLS config).
+# Kept out of /usr/share/nginx/html so no other location can hand them out.
+COPY --from=builder /app/dist-legal /usr/share/spatiumddi/legal
 # Issue #176: the API upstream + DNS resolver are now templated so the
 # same image works on Docker Compose (defaults below) and Kubernetes
 # (Helm chart overrides API_UPSTREAM_HOST to ``{{ fullname }}-api`` via

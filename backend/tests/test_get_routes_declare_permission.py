@@ -30,10 +30,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── public / pre-sign-in ────────────────────────────────────────────
     "/.well-known/acme-challenge/{token}": "ACME HTTP-01 challenge the CA fetches",
     "/api/docs": "OpenAPI viewer, no install data",
-    "/api/v1/about/third-party/python": (
-        f"{_PUBLIC}: the About page's licence notices (#2895), a static file "
-        "baked into the image, no install data"
-    ),
     "/api/redoc": "OpenAPI viewer, no install data",
     "/api/v1/auth/password-policy": f"{_PUBLIC}: the change-password screen renders the policy",
     "/api/v1/auth/providers": f"{_PUBLIC}: the login page lists sign-in buttons",
@@ -84,6 +80,14 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/saved-views": _SELF,
     "/api/v1/sessions/me": _SELF,
     # ── shell / static reference data every signed-in screen needs ──────
+    "/api/v1/about/session": (
+        "the About page's gate (#2895): nginx auth_request asks only whether "
+        "the caller is signed in; returns no data"
+    ),
+    "/api/v1/about/third-party/python": (
+        "the About page's licence notices (#2895), a static file baked into "
+        "the image; any signed-in user, never anonymous"
+    ),
     "/api/v1/admin/feature-modules": "the sidebar reads which modules are on",
     "/api/v1/ai/available": "whether the copilot is configured, no install data",
     "/api/v1/ai/mcp": "MCP server info + the count of tools this caller may call",

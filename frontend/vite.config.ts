@@ -17,21 +17,27 @@ const pkg = JSON.parse(
 // default for local `npm run dev`, not the release source of truth.
 const appVersion = process.env.VITE_APP_VERSION || pkg.version;
 
-// #2895 — the legal files the About page serves. They live once, at the
-// repo root; the build copies them into dist/ rather than keeping a second
-// copy in frontend/public/ that would drift. The Docker build context is the
-// repo root for exactly this reason (see frontend/Dockerfile). A plain
-// ``npm run dev`` serves nothing for them and the page says so.
-// Published with a ``.txt`` suffix: nginx types an extension-less file
-// ``application/octet-stream`` and the browser would download it instead of
-// showing it. (Both nginx configs label these paths ``charset utf-8`` —
-// NOTICE is not ASCII.)
+// #2895 — the legal files the About page shows: NOTICE, LICENSE and the npm
+// notice list. They are written to ``dist-legal/``, deliberately OUTSIDE
+// ``dist/``: everything in ``dist/`` is the public web root, and these are for
+// signed-in users only (someone probing the server must not learn which
+// libraries it runs). The frontend image copies ``dist-legal/`` to
+// /usr/share/spatiumddi/legal, which nginx serves at ``/legal/`` only after
+// asking the api whether the caller has a session. Nothing here is imported by
+// the app, so none of it lands in a JS chunk either.
+//
+// NOTICE and LICENSE live once, at the repo root; the build copies them rather
+// than keeping a second copy in frontend/ that would drift. The Docker build
+// context is the repo root for exactly this reason (see frontend/Dockerfile).
+// A plain ``npm run dev`` serves nothing for them and the page says so.
+// Published with a ``.txt`` suffix so nginx types them text/plain.
 //
 // A build that cannot find them FAILS rather than shipping an About page
 // whose NOTICE says "not available in this build": that is the page the
 // Apache-2.0 §4(d) obligation rests on, and a missing file must not look
 // like a successful build.
 const LEGAL_FILES = ["NOTICE", "LICENSE"];
+const LEGAL_OUT_DIR = fileURLToPath(new URL("./dist-legal", import.meta.url));
 
 function legalFiles(): Plugin {
   const roots = [
@@ -42,7 +48,7 @@ function legalFiles(): Plugin {
     name: "spatiumddi-legal-files",
     apply: "build",
     closeBundle() {
-      const out = fileURLToPath(new URL("./dist/legal", import.meta.url));
+      const out = LEGAL_OUT_DIR;
       mkdirSync(out, { recursive: true });
       for (const name of LEGAL_FILES) {
         const src = roots
@@ -141,9 +147,7 @@ export default defineConfig({
           failOnUnlicensed: true,
         },
         output: {
-          file: fileURLToPath(
-            new URL("./dist/third-party-licenses.txt", import.meta.url),
-          ),
+          file: `${LEGAL_OUT_DIR}/third-party-npm.txt`,
           template: thirdPartyText,
         },
       },

@@ -12,9 +12,10 @@
 
 # A developer's local install and build output: npm install in the image
 # must not inherit a host node_modules (wrong platform binaries), and dist/
-# is rebuilt there. frontend/legal is where the Dockerfile puts NOTICE and
-# LICENSE; a stale host copy must not shadow the root files.
+# and dist-legal/ are rebuilt there. frontend/legal is where the Dockerfile
+# puts NOTICE and LICENSE; a stale host copy must not shadow the root files.
 frontend/node_modules
 frontend/dist
+frontend/dist-legal
 frontend/legal
 **/.DS_Store
