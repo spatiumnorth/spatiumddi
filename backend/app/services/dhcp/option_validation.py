@@ -268,31 +268,57 @@ def _describe_code(code: int) -> str:
     return f"option {code} ({known.name})" if known else f"option {code}"
 
 
-_FQDN_OPTION_KEYS = ("domain-name", "domain-search")
+# Every stored spelling of options 15 and 119 that reaches a server (#1347):
+# the canonical names, and the Windows raw spelling ``opt-NN``, which the
+# Windows driver writes as option 15 / 119 just the same. ``code:15`` /
+# ``code:119`` are refused on write (no option-def), and a list-form entry
+# carrying code 15 / 119 is keyed by its canonical name before this runs.
+# Each maps to the rule the write check applies, which gates the rewrite.
+_FQDN_OPTION_RULES: dict[str, Callable[[Any], None]] = {
+    "domain-name": _fqdn,
+    "domain-search": _fqdn_list,
+    "opt-15": _fqdn,
+    "opt-119": _fqdn_list,
+}
 
 
-def _canonical_fqdn(value: Any) -> Any:
-    """``validate_fqdn``'s DNS form of one value, or the value untouched.
-
-    Lenient on purpose: a value ``validate_fqdn`` refuses (stored before the
-    write check existed, #597) is returned as it is, so this never raises at
-    render time and a round-tripped grandfathered value still compares equal.
-    A list stays a list; a comma-separated string stays one string.
-    """
-    if isinstance(value, list):
-        return [_canonical_fqdn(v) for v in value]
-    if not isinstance(value, str):
-        return value
-    parts = [p.strip() for p in value.split(",")] if "," in value else [value]
+def _canonical_str(value: str) -> str | None:
+    """The DNS form of one string (comma-separated entries allowed), or
+    ``None`` when any entry is refused by ``validate_fqdn``."""
     out: list[str] = []
-    for part in parts:
+    for part in (p.strip() for p in value.split(",")):
         if not part:
             continue
         try:
             out.append(validate_fqdn(part, field="value"))
         except ValueError:
-            return value
-    return ", ".join(out) if out else value
+            return None
+    return ", ".join(out) if out else None
+
+
+def _canonical_fqdn(value: Any) -> Any:
+    """``validate_fqdn``'s DNS form of one value, or the value untouched.
+
+    All or nothing: when any entry is refused by ``validate_fqdn`` (a value
+    stored before the write check existed, #597) the WHOLE value is returned
+    as it is. Rewriting only the valid entries would make the stored value
+    compare unequal to the round-tripped one, and the scope update path
+    validates every option that changed (#1228) — so an unrelated edit of a
+    scope carrying a grandfathered list would start answering 422.
+    A list stays a list; a comma-separated string stays one string.
+    """
+    if isinstance(value, str):
+        canon = _canonical_str(value)
+        return value if canon is None else canon
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            canon = _canonical_str(item) if isinstance(item, str) else None
+            if canon is None:
+                return value
+            out.append(canon)
+        return out
+    return value
 
 
 def canonical_domain_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -303,11 +329,25 @@ def canonical_domain_options(options: Mapping[str, Any] | None) -> dict[str, Any
     product stores for the same name are A-labels, so the two must agree. Used
     at write time (``normalize_options``) and again at render time, so rows
     stored before the fix are served in the same form without a migration.
+
+    Deterministic and idempotent, so the config-bundle ETag moves once for a
+    row stored in another form and is stable after that. A value is rewritten
+    only when the rewritten form passes the same check the write path runs:
+    otherwise a grandfathered value the check would refuse (a two-entry
+    ``domain-name``, say) would read as changed and block an unrelated edit.
     """
     out = dict(options or {})
-    for key in _FQDN_OPTION_KEYS:
-        if key in out and not _is_unset(out[key]):
-            out[key] = _canonical_fqdn(out[key])
+    for key, rule in _FQDN_OPTION_RULES.items():
+        if key not in out or _is_unset(out[key]):
+            continue
+        canon = _canonical_fqdn(out[key])
+        if canon == out[key]:
+            continue
+        try:
+            rule(canon)
+        except ValueError:
+            continue
+        out[key] = canon
     return out
 
 
