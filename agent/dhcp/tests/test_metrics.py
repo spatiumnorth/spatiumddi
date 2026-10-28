@@ -17,7 +17,11 @@ import json
 from datetime import UTC, datetime
 
 from spatium_dhcp_agent.config import AgentConfig
-from spatium_dhcp_agent.metrics import MetricsPoller, _parse_snapshot
+from spatium_dhcp_agent.metrics import (
+    MetricsPoller,
+    _parse_snapshot,
+    arrival_age_seconds,
+)
 
 
 def _snapshot(values: dict[str, int]) -> dict:
@@ -321,3 +325,310 @@ def test_the_drop_counter_follows_the_rendered_socket_mode(tmp_path):
     doc["Dhcp4"]["interfaces-config"]["dhcp-socket-type"] = "raw"
     (tmp_path / "kea.conf").write_text(json.dumps(doc))
     assert p._socket._socket_type() == "raw"
+
+
+# ── #2889: requests evicted from Kea's packet queue ─────────────────────────
+
+
+def test_parse_snapshot_keeps_pkt4_received_out_of_the_shipped_columns():
+    """``pkt4-received`` is a term of ``queue_evicted``, not a column: it is
+    parsed, and ``_compute_delta`` must not put it on the wire."""
+    p = _parse_snapshot(_snapshot({"pkt4-received": 40, "pkt4-discover-received": 10}))
+    assert p["_received4"] == 40
+    assert "_received4" not in _parse_snapshot(_snapshot({"pkt6-solicit-received": 3}))
+
+
+def _drive(tmp_path, monkeypatch, kea, socket_drops, v4_drops, arrivals):
+    """Run the REAL ``run()`` for ``len(kea)`` ticks with scripted inputs and
+    return every body posted."""
+    p = _poller(tmp_path)
+    sink: list = []
+    monkeypatch.setattr(p, "_client", lambda: _FakeClient(sink))
+    kea_it = iter(kea)
+    monkeypatch.setattr(p, "_poll_kea", lambda: next(kea_it, None))
+    sd_it = iter(zip(socket_drops, v4_drops))
+
+    def _sample():
+        total, v4 = next(sd_it)
+        p._socket.last_v4 = v4
+        return total
+
+    monkeypatch.setattr(p._socket, "sample", _sample)
+    # One (before, after) pair per tick: arrivals are read on both sides of
+    # Kea's snapshot. A tick whose Kea poll fails takes only the first.
+    arr_it = iter([v for pair in arrivals for v in pair])
+    monkeypatch.setattr(p._arrivals, "sample", lambda: next(arr_it))
+    real_wait = p._stop.wait
+    ticks = {"n": 0}
+
+    def _wait(timeout=None):
+        if timeout is not None and timeout < 30:
+            return False  # the #2889 aging wait inside a tick, not a tick
+        ticks["n"] += 1
+        if ticks["n"] >= len(kea):
+            p._stop.set()
+        return real_wait(0)
+
+    monkeypatch.setattr(p._stop, "wait", _wait)
+    p.run()
+    return sink
+
+
+def test_run_reports_queue_evicted_from_the_three_terms(tmp_path, monkeypatch):
+    """1,000 arrive in one minute, the kernel drops 30 (all DHCPv4), the
+    worker takes 870: 100 were evicted. Reported by the sample after, and
+    the port-547 share of ``socket_drop`` is not subtracted from v4 arrivals."""
+    kea = [
+        {"discover": 0, "_received4": 0},
+        {"discover": 500, "_received4": 500},
+        {"discover": 1300, "_received4": 1370},
+        {"discover": 1400, "_received4": 1470},
+    ]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0, 35, 0],  # 5 of the 35 are DHCPv6
+        v4_drops=[None, 0, 30, 0],
+        arrivals=[(None, 0), (500, 0), (1000, 0), (100, 0)],
+    )
+    assert [b["queue_evicted"] for b in sink] == [0, 0, 100]
+    assert [b["socket_drop"] for b in sink] == [0, 35, 0]
+
+
+def test_run_reports_queue_evicted_none_when_arrivals_unmeasured(tmp_path, monkeypatch):
+    """No CAP_NET_RAW, a v6-only server: unmeasured, explicit null, never 0."""
+    kea = [{"discover": 0, "_received4": 0}, {"discover": 5, "_received4": 5}]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0],
+        v4_drops=[None, 0],
+        arrivals=[(None, None), (None, None)],
+    )
+    assert len(sink) == 1
+    assert "queue_evicted" in sink[0]
+    assert sink[0]["queue_evicted"] is None
+
+
+def test_kea_restart_makes_the_bucket_after_it_unmeasured(tmp_path, monkeypatch):
+    """``pkt4-received`` going backwards is a Kea restart: its delta, and so
+    the eviction over that interval, is unknown — not a negative number and
+    not a fabricated eviction of everything that arrived."""
+    kea = [
+        {"discover": 0, "_received4": 900},
+        {"discover": 100, "_received4": 1000},
+        {"discover": 0, "_received4": 3},  # restarted
+        {"discover": 50, "_received4": 53},
+        {"discover": 100, "_received4": 103},
+    ]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0, 0, 0, 0],
+        v4_drops=[None, 0, 0, 0, 0],
+        arrivals=[(None, 0), (100, 0), (1000, 0), (50, 0), (50, 0)],
+    )
+    # The restart bucket itself is not posted (``_compute_delta`` drops it).
+    assert [b["queue_evicted"] for b in sink] == [0, 0, 0]
+
+
+def test_arrivals_are_carried_across_a_failed_kea_poll(tmp_path, monkeypatch):
+    """Kea's control socket did not answer for a tick: the next good tick
+    diffs Kea's counters across both minutes, so the arrivals read before
+    the failed poll must be counted in it too — or the gap reads as Kea
+    receiving more than arrived, and a real eviction after it is hidden."""
+    kea = [
+        {"discover": 0, "_received4": 0},
+        {"discover": 100, "_received4": 100},
+        None,  # control socket timed out
+        {"discover": 300, "_received4": 300},
+        {"discover": 400, "_received4": 340},  # 60 evicted
+        {"discover": 500, "_received4": 440},
+    ]
+    sink = _drive(
+        tmp_path,
+        monkeypatch,
+        kea,
+        socket_drops=[None, 0, 0, 0, 0],
+        v4_drops=[None, 0, 0, 0, 0],
+        arrivals=[(None, 0), (100, 0), (100,), (100, 0), (100, 0), (100, 0)],
+    )
+    assert [b["queue_evicted"] for b in sink] == [0, 0, 0, 60]
+
+
+# ── #2889: the QA walk's case 3, against a simulated Kea ───────────────────
+
+
+class _SimKea:
+    """A kea-dhcp4 in miniature, stepped 1 ms at a time: packets arrive at
+    ``rate``/s, wait in a queue of at most ``depth`` (a full queue evicts its
+    OLDEST packet, as Kea's ``pushBack`` does), and one worker takes them at
+    ``service``/s except during ``stalls`` (``(start, end)`` seconds). Kea's
+    ``pkt4-received`` counts a packet when the worker takes it."""
+
+    def __init__(self, rate, service, depth=1024, stalls=(), bursts=(), queued=0):
+        self.t = 0.0
+        self.rate = rate
+        self.service = service
+        self.depth = depth
+        self.stalls = stalls
+        self.bursts = dict(bursts)  # second -> extra packets arriving then
+        self.queue = queued
+        self.arrived = queued  # cumulative, as the counting socket sees them
+        self.received = 0
+        self.evicted = 0
+        self._arr_frac = 0.0
+        self._srv_frac = 0.0
+        self._read = 0
+
+    def _push(self, n):
+        self.arrived += n
+        self.queue += n
+        if self.queue > self.depth:
+            self.evicted += self.queue - self.depth
+            self.queue = self.depth
+
+    def advance(self, seconds):
+        steps = round(seconds * 1000)
+        for _ in range(steps):
+            self.t += 0.001
+            sec = int(self.t)
+            if sec in self.bursts and abs(self.t - sec - 0.0005) < 0.0006:
+                self._push(self.bursts.pop(sec))
+            self._arr_frac += self.rate / 1000
+            n = int(self._arr_frac)
+            self._arr_frac -= n
+            if n:
+                self._push(n)
+            if any(a <= self.t < b for a, b in self.stalls):
+                continue
+            self._srv_frac += self.service / 1000
+            k = min(int(self._srv_frac), self.queue)
+            self._srv_frac -= int(self._srv_frac)
+            self.queue -= k
+            self.received += k
+
+    def take_arrivals(self):
+        n = self.arrived - self._read
+        self._read = self.arrived
+        return n
+
+
+def _simulate(tmp_path, monkeypatch, sim, minutes, age=None):
+    """The REAL ``run()`` against ``sim``: every wait advances its clock."""
+    p = _poller(tmp_path)
+    sink: list = []
+    monkeypatch.setattr(p, "_client", lambda: _FakeClient(sink))
+    monkeypatch.setattr("spatium_dhcp_agent.metrics.random.uniform", lambda a, b: 0.0)
+    if age is not None:
+        monkeypatch.setattr(p, "_arrival_age", lambda: age)
+    opened = {"done": False}
+
+    def _arrivals():
+        if not opened["done"]:  # the opening read: a window begun part-way
+            opened["done"] = True
+            sim.take_arrivals()
+            return None
+        return sim.take_arrivals()
+
+    monkeypatch.setattr(p._arrivals, "sample", _arrivals)
+    monkeypatch.setattr(
+        p, "_poll_kea", lambda: {"discover": sim.received, "_received4": sim.received}
+    )
+
+    def _socket():
+        p._socket.last_v4 = 0
+        return 0
+
+    monkeypatch.setattr(p._socket, "sample", _socket)
+    ticks = {"n": 0}
+
+    def _wait(timeout=None):
+        sim.advance(timeout or 0)
+        if timeout is not None and timeout >= 30:
+            ticks["n"] += 1
+            if ticks["n"] >= minutes:
+                p._stop.set()
+                return True
+        return False
+
+    monkeypatch.setattr(p._stop, "wait", _wait)
+    p.run()
+    return [b["queue_evicted"] for b in sink]
+
+
+def _stalls_before_reads(age, period=60.0, first=60.0, n=10, length=0.253):
+    """A Kea stall ending just before each Kea snapshot of the run."""
+    out = []
+    t = first
+    for _ in range(n):
+        snap = t + age
+        out.append((snap - length, snap))
+        t = snap + period
+    return out
+
+
+def test_case3_packets_in_flight_at_two_reads_are_not_evictions(tmp_path, monkeypatch):
+    """The walk's case 3: a serving node at ~100 requests/s, Kea stalls
+    253 ms just before consecutive snapshots, so ~25 packets are still
+    waiting each time. Nothing is evicted; the bucket must read 0."""
+    age = arrival_age_seconds(1024)
+    sim = _SimKea(rate=100, service=700, stalls=_stalls_before_reads(age, n=8))
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=8)
+    assert sim.evicted == 0
+    assert out and all(v == 0 for v in out), out
+
+
+def test_case3_reproduces_without_the_aging_wait(tmp_path, monkeypatch):
+    """Negative control: the same run with the snapshot taken straight after
+    the arrivals read (the estimator as walked at 256e823) reports the
+    in-flight packets as evicted."""
+    sim = _SimKea(rate=100, service=700, stalls=_stalls_before_reads(0.0, n=8))
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=8, age=0.0)
+    assert sim.evicted == 0
+    assert sum(v or 0 for v in out) > 0
+
+
+def test_a_sustained_backlog_below_the_queue_depth_is_never_loss(tmp_path, monkeypatch):
+    """Kea runs at exactly its capacity, and a burst at 90 s leaves ~900
+    queued at every read from then on (below the 1,024 depth): nothing is
+    evicted, nothing is reported. Without the aging wait this read as ~900
+    evicted."""
+    sim = _SimKea(rate=700, service=700, bursts={90: 900})
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=10)
+    assert sim.evicted == 0
+    assert 800 <= sim.queue <= 1024
+    assert all(v == 0 for v in out), out
+    sim = _SimKea(rate=700, service=700, bursts={90: 900})
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=10, age=0.0)
+    assert sum(v or 0 for v in out) > 0  # negative control
+
+
+def test_a_burst_deeper_than_the_queue_is_counted_exactly(tmp_path, monkeypatch):
+    """The walk's case 1 shape: a burst evicts; the count matches what the
+    queue actually evicted, one bucket after the burst, once."""
+    sim = _SimKea(rate=0, service=700, bursts={150: 1043})
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=6)
+    assert sim.evicted == 19
+    assert sum(out) == 19
+    assert max(out) == 19  # all in one bucket
+    # Several bursts, quiet between them (the gate load's shape): each
+    # counted exactly, once.
+    sim = _SimKea(rate=0, service=700, bursts={150: 1043, 400: 1500, 520: 1100})
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=13)
+    assert sim.evicted == 19 + 476 + 76
+    assert sum(out) == sim.evicted
+
+
+def test_steady_background_traffic_can_only_lower_the_count(tmp_path, monkeypatch):
+    """The price of the aging wait: requests the worker serves during it
+    were not yet counted as arrived, so under continuous background traffic
+    the count is LOW by up to that traffic until a quieter read. It is
+    never high."""
+    sim = _SimKea(rate=50, service=700, bursts={150: 1043, 400: 1500})
+    out = _simulate(tmp_path, monkeypatch, sim, minutes=10)
+    assert sim.evicted > 0
+    assert 0 <= sum(out) <= sim.evicted

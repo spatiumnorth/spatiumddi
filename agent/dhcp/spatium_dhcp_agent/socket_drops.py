@@ -45,6 +45,10 @@ log = structlog.get_logger(__name__)
 # local port in hex, so these are compared post-parse rather than as text.
 DHCP_PORTS = frozenset({67, 547})
 _DHCP4_PORT = 67
+# Key prefix for a port-67 UDP socket inside :class:`SocketDropCounter`, so
+# its DHCPv4 share can be summed apart from port 547 (#2889). AF_PACKET
+# sockets are already ``packet:``-prefixed and are DHCPv4 by construction.
+_V4_UDP_KEY = "udp67:"
 
 _PROC_UDP = ("/proc/net/udp", "/proc/net/udp6")
 
@@ -402,6 +406,13 @@ class SocketDropCounter:
     ) -> None:
         self._prev: dict[str, int] | None = None
         self._mode: str | None = None
+        #: #2889 — the DHCPv4 share of the last :meth:`sample_from` result,
+        #: or ``None`` whenever that result was ``None``. The queue-eviction
+        #: estimate subtracts it from DHCPv4 arrivals, so it must not carry
+        #: the port-547 drops the total folds in. Keyed by the same per-socket
+        #: arithmetic as the total, so the two can never disagree about which
+        #: interval they cover.
+        self.last_v4: int | None = None
         self._packet_drops = read_packet_drops if packet_drops is None else packet_drops
         self._socket_type = (lambda: None) if socket_type is None else socket_type
 
@@ -427,8 +438,18 @@ class SocketDropCounter:
         if mode != self._mode:
             self._prev = None
             self._mode = mode
-        udp_ports = ports - {_DHCP4_PORT} if mode == "raw" else ports
-        current = read_socket_drops(paths, udp_ports)
+        # The port-67 UDP sockets are read apart from the rest and their keys
+        # tagged, so the DHCPv4 share can be told out of the total (#2889).
+        # In raw mode they are fallbacks and not counted at all (#1283).
+        v4_udp_ports = ports & {_DHCP4_PORT} if mode != "raw" else frozenset()
+        current = read_socket_drops(paths, ports - {_DHCP4_PORT})
+        if current is not None and v4_udp_ports:
+            v4_udp = read_socket_drops(paths, v4_udp_ports)
+            current = (
+                None
+                if v4_udp is None
+                else {**current, **{f"{_V4_UDP_KEY}{k}": v for k, v in v4_udp.items()}}
+            )
         if current is not None and mode != "udp":
             # A partial read counts as no read, as for the two procfs files.
             # In raw mode the UDP half alone does not measure kea-dhcp4 at all.
@@ -443,6 +464,7 @@ class SocketDropCounter:
                 current = None
             else:
                 current = {**current, **packet}
+        self.last_v4 = None
         if current is None:
             self._prev = None
             return None
@@ -451,13 +473,18 @@ class SocketDropCounter:
         if prev is None:
             return None
         total = 0
+        v4 = 0
         for inode, value in current.items():
             baseline = prev.get(inode, 0)
             # max() guards a same-inode counter that appears to fall. It
             # cannot happen for sk_drops, but an inode number reused by a
             # different socket inside one interval would look exactly like
             # that, and a negative contribution is never the right answer.
-            total += max(0, value - baseline)
+            d = max(0, value - baseline)
+            total += d
+            if inode.startswith((_V4_UDP_KEY, "packet:")):
+                v4 += d
+        self.last_v4 = v4
         return total
 
 

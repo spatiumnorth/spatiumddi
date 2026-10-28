@@ -1737,6 +1737,9 @@ class DHCPRateBucket(BaseModel):
     # receive buffer was full. The one that moves when a node is short of
     # CPU; ``receive_drop`` stays at 0 through exactly that failure.
     socket_drop: int | None = None
+    # #2889 — DHCPv4 requests Kea read and then evicted from its packet
+    # queue under a burst. Loss like ``socket_drop``; no Kea counter sees it.
+    queue_evicted: int | None = None
 
 
 class DHCPServerStatsResponse(BaseModel):
@@ -1806,6 +1809,7 @@ async def get_server_stats(
             # loss. A partially-measured bucket sums the samples that did.
             func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
             func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+            func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
         )
         .where(DHCPMetricSample.server_id == server_id)
         .where(DHCPMetricSample.bucket_at >= since)
@@ -1826,6 +1830,7 @@ async def get_server_stats(
             # ``is None`` rather than ``or``: 0 is a real, measured value.
             receive_drop=None if r.receive_drop is None else int(r.receive_drop),
             socket_drop=None if r.socket_drop is None else int(r.socket_drop),
+            queue_evicted=None if r.queue_evicted is None else int(r.queue_evicted),
         )
         for r in rows
     ]
