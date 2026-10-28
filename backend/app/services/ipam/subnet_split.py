@@ -68,6 +68,11 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+)
 from app.services.ipam.subnet_carry import NOT_CARRIED_PROVENANCE, split_inherited
 
 logger = structlog.get_logger(__name__)
@@ -421,29 +426,13 @@ async def preview_subnet_split(
     # can use. network / broadcast rows are the placeholders themselves
     # (or an operator's renamed one, which survives by design) — only a
     # row with another status is a host.
-    boundary_of: dict[str, str] = {}
-    for child in children_nets:
-        if child.prefixlen >= 31:
-            continue
-        boundary_of[str(child.network_address)] = f"the network address of {child}"
-        if isinstance(child, ipaddress.IPv4Network):
-            boundary_of[str(child.broadcast_address)] = f"the broadcast address of {child}"
-    for row in addr_rows:
-        if row.status in ("network", "broadcast"):
-            continue
-        where = boundary_of.get(str(row.address))
-        if where is not None:
-            conflicts.append(
-                SplitConflict(
-                    type="host_on_child_boundary",
-                    detail=(
-                        f"{row.address} ({row.status}"
-                        f"{', ' + row.hostname if row.hostname else ''}) would sit on "
-                        f"{where}, which no client can use. Move or delete it "
-                        "before splitting."
-                    ),
-                )
+    for detail in boundary_host_conflicts(addr_rows, children_nets):
+        conflicts.append(
+            SplitConflict(
+                type="host_on_child_boundary",
+                detail=detail.replace(" first.", " before splitting."),
             )
+        )
 
     warnings.append(
         f"Hosts move into children with a /{new_prefix_length} netmask; "
@@ -627,9 +616,7 @@ async def commit_subnet_split(
         .scalars()
         .all()
     )
-    parent_boundary_ips = {str(parent.network_address)}
-    if isinstance(parent, ipaddress.IPv4Network) and parent.prefixlen <= 30:
-        parent_boundary_ips.add(str(parent.broadcast_address))
+    parent_boundary_ips = boundary_addresses(parent)
 
     deleted_default_count = 0
     moved_count = 0
@@ -658,40 +645,9 @@ async def commit_subnet_split(
     # Recreate default-named placeholders on each child.
     placeholders_created = 0
     for cnet, child in zip(children_nets, new_children, strict=True):
-        if cnet.prefixlen >= 31:
-            # /31 / /32 / /127 / /128 — no placeholders.
-            continue
-        existing = (
-            (await db.execute(select(IPAddress.address).where(IPAddress.subnet_id == child.id)))
-            .scalars()
-            .all()
+        placeholders_created += await ensure_boundary_rows(
+            db, child.id, cnet, current_user.id if current_user is not None else None
         )
-        existing_set = {str(a) for a in existing}
-        net_addr = str(cnet.network_address)
-        if net_addr not in existing_set:
-            db.add(
-                IPAddress(
-                    subnet_id=child.id,
-                    address=net_addr,
-                    status="network",
-                    description="Network address",
-                    created_by_user_id=(current_user.id if current_user is not None else None),
-                )
-            )
-            placeholders_created += 1
-        if isinstance(cnet, ipaddress.IPv4Network) and cnet.prefixlen <= 30:
-            bcast = str(cnet.broadcast_address)
-            if bcast not in existing_set:
-                db.add(
-                    IPAddress(
-                        subnet_id=child.id,
-                        address=bcast,
-                        status="broadcast",
-                        description="Broadcast address",
-                        created_by_user_id=(current_user.id if current_user is not None else None),
-                    )
-                )
-                placeholders_created += 1
     await db.flush()
 
     # Re-bind DHCP scopes. We use the same fits-cleanly arithmetic as

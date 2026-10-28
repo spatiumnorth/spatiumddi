@@ -71,6 +71,11 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+)
 from app.services.ipam.subnet_carry import (
     merge_conflicts_and_warnings,
     merged_carried,
@@ -355,6 +360,24 @@ async def preview_subnet_merge(
     )
     warnings.extend(carry_warnings)
 
+    # A host on the merged subnet's network / broadcast address would sit
+    # where no client can use it and count against a total that excludes it
+    # (#2976). Hosts only: default placeholders are pruned and recreated.
+    if merged is not None:
+        src_ids = [s.id for s in sources]
+        host_rows = (
+            (await db.execute(select(IPAddress).where(IPAddress.subnet_id.in_(src_ids))))
+            .scalars()
+            .all()
+        )
+        for detail in boundary_host_conflicts(host_rows, [merged]):
+            conflicts.append(
+                MergeConflict(
+                    type="host_on_merged_boundary",
+                    detail=detail.replace(" first.", " before merging."),
+                )
+            )
+
     # DHCP scope handling — at most one survivor.
     scopes = (
         (
@@ -529,8 +552,7 @@ async def commit_subnet_merge(
         except ValueError:
             continue
         source_boundary_ips.add(str(sn.network_address))
-        if isinstance(sn, ipaddress.IPv4Network) and sn.prefixlen <= 30:
-            source_boundary_ips.add(str(sn.broadcast_address))
+        source_boundary_ips |= boundary_addresses(sn)
 
     # Migrate IPAddress rows.
     moved = 0
@@ -588,43 +610,9 @@ async def commit_subnet_merge(
     await db.flush()
 
     # Recreate default-named placeholders on the merged subnet.
-    placeholders_created = 0
-    if merged_net.prefixlen < 31:
-        existing = (
-            (
-                await db.execute(
-                    select(IPAddress.address).where(IPAddress.subnet_id == merged_subnet.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        existing_set = {str(a) for a in existing}
-        net_addr = str(merged_net.network_address)
-        if net_addr not in existing_set:
-            db.add(
-                IPAddress(
-                    subnet_id=merged_subnet.id,
-                    address=net_addr,
-                    status="network",
-                    description="Network address",
-                    created_by_user_id=(current_user.id if current_user is not None else None),
-                )
-            )
-            placeholders_created += 1
-        if isinstance(merged_net, ipaddress.IPv4Network) and merged_net.prefixlen <= 30:
-            bcast = str(merged_net.broadcast_address)
-            if bcast not in existing_set:
-                db.add(
-                    IPAddress(
-                        subnet_id=merged_subnet.id,
-                        address=bcast,
-                        status="broadcast",
-                        description="Broadcast address",
-                        created_by_user_id=(current_user.id if current_user is not None else None),
-                    )
-                )
-                placeholders_created += 1
+    placeholders_created = await ensure_boundary_rows(
+        db, merged_subnet.id, merged_net, current_user.id if current_user is not None else None
+    )
     await db.flush()
 
     # Bump DHCP config bundles on agent-based servers in any affected
