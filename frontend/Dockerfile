@@ -22,8 +22,10 @@ WORKDIR /app
 # NOTICE and LICENSE (#2895), and a file outside the context cannot be copied.
 # They stay single-sourced at the root; the Vite build copies them into
 # ``dist/legal/`` (see ``legalFiles`` in vite.config.ts). The
-# ``Dockerfile.dockerignore`` beside this file keeps a developer's local
-# node_modules / dist out of the context.
+# ``Dockerfile.dockerignore`` beside this file is an allowlist (frontend/,
+# NOTICE, LICENSE) so nothing else at the root, a developer's .env included,
+# is sent to the builder. BuildKit only — the legacy builder ignores a
+# per-Dockerfile ignore file and would upload the whole repo.
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install --prefer-offline
 
