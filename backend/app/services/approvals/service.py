@@ -454,8 +454,10 @@ async def mark_expired(db: AsyncSession, cr: ChangeRequest) -> ChangeRequest:
 #   3. Approver holds ``{approve, change_request}`` (``DecisionForbidden``).
 #   4. Approver holds the underlying op's ``required_permission``
 #      (``DecisionForbidden``) — can't rubber-stamp a delete you couldn't do.
-#   5. ``preview()`` re-runs (stale-state guard); if not ok the op does NOT
-#      execute (``DecisionConflict``), the row stays ``pending``.
+#   5. ``preview()`` re-runs (stale-state guard); if it refuses, the op does
+#      NOT execute and the row ends ``failed`` with the reason (#2911). A
+#      gate row whose preview still succeeds but describes a different scope
+#      (5b) is ``DecisionConflict`` and stays ``pending``.
 #   6. ``apply()`` dispatches under the **approver's** identity; the audit
 #      ``executed`` row carries approver as actor + requester in
 #      ``old_value.requested_by``.
@@ -758,8 +760,34 @@ async def approve_change_request(
             )
             return cr
 
-    # 5. Stale-state re-check — do NOT execute a doomed op; leave it pending.
-    preview = await op.preview(db, approver, args)
+    # 5. Stale-state re-check — do NOT execute a doomed op. If the re-run
+    #    preview REFUSES (raises, or reports ok=False: the target is gone, the
+    #    subnet is no longer empty, the address was taken), the operation can
+    #    no longer be done as submitted, so the request ends ``failed`` with
+    #    the reason, exactly like an apply() refusal (#2911). Contrast 5b: a
+    #    preview that still succeeds but DIFFERS from what the approver
+    #    reviewed is not a refusal, and stays pending with a 409.
+    try:
+        preview = await op.preview(db, approver, args)
+    except OperationPermissionError as exc:
+        # About this approver, as in step 4 — another may still approve.
+        await _safe_rollback(db)
+        raise DecisionForbidden(str(exc)) from exc
+    except HTTPException as exc:
+        await _safe_rollback(db)
+        return await _stamp_apply_failed(
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=_refusal_text(exc.detail),
+        )
+    except Exception as exc:  # noqa: BLE001
+        await _safe_rollback(db)
+        return await _stamp_apply_failed(
+            db, cr_id, approver=approver, request=request, note=note, error=str(exc)
+        )
     if not preview.ok:
         logger.info(
             "change_request.stale",
@@ -768,7 +796,18 @@ async def approve_change_request(
             detail=preview.detail,
             approver=str(approver.id),
         )
-        raise DecisionConflict(preview.detail)
+        # A preview is read-only, but roll back anyway so the stamp below
+        # starts from the same state as every other refusal: it re-locks the
+        # row and replays the approval before the failure.
+        await _safe_rollback(db)
+        return await _stamp_apply_failed(
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=preview.detail or "The operation can no longer be applied.",
+        )
 
     # 5a. Idempotent resolution (#62 concurrent break-glass). When the op's
     #     preview reports the target is ALREADY in the desired end-state

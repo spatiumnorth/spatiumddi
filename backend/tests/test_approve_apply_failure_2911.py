@@ -328,3 +328,146 @@ def test_refusal_text_is_readable_for_every_detail_shape() -> None:
     )
     assert _refusal_text({"b": 1, "a": None}) == '{"a": null, "b": 1}'
     assert _refusal_text([{"loc": ["x"], "msg": "bad"}]) == '[{"loc": ["x"], "msg": "bad"}]'
+
+
+# ── Step 5: the re-preview at approve time ───────────────────────────────────
+#
+# Two outcomes are kept apart (#2911). A re-preview that REFUSES (raises, or
+# reports ok=False) means the operation can no longer be done as submitted:
+# the request ends ``failed`` with the reason, like an apply() refusal. A
+# re-preview that still succeeds but DIFFERS from what the approver reviewed
+# is the scope-drift guard: 409, left pending, never failed.
+
+
+def _patch_preview(monkeypatch: pytest.MonkeyPatch, name: str, preview: Any) -> None:
+    op = operations._OPERATIONS[name]
+    monkeypatch.setitem(operations._OPERATIONS, name, dataclasses.replace(op, preview=preview))
+
+
+def _preview_refusing(detail: str) -> Any:
+    async def refuse(db, user, args):  # noqa: ANN001
+        return operations.PreviewResult(ok=False, detail=detail)
+
+    return refuse
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "preview",
+    [
+        _preview_refusing("target gone"),
+        _raising(HTTPException(status_code=409, detail="target gone")),
+        _raising(RuntimeError("target gone")),
+    ],
+    ids=["ok_false", "raises_4xx", "raises_error"],
+)
+async def test_change_requests_refusing_re_preview_records_failed(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    preview: Any,
+) -> None:
+    cr_id, atoken, approver = await _pending_gate_request(client, db_session)
+    approver_id = approver.id
+    _patch_preview(monkeypatch, "delete_subnet", preview)
+    applied: list[bool] = []
+
+    async def must_not_apply(db, user, args):  # noqa: ANN001
+        applied.append(True)
+        return {}
+
+    _patch_apply(monkeypatch, "delete_subnet", must_not_apply)
+
+    r = await client.post(
+        f"/api/v1/change-requests/{cr_id}/approve",
+        headers=_auth(atoken),
+        json={"decision_note": "go"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "failed"
+    assert body["error"] == "target gone"
+    assert body["decided_by_user_id"] == str(approver_id)
+    assert applied == []
+    assert await _audit_actions(db_session, cr_id) == ["requested", "approved", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_change_requests_re_preview_permission_error_stays_pending(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cr_id, atoken, _ = await _pending_gate_request(client, db_session)
+    _patch_preview(
+        monkeypatch,
+        "delete_subnet",
+        _raising(operations.OperationPermissionError("delete", "subnet")),
+    )
+    r = await client.post(f"/api/v1/change-requests/{cr_id}/approve", headers=_auth(atoken))
+    assert r.status_code == 403, r.text
+    assert (await _state(db_session, cr_id)).state == "pending"
+    assert await _audit_actions(db_session, cr_id) == ["requested"]
+
+
+@pytest.mark.asyncio
+async def test_change_requests_re_preview_that_differs_stays_pending(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The stale guard: the delete is still possible, but its preview no
+    longer says what the approver reviewed. 409, pending, nothing audited."""
+    cr_id, atoken, _ = await _pending_gate_request(client, db_session)
+    cr = await db_session.get(ChangeRequest, uuid.UUID(cr_id))
+    assert cr is not None
+    cr.preview_text = "Delete subnet — what the approver reviewed was different"
+    await db_session.commit()
+
+    r = await client.post(f"/api/v1/change-requests/{cr_id}/approve", headers=_auth(atoken))
+    assert r.status_code == 409, r.text
+    assert "scope changed" in r.json()["detail"]
+    row = await _state(db_session, cr_id)
+    assert row.state == "pending"
+    assert row.error is None
+    assert await _audit_actions(db_session, cr_id) == ["requested"]
+
+
+@pytest.mark.asyncio
+async def test_requests_re_preview_refusing_records_failed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A real refusal: the subnet the address was requested in is gone by
+    the time it is approved. The preview says so, and the request ends
+    failed with that reason for the requester to read."""
+    req_id, token, subnet, appr = await _pending_ip_request(client, db_session)
+    appr_id, subnet_id = appr.id, subnet.id
+    await db_session.delete(subnet)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/requests/{req_id}/approve", headers=_auth(token), json={"decision_note": "go"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "failed"
+    assert body["error"] == f"Subnet {subnet_id} not found"
+    assert body["decided_by_user_id"] == str(appr_id)
+    assert await _audit_actions(db_session, req_id) == ["requested", "approved", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_requests_re_preview_that_differs_still_provisions(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A portal request has no scope-drift guard on purpose (#696): its
+    preview names what the allocator would pick NOW, so a differing preview
+    is the normal case. It is neither refused nor failed — it executes, and
+    the fresh preview is recorded. (Gate rows: see the test above.)"""
+    req_id, token, _, _ = await _pending_ip_request(client, db_session)
+    cr = await db_session.get(ChangeRequest, uuid.UUID(req_id))
+    assert cr is not None
+    submitted = cr.preview_text
+    cr.preview_text = "something the approver did not review"
+    await db_session.commit()
+
+    resp = await client.post(f"/api/v1/requests/{req_id}/approve", headers=_auth(token), json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "executed"
+    assert resp.json()["preview_text"] == submitted

@@ -23,9 +23,17 @@
   after submit stayed pending, while an IP address taken after submit
   ended failed. Now the request ends `failed` and the requester reads the
   reason on the portal. A structured detail, such as the IPAM name
-  collision, is spelled out as a sentence. The one refusal that still
-  leaves a request `pending` is a permission error about the approver
-  (403), because a different approver may still approve it.
+  collision, is spelled out as a sentence. The same applies when the
+  preview that re-runs at approve time refuses (the target is gone, the
+  subnet is no longer empty): that used to answer 409 and leave the
+  request pending, and it now ends `failed` with the reason.
+
+  Two outcomes still leave a request `pending`. A permission error about
+  the approver answers 403, because a different approver may still
+  approve it. And on a `/change-requests` row, a re-run preview that
+  still succeeds but describes a different scope from the one the
+  approver reviewed answers 409, because the change is still possible
+  but is not what was approved.
 
   Two edges of the same path were also wrong. An `apply()` that committed
   and then raised had already persisted the `approved` stamp, so the

@@ -461,12 +461,18 @@ surface filters by `origin`, so neither queue ever renders the other's
 rows. `justification` is the requester's free-text "why" and is NULL on
 gate rows, which carry the policy-derived `risk_reason` instead.
 
-When the operation's `apply()` refuses at approve time (a 4xx such as a
-conflict that appeared after submit, a 5xx, or any other error), the row
-ends `failed` with the reason in `error`, after its `approved` stamp, and
-the approve answers 200, so the requester can read why (#2911). The only
-refusal that leaves it `pending` is a permission error about the approver
-(403), because a different approver may still approve it.
+When the operation refuses at approve time, the row ends `failed` with the
+reason in `error`, after its `approved` stamp, and the approve answers 200,
+so the requester can read why (#2911). That covers the re-run preview
+refusing (the target is gone, the subnet is no longer empty) and `apply()`
+raising a 4xx (a conflict that appeared after submit), a 5xx, or any other
+error. Two outcomes leave the row `pending` instead. A permission error
+about the approver answers 403, because a different approver may still
+approve. And on a gate row, a re-run preview that still succeeds but
+describes a different scope from the one the approver reviewed answers 409,
+since the change is still possible but is not what was approved. A portal
+row has no such check, because its preview names what the allocator would
+pick at that moment.
 
 ---
 
