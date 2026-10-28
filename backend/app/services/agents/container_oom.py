@@ -134,16 +134,25 @@ _RESTART_HISTORY_MAX = 64
 
 #: How long the agent may be silent, while its appliance's supervisor is not,
 #: before the supervisor's word replaces the stale last agent report (#2961).
-#: Silence is counted from the later of the agent's last heartbeat and the
-#: container's current start, so a container that has just (re)started (a
-#: reboot, a slot upgrade, a role-chart rollout) gets the whole threshold for
-#: its agent to come up. Above the 90-120 s the health sweeps allow before
-#: they read the row ``unreachable``, so a missed heartbeat or two stays
-#: quiet. The alert's five-minute grace then runs from when the supervisor
-#: first SAW the silence, not from the agent's last heartbeat: a supervisor
-#: that was down too (the node rebooting) would otherwise stamp a silence
-#: already older than the grace and page on its first heartbeat back.
+#: Silence is counted only over time the control plane could have heard the
+#: agent: from the latest of the agent's last heartbeat, the container's
+#: current start (a reboot, a slot upgrade, a role-chart rollout restarts it,
+#: and its agent gets the whole threshold to come up) and the start of the
+#: supervisor's current unbroken run of heartbeats (:data:`HEARD_SINCE_KEY`;
+#: a node that was down, or a control plane that was, heard nobody, so the
+#: agent's silence over that gap is not evidence). Above the 90-120 s the
+#: health sweeps allow before they read the row ``unreachable``, so a missed
+#: heartbeat or two stays quiet; the alert's five-minute grace runs from the
+#: same point.
 AGENT_SILENT_SECONDS = 180.0
+
+#: The backend-owned key, on each ``role_health[<service>]`` entry, holding
+#: when the supervisor's current unbroken run of heartbeats began. A gap
+#: longer than :data:`SUPERVISOR_GAP_SECONDS` between two supervisor
+#: heartbeats starts a new run. The supervisor heartbeats every ~30 s and the
+#: control plane may hold one for up to 28 s.
+HEARD_SINCE_KEY = "heard_since"
+SUPERVISOR_GAP_SECONDS = 120.0
 
 #: What the kubelet-sourced OOM reason above starts with, as opposed to the
 #: agent's own record ("oom_killed: named was killed for exceeding ..."). Both
@@ -364,6 +373,8 @@ def carry_restart_history(
     previous: dict[str, Any] | None,
     incoming: dict[str, Any],
     now: datetime,
+    *,
+    supervisor_last_seen: datetime | None = None,
 ) -> dict[str, Any]:
     """``incoming`` (a supervisor heartbeat's ``role_health``) with each
     container's observed ``restartCount`` history carried forward from
@@ -374,20 +385,34 @@ def carry_restart_history(
     count is recorded when it is first seen to change; the history restarts
     when the pod changes (a new pod's count starts again at 0) or the count
     goes down. Entries older than the window are pruned except the last one,
-    which is the window's baseline."""
+    which is the window's baseline.
+
+    Also stamps :data:`HEARD_SINCE_KEY`: carried forward while the supervisor
+    has heartbeated without a gap (``supervisor_last_seen``, the appliance's
+    previous heartbeat, within :data:`SUPERVISOR_GAP_SECONDS`), else now."""
     prev = previous if isinstance(previous, dict) else {}
+    continuous = (
+        supervisor_last_seen is not None
+        and 0 <= (now - supervisor_last_seen).total_seconds() <= SUPERVISOR_GAP_SECONDS
+    )
     out: dict[str, Any] = {}
     for svc, entry in incoming.items():
         if not isinstance(entry, dict):
             out[svc] = entry
             continue
         entry = dict(entry)
-        entry.pop(RESTART_HISTORY_KEY, None)  # backend-owned, never trusted
+        # Backend-owned, never trusted from the supervisor.
+        entry.pop(RESTART_HISTORY_KEY, None)
+        entry.pop(HEARD_SINCE_KEY, None)
+        old = prev.get(svc)
+        heard = _parse_ts(old.get(HEARD_SINCE_KEY)) if isinstance(old, dict) else None
+        if not continuous or heard is None or heard > now:
+            heard = now
+        entry[HEARD_SINCE_KEY] = heard.strftime("%Y-%m-%dT%H:%M:%SZ")
         count = _restart_count(entry.get("container"))
         if count is None:
             out[svc] = entry
             continue
-        old = prev.get(svc)
         history = _read_history(old)
         same_pod = isinstance(old, dict) and old.get("container_id") == entry.get("container_id")
         if not history or not same_pod or count < history[-1][1]:
@@ -475,25 +500,24 @@ def agent_silent_report(
     agent_last_seen: datetime | None,
     now: datetime,
 ) -> tuple[dict[str, str], datetime] | None:
-    """``({"status", "reason"}, now)`` for a server whose agent has been
+    """``({"status", "reason"}, since)`` for a server whose agent has been
     silent for :data:`AGENT_SILENT_SECONDS` while its appliance's supervisor
     is heartbeating and reports the container (#2961). The row would
     otherwise keep the last thing the agent said, usually ``ok``. Silence is
-    counted from the later of the agent's last heartbeat and the container's
-    current start (a container that has just started is given the whole
-    threshold), and the verdict's ``since`` is now: the moment the supervisor
-    first saw it, so the alert's grace is never already spent by a silence
-    the supervisor itself was not there to see (a rebooting node). None when
-    the agent has never reported (unknown, not an alarm) or has been heard
-    from recently."""
+    counted from the latest of the agent's last heartbeat, the container's
+    current start and the start of the supervisor's unbroken run of
+    heartbeats, and ``since`` is that point: a rebooted node, a restarted
+    container or a control plane that was itself down never stamps a silence
+    whose grace is already spent. None when the agent has never reported
+    (unknown, not an alarm) or has been heard from recently."""
     found = _container_entry(role_health, driver)
     if found is None or agent_last_seen is None:
         return None
-    service, _entry, runtime = found
+    service, entry, runtime = found
     anchor = agent_last_seen
-    running_since = _parse_ts(runtime.get("running_since"))
-    if running_since is not None and running_since > anchor:
-        anchor = running_since
+    for ts in (_parse_ts(runtime.get("running_since")), _parse_ts(entry.get(HEARD_SINCE_KEY))):
+        if ts is not None and ts > anchor:
+            anchor = ts
     if (now - anchor).total_seconds() < AGENT_SILENT_SECONDS:
         return None
     reason = (
@@ -501,7 +525,7 @@ def agent_silent_report(
         f"heartbeated since {agent_last_seen.strftime('%Y-%m-%dT%H:%M:%SZ')}, while the "
         f"appliance's supervisor is still reporting. Kubelet history: {_evidence(runtime)}."
     )
-    return {"status": STATUS_DEGRADED, "reason": reason}, now
+    return {"status": STATUS_DEGRADED, "reason": reason}, min(anchor, now)
 
 
 def container_verdict(
@@ -637,7 +661,9 @@ __all__ = [
     "STABLE_SECONDS",
     "AGENT_SILENT_PREFIX",
     "CRASH_LOOP_PREFIX",
+    "HEARD_SINCE_KEY",
     "RESTART_HISTORY_KEY",
+    "SUPERVISOR_GAP_SECONDS",
     "agent_silent_report",
     "apply_container_oom",
     "carry_restart_history",

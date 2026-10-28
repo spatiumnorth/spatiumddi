@@ -2462,6 +2462,9 @@ async def _supervisor_heartbeat(
     if refusal is not None:
         raise refusal
 
+    # #2961 — the previous heartbeat, so the role_health carry can tell an
+    # unbroken run of supervisor heartbeats from one resuming after a gap.
+    supervisor_prev_seen = row.last_seen_at
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
     if body.capabilities is not None:
@@ -2635,8 +2638,14 @@ async def _supervisor_heartbeat(
         # inside the crash-loop window are measured across heartbeats: each
         # container's observed counts are carried forward from the stored
         # row (a backend-owned key; one the supervisor sends is dropped).
+        # It also stamps when the supervisor's current unbroken run of
+        # heartbeats began, which bounds how long a silent agent can be said
+        # to have been silent.
         row.role_health = carry_restart_history(
-            row.role_health, dict(body.role_health), datetime.now(UTC)
+            row.role_health,
+            dict(body.role_health),
+            datetime.now(UTC),
+            supervisor_last_seen=supervisor_prev_seen,
         )
         # #2018 — the kubelet's OOMKilled for a DNS role container, onto the
         # server row. The agent died in the same group kill and cannot say

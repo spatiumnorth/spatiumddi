@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPServer
 from app.services.agents.container_oom import (
+    HEARD_SINCE_KEY,
     RESTART_HISTORY_KEY,
     agent_silent_report,
     carry_restart_history,
@@ -216,8 +217,17 @@ def test_a_silent_agent_needs_the_threshold_and_a_manager() -> None:
     assert got is not None
     assert got[0]["reason"].startswith("agent_unreachable:")
     assert "lifetime restart count 1," in got[0]["reason"]
-    # The grace runs from when the supervisor saw it, not the last heartbeat.
-    assert got[1] == now
+    # The grace runs from the start of the silence the supervisor could see.
+    assert got[1] == now - timedelta(minutes=4)
+    # A supervisor whose heartbeats resumed two minutes ago has not watched
+    # long enough to call the agent silent, however old its last heartbeat.
+    rh["dhcp-kea"][HEARD_SINCE_KEY] = _iso(now - timedelta(minutes=2))
+    assert agent_silent_report(rh, "kea", now - timedelta(minutes=30), now) is None
+    rh["dhcp-kea"][HEARD_SINCE_KEY] = _iso(now - timedelta(minutes=3, seconds=30))
+    got = agent_silent_report(rh, "kea", now - timedelta(minutes=30), now)
+    assert got is not None and got[1] == (now - timedelta(minutes=3, seconds=30)).replace(
+        microsecond=0
+    )
 
 
 def test_a_just_restarted_container_gets_the_whole_silence_threshold() -> None:
@@ -375,6 +385,10 @@ async def test_unreachable_under_a_live_supervisor_fires_after_the_threshold(
     )
     await db_session.commit()
     rh = _loop(now, status="healthy", restarts=0, history=[])
+    # The supervisor has been heartbeating without a break for ten minutes.
+    seeded = _loop(now, status="healthy", restarts=0, history=[])
+    seeded["dhcp-kea"][HEARD_SINCE_KEY] = _iso(now - timedelta(minutes=10))
+    await _seed(db_session, appliance, seeded)
 
     # 60 s of silence is a blip: nothing is written.
     await _supervisor_hb(client, appliance, token, rh)
@@ -391,12 +405,13 @@ async def test_unreachable_under_a_live_supervisor_fires_after_the_threshold(
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_DEGRADED
     assert (row.daemon_reason or "").startswith("agent_unreachable:")
-    # The grace runs from when the supervisor first SAW the silence, not from
-    # the agent's last heartbeat: a supervisor that was itself down (a
-    # rebooting node) must not stamp a silence whose grace is already spent.
+    # The supervisor watched the whole silence, so the grace runs from the
+    # agent's last heartbeat.
     since = row.daemon_status_since
-    assert since is not None and since >= now
-    young = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, since)
+    assert since == silent_since
+    young = await _matching_agent_daemon_degraded_subjects(
+        db_session, _RULE, since + timedelta(minutes=4)
+    )
     assert f"dhcp_server:{server.id}" not in {m[0] for m in young}
     late = since + timedelta(minutes=6)
     matches = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, late)
@@ -411,6 +426,40 @@ async def test_unreachable_under_a_live_supervisor_fires_after_the_threshold(
     assert f"dhcp_server:{server.id}" not in {m[0] for m in after}
 
 
+async def test_a_supervisor_back_from_a_gap_does_not_call_the_agent_silent(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A node reboot or a control-plane outage: neither the supervisor nor the
+    agent was heard for 12 minutes. The supervisor's first heartbeat back is
+    not evidence that the AGENT is silent; the agent gets the whole threshold
+    from that heartbeat, and the stored run-start is reset."""
+    appliance, token = await _appliance(db_session, "ddi-loop-10")
+    now = datetime.now(UTC).replace(microsecond=0)
+    server, _h = await _kea_server(
+        db_session,
+        host="ddi-loop-10",
+        appliance_id=appliance.id,
+        last_seen_at=now - timedelta(minutes=12),
+    )
+    seeded = _loop(now, status="healthy", restarts=0, history=[])
+    seeded["dhcp-kea"][HEARD_SINCE_KEY] = _iso(now - timedelta(hours=2))
+    await _seed(db_session, appliance, seeded)
+    appl = await db_session.get(type(appliance), appliance.id)
+    assert appl is not None
+    appl.last_seen_at = now - timedelta(minutes=12)
+    await db_session.commit()
+
+    await _supervisor_hb(
+        client, appliance, token, _loop(now, status="healthy", restarts=0, history=[])
+    )
+    assert (await _reload(db_session, server.id)).daemon_status == STATUS_OK
+    fresh = await db_session.get(type(appliance), appliance.id)
+    assert fresh is not None
+    await db_session.refresh(fresh)
+    heard = datetime.fromisoformat(fresh.role_health["dhcp-kea"][HEARD_SINCE_KEY])
+    assert heard >= now
+
+
 async def test_a_paused_server_is_never_called_silent(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -423,10 +472,21 @@ async def test_a_paused_server_is_never_called_silent(
     )
     server.maintenance_mode = True
     await db_session.commit()
-    await _supervisor_hb(
-        client, appliance, token, _loop(datetime.now(UTC), status="healthy", restarts=0, history=[])
-    )
+    # A supervisor that has been heartbeating for hours: only the pause keeps
+    # the hour-old silence from being stamped.
+    seeded = _loop(datetime.now(UTC), status="healthy", restarts=0, history=[])
+    seeded["dhcp-kea"][HEARD_SINCE_KEY] = _iso(datetime.now(UTC) - timedelta(hours=2))
+    await _seed(db_session, appliance, seeded)
+    rh = _loop(datetime.now(UTC), status="healthy", restarts=0, history=[])
+    await _supervisor_hb(client, appliance, token, rh)
     assert (await _reload(db_session, server.id)).daemon_status == STATUS_OK
+    # Unpaused, the same heartbeat does stamp it (the control).
+    srv = await db_session.get(DHCPServer, server.id)
+    assert srv is not None
+    srv.maintenance_mode = False
+    await db_session.commit()
+    await _supervisor_hb(client, appliance, token, rh)
+    assert (await _reload(db_session, server.id)).daemon_status == STATUS_DEGRADED
 
 
 async def test_the_wording_follows_the_source(db_session: AsyncSession) -> None:
