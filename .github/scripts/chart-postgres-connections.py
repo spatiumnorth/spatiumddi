@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -47,9 +48,7 @@ _MIB = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024, "Ti": 1024 * 1024}
 
 
 def _component(doc: dict[str, Any]) -> str:
-    return ((doc.get("metadata") or {}).get("labels") or {}).get(
-        "app.kubernetes.io/component", ""
-    )
+    return ((doc.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/component", "")
 
 
 def _container_env(doc: dict[str, Any]) -> dict[str, str]:
@@ -138,9 +137,7 @@ def _postgres_memory(docs: list[dict[str, Any]]) -> tuple[float | None, int]:
 
 
 def check(docs: list[dict[str, Any]], check_memory: bool = False) -> tuple[list[str], bool]:
-    api = next(
-        (d for d in docs if d.get("kind") == "Deployment" and _component(d) == "api"), None
-    )
+    api = next((d for d in docs if d.get("kind") == "Deployment" and _component(d) == "api"), None)
     limit = _max_connections(docs)
     if api is None or limit is None:
         return [], False
@@ -190,7 +187,7 @@ def main() -> int:
     problems: list[str] = []
     checked = 0
     for f in args.files:
-        text = sys.stdin.read() if f == "-" else open(f).read()
+        text = sys.stdin.read() if f == "-" else Path(f).read_text(encoding="utf-8")
         docs = [d for d in yaml.safe_load_all(text) if isinstance(d, dict)]
         errs, did = check(docs, check_memory=args.check_memory)
         checked += int(did)
@@ -198,7 +195,10 @@ def main() -> int:
     for p in problems:
         print(f"chart-postgres-connections: {p}", file=sys.stderr)
     if args.require and not checked:
-        print("chart-postgres-connections: no render carried an api + max_connections", file=sys.stderr)
+        print(
+            "chart-postgres-connections: no render carried an api + max_connections",
+            file=sys.stderr,
+        )
         return 1
     return 1 if problems else 0
 

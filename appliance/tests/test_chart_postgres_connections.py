@@ -26,8 +26,7 @@ HELPERS = ROOT / "charts" / "spatiumddi" / "templates" / "_helpers.tpl"
 
 
 def _render(max_connections: int, memory: str, max_replicas: int = 10) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         apiVersion: apps/v1
         kind: Deployment
         metadata:
@@ -78,8 +77,7 @@ def _render(max_connections: int, memory: str, max_replicas: int = 10) -> str:
               shared_buffers: 256MB
           resources:
             limits: {{memory: {memory}}}
-        """
-    )
+        """)
 
 
 def _run(manifest: str, tmp_path: Path, *flags: str) -> subprocess.CompletedProcess:
@@ -137,7 +135,7 @@ def test_a_render_without_a_database_is_skipped_but_require_refuses_it(tmp_path:
 
 
 def _const(text: str, name: str) -> int:
-    m = re.search(rf"^{name}\s*=\s*(\d+)", text, re.M)
+    m = re.search(rf"^{name}\s*=\s*(\d+)", text, re.MULTILINE)
     assert m, name
     return int(m.group(1))
 
