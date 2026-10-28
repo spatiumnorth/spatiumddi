@@ -255,6 +255,7 @@ from app.services.dns_io import (
     write_zone_file,
 )
 from app.services.dns_io import spreadsheet as sheet_io
+from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     SoftDeleteBatch,
@@ -9572,6 +9573,15 @@ async def _diff_zone_file(
     view_names = {v.id: v.name for v in views}
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     replace = body.conflict_strategy == "replace"
+    # #2913 — a TTL past what a server can serve is refused like the
+    # spreadsheet import refuses it, not stored as "no TTL" (which a merge then
+    # wrote over an explicit one).
+    unservable = [
+        f"{_label_of(p)}: skipped - TTL {p.bad_ttl} is above the maximum of {DNS_TTL_MAX}"
+        for p in parsed
+        if p.bad_ttl is not None
+    ]
+    parsed = [p for p in parsed if p.bad_ttl is None]
     diff = diff_records(
         parsed,
         existing,
@@ -9581,8 +9591,65 @@ async def _diff_zone_file(
         replace=replace,
         zone_name=zone.name,
     )
+    # #2912 — a new row meets the record API's own rules (the ones the
+    # spreadsheet import runs), or it is left out with the reason.
+    await _apply_record_rules_to_import(db, zone, diff)
     apply_cname_rule(diff, existing, replace=replace)
+    diff.skipped = unservable + diff.skipped
     return diff
+
+
+def _label_of(p: ParsedRecord) -> str:
+    return f"{p.name} {p.record_type} {p.value}"
+
+
+async def _apply_record_rules_to_import(db: DB, zone: DNSZone, diff: ZoneDiff) -> None:
+    """Move every ``to_create`` row the record API would refuse into
+    ``diff.skipped`` (#2912).
+
+    Uses ``_sheet_row_validator`` — the record API's own checks (owner rule,
+    TTL bounds, value rules, BIND's check-names) as a per-row verdict — rather
+    than a second copy. BIND refuses a zone holding one bad owner whole and
+    keeps serving the last good copy, so storing such a row also held back
+    every good row imported beside it. An update names a record that already
+    exists, so its name and value are not re-judged.
+    """
+    if not diff.to_create:
+        return
+    needs_absolute = any(
+        dotless_target(c.record_type, c.value) is not None for c in diff.to_create
+    ) and await group_needs_absolute_targets(db, zone.group_id)
+    check = _sheet_row_validator(zone, {}, needs_absolute)
+    keep: list[RecordChange] = []
+    for i, c in enumerate(diff.to_create, start=1):
+        verdict = check(
+            sheet_io.SheetRow(
+                row=i,
+                name=c.name,
+                type=c.record_type,
+                value=c.value,
+                ttl=c.ttl,
+                priority=c.priority,
+                weight=c.weight,
+                port=c.port,
+            ),
+            c.view_id,
+            None,
+        )
+        if isinstance(verdict, str):
+            diff.skipped.append(f"{c.name} {c.record_type} {c.value}: skipped - {verdict}")
+        else:
+            keep.append(c)
+    diff.to_create = keep
+
+
+def _skipped_type_notes(parsed: ParsedZone) -> list[str]:
+    """One line per record type the file carries that SpatiumDDI does not
+    store (#2914), so the preview and the result name what is not imported."""
+    return [
+        f"{rtype}: {n} record(s) skipped - SpatiumDDI does not store {rtype} records"
+        for rtype, n in sorted(parsed.skipped_types.items())
+    ]
 
 
 def _change_to_response(c: RecordChange) -> RecordChangeResponse:
@@ -9661,6 +9728,7 @@ async def import_zone_preview(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
+    diff.skipped = _skipped_type_notes(parsed) + diff.skipped
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -9722,6 +9790,7 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
+    diff.skipped = _skipped_type_notes(parsed) + diff.skipped
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
