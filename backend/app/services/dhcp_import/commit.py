@@ -32,6 +32,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import validate_optional_hostname
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import (
@@ -110,6 +111,34 @@ class CommitResult:
     @property
     def total_reservations_created(self) -> int:
         return sum(s.reservations_created for s in self.scopes)
+
+
+def drop_unservable_hostnames(scopes: list[ImportedScope]) -> list[str]:
+    """Blank every reservation hostname the static form would refuse (#2919).
+
+    A reservation's hostname is mirrored into IPAM and published as a DNS
+    owner by its next save, so an imported name must meet the same rule the
+    static form holds (``validate_optional_hostname``: letters, digits and
+    hyphens). A name that does not is imported with no hostname, and each is
+    named in the returned warnings. Runs on the preview and again on the
+    commit, which takes the plan the client sends back, not the parser's.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        for r in scope.reservations:
+            if not r.hostname:
+                continue
+            try:
+                cleaned = validate_optional_hostname(r.hostname) or ""
+            except ValueError as exc:
+                warnings.append(
+                    f"{scope.subnet_cidr}: reservation {r.ip_address} ({r.mac_address}) "
+                    f"imported with no hostname: {exc}"
+                )
+                r.hostname = ""
+            else:
+                r.hostname = cleaned
+    return warnings
 
 
 def _canonical_cidr(raw: str) -> str:
@@ -556,6 +585,7 @@ async def commit_import(
     now = datetime.now(UTC)
     results: list[CommitScopeResult] = []
     warnings = list(preview.warnings)
+    warnings.extend(drop_unservable_hostnames(preview.scopes))
 
     # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
     # importer keeps an unmapped option as ``opt-NN``), whatever the target

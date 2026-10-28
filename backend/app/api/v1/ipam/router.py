@@ -29,7 +29,7 @@ from app.core.agent_wake import collect_wake
 from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
-    name_in_zone_error,
+    host_in_zone_error,
     publishable_host_owner_error,
     validate_fqdn,
     validate_host_label,
@@ -2258,14 +2258,20 @@ async def _operator_ptr_twin(
 
 
 def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bool:
-    """True when ``<hostname>.<zone>`` is not a legal DNS name (#2072).
+    """True when ``<hostname>.<zone>`` is not a publishable DNS name (#2072, #2918).
+
+    Past 253 characters, or an owner the record API's check-names rule refuses
+    in that zone (an underscore label in the zone's own name).
 
     ``strict`` raises the 422 instead (the request paths); otherwise the
     caller skips the zone, and this logs why.
     """
-    err = name_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
+    err = host_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
     if err is None:
         return False
+    # Read by importers that report what they published (#2921); not a
+    # mapped column, lives for this request.
+    ip._dns_skip_reason = err  # type: ignore[attr-defined]
     if strict:
         raise HTTPException(status_code=422, detail=err)
     logger.warning(
@@ -2532,6 +2538,7 @@ async def _sync_dns_record(
     if owner_err is not None:
         if strict:
             raise HTTPException(status_code=422, detail=owner_err)
+        ip._dns_skip_reason = owner_err  # type: ignore[attr-defined]
         logger.warning(
             "ipam_dns_hostname_unpublishable",
             ip=str(ip.address),
@@ -10849,7 +10856,21 @@ async def bulk_allocate_preview(
         except ValueError:
             return True
 
-    items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
+    items, warnings, preview_zone_id = await _build_bulk_allocate_candidates(db, subnet, body)
+    # #2920 — the commit publishes each row it creates with the strict sync,
+    # which refuses (422) a name that does not fit its zone and aborts the
+    # batch. Name that here, with the commit's own rule and words, for the
+    # rows the commit would actually publish.
+    if body.create_dns_records and preview_zone_id is not None:
+        preview_zone = await db.get(DNSZone, preview_zone_id)
+        if preview_zone is not None and preview_zone.deleted_at is None:
+            zone_domain = preview_zone.name.rstrip(".")
+            for i in items:
+                if i.in_use or i.in_dynamic_pool or i.fqdn_collision or _no_perm(i.address):
+                    continue
+                name_err = host_in_zone_error(i.hostname, zone_domain, field="hostname")
+                if name_err is not None:
+                    raise HTTPException(status_code=422, detail=name_err)
     in_use = sum(1 for i in items if i.in_use)
     in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
     fqdn_coll = sum(1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision)
