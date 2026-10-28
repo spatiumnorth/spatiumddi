@@ -1863,6 +1863,7 @@ def _merge_owned_overrides(
     owned: dict[str, Any] | Callable[[dict], dict[str, Any]],
     *,
     namespace: str = "kube-system",
+    failure_policy_on_create: str | None = None,
 ) -> tuple[bool, str | None]:
     """Merge the supervisor's ``owned`` keys into the HelmChartConfig
     ``name`` and write it back only if that changes anything.
@@ -1910,7 +1911,11 @@ def _merge_owned_overrides(
       comment lasts until the supervisor's own keys next change.
 
     ``owned`` may be a callable taking the current document, for overrides
-    that depend on it (the slot-image mirror latch, #787)."""
+    that depend on it (the slot-image mirror latch, #787).
+
+    ``failure_policy_on_create`` is written as ``spec.failurePolicy`` when
+    this call CREATES the CR, and never on a PATCH (#2826, see
+    ``_CONTROL_FAILURE_POLICY``)."""
     path = (
         f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
         f"/helmchartconfigs/{quote(name)}"
@@ -1988,12 +1993,15 @@ def _merge_owned_overrides(
             return False, "HelmChartConfig changed under us; retrying next heartbeat"
         return False, f"PATCH status {st}: {rb[:200]!r}"
     base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
+    spec: dict[str, Any] = {"valuesContent": values_yaml}
+    if failure_policy_on_create:
+        spec["failurePolicy"] = failure_policy_on_create
     body = json.dumps(
         {
             "apiVersion": "helm.cattle.io/v1",
             "kind": "HelmChartConfig",
             "metadata": {"name": name, "namespace": namespace},
-            "spec": {"valuesContent": values_yaml},
+            "spec": spec,
         }
     ).encode("utf-8")
     try:
@@ -2730,6 +2738,28 @@ def dns_sizing_memory_mib(timeout: float = 5.0) -> tuple[int | None, str | None]
     return mib, None
 
 
+# #2826: the failure policy the control release's HelmChartConfig is created
+# with.
+#
+# helm-controller hands klipper-helm the HelmChartConfig's failurePolicy in
+# place of the HelmChart's whenever the Config carries one, and the
+# HelmChartConfig CRD defaults an omitted failurePolicy to 'reinstall' (k3s
+# v1.36.5+k3s1 embeds helm-controller v0.17.9). A Config created with
+# valuesContent alone therefore runs the release under 'reinstall', whatever
+# firstboot's _render_control_helmchart asks for ('retry', #1299), and under
+# 'reinstall' klipper-helm uninstalls a release it finds failed and installs it
+# again. firstboot's pin_control_failure_policy sets 'retry' on every boot, but
+# on a fresh appliance its first-boot read of the Config can fail ("failurePolicy
+# not pinned this boot"). The first promote then CREATED the Config, and until
+# the seed's next boot the formation's helm upgrades ran under 'reinstall': two
+# override writes 44 s apart left the release failed and it was uninstalled and
+# installed again, the seed's web ports refused for 34 s.
+#
+# Only the create carries it. An existing Config's policy is the pin's to set,
+# and every later write stays a merge-patch of valuesContent (#2024).
+_CONTROL_FAILURE_POLICY = "retry"
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
@@ -2877,7 +2907,12 @@ def apply_control_plane_overrides(
     # (including why that guard is not create-only) lives in
     # ``_merge_owned_overrides``, now the one write path for every
     # supervisor-owned HelmChartConfig (#2024).
-    return _merge_owned_overrides("spatium-control", owned)
+    #
+    # #2826: a Config this write CREATES runs the release under 'retry', not
+    # the CRD's 'reinstall' (``_CONTROL_FAILURE_POLICY``).
+    return _merge_owned_overrides(
+        "spatium-control", owned, failure_policy_on_create=_CONTROL_FAILURE_POLICY
+    )
 
 
 def apply_metallb_overrides(

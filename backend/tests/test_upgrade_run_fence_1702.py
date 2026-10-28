@@ -225,7 +225,9 @@ async def test_the_crash_handler_leaves_a_run_another_drive_holds(
     release = MagicMock(return_value=True)
     monkeypatch.setattr(orchestrator.mutex, "release_if_held", release)
 
-    async def _crash(db: AsyncSession, rid: uuid.UUID, *, holder: str) -> None:
+    async def _crash(
+        db: AsyncSession, rid: uuid.UUID, *, holder: str, avoid_version: str | None = None
+    ) -> None:
         # Another drive has taken the run over by the time this one crashes.
         other = await db.get(SystemUpgradeRun, rid)
         assert other is not None
@@ -252,7 +254,9 @@ async def test_the_crash_handler_still_fails_its_own_run(
     monkeypatch.setattr(orchestrator.mutex, "release_if_held", MagicMock(return_value=True))
     monkeypatch.setattr(orchestrator.mutex, "drive_identity", lambda: ME)
 
-    async def _crash(db: AsyncSession, rid: uuid.UUID, *, holder: str) -> None:
+    async def _crash(
+        db: AsyncSession, rid: uuid.UUID, *, holder: str, avoid_version: str | None = None
+    ) -> None:
         raise RuntimeError("boom")
 
     monkeypatch.setattr(task, "drive_upgrade", _crash)

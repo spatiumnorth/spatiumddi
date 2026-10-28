@@ -1,0 +1,22 @@
+[Unit]
+Description=Prepare the /etc overlay upper before it is mounted
+# Runs spatium-etc-reconcile --before-mount: the steps that change the
+# shared upper (/var/persist/etc) in ways overlayfs only defines while it is
+# NOT mounted. Today that is the whiteout that hides the live ISO session's
+# sudoers.d/live from both slots' /etc baselines.
+DefaultDependencies=no
+After=local-fs-pre.target var.mount
+Before=etc.mount local-fs.target
+ConditionPathIsMountPoint=!/etc
+ConditionPathIsDirectory=/usr/lib/etc.image
+ConditionPathIsDirectory=/var/persist/etc
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-etc-reconcile --before-mount
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=local-fs.target

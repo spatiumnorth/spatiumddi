@@ -3892,6 +3892,12 @@ _assert_admin_user_available() {
     local why=""
     if [ -z "$ADMIN_USER" ]; then
         why="No admin username was chosen."
+    elif [ "$ADMIN_USER" = "user" ] || [ "$ADMIN_USER" = "debian" ]; then
+        # Same set as spatium-preseed-parse's _LIVE_INSTALLER_USERS:
+        # the names Debian's live tooling uses for its live-session
+        # account. Checked here as well because this pre-flight is the
+        # one both install paths are guaranteed to reach.
+        why="The name '$ADMIN_USER' is reserved by the live installer. Pick a different name."
     elif getent passwd "$ADMIN_USER" >/dev/null 2>&1; then
         why="The account '$ADMIN_USER' already exists in the appliance image, so useradd would fail after the disk had been wiped. Pick a different name."
     fi
@@ -4096,6 +4102,13 @@ _save_install_logs() {
 #    (23 partial transfer, 11 disk full, ...) still fails, and the caller's
 #    pipefail + set -e aborts the install. Not a blanket ignore.
 #
+# The live session's own state stays behind too: the SSH drop-in, banner
+# and host keys spatium-live-bootstrap writes, and anything live-config
+# leaves in /etc/sudoers.d/live or its /var/lib/live/config run markers.
+# mkosi.postinst removes live-config's account components from the image,
+# so nothing should be at those two paths; the excludes keep that true for
+# an image built without that step.
+#
 # SRC / DEST default to the real thing; they are parameters so the tests
 # can run this against a stub rsync.
 _copy_live_root() {
@@ -4118,6 +4131,8 @@ _copy_live_root() {
         --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
         --exclude="/etc/ssh/ssh_host_*" \
         --exclude="/etc/issue.d/zz-spatium-live.issue" \
+        --exclude="/etc/sudoers.d/live" \
+        --exclude="/var/lib/live/config" \
         "${LIVE_ROOT_SRC:-/}" "${MOUNT}/" 2>> "$INSTALL_LOG" || _rc=$?
     if [ "$_rc" -eq 24 ]; then
         log "rsync exit 24 (some files vanished during the live-root copy) - treated as success"
@@ -4662,6 +4677,13 @@ EOF
         # Use cp -a to preserve perms / xattrs / symlinks. /etc is
         # only ~10 MiB so the copy is fast (<2 s on any disk worth
         # running an appliance on).
+        # The live session's sudoers rule (see _copy_live_root) must not
+        # become part of the slot's /etc baseline. The rsync excludes it;
+        # this removes any copy that reached the target another way,
+        # before the snapshot below makes it the lower layer of BOTH
+        # slots. A fresh target has no operator content to keep here.
+        rm -f "$MOUNT/etc/sudoers.d/live"
+        rm -rf "$MOUNT/var/lib/live/config"
         mkdir -p "$MOUNT/usr/lib/etc.image"
         cp -a "$MOUNT/etc/." "$MOUNT/usr/lib/etc.image/" >> "$INSTALL_LOG" 2>&1
 

@@ -718,6 +718,41 @@ def _enqueue_continuation(run_id: uuid.UUID, *, avoid_version: str) -> None:
     drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_version": avoid_version})
 
 
+def _stray_after_version_handoff(run: SystemUpgradeRun, avoid_version: str | None) -> str | None:
+    """#2869 — the version ``run`` was handed off from, when this drive runs
+    on it and is not the hand-off's continuation; else None.
+
+    After the flip, a drive on the old version hands the rest of the run to a
+    worker on the new one: it records ``drive_version_handoff``, releases its
+    Lease and sends a continuation that old workers pass on
+    (``avoid_version``, #1710). Any other drive still on the old version is a
+    copy the hand-off did not send. At a broker drop Celery restores the
+    running drive's message; on qa-review's drill of #2863 that copy ran the
+    moment the first one handed off, took the free Lease over and went on to
+    the settle wait on the old version, and the rollout stopped its worker
+    with the Lease held: the new version's drive was refused until the Lease
+    lapsed (600 s). The continuation itself still runs on the old version
+    once it has been passed on its whole budget, as #1710 designed."""
+    if not settings.version or avoid_version == settings.version:
+        return None
+    from_tag = shared_tags.record_of(run).get("from_tag")
+    if not from_tag or str(from_tag) != settings.version:
+        return None
+    if not shared_tags.flip_record(run).get("handed_off_at"):
+        return None
+    return str(from_tag)
+
+
+def _resumed_since_version_handoff(run: SystemUpgradeRun) -> bool:
+    """Whether the run was resumed (a Halt, then Resume) after its last
+    version hand-off: then the Resume's drive is what carries it on."""
+    names = [e.get("event") for e in (run.progress or {}).get("events") or []]
+    if "drive_version_handoff" not in names:
+        return False
+    last = len(names) - 1 - names[::-1].index("drive_version_handoff")
+    return "resumed" in names[last + 1 :]
+
+
 async def _locked_reread(db: AsyncSession, run: SystemUpgradeRun) -> SystemUpgradeRun | None:
     """Re-read ``run`` under ``FOR UPDATE``, discarding this session's
     unflushed changes to it.
@@ -976,6 +1011,7 @@ async def drive_upgrade(
     run_id: uuid.UUID,
     *,
     holder: str | None = None,
+    avoid_version: str | None = None,
 ) -> SystemUpgradeRun:
     """Drive a planned / halted-and-resumed / partially-completed run
     through to terminal state.
@@ -990,6 +1026,11 @@ async def drive_upgrade(
     ``mutex.drive_identity()``). The Celery task passes its own so that its
     crash handler can release the lease this drive took, and only that one
     (#1449, #1512).
+
+    ``avoid_version`` is the version hand-off's request this drive carries,
+    if any (#1710): set only on the continuation a drive sends once it has
+    flipped the shared tags. A drive still on that old version without it
+    does not take the handed-off run (#2869, ``_stray_after_version_handoff``).
     """
     # #1512 — the row under FOR UPDATE, re-read: two drives of one run (a
     # second Start, a second tab, Celery redelivery) used to both pass the
@@ -1031,6 +1072,23 @@ async def drive_upgrade(
             raise
         await db.refresh(run)
     elif run.state == "running":
+        stray_of = _stray_after_version_handoff(run, avoid_version)
+        if stray_of is not None:
+            # #2869 — the run was handed to the new version and its Lease
+            # released for that: not this drive's to take. The hand-off's own
+            # continuation carries it; after a Resume, nothing else does, so
+            # the Resume's drive goes on to the new version as that would.
+            resumed = _resumed_since_version_handoff(run)
+            if resumed:
+                _enqueue_continuation(run.id, avoid_version=stray_of)
+            logger.info(
+                "upgrade_drive_stray_after_version_handoff",
+                run_id=str(run.id),
+                version=stray_of,
+                holder=me,
+                passed_on=resumed,
+            )
+            return run
         # Resume / re-enqueue path. A drive that is still alive holds the
         # lease under its own identity, so this one is refused; it takes over
         # only once that lease expired (the previous worker died) or was

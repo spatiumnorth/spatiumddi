@@ -2461,6 +2461,24 @@ only: RFC 2136 records written to a PowerDNS zone never appeared in
 SpatiumDDI, and an external value sharing a `(name, record_type)` with a
 managed rrset was silently REPLACEd away by the next reconcile.
 
+**Split-horizon: a report is filed under the view it read.** With views,
+one zone name can be one zone row per view, each with its own records, and
+BIND answers a transfer from the first view whose `match-clients` take it.
+So a loopback transfer signed with the group key reads whichever view
+admits the loopback address. The BIND9 agent therefore reads each view's
+copy with that view's own transfer key (the key from #920 that selects
+exactly one view) and names the view in the report. The control plane files
+it under the zone row the control plane itself reads from that view (the
+same rule drift and Sync with servers use); a shared zone rendered into
+several views is filed only from its first operator view, so the views'
+copies do not take turns rewriting its mirror rows. A report that names no
+view (an older agent, PowerDNS, or a group whose views carry no transfer
+key) is filed only when the group holds a single row of that name. In every
+other case nothing is filed and the endpoint answers
+`skipped: view_ambiguous` or `view_not_read`: the control plane never
+guesses a view, because a guess mirrors one view's records into another
+view's zone, where that view's clients are answered them.
+
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
@@ -2513,6 +2531,16 @@ every later apply it spends up to the 300 s checker timeout reading the zone
 back while the zone is frozen. And a zone an operator has frozen with `rndc
 freeze` refuses the agent's own freeze, so the first apply holds that zone
 back, and the reload's thaw then clears the operator's freeze.
+
+**A start does not move a serial backwards (#2864, BIND9).** With named
+stopped, nothing freezes the zone, and the render carries the control plane's
+`last_serial`. If named had served a later serial (because an RFC 2136 update or an
+earlier apply moved it), the agent reads it from the previous zone file and its
+journal, and from the signed copy for an inline-signed zone. The zone keeps
+that serial if its data is unchanged, and serves one past it otherwise, the
+same rule a running named's freeze applies. A secondary that already holds the
+higher serial keeps transferring. A serial that cannot be read leaves the
+render's.
 
 As with the ingest's own rule, the RRset is the unit. A third party's apex NS
 record is not carried, and neither is an extra value at a name and type the
