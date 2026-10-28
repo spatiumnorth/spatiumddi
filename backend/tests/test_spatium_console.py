@@ -173,18 +173,157 @@ def test_crashloop_is_red_without_any_history(m):
     assert m.overall_verdict(st)[0] == "CRITICAL"
 
 
-def test_counter_watch_prunes_vanished_pods_and_bounds_samples(m):
+def test_counter_watch_forgets_vanished_pods_after_the_window(m):
     w = m.CounterWatch(m._RST_WINDOW_S)
     _recent(m, w, [_pod("a", 1), _pod("b", 1)], 0.0)
     _recent(m, w, [_pod("a", 1)], 10.0)
-    assert list(w._samples) == ["spatium/a"]
-    # A recreated pod has a new name and starts a fresh baseline.
-    assert _recent(m, w, [_pod("a2", 9)], 20.0) == {"a2": 0}
-    assert list(w._samples) == ["spatium/a2"]
-    # Samples older than the baseline are dropped, so memory stays bounded.
-    for i in range(1, 200):
-        w.observe("spatium/a2", 9, 20.0 + i * 30)
-    assert len(w._samples["spatium/a2"]) <= m._RST_WINDOW_S / 30 + 2
+    # "b" is gone from the listing but kept until it has been unseen for a
+    # whole window (so one failed cluster_pods cycle cannot wipe it) ...
+    assert w.keys() == {"spatium/a", "spatium/b"}
+    _recent(m, w, [_pod("a", 1)], 10.0 + m._RST_WINDOW_S + 1)
+    # ... and dropped after that.
+    assert w.keys() == {"spatium/a"}
+    # A recreated pod with a new name starts a fresh baseline.
+    assert _recent(m, w, [_pod("a2", 9)], 2000.0) == {"a2": 0}
+
+
+def test_counter_watch_samples_stay_bounded_at_refresh_cadence(m):
+    # The data tier refreshes every DATA_REFRESH_EVERY seconds; a steady
+    # counter observed for an hour at that cadence must not grow a deque
+    # entry per refresh.
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    t = 0.0
+    while t < 3600:
+        w.observe("k", 9, t)
+        t += m.DATA_REFRESH_EVERY
+    assert len(w._samples["k"]) == 1
+    # A counter that moves every refresh is bounded by the window instead.
+    w2 = m.CounterWatch(m._RST_WINDOW_S)
+    for i in range(2000):
+        w2.observe("k", i, i * m.DATA_REFRESH_EVERY)
+    assert len(w2._samples["k"]) <= m._RST_WINDOW_S / m.DATA_REFRESH_EVERY + 2
+
+
+def test_counter_watch_uses_a_monotonic_clock(m):
+    import time
+
+    assert m.CounterWatch(m._RST_WINDOW_S)._clock is time.monotonic
+
+
+def test_failed_pod_listing_does_not_reset_baselines(m):
+    # cluster_pods() returns [] on any failure. Treating that as "every pod
+    # vanished" would reset every baseline, and a flapping pod would read
+    # quiet again on the next good cycle.
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    _recent(m, w, [], 5.0)
+    assert _recent(m, w, [_pod("api-1", 8)], 10.0) == {"api-1": 3}
+
+
+def test_counter_reset_is_a_new_baseline_not_a_negative_or_huge_delta(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    assert w.observe("k", 8, 0.0) == 0
+    # The counter drops (pod recreated under the same name / etcd restart).
+    assert w.observe("k", 0, 10.0) == 0
+    # Increases after the drop count from the new baseline. Subtracting the
+    # pre-reset baseline instead would read 3 - 8 as nothing at all.
+    assert w.observe("k", 3, 20.0) == 3
+
+
+def test_counter_reset_keeps_in_window_increases_from_before_it(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    w.observe("k", 5, 0.0)
+    assert w.observe("k", 8, 10.0) == 3
+    assert w.observe("k", 1, 20.0) == 3
+    assert w.observe("k", 2, 30.0) == 4
+    # Once the pre-reset steps age out, only the post-reset one remains.
+    assert w.observe("k", 2, 10.0 + m._RST_WINDOW_S + 1) == 1
+
+
+def test_statefulset_pod_recreated_under_same_name_then_flapping_is_red(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("db-0", 12)], 0.0)
+    _recent(m, w, [_pod("db-0", 0)], 30.0)
+    rows = [_pod("db-0", 3)]
+    assert _recent(m, w, rows, 300.0) == {"db-0": 3}
+    assert m._rst_verdict(rows[0]["RstRecent"], "Running") == "red"
+
+
+def test_etcd_failures_after_an_etcd_restart_still_degrade(m):
+    w = m.CounterWatch(m._ETCD_FAIL_WINDOW_S)
+    _etcd_state(m, w, 40, 0.0)
+    # k3s / etcd restarted under a running console: the counter resets.
+    st = _etcd_state(m, w, 0, 30.0)
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+    st = _etcd_state(m, w, 1, 60.0)
+    assert m.overall_verdict(st) == ("DEGRADED", "etcd write failures")
+
+
+def _iso_ago(seconds):
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_fresh_console_floors_a_recent_restart_at_amber_never_red(m):
+    # The console restarts on every F1 logout, so its baseline is often
+    # young. A pod whose last restart is inside the window restarted at
+    # least once in it: amber, not quiet. Never red — the count is unknown.
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    row = _pod("api-1", 40)
+    row["RestartedAt"] = _iso_ago(120)
+    m.stamp_recent_restarts(w, [row], 0.0)
+    assert row["RstRecent"] == 1
+    assert m._rst_verdict(row["RstRecent"], "Running") == "amber"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = [row]
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+
+
+def test_restart_floor_ages_out_and_ignores_far_future_timestamps(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    old = _pod("old", 40)
+    old["RestartedAt"] = _iso_ago(m._RST_WINDOW_S + 60)
+    skewed = _pod("skewed", 40)
+    skewed["RestartedAt"] = _iso_ago(-3600)  # a node clock an hour ahead
+    near = _pod("near", 2)
+    near["RestartedAt"] = _iso_ago(-5)  # ordinary skew still counts
+    junk = _pod("junk", 2)
+    junk["RestartedAt"] = "not-a-time"
+    assert _recent(m, w, [old, skewed, near, junk], 0.0) == {
+        "old": 0,
+        "skewed": 0,
+        "near": 1,
+        "junk": 0,
+    }
+
+
+def test_restart_floor_does_not_mask_a_larger_observed_increase(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    row = _pod("api-1", 5)
+    row["RestartedAt"] = _iso_ago(30)
+    _recent(m, w, [row], 0.0)
+    row = _pod("api-1", 9)
+    row["RestartedAt"] = _iso_ago(5)
+    assert _recent(m, w, [row], 60.0) == {"api-1": 4}
+
+
+def test_health_screen_does_not_colour_a_quiet_lifetime_count(m, monkeypatch):
+    monkeypatch.setattr(m, "webui_selfcheck_status", lambda: None, raising=False)
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    quiet = _pod("quiet-pod", 40)
+    quiet["RstRecent"] = 0
+    hot = _pod("hot-pod", 41)
+    hot["RstRecent"] = 3
+    st.ps_rows = [quiet, hot]
+    con = Console(width=160, record=True, file=io.StringIO(), color_system="standard")
+    m._render_health_screen(con, st, [], None)
+    lines = con.export_text(styles=True).splitlines()
+    quiet_line = next(ln for ln in lines if "quiet-pod" in ln)
+    # (The verdict banner names hot-pod too; take the pods-table row.)
+    hot_line = next(ln for ln in lines if "hot-pod" in ln and "41" in ln)
+    # 33 = yellow, 31 = red (rich "standard" colour system).
+    assert "\x1b[2m40" in quiet_line  # dim
+    assert "\x1b[33m40" not in quiet_line and "\x1b[1;31m40" not in quiet_line
+    assert "31m41" in hot_line
 
 
 def _etcd_state(m, watch, failed, now):

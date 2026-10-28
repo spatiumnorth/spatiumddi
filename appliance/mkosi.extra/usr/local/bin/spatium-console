@@ -1307,59 +1307,121 @@ def _age_seconds(iso: str) -> float | None:
 # (``CounterWatch``) and judges the INCREASE inside a window: >=3 in
 # the window is flapping (red), 1-2 is amber, none is quiet. The first
 # sample is the baseline, so boot churn from before the console started —
-# including a node reboot, which restarts the console too — never counts.
-# The lifetime total stays visible, dim, in the RST column.
+# including a node reboot, which restarts the console too — never counts
+# as flapping. The lifetime total stays visible, dim, in the RST column.
+#
+# The console is NOT always long-lived: systemd restarts it every time an
+# operator logs out of the F1 login (and on any crash), which resets the
+# baseline. So a pod whose LAST restart (``RestartedAt``) is inside the
+# window is floored at 1 — "it restarted at least once in the last 15 min"
+# is a fact the pod status states outright, needing no history. That floor
+# can only ever reach amber, never red (the count before it is unknown), and
+# it ages out with the window, so it cannot pin the way a lifetime count did.
 _RST_WINDOW_S = 900.0    # restart increase is judged over the last 15 min
 _RST_FLAP_MIN = 3        # increase at/above this inside the window → red
 _ETCD_FAIL_WINDOW_S = 600.0  # any etcd proposals_failed increase in 10 min
+# A restart stamped this far in the FUTURE is still treated as just-now
+# (ordinary multi-node clock skew); further than that is ignored, so a node
+# whose clock runs ahead cannot hold the amber floor past the window.
+_RST_SKEW_TOLERANCE_S = 60.0
 
 
 class CounterWatch:
     """In-memory baseline for monotonic counters, keyed by an arbitrary
-    string. Per key a deque of ``(timestamp, value)`` samples; ``increase``
-    is the current value minus the newest sample at/before ``now - window``,
-    or minus the first sample while the history is shorter than the window
-    (so a console that has only been up 2 min judges 2 min). Samples older
-    than that baseline are dropped, bounding memory; ``prune`` forgets keys
-    that no longer exist. The clock is injectable for tests."""
+    string, judged on a monotonic clock (injectable for tests) so an NTP
+    step cannot stretch or collapse the window.
+
+    Per key a deque of ``(timestamp, value)`` CHANGE points: an observation
+    equal to the newest stored value is not appended, so memory is bounded
+    by how often the counter moves, not by the refresh cadence. The oldest
+    entry is the baseline — the newest change at/before ``now - window``,
+    or the first sample while the history is shorter than the window (a
+    console up for 2 min judges 2 min).
+
+    ``increase`` is the sum of the positive steps after the baseline. A
+    step DOWN is a counter reset — a StatefulSet pod recreated under the
+    same name restarts its ``restartCount`` at 0; k3s / etcd restarting
+    resets ``proposals_failed`` — and counts as 0: it becomes the new
+    baseline for the steps after it, while increases before it that are
+    still inside the window keep counting. (Subtracting from the first
+    sample instead reads ``8 -> 0 -> 3`` as no increase at all.)
+
+    Keys not observed for longer than the window are forgotten, so a pod
+    that is gone is dropped, but one failed ``cluster_pods`` cycle (which
+    returns ``[]``) does not wipe every baseline."""
 
     def __init__(self, window_s: float, clock=time.monotonic) -> None:
         self.window_s = window_s
         self._clock = clock
         self._samples: dict[str, deque] = {}
+        self._last_seen: dict[str, float] = {}
 
     def observe(self, key: str, value: int, now: float | None = None) -> int:
         """Record ``value`` for ``key`` and return its increase in-window."""
         if now is None:
             now = self._clock()
+        self._last_seen[key] = now
         dq = self._samples.setdefault(key, deque())
-        dq.append((now, value))
+        if not dq or dq[-1][1] != value:
+            dq.append((now, value))
         cutoff = now - self.window_s
-        # Keep exactly one sample at/before the cutoff: the baseline.
+        # Keep exactly one change point at/before the cutoff: the baseline.
         while len(dq) > 1 and dq[1][0] <= cutoff:
             dq.popleft()
-        return max(0, value - dq[0][1])
+        increase = 0
+        prev = dq[0][1]
+        for _, v in list(dq)[1:]:
+            if v > prev:
+                increase += v - prev
+            prev = v
+        self._forget_stale(cutoff)
+        return increase
 
-    def prune(self, live_keys: Iterable[str]) -> None:
-        live = set(live_keys)
-        for key in [k for k in self._samples if k not in live]:
-            del self._samples[key]
+    def _forget_stale(self, cutoff: float) -> None:
+        for key in [k for k, t in self._last_seen.items() if t < cutoff]:
+            del self._last_seen[key]
+            self._samples.pop(key, None)
+
+    def keys(self) -> set[str]:
+        return set(self._samples)
 
 
 def _pod_key(row: dict) -> str:
     return f"{row.get('Namespace') or ''}/{row.get('Names') or ''}"
 
 
+def _restarted_within_window(restarted_at: str) -> bool:
+    """True when the pod's last restart (``RestartedAt``, wall clock from
+    the kubelet) is inside the restart window. Unparseable / blank → False;
+    a timestamp more than ``_RST_SKEW_TOLERANCE_S`` in the future → False."""
+    if not restarted_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(restarted_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    try:
+        age = (datetime.now(ts.tzinfo) - ts).total_seconds()
+    except TypeError:
+        return False
+    return -_RST_SKEW_TOLERANCE_S <= age < _RST_WINDOW_S
+
+
 def stamp_recent_restarts(watch: CounterWatch, rows: list[dict],
                           now: float | None = None) -> None:
     """Record each pod's restart count and stamp ``RstRecent`` (the
-    in-window increase) on its row; forget pods that no longer exist.
-    A recreated pod has a new name, so it starts a fresh baseline."""
+    in-window increase, floored at 1 when ``RestartedAt`` is in-window) on
+    its row. A recreated pod with a new name starts a fresh baseline; one
+    recreated under the SAME name reads as a counter reset (see
+    ``CounterWatch``)."""
     for row in rows:
-        row["RstRecent"] = watch.observe(
-            _pod_key(row), int(row.get("Restarts") or 0), now
-        )
-    watch.prune(_pod_key(r) for r in rows)
+        restarts = int(row.get("Restarts") or 0)
+        recent = watch.observe(_pod_key(row), restarts, now)
+        if recent == 0 and restarts > 0 and _restarted_within_window(
+            row.get("RestartedAt") or ""
+        ):
+            recent = 1
+        row["RstRecent"] = recent
 
 
 def _rst_verdict(recent_restarts: int, k8s_state: str = "") -> str:
@@ -5675,11 +5737,15 @@ def _render_health_screen(
         reason = r.get("LastExitReason") or ""
         code = r.get("LastExitCode")
         le = (reason + (f" ({code})" if code not in (None, "") else "")) or "—"
-        ststyle = "bold red" if st8 in _POD_RED_STATES else ("yellow" if rc else "dim")
+        # #2928 — colour by the WINDOWED increase, like the Pods panel: the
+        # lifetime count is listed (dim when quiet) but never alarms alone.
+        rv = _rst_verdict(int(r.get("RstRecent") or 0), st8)
+        rst_style = "bold red" if rv == "red" else ("yellow" if rv == "amber" else "dim")
+        ststyle = "bold red" if st8 in _POD_RED_STATES else rst_style
         pods_tbl.add_row(
             Text(_short_pod_name(r.get("Names") or "")[:30]),
             Text(st8, style=ststyle),
-            Text(str(rc), style="yellow" if rc else "dim"),
+            Text(str(rc), style=rst_style),
             Text(le, style="dim"),
         )
     console.print(Panel(
