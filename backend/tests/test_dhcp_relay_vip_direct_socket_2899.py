@@ -76,6 +76,8 @@ async def _appliance(
     deployment_kind: str | None = "appliance",
     roles: list[str] | None = None,
     state: str = APPLIANCE_STATE_APPROVED,
+    variant: str = "appliance",
+    cluster_role: str | None = "member",
 ) -> Appliance:
     der = os.urandom(32)
     a = Appliance(
@@ -85,7 +87,8 @@ async def _appliance(
         public_key_fingerprint=hashlib.sha256(der).hexdigest(),
         state=state,
         deployment_kind=deployment_kind,
-        appliance_variant="application",
+        appliance_variant=variant,
+        cluster_role=cluster_role,
         assigned_roles=["dhcp"] if roles is None else roles,
         capabilities={"can_run_dhcp": True},
         assigned_dhcp_group_id=group.id if group is not None else None,
@@ -430,3 +433,169 @@ async def test_rule_is_seeded_enabled_and_catalogued(db_session: AsyncSession) -
     )
     assert len(rows) == 1
     assert rows[0].enabled is True
+
+
+# ── Review fixes: what the VIP Service really fronts ─────────────────────
+
+
+async def test_unpromoted_additional_node_is_not_behind_the_vip(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """An approved Additional node that was never promoted runs its own
+    single-node k3s: no MetalLB, no VIP Service. A branch DHCP appliance in
+    direct mode there is the very setup direct mode exists for, and must not
+    block the VIP, raise the alert, or be refused a role."""
+    user, h = await _admin(db_session)
+    g = await _group(db_session, "direct", name="branch")
+    standalone = await _appliance(db_session, g, cluster_role=None)
+    db_session.add(
+        DHCPServer(
+            name=f"kea-{uuid.uuid4().hex[:6]}",
+            driver="kea",
+            host=standalone.hostname,
+            port=67,
+            server_group_id=g.id,
+            agent_id=uuid.uuid4(),
+        )
+    )
+    await db_session.commit()
+
+    r = await client.put(METALLB, json=_metallb_body(), headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["dhcp_relay_vip_direct_groups"] == []
+    assert await alerts._matching_dhcp_relay_vip_direct_socket_subjects(db_session, _RULE) == []
+    other = await _group(db_session, "direct")
+    await move_appliance_dhcp_servers(db_session, standalone, other, user, dry_run=True)
+
+
+async def test_seed_and_hostname_owned_rows_are_behind_the_vip(
+    db_session: AsyncSession,
+) -> None:
+    """The seed carries no cluster_role until its first promote, and agents
+    register by hostname without an appliance FK — both are still on the
+    cluster the VIP Service lives in (a single-node seed loses EVERY relay)."""
+    seed_g = await _group(db_session, "direct", name="seed-g")
+    await _appliance(db_session, seed_g, variant="control-plane", cluster_role=None)
+    host_g = await _group(db_session, "direct", name="host-g")
+    member = await _appliance(db_session, None, roles=[])
+    db_session.add(
+        DHCPServer(
+            name=f"kea-{uuid.uuid4().hex[:6]}",
+            driver="kea",
+            host=member.hostname.upper() + ".",
+            port=67,
+            server_group_id=host_g.id,
+            agent_id=uuid.uuid4(),
+        )
+    )
+    await _set_vip(db_session)
+    await db_session.commit()
+    names = [g.name for g in await direct_groups_behind_relay_vip(db_session)]
+    assert names == ["host-g", "seed-g"]
+
+
+async def test_dhcp_server_move_into_a_direct_group_is_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    _, h = await _admin(db_session)
+    relay_g = await _group(db_session, "relay")
+    direct_g = await _group(db_session, "direct", name="move-target")
+    a = await _appliance(db_session, relay_g)
+    srv = DHCPServer(
+        name=f"kea-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host=a.hostname,
+        port=67,
+        server_group_id=relay_g.id,
+        agent_id=uuid.uuid4(),
+    )
+    off = DHCPServer(
+        name=f"kea-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host="10.9.9.9",
+        port=67,
+        server_group_id=relay_g.id,
+        agent_id=uuid.uuid4(),
+    )
+    db_session.add_all([srv, off])
+    await _set_vip(db_session)
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/dhcp/servers/{srv.id}", json={"server_group_id": str(direct_g.id)}, headers=h
+    )
+    assert r.status_code == 422, r.text
+    assert "'move-target'" in r.json()["detail"]
+    # A Kea that is not on the cluster moves freely.
+    r = await client.put(
+        f"/api/v1/dhcp/servers/{off.id}", json={"server_group_id": str(direct_g.id)}, headers=h
+    )
+    assert r.status_code == 200, r.text
+
+
+async def test_gaining_the_dhcp_role_on_a_direct_pointer_is_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The pointer already names the direct group; adding the dhcp role is
+    what starts its Kea pod behind the VIP. A re-save of a node already in
+    that state is not refused."""
+    _, h = await _admin(db_session)
+    direct_g = await _group(db_session, "direct", name="dormant")
+    a = await _appliance(db_session, direct_g, roles=[])
+    already = await _appliance(db_session, direct_g)
+    await _set_vip(db_session)
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/appliance/appliances/{a.id}/roles",
+        json={"roles": ["dhcp"], "dhcp_group_id": str(direct_g.id)},
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    assert "'dormant'" in r.json()["detail"]
+    r = await client.put(
+        f"/api/v1/appliance/appliances/{already.id}/roles",
+        json={"roles": ["dhcp"], "dhcp_group_id": str(direct_g.id)},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+
+
+async def test_unrelated_saves_on_an_existing_broken_state_pass(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Upgrade blast radius: a VIP already over a direct group. A group PUT
+    changing only the name, and a MetalLB PUT changing only BGP, both pass."""
+    _, h = await _admin(db_session)
+    g = await _group(db_session, "direct", name="legacy2")
+    await _appliance(db_session, g)
+    await _set_vip(db_session)
+    await db_session.commit()
+
+    r = await client.put(f"/api/v1/dhcp/server-groups/{g.id}", json={"name": "legacy3"}, headers=h)
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        f"/api/v1/dhcp/server-groups/{g.id}",
+        json={"description": "x", "dhcp_socket_mode": "direct"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    r = await client.put(METALLB, json=_metallb_body(control_plane_vip="192.168.0.242"), headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["dhcp_relay_vip_direct_groups"] == ["legacy3"]
+
+
+async def test_promoting_a_direct_group_node_is_refused(db_session: AsyncSession) -> None:
+    from app.services.dhcp.relay_vip import promote_refusal
+
+    direct_g = await _group(db_session, "direct", name="joiner-g")
+    relay_g = await _group(db_session, "relay")
+    joiner = await _appliance(db_session, direct_g, cluster_role=None)
+    fine = await _appliance(db_session, relay_g, cluster_role=None)
+    await db_session.commit()
+    assert await promote_refusal(db_session, [joiner]) is None  # no VIP yet
+    await _set_vip(db_session)
+    await db_session.commit()
+    refusal = await promote_refusal(db_session, [joiner, fine])
+    assert refusal is not None and "'joiner-g'" in refusal
+    assert await promote_refusal(db_session, [fine]) is None

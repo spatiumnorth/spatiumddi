@@ -62,10 +62,15 @@ async def move_appliance_dhcp_servers(
     *,
     dry_run: bool = False,
     roles: list[str] | None = None,
+    prev_roles: list[str] | set[str] | None = None,
 ) -> DhcpMoveResult:
     """Move the appliance's own Kea row(s) into ``dhcp_group`` in the caller's
     transaction, wake the agents and both groups after the caller's commit, and
-    audit each move. ``dry_run`` runs the refusals only (preview)."""
+    audit each move. ``dry_run`` runs the refusals only (preview).
+
+    ``prev_roles`` is the role set before this change, for a caller that has
+    already written the new one to ``appliance.assigned_roles``; with ``roles``
+    (a preview) the appliance's current roles are the previous ones."""
     from app.api.v1.dhcp.servers import (  # noqa: PLC0415
         _assert_driver_mix_allowed,
         _assert_no_v6_scopes_for_windows,
@@ -75,7 +80,12 @@ async def move_appliance_dhcp_servers(
     # #2899 — before the per-server loop, which an appliance whose agent has
     # not registered yet never enters: the pointer alone puts its Kea pod
     # behind the relay VIP Service.
-    if appliance.assigned_dhcp_group_id != dhcp_group.id:
+    # Refused on a transition only — a new group, or the dhcp role newly
+    # gained — so re-saving an appliance already in that state never is.
+    if prev_roles is None and roles is not None:
+        prev_roles = appliance.assigned_roles or []
+    gains_dhcp = prev_roles is not None and "dhcp" not in prev_roles
+    if appliance.assigned_dhcp_group_id != dhcp_group.id or gains_dhcp:
         refusal = await appliance_join_refusal(db, appliance, dhcp_group, roles)
         if refusal is not None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)

@@ -10,8 +10,12 @@
   a group's mode on its own, because relay mode stops directly attached
   clients being served. Instead, turning the relay VIP on is refused
   while a group it would front is in direct mode, and so are switching
-  such a group to direct and assigning an appliance's DHCP role to a
-  direct group while the VIP is set. Each refusal names the group and
+  such a group to direct, and — while the VIP is set — assigning a cluster
+  node's DHCP role to a direct group, moving a cluster node's Kea server
+  into one, and promoting a node that serves one into the cluster. Only
+  nodes of the control plane's own cluster count: a branch appliance that
+  was never promoted runs its own k3s, has no VIP, and keeps direct mode
+  without a refusal or an alert. Each refusal names the group and
   the fix. An install that already has this state keeps working as
   before: a new alert rule, **DHCP group in direct mode behind the relay
   VIP** (on by default, critical), and the MetalLB card both name the

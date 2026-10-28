@@ -68,7 +68,16 @@ VIP, and its filter (broadcast or the socket's own address only) drops it;
 the DNATed copy reaches Kea's UDP socket, which raw mode drains and
 discards. So those relays' clients get no address, and no counter shows it —
 the #2889 arrival counter leaves VIP-addressed frames out on purpose. In
-`relay` mode Kea reads that UDP socket, so every relay is answered.
+`relay` mode Kea reads that UDP socket, so every relay is answered. Kea
+replies to the relay's `giaddr`, from the node's own address — the same way
+the other nodes already answer the flows forwarded to them — so the reply
+comes back from the VIP only when the relay sends from its `giaddr`.
+
+"Behind the VIP" means a node of the control plane's own k3s cluster: the
+seed, and every promoted member. An approved Additional node that was never
+promoted runs its own single-node k3s with no MetalLB, so a branch appliance
+serving its directly attached VLAN in `direct` mode is not affected and is
+never refused or alerted on.
 
 There is no way to serve both through the VIP: Kea cannot mix raw and UDP
 sockets in one daemon, and SpatiumDDI does not switch a group's mode on its
@@ -77,8 +86,11 @@ own, because `relay` stops directly attached clients being served. Instead:
 - `PUT …/control-plane/metallb` refuses (422) to **turn on** a relay VIP
   while any group it would front is `direct`, naming the groups;
 - `PUT /dhcp/server-groups/{id}` refuses to change a group behind the VIP
-  **to** `direct`, and the Fleet / Copilot role assignment refuses to put an
-  appliance's Kea into a `direct` group while a VIP is set;
+  **to** `direct`; while a VIP is set, the Fleet / Copilot role assignment
+  refuses to point a cluster node's DHCP role at a `direct` group (or to add
+  the role to a node already pointed at one), `PUT /dhcp/servers/{id}`
+  refuses to move a cluster node's Kea into a `direct` group, and a
+  control-plane promote refuses a joiner that serves one;
 - the default-on `dhcp_relay_vip_direct_socket` alert (critical, one event
   per group) and the MetalLB card report the state whenever it exists — an
   install that had it before these checks, or a path they do not cover.

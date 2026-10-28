@@ -5067,7 +5067,9 @@ async def update_appliance_roles(
             # Copilot's assign_appliance_role, #1902).
             from app.services.appliance.dhcp_group_move import move_appliance_dhcp_servers
 
-            dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, current_user)
+            dhcp_move = await move_appliance_dhcp_servers(
+                db, row, dhcp_group, current_user, prev_roles=prev_dns_roles
+            )
             moved_servers.extend(dhcp_move.moved)
             row.assigned_dhcp_group_id = dhcp_group.id
 
@@ -5508,6 +5510,14 @@ async def promote_control_plane(
     dns_refusal = await promote_dns_group_refusal(db, members, targets)
     if dns_refusal is not None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, dns_refusal)
+    # #2899 — a joiner's Kea pod joins the relay VIP Service the moment it is
+    # a node, so a joiner serving a ``direct`` DHCP group cannot be promoted
+    # while a relay VIP is set.
+    from app.services.dhcp.relay_vip import promote_refusal as dhcp_vip_refusal  # noqa: PLC0415
+
+    vip_refusal = await dhcp_vip_refusal(db, targets)
+    if vip_refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, vip_refusal)
 
     new_total = current_count + len(targets)
     if new_total % 2 == 0:

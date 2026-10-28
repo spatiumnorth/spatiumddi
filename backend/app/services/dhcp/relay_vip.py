@@ -23,8 +23,17 @@ counter records it: the #2889 arrival counter deliberately excludes frames
 addressed to the VIP, and Kea never counts what it never reads.
 
 In ``relay`` mode (``dhcp-socket-type: udp``) Kea reads that UDP socket, so
-the DNATed packet is served, and its reply leaves through the same conntrack
-entry and is un-NATed to come from the VIP.
+the DNATed packet is served. Kea answers a relayed request to ``giaddr``:67
+(not to the packet's IP source), from the node's own address. When the relay
+sends from its ``giaddr`` the reply matches the flow's conntrack entry and
+leaves un-NATed from the VIP; when it sends from another address (a Cisco
+``ip helper-address`` sources from the interface facing the server by
+default) the reply leaves from the node's own address — exactly as the
+replies from the other nodes already do in both modes, since kube-proxy
+masquerades a forwarded flow and the serving node replies to ``giaddr``
+directly. Relays accept that (the other nodes' answers prove it); a stateful
+firewall between relay and cluster that pins the reply to the VIP would not,
+in either mode, and is out of scope here.
 
 There is no way to keep ``direct`` mode and fix it. Kea cannot mix raw and UDP
 sockets in one daemon, and making the raw filter admit the VIP would mean
@@ -43,26 +52,74 @@ and the default-on ``dhcp_relay_vip_direct_socket`` alert reports the state
 whenever it exists (an install that had it before this check, or a path the
 refusals do not cover).
 
-"Behind the VIP" means a Kea pod the Service selects: an approved appliance
-reporting ``deployment_kind = 'appliance'`` (a k3s node — the only place the
-VIP exists) that holds the ``dhcp`` role in the group, or whose registered Kea
-server row is in the group.
+"Behind the VIP" means a Kea pod the Service selects. The Service lives in the
+control plane's own k3s cluster and selects every ``dhcp-kea`` pod there,
+whatever group it serves — so it is every group with a Kea on a node OF THAT
+CLUSTER: the seed (a control-plane variant, which carries no ``cluster_role``
+until its first promote) and every promoted or joining member. NOT an
+approved-but-unpromoted Additional node: that one runs its own single-node
+k3s with no MetalLB and no VIP Service (``network_mtu.in_cluster`` makes the
+same distinction), and a branch DHCP appliance serving its own directly
+attached VLAN in ``direct`` mode is exactly the setup ``direct`` exists for.
+A group counts when such a node holds the ``dhcp`` role pointed at it, or
+when such a node's registered Kea server row is in it.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
-from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+from app.models.appliance import (
+    APPLIANCE_STATE_APPROVED,
+    CLUSTER_ROLE_MEMBER,
+    CLUSTER_ROLE_PRIMARY,
+    DESIRED_CLUSTER_ROLE_MEMBER,
+    Appliance,
+)
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.settings import PlatformSettings
 
 # The socket mode that renders ``dhcp-socket-type: raw``.
 DIRECT_SOCKET_MODE = "direct"
+
+# Install variants that self-bootstrap the control plane, i.e. the seed of the
+# cluster the VIP lives in (``api/v1/appliance/supervisor._SELF_BOOTSTRAP_VARIANTS``).
+_SEED_VARIANTS = ("control-plane", "full-stack", "frontend-core")
+_CLUSTER_ROLES = (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+
+
+def in_vip_cluster(appliance: Appliance) -> bool:
+    """Is ``appliance`` a node of the cluster the relay VIP Service lives in?"""
+    return (
+        appliance.state == APPLIANCE_STATE_APPROVED
+        and appliance.revoked_at is None
+        and appliance.deployment_kind == "appliance"
+        and (
+            appliance.appliance_variant in _SEED_VARIANTS
+            or appliance.cluster_role in _CLUSTER_ROLES
+            or appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        )
+    )
+
+
+def _in_vip_cluster_sql(a: Any) -> Any:
+    """SQL form of :func:`in_vip_cluster` over the (aliased) Appliance ``a``."""
+    return and_(
+        a.state == APPLIANCE_STATE_APPROVED,
+        a.revoked_at.is_(None),
+        a.deployment_kind == "appliance",
+        or_(
+            a.appliance_variant.in_(_SEED_VARIANTS),
+            a.cluster_role.in_(_CLUSTER_ROLES),
+            a.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
+        ),
+    )
 
 
 def effective_relay_vip(settings: PlatformSettings | None) -> str:
@@ -84,23 +141,36 @@ async def load_relay_vip(db: AsyncSession) -> str:
 
 async def group_ids_behind_relay_vip(db: AsyncSession) -> set[uuid.UUID]:
     """Every DHCP server group with a Kea pod the relay VIP Service selects."""
-    from app.services.appliance.ownership import (  # noqa: PLC0415
-        orchestrated_server_condition,
-    )
+    from app.services.appliance.ownership import hostname_sql  # noqa: PLC0415
 
+    a = aliased(Appliance)
     assigned = (
         (
             await db.execute(
-                select(Appliance.assigned_dhcp_group_id).where(
-                    Appliance.state == APPLIANCE_STATE_APPROVED,
-                    Appliance.deployment_kind == "appliance",
-                    Appliance.assigned_dhcp_group_id.is_not(None),
-                    Appliance.assigned_roles.contains(["dhcp"]),
+                select(a.assigned_dhcp_group_id).where(
+                    _in_vip_cluster_sql(a),
+                    a.assigned_dhcp_group_id.is_not(None),
+                    a.assigned_roles.contains(["dhcp"]),
                 )
             )
         )
         .scalars()
         .all()
+    )
+    # A Kea row owned by a cluster node: by the FK, or by the agent's reported
+    # host against the node's hostname (agents register by hostname and never
+    # set ``appliance_id``; the hostname branch of ``own_server_condition``).
+    owner = aliased(Appliance)
+    on_cluster = exists().where(
+        _in_vip_cluster_sql(owner),
+        or_(
+            owner.id == DHCPServer.appliance_id,
+            and_(
+                DHCPServer.appliance_id.is_(None),
+                DHCPServer.agent_id.is_not(None),
+                hostname_sql(owner.hostname) == hostname_sql(DHCPServer.host),
+            ),
+        ),
     )
     registered = (
         (
@@ -108,7 +178,7 @@ async def group_ids_behind_relay_vip(db: AsyncSession) -> set[uuid.UUID]:
                 select(DHCPServer.server_group_id).where(
                     DHCPServer.driver == "kea",
                     DHCPServer.server_group_id.is_not(None),
-                    orchestrated_server_condition(DHCPServer),
+                    on_cluster,
                 )
             )
         )
@@ -183,20 +253,86 @@ async def appliance_join_refusal(
     """Why pointing ``appliance`` at ``group`` would put a ``direct`` group
     behind the relay VIP, or None.
 
-    ``roles`` overrides the appliance's current roles (a preview). Only an
-    approved appliance reporting ``deployment_kind = 'appliance'`` runs its
-    Kea as a pod the VIP Service selects.
+    ``roles`` overrides the appliance's current roles (a preview). Only a
+    node of the VIP's own cluster (:func:`in_vip_cluster`) runs its Kea as a
+    pod the VIP Service selects.
     """
     if group.dhcp_socket_mode != DIRECT_SOCKET_MODE:
         return None
     if "dhcp" not in ((appliance.assigned_roles if roles is None else roles) or []):
         return None
-    if appliance.state != APPLIANCE_STATE_APPROVED or appliance.deployment_kind != "appliance":
+    if not in_vip_cluster(appliance):
         return None
     vip = await load_relay_vip(db)
     if not vip:
         return None
     return refusal_for_groups(vip, [group.name])
+
+
+async def server_join_refusal(
+    db: AsyncSession, server: DHCPServer, group_id: uuid.UUID | None
+) -> str | None:
+    """Why moving the Kea ``server`` into ``group_id`` would put a ``direct``
+    group behind the relay VIP, or None. For the DHCP server PUT: the row's
+    owner is a cluster node, so its Kea pod is behind the Service."""
+    from app.services.appliance.ownership import (  # noqa: PLC0415
+        owning_appliance_for_dhcp_server,
+    )
+
+    if group_id is None or server.driver != "kea":
+        return None
+    group = await db.get(DHCPServerGroup, group_id)
+    if group is None or group.dhcp_socket_mode != DIRECT_SOCKET_MODE:
+        return None
+    vip = await load_relay_vip(db)
+    if not vip:
+        return None
+    owner = await owning_appliance_for_dhcp_server(db, server)
+    if owner is None or not in_vip_cluster(owner):
+        return None
+    return refusal_for_groups(vip, [group.name])
+
+
+async def promote_refusal(db: AsyncSession, joiners: Iterable[Appliance]) -> str | None:
+    """Why promoting ``joiners`` into the control-plane cluster would put a
+    ``direct`` group behind the relay VIP, or None. A joiner's Kea pod joins
+    the cluster's DaemonSet, and so the VIP Service, the moment it is a node."""
+    from app.services.appliance.ownership import own_server_condition  # noqa: PLC0415
+
+    vip = await load_relay_vip(db)
+    if not vip:
+        return None
+    ids: set[uuid.UUID] = set()
+    for a in joiners:
+        if "dhcp" in (a.assigned_roles or []) and a.assigned_dhcp_group_id is not None:
+            ids.add(a.assigned_dhcp_group_id)
+        own = await own_server_condition(db, a, DHCPServer)
+        ids.update(
+            gid
+            for gid in (
+                await db.execute(
+                    select(DHCPServer.server_group_id).where(own, DHCPServer.driver == "kea")
+                )
+            ).scalars()
+            if gid is not None
+        )
+    if not ids:
+        return None
+    names = (
+        (
+            await db.execute(
+                select(DHCPServerGroup.name)
+                .where(
+                    DHCPServerGroup.id.in_(ids),
+                    DHCPServerGroup.dhcp_socket_mode == DIRECT_SOCKET_MODE,
+                )
+                .order_by(DHCPServerGroup.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return refusal_for_groups(vip, names) if names else None
 
 
 def alert_message(group_name: str, vip: str) -> str:

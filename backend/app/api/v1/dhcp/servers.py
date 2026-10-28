@@ -677,6 +677,14 @@ async def update_server(
             db, target_group, target_driver, exclude_server_id=s.id
         )
         await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
+    if target_group != s.server_group_id:
+        # #2899 — a cluster node's Kea is behind the MetalLB relay VIP
+        # Service; it cannot move into a ``direct`` group while a VIP is set.
+        from app.services.dhcp.relay_vip import server_join_refusal  # noqa: PLC0415
+
+        refusal = await server_join_refusal(db, s, target_group)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
     for k, v in changes.items():
         setattr(s, k, v)
 
