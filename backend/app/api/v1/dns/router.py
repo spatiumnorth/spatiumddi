@@ -58,6 +58,7 @@ from app.core.agent_wake import (
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
+    admin_email_error,
     bind_check_names_error,
     primary_ns_error,
     record_value_error,
@@ -5635,6 +5636,7 @@ async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: CurrentUser
 ) -> ZoneResponse:
     await _require_group(group_id, db)
+    await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
     _refuse_superadmin_zone_fields(current_user, body.model_dump(), None)
     await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
     await _assert_forward_zone_serviceable(
@@ -6441,6 +6443,14 @@ async def update_zone(
         ns_err = primary_ns_error(changes["primary_ns"])
         if ns_err is not None:
             raise HTTPException(status_code=422, detail=f"Primary NS (primary_ns) {ns_err}")
+    # #2916 — the same for the Admin Email (SOA RNAME), checked by BIND too.
+    if "admin_email" in changes and (changes["admin_email"] or "") != (zone.admin_email or ""):
+        mail_err = admin_email_error(changes["admin_email"])
+        if mail_err is not None:
+            raise HTTPException(status_code=422, detail=f"Admin Email (admin_email) {mail_err}")
+    # #2917 — a changed view must be a view of this zone's own server group.
+    if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
+        await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -7800,8 +7810,16 @@ class FromTemplateRequest(BaseModel):
 
     @field_validator("zone_name")
     @classmethod
-    def ensure_trailing_dot(cls, v: str) -> str:
-        return v if v.endswith(".") else v + "."
+    def validate_zone_name(cls, v: str) -> str:
+        # #2915 — the rule zone create applies (ZoneCreate.validate_zone_name).
+        return validate_fqdn(v, field="zone name") + "."
+
+    @field_validator("zone_type")
+    @classmethod
+    def validate_zone_type(cls, v: str) -> str:
+        if v not in VALID_ZONE_TYPES:
+            raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
+        return v
 
     @model_validator(mode="after")
     def kind_follows_name(self) -> FromTemplateRequest:
@@ -7860,6 +7878,53 @@ async def create_zone_from_template(
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
+    await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
+
+    # #2915 — every record the template would write goes through the record
+    # API's rules before anything is written or pushed.
+    record_payloads = materialize(template, body.zone_name, body.params)
+    probe_zone = DNSZone(group_id=group_id, name=body.zone_name)  # never added
+    for r in record_payloads:
+        if r["record_type"] not in VALID_RECORD_TYPES:
+            # Catalog-author bug — refuse rather than write garbage records.
+            raise HTTPException(
+                status_code=500,
+                detail=f"Template {body.template_id} produced invalid record type {r['record_type']}",
+            )
+        try:
+            checked = RecordCreate(
+                name=r["name"],
+                record_type=r["record_type"],
+                value=r["value"],
+                ttl=r["ttl"],
+                priority=r["priority"],
+                weight=r["weight"],
+                port=r["port"],
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_validation_message(exc)) from exc
+        await _check_driver_gated_record_type(checked.record_type, group_id, db)
+        checked.priority, checked.weight, checked.port = _normalize_record_struct_fields(
+            checked.record_type, checked.priority, checked.weight, checked.port
+        )
+        _validate_address_record_value(
+            checked.record_type,
+            checked.value,
+            priority=checked.priority,
+            weight=checked.weight,
+            port=checked.port,
+            origin=body.zone_name,
+        )
+        await _enforce_absolute_target(db, probe_zone, checked.record_type, checked.value)
+        owner = f"{checked.name}.{body.zone_name}" if checked.name != "@" else body.zone_name
+        _enforce_bind_check_names(checked.record_type, owner, checked.value, body.zone_name)
+        r.update(
+            name=checked.name,
+            priority=checked.priority,
+            weight=checked.weight,
+            port=checked.port,
+        )
+
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -7886,16 +7951,8 @@ async def create_zone_from_template(
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
-    record_payloads = materialize(template, body.zone_name, body.params)
     created_records: list[DNSRecord] = []
     for r in record_payloads:
-        if r["record_type"] not in VALID_RECORD_TYPES:
-            # Catalog-author bug — refuse rather than write garbage records.
-            raise HTTPException(
-                status_code=500,
-                detail=f"Template {body.template_id} produced invalid record type {r['record_type']}",
-            )
-        await _check_driver_gated_record_type(r["record_type"], group_id, db)
         fqdn = (f"{r['name']}.{zone.name}" if r["name"] != "@" else zone.name).rstrip(".") + "."
         rec = DNSRecord(
             zone_id=zone.id,
@@ -8544,6 +8601,29 @@ async def _refuse_cname_conflict(
     if other is not None:
         raise HTTPException(
             status.HTTP_409_CONFLICT, describe_cname_conflict(record_type, fqdn, other)
+        )
+
+
+async def _enforce_zone_view_in_group(
+    db: DB, group_id: uuid.UUID, view_id: uuid.UUID | None
+) -> None:
+    """422 a zone ``view_id`` that is not a view of the zone's own group (#2917).
+
+    The record API's rule (``_enforce_views_in_zone_group``) for the zone paths:
+    a zone pinned to another group's view renders in none of this group's views,
+    so it is never served while the server row still reads ok.
+    """
+    if view_id is None:
+        return
+    found = (
+        await db.execute(
+            select(DNSView.id).where(DNSView.group_id == group_id, DNSView.id == view_id)
+        )
+    ).scalar_one_or_none()
+    if found is None:
+        raise HTTPException(
+            status_code=422,
+            detail="view_id does not name a view in this zone's server group",
         )
 
 

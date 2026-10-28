@@ -407,6 +407,52 @@ def primary_ns_error(value: str | None) -> str | None:
     return None
 
 
+_MAILBOX_LOCAL_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
+
+
+def admin_email_error(value: str | None) -> str | None:
+    """Why *value* cannot be a zone's Admin Email (the SOA RNAME), or None.
+
+    The RNAME is a mailbox in domain-name form (``hostmaster.example.com.``,
+    the first label being the local part). BIND's check-names reads it as a
+    mailbox: the local part is one label of letters, digits, ``-`` and ``_``,
+    and every label after it is a host name label. One that is not makes BIND
+    refuse the whole zone, so the group never serves it (#2916). Like the
+    Primary NS (:func:`primary_ns_error`), a single label would be read as a
+    name at the root, so it is refused. Empty means "not set" and is allowed.
+    """
+    if value is None or value == "":
+        return None
+    body = value[:-1] if value.endswith(".") else value
+    if not body or "." not in body:
+        return (
+            "must be a mailbox in domain-name form such as hostmaster.example.com. "
+            "(a single label such as 'hostmaster' would be read as a name at the root)"
+        )
+    if len(body) > MAX_NAME_LEN:
+        return f"exceeds {MAX_NAME_LEN} characters"
+    for i, label in enumerate(body.split(".")):
+        if not label:
+            return "contains an empty label"
+        if len(label) > MAX_LABEL_LEN:
+            return f"label '{label[:20]}…' exceeds {MAX_LABEL_LEN} characters"
+        if not label.isascii():
+            return f"label '{label}' is not ASCII"
+        if i == 0:
+            if not _MAILBOX_LOCAL_RE.match(label):
+                return (
+                    f"mailbox name '{label}' may hold only letters, digits, hyphens "
+                    "and underscores. BIND refuses a zone whose SOA mailbox is not valid"
+                )
+        elif not _HOST_LABEL_RE.match(label):
+            return (
+                f"label '{label}' is not a host name label: letters, digits and "
+                "hyphens only, with no leading or trailing hyphen (RFC 1123). "
+                "BIND refuses a zone whose SOA mailbox domain is not a host name"
+            )
+    return None
+
+
 def _zone_absolute(name: str, origin: str) -> str:
     """*name* the way a zone file whose ``$ORIGIN`` is *origin* reads it.
 
