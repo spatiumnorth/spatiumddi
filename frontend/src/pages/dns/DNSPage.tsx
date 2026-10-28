@@ -3137,7 +3137,7 @@ export function ZoneModal({
             {!canReadDomainPerm
               ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
               : domainModulesReady && !domainsModuleOn
-                ? " Domain tracking is turned off (Settings → Features), so the domain list is not available."
+                ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
                 : ""}
           </p>
         </Field>
