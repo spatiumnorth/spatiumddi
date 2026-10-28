@@ -538,7 +538,7 @@ async def preview_archive_manifest(
     )
 
     try:
-        manifest, dump_format = preview_backup_archive(archive_bytes)
+        manifest, dump_format, refusal = preview_backup_archive(archive_bytes)
     except BackupArchiveError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -552,4 +552,9 @@ async def preview_archive_manifest(
         # an Exclude-secrets archive whose dump is plain SQL.
         "dump_format": dump_format,
         "selective_restore_supported": dump_format == "custom",
+        # Whether the restore would accept this archive at all, and if not
+        # why (#2949): the restore's own refusals for a missing dump, a
+        # missing secrets.enc, or a format_version this build cannot read.
+        "restorable": refusal is None,
+        "restore_refusal": refusal,
     }

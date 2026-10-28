@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from app.api.token_path_scope import include_token_scoped
+from app.api.v1.about import router as about_router
 from app.api.v1.acme import router as acme_router
 from app.api.v1.address_sets import router as address_sets_router
 from app.api.v1.admin.agent_keys import router as agent_keys_router
@@ -586,6 +587,8 @@ api_v1_router.include_router(
 api_v1_router.include_router(upgrades_router, prefix="/upgrades", tags=["upgrades"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
+# #2895 — the About page's data sources; signed-in callers only (see the module).
+api_v1_router.include_router(about_router, prefix="/about", tags=["about"])
 api_v1_router.include_router(
     vlans_router,
     prefix="/vlans",

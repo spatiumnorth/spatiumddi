@@ -525,6 +525,13 @@ RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 # So a rule that counted it would fire permanently, and never auto-resolve,
 # on two ordinary correctly-working configurations. Deliberate policy drops
 # are not loss.
+#
+# #2889 — it also fires on ``queue_evicted``: DHCPv4 requests Kea read and
+# then evicted from its full multi-threading packet queue during a burst.
+# That is the same failure one stage later (a worker that cannot keep up
+# instead of a receive thread), it is never deliberate either, and no other
+# counter records it — ``socket_drop`` is before Kea reads, and
+# ``receive_drop`` is counted by the worker, after the queue.
 RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 
 # Issue #1110 — a DHCP scope served by two or more servers that do not
@@ -2220,11 +2227,16 @@ async def _matching_dhcp_packets_dropped_subjects(
     db: AsyncSession,
     rule: AlertRule,
 ) -> list[tuple[str, str, str]]:
-    """DHCP servers the kernel dropped packets for over the window (#980).
+    """DHCP servers that lost packets over the window (#980, #2889).
 
-    Fires on ``socket_drop`` alone: packets discarded because Kea's receive
-    buffer was full, so Kea never read them. That is unambiguous loss nobody
-    asked for, which is why a floor of one packet is reasonable.
+    Fires on ``socket_drop`` + ``queue_evicted``: packets discarded because
+    Kea's receive buffer was full, so Kea never read them, and requests Kea
+    read and then evicted from its full packet queue before its worker got
+    to them. Both are loss nobody asked for, which is why a floor of one
+    packet is reasonable. ``queue_evicted`` is derived by the agent from
+    three counters (see ``spatium_dhcp_agent.intake``), reporting only an
+    eviction a second sample has confirmed, so a backlog merely in flight
+    at one read does not fire it.
 
     **``receive_drop`` is deliberately not part of the test**, though the
     message reports it when present. Kea's ``pkt4-receive-drop`` counts
@@ -2239,6 +2251,9 @@ async def _matching_dhcp_packets_dropped_subjects(
     NULL is not zero. A server whose agent predates #980, or cannot read
     ``/proc/net/udp``, reports no ``socket_drop`` at all; ``SUM`` over its
     rows is NULL and the server is skipped rather than treated as loss-free.
+    The same holds for ``queue_evicted`` on its own: unmeasured (no raw
+    socket, a v6-only server, an older agent) contributes nothing, and a
+    server with neither measured is skipped.
     Note this is tested on ``socket_drop`` specifically and not on the pair:
     ``receive_drop`` always arrives from a #980 agent, so a combined test
     would read an unmeasurable server as measured-and-clean.
@@ -2256,6 +2271,7 @@ async def _matching_dhcp_packets_dropped_subjects(
             select(
                 DHCPMetricSample.server_id,
                 func.sum(DHCPMetricSample.socket_drop).label("sock"),
+                func.sum(DHCPMetricSample.queue_evicted).label("evicted"),
                 func.sum(DHCPMetricSample.receive_drop).label("recv"),
                 func.sum(DHCPMetricSample.discover).label("disc"),
             )
@@ -2266,14 +2282,21 @@ async def _matching_dhcp_packets_dropped_subjects(
     if not rows:
         return []
 
-    hits: dict[uuid.UUID, tuple[int, int | None, int]] = {}
+    hits: dict[uuid.UUID, tuple[int, int, int | None, int]] = {}
     for r in rows:
-        if r.sock is None:
+        if r.sock is None and r.evicted is None:
             continue  # unmeasured — skipped, not vouched for
-        sock = int(r.sock)
-        if sock < floor or sock <= 0:
+        sock = int(r.sock or 0)
+        evicted = int(r.evicted or 0)
+        lost = sock + evicted
+        if lost < floor or lost <= 0:
             continue
-        hits[r.server_id] = (sock, None if r.recv is None else int(r.recv), int(r.disc or 0))
+        hits[r.server_id] = (
+            sock,
+            evicted,
+            None if r.recv is None else int(r.recv),
+            int(r.disc or 0),
+        )
     if not hits:
         return []
 
@@ -2286,16 +2309,39 @@ async def _matching_dhcp_packets_dropped_subjects(
 
     win_min = int(_DHCP_PACKET_LOSS_WINDOW.total_seconds() // 60)
     matches: list[tuple[str, str, str]] = []
-    for sid, (sock, recv, disc) in hits.items():
+    for sid, (sock, evicted, recv, disc) in hits.items():
         name = names.get(sid) or str(sid)
-        message = (
-            f"DHCP server {name} lost {sock} packet(s) in the last {win_min} min: "
-            "the kernel discarded them because the server's receive buffer was "
-            "full, so it never read them. Usually means the node is short of "
-            f"CPU. It answered {disc} DISCOVER(s) over the same window, so every "
-            "server-side counter reads healthy — the loss is upstream of them and "
-            "costs each affected client a full retransmit round."
-        )
+        if not evicted:
+            # Kernel drops only — the #980 message, byte for byte, so a server
+            # whose evictions are unmeasured (NULL) or measured at zero reads
+            # exactly as it did before #2889.
+            message = (
+                f"DHCP server {name} lost {sock} packet(s) in the last {win_min} min: "
+                "the kernel discarded them because the server's receive buffer was "
+                "full, so it never read them. Usually means the node is short of "
+                f"CPU. It answered {disc} DISCOVER(s) over the same window, so every "
+                "server-side counter reads healthy — the loss is upstream of them and "
+                "costs each affected client a full retransmit round."
+            )
+        else:
+            parts = []
+            if sock:
+                parts.append(
+                    f"{sock} discarded by the kernel because the server's receive "
+                    "buffer was full, so it never read them"
+                )
+            parts.append(
+                f"{evicted} read and then evicted from the server's full packet "
+                "queue during a burst, before its worker reached them"
+            )
+            message = (
+                f"DHCP server {name} lost {sock + evicted} packet(s) in the last "
+                f"{win_min} min: {'; '.join(parts)}. Usually means the node is short "
+                f"of CPU for the load's bursts. It answered {disc} DISCOVER(s) over "
+                "the same window, so every server-side counter reads healthy — the "
+                "loss is upstream of them and costs each affected client a full "
+                "retransmit round."
+            )
         if recv:
             # Reported, never alerted on: this number legitimately includes
             # MAC-blocklist and HA out-of-scope drops.
@@ -6482,8 +6528,15 @@ async def seed_dhcp_packets_dropped_alert_rule() -> None:
     non-zero ``socket_drop`` is not an inference from a threshold, it is the
     kernel saying it threw a packet away.
 
-    "Cannot false-fire" is only true because the evaluator reads
-    ``socket_drop`` alone. Counting ``receive_drop`` as well would make a
+    #2889 added ``queue_evicted``, which IS an inference: arrivals less
+    the two counters that account for them. It joins the test anyway because
+    it is the same loss one stage later and nothing else reports it, and the
+    agent reports only an eviction a second sample has confirmed, so a backlog
+    in flight at one read does not reach this rule. Its residual false
+    positives are documented in ``docs/features/DHCP.md``.
+
+    "Cannot false-fire" is only true because the evaluator never reads
+    ``receive_drop``. Counting ``receive_drop`` as well would make a
     default-on rule fire permanently on any install using the DHCP MAC
     blocklist, since Kea counts a ``DROP``-class match there — the kind of
     alarm that trains operators to ignore the feed.
@@ -6518,7 +6571,9 @@ async def seed_dhcp_packets_dropped_alert_rule() -> None:
                 description=(
                     "Fires when the kernel discarded DHCP packets before the server "
                     "could read them — its receive buffer filled, usually because the "
-                    "node is short of CPU. Invisible to every other signal: the server "
+                    "node is short of CPU — or when the server read DHCPv4 requests and "
+                    "then evicted them from its full packet queue during a burst. "
+                    "Invisible to every other signal: the server "
                     "stays reachable and healthy and answers 100% of what reaches it, "
                     "while clients wait out retransmit rounds. Does NOT fire on packets "
                     "Kea read and discarded, because that figure also counts deliberate "
