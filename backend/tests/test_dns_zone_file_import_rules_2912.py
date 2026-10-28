@@ -94,3 +94,90 @@ def test_parser_keeps_zero_and_flags_big():
     by = {r.name: r for r in z.records}
     assert by["a"].ttl == 0 and by["a"].bad_ttl is None
     assert by["b"].ttl is None and by["b"].bad_ttl == 4294967295
+
+
+# A real-world zone with every supported type and the owner shapes a zone file
+# carries: apex, wildcard, underscore TXT / SRV / TLSA owners, a $ORIGIN
+# change, an IDN owner, absolute and relative names, a multi-string TXT.
+_BROAD = f"""$TTL 3600
+@ IN NS ns1.{ZONE}
+@ 300 IN MX 10 mail
+@ IN TXT "v=spf1 -all"
+@ IN CAA 0 issue "letsencrypt.org"
+ns1 IN A 192.0.2.53
+mail IN A 192.0.2.25
+www IN AAAA 2001:db8::1
+alias IN CNAME www
+*.wild IN A 192.0.2.99
+_dmarc IN TXT "v=DMARC1; p=none"
+_acme-challenge IN TXT "abc123"
+_sip._tcp IN SRV 10 20 5060 sip.{ZONE}
+_443._tcp.www IN TLSA 3 1 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+ssh IN SSHFP 1 1 0123456789abcdef0123456789abcdef01234567
+long IN TXT "part-one" "part-two"
+abs.{ZONE} IN A 192.0.2.7
+xn--bcher-kva IN A 192.0.2.8
+naptr IN NAPTR 100 10 "U" "E2U+sip" "!^.*$!sip:info@example.com!" .
+svc IN SVCB 1 www alpn="h2"
+@ IN HTTPS 1 . alpn="h2,h3"
+loc IN LOC 52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m
+$ORIGIN sub.{ZONE}
+host IN A 192.0.2.30
+"""
+
+
+async def test_a_broad_valid_zone_imports_every_row(client: AsyncClient, db_session: AsyncSession):
+    h = await _headers(db_session)
+    grp, zone = await _zone(db_session)
+    prev = await _post(client, h, grp, zone, _BROAD, "preview", "merge")
+    assert prev["skipped"] == [], prev["skipped"]
+    assert len(prev["to_create"]) == prev["record_count"]
+    done = await _post(client, h, grp, zone, _BROAD, "commit", "merge")
+    assert done["skipped"] == []
+    assert done["created"] == prev["record_count"]
+    names = set((await db_session.execute(select(DNSRecord.name))).scalars().all())
+    assert {
+        "@",
+        "*.wild",
+        "_sip._tcp",
+        "_443._tcp.www",
+        "host.sub",
+        "abs",
+        "xn--bcher-kva",
+    } <= names
+
+
+async def test_replace_keeps_a_record_whose_file_row_has_a_bad_ttl(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """A row withheld for its TTL is still in the file: a replace must not
+    read the record it names as absent and delete it."""
+    h = await _headers(db_session)
+    grp, zone = await _zone(db_session)
+    db_session.add(_rec(zone, "keep300", "A", "192.0.2.15", ttl=300))
+    await db_session.flush()
+    text = "keep300 4294967295 IN A 192.0.2.15\nnew 60 IN A 192.0.2.16\n"
+    prev = await _post(client, h, grp, zone, text, "preview", "replace")
+    assert prev["to_delete"] == []
+    assert prev["to_update"] == []
+    assert "keep300 A 192.0.2.15: skipped - TTL 4294967295" in _skipped_text(prev)
+    await _post(client, h, grp, zone, text, "commit", "replace")
+    ttls = {r.name: r.ttl for r in (await db_session.execute(select(DNSRecord))).scalars().all()}
+    assert ttls == {"keep300": 300, "new": 60}
+
+
+async def test_out_of_zone_and_bad_rows_are_skipped_with_a_capped_list(
+    client: AsyncClient, db_session: AsyncSession
+):
+    from app.api.v1.dns.router import _IMPORT_SKIPPED_MAX
+
+    h = await _headers(db_session)
+    grp, zone = await _zone(db_session)
+    n = _IMPORT_SKIPPED_MAX + 25
+    text = "ok 300 IN A 192.0.2.1\n" + "".join(f"bad_{i} 300 IN A 192.0.2.2\n" for i in range(n))
+    prev = await _post(client, h, grp, zone, text, "preview", "merge")
+    assert len(prev["skipped"]) == _IMPORT_SKIPPED_MAX + 1
+    assert prev["skipped"][-1] == "... and 25 more row(s) left alone"
+    done = await _post(client, h, grp, zone, text, "commit", "merge")
+    assert done["created"] == 1
+    assert done["skipped"] == prev["skipped"]

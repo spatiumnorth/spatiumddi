@@ -11,5 +11,9 @@
   A TTL of 0 is stored as 0 instead of as no TTL. A TTL past
   2147483647 is reported and left out instead of being dropped without
   a word, so a merge no longer overwrites a record's explicit TTL with
-  none. A row of a type SpatiumDDI does not store (HINFO, DNSSEC types)
+  none, and a replace keeps the record such a row names rather than
+  deleting it. A row of a type SpatiumDDI does not store (HINFO, DNSSEC types)
   is now named, by type and count, in the preview and the result.
+  The list of rows left alone is capped at 500 entries plus a count of
+  the rest, so a file of refused rows cannot grow the response and the
+  audit row without bound.

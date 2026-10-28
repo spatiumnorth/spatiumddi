@@ -9573,15 +9573,6 @@ async def _diff_zone_file(
     view_names = {v.id: v.name for v in views}
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     replace = body.conflict_strategy == "replace"
-    # #2913 — a TTL past what a server can serve is refused like the
-    # spreadsheet import refuses it, not stored as "no TTL" (which a merge then
-    # wrote over an explicit one).
-    unservable = [
-        f"{_label_of(p)}: skipped - TTL {p.bad_ttl} is above the maximum of {DNS_TTL_MAX}"
-        for p in parsed
-        if p.bad_ttl is not None
-    ]
-    parsed = [p for p in parsed if p.bad_ttl is None]
     diff = diff_records(
         parsed,
         existing,
@@ -9591,6 +9582,12 @@ async def _diff_zone_file(
         replace=replace,
         zone_name=zone.name,
     )
+    # #2913 — a TTL past what a server can serve is refused like the
+    # spreadsheet import refuses it, not stored as "no TTL" (which a merge then
+    # wrote over an explicit one). The row still goes through the diff, so a
+    # ``replace`` reads the record it names as present in the file and leaves
+    # it alone rather than deleting it; only its create / update is withheld.
+    unservable = _withhold_unservable_ttls(diff, parsed)
     # #2912 — a new row meets the record API's own rules (the ones the
     # spreadsheet import runs), or it is left out with the reason.
     await _apply_record_rules_to_import(db, zone, diff)
@@ -9599,8 +9596,37 @@ async def _diff_zone_file(
     return diff
 
 
-def _label_of(p: ParsedRecord) -> str:
-    return f"{p.name} {p.record_type} {p.value}"
+def _withhold_unservable_ttls(diff: ZoneDiff, parsed: list[ParsedRecord]) -> list[str]:
+    """Take every create / update / unchanged entry whose file row carries a
+    TTL past ``DNS_TTL_MAX`` out of ``diff`` (#2913), and return one skipped
+    line per such row."""
+    bad = {(p.name, p.record_type, p.value): p.bad_ttl for p in parsed if p.bad_ttl is not None}
+    if not bad:
+        return []
+
+    def keep(c: RecordChange) -> bool:
+        return (c.name, c.record_type, c.value) not in bad
+
+    diff.to_create = [c for c in diff.to_create if keep(c)]
+    diff.to_update = [c for c in diff.to_update if keep(c)]
+    diff.unchanged = [c for c in diff.unchanged if keep(c)]
+    return [
+        f"{name} {rtype} {value}: skipped - TTL {ttl} is above the maximum of {DNS_TTL_MAX}"
+        for (name, rtype, value), ttl in bad.items()
+    ]
+
+
+# The longest ``skipped`` list a zone-file import returns (and audits). A file
+# of nothing but refused rows is bounded only by the request body cap, and
+# the list is echoed in the response AND stored in the audit row.
+_IMPORT_SKIPPED_MAX = 500
+
+
+def _cap_skipped(skipped: list[str]) -> list[str]:
+    if len(skipped) <= _IMPORT_SKIPPED_MAX:
+        return skipped
+    more = len(skipped) - _IMPORT_SKIPPED_MAX
+    return [*skipped[:_IMPORT_SKIPPED_MAX], f"... and {more} more row(s) left alone"]
 
 
 async def _apply_record_rules_to_import(db: DB, zone: DNSZone, diff: ZoneDiff) -> None:
@@ -9612,7 +9638,10 @@ async def _apply_record_rules_to_import(db: DB, zone: DNSZone, diff: ZoneDiff) -
     than a second copy. BIND refuses a zone holding one bad owner whole and
     keeps serving the last good copy, so storing such a row also held back
     every good row imported beside it. An update names a record that already
-    exists, so its name and value are not re-judged.
+    exists, so its name, type and value are unchanged and are not re-judged
+    (the record API's update re-judges only what changes); an update writes
+    only the TTL and priority / weight / port, which the parser bounds
+    (``bad_ttl``; the wire format caps the others at 16 bits).
     """
     if not diff.to_create:
         return
@@ -9728,7 +9757,7 @@ async def import_zone_preview(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
-    diff.skipped = _skipped_type_notes(parsed) + diff.skipped
+    diff.skipped = _cap_skipped(_skipped_type_notes(parsed) + diff.skipped)
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -9790,7 +9819,7 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
-    diff.skipped = _skipped_type_notes(parsed) + diff.skipped
+    diff.skipped = _cap_skipped(_skipped_type_notes(parsed) + diff.skipped)
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
