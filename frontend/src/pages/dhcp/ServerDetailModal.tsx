@@ -835,10 +835,11 @@ function StatsTab({ serverId }: { serverId: string }) {
       nak: b.nak,
       decline: b.decline,
       release: b.release,
-      // #980 — DROPPED is socket_drop ALONE, and an unmeasured bucket stays
-      // null so Recharts breaks the line there: a gap where nobody looked,
-      // not a zero. See lib/dhcp-loss.ts for why receive_drop is excluded
-      // and why the coalesce matters.
+      // #980 / #2889 — DROPPED is socket_drop + queue_evicted, never
+      // receive_drop, and an unmeasured bucket stays null so Recharts breaks
+      // the line there: a gap where nobody looked, not a zero. See
+      // lib/dhcp-loss.ts for why receive_drop is excluded and why the
+      // coalesce matters.
       dropped: bucketLoss(b),
     }));
   }, [data, withDate]);
@@ -899,7 +900,14 @@ function StatsTab({ serverId }: { serverId: string }) {
               ) : loss.total > 0 ? (
                 <span
                   className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-medium text-rose-600"
-                  title="Packets the kernel discarded before the server could read them — its receive buffer filled. Most often the node is short of CPU: Kea answers 100% of what it reads, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC."
+                  title={
+                    "Packets the kernel discarded before the server could read them — its receive buffer filled — plus DHCPv4 requests the server read and then evicted from its full packet queue during a burst" +
+                    (loss.evicted > 0 ? ` (${loss.evicted} of these)` : "") +
+                    ". Most often the node is short of CPU for the load's bursts: Kea answers 100% of what it processes, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC." +
+                    (loss.evictionMeasured
+                      ? ""
+                      : " Queue evictions are not measured on this server (its agent has no raw-socket capability, or predates the counter).")
+                  }
                 >
                   {loss.total} dropped
                 </span>

@@ -119,6 +119,9 @@ class DHCPTimePoint(BaseModel):
     #: rendered as unknown, not as zero.
     receive_drop: int | None = None
     socket_drop: int | None = None
+    #: #2889 — DHCPv4 requests Kea read and then evicted from its packet
+    #: queue under a burst; no Kea counter sees them. Same ``None`` rule.
+    queue_evicted: int | None = None
 
 
 class DHCPTimeseries(BaseModel):
@@ -244,6 +247,7 @@ async def dhcp_timeseries(
         # coalesced like the counters above.
         func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
         func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+        func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
     ).where(DHCPMetricSample.bucket_at >= since)
     if server_id is not None:
         stmt = stmt.where(DHCPMetricSample.server_id == server_id)
@@ -266,6 +270,7 @@ async def dhcp_timeseries(
             # opposite of unmeasured.
             receive_drop=None if row.receive_drop is None else int(row.receive_drop),
             socket_drop=None if row.socket_drop is None else int(row.socket_drop),
+            queue_evicted=None if row.queue_evicted is None else int(row.queue_evicted),
         )
         for row in rows
     ]
