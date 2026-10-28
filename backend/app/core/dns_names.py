@@ -713,7 +713,9 @@ def host_in_zone_error(hostname: str, zone_name: str, *, field: str = "hostname"
     zone = zone_name.strip().rstrip(".")
     if not host or not zone:
         return None
-    return bind_check_names_error("A", f"{host}.{zone}", None, origin=zone, check_target=False)
+    # The owner absolute (root dot): a relative one has the origin appended
+    # again, which the message would then quote doubled.
+    return bind_check_names_error("A", f"{host}.{zone}.", None, origin=zone, check_target=False)
 
 
 def publishable_host_owner_error(hostname: str | None) -> str | None:

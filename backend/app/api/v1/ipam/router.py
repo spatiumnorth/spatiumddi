@@ -1816,7 +1816,7 @@ async def _assert_alias_names_fit(
                 ),
             )
         names_err = bind_check_names_error(
-            al.record_type, fqdn, None, origin=zone_domain, check_target=False
+            al.record_type, f"{fqdn}.", None, origin=zone_domain, check_target=False
         )
         if names_err is not None:
             raise HTTPException(status_code=422, detail=f"alias '{al.name}': {names_err}")
@@ -9916,7 +9916,23 @@ async def update_address(
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
         zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
-        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
+        try:
+            await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
+        except HTTPException as exc:
+            # The Edit dialog sends its hostname on every Save, so the sync
+            # runs on an edit of an unrelated field too. A name a later rule
+            # refuses (#2918: an underscore label in the zone's own name;
+            # #2072: past 253 characters) must not block such an edit (the
+            # #1228 / #2467 changed-fields rule): the refusal comes before
+            # anything is written, so the address's DNS is left as it was.
+            # Changing the hostname, the zone or the extras is still refused.
+            if exc.status_code != 422 or (hostname_changed or zone_changed or extra_zones_touched):
+                raise
+            logger.warning(
+                "ipam_dns_unchanged_name_not_republished",
+                ip=str(ip.address),
+                reason=exc.detail,
+            )
     elif subnet and restoring:
         await _sync_dns_record(
             db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True

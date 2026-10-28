@@ -33,7 +33,8 @@ LONG_ZONE = ".".join(["z" * 63, "y" * 63, "x" * 63, "example.test"])  # 204 char
 def test_rule_covers_zone_labels_and_length() -> None:
     assert host_in_zone_error("h1", "example.test") is None
     assert host_in_zone_error("h1", UNDERSCORE_ZONE + ".") is not None
-    assert "_lab" in (host_in_zone_error("h1", UNDERSCORE_ZONE) or "")
+    msg = host_in_zone_error("h1", UNDERSCORE_ZONE) or ""
+    assert "'h1._lab.example.test'" in msg and "_lab.example.test._lab" not in msg, msg
     assert host_in_zone_error("h" + "x" * 50 + "-1", LONG_ZONE) is not None
     # the default-gateway placeholder publishes no forward record, but its PTR
     # names gateway.<zone>, a target BIND's check-names refuses just the same
@@ -147,6 +148,39 @@ async def test_background_sync_skips_underscore_zone(db_session: AsyncSession) -
 
 
 @pytest.mark.asyncio
+async def test_unrelated_edit_in_underscore_zone_is_not_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An address published there before the rule existed keeps its edits: a
+    save that changes neither the hostname nor the zone runs no DNS sync, so
+    it is not refused (the #1228 changed-fields rule). Renaming it is."""
+    env = await _env(db_session, UNDERSCORE_ZONE)
+    assert env.zone is not None
+    ip = IPAddress(
+        subnet_id=env.subnet.id,
+        address="10.91.1.30",
+        status="allocated",
+        hostname="legacy",
+        forward_zone_id=env.zone.id,
+    )
+    db_session.add(ip)
+    await db_session.commit()
+    r = await client.put(
+        f"/api/v1/ipam/addresses/{ip.id}",
+        json={"description": "moved desks", "hostname": "legacy"},
+        headers=env.headers,
+    )
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        f"/api/v1/ipam/addresses/{ip.id}",
+        json={"hostname": "renamed"},
+        headers=env.headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "_lab" in r.text
+
+
+@pytest.mark.asyncio
 async def test_allocate_into_ordinary_zone_still_publishes(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -205,7 +239,7 @@ async def test_a_alias_under_underscore_zone_is_refused(db_session: AsyncSession
             db_session, [AliasInput(name="www", record_type="A")], env.zone.id
         )
     assert exc.value.status_code == 422
-    assert "_lab" in str(exc.value.detail)
+    assert "'www._lab.example.test'" in str(exc.value.detail), exc.value.detail
     # a CNAME owner may sit under an underscore label (the record API takes it)
     await _assert_alias_names_fit(
         db_session, [AliasInput(name="www", record_type="CNAME")], env.zone.id
