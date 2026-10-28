@@ -499,7 +499,8 @@ export const footerNav: NavEntry[] = [
   { label: "Appliance", icon: Wrench, to: "/appliance" },
   { label: "Features & Integrations", icon: ToggleLeft, to: "/admin/features" },
   { label: "Settings", icon: Settings, to: "/settings" },
-  // #2895 — Help → About: version, licence, NOTICE, third-party lists.
+  // #2895 — About: version, licence, NOTICE, third-party lists. The sidebar
+  // shows it as an icon in the footer's utility row; the palette lists it here.
   { label: "About", icon: Info, to: "/about" },
 ];
 

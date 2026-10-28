@@ -5,8 +5,7 @@
   to show only in Settings, and the licence, the company and the
   notices lived only in the repository, so nothing the product serves
   carried the Apache 2.0 NOTICE text or the MIT / BSD / ISC notices
-  the Vite build strips out of the bundle. `/about`, in the sidebar
-  footer, now shows the product, the version, Apache-2.0 and its
+  the Vite build strips out of the bundle. `/about` now shows the product, the version, Apache-2.0 and its
   text, Spatium North, links to the source, the docs and the privacy
   statement, the full NOTICE, a note on the GPL / LGPL components of
   the OS appliance image (the Debian userland, the kernel, and
@@ -28,6 +27,13 @@
   build-time pin in `versions.json` and is not in the runtime image.
 
 ### Changed
+
+- **The sidebar footer is more compact (#2895).** Appliance, Features
+  & Integrations and Settings stay text rows. About (new), GitHub and
+  Collapse share one row with the version, as icon buttons with a
+  tooltip and an accessible name, so the footer is four rows rather
+  than seven. Collapsed and in the mobile drawer every item is still
+  there, and the command palette still lists About.
 
 - **The frontend image's build context is now the repo root.** The
   About page serves `NOTICE` and `LICENSE`, which live once at the
