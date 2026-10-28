@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Layers, Loader2 } from "lucide-react";
 
+import { ListReadError } from "@/components/ui/list-read-error";
 import { backupApi, type BackupSection } from "@/lib/api";
 
 /**
@@ -120,8 +121,11 @@ export function BackupSectionsPicker({
               Loading catalog…
             </div>
           ) : sectionsQ.isError ? (
-            <div className="text-xs text-destructive">
-              Failed to load section catalog.
+            <div className="text-xs">
+              <ListReadError
+                error={sectionsQ.error}
+                what="the backup section catalog"
+              />
             </div>
           ) : (
             <ul className="space-y-1">
