@@ -53,6 +53,7 @@ from reportlab.platypus import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.content_disposition import slugify_filename_part
+from app.services.ipam.utilization import utilization_percent
 
 # Same scope resolution + payload shaping the CSV/JSON/XLSX exporter uses,
 # so a PDF and a spreadsheet of the same scope can't disagree about what
@@ -272,16 +273,58 @@ def _custom_field_rows(fields: dict[str, Any] | None) -> list[list[str]]:
     return [[_cell(k, 30), _cell(v, 70)] for k, v in sorted(fields.items())]
 
 
+def _family_summary_rows(blocks: list[dict[str, Any]]) -> list[list[str]]:
+    """Summary rows per address family, from the scope's top-level blocks.
+
+    Two rules (#2982, #2983). Families are never summed: an IPv4 address
+    count and an IPv6 one are not the same unit, and adding them printed
+    the IPv6 BIGINT clamp as a count. And the utilization is the
+    *block's* — allocated over the block CIDR, the same helper the API
+    uses — so the Summary and the Blocks table state one figure. Only
+    top-level blocks (parent not in the bundle) are summed; their
+    allocated count already rolls up every descendant.
+    """
+    ids = {b.get("id") for b in blocks}
+    roots = [b for b in blocks if b.get("parent_block_id") not in ids]
+    per_family: dict[int, list[int]] = {}
+    for b in roots:
+        try:
+            net = ipaddress.ip_network(str(b["network"]), strict=False)
+        except ValueError:
+            continue
+        acc = per_family.setdefault(net.version, [0, 0])
+        acc[0] += net.num_addresses
+        acc[1] += int(b.get("allocated_ips") or 0)
+    rows: list[list[str]] = []
+    for version in sorted(per_family):
+        total, alloc = per_family[version]
+        label = f"IPv{version}"
+        rows += [
+            [f"{label} addresses (blocks)", _num(total)],
+            [f"{label} allocated", _num(alloc)],
+            [f"{label} utilization", _pct(utilization_percent(alloc, total))],
+        ]
+    return rows
+
+
+def _subnet_total(s: dict[str, Any]) -> str:
+    """A subnet's size. The stored IPv6 total is clamped to BIGINT; print
+    the real size instead, never the clamp as a count."""
+    try:
+        net = ipaddress.ip_network(str(s["network"]), strict=False)
+    except (KeyError, ValueError):
+        return _num(s.get("total_ips"))
+    if net.version == 6:
+        return _num(net.num_addresses)
+    return _num(s.get("total_ips"))
+
+
 def _build_tree_story(bundle: ExportBundle, styles: Any, scope_label: str) -> list[Any]:
     h2 = styles["Heading2"]
     small = styles["small"]
     story: list[Any] = []
 
     subnets = _sort_subnets(bundle.subnets)
-    total_ips = sum(int(s.get("total_ips") or 0) for s in subnets)
-    alloc_ips = sum(int(s.get("allocated_ips") or 0) for s in subnets)
-    overall = (alloc_ips / total_ips * 100) if total_ips else None
-
     story.append(Paragraph("Summary", h2))
     story.append(
         _grid(
@@ -290,9 +333,7 @@ def _build_tree_story(bundle: ExportBundle, styles: Any, scope_label: str) -> li
                 ["Scope", _cell(scope_label, 60)],
                 ["Blocks", _num(len(bundle.blocks))],
                 ["Subnets", _num(len(subnets))],
-                ["Addressable IPs", _num(total_ips)],
-                ["Allocated", _num(alloc_ips)],
-                ["Utilization", _pct(overall)],
+                *_family_summary_rows(bundle.blocks),
             ],
             [2.2 * inch, 6.3 * inch],
         )
@@ -342,7 +383,7 @@ def _build_tree_story(bundle: ExportBundle, styles: Any, scope_label: str) -> li
                     _cell(s.get("block"), 22),
                     _cell(s.get("vlan_id"), 8),
                     _cell(s.get("status"), 12),
-                    _num(s.get("total_ips")),
+                    _subnet_total(s),
                     _num(s.get("allocated_ips")),
                     _pct(s.get("utilization_percent")),
                 ]

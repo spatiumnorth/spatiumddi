@@ -112,7 +112,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.utilization import block_utilization_percent, counts_toward_utilization
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -469,9 +469,7 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
 
     net = ipaddress.ip_network(str(block.network), strict=False)
     block_total = net.num_addresses
-    block.utilization_percent = (
-        round(float(allocated) / block_total * 100, 2) if block_total > 0 else 0.0
-    )
+    block.utilization_percent = block_utilization_percent(int(allocated), net)
     # Cache the raw counts too so block rows can render Used IPs (not just a
     # utilization bar). total_ips clamps to BIGINT for huge IPv6 blocks.
     block.allocated_ips = int(allocated)
