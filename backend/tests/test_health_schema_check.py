@@ -833,3 +833,26 @@ async def test_readiness_fails_when_database_is_down(
     assert response.status_code == 503
     assert response.json()["checks"]["database"].startswith("error")
     assert "schema" not in response.json()["checks"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_recovers_when_the_probe_connection_is_killed(
+    client: AsyncClient,
+) -> None:
+    """A failover or a Postgres restart kills the probe's one pooled
+    connection. The next probe must reconnect (pre-ping), not answer 503 until
+    something else recycles it: a probe that stays failed after a failover
+    takes every api pod out of the Service at once."""
+    from app.db import probe_engine
+
+    assert (await client.get("/health/ready")).status_code == 200
+    async with probe_engine().connect() as conn:
+        pid = (await conn.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+    async with engine.connect() as conn:
+        killed = (
+            await conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+        ).scalar_one()
+    assert killed is True
+    response = await client.get("/health/ready")
+    assert response.status_code == 200, response.json()
+    assert response.json()["checks"]["database"] == "ok"

@@ -15,3 +15,12 @@
   `terminationGracePeriodSeconds` in `k8s/base` and the Helm chart; the
   compose files set `stop_grace_period: 30s` on the api (Docker's default is
   10 s).
+  The probe's connection is held open at idle, so each api pod now counts
+  one more Postgres connection. The appliance's connection budget counts it
+  (`postgres_connection_budget` and firstboot's mirror): the cluster can open
+  52 connections at one node, 134 at three and 227 at nine, and on a
+  multi-node appliance whose Postgres memory limit is sized from that budget
+  the limit rises by about 16 MiB per control-plane node (3019Mi at three
+  nodes on a 12 GiB seed, 4507Mi at nine), which CloudNativePG applies with
+  one rolling restart. `max_connections` now passes the chart's 200 from
+  seven nodes with two worker processes (was eight).

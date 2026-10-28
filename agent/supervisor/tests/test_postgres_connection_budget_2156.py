@@ -63,18 +63,18 @@ def test_the_api_pool_shrinks_per_pod_as_pods_are_added() -> None:
 @pytest.mark.parametrize(
     ("cp_size", "concurrency", "expected"),
     [
-        # Per node: api 30 + its #2782 hooks 2 + each worker process with its
-        # hooks 2 x (1 + 2) + 1 = 39; no WAL sender; reserve 10 + beat's
-        # hooks 2.
-        (1, 2, 51),
-        (1, 4, 57),
-        # 3 x 39 + 2 WAL senders + 12.
-        (3, 2, 131),
-        (3, 4, 149),
-        # 9 x (13 + 2 + 6 + 1) + 8 WAL senders + 12: before #2156 the nine api
-        # pools alone could open 270.
-        (9, 2, 218),
-        (9, 4, 272),
+        # Per node: api 30 + its #2782 hooks 2 + its #2944 readiness probe 1
+        # + each worker process with its hooks 2 x (1 + 2) + 1 = 40; no WAL
+        # sender; reserve 10 + beat's hooks 2.
+        (1, 2, 52),
+        (1, 4, 58),
+        # 3 x 40 + 2 WAL senders + 12.
+        (3, 2, 134),
+        (3, 4, 152),
+        # 9 x (13 + 2 + 1 + 6 + 1) + 8 WAL senders + 12: before #2156 the nine
+        # api pools alone could open 270.
+        (9, 2, 227),
+        (9, 4, 281),
     ],
 )
 def test_the_connection_budget_at_one_three_and_nine_nodes(
@@ -96,8 +96,8 @@ def _chart_max_connections() -> int:
 @pytest.mark.parametrize("mem_mib", [8192, 24576])  # two and four worker processes
 def test_max_connections_always_covers_the_budget(cp_size: int, mem_mib: int) -> None:
     """A pool sized past max_connections is refused at the database. With the
-    #2782 hooks the budget passes the chart's 200 from five nodes (four worker
-    processes) or eight (two), so the supervisor writes the budget there and
+    #2782 hooks and the #2944 probe the budget passes the chart's 200 from
+    five nodes (four worker processes) or seven (two), so the supervisor writes the budget there and
     the chart's own value below it."""
     assert _chart_max_connections() == k8s_api._PG_CHART_MAX_CONNECTIONS
     s = k8s_api.control_plane_sizing(mem_mib, cp_size)
@@ -116,28 +116,28 @@ def test_max_connections_stays_the_charts_up_to_four_nodes() -> None:
         for mem in (8192, 24576):
             assert k8s_api.control_plane_sizing(mem, cp)["max_connections"] == 200
     assert [k8s_api.postgres_connection_budget(cp, 2) for cp in range(1, 11)] == [
-        51,
-        91,
-        131,
-        171,
-        181,
-        191,
-        200,
-        211,
-        218,
-        231,
+        52,
+        93,
+        134,
+        175,
+        186,
+        197,
+        207,
+        219,
+        227,
+        241,
     ]
     assert [k8s_api.postgres_connection_budget(cp, 4) for cp in range(1, 11)] == [
-        57,
-        103,
-        149,
-        195,
-        211,
-        227,
-        242,
-        259,
-        272,
-        291,
+        58,
+        105,
+        152,
+        199,
+        216,
+        233,
+        249,
+        267,
+        281,
+        301,
     ]
 
 
@@ -156,18 +156,19 @@ def test_one_backend_costs_at_least_what_the_killed_primary_measured() -> None:
 
 
 def test_the_issue_seed_at_one_three_and_nine_nodes() -> None:
-    """The cluster in the report: one node keeps 2479Mi, three take 2971Mi,
-    nine 4363Mi — above the ~2479 MiB the cgroup held at the kill, with room
-    for the 218 backends nine nodes can now open (#2782's hooks included)."""
+    """The cluster in the report: one node keeps 2479Mi, three take 3019Mi,
+    nine 4507Mi — above the ~2479 MiB the cgroup held at the kill, with room
+    for the 227 backends nine nodes can now open (#2782's hooks and #2944's
+    probe included)."""
     limits = {cp: k8s_api.control_plane_sizing(_ISSUE_SEED_MIB, cp)["postgres"] for cp in (1, 3, 9)}
-    assert limits == {1: 2479, 3: 619 + 256 + 131 * 16, 9: 619 + 256 + 218 * 16}
-    assert limits == {1: 2479, 3: 2971, 9: 4363}
+    assert limits == {1: 2479, 3: 619 + 256 + 134 * 16, 9: 619 + 256 + 227 * 16}
+    assert limits == {1: 2479, 3: 3019, 9: 4507}
     killed_at = (_ANON + _SHMEM + _KERNEL) / _MIB
     assert killed_at == pytest.approx(2479, abs=2)
     assert limits[9] > killed_at
     sized = k8s_api.control_plane_sizing(_ISSUE_SEED_MIB, 9)
-    assert sized["postgres_connections"] == 218
-    assert sized["max_connections"] == 218
+    assert sized["postgres_connections"] == 227
+    assert sized["max_connections"] == 227
     # shared_buffers, the request and the worker are the share's, unchanged.
     one = k8s_api.control_plane_sizing(_ISSUE_SEED_MIB, 1)
     for key in ("shared_buffers", "postgres_request", "worker", "api", "concurrency"):
@@ -192,7 +193,7 @@ def test_the_limit_holds_its_connections_everywhere(mem_mib: int, cp_size: int) 
 
 @pytest.mark.parametrize("mem_mib", [8192, 12288, 16384, 24030, 24576, 65536])
 def test_a_single_node_from_eight_gib_is_unchanged(mem_mib: int) -> None:
-    """One node's 51-57 connections fit the share from 8 GiB up, so those
+    """One node's 52-58 connections fit the share from 8 GiB up, so those
     installs render exactly what they did."""
     assert k8s_api.control_plane_sizing(mem_mib, 1)["postgres"] == _share_only_limit(mem_mib)
 
@@ -231,11 +232,11 @@ def test_nine_nodes_write_the_smaller_pool_and_the_larger_limit(monkeypatch) -> 
     doc = rec.doc
     assert doc["api"]["replicas"] == 9
     assert doc["api"]["databasePool"] == {"size": 10, "maxOverflow": 3}
-    assert doc["postgresql"]["resources"]["limits"] == {"memory": "4363Mi", "cpu": "3000m"}
+    assert doc["postgresql"]["resources"]["limits"] == {"memory": "4507Mi", "cpu": "3000m"}
     assert doc["postgresql"]["cnpg"]["instances"] == 9
     assert doc["postgresql"]["cnpg"]["parameters"] == {
         "shared_buffers": "619MB",
-        "max_connections": "218",
+        "max_connections": "227",
     }
 
 
