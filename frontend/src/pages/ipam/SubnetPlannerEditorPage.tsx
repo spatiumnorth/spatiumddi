@@ -263,7 +263,7 @@ export function SubnetPlannerEditorPage() {
             </button>
           </div>
         </div>
-        {applyMut.isError && (
+        {applyMut.isError && !showApplyConfirm && (
           <ApplyErrorBanner error={applyMut.error as unknown} />
         )}
         {reopenMut.isError && (
@@ -356,28 +356,34 @@ export function SubnetPlannerEditorPage() {
           spaceName={spaceName}
           onCancel={() => setShowApplyConfirm(false)}
           onConfirm={() => {
-            setShowApplyConfirm(false);
-            applyMut.mutate();
+            // Stay open while the call runs: a refusal shows here, where
+            // this confirm said it would (#2984); success closes it.
+            applyMut.mutate(undefined, {
+              onSuccess: () => setShowApplyConfirm(false),
+            });
           }}
           isPending={applyMut.isPending}
+          error={applyMut.isError ? (applyMut.error as unknown) : null}
         />
       )}
     </div>
   );
 }
 
-function ApplyConfirmModal({
+export function ApplyConfirmModal({
   tree,
   spaceName,
   onCancel,
   onConfirm,
   isPending,
+  error,
 }: {
   tree: PlanNode;
   spaceName: string | undefined;
   onCancel: () => void;
   onConfirm: () => void;
   isPending: boolean;
+  error?: unknown;
 }) {
   const counts = useMemo(() => countNodes(tree), [tree]);
   return (
@@ -413,6 +419,7 @@ function ApplyConfirmModal({
           If anything fails (overlap, missing parent, drifted state) the whole
           transaction rolls back and you'll see the conflicts here.
         </p>
+        {error != null && <ApplyErrorBanner error={error} />}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
