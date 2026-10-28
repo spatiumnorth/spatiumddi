@@ -166,7 +166,7 @@ class VultrDNSDriver(CloudDNSDriverBase):
         returned verbatim with ``None`` fields rather than failing the pull.
         """
         parts = (data or "").strip().split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+        if len(parts) == 3 and all(p.isascii() and p.isdigit() for p in parts[:2]):
             return parts[2].strip(), int(parts[0]), int(parts[1])
         return (data or "").strip(), None, None
 

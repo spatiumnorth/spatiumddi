@@ -394,7 +394,7 @@ async def _validate_match(db: Any, match_kind: str, match_value: str) -> None:
         # Allow numeric 0-63 or named DSCP. Loose validator — vendors
         # accept different naming conventions; we don't try to map.
         v = match_value.strip()
-        if v.isdigit():
+        if v.isascii() and v.isdigit():
             iv = int(v)
             if not (0 <= iv <= 63):
                 raise HTTPException(status_code=422, detail="dscp value must be 0..63")

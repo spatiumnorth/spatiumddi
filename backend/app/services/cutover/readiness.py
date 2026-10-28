@@ -110,7 +110,7 @@ def normalize_dynamic_update(raw: Any) -> str | None:
     text = str(raw).strip()
     if not text:
         return None
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         return _DYNAMIC_UPDATE_BY_INT.get(int(text))
     squashed = "".join(ch for ch in text.lower() if ch.isalnum())
     return _DYNAMIC_UPDATE_BY_TEXT.get(squashed)
