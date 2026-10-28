@@ -7875,6 +7875,14 @@ async def create_zone_from_template(
             detail="A zone with that name already exists in this group/view",
         )
 
+    # Every provider-refusal gate runs on the whole record set BEFORE the zone
+    # exists or is pushed anywhere, so a refusal is atomic (#3007).
+    record_payloads = materialize(template, body.zone_name, body.params)
+    for r in record_payloads:
+        if r["record_type"] in VALID_RECORD_TYPES:
+            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    await _check_driver_ttl([r["ttl"] for r in record_payloads], group_id, db)
+
     guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(
         group_id=group_id,
@@ -7888,7 +7896,6 @@ async def create_zone_from_template(
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
-    record_payloads = materialize(template, body.zone_name, body.params)
     created_records: list[DNSRecord] = []
     for r in record_payloads:
         if r["record_type"] not in VALID_RECORD_TYPES:
