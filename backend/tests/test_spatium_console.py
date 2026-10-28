@@ -93,19 +93,121 @@ def test_format_pod_age_units(m):
 
 
 def test_rst_verdict_thresholds(m):
-    recent = (datetime.now(UTC) - timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    old = (datetime.now(UTC) - timedelta(seconds=1000)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert m._rst_verdict(0, "") == "quiet"
-    # A currently-broken pod is red regardless of restart count / timestamp.
-    assert m._rst_verdict(0, "", "CrashLoopBackOff") == "red"
-    # Lifetime backstop (>= 10) is red even when quiet.
-    assert m._rst_verdict(12, old) == "red"
-    # Flapping: >= 3 restarts AND a recent one.
-    assert m._rst_verdict(4, recent) == "red"
-    # Restarted but quiet (recent restart but below the flap floor) → amber.
-    assert m._rst_verdict(2, recent) == "amber"
-    # Several restarts but not recent → amber, not red.
-    assert m._rst_verdict(5, old) == "amber"
+    assert m._rst_verdict(0) == "quiet"
+    # A currently-broken pod is red regardless of the windowed increase.
+    assert m._rst_verdict(0, "CrashLoopBackOff") == "red"
+    assert m._rst_verdict(1) == "amber"
+    assert m._rst_verdict(2) == "amber"
+    assert m._rst_verdict(3) == "red"
+
+
+# ── #2928 windowed restart / etcd deltas ──────────────────────────────────
+
+
+def _pod(name, restarts, state="Running"):
+    return {
+        "Names": name,
+        "Namespace": "spatium",
+        "K8sState": state,
+        "Restarts": restarts,
+        "RestartedAt": "",
+        "Ready": "1/1",
+    }
+
+
+def _recent(m, watch, rows, now):
+    m.stamp_recent_restarts(watch, rows, now)
+    return {r["Names"]: r["RstRecent"] for r in rows}
+
+
+def test_restart_fresh_baseline_with_high_lifetime_count_is_quiet(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    rows = [_pod("api-1", 40)]
+    assert _recent(m, w, rows, 0.0) == {"api-1": 0}
+    assert m._rst_verdict(rows[0]["RstRecent"], "Running") == "quiet"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+
+
+def test_restart_three_in_window_is_red(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    rows = [_pod("api-1", 8)]
+    assert _recent(m, w, rows, 120.0) == {"api-1": 3}
+    assert m._rst_verdict(3, "Running") == "red"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    verdict, offender = m.overall_verdict(st)
+    assert verdict == "CRITICAL"
+    assert "flapping" in offender
+
+
+def test_restart_one_in_window_is_amber(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    rows = [_pod("api-1", 6)]
+    assert _recent(m, w, rows, 60.0) == {"api-1": 1}
+    assert m._rst_verdict(1, "Running") == "amber"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+
+
+def test_restarts_older_than_window_are_quiet(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    _recent(m, w, [_pod("api-1", 8)], 60.0)
+    # Still inside the window at +800 s, then aged out past +960 s.
+    assert _recent(m, w, [_pod("api-1", 8)], 800.0) == {"api-1": 3}
+    assert _recent(m, w, [_pod("api-1", 8)], 1000.0) == {"api-1": 0}
+
+
+def test_crashloop_is_red_without_any_history(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    rows = [_pod("api-1", 30, "CrashLoopBackOff")]
+    _recent(m, w, rows, 0.0)
+    assert m._rst_verdict(rows[0]["RstRecent"], "CrashLoopBackOff") == "red"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    assert m.overall_verdict(st)[0] == "CRITICAL"
+
+
+def test_counter_watch_prunes_vanished_pods_and_bounds_samples(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("a", 1), _pod("b", 1)], 0.0)
+    _recent(m, w, [_pod("a", 1)], 10.0)
+    assert list(w._samples) == ["spatium/a"]
+    # A recreated pod has a new name and starts a fresh baseline.
+    assert _recent(m, w, [_pod("a2", 9)], 20.0) == {"a2": 0}
+    assert list(w._samples) == ["spatium/a2"]
+    # Samples older than the baseline are dropped, so memory stays bounded.
+    for i in range(1, 200):
+        w.observe("spatium/a2", 9, 20.0 + i * 30)
+    assert len(w._samples["spatium/a2"]) <= m._RST_WINDOW_S / 30 + 2
+
+
+def _etcd_state(m, watch, failed, now):
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.etcd = {"has_leader": 1, "is_leader": 1, "proposals_failed": failed}
+    st.etcd_failed_recent = watch.observe("etcd", failed, now)
+    return st
+
+
+def test_etcd_counter_nonzero_at_start_is_not_degraded(m):
+    w = m.CounterWatch(m._ETCD_FAIL_WINDOW_S)
+    st = _etcd_state(m, w, 7, 0.0)
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+    m.render_kpi_etcd(st)  # lifetime total renders without error
+
+
+def test_etcd_increase_in_window_degrades_then_clears(m):
+    w = m.CounterWatch(m._ETCD_FAIL_WINDOW_S)
+    _etcd_state(m, w, 7, 0.0)
+    st = _etcd_state(m, w, 8, 60.0)
+    assert m.overall_verdict(st) == ("DEGRADED", "etcd write failures")
+    st = _etcd_state(m, w, 8, 700.0)
+    assert m.overall_verdict(st)[0] == "HEALTHY"
 
 
 # ── 5 s-tier metric parsers (fixtures captured from the live cluster) ──────
