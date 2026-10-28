@@ -697,6 +697,31 @@ def validate_optional_hostname(v: str | None, *, field: str = "hostname") -> str
     return validate_hostname(v, field=field)
 
 
+def host_in_zone_error(hostname: str, zone_name: str, *, field: str = "hostname") -> str | None:
+    """Why an address's host record ``<hostname>.<zone_name>`` cannot be published.
+
+    The IPAM -> DNS publish path's one rule for the full owner name: the
+    253-character limit (``name_in_zone_error``) and the record API's own
+    check-names rule for an A / AAAA owner (``bind_check_names_error``), which
+    walks the zone's labels as well as the host's. A zone named with an
+    underscore label takes TXT / SRV but no host record, and BIND refuses the
+    zone whole if one is written (#2918). The rule holds for the default-gateway
+    placeholder (``gateway``) too: it publishes no forward record, but its PTR
+    names ``gateway.<zone>``, and BIND's check-names refuses a reverse zone
+    whose PTR target is not a host name just as it refuses the forward zone.
+    """
+    err = name_in_zone_error(hostname, zone_name, field=field)
+    if err is not None:
+        return err
+    host = hostname.strip().rstrip(".")
+    zone = zone_name.strip().rstrip(".")
+    if not host or not zone:
+        return None
+    # The owner absolute (root dot): a relative one has the origin appended
+    # again, which the message would then quote doubled.
+    return bind_check_names_error("A", f"{host}.{zone}.", None, origin=zone, check_target=False)
+
+
 def publishable_host_owner_error(hostname: str | None) -> str | None:
     """Why *hostname* cannot be published as a record owner, or None.
 

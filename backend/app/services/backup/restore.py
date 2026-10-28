@@ -94,6 +94,20 @@ CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
 # the dispatcher below routes to psql or pg_restore based on the
 # manifest's ``dump_format`` field.
 SUPPORTED_FORMAT_VERSIONS = {1, 2}
+
+
+def format_version_refusal(fmt_version: object) -> str | None:
+    """Why the restore refuses this ``format_version``, or None. Shared with
+    the manifest preview (#2949) so the console and the restore agree."""
+    if fmt_version in SUPPORTED_FORMAT_VERSIONS:
+        return None
+    return (
+        f"unsupported backup format_version: {fmt_version!r} "
+        f"(this build expects one of {sorted(SUPPORTED_FORMAT_VERSIONS)}). "
+        f"Upgrade SpatiumDDI before restoring this archive."
+    )
+
+
 PRE_RESTORE_DIR = Path("/var/lib/spatiumddi/backups")
 
 # A replay can run a while on a hefty install; same envelope as pg_dump so
@@ -1191,13 +1205,9 @@ async def _apply_backup_restore_inner(
     # Phase 1: parse + validate the archive, fail fast if it's
     # malformed, before taking the destructive safety dump path.
     manifest, db_bytes, dump_format, secrets_enc = extract_archive_members(archive_bytes)
-    fmt_version = manifest.get("format_version")
-    if fmt_version not in SUPPORTED_FORMAT_VERSIONS:
-        raise BackupRestoreError(
-            f"unsupported backup format_version: {fmt_version!r} "
-            f"(this build expects one of {sorted(SUPPORTED_FORMAT_VERSIONS)}). "
-            f"Upgrade SpatiumDDI before restoring this archive."
-        )
+    version_refusal = format_version_refusal(manifest.get("format_version"))
+    if version_refusal is not None:
+        raise BackupRestoreError(version_refusal)
 
     # Phase 2: passphrase verify. Decrypt secrets.enc up front so
     # we fail with "wrong passphrase" before deleting anything.

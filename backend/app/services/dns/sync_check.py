@@ -35,7 +35,7 @@ from sqlalchemy import ColumnElement, String, and_, any_, func, literal, or_, se
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import name_in_zone_error
+from app.core.dns_names import host_in_zone_error
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dns.record_identity import ptr_target_key, zone_target_readings
@@ -1027,7 +1027,7 @@ async def compute_subnet_dns_drift(
             for z in forward_zone_ids_in_order(primary_id, ip.extra_zone_ids)
             if z != primary_id
             and z in extra_zones_by_id
-            and name_in_zone_error(ip.hostname, extra_zones_by_id[z].name.rstrip("."), field="h")
+            and host_in_zone_error(ip.hostname, extra_zones_by_id[z].name.rstrip("."), field="h")
             is None
         ]
         extra_zone_ids = {z.id for z in extra_zones}

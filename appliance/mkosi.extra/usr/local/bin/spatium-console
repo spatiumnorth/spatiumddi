@@ -1299,40 +1299,148 @@ def _age_seconds(iso: str) -> float | None:
     return secs if secs > 0 else 0.0
 
 
-# P0.1 — RST recency/rate verdict. A fresh-install box churns ~5-8
-# restarts during boot (coredns/CNPG/api wait on each other); the old
-# raw ``>5 → bold red`` painted that healthy 25-minute-old box as "eight
-# things on fire". Instead gate red on a RECENT restart: a pod that's
-# restarted >=3 times AND last restarted <5 min ago is genuinely
-# flapping; one that restarted 6× during boot but has been quiet for 25
-# min is amber (worth a glance, not an alarm). >10 lifetime restarts is a
-# red backstop regardless of recency — that many is never benign.
-_RST_RECENT_S = 300.0    # last restart within 5 min → "recent"
-_RST_FLAP_MIN = 3        # restarts at/above this + recent → flapping
-_RST_LIFETIME_RED = 10   # lifetime restarts at/above this → red backstop
+# P0.1 / #2928 — RST verdict from WINDOWED restart deltas. The lifetime
+# ``restartCount`` is monotonic and every node reboot bumps every pod's by
+# one, so a verdict keyed on it (the old >=10 backstop, or ">=3 and last
+# restart <5 min ago") painted a healthy box red for the life of the pod.
+# The console is a long-running process, so it keeps its own baseline
+# (``CounterWatch``) and judges the INCREASE inside a window: >=3 in
+# the window is flapping (red), 1-2 is amber, none is quiet. The first
+# sample is the baseline, so boot churn from before the console started —
+# including a node reboot, which restarts the console too — never counts
+# as flapping. The lifetime total stays visible, dim, in the RST column.
+#
+# The console is NOT always long-lived: systemd restarts it every time an
+# operator logs out of the F1 login (and on any crash), which resets the
+# baseline. So a pod whose LAST restart (``RestartedAt``) is inside the
+# window is floored at 1 — "it restarted at least once in the last 15 min"
+# is a fact the pod status states outright, needing no history. That floor
+# can only ever reach amber, never red (the count before it is unknown), and
+# it ages out with the window, so it cannot pin the way a lifetime count did.
+_RST_WINDOW_S = 900.0    # restart increase is judged over the last 15 min
+_RST_FLAP_MIN = 3        # increase at/above this inside the window → red
+_ETCD_FAIL_WINDOW_S = 600.0  # any etcd proposals_failed increase in 10 min
+# A restart stamped this far in the FUTURE is still treated as just-now
+# (ordinary multi-node clock skew); further than that is ignored, so a node
+# whose clock runs ahead cannot hold the amber floor past the window.
+_RST_SKEW_TOLERANCE_S = 60.0
 
 
-def _rst_verdict(restarts: int, restarted_at: str, k8s_state: str = "") -> str:
-    """Classify a pod's restart history as ``red`` (flapping now /
-    pathological lifetime count / currently broken), ``amber`` (has
-    restarted but quiet), or ``quiet`` (zero restarts). Reused by
+class CounterWatch:
+    """In-memory baseline for monotonic counters, keyed by an arbitrary
+    string, judged on a monotonic clock (injectable for tests) so an NTP
+    step cannot stretch or collapse the window.
+
+    Per key a deque of ``(timestamp, value)`` CHANGE points: an observation
+    equal to the newest stored value is not appended, so memory is bounded
+    by how often the counter moves, not by the refresh cadence. The oldest
+    entry is the baseline — the newest change at/before ``now - window``,
+    or the first sample while the history is shorter than the window (a
+    console up for 2 min judges 2 min).
+
+    ``increase`` is the sum of the positive steps after the baseline. A
+    step DOWN is a counter reset — a StatefulSet pod recreated under the
+    same name restarts its ``restartCount`` at 0; k3s / etcd restarting
+    resets ``proposals_failed`` — and counts as 0: it becomes the new
+    baseline for the steps after it, while increases before it that are
+    still inside the window keep counting. (Subtracting from the first
+    sample instead reads ``8 -> 0 -> 3`` as no increase at all.)
+
+    Keys not observed for longer than the window are forgotten, so a pod
+    that is gone is dropped, but one failed ``cluster_pods`` cycle (which
+    returns ``[]``) does not wipe every baseline."""
+
+    def __init__(self, window_s: float, clock=time.monotonic) -> None:
+        self.window_s = window_s
+        self._clock = clock
+        self._samples: dict[str, deque] = {}
+        self._last_seen: dict[str, float] = {}
+
+    def observe(self, key: str, value: int, now: float | None = None) -> int:
+        """Record ``value`` for ``key`` and return its increase in-window."""
+        if now is None:
+            now = self._clock()
+        self._last_seen[key] = now
+        dq = self._samples.setdefault(key, deque())
+        if not dq or dq[-1][1] != value:
+            dq.append((now, value))
+        cutoff = now - self.window_s
+        # Keep exactly one change point at/before the cutoff: the baseline.
+        while len(dq) > 1 and dq[1][0] <= cutoff:
+            dq.popleft()
+        increase = 0
+        prev = dq[0][1]
+        for _, v in list(dq)[1:]:
+            if v > prev:
+                increase += v - prev
+            prev = v
+        self._forget_stale(cutoff)
+        return increase
+
+    def _forget_stale(self, cutoff: float) -> None:
+        for key in [k for k, t in self._last_seen.items() if t < cutoff]:
+            del self._last_seen[key]
+            self._samples.pop(key, None)
+
+    def keys(self) -> set[str]:
+        return set(self._samples)
+
+
+def _pod_key(row: dict) -> str:
+    return f"{row.get('Namespace') or ''}/{row.get('Names') or ''}"
+
+
+def _restarted_within_window(restarted_at: str) -> bool:
+    """True when the pod's last restart (``RestartedAt``, wall clock from
+    the kubelet) is inside the restart window. Unparseable / blank → False;
+    a timestamp more than ``_RST_SKEW_TOLERANCE_S`` in the future → False."""
+    if not restarted_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(restarted_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    try:
+        age = (datetime.now(ts.tzinfo) - ts).total_seconds()
+    except TypeError:
+        return False
+    return -_RST_SKEW_TOLERANCE_S <= age < _RST_WINDOW_S
+
+
+def stamp_recent_restarts(watch: CounterWatch, rows: list[dict],
+                          now: float | None = None) -> None:
+    """Record each pod's restart count and stamp ``RstRecent`` (the
+    in-window increase, floored at 1 when ``RestartedAt`` is in-window) on
+    its row. A recreated pod with a new name starts a fresh baseline; one
+    recreated under the SAME name reads as a counter reset (see
+    ``CounterWatch``)."""
+    for row in rows:
+        restarts = int(row.get("Restarts") or 0)
+        recent = watch.observe(_pod_key(row), restarts, now)
+        if recent == 0 and restarts > 0 and _restarted_within_window(
+            row.get("RestartedAt") or ""
+        ):
+            recent = 1
+        row["RstRecent"] = recent
+
+
+def _rst_verdict(recent_restarts: int, k8s_state: str = "") -> str:
+    """Classify a pod as ``red`` (flapping in the window / currently
+    broken), ``amber`` (restarted in the window, below the flap floor) or
+    ``quiet``. ``recent_restarts`` is the windowed increase
+    (``row["RstRecent"]``), not the lifetime count. Reused by
     ``render_services`` for the RST column colour and by
     ``overall_verdict`` for the header rollup."""
     # A pod sitting in a broken/waiting state (CrashLoopBackOff …) is red
-    # regardless of timestamp: ``RestartedAt`` is only populated once a
-    # restarted container is RUNNING again, so a pod stuck waiting would
-    # otherwise under-colour to amber. (Empty ``k8s_state`` never matches.)
+    # regardless of the counters: a pod stuck waiting has few observed
+    # increases. (Empty ``k8s_state`` never matches.)
     if k8s_state in _POD_RED_STATES:
         return "red"
-    if restarts <= 0:
-        return "quiet"
-    if restarts >= _RST_LIFETIME_RED:
+    if recent_restarts >= _RST_FLAP_MIN:
         return "red"
-    age = _age_seconds(restarted_at)
-    recent = age is not None and age < _RST_RECENT_S
-    if restarts >= _RST_FLAP_MIN and recent:
-        return "red"
-    return "amber"
+    if recent_restarts > 0:
+        return "amber"
+    return "quiet"
 
 
 # P0.2 — STATE column composer. The column is 16 chars wide
@@ -2433,10 +2541,7 @@ def _pod_sort_priority(row: dict) -> int:
     state = row.get("K8sState") or ""
     if (
         state in _POD_RED_STATES
-        or _rst_verdict(
-            int(row.get("Restarts") or 0), row.get("RestartedAt") or "", state
-        )
-        == "red"
+        or _rst_verdict(int(row.get("RstRecent") or 0), state) == "red"
     ):
         return 0
     if state in _POD_PENDING_STATES:
@@ -2607,10 +2712,9 @@ def overall_verdict(
     # concern. Name it (short name) so the chip is actionable.
     for row in visible_pods(state.ps_rows):
         k8s_state = row.get("K8sState") or ""
-        restarts = int(row.get("Restarts") or 0)
         if k8s_state in _POD_RED_STATES:
             return ("CRITICAL", f"{_short_pod_name(row.get('Names') or '')} {k8s_state}")
-        if _rst_verdict(restarts, row.get("RestartedAt") or "") == "red":
+        if _rst_verdict(int(row.get("RstRecent") or 0)) == "red":
             return ("CRITICAL", f"{_short_pod_name(row.get('Names') or '')} flapping")
     failing = list(hh.get("failing") or [])  # type: ignore[arg-type]
     if failing:
@@ -2645,8 +2749,10 @@ def overall_verdict(
     retrying = list(hh.get("retrying") or [])  # type: ignore[arg-type]
     if retrying:
         return ("DEGRADED", f"host config retrying: {retrying[0]}")
-    # Phase 2 INC 3 — etcd write failures (any node count).
-    if int(state.etcd.get("proposals_failed", 0) or 0) > 0:
+    # Phase 2 INC 3 / #2928 — etcd write failures (any node count). The
+    # counter is lifetime-monotonic, so only an INCREASE inside the window
+    # counts (the first sample is the baseline).
+    if state.etcd_failed_recent > 0:
         return ("DEGRADED", "etcd write failures")
     # Phase 2 INC 4 — /health/ready reports db/schema/redis. Only fires when
     # the fetch actually returned a non-ok status (empty dict = no api_ip /
@@ -3154,15 +3260,15 @@ def render_services(
             rn, rm = 0, 0
         ready_style = "dim" if (rm and rn >= rm) else "yellow"
 
-        # RESTARTS — P0.1 recency/rate gate (see ``_rst_verdict``):
-        # dim at 0, amber when restarted-but-quiet, bold red only when
-        # flapping NOW (>=3 restarts, last one <5 min ago) or past the
-        # >10 lifetime backstop. Kills the fresh-install "everything's
-        # red" false alarm.
+        # RESTARTS — #2928 windowed gate (see ``_rst_verdict``): the number
+        # shown is the lifetime total, coloured by the INCREASE in the
+        # last 15 min — dim when none, amber for 1-2, bold red for >=3.
         restarts = int(row.get("Restarts") or 0)
         restarted_at = row.get("RestartedAt") or ""
         rst_text = str(restarts) if restarts else "·"
-        rst_verdict = _rst_verdict(restarts, restarted_at, row.get("K8sState") or "")
+        rst_verdict = _rst_verdict(
+            int(row.get("RstRecent") or 0), row.get("K8sState") or ""
+        )
         rst_style = (
             "dim" if rst_verdict == "quiet"
             else "bold red" if rst_verdict == "red"
@@ -4183,8 +4289,9 @@ def render_kpi_etcd(state: "DashboardState") -> Panel:
     e = state.etcd
     has_leader = e.get("has_leader", 0) == 1
     prop_fail = int(e.get("proposals_failed", 0) or 0)
+    recent_fail = state.etcd_failed_recent
     db = float(e.get("db_in_use", 0) or 0)
-    border = "green" if (has_leader and prop_fail == 0) else "bold red"
+    border = "green" if (has_leader and recent_fail == 0) else "bold red"
     row1 = Text()
     row1.append("leader ", style="dim")
     row1.append("●", style="green") if has_leader else row1.append("NO LEADER", style="bold red")
@@ -4193,7 +4300,8 @@ def render_kpi_etcd(state: "DashboardState") -> Panel:
     row2.append_text(_heat_bar(db, 2 * 2**30, 6))
     row3 = Text()
     row3.append("prop-fail ", style="dim")
-    row3.append(str(prop_fail), style="green" if prop_fail == 0 else "bold red")
+    # Lifetime total stays visible (dim); only a recent increase alarms.
+    row3.append(str(prop_fail), style="bold red" if recent_fail else "dim")
     return _kpi_box("[bold]etcd[/bold]", [row1, row2, row3], border)
 
 
@@ -4608,6 +4716,12 @@ class DashboardState:
         # INC 3 (etcd) + INC 4 (api/cnpg/node-parse) populate them. Adding
         # the fields now keeps the INC 2 placeholder boxes AttributeError-free.
         self.etcd: dict = {}
+        # #2928 — windowed baselines so lifetime counters don't pin the
+        # verdict. Pod restarts are stamped onto each ps_row as
+        # ``RstRecent``; etcd's is ``etcd_failed_recent``.
+        self.restart_watch = CounterWatch(_RST_WINDOW_S)
+        self.etcd_watch = CounterWatch(_ETCD_FAIL_WINDOW_S)
+        self.etcd_failed_recent: int = 0
         self.cnpg: dict = {}
         self.api_ready: dict = {}
         self.api_ip: str | None = None
@@ -4705,11 +4819,16 @@ class DashboardState:
                     else None
                 )
                 self.ps_rows = f_pods.result()
+                stamp_recent_restarts(self.restart_watch, self.ps_rows)
                 self.nodes = f_nodes.result()
                 _summary = f_summary.result()
                 _svc = f_svc.result()
                 self.k3s_state = f_k3s.result()
                 self.etcd = f_etcd.result() or self.etcd
+                if "proposals_failed" in self.etcd:
+                    self.etcd_failed_recent = self.etcd_watch.observe(
+                        "etcd", int(self.etcd["proposals_failed"] or 0)
+                    )
                 self.cp_reachable = f_cp.result() if f_cp else None
             self._set_node_pct(node_stats_from_summary(_summary))
             # INC 9 — cluster-wide Top-pods on a multi-node cluster; a
@@ -5618,11 +5737,15 @@ def _render_health_screen(
         reason = r.get("LastExitReason") or ""
         code = r.get("LastExitCode")
         le = (reason + (f" ({code})" if code not in (None, "") else "")) or "—"
-        ststyle = "bold red" if st8 in _POD_RED_STATES else ("yellow" if rc else "dim")
+        # #2928 — colour by the WINDOWED increase, like the Pods panel: the
+        # lifetime count is listed (dim when quiet) but never alarms alone.
+        rv = _rst_verdict(int(r.get("RstRecent") or 0), st8)
+        rst_style = "bold red" if rv == "red" else ("yellow" if rv == "amber" else "dim")
+        ststyle = "bold red" if st8 in _POD_RED_STATES else rst_style
         pods_tbl.add_row(
             Text(_short_pod_name(r.get("Names") or "")[:30]),
             Text(st8, style=ststyle),
-            Text(str(rc), style="yellow" if rc else "dim"),
+            Text(str(rc), style=rst_style),
             Text(le, style="dim"),
         )
     console.print(Panel(

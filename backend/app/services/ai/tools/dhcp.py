@@ -999,10 +999,13 @@ class FindDHCPServerStatsArgs(BaseModel):
         "window. Use for 'how busy is server X?' and 'is server X dropping "
         "packets?'. socket_drop counts packets the kernel dropped before the "
         "server could read them (its receive buffer filled — the node is "
-        "short of CPU); receive_drop counts packets the server read and then "
-        "discarded. Either may be null, meaning the agent did not measure it "
-        "(too old, or cannot read /proc/net/udp) — null is NOT zero, and must "
-        "not be reported as 'no packets were dropped'."
+        "short of CPU); queue_evicted counts DHCPv4 requests the server read "
+        "and then discarded from its full packet queue during a burst, which "
+        "no server-side counter records; receive_drop counts packets the "
+        "server read and then discarded. Any may be null, meaning the agent "
+        "did not measure it (too old, no raw-socket capability, a v6-only "
+        "server) — null is NOT zero, and must not be reported as 'no packets "
+        "were dropped'."
     ),
     args_model=FindDHCPServerStatsArgs,
     category="dhcp",
@@ -1049,6 +1052,7 @@ async def find_dhcp_server_stats(
                 # null rather than as a zero it would summarise as healthy.
                 func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
                 func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+                func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
             )
             .where(DHCPMetricSample.server_id == sid)
             .where(DHCPMetricSample.bucket_at >= since)
@@ -1081,13 +1085,22 @@ async def find_dhcp_server_stats(
             "socket_drop": (
                 None if totals_row.socket_drop is None else int(totals_row.socket_drop)
             ),
+            # #2889 — its own null: measured independently of socket_drop
+            # (it needs a raw socket and a kea-dhcp4), so ``measured`` above
+            # does not vouch for it.
+            "queue_evicted": (
+                None if totals_row.queue_evicted is None else int(totals_row.queue_evicted)
+            ),
             "receive_drop": (
                 None if totals_row.receive_drop is None else int(totals_row.receive_drop)
             ),
             "measured": totals_row.socket_drop is not None,
             "note": (
-                "socket_drop is lost traffic; receive_drop also counts deliberate "
-                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a fault"
+                "socket_drop and queue_evicted are lost traffic (the kernel "
+                "dropped it before the server read it; the server read it and "
+                "its full queue evicted it). receive_drop also counts deliberate "
+                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a "
+                "fault"
             ),
         },
     }

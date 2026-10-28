@@ -25,25 +25,34 @@ describe("bucketLoss", () => {
 
 describe("summariseLoss", () => {
   it("an empty window is not measured", () => {
-    expect(summariseLoss([])).toEqual({ measured: false, total: 0 });
+    expect(summariseLoss([])).toEqual({
+      measured: false,
+      total: 0,
+      evicted: 0,
+      evictionMeasured: false,
+    });
   });
 
   it("all-unmeasured is not measured", () => {
-    expect(summariseLoss([{}, { socket_drop: null }])).toEqual({
+    expect(summariseLoss([{}, { socket_drop: null }])).toMatchObject({
       measured: false,
       total: 0,
     });
   });
 
   it("measured zero is measured — a clean bill, not an absent one", () => {
-    expect(summariseLoss([{ socket_drop: 0 }, { socket_drop: 0 }])).toEqual({
+    expect(
+      summariseLoss([{ socket_drop: 0 }, { socket_drop: 0 }]),
+    ).toMatchObject({
       measured: true,
       total: 0,
     });
   });
 
   it("sums measured buckets", () => {
-    expect(summariseLoss([{ socket_drop: 3 }, { socket_drop: 4 }])).toEqual({
+    expect(
+      summariseLoss([{ socket_drop: 3 }, { socket_drop: 4 }]),
+    ).toMatchObject({
       measured: true,
       total: 7,
     });
@@ -51,8 +60,44 @@ describe("summariseLoss", () => {
 
   it("a partly-measured window reports what it knows", () => {
     // One agent restart mid-window must not hide the loss either side of it.
-    expect(summariseLoss([{ socket_drop: 5 }, {}, { socket_drop: 2 }])).toEqual(
-      { measured: true, total: 7 },
-    );
+    expect(
+      summariseLoss([{ socket_drop: 5 }, {}, { socket_drop: 2 }]),
+    ).toMatchObject({ measured: true, total: 7 });
+  });
+});
+
+describe("#2889 queue_evicted", () => {
+  it("adds queue evictions to kernel drops", () => {
+    expect(bucketLoss({ socket_drop: 3, queue_evicted: 40 })).toBe(43);
+  });
+
+  it("an unmeasured eviction adds nothing and voids nothing", () => {
+    // A server without a raw socket still measures its kernel drops.
+    expect(bucketLoss({ socket_drop: 3, queue_evicted: null })).toBe(3);
+    expect(bucketLoss({ socket_drop: 3 })).toBe(3);
+  });
+
+  it("evictions alone are a measurement", () => {
+    expect(bucketLoss({ socket_drop: null, queue_evicted: 0 })).toBe(0);
+  });
+
+  it("summarises the evicted share and whether it was measured", () => {
+    expect(
+      summariseLoss([
+        { socket_drop: 1, queue_evicted: 10 },
+        { socket_drop: 0, queue_evicted: null },
+      ]),
+    ).toEqual({
+      measured: true,
+      total: 11,
+      evicted: 10,
+      evictionMeasured: true,
+    });
+    expect(summariseLoss([{ socket_drop: 2 }])).toEqual({
+      measured: true,
+      total: 2,
+      evicted: 0,
+      evictionMeasured: false,
+    });
   });
 });
