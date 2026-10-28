@@ -40,6 +40,7 @@ from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dns.record_identity import ptr_target_key, zone_target_readings
 from app.services.integration_ownership import dns_record_owned_elsewhere
+from app.services.ipam.zone_binding import stored_uuid_list, stored_zone_uuid
 
 logger = structlog.get_logger(__name__)
 
@@ -124,13 +125,13 @@ async def _effective_dns(db: AsyncSession, subnet: Subnet) -> tuple[list[str], u
     that was previously pinned on it. Don't bypass this helper.
     """
     if not subnet.dns_inherit_settings:
-        zone_id = uuid.UUID(subnet.dns_zone_id) if subnet.dns_zone_id else None
+        zone_id = stored_zone_uuid(subnet.dns_zone_id)
         return (list(subnet.dns_group_ids or []), zone_id)
 
     current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
     while current is not None:
         if not current.dns_inherit_settings:
-            zone_id = uuid.UUID(current.dns_zone_id) if current.dns_zone_id else None
+            zone_id = stored_zone_uuid(current.dns_zone_id)
             return (list(current.dns_group_ids or []), zone_id)
         if current.parent_block_id:
             current = await db.get(IPBlock, current.parent_block_id)
@@ -138,7 +139,7 @@ async def _effective_dns(db: AsyncSession, subnet: Subnet) -> tuple[list[str], u
             space = await db.get(IPSpace, current.space_id)
             if space is None:
                 break
-            zone_id = uuid.UUID(space.dns_zone_id) if space.dns_zone_id else None
+            zone_id = stored_zone_uuid(space.dns_zone_id)
             return (list(space.dns_group_ids or []), zone_id)
     return ([], None)
 
@@ -236,7 +237,9 @@ def reverse_zone_network(name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Net
     labels = name.lower().rstrip(".").split(".")
     if labels[-2:] == ["in-addr", "arpa"]:
         octets = labels[:-2][::-1]
-        if not 1 <= len(octets) <= 3 or not all(o.isdigit() and int(o) <= 255 for o in octets):
+        if not 1 <= len(octets) <= 3 or not all(
+            o.isascii() and o.isdigit() and int(o) <= 255 for o in octets
+        ):
             return None
         addr = ".".join(octets + ["0"] * (4 - len(octets)))
         return ipaddress.ip_network(f"{addr}/{8 * len(octets)}")
@@ -387,11 +390,14 @@ async def load_reverse_candidates(
     ).scalars()
     for z in linked:
         out[z.id] = ReverseCandidate(z, subnet.space_id, subnet.network, False)
-    if group_ids:
+    # A stored entry that is not a UUID names no group (#2923): skip it
+    # rather than hand the database a value it cannot compare to a uuid.
+    valid_group_ids = stored_uuid_list(group_ids)
+    if valid_group_ids:
         rows = await db.execute(
             select(DNSZone, Subnet.space_id, Subnet.network)
             .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
-            .where(DNSZone.group_id.in_(group_ids), reverse_owner_candidates())
+            .where(DNSZone.group_id.in_(valid_group_ids), reverse_owner_candidates())
         )
         for z, space_id, network in rows.all():
             out[z.id] = ReverseCandidate(z, space_id, network, True)

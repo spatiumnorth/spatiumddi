@@ -521,7 +521,11 @@ def bind_check_names_error(
         target = tokens[-1]
     elif rtype in BIND_SERVICE_BINDING_TYPES:
         # ServiceMode only: an AliasMode (priority 0) target is not checked.
-        if len(tokens) < 2 or not tokens[0].isdigit() or int(tokens[0]) == 0:
+        if (
+            len(tokens) < 2
+            or not (tokens[0].isascii() and tokens[0].isdigit())
+            or int(tokens[0]) == 0
+        ):
             return None
         target = tokens[1]
     elif rtype == "PTR" and _is_reverse_mapping(_zone_absolute(owner, origin)):

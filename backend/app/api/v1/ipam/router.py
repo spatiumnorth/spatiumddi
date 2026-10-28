@@ -109,6 +109,12 @@ from app.services.ipam.hygiene import (
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
+from app.services.ipam.zone_binding import (
+    check_group_uuid_list,
+    check_zone_uuid,
+    check_zone_uuid_list,
+    stored_zone_uuid,
+)
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
@@ -495,7 +501,7 @@ async def _resolve_effective_dns(
     """
     # Subnet override wins if inherit is off.
     if not subnet.dns_inherit_settings:
-        zone_id = uuid.UUID(subnet.dns_zone_id) if subnet.dns_zone_id else None
+        zone_id = stored_zone_uuid(subnet.dns_zone_id)
         return (
             list(subnet.dns_group_ids or []),
             zone_id,
@@ -505,7 +511,7 @@ async def _resolve_effective_dns(
     current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
     while current is not None:
         if not current.dns_inherit_settings:
-            zone_id = uuid.UUID(current.dns_zone_id) if current.dns_zone_id else None
+            zone_id = stored_zone_uuid(current.dns_zone_id)
             return (
                 list(current.dns_group_ids or []),
                 zone_id,
@@ -519,7 +525,7 @@ async def _resolve_effective_dns(
             space = await db.get(IPSpace, current.space_id)
             if space is None:
                 break
-            zone_id = uuid.UUID(space.dns_zone_id) if space.dns_zone_id else None
+            zone_id = stored_zone_uuid(space.dns_zone_id)
             return (
                 list(space.dns_group_ids or []),
                 zone_id,
@@ -3315,30 +3321,6 @@ def _validate_ddns_policy_optional(v: str | None) -> str | None:
     return v
 
 
-def _check_zone_uuid(v: str | None, *, blank: str | None = None) -> str | None:
-    """Shared ``dns_zone_id`` rule for every IPAM body (#2923): the text
-    binding must be the UUID of a DNS zone. ``""`` is returned as ``blank``
-    (``None`` on the container creates, ``""`` where it means "no DNS record").
-    """
-    if v is None:
-        return None
-    if v == "":
-        return blank
-    try:
-        return str(uuid.UUID(str(v)))
-    except ValueError as exc:
-        raise ValueError("dns_zone_id must be the UUID of a DNS zone") from exc
-
-
-def _check_zone_uuid_list(v: list[str] | None, *, field: str) -> list[str] | None:
-    for item in v or []:
-        try:
-            uuid.UUID(str(item))
-        except ValueError as exc:
-            raise ValueError(f"{field} entries must be UUIDs of DNS zones") from exc
-    return v
-
-
 class IPSpaceCreate(BaseModel):
     name: str
     description: str = ""
@@ -3391,12 +3373,17 @@ class IPSpaceCreate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank=None)
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("dns_additional_zone_ids")
     @classmethod
     def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="dns_additional_zone_ids")
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPSpaceUpdate(BaseModel):
@@ -3439,12 +3426,17 @@ class IPSpaceUpdate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank=None)
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("dns_additional_zone_ids")
     @classmethod
     def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="dns_additional_zone_ids")
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPSpaceResponse(BaseModel):
@@ -3539,12 +3531,17 @@ class IPBlockCreate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank=None)
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("dns_additional_zone_ids")
     @classmethod
     def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="dns_additional_zone_ids")
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPBlockUpdate(BaseModel):
@@ -3580,12 +3577,17 @@ class IPBlockUpdate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank=None)
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("dns_additional_zone_ids")
     @classmethod
     def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="dns_additional_zone_ids")
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPBlockResponse(BaseModel):
@@ -3731,12 +3733,7 @@ class SubnetCreate(BaseModel):
         # The binding is stored as text but must name a zone: a body that
         # sends garbage here used to be accepted because the field was
         # dropped on the floor (spatiumddi#1066); now it is refused.
-        if v is None or v == "":
-            return None
-        try:
-            return str(uuid.UUID(str(v)))
-        except ValueError as exc:
-            raise ValueError("dns_zone_id must be the UUID of a DNS zone") from exc
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("subnet_role")
     @classmethod
@@ -3826,7 +3823,12 @@ class SubnetCreate(BaseModel):
     @field_validator("dns_additional_zone_ids")
     @classmethod
     def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="dns_additional_zone_ids")
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class SubnetUpdate(BaseModel):
@@ -3962,12 +3964,17 @@ class SubnetUpdate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank=None)
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("dns_additional_zone_ids")
     @classmethod
     def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="dns_additional_zone_ids")
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class SubnetVLANRef(BaseModel):
@@ -4307,12 +4314,12 @@ class IPAddressCreate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank="")
+        return check_zone_uuid(v, blank="")
 
     @field_validator("extra_zone_ids")
     @classmethod
     def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="extra_zone_ids")
+        return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
 class IPAddressUpdate(BaseModel):
@@ -4372,12 +4379,12 @@ class IPAddressUpdate(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank="")
+        return check_zone_uuid(v, blank="")
 
     @field_validator("extra_zone_ids")
     @classmethod
     def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="extra_zone_ids")
+        return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
 class IPAddressResponse(BaseModel):
@@ -4553,17 +4560,18 @@ class NextIPRequest(BaseModel):
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
-    # ── IP Spaces ──────────────────────────────────────────────────────────────────
-
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank="")
+        return check_zone_uuid(v, blank="")
 
     @field_validator("extra_zone_ids")
     @classmethod
     def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
-        return _check_zone_uuid_list(v, field="extra_zone_ids")
+        return check_zone_uuid_list(v, field="extra_zone_ids")
+
+
+# ── IP Spaces ──────────────────────────────────────────────────────────────────
 
 
 @router.get("/spaces", response_model=list[IPSpaceResponse])
@@ -10753,7 +10761,7 @@ class BulkAllocateRequest(BaseModel):
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
-        return _check_zone_uuid(v, blank="")
+        return check_zone_uuid(v, blank="")
 
 
 class BulkAllocatePreviewResponse(BaseModel):
