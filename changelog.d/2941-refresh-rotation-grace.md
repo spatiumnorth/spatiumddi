@@ -17,6 +17,15 @@
   and the old access token alike. A password change made from a tab
   whose token is inside the window now keeps that tab's current session
   instead of revoking it.
+- **A sign-out, password change or force-logout can no longer be raced by
+  a refresh (#2941).** A revocation that ran while a refresh was rotating
+  one of the account's sessions waited for that refresh and then missed the
+  session it had just created, which stayed signed in. Revocations now lock
+  the account's sessions first, so the new session is revoked with the rest.
+  A force-logout from the session viewer on a row a refresh had rotated
+  since the list was loaded used to do nothing; it now follows the rotation
+  and revokes the session the browser is actually using. The viewer also
+  marks the caller's own session ("this session"), which it had never done.
 
 ### Migrations
 

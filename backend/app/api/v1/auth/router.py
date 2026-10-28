@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from jose import JWTError
 from jose import jwt as jose_jwt
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
@@ -70,14 +70,18 @@ from app.core.security import (
     create_access_token,
     create_mfa_challenge_token,
     create_refresh_token,
-    decode_access_token,
     decode_mfa_challenge_token,
     hash_password,
     hash_refresh_token,
     verify_password,
 )
 from app.core.session_idle import get_session_timeout_minutes, is_idle_expired, last_activity
-from app.core.session_rotation import resolve_live_session_id, rotation_successor
+from app.core.session_rotation import (
+    request_session_jti,
+    resolve_live_session_id,
+    revoke_live_sessions,
+    rotation_successor,
+)
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.auth_provider import PASSWORD_PROVIDER_TYPES, AuthProvider
@@ -1006,16 +1010,7 @@ def _current_session_jti(request: Request) -> str | None:
     (including a token with no ``jti``, #1222) — in which case we simply
     revoke every session, which is the safe direction (the caller just has
     to log in again)."""
-    header = request.headers.get("authorization") or ""
-    scheme, _, raw = header.partition(" ")
-    if scheme.lower() != "bearer" or not raw:
-        return None
-    try:
-        payload = decode_access_token(raw)
-    except JWTError:
-        return None
-    jti = payload.get("jti")
-    return str(jti) if jti is not None else None
+    return request_session_jti(request)
 
 
 @router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
@@ -1079,12 +1074,10 @@ async def change_password(
     current_jti = await resolve_live_session_id(
         db, _current_session_jti(request), datetime.now(UTC)
     )
-    revoke_stmt = update(UserSession).where(
-        UserSession.user_id == current_user.id, UserSession.revoked.is_(False)
-    )
+    revoke_where = [UserSession.user_id == current_user.id]
     if current_jti is not None:
-        revoke_stmt = revoke_stmt.where(UserSession.id != current_jti)
-    await db.execute(revoke_stmt.values(revoked=True))
+        revoke_where.append(UserSession.id != current_jti)
+    await revoke_live_sessions(db, *revoke_where)
 
     audit = AuditLog(
         user_id=current_user.id,
@@ -1108,11 +1101,7 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
     _clear_refresh_cookie(response)
     # #1354 — signing out abandons a started MFA enrolment.
     enrolment_dropped = clear_pending_enrolment(current_user)
-    await db.execute(
-        update(UserSession)
-        .where(UserSession.user_id == current_user.id, UserSession.revoked.is_(False))
-        .values(revoked=True)
-    )
+    await revoke_live_sessions(db, UserSession.user_id == current_user.id)
     audit = AuditLog(
         user_id=current_user.id,
         user_display_name=current_user.display_name,

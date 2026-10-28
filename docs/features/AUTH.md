@@ -54,6 +54,27 @@ SpatiumDDI's auth stack has three layers:
   from the session viewer, a password change or disabling the account
   revokes the live session, which ends the old cookie and the old access
   token at once, with no grace.
+  - **The window is anchored to the rotation.** A refresh inside the window
+    does not rotate again, so it never moves `rotated_at`; replaying the old
+    cookie over and over cannot stretch the 10 seconds. The successor's own
+    absolute expiry and idle timeout are checked on every grace answer, and
+    a grace refresh does not count as activity.
+  - **What a captured cookie is worth.** A refresh cookie captured from a
+    rotated session and replayed inside those 10 seconds is answered like
+    the browser it came from: with an ordinary 15-minute access token for
+    the successor session. That is the trade the window makes, and why it
+    is 10 seconds rather than the minute some identity providers allow:
+    long enough for a concurrent refresh, and requests already in flight
+    with the old access token, to land; short enough that a cookie copied
+    out of a rotated session is useless almost at once. Revoking the
+    successor (logout, force-logout, a password change) ends that access
+    token too, since it names the successor.
+  - **Revocation cannot be raced by a rotation.** The bulk revocations lock
+    the account's live sessions before revoking them, so a refresh rotating
+    one at the same moment either finishes first (and its successor is
+    revoked with the rest) or waits and is refused. A force-logout from the
+    session viewer follows a row that was rotated after the list was
+    fetched to its live successor, and revokes that.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 

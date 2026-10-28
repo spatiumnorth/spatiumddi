@@ -401,3 +401,256 @@ async def test_rotation_successor_honours_the_clock(
     assert await rotation_successor(db_session, a, a.rotated_at - timedelta(seconds=1)) is None
     # A live row stands for itself.
     assert (await rotation_successor(db_session, b, edge)).id == b.id
+
+
+# ── every other revocation path, and the grace never outliving one ─────────
+
+
+async def test_admin_password_reset_ends_the_rotated_session_at_once(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    user, cookie_a, token_a, cookie_b, token_b = await _rotated(client, db_session)
+    admin = await _user(db_session, is_superadmin=True)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/users/{user.id}/reset-password",
+        json={"new_password": "AdminSetPass1!"},
+        headers=_bearer(admin),
+    )
+    assert r.status_code == 204, r.text
+    await _assert_all_dead(client, cookie_a, token_a, cookie_b, token_b)
+
+
+async def test_provider_link_ends_the_rotated_session_at_once(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from tests.test_external_user_sync import _group, _provider
+
+    user, cookie_a, token_a, cookie_b, token_b = await _rotated(client, db_session)
+    provider = await _provider(db_session, await _group(db_session))
+    await db_session.execute(
+        update(User).where(User.id == user.id).values(auth_source="ldap", external_id="CN=x")
+    )
+    admin = await _user(db_session, is_superadmin=True)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/users/{user.id}/link-provider",
+        json={"auth_provider_id": str(provider.id)},
+        headers=_bearer(admin),
+    )
+    assert r.status_code == 200, r.text
+    await _assert_all_dead(client, cookie_a, token_a, cookie_b, token_b)
+
+
+async def test_deleting_the_user_ends_the_rotated_session_at_once(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    user, cookie_a, token_a, cookie_b, token_b = await _rotated(client, db_session)
+    admin = await _user(db_session, is_superadmin=True)
+    await db_session.commit()
+    r = await client.delete(f"/api/v1/users/{user.id}", headers=_bearer(admin))
+    assert r.status_code == 204, r.text
+    await _assert_all_dead(client, cookie_a, token_a, cookie_b, token_b)
+
+
+async def test_force_logout_of_the_rotated_row_revokes_its_successor(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The viewer listed A live; a tab rotated it to B before the operator
+    clicked Revoke on A. Revoking A alone would change nothing (it is
+    already revoked) and leave B live, with A's cookie graced into it."""
+    _u, cookie_a, token_a, cookie_b, token_b = await _rotated(client, db_session)
+    admin = await _user(db_session, is_superadmin=True)
+    await db_session.commit()
+    a = await _row(db_session, cookie_a)
+    r = await client.delete(f"/api/v1/sessions/{a.id}", headers=_bearer(admin))
+    assert r.status_code == 204, r.text
+    await _assert_all_dead(client, cookie_a, token_a, cookie_b, token_b)
+
+
+async def test_force_logout_follows_a_stale_row_past_its_window(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A list fetched minutes ago: the chain is followed however old it is."""
+    _u, cookie_a, _ta, cookie_b, _tb = await _rotated(client, db_session)
+    r = await _refresh_with(client, cookie_b)
+    assert r.status_code == 200
+    token_c = r.json()["access_token"]
+    await _backdate_rotation(db_session, cookie_a)
+    await _backdate_rotation(db_session, cookie_b)
+    admin = await _user(db_session, is_superadmin=True)
+    await db_session.commit()
+    a = await _row(db_session, cookie_a)
+    r = await client.delete(f"/api/v1/sessions/{a.id}", headers=_bearer(admin))
+    assert r.status_code == 204, r.text
+    assert await _me(client, token_c) == 401
+
+
+async def test_force_logout_of_a_logged_out_chain_is_a_no_op(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    user, cookie_a, _ta, _cb, token_b = await _rotated(client, db_session)
+    r = await client.post("/api/v1/auth/logout", headers={"Authorization": f"Bearer {token_b}"})
+    assert r.status_code == 204
+    other_token, _oc = await _login(client, user)
+    a = await _row(db_session, cookie_a)
+    r = await client.delete(f"/api/v1/sessions/{a.id}", headers=_bearer(user))
+    assert r.status_code == 204, r.text
+    # Nothing else of the user's was touched.
+    assert await _me(client, other_token) == 200
+
+
+async def test_repeated_replay_never_extends_the_window(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    user, cookie_a, token_a, _cb, _tb = await _rotated(client, db_session)
+    rotated_at = (await _row(db_session, cookie_a)).rotated_at
+    for _ in range(5):
+        r = await _refresh_with(client, cookie_a)
+        assert r.status_code == 200, r.text
+        assert not _sets_refresh_cookie(r)
+    assert (await _row(db_session, cookie_a)).rotated_at == rotated_at
+    assert await _session_count(db_session, user) == 2
+
+    await _backdate_rotation(db_session, cookie_a)
+    assert (await _refresh_with(client, cookie_a)).status_code == 401
+    assert await _me(client, token_a) == 401
+
+
+async def test_grace_does_not_revive_an_expired_successor(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _u, cookie_a, token_a, cookie_b, _tb = await _rotated(client, db_session)
+    await db_session.execute(
+        update(UserSession)
+        .where(UserSession.refresh_token_hash == hash_refresh_token(cookie_b))
+        .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await db_session.commit()
+    assert (await _refresh_with(client, cookie_a)).status_code == 401
+    assert await _me(client, token_a) == 401
+
+
+async def test_grace_does_not_revive_an_idle_successor(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.core import session_idle
+    from app.models.settings import PlatformSettings
+
+    _u, cookie_a, token_a, cookie_b, _tb = await _rotated(client, db_session)
+    long_ago = datetime.now(UTC) - timedelta(hours=2)
+    await db_session.execute(
+        update(UserSession)
+        .where(UserSession.refresh_token_hash == hash_refresh_token(cookie_b))
+        .values(last_seen_at=long_ago, created_at=long_ago)
+    )
+    await db_session.execute(
+        update(PlatformSettings).where(PlatformSettings.id == 1).values(session_timeout_minutes=15)
+    )
+    await db_session.commit()
+    session_idle._cache_loaded_at = 0.0
+    try:
+        assert (await _refresh_with(client, cookie_a)).status_code == 401
+        assert await _me(client, token_a) == 401
+        # And the grace answer did not count as activity on the successor.
+        assert (await _row(db_session, cookie_b)).last_seen_at == long_ago
+    finally:
+        session_idle._cache_loaded_at = 0.0
+
+
+async def test_the_viewer_marks_the_successor_as_the_callers_session(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _u, _ca, token_a, cookie_b, _tb = await _rotated(client, db_session)
+    b = await _row(db_session, cookie_b)
+    r = await client.get("/api/v1/sessions/me", headers={"Authorization": f"Bearer {token_a}"})
+    assert r.status_code == 200, r.text
+    current = [row["id"] for row in r.json() if row["is_current"]]
+    assert current == [str(b.id)]
+
+
+# ── a revocation racing a rotation ─────────────────────────────────────────
+
+
+async def test_logout_racing_a_rotation_revokes_the_successor(
+    db_session: AsyncSession,
+) -> None:
+    """A refresh has locked A, inserted its successor S and not yet
+    committed when logout runs. A single UPDATE would wait on A, find it
+    revoked once the refresh commits, and never see S (its snapshot
+    predates S), leaving S live and A's cookie graced into it."""
+
+    async def own_session() -> AsyncGenerator[AsyncSession, None]:
+        async with _TestSessionLocal() as s:
+            yield s
+
+    await _ensure_settings(db_session)
+    user = await _user(db_session, password=_PASSWORD)
+    await db_session.commit()
+
+    app.dependency_overrides[get_db] = own_session
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as tab:
+            _token_a, cookie_a = await _login(tab, user)
+            other_token, _oc = await _login(tab, user)
+
+            async with _TestSessionLocal() as refresh:
+                a = (
+                    await refresh.execute(
+                        select(UserSession)
+                        .where(UserSession.refresh_token_hash == hash_refresh_token(cookie_a))
+                        .with_for_update()
+                    )
+                ).scalar_one()
+                _raw, s_hash = create_refresh_token(str(user.id))
+                s = UserSession(
+                    user_id=user.id,
+                    refresh_token_hash=s_hash,
+                    created_at=a.created_at,
+                    expires_at=a.expires_at,
+                )
+                refresh.add(s)
+                await refresh.flush()
+                a.revoked = True
+                a.rotated_at = datetime.now(UTC)
+                a.rotated_to_id = s.id
+                await refresh.flush()
+                s_id = s.id
+
+                task = asyncio.create_task(
+                    tab.post(
+                        "/api/v1/auth/logout",
+                        headers={"Authorization": f"Bearer {other_token}"},
+                    )
+                )
+                for _ in range(400):
+                    async with _TestSessionLocal() as probe:
+                        waiting = (
+                            await probe.execute(
+                                text(
+                                    "SELECT count(*) FROM pg_stat_activity "
+                                    "WHERE wait_event_type = 'Lock' "
+                                    "AND datname = current_database()"
+                                )
+                            )
+                        ).scalar_one()
+                    if waiting >= 1:
+                        break
+                    await asyncio.sleep(0.025)
+                else:  # pragma: no cover — a hang, not the bug under test
+                    raise AssertionError("logout never queued on the rotating row")
+                await refresh.commit()
+            r = await task
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 204, r.text
+    s_row = (
+        await db_session.execute(
+            select(UserSession)
+            .where(UserSession.id == s_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert s_row.revoked is True
