@@ -111,6 +111,12 @@ class Operation:
     # inline too. ``tests/test_operation_permission_declared.py`` fails for any
     # operation that sets neither.
     requires_superadmin: bool = False
+    # Optional submit-time refusal, run ONLY by the request portal
+    # (``submit_request``) after ``preview`` passes. It raises a 4xx
+    # ``HTTPException`` for what the REST create would refuse (#2903). Kept
+    # off ``preview`` because the copilot shares that and deliberately only
+    # hints at conflicts; apply re-enforces regardless.
+    validate_submit: Callable[[AsyncSession, User, Any], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -340,6 +346,24 @@ async def _preview_create_ip_address(
             rtype = "AAAA" if addr_obj.version == 6 else "A"
             parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_ip_address(
+    db: AsyncSession, user: User, args: CreateIPAddressArgs
+) -> None:
+    """Request-portal submit check: what the REST create would refuse (#2903/#2905)."""
+    from app.services.ipam.address_create_rules import (  # noqa: PLC0415
+        assert_address_unallocated,
+        assert_static_dhcp_has_mac,
+        assert_subnet_takes_addresses,
+    )
+
+    subnet = await db.get(Subnet, args.subnet_id)
+    if subnet is None:  # preview already refused; defensive
+        return
+    assert_subnet_takes_addresses(subnet)
+    assert_static_dhcp_has_mac(args.status, args.mac_address)
+    await assert_address_unallocated(db, subnet.id, args.address)
 
 
 async def _apply_create_ip_address(
@@ -1832,6 +1856,7 @@ register(
         args_model=CreateIPAddressArgs,
         preview=_preview_create_ip_address,
         apply=_apply_create_ip_address,
+        validate_submit=_validate_submit_create_ip_address,
         category="ipam",
         required_permission=("write", "ip_address"),
     )
@@ -2999,7 +3024,7 @@ async def _preview_create_dhcp_static(
                 ),
             )
         )
-    ).scalar_one_or_none()
+    ).first()
     suffix = ""
     if existing is not None:
         suffix = " — note: a static for this IP or MAC already exists; apply will fail"
@@ -3017,6 +3042,19 @@ async def _preview_create_dhcp_static(
     # #2901 — apply mirrors the reservation into IPAM, as the REST create does.
     parts.append("mirrors into IPAM as a static_dhcp address")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_dhcp_static(
+    db: AsyncSession, user: User, args: CreateDHCPStaticArgs
+) -> None:
+    """Request-portal submit check: the REST create's reservation conflicts (#2903)."""
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.services.dhcp.static_conflicts import check_static_conflicts  # noqa: PLC0415
+
+    scope = await db.get(DHCPScope, args.scope_id)
+    if scope is None:  # preview already refused; defensive
+        return
+    await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
 
 
 async def _apply_create_dhcp_static(
@@ -3110,6 +3148,7 @@ register(
         args_model=CreateDHCPStaticArgs,
         preview=_preview_create_dhcp_static,
         apply=_apply_create_dhcp_static,
+        validate_submit=_validate_submit_create_dhcp_static,
         category="dhcp",
         required_permission=("write", "dhcp_static"),
     )

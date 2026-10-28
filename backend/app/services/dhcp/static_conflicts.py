@@ -41,6 +41,23 @@ async def check_static_conflicts(
             detail=f"MAC {mac} already reserved in this group in scope {row.scope_id}",
         )
 
+    # The same IP twice in one scope — the partial unique index
+    # ``uq_dhcp_static_scope_ip`` would refuse it anyway; naming it here gives
+    # the submit pre-check (#2903) and every other caller one legible 409.
+    same_ip = await db.execute(
+        select(DHCPStaticAssignment).where(
+            DHCPStaticAssignment.scope_id == scope.id,
+            DHCPStaticAssignment.ip_address == ip,
+        )
+    )
+    for row in same_ip.scalars().all():
+        if exclude_id is not None and row.id == exclude_id:
+            continue
+        raise HTTPException(
+            status_code=409,
+            detail=f"IP {ip} is already reserved in this scope",
+        )
+
     try:
         ip_addr = ipaddress.ip_address(ip)
     except ValueError as e:
