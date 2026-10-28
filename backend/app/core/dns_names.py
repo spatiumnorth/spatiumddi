@@ -407,7 +407,12 @@ def primary_ns_error(value: str | None) -> str | None:
     return None
 
 
-_MAILBOX_LOCAL_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
+# BIND's ``dns_name_ismailbox``: the first label of an SOA RNAME (the
+# mailbox's local part) may hold any printable ASCII character but a space;
+# only the labels after it are held to the host-name rule. Measured against
+# named-checkzone 9.20: ``admin+dns``, ``dns_admin`` and ``a!b`` load, while
+# ``hostmaster.under_score.example.com.`` is refused (check-names).
+_MAILBOX_LOCAL_RE = re.compile(r"^[\x21-\x7e]+\Z")
 
 
 def admin_email_error(value: str | None) -> str | None:
@@ -415,14 +420,22 @@ def admin_email_error(value: str | None) -> str | None:
 
     The RNAME is a mailbox in domain-name form (``hostmaster.example.com.``,
     the first label being the local part). BIND's check-names reads it as a
-    mailbox: the local part is one label of letters, digits, ``-`` and ``_``,
-    and every label after it is a host name label. One that is not makes BIND
-    refuse the whole zone, so the group never serves it (#2916). Like the
-    Primary NS (:func:`primary_ns_error`), a single label would be read as a
-    name at the root, so it is refused. Empty means "not set" and is allowed.
+    mailbox: the local part is any printable ASCII (``admin+dns``,
+    ``dns_admin``), and every label after it must be a host name label. One
+    that is not makes BIND refuse the whole zone, so the group never serves
+    it (#2916). Like the Primary NS (:func:`primary_ns_error`), a single label
+    would be read as a name at the root, so it is refused. Characters a
+    master file cannot carry unescaped (``@``, ``\\``, ``;`` …) are refused
+    by :func:`contains_zonefile_unsafe` too, so a local part holding a dot
+    cannot be written. Empty means "not set" and is allowed.
     """
     if value is None or value == "":
         return None
+    if contains_zonefile_unsafe(value):
+        return (
+            "must be a mailbox in domain-name form such as hostmaster.example.com. "
+            "(no whitespace, control characters, or zone-file syntax such as '@')"
+        )
     body = value[:-1] if value.endswith(".") else value
     if not body or "." not in body:
         return (
@@ -437,13 +450,13 @@ def admin_email_error(value: str | None) -> str | None:
         if len(label) > MAX_LABEL_LEN:
             return f"label '{label[:20]}…' exceeds {MAX_LABEL_LEN} characters"
         if not label.isascii():
-            return f"label '{label}' is not ASCII"
+            return (
+                f"label '{label}' is not ASCII; write an internationalised domain "
+                "in its xn-- form"
+            )
         if i == 0:
             if not _MAILBOX_LOCAL_RE.match(label):
-                return (
-                    f"mailbox name '{label}' may hold only letters, digits, hyphens "
-                    "and underscores. BIND refuses a zone whose SOA mailbox is not valid"
-                )
+                return f"mailbox name '{label}' holds a character BIND does not accept"
         elif not _HOST_LABEL_RE.match(label):
             return (
                 f"label '{label}' is not a host name label: letters, digits and "

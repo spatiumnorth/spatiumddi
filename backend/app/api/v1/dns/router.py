@@ -7819,6 +7819,15 @@ class FromTemplateRequest(BaseModel):
     def validate_zone_type(cls, v: str) -> str:
         if v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
+        # A template writes records, which only a primary zone serves. A
+        # secondary / stub zone also needs masters this request cannot carry
+        # (zone create refuses one without, #336), and a forward zone holds
+        # no records at all.
+        if v != "primary":
+            raise ValueError(
+                "zone_type must be 'primary': a template writes records, which "
+                "only a primary zone serves"
+            )
         return v
 
     @model_validator(mode="after")

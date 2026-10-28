@@ -150,20 +150,58 @@ async def test_every_template_still_creates_with_its_placeholders(
     headers = await _headers(db_session)
     grp, _ = await _group(db_session)
     await db_session.commit()
+    assert len(templates) >= 4
+    created = 0
     for i, t in enumerate(templates):
-        params = {
-            p["key"]: (p.get("default") or p.get("placeholder") or "192.0.2.1")
-            for p in t["parameters"]
-            if p.get("required")
-        }
-        resp = await client.post(
-            _tpl(grp),
-            headers=headers,
-            json={"template_id": t["id"], "zone_name": f"t{i}.example.test", "params": params},
-        )
-        # A placeholder that is not a legal value for its own template is a
-        # test-data problem, so report which one.
-        assert resp.status_code == 201, (t["id"], params, resp.text)
+        # Twice per template: only the required parameters, then every
+        # parameter, so the records behind optional ones (DMARC, DKIM, the
+        # AAAA, the AD site records) are held to the rules too.
+        for j, only_required in enumerate((True, False)):
+            params = {
+                p["key"]: (p.get("default") or p.get("placeholder") or "192.0.2.1")
+                for p in t["parameters"]
+                if p.get("required") or not only_required
+            }
+            resp = await client.post(
+                _tpl(grp),
+                headers=headers,
+                json={
+                    "template_id": t["id"],
+                    "zone_name": f"t{i}-{j}.example.test",
+                    "params": params,
+                },
+            )
+            # A placeholder that is not a legal value for its own template is
+            # a test-data problem, so report which one.
+            assert resp.status_code == 201, (t["id"], params, resp.text)
+            created += 1
+    assert created == 2 * len(templates)
+    # Every record a template materialised was written.
+    assert (await db_session.execute(select(DNSRecord.id))).first() is not None
+
+
+@pytest.mark.parametrize("zone_type", ["secondary", "stub", "forward"])
+async def test_template_refuses_a_zone_type_that_serves_no_records(
+    client: AsyncClient, db_session: AsyncSession, zone_type: str
+) -> None:
+    """A secondary / stub zone made here would have no masters (zone create
+    refuses that), and none of the three serves the template's records."""
+    headers = await _headers(db_session)
+    grp, _ = await _group(db_session)
+    await db_session.commit()
+    resp = await client.post(
+        _tpl(grp),
+        headers=headers,
+        json={
+            "template_id": "web-basic",
+            "zone_name": "zt.example.test",
+            "zone_type": zone_type,
+            "params": {"origin_ip": "192.0.2.1"},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert "zone_type" in resp.text
+    assert await _count_zones(db_session, grp) == 0
 
 
 async def test_template_creates_valid_zone(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -184,6 +222,47 @@ async def test_template_creates_valid_zone(client: AsyncClient, db_session: Asyn
 
 
 # ── #2916 ──────────────────────────────────────────────────────────────────
+
+
+# Measured against named-checkzone 9.20 (-k fail): BIND reads the RNAME as a
+# mailbox — any printable local part, then host-name labels. The single label
+# loads in BIND but names a mailbox at the root, refused as for Primary NS.
+ADMIN_EMAIL_BAD = [
+    "hostmaster.under_score.rn.example.test.",  # BIND: bad name (check-names)
+    "hostmaster.-lead.example.test.",  # BIND: bad name (check-names)
+    "hostmaster.trail-.example.test.",  # BIND: bad name (check-names)
+    "hostmaster." + "a" * 64 + ".test.",  # BIND: label too long
+    "a" * 64 + ".example.test.",  # BIND: label too long
+    "hostmaster",
+    "hostmaster.",
+    "hostmaster..example.test.",
+    "hostmaster@example.test",
+    # BIND loads an escaped dot in the local part, but a backslash is
+    # zone-file syntax the SOA fields have refused since #597.
+    "first\\.last.example.test.",
+    "hostmaster.b\u00fccher.example.",
+]
+ADMIN_EMAIL_GOOD = [
+    "hostmaster.rn.example.test.",
+    "hostmaster.rn.example.test",
+    "dns-admin.example.test.",
+    "dns_admin.example.test.",
+    "host_master.example.test",
+    "admin+dns.example.test.",
+    "a!b.example.test.",
+    "first.last.example.test.",
+    "hostmaster.xn--bcher-kva.example.",
+    "",
+]
+
+
+def test_admin_email_rule_vectors() -> None:
+    from app.core.dns_names import admin_email_error
+
+    for bad in ADMIN_EMAIL_BAD:
+        assert admin_email_error(bad) is not None, bad
+    for good in ADMIN_EMAIL_GOOD:
+        assert admin_email_error(good) is None, good
 
 
 @pytest.mark.parametrize(
@@ -208,7 +287,10 @@ async def test_admin_email_must_be_a_mailbox_name(
     assert await _count_zones(db_session, grp) == 0
 
 
-@pytest.mark.parametrize("value", ["hostmaster.rn.example.test.", "host_master.example.test", ""])
+@pytest.mark.parametrize(
+    "value",
+    ["hostmaster.rn.example.test.", "host_master.example.test", "admin+dns.example.test.", ""],
+)
 async def test_admin_email_valid_forms_pass(
     client: AsyncClient, db_session: AsyncSession, value: str
 ) -> None:
@@ -244,6 +326,21 @@ async def test_admin_email_update_holds_changed_value_only(
         url, headers=headers, json={"admin_email": legacy.admin_email, "ttl": 600}
     )
     assert ok.status_code == 200, ok.text
+    # The dialog re-sends every field on save: an edit of any of them keeps
+    # the legacy Admin Email it does not change.
+    full = {
+        "admin_email": legacy.admin_email,
+        "primary_ns": "",
+        "ttl": 900,
+        "refresh": 7200,
+        "retry": 1800,
+        "expire": 1209600,
+        "minimum": 600,
+        "color": "",
+        "tags": {"k": "v"},
+    }
+    again = await client.put(url, headers=headers, json=full)
+    assert again.status_code == 200, again.text
     bad = await client.put(url, headers=headers, json={"admin_email": "hostmaster"})
     assert bad.status_code == 422
     assert "admin_email" in bad.text

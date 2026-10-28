@@ -1121,6 +1121,26 @@ def _is_host_name(absolute: str) -> bool:
     return all(_HOST_LABEL_RE.match(label) for label in body.split("."))
 
 
+_MAILBOX_LOCAL_RE = re.compile(r"^[\x21-\x7e]+$")
+
+
+def _is_mailbox_name(absolute: str) -> bool:
+    """Whether absolute ``absolute`` is a usable SOA RNAME: the control
+    plane's ``admin_email_error`` rule (backend ``app/core/dns_names.py``).
+    BIND's check-names reads the RNAME as a mailbox — a local part of any
+    printable ASCII, then host-name labels — and refuses the whole zone when
+    it is not one; a row stored before #2916 with
+    ``hostmaster.under_score.…`` kept the zone from ever being served. At
+    least two labels, as for the Primary NS."""
+    body = absolute[:-1] if absolute.endswith(".") else absolute
+    if not body or len(body) > 253 or "." not in body:
+        return False
+    local, _, domain = body.partition(".")
+    if len(local) > 63 or not _MAILBOX_LOCAL_RE.match(local):
+        return False
+    return all(_HOST_LABEL_RE.match(label) for label in domain.split("."))
+
+
 def _zone_file_name(value: str, origin: str) -> str:
     """How BIND reads ``value`` written into the file of zone ``origin``:
     absolute when it ends in a dot, the apex for ``@`` or nothing, otherwise
@@ -1192,6 +1212,8 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     if primary_ns is not None and not _is_host_name(primary_ns):
         primary_ns = None  # reported below as an unusable field, then healed
     admin = _absolute_name(zone.get("admin_email"))
+    if admin is not None and not _is_mailbox_name(admin):
+        admin = None  # reported below as an unusable field, then healed
     for field, parsed in (("primary_ns", primary_ns), ("admin_email", admin)):
         if parsed is None and str(zone.get(field) or "").strip():
             notes.append(("unusable_field", f"{field}={zone.get(field)!r}"))
