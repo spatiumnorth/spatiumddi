@@ -4,6 +4,7 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 import { idleHeader } from "@/lib/activity";
+import { sharedRefresh } from "@/lib/crossTabAuth";
 import {
   getAccessToken,
   setAccessToken,
@@ -120,6 +121,7 @@ function createClient(): AxiosInstance {
 
         originalRequest._retry = true;
         isRefreshing = true;
+        const staleToken = getAccessToken();
         try {
           // The refresh token rides the HttpOnly cookie automatically; the
           // rotated refresh token comes back as a new Set-Cookie and the fresh
@@ -127,12 +129,19 @@ function createClient(): AxiosInstance {
           // cookie flow on a cross-ORIGIN (but same-site) API host when CORS
           // credentials are enabled; the cookie is SameSite=Strict, so a
           // genuinely cross-SITE SPA/API split is not supported by design.
-          const res = await client.post<RefreshResponse>(
-            "/auth/refresh",
-            {},
-            { withCredentials: true },
+          // One refresh for every tab of this browser (#2960): another tab
+          // may already have rotated, in which case its token is adopted.
+          const { access_token, force_password_change } = await sharedRefresh(
+            async () =>
+              (
+                await client.post<RefreshResponse>(
+                  "/auth/refresh",
+                  {},
+                  { withCredentials: true },
+                )
+              ).data,
+            staleToken,
           );
-          const { access_token, force_password_change } = res.data;
           setAccessToken(access_token);
           setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
