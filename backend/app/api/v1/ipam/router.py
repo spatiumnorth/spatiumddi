@@ -1786,7 +1786,9 @@ async def _assert_alias_names_fit(
     aliases: list[Any],
     zone_id: uuid.UUID | None,
 ) -> None:
-    """422 an alias whose name inside its zone passes 253 characters.
+    """422 an alias whose name inside its zone passes 253 characters, or
+    whose full owner the record API's check-names rule refuses (#2918: an
+    A alias under a zone whose own name carries an underscore label).
 
     ``AliasInput`` checks the alias on its own; only here is the zone known.
     A name longer than a DNS name can carry makes BIND refuse the whole zone
@@ -1813,6 +1815,11 @@ async def _assert_alias_names_fit(
                     "the server applying its configuration."
                 ),
             )
+        names_err = bind_check_names_error(
+            al.record_type, fqdn, None, origin=zone_domain, check_target=False
+        )
+        if names_err is not None:
+            raise HTTPException(status_code=422, detail=f"alias '{al.name}': {names_err}")
 
 
 async def _create_alias_records(
@@ -2279,6 +2286,7 @@ def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bo
         ip=str(ip.address),
         zone=zone_domain,
         hostname_length=len(ip.hostname or ""),
+        reason=err,
     )
     return True
 

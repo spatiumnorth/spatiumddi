@@ -18,7 +18,7 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.ipam.router import _sync_dns_record
+from app.api.v1.ipam.router import AliasInput, _assert_alias_names_fit, _sync_dns_record
 from app.core.dns_names import host_in_zone_error
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
@@ -35,8 +35,10 @@ def test_rule_covers_zone_labels_and_length() -> None:
     assert host_in_zone_error("h1", UNDERSCORE_ZONE + ".") is not None
     assert "_lab" in (host_in_zone_error("h1", UNDERSCORE_ZONE) or "")
     assert host_in_zone_error("h" + "x" * 50 + "-1", LONG_ZONE) is not None
-    # the default-gateway placeholder never publishes a forward record
-    assert host_in_zone_error("gateway", UNDERSCORE_ZONE) is None
+    # the default-gateway placeholder publishes no forward record, but its PTR
+    # names gateway.<zone>, a target BIND's check-names refuses just the same
+    assert host_in_zone_error("gateway", UNDERSCORE_ZONE) is not None
+    assert host_in_zone_error("gateway", "example.test") is None
 
 
 class Env:
@@ -92,6 +94,7 @@ async def _env(db: AsyncSession, zone_name: str | None, net: str = "10.91.1.0/24
         network=net,
         name="s",
         dns_zone_id=str(zone.id) if zone else None,
+        dns_group_ids=[str(zone.group_id)] if zone else None,
         dns_inherit_settings=False,
     )
     db.add(subnet)
@@ -156,6 +159,57 @@ async def test_allocate_into_ordinary_zone_still_publishes(
     assert r.status_code == 201, r.text
     assert env.zone is not None
     assert await _records(db_session, env.zone) == 1
+
+
+async def _with_reverse_zone(db: AsyncSession, zone: DNSZone) -> DNSZone:
+    rev = DNSZone(
+        group_id=zone.group_id,
+        name="1.91.10.in-addr.arpa.",
+        zone_type="primary",
+        kind="reverse",
+        primary_ns="ns1.example.test.",
+        admin_email="admin.example.test.",
+    )
+    db.add(rev)
+    await db.commit()
+    return rev
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("zone_name", "ptrs"), [(UNDERSCORE_ZONE, 0), ("example.test", 1)])
+async def test_gateway_ptr_not_published_under_underscore_zone(
+    db_session: AsyncSession, zone_name: str, ptrs: int
+) -> None:
+    """The gateway placeholder's PTR target is ``gateway.<zone>``: under an
+    underscore zone label BIND's check-names refuses the reverse zone whole,
+    so the PTR is not written there (the control proves the PTR path runs)."""
+    env = await _env(db_session, zone_name)
+    assert env.zone is not None
+    rev = await _with_reverse_zone(db_session, env.zone)
+    gw = IPAddress(
+        subnet_id=env.subnet.id, address="10.91.1.1", status="allocated", hostname="gateway"
+    )
+    db_session.add(gw)
+    await db_session.flush()
+    await _sync_dns_record(db_session, gw, env.subnet, backfill_reverse_zone=False)
+    await db_session.flush()
+    assert await _records(db_session, rev, "PTR") == ptrs
+
+
+@pytest.mark.asyncio
+async def test_a_alias_under_underscore_zone_is_refused(db_session: AsyncSession) -> None:
+    env = await _env(db_session, UNDERSCORE_ZONE)
+    assert env.zone is not None
+    with pytest.raises(HTTPException) as exc:
+        await _assert_alias_names_fit(
+            db_session, [AliasInput(name="www", record_type="A")], env.zone.id
+        )
+    assert exc.value.status_code == 422
+    assert "_lab" in str(exc.value.detail)
+    # a CNAME owner may sit under an underscore label (the record API takes it)
+    await _assert_alias_names_fit(
+        db_session, [AliasInput(name="www", record_type="CNAME")], env.zone.id
+    )
 
 
 # ── #2920 ────────────────────────────────────────────────────────────
@@ -310,7 +364,9 @@ async def test_kea_import_drops_hostname_static_form_refuses(
     )
     assert r.status_code == 200, r.text
     assert r.json()["total_reservations_created"] == 2
-    assert any("192.0.2.140" in w for w in r.json()["warnings"])
+    assert any(
+        "192.0.2.140" in w and "'under_score'" in w for w in r.json()["warnings"]
+    ), r.json()["warnings"]
     rows = (await db_session.execute(select(DHCPStaticAssignment))).scalars().all()
     by_ip = {str(x.ip_address): x.hostname for x in rows}
     assert by_ip["192.0.2.140"] == ""

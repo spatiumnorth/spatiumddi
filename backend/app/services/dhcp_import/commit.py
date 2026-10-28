@@ -131,9 +131,11 @@ def drop_unservable_hostnames(scopes: list[ImportedScope]) -> list[str]:
             try:
                 cleaned = validate_optional_hostname(r.hostname) or ""
             except ValueError as exc:
+                # The warning carries the source name whole (the validator's
+                # message names only the offending label), so it is not lost.
                 warnings.append(
                     f"{scope.subnet_cidr}: reservation {r.ip_address} ({r.mac_address}) "
-                    f"imported with no hostname: {exc}"
+                    f"imported with no hostname (source hostname {r.hostname!r}): {exc}"
                 )
                 r.hostname = ""
             else:
