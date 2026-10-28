@@ -88,8 +88,10 @@ _TTL_AUTO = 1
 # or 60-86400 (30 on Enterprise) and rejects anything else. A stored 0 is
 # therefore sent as 0, not mapped to ``_TTL_AUTO`` or a floor: only ``None``
 # means "let the provider decide", and substituting a different TTL would
-# publish a value the database does not hold and show as drift. Cloudflare's
-# own validation refuses the write, which surfaces to the operator.
+# publish a value the database does not hold. The record API refuses such a
+# TTL up front for a Cloudflare group (``PROVIDER_TTL_RANGES`` in
+# ``app.drivers.dns``), so it only reaches here from a row stored before that
+# gate or moved in from another group, and Cloudflare then refuses the write.
 
 # Types whose priority is part of the record's identity (two MX with the
 # same exchange and different preferences are two records).

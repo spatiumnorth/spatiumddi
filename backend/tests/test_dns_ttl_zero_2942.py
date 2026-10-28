@@ -1,13 +1,13 @@
 """#2942 — a stored TTL of 0 is published as 0, never as a default.
 
-The record API accepts ``ttl: 0`` and the zone-file import stores it, so the
-database can hold 0. ``ttl or default`` reads that as missing; only ``None``
+The record API accepts ``ttl: 0`` (and #2932 makes the zone-file import keep
+it), so the database can hold 0. ``ttl or default`` reads that as missing; only ``None``
 may fall back. One test per driver path, each with a positive control
 (``None`` still takes the default).
 
-Cloudflare is deliberately not here: it has no way to represent 0 (see the
-driver module docstring) and sends the stored value through unchanged so the
-provider's own validation refuses it, instead of publishing something else.
+Cloudflare has no way to represent 0, so the record API refuses it for a
+Cloudflare group (``test_dns_provider_ttl_range_2942.py``); the driver still
+sends a stored 0 unchanged rather than publishing something else.
 """
 
 from __future__ import annotations
