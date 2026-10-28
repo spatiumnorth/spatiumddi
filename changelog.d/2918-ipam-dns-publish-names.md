@@ -10,8 +10,9 @@
   alias in such a zone, and the default gateway placeholder, whose PTR
   names `gateway.<zone>`: BIND refuses a reverse zone whose PTR target
   is not a host name, so that PTR is no longer written there. An edit
-  that changes neither the hostname nor the zone runs no DNS sync and
-  is not refused. The Kea (and ISC / Windows)
+  of an address published there before the rule, that changes neither
+  its hostname nor its zones (a description, say), is not refused; its
+  DNS is left as it was. The Kea (and ISC / Windows)
   DHCP import imported reservation hostnames the static form refuses,
   and the next save published them; such a hostname is now imported
   as blank with a warning in the preview and the commit result that
