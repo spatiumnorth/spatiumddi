@@ -217,3 +217,169 @@ async def test_specific_ip_reuses_an_available_row_but_refuses_a_held_one(
     rows = await _addrs(client, h, sid)
     assert rows["10.163.4.6"] == "allocated"
     assert (await client.get(f"/api/v1/ipam/subnets/{sid}", headers=h)).json()["allocated_ips"] == 6
+
+
+# ── #2980: the take keeps the row and retracts what it published ─────────
+
+
+async def test_specific_ip_takes_a_swept_reservation_in_place(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """The reservation sweep flips an expired ``reserved`` row to ``available``
+    and keeps its name, its A / alias records and its MAC history. Taking the
+    address must retract those records (not leave them served with no row,
+    which a delete would: ``dns_record.ip_address_id`` is SET NULL), keep the
+    row's identity (a delete would CASCADE away MAC history and the OT /
+    BACnet / E911 registrations hanging off it) and audit the take."""
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+    from app.models.ipam import IPAddress, IpMacHistory
+    from tests.test_ipam_alias_cname_exclusive_2080 import _records, _setup
+
+    h, sid, zone = await _setup(client, db_session, "10.97.0.0/16", "10.97.5.0/24")
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/addresses",
+        headers=h,
+        json={
+            "address": "10.97.5.50",
+            "status": "reserved",
+            "hostname": "old50",
+            "mac_address": "aa:bb:cc:00:00:50",
+            "description": "held",
+            "aliases": [{"name": "www50", "record_type": "CNAME"}],
+        },
+    )
+    assert r.status_code == 201, r.text
+    old_id = r.json()["id"]
+    assert ("old50", "A") in await _records(db_session, zone.id)
+    assert ("www50", "CNAME") in await _records(db_session, zone.id)
+    # What the sweep does (ipam_reservation_sweep._sweep).
+    row = await db_session.get(IPAddress, uuid.UUID(old_id))
+    assert row is not None
+    row.status = "available"
+    await db_session.commit()
+
+    p = await client.get(f"/api/v1/ipam/subnets/{sid}/next-ip-preview", headers=h)
+    assert p.status_code == 200
+    ok = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/addresses",
+        headers=h,
+        json={"address": "10.97.5.50", "status": "allocated", "hostname": "new50"},
+    )
+    assert ok.status_code == 201, ok.text
+    body = ok.json()
+    assert body["id"] == old_id
+    assert body["hostname"] == "new50"
+    assert body["mac_address"] is None
+    assert body["description"] == ""
+    recs = await _records(db_session, zone.id)
+    assert ("old50", "A") not in recs
+    assert ("www50", "CNAME") not in recs
+    assert ("new50", "A") in recs
+    hist = (
+        (
+            await db_session.execute(
+                select(IpMacHistory).where(IpMacHistory.ip_address_id == uuid.UUID(old_id))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(hist) == 1
+    audits = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "ip_address", AuditLog.resource_id == old_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    took = [a for a in audits if (a.old_value or {}).get("reason") == "reclaimed_available_row"]
+    assert len(took) == 1
+    assert took[0].old_value["hostname"] == "old50"
+
+
+async def test_an_available_row_still_linked_to_a_reservation_is_held(
+    client: AsyncClient, db_session: AsyncSession
+):
+    from app.models.ipam import IPAddress
+
+    h = await _headers(db_session)
+    sid, _ = await _avail_subnet(client, h, db_session)
+    from sqlalchemy import select
+
+    row = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == uuid.UUID(sid), IPAddress.address == "10.163.4.6"
+            )
+        )
+    ).scalar_one()
+    row.static_assignment_id = str(uuid.uuid4())
+    await db_session.commit()
+    p = await client.get(f"/api/v1/ipam/subnets/{sid}/next-ip-preview", headers=h)
+    assert p.json()["address"] is None
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/addresses",
+        headers=h,
+        json={"address": "10.163.4.6", "status": "allocated", "hostname": "y"},
+    )
+    assert r.status_code == 409, r.text
+
+
+# ── #2979: the import follows New Subnet's rule, kind included ───────────
+
+
+async def test_import_multicast_subnet_gets_no_placeholder_rows(
+    client: AsyncClient, db_session: AsyncSession
+):
+    h = await _headers(db_session)
+    space = IPSpace(name=f"sp2979m-{uuid.uuid4().hex[:8]}", description="")
+    db_session.add(space)
+    await db_session.commit()
+    csv = b"network,name,gateway\n239.192.10.0/24,mc,\n10.233.90.0/31,p2p,\n"
+    r = await client.post(
+        "/api/v1/ipam/import/commit",
+        headers=h,
+        files={"file": ("s.csv", csv, "text/csv")},
+        data={"space_id": str(space.id), "strategy": "fail"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["created_subnets"] == 2, r.text
+    subs = (await client.get(f"/api/v1/ipam/subnets?space_id={space.id}", headers=h)).json()
+    subs = subs["items"] if isinstance(subs, dict) else subs
+    by_net = {s["network"]: s for s in subs}
+    mc = by_net["239.192.10.0/24"]
+    assert mc["kind"] == "multicast"
+    assert await _addrs(client, h, mc["id"]) == {}
+    assert await _addrs(client, h, by_net["10.233.90.0/31"]["id"]) == {}
+
+
+async def test_import_many_subnets_rolls_up_a_shared_chain(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Several imported subnets under one existing chain: every block on it
+    equals the sum of its subnets (recounted once per block, batched)."""
+    h = await _headers(db_session)
+    space, root = await _space_block(db_session, "10.235.0.0/16")
+    mid = await client.post(
+        "/api/v1/ipam/blocks",
+        headers=h,
+        json={"space_id": space, "parent_block_id": root, "network": "10.235.0.0/20", "name": "m"},
+    )
+    assert mid.status_code == 201, mid.text
+    rows = "".join(f"10.235.{i}.0/24,s{i},\n" for i in range(1, 6)).encode()
+    r = await client.post(
+        "/api/v1/ipam/import/commit",
+        headers=h,
+        files={"file": ("s.csv", b"network,name,gateway\n" + rows, "text/csv")},
+        data={"space_id": space, "strategy": "fail"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["created_subnets"] == 5
+    assert await _alloc(client, h, "blocks", mid.json()["id"]) == 5
+    assert await _alloc(client, h, "blocks", root) == 5

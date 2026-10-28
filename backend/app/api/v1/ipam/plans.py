@@ -29,7 +29,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
-from app.services.ipam.subnet_placeholders import create_placeholder_rows
+from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
 
 _V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
 _V6_MULTICAST = ipaddress.ip_network("ff00::/8")
@@ -761,9 +761,8 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             created_subnets.append(str(subnet.id))
             # Placeholder network/broadcast/gateway rows, mirroring create_subnet
             # (#505). Multicast leaves and v4 /31+/32 / v6 /127+/128 get none.
-            is_v6 = isinstance(node_net, ipaddress.IPv6Network)
             gw_row: IPAddress | None = None
-            if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
+            if has_boundary_rows(node_net, node_kind):
                 _, gw_row = await create_placeholder_rows(
                     db,
                     subnet,
@@ -786,30 +785,24 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
     await materialise(tree, None, is_root=True)
 
     # Every created subnet holds placeholder rows and every created block
-    # rolls them up; the counters were seeded at 0 (#2412). Deepest first.
+    # rolls them up; the counters were seeded at 0 (#2412). A plan anchored to
+    # an existing block that creates no block of its own still changes that
+    # block's subnets, so the blocks the created subnets sit in are recounted
+    # too, chains included (#2981). Each block on the chains is counted once.
     from app.api.v1.ipam.router import (  # noqa: PLC0415
-        _update_block_utilization,
-        _update_utilization,
+        _update_blocks_utilization,
+        _update_subnets_utilization,
     )
 
-    for sid in created_subnets:
-        await _update_utilization(db, uuid.UUID(sid))
+    subnet_ids = [uuid.UUID(sid) for sid in created_subnets]
+    await _update_subnets_utilization(db, subnet_ids)
     await db.flush()
-    for bid in reversed(created_blocks):
-        await _update_block_utilization(db, uuid.UUID(bid))
-    # A plan anchored to an existing block that creates no block of its own
-    # still changes that block's subnets: recount the block each created subnet
-    # sits in, which walks up the chain (the anchor included) (#2981).
-    if created_subnets:
-        parent_ids = (
-            await db.execute(
-                select(Subnet.block_id).where(
-                    Subnet.id.in_([uuid.UUID(sid) for sid in created_subnets])
-                )
-            )
-        ).scalars()
-        for bid in {str(b) for b in parent_ids}:
-            await _update_block_utilization(db, uuid.UUID(bid))
+    parent_ids = (
+        (await db.execute(select(Subnet.block_id).where(Subnet.id.in_(subnet_ids)))).scalars().all()
+        if subnet_ids
+        else []
+    )
+    await _update_blocks_utilization(db, [*(uuid.UUID(b) for b in created_blocks), *parent_ids])
 
     plan.applied_at = datetime.now(UTC)
     plan.applied_resource_ids = {

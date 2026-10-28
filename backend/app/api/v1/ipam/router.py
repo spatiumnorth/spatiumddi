@@ -93,7 +93,8 @@ from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
     assert_static_dhcp_has_mac,
     assert_subnet_takes_addresses,
-    reclaim_available_row,
+    holds_address,
+    take_address_row,
 )
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
@@ -113,7 +114,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
-from app.services.ipam.subnet_placeholders import create_placeholder_rows
+from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
@@ -444,9 +445,27 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
     Also updates all ancestor blocks up the tree.
     """
     block = await db.get(IPBlock, block_id)
-    if block is None:
-        return
+    while block is not None:
+        await _recount_block(db, block)
+        block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
 
+
+async def _update_blocks_utilization(db: AsyncSession, block_ids: Iterable[uuid.UUID]) -> None:
+    """``_update_block_utilization`` for many blocks at once (#2981): every
+    block on the union of their chains is recounted exactly once, rather than
+    once per block below it. A block's sum reads its descendant SUBNETS, not
+    its child blocks, so the order does not matter."""
+    seen: set[uuid.UUID] = set()
+    for start in block_ids:
+        block = await db.get(IPBlock, start)
+        while block is not None and block.id not in seen:
+            seen.add(block.id)
+            await _recount_block(db, block)
+            block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
+
+
+async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
+    """Recount one block's cached counters from its descendant subnets."""
     # Sum allocated_ips for all subnets in this block and all descendant blocks
     # deleted_at IS NULL guards: raw SQL bypasses the ORM soft-delete filter,
     # so trashed blocks/subnets would otherwise inflate the rollup (#490).
@@ -465,7 +484,7 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
             WHERE s.block_id IN (SELECT id FROM descendants)
               AND s.deleted_at IS NULL
         """),
-        {"block_id": str(block_id)},
+        {"block_id": str(block.id)},
     )
     allocated = result.scalar() or 0
 
@@ -479,9 +498,29 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
     block.allocated_ips = int(allocated)
     block.total_ips = min(block_total, _BIGINT_MAX)
 
-    # Walk up the tree and update each ancestor
-    if block.parent_block_id:
-        await _update_block_utilization(db, block.parent_block_id)
+
+async def _update_subnets_utilization(db: AsyncSession, subnet_ids: Iterable[uuid.UUID]) -> None:
+    """``_update_utilization`` for many subnets in one grouped count (#2981)."""
+    ids = list(dict.fromkeys(subnet_ids))
+    if not ids:
+        return
+    counts: dict[uuid.UUID, int] = {
+        sid: int(n)
+        for sid, n in (
+            await db.execute(
+                select(IPAddress.subnet_id, func.count())
+                .where(IPAddress.subnet_id.in_(ids))
+                .where(counts_toward_utilization())
+                .group_by(IPAddress.subnet_id)
+            )
+        ).all()
+    }
+    for subnet in (await db.execute(select(Subnet).where(Subnet.id.in_(ids)))).scalars():
+        allocated = counts.get(subnet.id, 0)
+        subnet.allocated_ips = allocated
+        subnet.utilization_percent = (
+            round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
+        )
 
 
 async def _resolve_effective_dns(
@@ -1310,8 +1349,8 @@ async def _pick_next_available_ip(
         select(IPAddress.address).where(
             IPAddress.subnet_id == subnet.id,
             # An ``available`` row is free (#2980): the counters say so and the
-            # create reclaims it.
-            IPAddress.status != "available",
+            # create takes it over in place.
+            holds_address(),
         )
     )
     used: set[str] = {str(row[0]) for row in used_result}
@@ -6036,17 +6075,8 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # doesn't apply.
     auto_created: list[str] = []
     gw_row: IPAddress | None = None
-    is_v6 = isinstance(net, ipaddress.IPv6Network)
-    # Threshold is version-aware: a v4 /31+/32 has no network/broadcast concept
-    # (RFC 3021), and the v6 analogue is /127+/128. The old flat ``< 31`` was v4
-    # logic, so EVERY realistic v6 subnet (/48, /64, /112) fell through and got
-    # no network/gateway pseudo-rows despite the branch's IPv6 handling (#506).
-    placeholder_threshold = 127 if is_v6 else 31
-    if (
-        net.prefixlen < placeholder_threshold
-        and not body.skip_auto_addresses
-        and subnet_kind != "multicast"
-    ):
+    # Version-aware (#506): a v4 /31+/32 and a v6 /127+/128 get none.
+    if has_boundary_rows(net, subnet_kind) and not body.skip_auto_addresses:
         auto_created, gw_row = await create_placeholder_rows(
             db,
             subnet,
@@ -9294,6 +9324,15 @@ async def create_address(
     if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
+        # An ``available`` row at this address is the slot being taken (#2980):
+        # its own name and PTR are retracted by the take, not a collision.
+        free_row_id = await db.scalar(
+            select(IPAddress.id).where(
+                IPAddress.subnet_id == subnet_id,
+                IPAddress.address == body.address,
+                IPAddress.status == "available",
+            )
+        )
         warnings = await _check_ip_collisions(
             db,
             hostname=body.hostname,
@@ -9302,6 +9341,7 @@ async def create_address(
             role=body.role,
             subnet=subnet,
             address=body.address,
+            exclude_ip_id=free_row_id,
         )
         # Public-facing safety guard (issue #25). Append to the same
         # warnings list so the operator sees both surfaces in one
@@ -9333,17 +9373,19 @@ async def create_address(
         address=body.address,
         zone_id=explicit_zone,
     )
-    # An ``available`` row at this address is a free slot (#2980): replaced.
-    await reclaim_available_row(db, subnet_id, body.address)
-    ip = IPAddress(
-        subnet_id=subnet_id,
-        created_by_user_id=current_user.id,
-        **body.model_dump(exclude={"dns_zone_id", "force", "aliases"}),
-    )
+    # An ``available`` row at this address is a free slot (#2980): taken over
+    # in place (its DNS retracted, its identity kept), not duplicated.
+    fields = body.model_dump(exclude={"address", "dns_zone_id", "force", "aliases"})
     if no_dns:
-        ip.extra_zone_ids = []
-    db.add(ip)
-    await db.flush()
+        fields["extra_zone_ids"] = []
+    ip = await take_address_row(
+        db,
+        subnet,
+        body.address,
+        current_user,
+        created_by_user_id=current_user.id,
+        **fields,
+    )
 
     # Stamp a MAC observation row. Idempotent on the (ip_id, mac)
     # uniqueness — a future PUT bumps last_seen instead of inserting.
@@ -11226,10 +11268,11 @@ async def allocate_next_ip(
         address=chosen,
         zone_id=explicit_zone,
     )
-    await reclaim_available_row(db, subnet_id, str(chosen))
-    ip = IPAddress(
-        subnet_id=subnet_id,
-        address=str(chosen),
+    ip = await take_address_row(
+        db,
+        subnet,
+        str(chosen),
+        current_user,
         status=body.status,
         hostname=body.hostname,
         mac_address=body.mac_address,
@@ -11242,8 +11285,6 @@ async def allocate_next_ip(
         decom_date=body.decom_date,
         created_by_user_id=current_user.id,
     )
-    db.add(ip)
-    await db.flush()
 
     if body.mac_address:
         await _record_mac_history(db, ip.id, body.mac_address)
