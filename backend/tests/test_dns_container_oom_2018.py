@@ -228,7 +228,7 @@ async def test_a_container_that_ended_for_another_reason_is_not_an_oom(
     await db_session.commit()
 
     killed_at = datetime.now(UTC) - timedelta(minutes=2)
-    rh = _role_health(killed_at=killed_at, running_since=None, reason="Error")
+    rh = _role_health(killed_at=killed_at, running_since=None, reason="Error", restarts=1)
     await _supervisor_hb(client, appliance, token, rh)
     await _agent_hb(client, headers, {"status": "ok"})
     row = await _reload(db_session, server.id)

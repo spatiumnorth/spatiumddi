@@ -124,8 +124,7 @@ from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
 from app.services.agents.container_oom import (
     apply_container_oom,
-    container_oom_report,
-    is_oom_reason,
+    verdict_needs_write,
 )
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
@@ -2239,8 +2238,10 @@ _HEARTBEAT_HOLD_CAP_S = 28.0
 
 
 async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
-    """Stamp a current ``OOMKilled`` from ``appliance.role_health`` onto the
-    DNS and DHCP server rows this appliance's containers serve (#2018, #2023).
+    """Stamp the supervisor's verdict from ``appliance.role_health`` onto the
+    DNS and DHCP server rows this appliance's containers serve: a current
+    ``OOMKilled`` (#2018, #2023), a crash loop whatever the kubelet calls the
+    cause, or an agent that has gone silent under a live supervisor (#2961).
     See ``app.services.agents.container_oom``.
 
     One row per engine: the most recently seen of the rows this appliance
@@ -2286,12 +2287,7 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
                 getattr(best, seen_attr) or floor
             ):
                 live[server.driver] = server
-        ids = [
-            s.id
-            for s in live.values()
-            if container_oom_report(health, s.driver, now) is not None
-            and not is_oom_reason(s.daemon_reason)
-        ]
+        ids = [s.id for s in live.values() if verdict_needs_write(s, health, now)]
         if not ids:
             continue
         locked = (

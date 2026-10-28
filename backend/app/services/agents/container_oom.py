@@ -41,7 +41,8 @@ supervisor, so this does not reach it; see ``docs/features/DNS.md`` 8.0.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -101,8 +102,55 @@ _OOM_REASON = "OOMKilled"
 ROLE_HEALTH_FRESH_SECONDS = 900.0
 
 
+#: The heartbeat ``daemon.reason`` prefixes the SUPERVISOR writes when the
+#: kubelet's container state, not the agent, is the evidence (#2961).
+CRASH_LOOP_PREFIX = "crash_loop:"
+AGENT_SILENT_PREFIX = "agent_unreachable:"
+
+#: A container is crash-looping once the kubelet has restarted it this many
+#: times, it last ended inside :data:`CRASH_LOOP_WINDOW`, and it is not
+#: currently a healthy, ready pod. One restart (a deploy, a node drain, one
+#: bad probe) never qualifies; a restart count is lifetime, so a container that
+#: restarted twice last month and once just now is also kept out by the
+#: "not healthy" test, which a settled pod fails.
+CRASH_LOOP_MIN_RESTARTS = 3
+CRASH_LOOP_WINDOW = timedelta(minutes=15)
+
+#: How long the agent may be silent, while its appliance's supervisor is not,
+#: before the supervisor's word replaces the stale last agent report (#2961).
+#: Above the 90-120 s the health sweeps allow before they read the row
+#: ``unreachable``, so a missed heartbeat or two stays quiet; the alert's own
+#: five-minute grace, timed from the last agent heartbeat, still applies.
+AGENT_SILENT_SECONDS = 180.0
+
+#: What the kubelet-sourced OOM reason above starts with, as opposed to the
+#: agent's own record ("oom_killed: named was killed for exceeding ..."). Both
+#: share :data:`REASON_PREFIX`, so the source is read from this shape.
+_KUBELET_OOM_RE = re.compile(r"^oom_killed: the [\w-]+ container \(")
+
+
 def is_oom_reason(reason: str | None) -> bool:
     return str(reason or "").strip().startswith(REASON_PREFIX)
+
+
+def is_crash_loop_reason(reason: str | None) -> bool:
+    return str(reason or "").strip().startswith(CRASH_LOOP_PREFIX)
+
+
+def is_silent_agent_reason(reason: str | None) -> bool:
+    return str(reason or "").strip().startswith(AGENT_SILENT_PREFIX)
+
+
+def reason_source(reason: str | None) -> str:
+    """Who produced a daemon ``reason``: ``"supervisor"`` when the kubelet's
+    container state is the evidence (a crash loop, a silent agent, or the
+    kubelet-sourced OOM text), ``"agent"`` when the agent said it (#2962)."""
+    text = str(reason or "").strip()
+    if is_crash_loop_reason(text) or is_silent_agent_reason(text):
+        return "supervisor"
+    if _KUBELET_OOM_RE.match(text):
+        return "supervisor"
+    return "agent"
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -181,6 +229,139 @@ def container_oom_report(
     return {"status": STATUS_DEGRADED, "reason": reason}, killed_at
 
 
+def _container_entry(
+    role_health: dict[str, Any] | None, driver: str | None
+) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    """``(service, role_health entry, container runtime)`` for the server's
+    container, or None."""
+    service = DRIVER_SERVICE.get(driver or "")
+    if service is None or not isinstance(role_health, dict):
+        return None
+    entry = role_health.get(service)
+    if not isinstance(entry, dict):
+        return None
+    runtime = entry.get("container")
+    if not isinstance(runtime, dict):
+        return None
+    return service, entry, runtime
+
+
+def _what(driver: str | None, service: str) -> str:
+    daemon = _DAEMON_NAME.get(driver or "", "the DNS daemon")
+    agent = "DHCP" if driver in DHCP_DRIVER_SERVICE else "DNS"
+    return f"the {service} container ({daemon} and the {agent} agent with it)"
+
+
+def _evidence(runtime: dict[str, Any]) -> str:
+    """ "restarted N times, last ended with reason X, exit code Y at T" for a
+    container's kubelet history."""
+    try:
+        restarts = int(runtime.get("restart_count") or 0)
+    except (TypeError, ValueError):
+        restarts = 0
+    parts = [f"restarted {restarts} time{'s' if restarts != 1 else ''}"]
+    last = runtime.get("last_termination")
+    if isinstance(last, dict):
+        reason = str(last.get("reason") or "").strip() or "unknown"
+        code = last.get("exit_code")
+        at = _parse_ts(last.get("finished_at"))
+        text = f"last ended with reason {reason}"
+        if code is not None:
+            text += f", exit code {code}"
+        if at is not None:
+            text += f" at {at.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        parts.append(text)
+    return ", ".join(parts)
+
+
+def container_crash_loop_report(
+    role_health: dict[str, Any] | None,
+    driver: str | None,
+    now: datetime,
+) -> tuple[dict[str, str], datetime] | None:
+    """``({"status", "reason"}, since)`` while the server's container is
+    crash-looping whatever the kubelet calls the cause (#2961): restarted at
+    least :data:`CRASH_LOOP_MIN_RESTARTS` times, last ended within
+    :data:`CRASH_LOOP_WINDOW`, not a settled healthy pod, and not up for
+    :data:`STABLE_SECONDS`. ``since`` is when the watchdog first saw the
+    current status. None otherwise, and for an OOM kill (that has its own
+    verdict, :func:`container_oom_report`)."""
+    found = _container_entry(role_health, driver)
+    if found is None:
+        return None
+    service, entry, runtime = found
+    last = runtime.get("last_termination")
+    if not isinstance(last, dict) or last.get("reason") == _OOM_REASON:
+        return None
+    try:
+        restarts = int(runtime.get("restart_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    if restarts < CRASH_LOOP_MIN_RESTARTS:
+        return None
+    if entry.get("status") not in ("unhealthy", "starting"):
+        return None
+    ended = _parse_ts(last.get("finished_at"))
+    if ended is not None and now - ended > CRASH_LOOP_WINDOW:
+        return None
+    running_since = _parse_ts(runtime.get("running_since"))
+    if running_since is not None and (now - running_since).total_seconds() >= STABLE_SECONDS:
+        return None
+    since = _parse_ts(entry.get("since")) or ended or now
+    since = min(since, now)
+    state = "up again" if running_since is not None else "not running"
+    reason = (
+        f"{CRASH_LOOP_PREFIX} {_what(driver, service)} is crash-looping: "
+        f"{_evidence(runtime)} ({state}). The supervisor reports this from the "
+        "kubelet's container state; the agent dies with the container and cannot. "
+        "Check the container's logs and its termination reason on the appliance."
+    )
+    return {"status": STATUS_DEGRADED, "reason": reason}, since
+
+
+def agent_silent_report(
+    role_health: dict[str, Any] | None,
+    driver: str | None,
+    agent_last_seen: datetime | None,
+    now: datetime,
+) -> tuple[dict[str, str], datetime] | None:
+    """``({"status", "reason"}, last_seen)`` for a server whose agent has been
+    silent for :data:`AGENT_SILENT_SECONDS` while its appliance's supervisor
+    is heartbeating and manages the container (#2961). The row would
+    otherwise keep the last thing the agent said, usually ``ok``. ``since`` is
+    the agent's last heartbeat, so the alert's grace runs from the start of
+    the silence. None when the agent has never reported (unknown, not an
+    alarm) or has been heard from recently."""
+    found = _container_entry(role_health, driver)
+    if found is None or agent_last_seen is None:
+        return None
+    service, _entry, runtime = found
+    silent = (now - agent_last_seen).total_seconds()
+    if silent < AGENT_SILENT_SECONDS:
+        return None
+    reason = (
+        f"{AGENT_SILENT_PREFIX} the agent in {_what(driver, service)} has not "
+        f"heartbeated since {agent_last_seen.strftime('%Y-%m-%dT%H:%M:%SZ')}, while the "
+        f"appliance's supervisor is still reporting. Kubelet history: {_evidence(runtime)}."
+    )
+    return {"status": STATUS_DEGRADED, "reason": reason}, agent_last_seen
+
+
+def container_verdict(
+    role_health: dict[str, Any] | None,
+    driver: str | None,
+    agent_last_seen: datetime | None,
+    now: datetime,
+) -> tuple[dict[str, str], datetime] | None:
+    """The supervisor's verdict for a server whose agent cannot speak for
+    itself, strongest first: an OOM kill, a crash loop, a silent agent."""
+    return (
+        container_oom_report(role_health, driver, now)
+        or container_crash_loop_report(role_health, driver, now)
+        or agent_silent_report(role_health, driver, agent_last_seen, now)
+    )
+
+
 def fresh_role_health(appliance: Any, now: datetime) -> dict[str, Any] | None:
     """``appliance.role_health`` while the supervisor that reported it is
     still heartbeating (:data:`ROLE_HEALTH_FRESH_SECONDS`); None otherwise,
@@ -205,12 +386,54 @@ def effective_daemon_report(
     report is then ``ok``, a deferred start, anything but its own
     ``oom_killed:`` record). Returns ``(report, stamp)``; ``stamp`` is the
     kill time when the kubelet's report is the one used."""
-    if isinstance(reported, dict) and is_oom_reason(reported.get("reason")):
+    if isinstance(reported, dict) and (
+        is_oom_reason(reported.get("reason")) or is_crash_loop_reason(reported.get("reason"))
+    ):
         return reported, now
-    oom = container_oom_report(role_health, driver, now)
-    if oom is None:
+    # A crash loop is held the same way: between crashes the restarted agent
+    # says ``ok`` (#2961). A silent agent is not: this heartbeat IS the agent.
+    verdict = container_oom_report(role_health, driver, now) or container_crash_loop_report(
+        role_health, driver, now
+    )
+    if verdict is None:
         return reported, now
-    return oom[0], oom[1]
+    return verdict[0], verdict[1]
+
+
+def server_last_heard(server: Any) -> datetime | None:
+    """When the server's agent last heartbeated: DNSServer calls the stamp
+    ``last_seen_at``, DHCPServer ``agent_last_seen``. None for a server whose
+    silence is deliberate (paused for maintenance, disabled), so the silent-agent
+    verdict never reads it."""
+    if getattr(server, "maintenance_mode", False) or getattr(server, "is_enabled", True) is False:
+        return None
+    if getattr(server, "driver", None) in DHCP_DRIVER_SERVICE:
+        return getattr(server, "agent_last_seen", None)
+    return getattr(server, "last_seen_at", None)
+
+
+def verdict_needs_write(server: Any, role_health: dict[str, Any] | None, now: datetime) -> bool:
+    """Whether :func:`apply_container_oom` would write to ``server``."""
+    verdict = container_verdict(
+        role_health, getattr(server, "driver", None), server_last_heard(server), now
+    )
+    if verdict is None:
+        return False
+    return _differs(server.daemon_reason, verdict[0]["reason"])
+
+
+def _differs(current: str | None, new: str) -> bool:
+    """A verdict replaces the row's reason unless that reason is already an
+    equal-or-stronger supervisor verdict. OOM is never rewritten (the first
+    text carries the kill's own timing); a crash loop and a silent agent are
+    refreshed in place so their restart count stays current, but a silent
+    agent never replaces a crash loop or an OOM."""
+    cur = str(current or "")
+    if is_oom_reason(new):
+        return not is_oom_reason(cur)
+    if is_crash_loop_reason(new):
+        return not is_oom_reason(cur) and cur != new
+    return not (is_oom_reason(cur) or is_crash_loop_reason(cur)) and cur != new
 
 
 def apply_container_oom(
@@ -219,28 +442,31 @@ def apply_container_oom(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Stamp the kubelet's OOM verdict onto ``server`` (a DNSServer or, since
-    #2023, a DHCPServer) when the
-    row does not already say so. For the supervisor heartbeat, which is the
-    only report there is while the container crash-loops. Never clears: the
-    agent's next ``ok`` heartbeat does that once the verdict has expired.
-    Returns whether it wrote."""
+    """Stamp the supervisor's verdict onto ``server`` (a DNSServer or, since
+    #2023, a DHCPServer): the kubelet's OOM kill (#2018), a crash loop or a
+    silent agent (#2961). For the supervisor heartbeat, which is the only
+    report there is while the container crash-loops. Never clears: the agent's
+    next ``ok`` heartbeat does that once the verdict has expired. Returns
+    whether it wrote."""
     stamp = now or datetime.now(UTC)
-    oom = container_oom_report(role_health, getattr(server, "driver", None), stamp)
-    if oom is None or is_oom_reason(server.daemon_reason):
+    verdict = container_verdict(
+        role_health, getattr(server, "driver", None), server_last_heard(server), stamp
+    )
+    if verdict is None or not _differs(server.daemon_reason, verdict[0]["reason"]):
         return False
-    report, killed_at = oom
+    report, since = verdict
     apply_reported_daemon_state(
         server,
         report,
         agent_kind="dhcp" if getattr(server, "driver", None) in DHCP_DRIVER_SERVICE else "dns",
         server_id=str(server.id),
-        now=min(killed_at, stamp),
+        now=min(since, stamp),
     )
     logger.warning(
-        "agent_daemon_oom_from_kubelet",
+        "agent_daemon_state_from_supervisor",
         server_id=str(server.id),
-        killed_at=killed_at.isoformat(),
+        reason_source=reason_source(report["reason"]),
+        since=since.isoformat(),
     )
     return True
 
@@ -252,8 +478,18 @@ __all__ = [
     "ROLE_HEALTH_FRESH_SECONDS",
     "REASON_PREFIX",
     "STABLE_SECONDS",
+    "AGENT_SILENT_PREFIX",
+    "CRASH_LOOP_PREFIX",
+    "agent_silent_report",
     "apply_container_oom",
+    "container_crash_loop_report",
     "container_oom_report",
+    "container_verdict",
+    "is_crash_loop_reason",
+    "is_silent_agent_reason",
+    "reason_source",
+    "server_last_heard",
+    "verdict_needs_write",
     "effective_daemon_report",
     "fresh_role_health",
     "is_oom_reason",

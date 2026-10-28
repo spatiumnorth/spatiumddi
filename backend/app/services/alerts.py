@@ -4375,6 +4375,36 @@ async def _matching_dns_pool_health_stale_subjects(
     return matches
 
 
+def _daemon_degraded_source_text(reason: str) -> str:
+    """The closing sentences of an ``agent_daemon_degraded`` message, worded by
+    who actually reported (#2962). The agent's own report is the only case in
+    which "the agent is heartbeating" is true: a kubelet-sourced verdict (an
+    OOM kill, a crash loop) comes from the appliance's supervisor because the
+    agent died with its container, and a silent agent is the opposite of
+    heartbeating."""
+    from app.services.agents.container_oom import (  # noqa: PLC0415
+        is_silent_agent_reason,
+        reason_source,
+    )
+
+    if reason_source(reason) == "supervisor":
+        if is_silent_agent_reason(reason):
+            lead = (
+                "The agent is not heartbeating, so the server reads unreachable, while "
+                "its appliance's supervisor still is."
+            )
+        else:
+            lead = (
+                "The agent died with its container and cannot report this itself; the "
+                "appliance's supervisor reports it from the kubelet's container state."
+            )
+        return f"{lead} Supervisor reported: {reason}"
+    return (
+        "The agent is heartbeating, so the server reads reachable and healthy on every "
+        "other signal while it is not serving." + (f" Agent reported: {reason}" if reason else "")
+    )
+
+
 async def _matching_agent_daemon_degraded_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4434,9 +4464,8 @@ async def _matching_agent_daemon_degraded_subjects(
             message = (
                 f"{kind} server '{row.name}' reports its daemon is "
                 f"{str(row.daemon_status).replace('_', ' ')} and has for {minutes} min "
-                f"(since {since.isoformat(timespec='seconds')}). The agent is heartbeating, "
-                "so the server reads reachable and healthy on every other signal while it "
-                "is not serving." + (f" Agent reported: {reason}" if reason else "")
+                f"(since {since.isoformat(timespec='seconds')}). "
+                + _daemon_degraded_source_text(reason)
             )
             subject_id = f"{model.__tablename__}:{row.id}"
             matches.append((subject_id, f"{row.name} ({kind})", message, rule.severity))
