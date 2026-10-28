@@ -192,13 +192,17 @@ async def test_apply_proposal_403_for_unprivileged_owner(db_session: AsyncSessio
 
 @pytest.mark.asyncio
 async def test_apply_proposal_succeeds_for_authorized_writer(db_session: AsyncSession) -> None:
-    """A user granted ('write','ip_address') — the same grant the REST
-    route requires — can apply the proposal and the row lands."""
+    """A user granted the operation's ('write','ip_address') AND the REST
+    create's per-resource gate (write on the subnet) can apply the proposal
+    and the row lands."""
     subnet = await _subnet(db_session)
     writer = await _user(
         db_session,
         name="ipam-editor",
-        permissions=[{"action": "write", "resource_type": "ip_address"}],
+        permissions=[
+            {"action": "write", "resource_type": "ip_address"},
+            {"action": "write", "resource_type": "subnet", "resource_id": str(subnet.id)},
+        ],
     )
     proposal = await _make_proposal(
         db_session,
