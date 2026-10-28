@@ -386,9 +386,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "The DNS subsystem as a whole — zones, records, views, server "
             "groups, blocklists and the DNS dashboard panels. Turn it off "
             "on an IPAM-only or DHCP-only install to put the entire DNS "
-            "surface away; every DNS feature below depends on it. Agent "
-            "registration and config polling are deliberately unaffected, "
-            "and disabling is refused while any DNS server or zone exists."
+            "surface away; every DNS feature below depends on it. Disabling "
+            "is refused while any DNS server or zone exists. While it is "
+            "off, new agents cannot register; agents already registered "
+            "keep heartbeating and polling their config."
         ),
     ),
     # DNS — togglable extras under the Settings → Import surface and
@@ -433,9 +434,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "reservations, leases, client classes and the DHCP dashboard "
             "panels, plus the DHCP affordances inside IPAM. Turn it off on "
             "a DNS-only or IPAM-only install; every DHCP feature below "
-            "depends on it. Agent registration and config polling are "
-            "deliberately unaffected, and disabling is refused while any "
-            "DHCP server or scope exists."
+            "depends on it. Disabling is refused while any DHCP server or "
+            "scope exists. While it is off, new agents cannot register; "
+            "agents already registered keep heartbeating and polling "
+            "their config."
         ),
     ),
     # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
