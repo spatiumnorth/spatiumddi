@@ -221,6 +221,23 @@ def targets_are_relative(server: Any) -> bool:
     return True
 
 
+def loc_canonical(rtype: str, value: str) -> str:
+    """A LOC / CAA value in dnspython's ``to_text`` form (what the AXFR reader
+    prints); the lower-cased text when it does not parse, so a malformed
+    value still keys deterministically instead of raising."""
+    text = value.strip()
+    try:
+        import dns.rdata
+        import dns.rdataclass
+        import dns.rdatatype
+
+        return dns.rdata.from_text(
+            dns.rdataclass.IN, dns.rdatatype.from_text(rtype), text
+        ).to_text()
+    except Exception:  # noqa: BLE001 - any parse failure falls back to raw text
+        return text.lower()
+
+
 def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets: bool) -> str:
     """Canonicalise a record value for dedup.
 
@@ -242,6 +259,11 @@ def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets
         # form, case kept: TXT content is case-sensitive (DKIM keys,
         # tokens). Not stripped: the renderers serve surrounding spaces.
         return quote_txt(value or "")
+    if rtype in ("LOC", "CAA"):
+        # #2925: ``7m`` and ``7.00m`` are one record, and so are a bare and
+        # a quoted CAA value; the AXFR reader prints dnspython's canonical
+        # form, a typed value can be any spelling.
+        return loc_canonical(rtype, value or "")
     v = (value or "").strip().lower()
     if rtype in ("A", "AAAA"):
         # Canonical form (#1513): an expanded/upper-case address as
