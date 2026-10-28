@@ -596,7 +596,8 @@ def _validate_choice(value: str, *, field: str) -> str:
 
 
 def _validate_port(port: str, *, field: str, element: str) -> None:
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
+    # ASCII digits only: ``str.isdigit()`` is true for ``²`` and ``int()`` then raises.
+    if not (port.isascii() and port.isdigit()) or not 1 <= int(port) <= 65535:
         raise ViewValidationError(
             f"'{port}' is not a port number (1-65535).", field=field, value=element
         )

@@ -166,7 +166,7 @@ def _srv_row_key(row: dict[str, Any]) -> tuple[int, int, int, str] | None:
     # Cloudflare's own SRV content omits the priority ("<weight> <port>
     # <target>") and carries it as the row's top-level ``priority``.
     parts = content.split(None, 2)
-    if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+    if len(parts) == 3 and all(p.isascii() and p.isdigit() for p in parts[:2]):
         try:
             prio = int(row.get("priority") or 0)
         except (TypeError, ValueError):
