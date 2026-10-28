@@ -14071,7 +14071,11 @@ export interface ClusterWorkloadHealth {
   kind: string | null;
   ready: number;
   total: number;
+  /** Lifetime total: informational only. */
   restarts: number;
+  /** #2945 — containers restarted in the last 15 min; drives the amber. */
+  recent_restarts?: number;
+  last_restart_at?: string | null;
   /** Job pods still running for this component (#1213), e.g. a CNPG
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;

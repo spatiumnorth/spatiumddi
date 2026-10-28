@@ -109,6 +109,45 @@ def _age_seconds(iso: str | None) -> int | None:
     return int((datetime.now(UTC) - dt).total_seconds())
 
 
+# #2945 — a restart counts as "recent" when a container's previous instance
+# ended inside this window. Same 15 minutes as the appliance console's RST
+# verdict (#2928, ``_RST_WINDOW_S``); keep the two in step. The lifetime
+# ``restartCount`` only ever grows and every node reboot adds one to every
+# pod on the node, so judging on it leaves a healthy cluster amber forever.
+RECENT_RESTART_WINDOW_S = 900
+# A finishedAt this far in the future is clock skew and still reads as
+# just-now; further out it is ignored so a fast node clock cannot pin it.
+_RESTART_SKEW_S = 60
+
+
+def _recent_restarts(pod_status: dict[str, Any], now: datetime) -> tuple[int, str | None]:
+    """(containers that restarted in the window, latest such finishedAt).
+
+    Stateless: read straight off ``lastState.terminated.finishedAt``, which
+    the pod status carries, so it is right on any api replica.
+    """
+    count = 0
+    latest: tuple[datetime, str] | None = None
+    for cs in pod_status.get("containerStatuses") or []:
+        if not int(cs.get("restartCount") or 0):
+            continue
+        raw = ((cs.get("lastState") or {}).get("terminated") or {}).get("finishedAt")
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        age = (now - dt).total_seconds()
+        if -_RESTART_SKEW_S <= age <= RECENT_RESTART_WINDOW_S:
+            count += 1
+            if latest is None or dt > latest[0]:
+                latest = (dt, str(raw))
+    return count, latest[1] if latest else None
+
+
 # ── per-resource extractors ────────────────────────────────────────────────
 
 
@@ -753,6 +792,8 @@ def _apply_cnpg_instances(
             "ready": 0,
             "total": 0,
             "restarts": 0,
+            "recent_restarts": 0,
+            "last_restart_at": None,
             "jobs_running": 0,
         }
         workloads.append(row)
@@ -955,6 +996,7 @@ def get_cluster_health() -> dict[str, Any]:
     # #2856 — the instance pods themselves (not the initdb / join Jobs), for
     # the per-instance verdict on the database row.
     cnpg_instance_pods: list[dict[str, Any]] = []
+    now_utc = datetime.now(UTC)
     for p in pods_raw:
         meta = p.get("metadata") or {}
         status = p.get("status") or {}
@@ -972,6 +1014,7 @@ def get_cluster_health() -> dict[str, Any]:
             pods_running += 1
         ready_n, total_n = _ready_counts(p)
         restarts = sum(c.get("restartCount", 0) for c in status.get("containerStatuses") or [])
+        recent, last_restart = _recent_restarts(status, now_utc)
         cpu_u, mem_u = pod_usage.get((ns, name), (None, None))
         comp = _pod_component(p)
         owner = _pod_owner_kind(p)
@@ -1002,10 +1045,23 @@ def get_cluster_health() -> dict[str, Any]:
             continue
         agg = rollup.setdefault(
             comp,
-            {"component": comp, "kind": owner, "ready": 0, "total": 0, "restarts": 0},
+            {
+                "component": comp,
+                "kind": owner,
+                "ready": 0,
+                "total": 0,
+                "restarts": 0,
+                "recent_restarts": 0,
+                "last_restart_at": None,
+            },
         )
         agg["total"] += 1
         agg["restarts"] += restarts
+        agg["recent_restarts"] += recent
+        if last_restart and (
+            agg["last_restart_at"] is None or last_restart > agg["last_restart_at"]
+        ):
+            agg["last_restart_at"] = last_restart
         fully_ready = (total_n > 0 and ready_n == total_n) or phase == "Succeeded"
         if fully_ready:
             agg["ready"] += 1
