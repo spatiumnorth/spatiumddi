@@ -328,6 +328,17 @@ async def _preview_create_ip_address(
         # Truncate to keep the preview readable.
         d = args.description if len(args.description) < 80 else args.description[:77] + "..."
         parts.append(f"desc={d!r}")
+    if args.hostname:
+        # #2900 — say what apply will publish, the way the REST create does:
+        # the A / AAAA record lands in the subnet's effective forward zone.
+        from app.api.v1.ipam.router import _resolve_effective_zone  # local import — avoid cycle
+        from app.models.dns import DNSZone
+
+        zone_id = await _resolve_effective_zone(db, subnet)
+        zone = await db.get(DNSZone, zone_id) if zone_id else None
+        if zone is not None:
+            rtype = "AAAA" if addr_obj.version == 6 else "A"
+            parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
@@ -336,10 +347,10 @@ async def _apply_create_ip_address(
 ) -> dict[str, Any]:
     """Re-validate at apply time + insert the row.
 
-    Mirrors the conflict checks from the IPAM router's create_address
-    handler. We don't import that handler directly (it's bound to a
-    FastAPI request shape) — duplicating the few-line conflict check
-    is the simpler alternative until the apply set grows.
+    A hostname-bearing address delegates to the IPAM router's
+    ``create_address`` (DNS sync + every other side effect of a manual
+    allocation, #2900). One without a hostname publishes nothing and is
+    inserted directly after the same few-line conflict checks.
     """
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
 
@@ -378,6 +389,56 @@ async def _apply_create_ip_address(
     if args.status == "static_dhcp" and not args.mac_address:
         raise ValueError("mac_address is required when status is 'static_dhcp'")
 
+    if args.hostname:
+        # #2900 — a named address goes through the REST create, so an
+        # approved request / applied proposal does everything a manual
+        # allocation does: the A (+ PTR) record in the subnet's effective
+        # zone under ``strict`` (a name DNS refuses fails the apply and
+        # rolls the address back with it), the collision + dynamic-pool
+        # checks (409 — ``force`` is the operator's call, not an approver's,
+        # so the apply refuses rather than overriding), MAC history, the
+        # static-DHCP reservation for ``static_dhcp`` and utilisation. The
+        # handler commits and writes its own audit row; the DNS wake rides
+        # the caller's ``collecting_wakes()``.
+        from app.api.v1.ipam.router import (  # local import — avoid cycle
+            IPAddressCreate,
+            create_address,
+        )
+
+        created = await create_address(
+            subnet.id,
+            IPAddressCreate(
+                address=args.address,
+                status=args.status,
+                hostname=args.hostname,
+                mac_address=args.mac_address,
+                description=args.description or "",
+            ),
+            user,
+            db,
+        )
+        named: dict[str, Any] = {
+            "id": str(created.id),
+            "address": args.address,
+            "subnet_id": str(subnet.id),
+            "status": args.status,
+            "hostname": args.hostname,
+        }
+        # A ``static_dhcp`` row whose reservation could not be created (an
+        # ambiguous scope, or no ``dhcp_static`` write) carries the reason;
+        # keep it on the executed request / proposal instead of dropping it.
+        warning = getattr(created, "dhcp_static_warning", None)
+        if warning:
+            named["dhcp_static_warning"] = warning
+        return named
+
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _record_mac_history,
+        _update_block_utilization,
+        _update_utilization,
+    )
+    from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+
     row = IPAddress(
         subnet_id=subnet.id,
         address=args.address,
@@ -386,9 +447,17 @@ async def _apply_create_ip_address(
         fqdn=args.fqdn,
         mac_address=args.mac_address,
         description=args.description or "",
+        created_by_user_id=user.id,
     )
     db.add(row)
     await db.flush()
+
+    # #2900 — the downstream work the REST create runs that needs no
+    # hostname: MAC history, the DHCP reservation a ``static_dhcp`` row owns
+    # (#1628; gated on the acting user's ``dhcp_static`` write, warning
+    # otherwise), and the subnet / block utilisation counters.
+    await _record_mac_history(db, row.id, args.mac_address)
+    dhcp_sync = await sync_static_for_ipam_row(db, row, user=user)
 
     # Audit the apply path so the audit log captures the outcome (the
     # propose step doesn't audit — proposals can be discarded). The
@@ -410,15 +479,21 @@ async def _apply_create_ip_address(
             "via": "ai_proposal",
         },
     )
+    await db.flush()
+    await _update_utilization(db, subnet.id)
+    await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(row)
-    return {
+    result: dict[str, Any] = {
         "id": str(row.id),
         "address": args.address,
         "subnet_id": str(subnet.id),
         "status": args.status,
         "hostname": args.hostname,
     }
+    if dhcp_sync.warning:
+        result["dhcp_static_warning"] = dhcp_sync.warning
+    return result
 
 
 # ── run_nmap_scan operation ────────────────────────────────────────────
