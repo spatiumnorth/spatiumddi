@@ -307,14 +307,24 @@ def _family_summary_rows(blocks: list[dict[str, Any]]) -> list[list[str]]:
     return rows
 
 
-def _subnet_total(s: dict[str, Any]) -> str:
-    """A subnet's size. The stored IPv6 total is clamped to BIGINT; print
-    the real size instead, never the clamp as a count."""
+# Above this an IPv6 size is printed as a power of two in the narrow
+# Subnets "Total" column: a /64 spelled out is 26 characters, about 1.6"
+# at 8 pt, in a 0.7" right-aligned plain-string cell, so it would print
+# over the Status column. ``2^64`` is the same exact figure.
+_COMPACT_V6_ABOVE = 10**8
+
+
+def _subnet_total(s: dict[str, Any], *, compact: bool = False) -> str:
+    """A subnet's size. The stored IPv6 total is clamped to BIGINT
+    (2^63 - 1); print the real size instead, never the clamp as a count
+    (#2983). With ``compact`` a large IPv6 size reads ``2^N``."""
     try:
         net = ipaddress.ip_network(str(s["network"]), strict=False)
     except (KeyError, ValueError):
         return _num(s.get("total_ips"))
     if net.version == 6:
+        if compact and net.num_addresses > _COMPACT_V6_ABOVE:
+            return f"2^{net.max_prefixlen - net.prefixlen}"
         return _num(net.num_addresses)
     return _num(s.get("total_ips"))
 
@@ -383,7 +393,7 @@ def _build_tree_story(bundle: ExportBundle, styles: Any, scope_label: str) -> li
                     _cell(s.get("block"), 22),
                     _cell(s.get("vlan_id"), 8),
                     _cell(s.get("status"), 12),
-                    _subnet_total(s),
+                    _subnet_total(s, compact=True),
                     _num(s.get("allocated_ips")),
                     _pct(s.get("utilization_percent")),
                 ]
@@ -480,7 +490,7 @@ def _build_subnet_story(bundle: ExportBundle, styles: Any) -> list[Any]:
                 ["VLAN", _cell(subnet.get("vlan_id"), 20)],
                 ["VXLAN", _cell(subnet.get("vxlan_id"), 20)],
                 ["Status", _cell(subnet.get("status"), 20)],
-                ["Addressable IPs", _num(subnet.get("total_ips"))],
+                ["Addressable IPs", _subnet_total(subnet)],
                 ["Allocated", _num(subnet.get("allocated_ips"))],
                 ["Utilization", _pct(subnet.get("utilization_percent"))],
             ],

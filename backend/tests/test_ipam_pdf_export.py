@@ -293,41 +293,51 @@ def _summary(text: str, label: str) -> str:
 async def test_summary_utilisation_is_the_blocks_row_utilisation(
     db_session: AsyncSession,
 ) -> None:
-    from app.services.ipam.utilization import block_utilization_percent
+    """A /30 block holding one full /30 subnet: the block's allocated
+    count includes the subnet's network + broadcast (maintainer decision
+    on #2982), so it reads 4 / 4, 100%, in the Summary and in the Blocks
+    row alike — while the subnet keeps its own usable 2 / 2 (#2411)."""
+    from app.api.v1.ipam.router import _update_block_utilization, _update_utilization
 
     space = IPSpace(name="Util")
     db_session.add(space)
     await db_session.flush()
-    block = IPBlock(
-        space_id=space.id,
-        network="10.233.40.0/30",
-        name="b",
-        allocated_ips=2,
-        total_ips=4,
-        utilization_percent=block_utilization_percent(2, "10.233.40.0/30"),
-    )
+    block = IPBlock(space_id=space.id, network="10.233.40.0/30", name="b")
     db_session.add(block)
     await db_session.flush()
-    db_session.add(
-        Subnet(
-            space_id=space.id,
-            block_id=block.id,
-            network="10.233.40.0/30",
-            name="s",
-            total_ips=2,
-            allocated_ips=2,
-            utilization_percent=100.0,
-        )
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.233.40.0/30",
+        name="s",
+        total_ips=2,
     )
+    db_session.add(subnet)
+    await db_session.flush()
+    for addr, st in (
+        ("10.233.40.0", "network"),
+        ("10.233.40.1", "reserved"),
+        ("10.233.40.2", "allocated"),
+        ("10.233.40.3", "broadcast"),
+    ):
+        db_session.add(IPAddress(subnet_id=subnet.id, address=addr, status=st))
+    await db_session.flush()
+    await _update_utilization(db_session, subnet.id)
+    await db_session.flush()
+    await _update_block_utilization(db_session, block.id)
     await db_session.commit()
+    assert (subnet.allocated_ips, subnet.utilization_percent) == (2, 100.0)
+    assert (block.allocated_ips, block.utilization_percent) == (4, 100.0)
+
     data, _ = await generate_ipam_pdf(db_session, block_id=block.id)
     text = _pdf_text(data)
-    assert _summary(text, "IPv4 utilization") == "50%"
+    assert _summary(text, "IPv4 utilization") == "100%"
     assert _summary(text, "IPv4 addresses (blocks)") == "4"
-    assert _summary(text, "IPv4 allocated") == "2"
-    # The Blocks row's "Used" cell is the same figure; the old Summary
-    # said 100% (over subnet capacity).
-    assert "100%" not in text.split("Subnets")[0]
+    assert _summary(text, "IPv4 allocated") == "4"
+    # The Blocks row's "Used" cell states the same figure.
+    blocks_part = text.split("Description\nUsed\n", 1)[1].split("Subnets")[0]
+    assert "100%" in blocks_part
+    assert "50%" not in text
 
 
 async def test_families_are_not_summed_and_v6_prints_true_size(
@@ -338,24 +348,64 @@ async def test_families_are_not_summed_and_v6_prints_true_size(
     await db_session.flush()
     b4 = IPBlock(space_id=space.id, network="10.9.0.0/24", name="v4", allocated_ips=10)
     b6 = IPBlock(space_id=space.id, network="fd33:233:0:201::/64", name="v6", allocated_ips=1)
-    db_session.add_all([b4, b6])
+    b6big = IPBlock(space_id=space.id, network="::/0", name="all", allocated_ips=0)
+    db_session.add_all([b4, b6, b6big])
     await db_session.flush()
-    db_session.add(
-        Subnet(
-            space_id=space.id,
-            block_id=b6.id,
-            network="fd33:233:0:201::/64",
-            name="s6",
-            total_ips=2**63 - 1,
-            allocated_ips=1,
-        )
+    b6.parent_block_id = b6big.id
+    db_session.add_all(
+        [
+            Subnet(
+                space_id=space.id,
+                block_id=b6.id,
+                network="fd33:233:0:201::/64",
+                name="s6",
+                total_ips=2**63 - 1,
+                allocated_ips=1,
+            ),
+            Subnet(
+                space_id=space.id,
+                block_id=b6.id,
+                network="fd33:233:0:201::/120",
+                name="s6small",
+                total_ips=256,
+                allocated_ips=1,
+            ),
+        ]
     )
     await db_session.commit()
     data, _ = await generate_ipam_pdf(db_session, space_id=space.id)
     text = _pdf_text(data)
     assert _summary(text, "IPv4 addresses (blocks)") == "256"
-    assert _summary(text, "IPv6 addresses (blocks)") == f"{2**64:,}"
+    # Only the /0 root is summed (the /64 is under it): a 39-digit count,
+    # exact, never the BIGINT clamp.
+    assert _summary(text, "IPv6 addresses (blocks)") == f"{2**128:,}"
     assert _summary(text, "IPv4 allocated") == "10"
-    assert _summary(text, "IPv6 allocated") == "1"
+    assert _summary(text, "IPv6 allocated") == "0"
     assert "9,223,372,036,854,775,807" not in text
-    assert f"{2**64:,}" in text  # the /64 subnet row, true size
+    # The narrow Subnets "Total" column prints a large v6 size as a power
+    # of two rather than overflowing its cell; a small one stays a count.
+    subnets_part = text.split("Subnets", 1)[1]
+    assert "2^64" in subnets_part
+    assert "256" in subnets_part
+
+
+async def test_subnet_detail_prints_v6_true_size(db_session: AsyncSession) -> None:
+    space = IPSpace(name="V6Detail")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="fd34::/48", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="fd34::/64",
+        name="s",
+        total_ips=2**63 - 1,
+    )
+    db_session.add(subnet)
+    await db_session.commit()
+    data, _ = await generate_ipam_pdf(db_session, subnet_id=subnet.id)
+    text = _pdf_text(data)
+    assert _summary(text, "Addressable IPs") == f"{2**64:,}"
+    assert "9,223,372,036,854,775,807" not in text

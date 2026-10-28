@@ -112,7 +112,12 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
-from app.services.ipam.utilization import block_utilization_percent, counts_toward_utilization
+from app.services.ipam.utilization import (
+    block_allocated,
+    block_subnet_contribution_sql,
+    block_utilization_percent,
+    counts_toward_utilization,
+)
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -439,17 +444,21 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
 async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> None:
     """Recompute utilization_percent for a block by summing allocated IPs across all
     descendant subnets (recursive), expressed as a fraction of the block's CIDR size.
-    Also updates all ancestor blocks up the tree.
+    Each subnet's network/broadcast addresses count as used here (#2982), so a
+    block fully carved into full subnets reads 100%; the subnet's own counter
+    still leaves them out (#2411). Also updates all ancestor blocks up the tree.
     """
     block = await db.get(IPBlock, block_id)
     if block is None:
         return
 
-    # Sum allocated_ips for all subnets in this block and all descendant blocks
+    # Sum each subnet's contribution (allocated_ips + its network/broadcast)
+    # over this block and all descendant blocks.
     # deleted_at IS NULL guards: raw SQL bypasses the ORM soft-delete filter,
     # so trashed blocks/subnets would otherwise inflate the rollup (#490).
+    contribution = block_subnet_contribution_sql("s")
     result = await db.execute(
-        text("""
+        text(f"""
             WITH RECURSIVE descendants AS (
                 SELECT id FROM ip_block
                 WHERE id = CAST(:block_id AS uuid) AND deleted_at IS NULL
@@ -458,18 +467,17 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
                     INNER JOIN descendants d ON b.parent_block_id = d.id
                 WHERE b.deleted_at IS NULL
             )
-            SELECT COALESCE(SUM(s.allocated_ips), 0)
+            SELECT COALESCE(SUM({contribution}), 0)
             FROM subnet s
             WHERE s.block_id IN (SELECT id FROM descendants)
               AND s.deleted_at IS NULL
-        """),
+        """),  # the fragment is a constant: no request input reaches it
         {"block_id": str(block_id)},
     )
-    allocated = result.scalar() or 0
-
     net = ipaddress.ip_network(str(block.network), strict=False)
     block_total = net.num_addresses
-    block.utilization_percent = block_utilization_percent(int(allocated), net)
+    allocated = block_allocated(int(result.scalar() or 0), net)
+    block.utilization_percent = block_utilization_percent(allocated, net)
     # Cache the raw counts too so block rows can render Used IPs (not just a
     # utilization bar). total_ips clamps to BIGINT for huge IPv6 blocks.
     block.allocated_ips = int(allocated)
