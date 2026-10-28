@@ -8601,6 +8601,7 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _check_driver_record_values([(body.record_type, body.value)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
@@ -8731,6 +8732,9 @@ async def update_record(
         return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
+    if "value" in changes:
+        # #2959 — before the row is touched, so a refusal leaves it as it was.
+        await _check_driver_record_values([(record.record_type, changes["value"])], group_id, db)
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -9297,6 +9301,9 @@ async def bulk_create_records(
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_record_values(
+        [(r.record_type, r.value) for r in body.records], group_id, db
+    )
 
     # Normalise first: MX defaults its priority to 10, so an MX with and one
     # without an explicit 10 are the same record and must compare equal.
@@ -9740,6 +9747,9 @@ async def import_zone_commit(
     _reject_if_synthesised_zone(zone, "import")
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_record_values(
+        [(c.record_type, c.value) for c in diff.to_create], group_id, db
+    )
 
     # #2275 — a view-scoped import creates or deletes records in that view,
     # which moves where the zone renders.
@@ -10815,6 +10825,35 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                     "public resolvers."
                 ),
             )
+
+
+async def _check_driver_record_values(
+    records: Iterable[tuple[str, str]], group_id: uuid.UUID, db: DB
+) -> None:
+    """Reject a record VALUE a server in the group's driver cannot hold (#2959).
+
+    ``records`` is ``(record_type, value)`` pairs. A driver says what it
+    cannot hold through an optional ``record_value_refusal(record_type, value)
+    -> str | None`` (Linode cannot carry non-zero CAA flags, for example).
+    Without this the record would be stored and then fail on every push. Same
+    fail-soft semantics as ``_check_driver_gated_record_type``: an empty group
+    passes, and the driver re-checks at apply time. One query for any number
+    of records.
+    """
+    pairs = list(records)
+    if not pairs:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    checks = [
+        check
+        for driver in sorted({d for d in res.scalars().all() if d})
+        if (check := getattr(_DNS_DRIVERS.get(driver), "record_value_refusal", None))
+    ]
+    for check in checks:
+        for record_type, value in pairs:
+            refusal = check(record_type, value or "")
+            if refusal:
+                raise HTTPException(status_code=422, detail=refusal)
 
 
 async def _require_record(

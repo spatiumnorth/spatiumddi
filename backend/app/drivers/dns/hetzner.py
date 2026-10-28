@@ -55,7 +55,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.drivers.dns._caa import caa_presentation
+from app.drivers.dns._caa import caa_key, caa_presentation
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -336,6 +336,13 @@ class HetznerDNSDriver(CloudDNSDriverBase):
                 return " ".join(parts[:3] + [cls._absolute(parts[3])])
             return value
         if rtype == "CAA":
+            # One zone-file presentation string in the record's ``value``:
+            # ``0 issue "letsencrypt.org"`` (#2959). The Cloud API spec
+            # (docs.hetzner.cloud/cloud.spec.json, Zone RRSets) defines record
+            # values in presentation format, MX as ``10 smtp.example.com.``;
+            # octodns-hetzner's ``_params_for_CAA`` sends exactly this form on
+            # both its dnsapi and hcloud backends, and community.dns's Hetzner
+            # module passes it through unchanged on the new API.
             return caa_presentation(value)
         if rtype in _HOSTNAME_TARGET_TYPES:
             return cls._absolute(value)
@@ -514,17 +521,27 @@ class HetznerDNSDriver(CloudDNSDriverBase):
             value = self._wire_value(rec)
             current = await self._get_rrset(client, zone_fqdn, name, rtype)
             values = [r.get("value") for r in (current or {}).get("records") or []]
+            # A held CAA value may be spelled differently from ours (a release
+            # before #2959 sent the stored value as typed, e.g. unquoted). It
+            # is the same record, and Hetzner identifies a record by its exact
+            # value, so match by CAA key and remove the HELD spelling.
+            held = value
+            if rtype == "CAA":
+                held = next(
+                    (v for v in values if isinstance(v, str) and caa_key(v) == caa_key(value)),
+                    value,
+                )
 
             if change.op == "delete":
-                if current is None or value not in values:
+                if current is None or held not in values:
                     return  # idempotent delete — nothing to remove
-                if values == [value]:
+                if values == [held]:
                     await self._delete_rrset(client, zone_fqdn, name, rtype)
                 else:
                     await self._post_action(
                         client,
                         f"{self._rrset_path(zone_fqdn, name, rtype)}/actions/remove_records",
-                        {"records": [{"value": value}]},
+                        {"records": [{"value": held}]},
                     )
                 return
 
@@ -533,7 +550,7 @@ class HetznerDNSDriver(CloudDNSDriverBase):
             if current is None:
                 await self._create_rrset(client, zone_fqdn, name, rtype, [value], rec.ttl)
                 return
-            if value not in values:
+            if held not in values:
                 await self._post_action(
                     client,
                     f"{self._rrset_path(zone_fqdn, name, rtype)}/actions/add_records",

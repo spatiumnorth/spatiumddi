@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 
-from app.drivers.dns._caa import caa_key, caa_presentation
+from app.drivers.dns._caa import caa_key, caa_presentation, parse_caa
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -266,9 +266,44 @@ class VultrDNSDriver(CloudDNSDriverBase):
             return VultrDNSDriver._srv_data(rec)
         if rec.record_type.upper() == "CAA":
             # Vultr keeps the CAA record in its one ``data`` field in zone-file
-            # form, ``<flags> <tag> "<value>"`` (#2959).
+            # form, ``<flags> <tag> "<value>"`` (#2959). Sources: Vultr's own
+            # external-dns webhook (github.com/vultr/external-dns-vultr-webhook,
+            # internal/vultr/vultr_test.go fixture ``Data: 0 issue
+            # "letsencrypt.org"``) and DNSControl's Vultr provider
+            # (providers/vultr/vultrProvider.go writes ``%v %s "%s"`` and reads
+            # the same string back). The API docs page itself is not
+            # machine-readable, so these two are the evidence.
             return caa_presentation(rec.value)
         return rec.value
+
+    @staticmethod
+    def record_value_refusal(record_type: str, value: str) -> str | None:
+        """Why Vultr cannot hold this record value, or None (#2959).
+
+        Checked by the record API before a record is stored. DNSControl's
+        Vultr provider (providers/vultr/auditrecords.go, "Last verified
+        2026-07-26") refuses a CAA whose value is empty or contains
+        whitespace, because Vultr does not round-trip it. A value needing a
+        presentation escape (``"``, ``\\``, or a byte outside printable
+        ASCII) is refused too: DNSControl writes the value inside the quotes
+        unescaped, and how Vultr reads an escape inside a CAA value is not
+        documented, so the record could be stored as something else."""
+        if record_type.upper() != "CAA":
+            return None
+        parsed = parse_caa(value)
+        if parsed is None:
+            return None  # sent as typed, as before; Vultr's own answer stands
+        raw = parsed[2]
+        if not raw:
+            return "Vultr: a CAA record with an empty value cannot be stored."
+        if any(b in b" \t\r\n" for b in raw):
+            return "Vultr: a CAA value containing whitespace cannot be stored on Vultr."
+        if any(b in (0x22, 0x5C) or not 0x20 < b < 0x7F for b in raw):
+            return (
+                "Vultr: a CAA value containing a quote, a backslash or a "
+                "non-printable/non-ASCII byte cannot be stored reliably on Vultr."
+            )
+        return None
 
     def _record_payload(self, change: RecordChange) -> dict[str, Any]:
         rec = change.record
