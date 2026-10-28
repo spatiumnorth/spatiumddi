@@ -42,6 +42,7 @@ from sqlalchemy import func, or_, select, text, update
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -4265,25 +4266,47 @@ async def _standalone_kea_group_matches(
     db: AsyncSession,
 ) -> list[tuple[str, str, str, str | None]]:
     """#2969 — a ``standalone`` group with 2+ Kea members and at least one
-    scope. Scopes belong to the group, so every member renders and serves them
-    with no HA hook to coordinate (``standalone`` never renders HA). Fixed by
-    setting the group's mode to hot-standby / load-balancing, or by leaving one
-    Kea member in the group."""
+    active scope. Scopes belong to the group, so every member renders and
+    serves its active ones with no HA hook to coordinate (``standalone`` never
+    renders HA). Fixed by setting the group's mode to hot-standby /
+    load-balancing, or by leaving one Kea member in the group.
+
+    Kea members only. A group that also has a Windows member is skipped: the
+    failover report above already reports each of its scopes uncoordinated
+    (a mixed group is, #1110), and a second, group-level event for the same
+    fault would page twice. An inactive scope is not rendered into any
+    bundle, so it is not served and does not count."""
     from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup  # noqa: PLC0415
 
     kea_count = func.count(DHCPServer.id)
+    # Aliased, or the subquery would auto-correlate to the outer DHCPServer
+    # join (a Kea row) and never find a Windows member.
+    win = aliased(DHCPServer)
+    has_windows = (
+        select(win.id)
+        .where(win.server_group_id == DHCPServerGroup.id, win.driver == "windows_dhcp")
+        .exists()
+    )
     rows = (
         await db.execute(
             select(DHCPServerGroup.id, DHCPServerGroup.name, kea_count)
             .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
-            .where(DHCPServerGroup.mode == "standalone", DHCPServer.driver == "kea")
+            .where(
+                DHCPServerGroup.mode == "standalone",
+                DHCPServer.driver == "kea",
+                ~has_windows,
+            )
             .group_by(DHCPServerGroup.id, DHCPServerGroup.name)
             .having(kea_count >= 2)
         )
     ).all()
     out: list[tuple[str, str, str, str | None]] = []
     for gid, name, n in rows:
-        has_scope = await db.scalar(select(DHCPScope.id).where(DHCPScope.group_id == gid).limit(1))
+        has_scope = await db.scalar(
+            select(DHCPScope.id)
+            .where(DHCPScope.group_id == gid, DHCPScope.is_active.is_(True))
+            .limit(1)
+        )
         if has_scope is None:
             continue
         out.append(

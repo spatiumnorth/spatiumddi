@@ -28,8 +28,9 @@ from app.api.v1.dhcp._failover_schemas import (
     GroupFailoverResponse,
 )
 from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
-from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.agent_wake import appliance_channel, collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.models.appliance import Appliance
 from app.models.dhcp import HA_MODES, DHCPServerGroup
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteGroupArgs
@@ -491,8 +492,18 @@ async def update_group(
         problem = group_name_problem("dhcp", new_name)
         if problem is not None:
             raise HTTPException(status_code=422, detail=problem)
+    was_ha = g.mode in HA_MODES
     for k, v in changes.items():
         setattr(g, k, v)
+    # #2969 — the HA listener firewall rule (#1167) follows the mode too, and
+    # it rides the supervisor heartbeat, not the DHCP bundle. A mode change
+    # into or out of HA wakes each appliance serving this group so the rule
+    # opens (or closes) with the hook instead of a heartbeat interval later.
+    if (g.mode in HA_MODES) != was_ha:
+        for appliance_id in (
+            await db.execute(select(Appliance.id).where(Appliance.assigned_dhcp_group_id == g.id))
+        ).scalars():
+            collect_wake(appliance_channel(appliance_id))
     # HA tuning (mode / heartbeat / delays / auto-failover), the Kea socket
     # mode (#365) and the packet-worker pool size (#980) all render into
     # every member's bundle, so wake the group channel — the bundle ETag
