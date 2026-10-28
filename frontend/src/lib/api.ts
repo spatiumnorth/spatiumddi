@@ -5845,7 +5845,8 @@ export interface ZoneServerStateEntry {
   // #2042 — ops for this zone the server has not acknowledged yet.
   pending_ops: number;
   // #2316 — `ok` counts; `unreachable` (server not active) never counts as in
-  // sync; `paused` (maintenance) is excluded from the count.
+  // sync; `paused` (maintenance) and `disabled` (is_enabled false, #2927) are
+  // excluded from the count, each listed under its own name.
   freshness: "ok" | "unreachable" | "paused" | "disabled";
   counted: boolean;
 }

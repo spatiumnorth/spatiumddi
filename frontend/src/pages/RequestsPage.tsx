@@ -716,6 +716,15 @@ export default function RequestsPage() {
                         by {r.decided_by_display}
                       </p>
                     ) : null}
+                    {r.decision_note ? (
+                      <p
+                        data-testid="decision-note"
+                        className="mt-1 min-w-0 max-w-xs whitespace-pre-wrap break-words text-xs text-muted-foreground"
+                      >
+                        <span className="font-medium">Note:</span>{" "}
+                        {r.decision_note}
+                      </p>
+                    ) : null}
                   </td>
                   <td className="px-3 py-2 text-xs">
                     {r.requested_by_display}

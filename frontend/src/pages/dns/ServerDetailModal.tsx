@@ -358,7 +358,7 @@ function OverviewInfo({ server }: { server: DNSServer }) {
       />
       <InfoCard
         label="Enabled"
-        value={server.is_enabled ? "yes" : "no (paused)"}
+        value={server.is_enabled ? "yes" : "no (disabled)"}
         accent={server.is_enabled ? undefined : "warning"}
       />
       <InfoCard label="Primary" value={server.is_primary ? "yes" : "no"} />
