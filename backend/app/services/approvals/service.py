@@ -17,6 +17,7 @@ the *state-machine* invariants (a request only ever transitions out of
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -488,16 +489,44 @@ class DecisionUnprocessable(DecisionError):
     status_code = 422
 
 
-def _decision_for_status(status_code: int, detail: str) -> DecisionError:
-    """Map an HTTP 4xx ``apply()`` raised to the matching DecisionError so the
-    approve callers surface the precondition status (#11)."""
-    mapping: dict[int, type[DecisionError]] = {
-        403: DecisionForbidden,
-        404: DecisionNotFound,
-        409: DecisionConflict,
-        422: DecisionUnprocessable,
-    }
-    return mapping.get(status_code, DecisionConflict)(detail)
+def _refusal_text(detail: Any) -> str:
+    """The text an HTTPException's ``detail`` puts on a failed request.
+
+    The requester reads ``error`` on the portal (#2911), so it must be a
+    sentence, not a Python ``repr``. Most details are strings. The IPAM
+    collision check raises ``{"warnings": [...], "requires_confirmation":
+    True}`` — the REST UI's "save anyway" prompt — which has no confirm step
+    at approve time, so each warning is spelled out instead. Anything else
+    falls back to JSON."""
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict) and isinstance(detail.get("warnings"), list):
+        parts: list[str] = []
+        for w in detail["warnings"]:
+            if not isinstance(w, dict):
+                parts.append(str(w))
+                continue
+            kind = w.get("kind")
+            if kind == "fqdn_collision":
+                parts.append(
+                    f"The name {w.get('fqdn')} is already used by {w.get('existing_ip')}"
+                    f" in {w.get('existing_subnet')}."
+                )
+            elif kind == "mac_collision":
+                parts.append(
+                    f"MAC {w.get('mac_address')} is already on {w.get('existing_ip')}"
+                    f" in {w.get('existing_subnet')}."
+                )
+            elif kind == "ptr_collision":
+                parts.append(
+                    f"The reverse name {w.get('ptr_name')} in {w.get('zone')} already"
+                    f" points to {w.get('existing_value')}."
+                )
+            else:
+                parts.append(json.dumps(w, sort_keys=True, default=str))
+        if parts:
+            return " ".join(parts)
+    return json.dumps(detail, sort_keys=True, default=str)
 
 
 async def _safe_rollback(db: AsyncSession) -> None:
@@ -564,36 +593,14 @@ async def _stamp_apply_failed(
 ) -> ChangeRequest:
     """Re-lock the (rolled-back) row and stamp ``pending → approved → failed``.
 
-    Shared by the approve spine's 5xx and generic-exception paths. The
+    Shared by every apply-time refusal except a permission error: a 4xx, a
+    5xx and any other exception all end here (#2911). The
     approval transition was rolled back alongside ``apply()``, so replay it
     before ``mark_failed`` — unless ``apply()`` had already committed it, in
     which case only the failure is stamped (one ``approved`` audit row, not
     two). Raises :class:`DecisionConflict` if the row vanished or another
     actor decided it mid-apply."""
     cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
-    return await _stamp_failed_locked(
-        db,
-        cr,
-        approver=approver,
-        request=request,
-        note=note,
-        error=error,
-        approval_committed=approval_committed,
-    )
-
-
-async def _stamp_failed_locked(
-    db: AsyncSession,
-    cr: ChangeRequest,
-    *,
-    approver: User,
-    request: Request | None,
-    note: str | None,
-    error: str,
-    approval_committed: bool,
-) -> ChangeRequest:
-    """Stamp a row :func:`_relock_after_failed_apply` locked as ``failed``,
-    replaying ``approved`` first unless ``apply()`` already committed it."""
     requester_id = cr.requested_by_user_id
     if not approval_committed:
         await mark_approved(db, cr, approver=approver, request=request, note=note)
@@ -869,45 +876,24 @@ async def approve_change_request(
         await _safe_rollback(db)
         raise DecisionForbidden(str(exc)) from exc
     except HTTPException as exc:
-        # #11: a client 4xx from apply() is NOT an execution failure — it's a
-        # raced precondition the op rejected (e.g. the subnet became
-        # non-empty, or the row vanished, between preview and apply). Surface
-        # the same status, leave the request PENDING (the requester can cancel
-        # or retry once the precondition clears). Only a 5xx (server fault)
-        # falls through to mark_failed below.
+        # Every refusal at approve time is recorded on the request (#2911).
+        # A 4xx from apply() used to leave the row pending (#11): the theory
+        # was a raced precondition that might clear. In practice nobody is
+        # told — the requester sees a pending row with no reason, and which
+        # outcome a refusal got depended on whether the operation happened to
+        # raise HTTPException or ValueError. So a 4xx ends ``failed`` with its
+        # detail, exactly like a 5xx or any other exception; the requester
+        # reads why and can re-submit. OperationPermissionError (above) is the
+        # one refusal that stays pending: it is about THIS approver, and a
+        # different approver may still approve.
         await _safe_rollback(db)
-        sc = exc.status_code
-        if 400 <= sc < 500:
-            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            # Leaving it pending is only possible while it IS pending. If
-            # apply() committed (persisting the approved stamp) before it
-            # raised, the row is approved and nothing would ever move it
-            # again — record the refusal as this approval's failure instead.
-            cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
-            if approval_committed:
-                return await _stamp_failed_locked(
-                    db,
-                    cr,
-                    approver=approver,
-                    request=request,
-                    note=note,
-                    error=detail,
-                    approval_committed=True,
-                )
-            # Release the re-lock. Nothing changed, and committing (rather
-            # than rolling back again) keeps the refreshed approver loaded
-            # for whatever the caller reads next.
-            await db.commit()
-            logger.info(
-                "change_request.apply_precondition",
-                change_request_id=str(cr_id),
-                operation=op.name,
-                status_code=sc,
-                detail=detail,
-            )
-            raise _decision_for_status(sc, detail) from exc
         return await _stamp_apply_failed(
-            db, cr_id, approver=approver, request=request, note=note, error=str(exc.detail)
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=_refusal_text(exc.detail),
         )
     except Exception as exc:  # noqa: BLE001
         # apply() rolled back its own transaction; reload + lock to stamp the

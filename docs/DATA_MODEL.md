@@ -461,6 +461,13 @@ surface filters by `origin`, so neither queue ever renders the other's
 rows. `justification` is the requester's free-text "why" and is NULL on
 gate rows, which carry the policy-derived `risk_reason` instead.
 
+When the operation's `apply()` refuses at approve time (a 4xx such as a
+conflict that appeared after submit, a 5xx, or any other error), the row
+ends `failed` with the reason in `error`, after its `approved` stamp, and
+the approve answers 200, so the requester can read why (#2911). The only
+refusal that leaves it `pending` is a permission error about the approver
+(403), because a different approver may still approve it.
+
 ---
 
 ## 10. Observability + audit

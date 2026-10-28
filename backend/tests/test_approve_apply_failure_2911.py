@@ -148,17 +148,37 @@ async def test_change_requests_approve_records_failed(
 
 
 @pytest.mark.asyncio
-async def test_change_requests_approve_4xx_stays_pending(
+async def test_change_requests_approve_4xx_records_failed(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#11's contract on the gate router too: a raced precondition 4xx keeps
-    its status and leaves the request pending, with no decision audited."""
-    cr_id, atoken, _ = await _pending_gate_request(client, db_session)
+    """A 4xx from apply() ends ``failed`` on the gate router too (#2911)."""
+    cr_id, atoken, approver = await _pending_gate_request(client, db_session)
     _patch_apply(
         monkeypatch, "delete_subnet", _raising(HTTPException(status_code=409, detail="raced"))
     )
     r = await client.post(f"/api/v1/change-requests/{cr_id}/approve", headers=_auth(atoken))
-    assert r.status_code == 409, r.text
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "failed"
+    assert body["error"] == "raced"
+    assert body["decided_by_user_id"] == str(approver.id)
+    assert await _audit_actions(db_session, cr_id) == ["requested", "approved", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_change_requests_approve_permission_error_stays_pending(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one refusal left pending: a permission error is about this
+    approver, and a different approver may still approve."""
+    cr_id, atoken, _ = await _pending_gate_request(client, db_session)
+    _patch_apply(
+        monkeypatch,
+        "delete_subnet",
+        _raising(operations.OperationPermissionError("delete", "subnet")),
+    )
+    r = await client.post(f"/api/v1/change-requests/{cr_id}/approve", headers=_auth(atoken))
+    assert r.status_code == 403, r.text
     assert (await _state(db_session, cr_id)).state == "pending"
     assert await _audit_actions(db_session, cr_id) == ["requested"]
 
@@ -225,8 +245,7 @@ async def test_apply_that_committed_then_raised_does_not_strand_approved(
     is not ``pending`` when the spine re-locks it. That is still this
     approval's own failure: it ends ``failed`` with the reason, rather than a
     bare error that leaves it ``approved`` forever (never expired, never
-    decidable). Holds for a 4xx too — a request that is no longer pending
-    cannot be "left pending"."""
+    decidable). Only one ``approved`` audit row is written."""
     req_id, token, _, appr = await _pending_ip_request(client, db_session)
     _patch_apply(monkeypatch, "create_ip_address", _commit_then_raising(exc))
 
@@ -284,3 +303,28 @@ async def test_concurrent_reject_is_not_overwritten_by_failed(
     assert cr.error is None
     assert cr.decided_by_user_id == other_id
     assert await _audit_actions(db_session, req_id) == ["requested", "rejected"]
+
+
+def test_refusal_text_is_readable_for_every_detail_shape() -> None:
+    """A dict ``detail`` must not reach the requester as a Python repr."""
+    from app.services.approvals.service import _refusal_text
+
+    assert _refusal_text("MAC taken") == "MAC taken"
+    assert (
+        _refusal_text(
+            {
+                "warnings": [
+                    {
+                        "kind": "mac_collision",
+                        "mac_address": "aa:bb:cc:dd:ee:ff",
+                        "existing_ip": "10.0.0.5",
+                        "existing_subnet": "10.0.0.0/24",
+                    }
+                ],
+                "requires_confirmation": True,
+            }
+        )
+        == "MAC aa:bb:cc:dd:ee:ff is already on 10.0.0.5 in 10.0.0.0/24."
+    )
+    assert _refusal_text({"b": 1, "a": None}) == '{"a": null, "b": 1}'
+    assert _refusal_text([{"loc": ["x"], "msg": "bad"}]) == '[{"loc": ["x"], "msg": "bad"}]'

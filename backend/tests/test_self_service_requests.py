@@ -717,20 +717,17 @@ async def test_approve_when_apply_raises_a_5xx_records_failed(
 
 
 @pytest.mark.asyncio
-async def test_approve_when_apply_raises_a_4xx_keeps_the_status_and_stays_pending(
+async def test_approve_when_apply_raises_a_4xx_records_failed(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#11's documented behaviour, unchanged: a client 4xx is a raced
-    precondition, surfaced with its status and the request left pending."""
+    """A 4xx refusal from apply() is recorded like any other (#2911): the
+    request ends ``failed`` with the detail the requester can read. It used to
+    stay pending (#11), telling nobody why."""
     from fastapi import HTTPException
 
-    req_id, token, _, _ = await _pending_ip_request(client, db_session)
+    req_id, token, _, appr = await _pending_ip_request(client, db_session)
     _patched_apply(monkeypatch, HTTPException(status_code=409, detail="raced"))
-    resp = await client.post(f"/api/v1/requests/{req_id}/approve", headers=_auth(token), json={})
-    assert resp.status_code == 409, resp.text
-    assert "raced" in resp.text
-    row = (await client.get(f"/api/v1/requests/{req_id}", headers=_auth(token))).json()
-    assert row["state"] == "pending"
+    await _assert_failed_with(client, db_session, req_id, token, appr, "raced")
 
 
 @pytest.mark.asyncio

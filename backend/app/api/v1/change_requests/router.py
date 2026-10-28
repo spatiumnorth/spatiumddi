@@ -566,21 +566,22 @@ async def approve_request(
        (409, left ``pending`` so the requester can cancel).
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
-       in ``old_value.requested_by``. A client 4xx raised by ``apply()``
-       leaves the row ``pending`` and surfaces the status; a server fault
-       or any other exception marks it ``failed`` (200, with ``error``), as
-       does a 4xx raised after ``apply()`` already committed the approval
-       (#2911).
+       in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx
+       or any other exception — the row is stamped ``approved`` then
+       ``failed`` with the reason in ``error`` and the call answers 200
+       (#2911), so the requester can read why. The one exception is a
+       permission error about this approver: 403, left ``pending``, since a
+       different approver may still approve.
     """
     await _assert_gate_row(db, cr_id)
     note = body.decision_note if body is not None else None
 
     # Delegate to the single two-person spine (services/approvals/service.py)
     # so this HTTP path and the AI propose→apply path enforce the IDENTICAL
-    # invariants (#5 fail-closed on a deleted requester, #11 client-4xx from
-    # apply leaves the row pending, #13 expiry routes through the audited
-    # mark_expired, #14 mark_failed carries the requester id, #15 guarded
-    # rollback). DecisionError subclasses carry the right HTTP status.
+    # invariants (#5 fail-closed on a deleted requester, #2911 every apply
+    # refusal but a permission error ends failed, #13 expiry routes through
+    # the audited mark_expired, #14 mark_failed carries the requester id,
+    # #15 guarded rollback). DecisionError subclasses carry the right HTTP status.
     try:
         cr = await approve_change_request(
             db, cr_id, approver=current_user, request=request, note=note
