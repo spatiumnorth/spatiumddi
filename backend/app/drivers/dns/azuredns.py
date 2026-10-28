@@ -436,7 +436,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
             if not remaining:
                 client.record_sets.delete(rg, zone_label, relative, rtype)
                 return
-            ttl = getattr(existing, "ttl", None) or 3600
+            ttl = getattr(existing, "ttl", None)
+            if ttl is None:
+                ttl = 3600
             params = {"ttl": ttl, _RECORD_TYPE_TO_AZURE_ATTR[rtype]: remaining}
             client.record_sets.create_or_update(rg, zone_label, relative, rtype, params)
 

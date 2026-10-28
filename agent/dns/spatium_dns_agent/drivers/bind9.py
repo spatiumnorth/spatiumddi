@@ -5424,7 +5424,8 @@ class Bind9Driver(DriverBase):
         overlay[key] = new
         before = _zone_apex(_apex_zone(state))
         after = _zone_apex(_apex_zone(new))
-        ttl = int(state.get("ttl") or 3600)
+        _state_ttl = state.get("ttl")
+        ttl = int(_state_ttl) if _state_ttl is not None else 3600
         glue = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
         if after.placeholder_glue and not before.placeholder_glue:
             upd.add(glue, ttl, "A", _PLACEHOLDER_NS_ADDRESS)

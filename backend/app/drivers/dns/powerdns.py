@@ -284,7 +284,7 @@ class PowerDNSDriver(DNSDriver):
             {
                 "name": qname,
                 "type": rtype,
-                "ttl": records[0].ttl or zone.ttl,
+                "ttl": records[0].ttl if records[0].ttl is not None else zone.ttl,
                 "records": rrs,
             }
             for (qname, rtype), rrs in sorted(rrsets.items())

@@ -85,6 +85,7 @@ from app.drivers.dns import (
     get_driver,
     is_agentless,
     supports_topology_pull,
+    ttl_refusal,
 )
 from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
@@ -8602,6 +8603,7 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _check_driver_ttl([body.ttl], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
@@ -8732,6 +8734,8 @@ async def update_record(
         return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
+    if "ttl" in changes:
+        await _check_driver_ttl([changes["ttl"]], group_id, db)
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -9298,6 +9302,7 @@ async def bulk_create_records(
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_ttl([r.ttl for r in body.records], group_id, db)
 
     # Normalise first: MX defaults its priority to 10, so an MX with and one
     # without an explicit 10 are the same record and must compare equal.
@@ -9838,6 +9843,7 @@ async def import_zone_commit(
     _reject_if_synthesised_zone(zone, "import")
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_ttl([c.ttl for c in (*diff.to_create, *diff.to_update)], group_id, db)
 
     # #2275 — a view-scoped import creates or deletes records in that view,
     # which moves where the zone renders.
@@ -10548,6 +10554,10 @@ async def import_zone_spreadsheet_commit(
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
 
+    await _check_driver_ttl(
+        [c.ttl for c in plan.creates] + [u.candidate.ttl for u in plan.updates], group_id, db
+    )
+
     # #2275 — rows carry a view, and a record's view places its zone there.
     render_guard = await RenderGuard.capture(db, group_id, [zone.name])
     batch_id = uuid.uuid4()
@@ -10862,6 +10872,24 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
                 f"supports manual DNSSEC key management (#49)."
             ),
         )
+
+
+async def _check_driver_ttl(ttls: Iterable[int | None], group_id: uuid.UUID, db: DB) -> None:
+    """422 a record TTL a driver in the zone's group cannot publish exactly (#2942).
+
+    Without it a TTL of 0 reaches Cloudflare (refused, so the stored record
+    never publishes) or Vultr / Linode (read as "automatic", so a different
+    TTL publishes). Empty groups pass, as for the record-type gate.
+    """
+    wanted = {t for t in ttls if t is not None}
+    if not wanted:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    for driver in sorted({d for d in res.scalars().all() if d}):
+        for ttl in sorted(wanted):
+            reason = ttl_refusal(driver, ttl)
+            if reason is not None:
+                raise HTTPException(status_code=422, detail=reason)
 
 
 async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID, db: DB) -> None:

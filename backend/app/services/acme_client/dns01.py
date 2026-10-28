@@ -353,7 +353,7 @@ async def cleanup(db: AsyncSession, handle: DNS01Handle) -> None:
                 "name": rec.name,
                 "type": "TXT",
                 "value": rec.value,
-                "ttl": rec.ttl or ACME_TXT_TTL,
+                "ttl": rec.ttl if rec.ttl is not None else ACME_TXT_TTL,
             },
             target_serial=target_serial,
         )
