@@ -328,6 +328,17 @@ async def _preview_create_ip_address(
         # Truncate to keep the preview readable.
         d = args.description if len(args.description) < 80 else args.description[:77] + "..."
         parts.append(f"desc={d!r}")
+    if args.hostname:
+        # #2900 — say what apply will publish, the way the REST create does:
+        # the A / AAAA record lands in the subnet's effective forward zone.
+        from app.api.v1.ipam.router import _resolve_effective_zone  # local import — avoid cycle
+        from app.models.dns import DNSZone
+
+        zone_id = await _resolve_effective_zone(db, subnet)
+        zone = await db.get(DNSZone, zone_id) if zone_id else None
+        if zone is not None:
+            rtype = "AAAA" if addr_obj.version == 6 else "A"
+            parts.append(f"publishes {rtype} {args.hostname}.{zone.name.rstrip('.')}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
@@ -336,10 +347,10 @@ async def _apply_create_ip_address(
 ) -> dict[str, Any]:
     """Re-validate at apply time + insert the row.
 
-    Mirrors the conflict checks from the IPAM router's create_address
-    handler. We don't import that handler directly (it's bound to a
-    FastAPI request shape) — duplicating the few-line conflict check
-    is the simpler alternative until the apply set grows.
+    A hostname-bearing address delegates to the IPAM router's
+    ``create_address`` (DNS sync + every other side effect of a manual
+    allocation, #2900). One without a hostname publishes nothing and is
+    inserted directly after the same few-line conflict checks.
     """
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
 
@@ -377,6 +388,42 @@ async def _apply_create_ip_address(
 
     if args.status == "static_dhcp" and not args.mac_address:
         raise ValueError("mac_address is required when status is 'static_dhcp'")
+
+    if args.hostname:
+        # #2900 — a named address goes through the REST create, so an
+        # approved request / applied proposal does everything a manual
+        # allocation does: the A (+ PTR) record in the subnet's effective
+        # zone under ``strict`` (a name DNS refuses fails the apply and
+        # rolls the address back with it), the collision + dynamic-pool
+        # checks (409 — ``force`` is the operator's call, not an approver's,
+        # so the apply refuses rather than overriding), MAC history, the
+        # static-DHCP reservation for ``static_dhcp`` and utilisation. The
+        # handler commits and writes its own audit row; the DNS wake rides
+        # the caller's ``collecting_wakes()``.
+        from app.api.v1.ipam.router import (  # local import — avoid cycle
+            IPAddressCreate,
+            create_address,
+        )
+
+        created = await create_address(
+            subnet.id,
+            IPAddressCreate(
+                address=args.address,
+                status=args.status,
+                hostname=args.hostname,
+                mac_address=args.mac_address,
+                description=args.description or "",
+            ),
+            user,
+            db,
+        )
+        return {
+            "id": str(created.id),
+            "address": args.address,
+            "subnet_id": str(subnet.id),
+            "status": args.status,
+            "hostname": args.hostname,
+        }
 
     row = IPAddress(
         subnet_id=subnet.id,
