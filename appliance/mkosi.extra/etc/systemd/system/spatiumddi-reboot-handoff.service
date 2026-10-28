@@ -1,0 +1,26 @@
+[Unit]
+Description=Uncordon this node after a Fleet reboot that handed its PostgreSQL primary off (issue #2849)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/2849
+# Where k3s runs, and only there: k3s.service's own conditions.
+ConditionKernelCommandLine=!boot=live
+ConditionPathExists=/etc/spatiumddi/appliance-release
+# Ordering only: a unit never pulls k3s in (#1723). The runner waits for
+# the API itself.
+After=k3s.service
+
+[Service]
+# Before a Fleet reboot of the node holding CloudNativePG's primary,
+# spatiumddi-reboot-agent cordons the node, marked with the annotation
+# spatium.io/reboot-cordoned, and waits for CNPG to switch the primary over
+# to another node (spatium-reboot-handoff --before-reboot). Back up, this
+# uncordons the node once the API answers, and only when the annotation is
+# on it: CNPG's instance of this node keeps its volume here and waits for
+# it. An operator's cordon, or a per-node upgrade's drain, carries no such
+# annotation and stays. exec, not oneshot: boot does not wait for the API.
+# The runner gives up after 15 minutes and always exits 0; the next boot
+# looks again.
+Type=exec
+ExecStart=/usr/local/bin/spatium-reboot-handoff --at-boot
+
+[Install]
+WantedBy=multi-user.target

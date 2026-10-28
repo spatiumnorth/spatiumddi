@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""spatium-reboot-handoff — a Fleet reboot of a cluster node moves the
+PostgreSQL primary off the node before the node goes down (#2849).
+
+The kubelet's graceful node shutdown (#1976) stops the primary with the rest
+of the node's pods, and CloudNativePG fails over only once it has stopped:
+while the node is itself shutting down, and with whatever of the cluster's
+control (the CNPG operator, the endpoint controllers) runs on that node going
+down too. The API through the other nodes then failed for 24 to 69 s with the
+primary killed at the kubelet's 45 s (#2849), and still for up to 44 s once
+its shutdown was bounded to 15 s (#2878).
+
+Before the reboot (``--before-reboot``, run by spatiumddi-reboot-agent): when
+the current primary of a CNPG Cluster runs on this node, and CNPG can switch
+over (two or more instances, all ready, one at least on another node, no
+switchover or failover under way), this cordons the node and waits until CNPG
+has switched the primary over to an instance on another node and the
+Cluster's ``-rw`` Service lists that instance ready, and no instance of this
+node. CNPG switches over by itself when the node of its primary turns
+unschedulable (internal/controller/replicas.go), as it does for the drain of
+a per-node upgrade. The wait is bounded to SPATIUM_HANDOFF_WAIT_S; past it,
+the reboot goes on as before. The cordon carries the annotation
+``spatium.io/reboot-cordoned``. A node already unschedulable (an operator's
+cordon, an upgrade's drain) is left as it is and not marked, and the cordon's
+patch carries the resourceVersion it read, so a cordon set by someone else
+meanwhile is never taken for this handoff's own.
+
+At each boot (``--at-boot``, spatiumddi-reboot-handoff.service): once the API
+answers, a node carrying that annotation is uncordoned and the annotation is
+dropped. CNPG's instance of this node waits for it, as its volume is on this
+node. A cordon without the annotation is never touched, and a Node not
+registered yet (a first boot) has none to undo. The uncordon is a JSON patch
+that holds only while the annotation is the one read, and that carries no
+resourceVersion: k3s and its supervisor write the Node's labels, annotations
+and status for seconds after a boot, and three merge patches carrying the
+resourceVersion they had read all lost to those writes (#2849). A read or a
+patch that fails is tried again, after a pause, until the boot's budget is
+spent. ``--undo`` does the same with a short budget, for a reboot that did not
+happen.
+
+Best effort: it never holds a reboot or a boot past its budget, logs what it
+did or could not, and always exits 0. The SPATIUM_* variables below exist for
+appliance/tests.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+KUBECTL = shlex.split(os.environ.get("SPATIUM_KUBECTL", "/usr/local/bin/k3s kubectl"))
+KUBECONFIG = os.environ.get("SPATIUM_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
+#: --at-boot: how long to wait for the API (as spatium-clear-shutdown-pods).
+API_WAIT_S = float(os.environ.get("SPATIUM_API_WAIT_S", "900"))
+API_POLL_S = float(os.environ.get("SPATIUM_API_POLL_S", "5"))
+#: --before-reboot and --undo: how long to wait for the API.
+API_WAIT_SHORT_S = float(os.environ.get("SPATIUM_API_WAIT_SHORT_S", "15"))
+#: --before-reboot: how long to wait, once cordoned, for the switchover. A
+#: switchover takes seconds; ha/cnpg_rolling_update's bound is 30 s.
+HANDOFF_WAIT_S = float(os.environ.get("SPATIUM_HANDOFF_WAIT_S", "90"))
+HANDOFF_POLL_S = float(os.environ.get("SPATIUM_HANDOFF_POLL_S", "2"))
+#: --before-reboot: how long the cordon may keep trying.
+CORDON_WAIT_S = float(os.environ.get("SPATIUM_CORDON_WAIT_S", "15"))
+#: The pause before a failed read or patch of the Node is tried again; it
+#: doubles up to RETRY_MAX_S.
+RETRY_FIRST_S = float(os.environ.get("SPATIUM_RETRY_FIRST_S", "1"))
+RETRY_MAX_S = float(os.environ.get("SPATIUM_RETRY_MAX_S", "10"))
+
+CORDON_ANNOTATION = "spatium.io/reboot-cordoned"
+CLUSTERS = "clusters.postgresql.cnpg.io"
+CLUSTER_LABEL = "cnpg.io/cluster"
+#: CNPG's instance pods (pkg/specs/pods.go), not its jobs' pods.
+INSTANCE_LABEL = "cnpg.io/podRole=instance"
+#: What the -rw Service selects on (CNPG pkg/specs/services.go).
+ROLE_LABEL = "cnpg.io/instanceRole"
+
+
+def log(msg: str) -> None:
+    print(f"[reboot-handoff] {msg}", flush=True)
+
+
+def kubectl(*args: str, timeout: float = 10) -> tuple[int, str, str]:
+    env = {**os.environ, "KUBECONFIG": KUBECONFIG}
+    try:
+        res = subprocess.run(
+            [*KUBECTL, "--request-timeout=5s", *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return 1, "", f"{type(ex).__name__}: {ex}"
+    return res.returncode, res.stdout, res.stderr
+
+
+def last_line(text: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return lines[-1][:300] if lines else "no output"
+
+
+def node_name() -> str:
+    """The Node k3s registered for this host: the hostname, lower-cased (k3s
+    GetHostnameAndIPs; the appliance sets neither node-name nor with-node-id)."""
+    return (os.environ.get("SPATIUM_NODE_NAME") or socket.gethostname()).strip().lower()
+
+
+def get_json(*args: str) -> tuple[dict | None, str]:
+    """(the object kubectl printed, "") or (None, why)."""
+    rc, out, err = kubectl("get", *args, "-o", "json")
+    if rc != 0:
+        return None, last_line(err or out)
+    try:
+        return json.loads(out), ""
+    except ValueError as ex:
+        return None, f"unreadable answer: {ex}"
+
+
+def wait_api(budget_s: float) -> bool:
+    deadline = time.monotonic() + budget_s
+    while True:
+        rc, _, _ = kubectl("get", "--raw=/readyz")
+        if rc == 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(API_POLL_S)
+
+
+# ---- pure: what the API shows ---------------------------------------------------
+
+
+def instance_selector(cluster_name: str | None) -> str:
+    return f"{CLUSTER_LABEL}={cluster_name},{INSTANCE_LABEL}"
+
+
+def key_of(cluster: dict) -> str:
+    meta = cluster.get("metadata") or {}
+    return f"{meta.get('namespace')}/{meta.get('name')}"
+
+
+def pod_named(pods: list[dict], name: str) -> dict | None:
+    for pod in pods:
+        if (pod.get("metadata") or {}).get("name") == name:
+            return pod
+    return None
+
+
+def node_of(pods: list[dict], name: str) -> str:
+    return ((pod_named(pods, name) or {}).get("spec") or {}).get("nodeName") or ""
+
+
+def primary_here(cluster: dict, pods: list[dict], node: str) -> str:
+    """The name of the Cluster's current primary when it runs on `node`, else ""."""
+    primary = (cluster.get("status") or {}).get("currentPrimary") or ""
+    return primary if primary and node_of(pods, primary) == node else ""
+
+
+def switch_blocker(cluster: dict, pods: list[dict], node: str) -> str:
+    """Why CNPG would not switch the primary off `node` now, or "" when it would
+    (internal/controller/replicas.go, setPrimaryOnSchedulableNode: every
+    instance ready, all but one on other nodes, and no switchover under way)."""
+    spec, status = cluster.get("spec") or {}, cluster.get("status") or {}
+    instances = int(spec.get("instances") or 0)
+    ready = int(status.get("readyInstances") or 0)
+    if instances < 2:
+        return "a single instance, no replica to switch over to"
+    if ready != instances:
+        return f"{ready} of its {instances} instances ready"
+    if status.get("currentPrimary") != status.get("targetPrimary"):
+        return (f"a switchover or failover is under way (target "
+                f"{status.get('targetPrimary') or 'none'})")
+    elsewhere = sum(
+        1 for p in pods if (p.get("spec") or {}).get("nodeName") not in ("", None, node)
+    )
+    if elsewhere < instances - 1:
+        return f"only {elsewhere} of its instances on other nodes"
+    return ""
+
+
+def ready_endpoints(slices: list[dict]) -> list[dict]:
+    """The endpoints the -rw Service's EndpointSlices list as ready (an unset
+    ready condition counts as ready, as kube-proxy reads it)."""
+    out = []
+    for sl in slices:
+        for ep in sl.get("endpoints") or []:
+            if (ep.get("conditions") or {}).get("ready") is not False:
+                out.append(ep)
+    return out
+
+
+def handed_off(cluster: dict, pods: list[dict], slices: list[dict], node: str) -> tuple[bool, str]:
+    """(True, where the primary is now) once the Cluster's primary runs on
+    another node, is labelled primary, and its -rw Service lists it ready and no
+    pod of `node`; else (False, what is still missing)."""
+    status = cluster.get("status") or {}
+    current, target = status.get("currentPrimary") or "", status.get("targetPrimary") or ""
+    if not current or current != target:
+        return False, f"switching over to {target or 'none'}"
+    pod = pod_named(pods, current)
+    where = node_of(pods, current)
+    if pod is None or not where:
+        return False, f"{current} is not listed yet"
+    if where == node:
+        return False, f"{current} is still the primary here"
+    if ((pod.get("metadata") or {}).get("labels") or {}).get(ROLE_LABEL) != "primary":
+        return False, f"{current} is not labelled primary yet"
+    ready = ready_endpoints(slices)
+    names = {(ep.get("targetRef") or {}).get("name") for ep in ready}
+    if current not in names:
+        return False, f"the -rw Service does not list {current} ready yet"
+    here = sorted(
+        (ep.get("targetRef") or {}).get("name") or "?"
+        for ep in ready
+        if (ep.get("nodeName") or node_of(pods, (ep.get("targetRef") or {}).get("name") or ""))
+        == node
+    )
+    if here:
+        return False, f"the -rw Service still lists {', '.join(here)} of this node"
+    return True, f"{current} on {where}"
+
+
+def annotation_path(key: str) -> str:
+    """The JSON pointer (RFC 6901) of an annotation, "~" and "/" escaped."""
+    return "/metadata/annotations/" + key.replace("~", "~0").replace("/", "~1")
+
+
+def cordon_patch(resource_version: str, stamp: str) -> dict:
+    """A merge patch that cordons the Node and marks the cordon as this
+    handoff's. The resourceVersion read is its precondition: a cordon someone
+    else set since that read fails it, and is never taken for this one's."""
+    return {
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {CORDON_ANNOTATION: stamp},
+        },
+        "spec": {"unschedulable": True},
+    }
+
+
+def uncordon_patch(stamp: str) -> list[dict]:
+    """A JSON patch that uncordons the Node and drops the mark. The apiserver
+    applies it to the Node as it is when the patch lands, and only while the
+    mark still holds `stamp`; else it changes nothing. It carries no
+    resourceVersion, so the writes k3s and the kubelet make to the Node at
+    boot cannot fail it (#2849)."""
+    path = annotation_path(CORDON_ANNOTATION)
+    return [
+        {"op": "test", "path": path, "value": stamp},
+        {"op": "remove", "path": path},
+        # add, not replace: an operator's uncordon while the node was down
+        # left no unschedulable field to replace
+        {"op": "add", "path": "/spec/unschedulable", "value": False},
+    ]
+
+
+# ---- the node ------------------------------------------------------------------
+
+
+def patch_node(node: str, body: dict | list, patch_type: str) -> str:
+    """"" once the apiserver took the patch, else kubectl's last line. What
+    follows a failure is decided from a fresh read of the Node, not from these
+    words."""
+    rc, out, err = kubectl("patch", "node", node, f"--type={patch_type}", "-p", json.dumps(body))
+    return "" if rc == 0 else last_line(f"{out}\n{err}")
+
+
+def not_found(why: str) -> bool:
+    return "NotFound" in why or "not found" in why
+
+
+def pauses():
+    """RETRY_FIRST_S, doubling, then RETRY_MAX_S for ever."""
+    pause = RETRY_FIRST_S
+    while True:
+        yield pause
+        pause = min(pause * 2, RETRY_MAX_S)
+
+
+def cordon(node: str, budget_s: float) -> tuple[str, str]:
+    """(cordoned | already | pre_cordoned | gone | failed, detail). A read or
+    patch that fails (the Node written since it was read, an API error) is
+    tried again from a fresh read, after a pause, until `budget_s` is spent."""
+    deadline = time.monotonic() + budget_s
+    waits = pauses()
+    sent: set[str] = set()
+    tries, last = 0, ""
+    while True:
+        obj, why = get_json("node", node)
+        if obj is None:
+            if not_found(why):
+                return "gone", why
+            last = f"could not read the Node: {why}"
+        else:
+            meta, spec = obj.get("metadata") or {}, obj.get("spec") or {}
+            mark = (meta.get("annotations") or {}).get(CORDON_ANNOTATION)
+            if spec.get("unschedulable"):
+                if mark is None:
+                    return "pre_cordoned", ""
+                # a patch of ours whose answer was lost had landed
+                return ("cordoned" if mark in sent else "already"), ""
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            sent.add(stamp)
+            tries += 1
+            last = patch_node(node, cordon_patch(meta.get("resourceVersion") or "", stamp),
+                              "merge")
+            if not last:
+                return "cordoned", ""
+        pause = next(waits)
+        if time.monotonic() + pause > deadline:
+            return "failed", f"{tries} tries; the last: {last}"
+        log(f"{node}: not cordoned yet ({last}); trying again in {pause:g} s")
+        time.sleep(pause)
+
+
+def uncordon(node: str, budget_s: float) -> tuple[str, str]:
+    """(uncordoned | not_ours | gone | failed, detail): only a Node carrying
+    CORDON_ANNOTATION is touched, and only while the mark is the one read. A
+    read or patch that fails is tried again from a fresh read, after a pause,
+    until `budget_s` is spent."""
+    deadline = time.monotonic() + budget_s
+    waits = pauses()
+    sent = ""
+    tries, last = 0, ""
+    while True:
+        obj, why = get_json("node", node)
+        if obj is None:
+            if not_found(why):
+                return "gone", why
+            last = f"could not read the Node: {why}"
+        else:
+            meta, spec = obj.get("metadata") or {}, obj.get("spec") or {}
+            mark = (meta.get("annotations") or {}).get(CORDON_ANNOTATION)
+            if mark is None:
+                if sent and not spec.get("unschedulable"):
+                    # a patch of ours whose answer was lost had landed
+                    return "uncordoned", sent
+                return "not_ours", ""
+            sent = mark
+            tries += 1
+            last = patch_node(node, uncordon_patch(mark), "json")
+            if not last:
+                return "uncordoned", mark
+        pause = next(waits)
+        if time.monotonic() + pause > deadline:
+            return "failed", f"{tries} tries; the last: {last}"
+        log(f"{node}: not uncordoned yet ({last}); trying again in {pause:g} s")
+        time.sleep(pause)
+
+
+# ---- the runs ------------------------------------------------------------------
+
+
+def cluster_state(ns: str, name: str) -> tuple[dict | None, list[dict], list[dict], str]:
+    """(the Cluster, its instance pods, its -rw EndpointSlices, why not read)."""
+    cluster, why = get_json(CLUSTERS, "-n", ns, name)
+    if cluster is None:
+        return None, [], [], why
+    pods, why = get_json("pods", "-n", ns, "-l", instance_selector(name))
+    if pods is None:
+        return None, [], [], why
+    slices, why = get_json(
+        "endpointslices.discovery.k8s.io",
+        "-n",
+        ns,
+        "-l",
+        f"kubernetes.io/service-name={name}-rw",
+    )
+    if slices is None:
+        return None, [], [], why
+    return cluster, pods.get("items") or [], slices.get("items") or [], ""
+
+
+def before_reboot() -> int:
+    """Cordon this node and wait for CNPG to switch its primary off it (#2849)."""
+    node = node_name()
+    if not wait_api(API_WAIT_SHORT_S):
+        log(f"{node}: no API within {API_WAIT_SHORT_S:.0f} s: nothing handed off")
+        return 0
+    listed, why = get_json(CLUSTERS, "--all-namespaces")
+    if listed is None:
+        log(f"{node}: could not list the CNPG Clusters ({why}): nothing handed off")
+        return 0
+    held: dict[str, str] = {}
+    for cluster in listed.get("items") or []:
+        meta = cluster.get("metadata") or {}
+        pods, why = get_json(
+            "pods", "-n", meta.get("namespace") or "", "-l", instance_selector(meta.get("name"))
+        )
+        if pods is None:
+            log(f"{key_of(cluster)}: could not list its instances ({why})")
+            continue
+        items = pods.get("items") or []
+        primary = primary_here(cluster, items, node)
+        if not primary:
+            continue
+        blocker = switch_blocker(cluster, items, node)
+        if blocker:
+            log(f"{key_of(cluster)}: its primary {primary} stays on {node}, as CNPG would not "
+                f"switch over now ({blocker})")
+            continue
+        held[key_of(cluster)] = primary
+    if not held:
+        log(f"{node}: no CNPG primary to hand off")
+        return 0
+
+    outcome, detail = cordon(node, CORDON_WAIT_S)
+    if outcome in ("gone", "failed"):
+        log(f"{node}: could not cordon it ({detail}): nothing handed off")
+        return 0
+    said = {
+        "cordoned": f"cordoned {node} (annotation {CORDON_ANNOTATION})",
+        "already": f"{node} is already cordoned by an earlier handoff",
+        "pre_cordoned": f"{node} was already unschedulable: left as it is, not marked",
+    }[outcome]
+    log(f"{said}; waiting up to {HANDOFF_WAIT_S:.0f} s for CNPG to switch "
+        f"{', '.join(f'{k} ({v})' for k, v in sorted(held.items()))} over")
+    started = time.monotonic()
+    deadline = started + HANDOFF_WAIT_S
+    missing = dict.fromkeys(held, "not read yet")
+    while True:
+        for key in sorted(missing):
+            ns, name = key.split("/", 1)
+            cluster, pods, slices, why = cluster_state(ns, name)
+            if cluster is None:
+                missing[key] = f"not read ({why})"
+                continue
+            done, what = handed_off(cluster, pods, slices, node)
+            if done:
+                log(f"{key}: the primary moved from {held[key]} to {what}, and the -rw "
+                    f"Service lists it ({time.monotonic() - started:.1f} s after the cordon)")
+                del missing[key]
+            else:
+                missing[key] = what
+        if not missing:
+            return 0
+        if time.monotonic() + HANDOFF_POLL_S > deadline:
+            for key, what in sorted(missing.items()):
+                log(f"{key}: the primary did not move within {HANDOFF_WAIT_S:.0f} s ({what}); "
+                    "rebooting anyway")
+            return 0
+        time.sleep(HANDOFF_POLL_S)
+
+
+def release(budget_s: float) -> int:
+    """Uncordon this node when a handoff cordoned it, within `budget_s`."""
+    node = node_name()
+    deadline = time.monotonic() + budget_s
+    if not wait_api(budget_s):
+        log(f"{node}: no API within {budget_s:.0f} s; nothing uncordoned (the next boot "
+            "looks again)")
+        return 0
+    outcome, detail = uncordon(node, deadline - time.monotonic())
+    if outcome == "uncordoned":
+        log(f"uncordoned {node}, cordoned by the handoff of {detail}")
+    elif outcome == "not_ours":
+        log(f"{node}: no handoff cordon on it: nothing to do")
+    elif outcome == "gone":
+        log(f"{node}: no Node of this name registered yet, so no handoff cordon on it: "
+            "nothing to do")
+    else:
+        log(f"{node}: could not uncordon it within {budget_s:.0f} s ({detail}); the next "
+            "boot looks again")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if args == ["--before-reboot"]:
+        return before_reboot()
+    if args == ["--at-boot"]:
+        return release(API_WAIT_S)
+    if args == ["--undo"]:
+        return release(API_WAIT_SHORT_S)
+    log(f"unknown arguments {args}; nothing done")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
