@@ -18,8 +18,16 @@ has switched the primary over to an instance on another node and the
 Cluster's ``-rw`` Service lists that instance ready, and no instance of this
 node. CNPG switches over by itself when the node of its primary turns
 unschedulable (internal/controller/replicas.go), as it does for the drain of
-a per-node upgrade. The wait is bounded to SPATIUM_HANDOFF_WAIT_S; past it,
-the reboot goes on as before. The cordon carries the annotation
+a per-node upgrade. It then waits until the old primary, which stays on this
+node, runs again as a ready standby: CNPG stops it and starts its container
+again to demote it, and the new instance manager finishes the demotion
+(pg_rewind, its configuration as a standby, PostgreSQL started again) only
+once it reaches the new primary through that same ``-rw`` Service
+(internal/management/controller/instance_startup.go). A reboot issued the
+moment the Service moved could stop it in the middle, and it came back from
+that through crash recovery (#2849); a running standby stops cleanly. The
+whole wait is bounded to SPATIUM_HANDOFF_WAIT_S; past it, the reboot goes on
+as before. The cordon carries the annotation
 ``spatium.io/reboot-cordoned``. A node already unschedulable (an operator's
 cordon, an upgrade's drain) is left as it is and not marked, and the cordon's
 patch carries the resourceVersion it read, so a cordon set by someone else
@@ -45,6 +53,7 @@ appliance/tests.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import shlex
@@ -78,6 +87,9 @@ CLUSTER_LABEL = "cnpg.io/cluster"
 INSTANCE_LABEL = "cnpg.io/podRole=instance"
 #: What the -rw Service selects on (CNPG pkg/specs/services.go).
 ROLE_LABEL = "cnpg.io/instanceRole"
+#: The instance pod's container that runs the instance manager and PostgreSQL
+#: (CNPG pkg/specs/pods.go).
+INSTANCE_CONTAINER = "postgres"
 
 
 def log(msg: str) -> None:
@@ -224,6 +236,45 @@ def handed_off(cluster: dict, pods: list[dict], slices: list[dict], node: str) -
     if here:
         return False, f"the -rw Service still lists {', '.join(here)} of this node"
     return True, f"{current} on {where}"
+
+
+def epoch_of(stamp: str) -> float | None:
+    """A Kubernetes time (RFC 3339 in UTC, whole seconds, as the API writes
+    it) as epoch seconds; None when it is not one."""
+    try:
+        return float(calendar.timegm(time.strptime((stamp or "")[:19], "%Y-%m-%dT%H:%M:%S")))
+    except ValueError:
+        return None
+
+
+def demoted(pods: list[dict], old: str, node: str, since: float) -> tuple[bool, str]:
+    """(True, how) once the old primary `old` runs again as a ready standby, or
+    nothing of it runs on `node`; else (False, what is still missing).
+
+    CNPG demotes it by stopping it and starting its container again; the new
+    instance manager waits until it reaches the new primary through the -rw
+    Service, then runs pg_rewind, writes its configuration as a standby's and
+    starts PostgreSQL (internal/management/controller/instance_startup.go).
+    Its postgres container started since `since` (the handoff's start; the
+    kubelet's times are whole seconds) and ready means that PostgreSQL runs as
+    a standby; the container that ran as the primary, however ready it still
+    reads, does not count."""
+    pod = pod_named(pods, old)
+    if pod is None:
+        return True, f"{old} is not listed: nothing of it runs here"
+    if ((pod.get("spec") or {}).get("nodeName") or "") != node:
+        return True, f"{old} does not run here"
+    statuses = (pod.get("status") or {}).get("containerStatuses") or []
+    status = next((c for c in statuses if c.get("name") == INSTANCE_CONTAINER), None) or {}
+    running = (status.get("state") or {}).get("running") or {}
+    started = epoch_of(running.get("startedAt") or "")
+    if started is None:
+        return False, f"{old} is not running"
+    if started < int(since):
+        return False, f"{old} has not started again as a standby since the handoff began"
+    if not status.get("ready"):
+        return False, f"{old} is not ready yet"
+    return True, f"{old} is a ready standby again"
 
 
 def annotation_path(key: str) -> str:
@@ -378,7 +429,8 @@ def cluster_state(ns: str, name: str) -> tuple[dict | None, list[dict], list[dic
 
 
 def before_reboot() -> int:
-    """Cordon this node and wait for CNPG to switch its primary off it (#2849)."""
+    """Cordon this node, wait for CNPG to switch its primary off it, and then for
+    the old primary to run again as a ready standby (#2849)."""
     node = node_name()
     if not wait_api(API_WAIT_SHORT_S):
         log(f"{node}: no API within {API_WAIT_SHORT_S:.0f} s: nothing handed off")
@@ -410,6 +462,7 @@ def before_reboot() -> int:
         log(f"{node}: no CNPG primary to hand off")
         return 0
 
+    since = time.time()
     outcome, detail = cordon(node, CORDON_WAIT_S)
     if outcome in ("gone", "failed"):
         log(f"{node}: could not cordon it ({detail}): nothing handed off")
@@ -424,6 +477,7 @@ def before_reboot() -> int:
     started = time.monotonic()
     deadline = started + HANDOFF_WAIT_S
     missing = dict.fromkeys(held, "not read yet")
+    moved: set[str] = set()
     while True:
         for key in sorted(missing):
             ns, name = key.split("/", 1)
@@ -431,10 +485,19 @@ def before_reboot() -> int:
             if cluster is None:
                 missing[key] = f"not read ({why})"
                 continue
-            done, what = handed_off(cluster, pods, slices, node)
-            if done:
+            if key not in moved:
+                done, what = handed_off(cluster, pods, slices, node)
+                if not done:
+                    missing[key] = what
+                    continue
+                moved.add(key)
                 log(f"{key}: the primary moved from {held[key]} to {what}, and the -rw "
                     f"Service lists it ({time.monotonic() - started:.1f} s after the cordon)")
+            # The old primary finishes its demotion only now that it reaches the
+            # new one through the -rw Service: never reboot in the middle of it.
+            done, what = demoted(pods, held[key], node, since)
+            if done:
+                log(f"{key}: {what} ({time.monotonic() - started:.1f} s after the cordon)")
                 del missing[key]
             else:
                 missing[key] = what
@@ -442,8 +505,12 @@ def before_reboot() -> int:
             return 0
         if time.monotonic() + HANDOFF_POLL_S > deadline:
             for key, what in sorted(missing.items()):
-                log(f"{key}: the primary did not move within {HANDOFF_WAIT_S:.0f} s ({what}); "
-                    "rebooting anyway")
+                if key in moved:
+                    log(f"{key}: {held[key]} did not run again as a ready standby within "
+                        f"{HANDOFF_WAIT_S:.0f} s ({what}); rebooting anyway")
+                else:
+                    log(f"{key}: the primary did not move within {HANDOFF_WAIT_S:.0f} s "
+                        f"({what}); rebooting anyway")
             return 0
         time.sleep(HANDOFF_POLL_S)
 

@@ -8,7 +8,8 @@
   and still for 44 s with the primary's shutdown bounded (#2878). A
   Fleet reboot of a cluster node now first cordons the node, as an
   upgrade's drain does, waits until CloudNativePG has switched the
-  primary over to another node and its Service points there (90 s at
-  most; past that the reboot goes on as before), and then reboots. The
+  primary over to another node and its Service points there, and until
+  the old primary runs again as a standby (90 s at most; past that the
+  reboot goes on as before), and then reboots. The
   node uncordons itself once it is back. A node that was already
   cordoned is left as it was.

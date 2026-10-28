@@ -10,7 +10,11 @@ spatiumddi-reboot-agent now runs spatium-reboot-handoff --before-reboot
 before ``systemctl reboot``: when this node holds a Cluster's current primary
 and CNPG can switch over, it cordons the node (marked with an annotation) and
 waits, bounded, until CNPG has switched the primary over to another node and
-the -rw Service lists it. spatiumddi-reboot-handoff.service runs --at-boot and
+the -rw Service lists it, and then until the old primary runs again as a ready
+standby: CNPG finishes demoting it only once it reaches the new primary through
+that Service, and on a QA cluster a reboot issued at that moment stopped it in
+the middle (it came back through crash recovery, stack walk dev-8d394e6).
+spatiumddi-reboot-handoff.service runs --at-boot and
 uncordons the node only when that annotation is on it, by a JSON patch that
 tests the annotation and carries no resourceVersion, tried again until its
 budget is spent: at boot k3s writes the Node for seconds, and on a QA rig
@@ -68,9 +72,12 @@ ANN = "spatium.io/reboot-cordoned"
 # `failing_patches` fail as `patch_error`; `lost_answers` land but answer as a
 # timeout. `switch` plays CNPG: once the Node is unschedulable and the Cluster
 # has been read `after_gets` times, the primary moves to `to`; the -rw slice
-# follows after `slice_after_gets` reads.
+# follows after `slice_after_gets` reads. The old primary's postgres container
+# starts again (CNPG demotes it) after `restart_after_gets` reads, not ready,
+# and is ready again (a standby) after `ready_after_gets`; until it starts
+# again, its pod reads as it did before the switch.
 FAKE_KUBECTL = r'''
-import json, os, sys
+import json, os, sys, time
 ANN = "spatium.io/reboot-cordoned"
 path = os.environ["FAKE_KUBECTL_STATE"]
 st = json.load(open(path))
@@ -88,6 +95,13 @@ def err(msg):
     sys.exit(1)
 def match(labels, sel):
     return all((labels or {}).get(k) == v for k, v in (p.split("=", 1) for p in sel.split(",")))
+def postgres_of(name):
+    for p in st["pods"]:
+        if p["metadata"]["name"] == name:
+            for c in p.setdefault("status", {}).setdefault("containerStatuses", []):
+                if c.get("name") == "postgres":
+                    return c
+    return None
 def play_cnpg():
     sw = st.get("switch")
     if not sw or not (st["node"] or {}).get("spec", {}).get("unschedulable"):
@@ -96,6 +110,7 @@ def play_cnpg():
     n = st["cluster_gets"]
     if n >= sw["after_gets"] and not sw.get("done"):
         sw["done"] = True
+        sw["from"] = st["clusters"][0]["status"]["currentPrimary"]
         for c in st["clusters"]:
             c["status"]["currentPrimary"] = c["status"]["targetPrimary"] = sw["to"]
         for p in st["pods"]:
@@ -106,6 +121,16 @@ def play_cnpg():
         for s in st["slices"]:
             s["endpoints"] = [{"targetRef": {"kind": "Pod", "name": sw["to"]},
                                "nodeName": node_of[sw["to"]], "conditions": {"ready": True}}]
+    old = postgres_of(sw.get("from") or "")
+    if old is not None and n >= sw.get("restart_after_gets", sw["after_gets"]) \
+            and not sw.get("restarted"):
+        sw["restarted"] = True
+        old["ready"] = False
+        old["state"] = {"running": {"startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                 time.gmtime())}}
+    if old is not None and sw.get("restarted") and n >= sw.get(
+            "ready_after_gets", sw.get("slice_after_gets", sw["after_gets"])):
+        old["ready"] = True
 if args[:2] == ["get", "--raw=/readyz"]:
     if st.get("api_down_polls", 0) > 0:
         st["api_down_polls"] -= 1
@@ -242,12 +267,25 @@ def _cluster(primary: str = f"{CL}-1", *, target: str | None = None, instances: 
     }
 
 
-def _ipod(n: int, node: str, role: str) -> dict:
+#: When the instances' postgres containers last started: long before any handoff.
+LONG_AGO = "2026-10-27T00:00:00Z"
+
+
+def _ipod(n: int, node: str, role: str, *, started: str | None = LONG_AGO,
+          ready: bool = True) -> dict:
+    """An instance pod; its postgres container running since `started` (not
+    running when None), ready or not."""
+    state = {"running": {"startedAt": started}} if started else {"waiting": {"reason": "x"}}
     return {
         "metadata": {"namespace": NS, "name": f"{CL}-{n}",
                      "labels": {"cnpg.io/cluster": CL, "cnpg.io/podRole": "instance",
                                 "cnpg.io/instanceRole": role}},
         "spec": {"nodeName": node},
+        "status": {
+            "initContainerStatuses": [{"name": "bootstrap-controller", "ready": True,
+                                       "state": {"terminated": {"exitCode": 0}}}],
+            "containerStatuses": [{"name": "postgres", "ready": ready, "state": state}],
+        },
     }
 
 
@@ -427,6 +465,40 @@ def test_the_handoff_is_done_once_the_rw_service_lists_the_new_primary_only(
     assert says in what
 
 
+# The handoff began at 06:22:46Z; CNPG restarted the old primary's container to
+# demote it at 06:23:01Z (stack walk dev-8d394e6, turn 3).
+SINCE = 1793168566.75  # 2026-10-28T06:22:46.75Z
+AFTER = "2026-10-28T06:23:01Z"
+
+
+@pytest.mark.parametrize(("old", "done", "says"), [
+    # the API still shows the container that ran as the primary: it is not a
+    # standby yet, however ready it reads
+    (_ipod(1, NODE, "replica", started=LONG_AGO, ready=True), False, "not started again"),
+    (_ipod(1, NODE, "replica", started="2026-10-28T06:22:45Z", ready=True), False,
+     "not started again"),
+    # started again for the demotion, PostgreSQL not up as a standby yet
+    (_ipod(1, NODE, "replica", started=AFTER, ready=False), False, "not ready"),
+    (_ipod(1, NODE, "replica", started=None, ready=False), False, "not running"),
+    (_ipod(1, NODE, "replica", started=AFTER, ready=True), True, "ready standby"),
+    # the same second as the handoff's start still counts: the kubelet's times
+    # are whole seconds
+    (_ipod(1, NODE, "replica", started="2026-10-28T06:22:46Z", ready=True), True,
+     "ready standby"),
+    # nothing of it on this node for the reboot to stop
+    (_ipod(1, OTHER, "replica", started=LONG_AGO, ready=False), True, "does not run here"),
+    (None, True, "not listed"),
+])
+def test_the_old_primary_is_demoted_once_it_runs_again_as_a_ready_standby(
+        old, done, says) -> None:
+    pods = [_ipod(2, OTHER, "primary"), _ipod(3, THIRD, "replica")]
+    if old is not None:
+        pods.insert(0, old)
+    ok, what = _module().demoted(pods, f"{CL}-1", NODE, SINCE)
+    assert ok is done
+    assert says in what
+
+
 # ---- --before-reboot -----------------------------------------------------------------
 
 
@@ -444,6 +516,56 @@ def test_it_cordons_with_its_annotation_and_waits_for_the_switchover(tmp_path: P
     assert f"the primary moved from {CL}-1 to {CL}-2 on {OTHER}" in res.stdout
     # it waited for the -rw slice, not only for the Cluster's status
     assert st["cluster_gets"] >= 5
+
+
+def test_it_reboots_only_once_the_old_primary_runs_again_as_a_ready_standby(
+        tmp_path: Path) -> None:
+    # The -rw Service lists the new primary at the 5th read; the old primary's
+    # container starts again (its demotion) at the 6th and is ready at the 9th.
+    # CNPG lets the old primary finish its demotion only once it reaches the
+    # new one through the -rw Service, so a reboot at the 5th read would stop
+    # it in the middle (#2849, stack walk dev-8d394e6 turn 3).
+    res, st = _run(tmp_path, ("--before-reboot",),
+                   switch={"after_gets": 3, "slice_after_gets": 5, "restart_after_gets": 6,
+                           "ready_after_gets": 9, "to": f"{CL}-2"})
+    assert res.returncode == 0, res.stderr
+    out = res.stdout
+    moved = out.index(f"the primary moved from {CL}-1 to {CL}-2 on {OTHER}")
+    standby = out.index(f"{CL}-1 is a ready standby again")
+    assert moved < standby
+    assert st["cluster_gets"] >= 9
+    assert "rebooting anyway" not in out
+    # a whole read of the Cluster, its pods and its -rw slice each time
+    pods_reads = [c for c in st["calls"] if c[:2] == ["get", "pods"] and "-n" in c]
+    assert len(pods_reads) >= 9
+
+
+def test_a_stale_ready_read_of_the_old_primary_is_not_taken_for_its_demotion(
+        tmp_path: Path) -> None:
+    # The pod still reads as the container that ran as the primary (ready)
+    # after the -rw Service moved: the handoff waits for the container that
+    # started since it began.
+    res, st = _run(tmp_path, ("--before-reboot",),
+                   switch={"after_gets": 2, "slice_after_gets": 3, "restart_after_gets": 7,
+                           "ready_after_gets": 8, "to": f"{CL}-2"})
+    assert res.returncode == 0, res.stderr
+    assert f"{CL}-1 is a ready standby again" in res.stdout
+    assert st["cluster_gets"] >= 8
+
+
+def test_an_old_primary_never_ready_again_holds_the_reboot_no_longer_than_the_budget(
+        tmp_path: Path) -> None:
+    started = time.monotonic()
+    res, _ = _run(tmp_path, ("--before-reboot",), handoff_s=1.0,
+                  switch={"after_gets": 1, "slice_after_gets": 2, "restart_after_gets": 2,
+                          "ready_after_gets": 10_000, "to": f"{CL}-2"})
+    took = time.monotonic() - started
+    assert res.returncode == 0, res.stderr
+    assert "the primary moved" in res.stdout
+    assert f"{CL}-1 did not run again as a ready standby within" in res.stdout
+    assert f"{CL}-1 is not ready yet" in res.stdout
+    assert "rebooting anyway" in res.stdout
+    assert took < 15
 
 
 def test_a_node_without_the_primary_is_never_cordoned(tmp_path: Path) -> None:

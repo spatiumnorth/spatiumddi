@@ -69,7 +69,9 @@ sleep "$GRACE_SECONDS"
 # other pods, and the failover would then run while this node shuts down.
 # On a cluster node holding the primary, the handoff cordons the node and
 # waits (bounded) for CNPG to switch the primary over to another node, as an
-# upgrade's drain makes it do; the node is uncordoned at its next boot
+# upgrade's drain makes it do, and for the old primary to run again as a
+# standby, so the reboot never stops it in the middle of its demotion; the
+# node is uncordoned at its next boot
 # (spatiumddi-reboot-handoff.service). Anywhere else it returns at once. It
 # always exits 0; its lines go to this log.
 if [ -x "$HANDOFF" ]; then
