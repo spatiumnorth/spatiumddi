@@ -123,6 +123,10 @@ def _emitted_types(providers: list[SearchProvider]) -> set[str]:
     return {p.type for p in providers if not p.also_emits}
 
 
+# Rows fetched per type; the ceiling on ``total`` (``total_capped`` flags it).
+FETCH_CAP = 100
+
+
 async def execute(
     db: AsyncSession,
     user: User,
@@ -151,7 +155,9 @@ async def execute(
     # Fetch more per type than we will show. The engine reranks across types
     # afterwards, so a type whose rows all lose the rerank must not have
     # consumed the whole budget.
-    per_type = max(limit, 10)
+    # Independent of ``limit`` so that ``total`` does not move with it (#2987).
+    per_type = FETCH_CAP
+    capped = False
 
     results: list[SearchResult] = []
     for provider in to_run:
@@ -165,7 +171,10 @@ async def execute(
             # there would blank the entire palette — the exact opposite of
             # the isolation this block is here to provide.
             async with db.begin_nested():
-                results.extend(await provider.fn(db, shape, per_type))
+                got = await provider.fn(db, shape, per_type)
+                if len(got) >= per_type:
+                    capped = True
+                results.extend(got)
         except Exception:  # noqa: BLE001 — one broken type must not blank the palette
             logger.warning("search_provider_failed", type=provider.type, exc_info=True)
 
@@ -213,6 +222,7 @@ async def execute(
     return SearchResponse(
         query=q,
         total=len(ranked),
+        total_capped=capped,
         results=ranked[:limit],
         searched_types=searched,
     )

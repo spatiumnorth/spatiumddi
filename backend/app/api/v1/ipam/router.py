@@ -115,6 +115,9 @@ from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
+from app.services.search.providers import IP_MAC_NORMALIZED_SQL
+from app.services.search.ranking import escape_like, like_pattern
+from app.services.search.schemas import shape_of
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
@@ -9067,6 +9070,22 @@ _ADDRESS_SORT_KEYS = {"address", "hostname", "status", "mac", "last_seen", "desc
 _SEARCH_IDS_CAP = 5000
 
 
+def _could_be_mac(shape: Any) -> bool:
+    if shape.is_ip or shape.is_cidr or not shape.mac_normalized:
+        return False
+    return re.fullmatch(r"[0-9a-f]+", shape.mac_normalized) is not None and bool(
+        re.fullmatch(r"[0-9a-fA-F:.\-]+", shape.raw)
+    )
+
+
+def _mac_like_condition(value: str) -> Any:
+    """Separator-insensitive, wildcard-safe MAC substring match (#2991)."""
+    norm = shape_of(value.strip()).mac_normalized
+    return text(f"{IP_MAC_NORMALIZED_SQL} ILIKE :mac_norm").bindparams(
+        mac_norm=f"%{escape_like(norm)}%"
+    )
+
+
 def _address_search_conditions(
     *,
     q: str | None,
@@ -9085,20 +9104,26 @@ def _address_search_conditions(
     if status_filter:
         conds.append(IPAddress.status == status_filter)
     if hostname:
-        conds.append(IPAddress.hostname.ilike(f"%{hostname}%"))
+        conds.append(IPAddress.hostname.ilike(like_pattern(hostname), escape="\\"))
     if mac:
-        conds.append(sa_cast(IPAddress.mac_address, String).ilike(f"%{mac}%"))
+        conds.append(_mac_like_condition(mac))
     if q:
-        pat = f"%{q}%"
-        conds.append(
-            or_(
-                func.host(IPAddress.address).ilike(pat),
-                IPAddress.hostname.ilike(pat),
-                IPAddress.fqdn.ilike(pat),
-                IPAddress.description.ilike(pat),
-                sa_cast(IPAddress.mac_address, String).ilike(pat),
-            )
-        )
+        pat = like_pattern(q)
+        alternatives = [
+            func.host(IPAddress.address).ilike(pat, escape="\\"),
+            IPAddress.hostname.ilike(pat, escape="\\"),
+            IPAddress.fqdn.ilike(pat, escape="\\"),
+            IPAddress.description.ilike(pat, escape="\\"),
+        ]
+        # MAC in any separator style, as the global search does (#2991). Only
+        # for a query that can be a (partial) MAC: hex plus ``:-.`` separators
+        # and not an IP, or "10.0.0.1" would match a MAC holding "10001".
+        shape = shape_of(q.strip())
+        if _could_be_mac(shape):
+            alternatives.append(_mac_like_condition(q))
+        else:
+            alternatives.append(sa_cast(IPAddress.mac_address, String).ilike(pat, escape="\\"))
+        conds.append(or_(*alternatives))
     return conds
 
 

@@ -3663,6 +3663,8 @@ export interface SearchResponse {
   total: number;
   results: SearchResult[];
   searched_types: SearchTypeInfo[];
+  /** True when `total` is a floor — a type hit the server's fetch cap. */
+  total_capped?: boolean;
 }
 
 export const searchApi = {

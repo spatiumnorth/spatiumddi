@@ -16747,7 +16747,10 @@ export function IPAMPage() {
   const canImportSubnets = perms.can("write", "subnet");
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const deepLinkHandled = useRef(false);
+  // Location key of the palette navigation already applied. A boolean latch
+  // opened only the FIRST hit picked while /ipam stayed mounted (#2988); each
+  // navigate() carries a fresh key, so later picks are applied too.
+  const deepLinkHandledKey = useRef<string | null>(null);
   const urlRestored = useRef(false);
   // Captured from ``location.state`` on the first deep-link read and
   // passed down to ``SubnetDetail``. Can't be read lazily by
@@ -16786,7 +16789,7 @@ export function IPAMPage() {
 
   // Deep-link: read router state set by GlobalSearch navigation
   useEffect(() => {
-    if (deepLinkHandled.current) return;
+    if (deepLinkHandledKey.current === location.key) return;
     const state = location.state as {
       selectSpace?: string;
       selectBlock?: string;
@@ -16798,14 +16801,14 @@ export function IPAMPage() {
       const sp = spaces.find((s) => s.id === state.selectSpace);
       if (sp) {
         selectSpace(sp);
-        deepLinkHandled.current = true;
+        deepLinkHandledKey.current = location.key;
         urlRestored.current = true;
       }
     } else if (state.selectBlock && allBlocks) {
       const bl = allBlocks.find((b) => b.id === state.selectBlock);
       if (bl) {
         selectBlock(bl);
-        deepLinkHandled.current = true;
+        deepLinkHandledKey.current = location.key;
         urlRestored.current = true;
       }
     } else if (state.selectSubnet && allSubnets) {
@@ -16819,7 +16822,7 @@ export function IPAMPage() {
           highlightTargetSubnetRef.current = sn.id;
         }
         selectSubnet(sn);
-        deepLinkHandled.current = true;
+        deepLinkHandledKey.current = location.key;
         urlRestored.current = true;
       }
     }
