@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import {
@@ -7905,7 +7905,7 @@ export function DnsSyncModal({
   );
 }
 
-function OrphansModal({
+export function OrphansModal({
   subnetId,
   subnetLabel,
   onClose,
@@ -7916,6 +7916,7 @@ function OrphansModal({
 }) {
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [purgeError, setPurgeError] = useState<string | null>(null);
   const { data: addrs, isLoading } = useQuery({
     queryKey: ["addresses", subnetId],
     queryFn: () => ipamApi.listAddresses(subnetId),
@@ -7924,6 +7925,8 @@ function OrphansModal({
 
   const mut = useMutation({
     mutationFn: () => ipamApi.purgeOrphans(subnetId, Array.from(selected)),
+    // A refused purge (404 subnet in Trash, 403, 502) says why, not nothing (#2992).
+    onError: (err) => setPurgeError(formatApiError(err, "Purge failed")),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -8002,7 +8005,15 @@ function OrphansModal({
             </div>
           </div>
         )}
-        <div className="flex justify-end gap-2 pt-2">
+        {purgeError && (
+          <p
+            role="alert"
+            className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            {purgeError}
+          </p>
+        )}
+        <div className="flex flex-wrap justify-end gap-2 pt-2">
           {orphans.length === 0 ? (
             <button
               onClick={onClose}
@@ -8020,7 +8031,10 @@ function OrphansModal({
               </button>
               <button
                 disabled={selected.size === 0 || mut.isPending}
-                onClick={() => mut.mutate()}
+                onClick={() => {
+                  setPurgeError(null);
+                  mut.mutate();
+                }}
                 className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-40"
               >
                 {mut.isPending ? "Purging…" : `Purge ${selected.size}`}
@@ -11380,7 +11394,7 @@ function BulkDeleteAddressesModal({
 
 // ─── Subnet Row in tree ───────────────────────────────────────────────────────
 
-function SubnetRow({
+export function SubnetRow({
   subnet,
   isSelected,
   onSelect,
@@ -11425,10 +11439,13 @@ function SubnetRow({
             ·
           </div>
           <Network className="h-3.5 w-3.5 flex-shrink-0" />
+          {/* The CIDR never shrinks; the name is what gets cut (#2993). */}
           <div className="flex min-w-0 flex-1 flex-col">
-            <span className="truncate font-mono text-xs">{subnet.network}</span>
+            <span className="shrink-0 whitespace-nowrap font-mono text-xs">
+              {subnet.network}
+            </span>
             {subnet.name && (
-              <span className="truncate text-xs text-muted-foreground/60">
+              <span className="min-w-0 truncate text-xs text-muted-foreground/60">
                 {subnet.name}
               </span>
             )}
@@ -15770,6 +15787,7 @@ export function SpaceSection({
   onSelectSubnet,
   onSelectBlock,
   filter = "",
+  onHiddenChange,
 }: {
   space: IPSpace;
   selectedSubnetId: string | null;
@@ -15782,6 +15800,9 @@ export function SpaceSection({
   // When set, non-matching nodes are hidden, ancestors of matches are kept
   // so the path renders, and the whole space auto-expands.
   filter?: string;
+  // Told whether the quick-filter hides this whole space (read, and nothing
+  // in it matches), so the tree can say nothing matched (#2994).
+  onHiddenChange?: (spaceId: string, hidden: boolean) => void;
 }) {
   const [expanded, setExpanded] = useSessionState<boolean>(
     `spatium.ipam.expandedSpace.${space.id}`,
@@ -15888,6 +15909,19 @@ export function SpaceSection({
       matchCount: keptBlocks.length + keptSubnets.length,
     };
   }, [blocks, subnets, filtering, filterQ, spaceMatches]);
+
+  // Hidden only once both reads answered: an unread space is unknown, and
+  // reporting it hidden would flash "no match" while the tree loads (#2994).
+  const hiddenByFilter =
+    filtering &&
+    !spaceMatches &&
+    matchCount === 0 &&
+    subnets !== undefined &&
+    blocks !== undefined;
+  useEffect(() => {
+    onHiddenChange?.(space.id, hiddenByFilter);
+    return () => onHiddenChange?.(space.id, false);
+  }, [onHiddenChange, space.id, hiddenByFilter]);
 
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
@@ -16731,6 +16765,14 @@ export function IPAMPage() {
   const [showIpSearch, setShowIpSearch] = useState(false);
   // Tree quick-filter (network / name substring across every space).
   const [treeFilter, setTreeFilter] = useState("");
+  const [hiddenSpaces, setHiddenSpaces] = useState<Record<string, boolean>>({});
+  const onSpaceHiddenChange = useCallback(
+    (id: string, hidden: boolean) =>
+      setHiddenSpaces((prev) =>
+        !!prev[id] === hidden ? prev : { ...prev, [id]: hidden },
+      ),
+    [],
+  );
   // Progressive disclosure: dense by default, opt-in help layer. When on, a
   // glossary of the IPAM visual vocabulary appears so newcomers aren't lost
   // while experts keep the uncluttered default (#465). Sticky per-user.
@@ -17089,8 +17131,27 @@ export function IPAMPage() {
               onSelectSubnet={selectSubnet}
               onSelectBlock={selectBlock}
               filter={treeFilter}
+              onHiddenChange={onSpaceHiddenChange}
             />
           ))}
+          {treeFilter.trim() &&
+            spaces != null &&
+            spaces.length > 0 &&
+            spaces.every((sp) => hiddenSpaces[sp.id]) && (
+              <p
+                role="status"
+                className="px-2 py-3 text-xs text-muted-foreground"
+              >
+                Nothing in the tree matches “{treeFilter.trim()}”.{" "}
+                <button
+                  type="button"
+                  onClick={() => setTreeFilter("")}
+                  className="text-primary hover:underline"
+                >
+                  Clear the filter
+                </button>
+              </p>
+            )}
         </div>
       </div>
 
