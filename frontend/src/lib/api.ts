@@ -8466,6 +8466,18 @@ export interface DHCPServerGroup {
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
+  /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
+   *  of two or more. HA does not render while this is non-empty. Empty for a
+   *  standalone group. Optional so fixtures predating it still type-check. */
+  ha_peer_urls_missing?: string[];
+  /** #2963 — why the control plane did not derive the missing URL(s):
+   *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
+   *  becomes a Kea backup and can take over the primary role, so it is left
+   *  to the operator). Null when it is derivable or nothing is missing. */
+  ha_autofill_skipped_reason?:
+    | "bridged_network_mode"
+    | "more_than_two_kea_members"
+    | null;
   // Member servers (rolled up by the /server-groups response).
   servers: DHCPServerGroupMember[];
   created_at: string;

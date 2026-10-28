@@ -40,6 +40,7 @@ from app.services.appliance.group_names import (
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
 from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
+from app.services.dhcp.ha_peer_autofill import HA_GROUP_MODES, autofill_skipped_reason
 from app.services.dhcp.windows_failover_report import group_failover_report
 
 router = APIRouter(
@@ -161,9 +162,17 @@ class GroupResponse(BaseModel):
     # Computed: count of Kea servers currently in the group. ≥ 2 means
     # the group renders the libdhcp_ha.so hook on every peer.
     kea_member_count: int = 0
-    # #2963 - names of Kea members with no ``ha_peer_url`` in a group of two or
-    # more: HA is NOT rendered while this is non-empty. Empty otherwise.
+    # #2963 - names of Kea members with no ``ha_peer_url`` in an HA-mode group
+    # of two or more: HA is NOT rendered while this is non-empty. Empty
+    # otherwise, including for a ``standalone`` group (no HA wanted).
     ha_peer_urls_missing: list[str] = []
+    # #2963 - when ``ha_peer_urls_missing`` is non-empty, why the control plane
+    # did not derive the URL: ``bridged_network_mode`` or
+    # ``more_than_two_kea_members`` (a 3rd+ member would become a Kea backup
+    # and can reshuffle the pair's roles, so that is left to the operator).
+    # None when the URL is derivable (an appliance member will be filled at its
+    # next join) or nothing is missing.
+    ha_autofill_skipped_reason: str | None = None
     # Member servers rolled up so the UI can render a group detail page
     # without a second round-trip. Empty when nothing's registered.
     servers: list[ServerSummary] = []
@@ -198,7 +207,12 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         kea_packet_logging=g.kea_packet_logging,
         kea_member_count=len(kea),
         ha_peer_urls_missing=(
-            sorted(s.name for s in kea if not s.ha_peer_url) if len(kea) >= 2 else []
+            sorted(s.name for s in kea if not s.ha_peer_url)
+            if len(kea) >= 2 and g.mode in HA_GROUP_MODES
+            else []
+        ),
+        ha_autofill_skipped_reason=(
+            autofill_skipped_reason(g, len(kea)) if any(not s.ha_peer_url for s in kea) else None
         ),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
         ha_peer_auth_active=len(kea) >= 2
