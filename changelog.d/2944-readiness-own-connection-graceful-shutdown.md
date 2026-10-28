@@ -24,12 +24,14 @@
   nodes on a 12 GiB seed, 4507Mi at nine), which CloudNativePG applies with
   one rolling restart. `max_connections` now passes the chart's 200 from
   seven nodes with two worker processes (was eight).
-  The frontend nginx now rate limits `/health/*` and `/metrics` per client,
-  5 requests a second with a burst of 20, answering 429 past it, in both the
-  image template and the chart's TLS config. `/health/ready` and
-  `/health/platform` are unauthenticated, and a flood through the frontend
-  could otherwise queue the probe's one database connection. The client is
-  the address after `FRONTEND_TRUSTED_PROXY_CIDRS` resolution, so behind an
-  unlisted proxy every client shares one allowance. The kubelet probes the
-  api pod directly and is not affected; the dashboard polls
-  `/health/platform` every 30 s.
+  The frontend nginx now rate limits `/health/ready`, `/health/live`,
+  `/health/startup` and `/metrics` per client, 5 requests a second with a
+  burst of 20, answering 429 past it, in both the image template and the
+  chart's TLS config. They are unauthenticated, and a flood through the
+  frontend could otherwise queue the probe's one database connection. The
+  client is the address after `FRONTEND_TRUSTED_PROXY_CIDRS` resolution, so
+  behind an unlisted proxy every client shares one allowance. The kubelet
+  probes the api pod directly and is not affected. `/health/platform`, the
+  Dashboard's own Platform Health call, is left out of the limit, and the
+  console now retries a 429 (honouring `Retry-After`, otherwise after 0.5,
+  1 and 2 s) where it used to give up on every 4xx until the next refetch.

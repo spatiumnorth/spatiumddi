@@ -7,7 +7,10 @@ own, so an unthrottled flood through nginx could queue the kubelet's probe
 behind it and take the pod out of the Service. Both nginx configs therefore
 carry a ``limit_req_zone`` keyed on ``$binary_remote_addr`` (the address
 after the real_ip module has resolved the end client behind a trusted
-proxy) and a ``limit_req`` on the location that proxies ``/health``.
+proxy) and a ``limit_req`` on the location that proxies ``/health``, except
+``/health/platform``: the console's own Platform Health call has an exact
+location of its own without the limit, so a browser whose allowance was spent
+still renders the card (ddi-pg walk of #2947, case 5).
 
 There are TWO hand-maintained copies of this config (the image's template
 and the appliance's TLS ConfigMap); these read both. The behaviour itself
@@ -60,15 +63,51 @@ def _locations(text: str) -> dict[str, str]:
     return out
 
 
+LIMITED = ("/health/ready", "/health/live", "/health/startup", "/metrics")
+EXEMPT = "/health/platform"
+
+
+def _serving(locs: dict[str, str], uri: str) -> tuple[str, str]:
+    """The location nginx picks for ``uri``: an exact (``=``) match wins, then
+    the longest ``^~`` prefix, then the first matching regex in file order,
+    then the longest plain prefix."""
+    exact = [(s, b) for s, b in locs.items() if s.startswith("= ") and s[2:].strip() == uri]
+    if exact:
+        return exact[0]
+    prefixes = []
+    for s, b in locs.items():
+        parts = s.split()
+        if parts[0] in ("~", "~*", "=") or parts[0].startswith("@"):
+            continue
+        path = parts[-1]
+        if uri.startswith(path):
+            prefixes.append((len(path), parts[0] == "^~", s, b))
+    longest = max(prefixes, default=None)
+    if longest and longest[1]:
+        return longest[2], longest[3]
+    for s, b in locs.items():  # dicts keep file order
+        parts = s.split(None, 1)
+        if parts[0] in ("~", "~*"):
+            flags = re.I if parts[0] == "~*" else 0
+            if re.search(parts[1], uri, flags):
+                return s, b
+    assert longest, uri
+    return longest[2], longest[3]
+
+
+def _limited(body: str) -> bool:
+    return re.search(r"^\s*limit_req\s+zone=", body, re.M) is not None
+
+
 def _proxies_health(spec: str, body: str) -> bool:
-    """A location that would serve ``/health/ready`` by proxying it upstream."""
+    """A location that proxies any ``/health`` or ``/metrics`` path upstream."""
     if "proxy_pass" not in body:
         return False
     if spec.startswith("~"):
         pattern = spec.split(None, 1)[1]
-        return re.search(pattern, "/health/ready") is not None
+        return any(re.search(pattern, u) for u in (*LIMITED, EXEMPT))
     path = spec.split()[-1]
-    return "/health/ready".startswith(path) and path not in ("/",)
+    return path != "/" and any(u.startswith(path) for u in (*LIMITED, EXEMPT))
 
 
 def test_every_nginx_config_that_proxies_health_is_covered() -> None:
@@ -86,11 +125,32 @@ def test_every_nginx_config_that_proxies_health_is_covered() -> None:
 
 
 @CONFIGS
+@pytest.mark.parametrize("uri", LIMITED)
+def test_probe_paths_are_rate_limited(path: Path, uri: str) -> None:
+    spec, body = _serving(_locations(_text(path)), uri)
+    assert "proxy_pass" in body, (path.name, uri, spec)
+    assert _limited(body), f"{path.name}: {uri} is served by {spec} without limit_req"
+
+
+@CONFIGS
+def test_the_consoles_platform_health_is_not_limited(path: Path) -> None:
+    """The Dashboard's Platform Health card reads /health/platform through
+    this nginx; a browser whose allowance another tab or a script spent must
+    still get it (ddi-pg walk of #2947, case 5)."""
+    spec, body = _serving(_locations(_text(path)), EXEMPT)
+    assert spec == f"= {EXEMPT}", (path.name, spec)
+    assert "proxy_pass" in body
+    assert not _limited(body), f"{path.name}: {EXEMPT} is rate limited"
+
+
+@CONFIGS
 def test_health_is_rate_limited_per_client(path: Path) -> None:
     text = _text(path)
     zones = dict(_ZONE_RE.findall(text))
     assert zones, f"{path.name}: no limit_req_zone keyed on $binary_remote_addr"
-    health = {s: b for s, b in _locations(text).items() if _proxies_health(s, b)}
+    health = {
+        s: b for s, b in _locations(text).items() if _proxies_health(s, b) and s != f"= {EXEMPT}"
+    }
     assert health, f"{path.name}: no location proxies /health"
     for spec, body in health.items():
         m = re.search(r"^\s*limit_req\s+zone=(\w+)\s+burst=(\d+)(\s+nodelay)?;", body, re.M)
@@ -108,7 +168,7 @@ def test_the_limit_leaves_room_for_monitoring(path: Path) -> None:
     every browser behind one NAT, must never trip it."""
     text = _text(path)
     zones = {name: int(rate) for name, rate in _ZONE_RE.findall(text)}
-    for body in (b for s, b in _locations(text).items() if _proxies_health(s, b)):
+    for body in (b for s, b in _locations(text).items() if _proxies_health(s, b) and _limited(b)):
         m = re.search(r"limit_req\s+zone=(\w+)\s+burst=(\d+)", body)
         assert m
         assert zones[m.group(1)] >= 5
@@ -116,10 +176,22 @@ def test_the_limit_leaves_room_for_monitoring(path: Path) -> None:
 
 
 def test_the_two_copies_agree() -> None:
-    """The ConfigMap is a hand-kept copy of the image template."""
+    """The ConfigMap is a hand-kept copy of the image template: same zone, and
+    the same verdict for every health path."""
     image = _ZONE_RE.findall(_text(IMAGE_TEMPLATE))
     appliance = _ZONE_RE.findall(_text(APPLIANCE_TEMPLATE))
-    assert image == appliance
+    assert image and image == appliance
+
+    def verdicts(path: Path) -> dict[str, tuple[str, bool, str | None]]:
+        locs = _locations(_text(path))
+        out = {}
+        for uri in (*LIMITED, EXEMPT):
+            spec, body = _serving(locs, uri)
+            m = re.search(r"limit_req\s+zone=\w+\s+burst=\d+(?:\s+nodelay)?;", body)
+            out[uri] = (spec, _limited(body), m.group(0) if m else None)
+        return out
+
+    assert verdicts(IMAGE_TEMPLATE) == verdicts(APPLIANCE_TEMPLATE)
 
 
 def test_the_zone_is_keyed_after_real_ip() -> None:
