@@ -90,7 +90,11 @@ from app.models.dhcp import (
 from app.models.dns import DNSRecord
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.dhcp.config_bundle import build_config_bundle
-from app.services.ipam.subnet_boundary import boundary_host_conflicts, ensure_boundary_rows
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -720,7 +724,12 @@ async def preview_subnet_resize(
             ResizeConflict(
                 type="host_on_new_boundary", detail=d.replace(" first.", " before resizing.")
             )
-            for d in boundary_host_conflicts(await _subnet_rows(db, subnet.id), [new_net])
+            for d in boundary_host_conflicts(
+                await _subnet_rows(db, subnet.id),
+                [new_net],
+                kind=subnet.kind,
+                already=boundary_addresses(old_net, subnet.kind),
+            )
         )
 
     # Placeholder classification — independent of conflicts so the UI can
@@ -1169,7 +1178,15 @@ async def commit_subnet_resize(
     parent_conflicts = await _parent_containment_conflicts_subnet(db, subnet, new_net)
     if parent_conflicts:
         raise ResizeError(parent_conflicts[0].detail, status_code=422)
-    host_conflicts = boundary_host_conflicts(await _subnet_rows(db, subnet.id), [new_net])
+    # Only a boundary the resize moves onto a host is refused: a host already
+    # on the old network address (skip_auto_addresses, or an IPv6 subnet from
+    # before #506) stays where it was when the network address does not move.
+    host_conflicts = boundary_host_conflicts(
+        await _subnet_rows(db, subnet.id),
+        [new_net],
+        kind=subnet.kind,
+        already=boundary_addresses(old_net, subnet.kind),
+    )
     if host_conflicts:
         raise ResizeError(
             "Resize blocked: "
@@ -1210,6 +1227,7 @@ async def commit_subnet_resize(
             subnet.id,
             new_net,
             current_user.id if current_user is not None else None,
+            kind=subnet.kind,
         )
         await db.flush()
 

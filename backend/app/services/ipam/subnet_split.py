@@ -426,7 +426,15 @@ async def preview_subnet_split(
     # can use. network / broadcast rows are the placeholders themselves
     # (or an operator's renamed one, which survives by design) — only a
     # row with another status is a host.
-    for detail in boundary_host_conflicts(addr_rows, children_nets):
+    # A host already on the parent's own network address (a subnet created
+    # with skip_auto_addresses, or an IPv6 one from before #506) stays where
+    # it was: existing data, not a boundary the split creates.
+    for detail in boundary_host_conflicts(
+        addr_rows,
+        children_nets,
+        kind=subnet.kind,
+        already=boundary_addresses(parent, subnet.kind),
+    ):
         conflicts.append(
             SplitConflict(
                 type="host_on_child_boundary",
@@ -646,7 +654,11 @@ async def commit_subnet_split(
     placeholders_created = 0
     for cnet, child in zip(children_nets, new_children, strict=True):
         placeholders_created += await ensure_boundary_rows(
-            db, child.id, cnet, current_user.id if current_user is not None else None
+            db,
+            child.id,
+            cnet,
+            current_user.id if current_user is not None else None,
+            kind=subnet.kind,
         )
     await db.flush()
 
