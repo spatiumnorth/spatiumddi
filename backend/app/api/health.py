@@ -14,7 +14,7 @@ from starlette import status
 from starlette.responses import JSONResponse
 
 from app.core.schema_check import SchemaCheck, missing_from_database, schema_at_head
-from app.db import AsyncSessionLocal
+from app.db import AsyncSessionLocal, ProbeSessionLocal
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["health"])
@@ -137,7 +137,7 @@ async def _judge_newer_schema(
         missing = checked[1]
     else:
         try:
-            tables, columns = await missing_from_database()
+            tables, columns = await missing_from_database(session_factory=ProbeSessionLocal)
         except Exception as exc:  # noqa: BLE001
             # A read that could not run proves nothing: fail closed, keep nothing.
             first = (str(exc).splitlines() or [""])[0][:160]
@@ -174,7 +174,7 @@ async def _check_schema_ready() -> tuple[str, str]:
     ``("error", "<detail>")`` with an operator-actionable message. It reads
     the latch; only ``readiness`` sets it.
     """
-    result = await schema_at_head()
+    result = await schema_at_head(session_factory=ProbeSessionLocal)
     missing: tuple[str, ...] = ()
     if result.ok:
         verdict, detail = "ok", result.detail
@@ -232,7 +232,7 @@ async def readiness() -> JSONResponse:
     # probe response itself honest-and-fast while that happens.
     try:
         async with asyncio.timeout(4):
-            async with AsyncSessionLocal() as session:
+            async with ProbeSessionLocal() as session:
                 await session.execute(text("SELECT 1"))
         checks["database"] = "ok"
     except TimeoutError:

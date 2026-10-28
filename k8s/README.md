@@ -275,6 +275,10 @@ The `spatiumddi` namespace carries `pod-security.kubernetes.io/warn: baseline` a
 
 These manifests set no `priorityClassName`. That is the correct default for a bring-your-own cluster: a pod naming a PriorityClass the cluster does not define is refused by the apiserver. If you have a priority policy, the Helm chart exposes `global.priorityClassName` / `global.servicePriorityClassName` — see [`docs/deployment/KUBERNETES.md`](../docs/deployment/KUBERNETES.md).
 
+## api shutdown and readiness (#2944)
+
+The api image runs uvicorn with `--timeout-graceful-shutdown 20`, and the `api` Deployment's `terminationGracePeriodSeconds` is 30. After SIGTERM uvicorn waits at most 20 s for in-flight requests, then runs lifespan shutdown (which closes the after-commit hooks' database engine) with 10 s to spare before the SIGKILL. If you raise or lower either number keep the flag below the grace period; `backend/tests/test_api_graceful_shutdown.py` pins that for the manifests, the Helm chart and the compose files. `/health/ready` checks the database over its own one-connection engine, so a request pool saturated by load does not fail the probe.
+
 ## TLS / Ingress
 
 The Ingress in `k8s/base/frontend.yaml` uses `ingressClassName: nginx`. For TLS:
