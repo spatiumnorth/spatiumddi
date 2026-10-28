@@ -33,6 +33,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.drivers.dns._caa import caa_key, caa_presentation
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -118,6 +119,9 @@ def _content_key(record_type: str, content: str) -> str:
         if len(value) >= 2 and value[0] == value[-1] == '"' and '" "' not in value:
             return value[1:-1]
         return value
+    if rtype == "CAA":
+        # Bare and quoted spellings are one record (#2943).
+        return caa_key(value)
     if rtype in ("A", "AAAA"):
         try:
             return ipaddress.ip_address(value).compressed
@@ -125,6 +129,15 @@ def _content_key(record_type: str, content: str) -> str:
             return value.lower()
     if rtype in _NAME_CONTENT_TYPES:
         return value.rstrip(".").lower()
+    return value
+
+
+def _wire_content(record_type: str, value: str) -> str:
+    """The ``content`` sent for a value: a CAA value in its quoted form
+    (#2943), so a bare stored value neither goes out bare nor misses the
+    quoted row in the server-side ``content`` filter of a lookup."""
+    if record_type.upper() == "CAA":
+        return caa_presentation(value)
     return value
 
 
@@ -397,7 +410,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 "target": rec.value,
             }
             return payload
-        payload["content"] = rec.value
+        payload["content"] = _wire_content(rec.record_type, rec.value)
         if rec.priority is not None:
             payload["priority"] = rec.priority
         return payload
@@ -452,7 +465,9 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         # MX/SRV) actually matches — the server-side filter is a narrowing
         # hint, not a guarantee.
         for rec in results:
-            if rec.get("content") != content:
+            if _content_key(record_type, str(rec.get("content") or "")) != _content_key(
+                record_type, content
+            ):
                 continue
             if priority is not None and rec.get("priority") != priority:
                 continue
@@ -528,7 +543,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 }
                 match = next((r for r in unmatched if _srv_row_key(r) == srv_key), None)
             else:
-                payload["content"] = member.value
+                payload["content"] = _wire_content(rtype, member.value)
                 if member.priority is not None:
                     payload["priority"] = member.priority
                 key = _content_key(rtype, member.value)
@@ -604,7 +619,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     content=(
                         compose_structured_rdata(change.record)
                         if change.record.record_type.upper() == "SRV"
-                        else change.record.value
+                        else _wire_content(change.record.record_type, change.record.value)
                     ),
                     priority=change.record.priority,
                 )
@@ -634,7 +649,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     content=(
                         compose_structured_rdata(change.record)
                         if change.record.record_type.upper() == "SRV"
-                        else change.record.value
+                        else _wire_content(change.record.record_type, change.record.value)
                     ),
                     priority=change.record.priority,
                 )

@@ -49,6 +49,7 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
+from ._caa import caa_presentation
 from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, DriverBase
 
@@ -154,6 +155,8 @@ def _record_content(rec: dict[str, Any], zone: str | None = None) -> str:
     value = rec.get("value") or ""
     if rtype == "TXT":
         return _quote_txt(value)
+    if rtype == "CAA":
+        return caa_presentation(value)
     if rtype in ("CNAME", "DNAME", "NS", "PTR", "ALIAS"):
         return _qualify_target(value.strip(), zone)
     if rtype == "MX":
