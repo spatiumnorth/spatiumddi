@@ -4257,7 +4257,47 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
                     "critical",
                 )
             )
+    matches.extend(await _standalone_kea_group_matches(db))
     return matches
+
+
+async def _standalone_kea_group_matches(
+    db: AsyncSession,
+) -> list[tuple[str, str, str, str | None]]:
+    """#2969 — a ``standalone`` group with 2+ Kea members and at least one
+    scope. Scopes belong to the group, so every member renders and serves them
+    with no HA hook to coordinate (``standalone`` never renders HA). Fixed by
+    setting the group's mode to hot-standby / load-balancing, or by leaving one
+    Kea member in the group."""
+    from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup  # noqa: PLC0415
+
+    kea_count = func.count(DHCPServer.id)
+    rows = (
+        await db.execute(
+            select(DHCPServerGroup.id, DHCPServerGroup.name, kea_count)
+            .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+            .where(DHCPServerGroup.mode == "standalone", DHCPServer.driver == "kea")
+            .group_by(DHCPServerGroup.id, DHCPServerGroup.name)
+            .having(kea_count >= 2)
+        )
+    ).all()
+    out: list[tuple[str, str, str, str | None]] = []
+    for gid, name, n in rows:
+        has_scope = await db.scalar(select(DHCPScope.id).where(DHCPScope.group_id == gid).limit(1))
+        if has_scope is None:
+            continue
+        out.append(
+            (
+                f"{gid}:standalone",
+                f"{name} (standalone)",
+                f"DHCP server group '{name}' is standalone but has {n} Kea servers "
+                "serving the same scopes with no coordination: each can hand the "
+                "same address to a different client. Set the group mode to "
+                "hot-standby or load-balancing, or keep one Kea server in it.",
+                "critical",
+            )
+        )
+    return out
 
 
 async def _matching_dns_blocklist_feed_stale_subjects(

@@ -30,7 +30,7 @@ from app.api.v1.dhcp._failover_schemas import (
 from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPServerGroup
+from app.models.dhcp import HA_MODES, DHCPServerGroup
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteGroupArgs
 from app.services.appliance.group_names import (
@@ -195,7 +195,8 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         kea_packet_logging=g.kea_packet_logging,
         kea_member_count=len(kea),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
-        ha_peer_auth_active=len(kea) >= 2
+        ha_peer_auth_active=g.mode in HA_MODES
+        and len(kea) >= 2
         and all(s.ha_peer_url for s in kea)
         and peer_auth_ready(g, kea),
         servers=[
