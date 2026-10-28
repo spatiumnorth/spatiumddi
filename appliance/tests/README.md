@@ -27,6 +27,7 @@ helm or a cluster.
 | `test_k3s_kubelet_eviction.py` | `config.yaml`'s kubelet args give the kubelet a `memory.available` eviction threshold beside k3s's restated disk floors, a short pressure-transition period and node reserves (#1124) |
 | `test_install_ntp_decline.py` | Blanking the installer's **Time source** really disabling NTP — the rendered on-target `chrony.conf` plus firstboot's explicit-decline sentinel (#1002) |
 | `test_snmp_agentx_probe.py` | `spatiumddi-snmp-reload`'s config probe running on a throwaway AgentX socket, so it never takes the live snmpd's `/run/agentx/master` (and lldpd's LLDP-MIB registration) — against a stub and, when installed, the real `snmpd` (#2154) |
+| `test_live_session_sudoers.py` | The live ISO's session sudoers rule staying off installed systems: live-config's account components removed from the image, the installer's excludes, `spatium-etc-reconcile`'s exact-content cleanup, and `user` / `debian` reserved as admin usernames |
 | `test_preseed_lint.py` | `spatium-install --check-preseed` linter |
 | `test_preseed_security.py` | The #549 preseed installer's security guards (#581) |
 | `test_slot_status_active_version.py` | `spatium-upgrade-slot status` reading the active slot's version without a mount (#788) |
