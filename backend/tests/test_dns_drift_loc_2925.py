@@ -119,11 +119,9 @@ def test_tlsa_long_data_matches_the_chunked_wire_form() -> None:
 
 
 def test_other_types_are_not_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.services.dns.pull_from_server as pfs
-
     def boom(*_a: object, **_k: object) -> str:
         raise AssertionError("parsed a type that has no rdata rule")
 
-    monkeypatch.setattr(pfs, "_wire_canonical", boom)
+    monkeypatch.setattr("app.services.dns.pull_from_server._wire_canonical", boom)
     for rtype, value in [("A", "192.0.2.1"), ("MX", "mail"), ("TXT", "x"), ("CNAME", "a")]:
         _n(rtype, value)
