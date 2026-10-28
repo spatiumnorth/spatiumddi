@@ -55,6 +55,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.drivers.dns._caa import caa_presentation
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -334,12 +335,22 @@ class HetznerDNSDriver(CloudDNSDriverBase):
             if len(parts) == 4:
                 return " ".join(parts[:3] + [cls._absolute(parts[3])])
             return value
+        if rtype == "CAA":
+            return caa_presentation(value)
         if rtype in _HOSTNAME_TARGET_TYPES:
             return cls._absolute(value)
         return value
 
+    @staticmethod
+    def _read_value_cmp(rtype: str, value: Any) -> Any:
+        """A held value as the desired set would spell it: a CAA record is
+        one record however it was quoted (#2959)."""
+        return caa_presentation(value) if rtype == "CAA" and isinstance(value, str) else value
+
     @classmethod
     def _read_value(cls, rtype: str, value: str) -> str:
+        if rtype.upper() == "CAA":
+            return caa_presentation(value)
         return cls._txt_from_wire(value) if rtype.upper() == "TXT" else value
 
     # ── Zone reads ──────────────────────────────────────────────────────
@@ -485,7 +496,10 @@ class HetznerDNSDriver(CloudDNSDriverBase):
                 if current is None:
                     await self._create_rrset(client, zone_fqdn, name, rtype, desired, ttl)
                     return
-                have = {r.get("value") for r in current.get("records") or []}
+                have = {
+                    self._read_value_cmp(rtype, r.get("value"))
+                    for r in current.get("records") or []
+                }
                 if have != set(desired):
                     await self._post_action(
                         client,

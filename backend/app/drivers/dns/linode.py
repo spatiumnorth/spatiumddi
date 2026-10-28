@@ -44,6 +44,7 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import caa_text, caa_unquoted_value, parse_caa
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -264,7 +265,11 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                         RecordData(
                             name=self._relativize(rec.get("name") or "", zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["target"],
+                            value=(
+                                caa_text(0, rec["tag"], rec["target"])
+                                if str(rec["type"]).upper() == "CAA" and rec.get("tag")
+                                else rec["target"]
+                            ),
                             ttl=ttl,
                             priority=rec.get("priority"),
                             # SRV weight/port are their own Linode fields
@@ -289,6 +294,20 @@ class LinodeDNSDriver(CloudDNSDriverBase):
             # Linode's "use the zone default TTL" is the sentinel 0.
             "ttl_sec": _TTL_DEFAULT if rec.ttl is None else rec.ttl,
         }
+        if rec.record_type.upper() == "CAA":
+            parsed = parse_caa(rec.value)
+            if parsed is None:
+                raise CloudDNSError(
+                    f"Linode: CAA value {rec.value!r} is not '<flags> <tag> <value>'."
+                )
+            if parsed[0] != 0:
+                # Linode's record has a tag and a target but no flags field,
+                # so the issuer-critical bit cannot be carried (#2959).
+                raise CloudDNSError(
+                    f"Linode: CAA flags {parsed[0]} cannot be stored; Linode has no flags field."
+                )
+            payload["tag"] = parsed[1]
+            payload["target"] = caa_unquoted_value(rec.value)
         if rec.priority is not None:
             payload["priority"] = rec.priority
         if rec.record_type.upper() == "SRV":
@@ -345,8 +364,14 @@ class LinodeDNSDriver(CloudDNSDriverBase):
         # Value-keyed lookup: pick the row whose target (and priority for
         # MX/SRV) actually matches.
         match_priority = priority is not None and record_type in _PRIORITY_TYPES
+        caa = parse_caa(target) if record_type.upper() == "CAA" else None
         for rec in results:
-            if rec.get("target") != target:
+            if caa is not None:
+                if (rec.get("tag") or "").lower() != caa[1].lower() or rec.get(
+                    "target"
+                ) != caa_unquoted_value(target):
+                    continue
+            elif rec.get("target") != target:
                 continue
             if match_priority and rec.get("priority") != priority:
                 continue

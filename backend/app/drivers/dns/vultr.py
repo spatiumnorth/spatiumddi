@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import caa_key, caa_presentation
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -234,6 +235,8 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     if rec.get("type") not in ("MX", "SRV"):
                         priority = None
                     value = rec["data"]
+                    if rec.get("type") == "CAA":
+                        value = caa_presentation(value)
                     weight: int | None = None
                     port: int | None = None
                     if rec.get("type") == "SRV":
@@ -257,6 +260,16 @@ class VultrDNSDriver(CloudDNSDriverBase):
         return records
 
     # ── Record writes ───────────────────────────────────────────────────
+    @staticmethod
+    def _data(rec: RecordData) -> str:
+        if rec.record_type.upper() == "SRV":
+            return VultrDNSDriver._srv_data(rec)
+        if rec.record_type.upper() == "CAA":
+            # Vultr keeps the CAA record in its one ``data`` field in zone-file
+            # form, ``<flags> <tag> "<value>"`` (#2959).
+            return caa_presentation(rec.value)
+        return rec.value
+
     def _record_payload(self, change: RecordChange) -> dict[str, Any]:
         rec = change.record
         payload: dict[str, Any] = {
@@ -264,7 +277,7 @@ class VultrDNSDriver(CloudDNSDriverBase):
             "type": rec.record_type,
             # SRV: weight/port have no Vultr fields — they ride in data
             # (priority stays in its own field, omitted from data) (#1526).
-            "data": self._srv_data(rec) if rec.record_type.upper() == "SRV" else rec.value,
+            "data": self._data(rec),
             # Vultr's "automatic" TTL is the sentinel 0.
             "ttl": _TTL_AUTO if rec.ttl is None else rec.ttl,
         }
@@ -305,7 +318,10 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     continue
                 if (rec.get("name") or "") != name:
                     continue
-                if rec.get("data") != content:
+                if record_type == "CAA":
+                    if caa_key(rec.get("data") or "") != caa_key(content or ""):
+                        continue
+                elif rec.get("data") != content:
                     continue
                 if priority is not None and rec.get("priority") != priority:
                     continue
