@@ -2736,9 +2736,17 @@ export function ZoneModal({
   const [customerId, setCustomerId] = useState<string | null>(
     zone?.customer_id ?? null,
   );
-  // The route takes read on 'manage_domains': a user without it is not asked
-  // (#2926), and the select says the list is not available.
-  const canReadDomains = usePermissions().can("read", "manage_domains");
+  // The route takes read on 'manage_domains' and is mounted behind the
+  // network.domains module (404 when off). A user without the grant, or an
+  // install with the module off, is not asked (#2926): the select says the
+  // list is not available. ``ready`` waits for the real module state, since
+  // ``enabled`` answers true while it loads.
+  const canReadDomainPerm = usePermissions().can("read", "manage_domains");
+  const { enabled: domainModuleEnabled, ready: domainModulesReady } =
+    useFeatureModules();
+  const domainsModuleOn =
+    domainModulesReady && domainModuleEnabled("network.domains");
+  const canReadDomains = canReadDomainPerm && domainsModuleOn;
   const { data: domainList } = useQuery({
     queryKey: ["domains-picker"],
     queryFn: () => domainsApi.list({ page_size: 500 }),
@@ -3104,6 +3112,17 @@ export function ZoneModal({
             disabled={!canReadDomains}
           >
             <option value="">— Auto-match by zone name —</option>
+            {/* A link the list does not carry (the list is not readable, or
+                not loaded yet) is still the zone's link: show it as set and
+                send it back unchanged, never as "auto-match" (#2926). */}
+            {domainId &&
+              !(domainList?.items ?? []).some((d) => d.id === domainId) && (
+                <option value={domainId}>
+                  {canReadDomains
+                    ? "Linked domain (loading…)"
+                    : "Linked to a domain (kept as is)"}
+                </option>
+              )}
             {(domainList?.items ?? []).map((d) => (
               <option key={d.id} value={d.id}>
                 {d.name}
@@ -3115,8 +3134,11 @@ export function ZoneModal({
             Pin to a tracked domain registration so the Domain detail page
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
-            {!canReadDomains &&
-              " The domain list is not available to your account (it needs read on domains), so only auto-match is offered."}
+            {!canReadDomainPerm
+              ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
+              : domainModulesReady && !domainsModuleOn
+                ? " Domain tracking is turned off (Settings → Features), so the domain list is not available."
+                : ""}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -3516,7 +3538,8 @@ function RecordModal({
 
 /**
  * Per-server serial-drift pill (#2316: a non-active server is never counted
- * as in sync, a paused one is excluded and listed as "paused"). Display states:
+ * as in sync, a paused one is excluded and listed as "paused"; a disabled one
+ * is excluded and listed as "disabled", #2927). Display states:
  *  - All servers on the target serial → emerald "N/N synced · serial X"
  *  - Some servers behind / ahead      → amber "1/3 drift · target X"
  *  - No server has reported yet       → muted "— not reported"
@@ -3524,7 +3547,7 @@ function RecordModal({
  * Hover tooltip lists every server with its own serial for quick drift
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
-function ZoneSyncPill({ state }: { state: ZoneServerState }) {
+export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   if (state.servers.length === 0) return null;
   // #2316 — a paused (maintenance) server is shown separately and left out
   // of the count; a server that is not active is counted, but never as in
