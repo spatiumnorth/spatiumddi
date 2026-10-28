@@ -16,6 +16,7 @@ from jose import JWTError
 from jose import jwt as jose_jwt
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
@@ -274,7 +275,8 @@ def _client_ip(request: Request) -> str | None:
 # stays short-lived and lives in JS memory only (see frontend
 # ``lib/authToken.ts``). The cookie is path-scoped to ``/api/v1/auth`` so
 # it rides only the refresh + logout calls, not every API request.
-_REFRESH_COOKIE = "spatium_refresh"
+REFRESH_COOKIE = "spatium_refresh"
+_REFRESH_COOKIE = REFRESH_COOKIE
 _REFRESH_COOKIE_PATH = "/api/v1/auth"
 
 
@@ -295,6 +297,44 @@ def _set_refresh_cookie(response: Response, request: Request, raw_refresh: str) 
 
 def _clear_refresh_cookie(response: Response) -> None:
     response.delete_cookie(_REFRESH_COOKIE, path=_REFRESH_COOKIE_PATH)
+
+
+async def _refresh_session_is_live(db: AsyncSession, session: UserSession, now: datetime) -> bool:
+    """Not revoked, not past ``expires_at``, and not idle past the configured
+    Session Timeout. ``session`` is already resolved through the rotation
+    grace (#2941). The refresh cookie outlives the access token, so the idle
+    check here is the gate that actually ends an abandoned session."""
+    return (
+        not session.revoked
+        and session.expires_at > now
+        and not is_idle_expired(session, await get_session_timeout_minutes(db), now)
+    )
+
+
+async def live_refresh_session(db: AsyncSession, raw_refresh: str) -> UserSession | None:
+    """The live session a refresh cookie belongs to, or ``None``.
+
+    Read-only — rotation is the caller's business. Used by the API docs'
+    spec route (#2935), which reads the cookie WITHOUT rotating it; it
+    applies the same liveness rule as ``/auth/refresh``
+    (``_refresh_session_is_live``), so the two cannot disagree about what a
+    live cookie is. That includes the rotation grace (#2941): a cookie
+    another tab rotated within the last few seconds stands for its
+    successor, so a docs tab holding it still loads the spec. A cookie
+    revoked any other way (logout, force-logout, password change), or one
+    whose grace has passed, resolves to ``None``.
+    """
+    result = await db.execute(
+        select(UserSession).where(UserSession.refresh_token_hash == hash_refresh_token(raw_refresh))
+    )
+    presented = result.scalar_one_or_none()
+    if presented is None:
+        return None
+    now = datetime.now(UTC)
+    session = await rotation_successor(db, presented, now)
+    if session is None or not await _refresh_session_is_live(db, session, now):
+        return None
+    return session
 
 
 async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) -> TokenResponse:
@@ -910,14 +950,9 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
     # this refresh renews.
     session = await rotation_successor(db, presented, now) if presented is not None else None
     in_grace = session is not None and session is not presented
-    # A session idle past the configured Session Timeout cannot be renewed:
-    # the refresh cookie outlives the access token, so this is the gate that
-    # actually ends an abandoned session.
-    if (
-        session is None
-        or session.expires_at <= now
-        or is_idle_expired(session, await get_session_timeout_minutes(db), now)
-    ):
+    # Expiry and the idle timeout, by the same rule the docs spec route
+    # applies (``live_refresh_session``).
+    if session is None or not await _refresh_session_is_live(db, session, now):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
         )

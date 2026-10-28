@@ -112,7 +112,7 @@ build: build-supervisor
 	# where the control-plane node showed up under Service agents
 	# because the baked UI predated the two-role / promote-UI changes.
 	# Mirrors build-supervisor; the retag loop below maps it to ghcr:dev.
-	docker build -t spatiumddi-frontend:dev $(FRONTEND_DIR)
+	docker build -t spatiumddi-frontend:dev -f $(FRONTEND_DIR)/Dockerfile .
 	# #272 — explicitly build api / dns / dhcp too. The PROD compose
 	# (``$(COMPOSE)`` = docker-compose.yml) has NO ``build:`` sections —
 	# every service pins a pre-built ``image:`` — so ``docker compose
@@ -287,9 +287,9 @@ test-durations:
 # trivy-scheduled.yml superset that nominally covers it has been exiting
 # at the backend image before reaching it — so in practice nothing scanned
 # it, and the first scan in 2026.09.04-1 found four HIGH CVEs in the
-# nginx-alpine base. Its build context is ``frontend/`` rather than the
-# repo root, which is why each spec carries one —
-# ``dockerfile:context:name``.
+# nginx-alpine base. Its build context was ``frontend/`` until #2895 (the
+# About page serves the root NOTICE and LICENSE); each spec still carries its
+# own — ``dockerfile:context:name``.
 #
 # IMAGE=<name> scans one image; omit to scan all eight.
 #
@@ -306,7 +306,7 @@ TRIVY_IMAGES ?= \
 	agent/dns/images/dnsdist/Dockerfile:.:dnsdist \
 	agent/supervisor/images/supervisor/Dockerfile:.:supervisor \
 	agent/looking-glass/images/gobgp/Dockerfile:.:looking-glass \
-	frontend/Dockerfile:frontend:frontend
+	frontend/Dockerfile:.:frontend
 
 trivy:
 	@IMAGE="$(IMAGE)" TRIVY_CACHE="$(TRIVY_CACHE)" bash scripts/trivy-scan.sh $(TRIVY_IMAGES)

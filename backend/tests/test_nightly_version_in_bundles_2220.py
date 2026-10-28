@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.services.support_bundle import generate
 
+from ._signed_in import signed_in_headers
 from .test_diagnostic_bundle_redaction import _bundle
 
 TAG = "nightly-20261021"
@@ -30,7 +31,8 @@ def nightly(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_support_bundle_manifest_and_versions_match_the_version_endpoint(
     nightly: None, client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    served = (await client.get("/api/v1/version")).json()["version"]
+    headers = await signed_in_headers(db_session)
+    served = (await client.get("/api/v1/version", headers=headers)).json()["version"]
     assert served == STAMP
 
     result = await generate(db_session, scrubbed=True)

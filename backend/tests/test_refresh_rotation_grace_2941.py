@@ -26,6 +26,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +41,20 @@ from tests.test_fix_m3_m4_auth_session import _bearer, _ensure_settings, _user
 
 _PASSWORD = "OldPass123!"
 _COOKIE = "spatium_refresh"
+
+
+@pytest.fixture(autouse=True)
+def _no_login_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test here signs in over HTTP from the one test-client address,
+    so the file as a whole, or alongside another file that does the same in
+    one shard, outruns the per-IP login budget (30 a minute) and the next
+    sign-in is a 429. That throttle is not what these tests are about."""
+    from app.api.v1.auth import router as auth_router
+
+    async def _not_limited(_ip: str | None) -> bool:
+        return False
+
+    monkeypatch.setattr(auth_router, "login_rate_limited", _not_limited)
 
 
 async def _login(client: AsyncClient, user: User) -> tuple[str, str]:

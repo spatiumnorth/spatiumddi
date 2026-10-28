@@ -982,7 +982,9 @@ All services expose:
 - Unlike `/health/ready` (which returns a single binary verdict for
   orchestrator probes), this endpoint enumerates each control-plane
   piece so the UI can show a per-component status dot.
-- Response: `200 {"status": "ok"|"degraded", "components": [...]}`.
+- Response: `200 {"status": "ok"|"degraded", "components": [...]}` to a
+  signed-in caller. An anonymous caller gets `{"status": ...}` only —
+  enough for an uptime monitor, and nothing about the stack (#2935).
   Individual component failures **never** make the endpoint itself
   fail — the caller always gets a 200 with the rollup so a single
   flaky component doesn't blank the dashboard card.

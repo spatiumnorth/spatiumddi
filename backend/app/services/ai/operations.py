@@ -111,6 +111,12 @@ class Operation:
     # inline too. ``tests/test_operation_permission_declared.py`` fails for any
     # operation that sets neither.
     requires_superadmin: bool = False
+    # Optional submit-time refusal, run ONLY by the request portal
+    # (``submit_request``) after ``preview`` passes. It raises a 4xx
+    # ``HTTPException`` for what the REST create would refuse (#2903). Kept
+    # off ``preview`` because the copilot shares that and deliberately only
+    # hints at conflicts; apply re-enforces regardless.
+    validate_submit: Callable[[AsyncSession, User, Any], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -342,6 +348,24 @@ async def _preview_create_ip_address(
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
+async def _validate_submit_create_ip_address(
+    db: AsyncSession, user: User, args: CreateIPAddressArgs
+) -> None:
+    """Request-portal submit check: what the REST create would refuse (#2903/#2905)."""
+    from app.services.ipam.address_create_rules import (  # noqa: PLC0415
+        assert_address_unallocated,
+        assert_static_dhcp_has_mac,
+        assert_subnet_takes_addresses,
+    )
+
+    subnet = await db.get(Subnet, args.subnet_id)
+    if subnet is None:  # preview already refused; defensive
+        return
+    assert_subnet_takes_addresses(subnet)
+    assert_static_dhcp_has_mac(args.status, args.mac_address)
+    await assert_address_unallocated(db, subnet.id, args.address)
+
+
 async def _apply_create_ip_address(
     db: AsyncSession, user: User, args: CreateIPAddressArgs
 ) -> dict[str, Any]:
@@ -370,6 +394,15 @@ async def _apply_create_ip_address(
     net = ipaddress.ip_network(str(subnet.network), strict=False)
     if addr_obj not in net:
         raise ValueError(f"Address {args.address} is not within subnet {subnet.network}")
+
+    # #2905 — the REST create's multicast refusal. A hostname-bearing apply
+    # reaches it through ``create_address``; this one inserts directly, so a
+    # request queued before submit learned the rule must still not land.
+    if subnet.kind == "multicast":
+        raise ValueError(
+            f"Subnet {subnet.network} is a multicast subnet — addresses are stream "
+            "identities. Create a multicast group under /multicast/groups instead."
+        )
 
     # Re-check for existing allocation under the apply transaction.
     existing = (
@@ -1832,6 +1865,7 @@ register(
         args_model=CreateIPAddressArgs,
         preview=_preview_create_ip_address,
         apply=_apply_create_ip_address,
+        validate_submit=_validate_submit_create_ip_address,
         category="ipam",
         required_permission=("write", "ip_address"),
     )
@@ -2222,7 +2256,7 @@ async def _preview_create_dns_record(
                 DNSRecord.deleted_at.is_(None),
             )
         )
-    ).scalar_one_or_none()
+    ).first()
     suffix = " — note: an identical record already exists" if existing else ""
 
     parts = [
@@ -2238,6 +2272,40 @@ async def _preview_create_dns_record(
     if args.port is not None:
         parts.append(f"port={args.port}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_dns_record(
+    db: AsyncSession, user: User, args: CreateDNSRecordArgs
+) -> None:
+    """Request-portal submit check: the identical-record 409 the REST create
+    and this operation's apply both make (#1230), refused while the requester
+    is still present rather than at approve (#2903)."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
+
+    rtype = args.record_type.strip().upper()
+    existing = await find_identical_record(
+        db,
+        UUID(args.zone_id),
+        view_id=None,
+        name=args.name.strip(),
+        record_type=rtype,
+        value=args.value,
+        priority=args.priority,
+        weight=args.weight if rtype == "SRV" else None,
+        port=args.port if rtype == "SRV" else None,
+    )
+    if existing is not None:
+        # The REST wording minus the existing row's id (``describe_identical``
+        # names it): the requester need not hold read on the zone's records.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An identical {existing.record_type} record {existing.fqdn} -> "
+                f"{existing.value} already exists."
+            ),
+        )
 
 
 async def _apply_create_dns_record(
@@ -2410,6 +2478,7 @@ register(
         args_model=CreateDNSRecordArgs,
         preview=_preview_create_dns_record,
         apply=_apply_create_dns_record,
+        validate_submit=_validate_submit_create_dns_record,
         category="dns",
         required_permission=("write", "dns_record"),
     )
@@ -2999,7 +3068,7 @@ async def _preview_create_dhcp_static(
                 ),
             )
         )
-    ).scalar_one_or_none()
+    ).first()
     suffix = ""
     if existing is not None:
         suffix = " — note: a static for this IP or MAC already exists; apply will fail"
@@ -3017,6 +3086,21 @@ async def _preview_create_dhcp_static(
     # #2901 — apply mirrors the reservation into IPAM, as the REST create does.
     parts.append("mirrors into IPAM as a static_dhcp address")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
+
+
+async def _validate_submit_create_dhcp_static(
+    db: AsyncSession, user: User, args: CreateDHCPStaticArgs
+) -> None:
+    """Request-portal submit check: the REST create's reservation conflicts (#2903)."""
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.services.dhcp.static_conflicts import check_static_conflicts  # noqa: PLC0415
+
+    scope = await db.get(DHCPScope, args.scope_id)
+    if scope is None:  # preview already refused; defensive
+        return
+    await check_static_conflicts(
+        db, scope, args.ip_address, args.mac_address.lower(), name_other_scope=False
+    )
 
 
 async def _apply_create_dhcp_static(
@@ -3110,6 +3194,7 @@ register(
         args_model=CreateDHCPStaticArgs,
         preview=_preview_create_dhcp_static,
         apply=_apply_create_dhcp_static,
+        validate_submit=_validate_submit_create_dhcp_static,
         category="dhcp",
         required_permission=("write", "dhcp_static"),
     )

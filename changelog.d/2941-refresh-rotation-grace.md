@@ -16,7 +16,9 @@
   and disabling the account end the session at once, for the old cookie
   and the old access token alike. A password change made from a tab
   whose token is inside the window now keeps that tab's current session
-  instead of revoking it.
+  instead of revoking it. The API docs pages, which read the cookie
+  without rotating it (#2935), honour the same window, so a docs tab
+  opened just as another tab refreshed still loads the schema.
 - **A sign-out, password change or force-logout can no longer be raced by
   a refresh (#2941).** A revocation that ran while a refresh was rotating
   one of the account's sessions waited for that refresh and then missed the

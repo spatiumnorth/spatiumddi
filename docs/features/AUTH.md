@@ -54,6 +54,10 @@ SpatiumDDI's auth stack has three layers:
   from the session viewer, a password change or disabling the account
   revokes the live session, which ends the old cookie and the old access
   token at once, with no grace.
+  The API docs' spec route (`GET /api/v1/auth/openapi.json`, #2935), which
+  reads the refresh cookie without rotating it, applies the same rule: a
+  docs tab holding a cookie another tab rotated within the window still
+  loads the schema, and one revoked any other way does not.
   - **The window is anchored to the rotation.** A refresh inside the window
     does not rotate again, so it never moves `rotated_at`; replaying the old
     cookie over and over cannot stretch the 10 seconds. The successor's own
