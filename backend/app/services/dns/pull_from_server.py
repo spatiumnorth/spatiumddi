@@ -27,7 +27,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
+import dns.tokenizer
 import structlog
+from dns.rdtypes.ANY.CAA import CAA
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -221,21 +226,90 @@ def targets_are_relative(server: Any) -> bool:
     return True
 
 
-def loc_canonical(rtype: str, value: str) -> str:
-    """A LOC / CAA value in dnspython's ``to_text`` form (what the AXFR reader
-    prints); the lower-cased text when it does not parse, so a malformed
-    value still keys deterministically instead of raising."""
-    text = value.strip()
-    try:
-        import dns.rdata
-        import dns.rdataclass
-        import dns.rdatatype
+#: Types whose value is free-form presentation text that dnspython parses:
+#: a typed value can be any of several spellings of one rdata (``7m`` /
+#: ``7.00m``, ``03`` / ``3``, hex split by spaces or in upper case), while the
+#: AXFR reader prints the one ``to_text`` form (#2925). Kept to these types:
+#: parsing every record of a large zone would cost for nothing.
+_RDATA_CANONICAL_TYPES = frozenset({"LOC", "TLSA", "SSHFP"})
 
-        return dns.rdata.from_text(
-            dns.rdataclass.IN, dns.rdatatype.from_text(rtype), text
+#: A LOC direction letter written in lower case, which dnspython refuses.
+_LOC_DIRECTION = re.compile(r"(?<=\s)([nsew])(?=\s|$)")
+
+#: ``<flags> <tag> <value>``; the value is everything after the tag.
+_CAA_FIELDS = re.compile(r"^(\d+)\s+(\S+)\s+(.*)$", re.S)
+
+
+def _wire_canonical(rtype: str, text: str) -> str:
+    """``text`` as dnspython prints it after a wire round trip, which is what
+    the AXFR reader prints for the record a server built from it.
+
+    The round trip is load-bearing for LOC: size and precisions are stored
+    as one digit times a power of ten, so a typed ``15m`` is served, and read
+    back, as ``10.00m``. Raises when dnspython cannot parse ``text``."""
+    rdtype = dns.rdatatype.from_text(rtype)
+    wire = dns.rdata.from_text(dns.rdataclass.IN, rdtype, text).to_wire()
+    if wire is None:  # only when writing into a caller's file; never here
+        raise ValueError("no wire form")
+    return dns.rdata.from_wire(dns.rdataclass.IN, rdtype, wire, 0, len(wire)).to_text()
+
+
+def rdata_canonical(rtype: str, value: str) -> str:
+    """A LOC / TLSA / SSHFP value in the AXFR reader's form (#2925).
+
+    A value dnspython cannot parse keys as its stripped, lower-cased text,
+    as every type without a rule does: nothing in these types is
+    case-sensitive. LOC direction letters are tried upper-cased first, so
+    ``n`` / ``N`` are one record."""
+    text = value.strip()
+    candidates = [text]
+    if rtype == "LOC":
+        upper = _LOC_DIRECTION.sub(lambda m: m.group(1).upper(), text)
+        if upper != text:
+            candidates.append(upper)
+    for candidate in candidates:
+        try:
+            return _wire_canonical(rtype, candidate)
+        except Exception:  # noqa: BLE001 - dnspython raises several types; try the next form
+            continue
+    return text.lower()
+
+
+def caa_canonical(value: str) -> str:
+    """A CAA value in the AXFR reader's form (#2925): ``0 issue ca.org`` and
+    ``0 issue "ca.org"`` are one record.
+
+    Parsed by hand rather than as a zone-file line, because a zone-file
+    parse would key two genuinely different records together: an unquoted
+    ``ca.org; account=1`` reads as ``ca.org`` and a comment, and a provider
+    that takes the value as given (Azure) serves all of it. So an unquoted
+    value is the rest of the text as written, and only a quoted one is
+    unescaped. The tag is lower-cased, since tags match case-insensitively
+    (RFC 8659 §4.1); the value keeps its case, since an ``iodef`` URL or an
+    account URI is case-sensitive. The flags compare as a number. A value
+    that does not parse keys as its text with runs of whitespace folded,
+    case kept for the same reason."""
+    text = value.strip()
+    fallback = " ".join(text.split())
+    m = _CAA_FIELDS.match(text)
+    if m is None:
+        return fallback
+    flags, tag, rest = m.groups()
+    try:
+        if rest.startswith('"'):
+            tok = dns.tokenizer.Tokenizer(rest)
+            token = tok.get()
+            if not token.is_quoted_string():
+                return fallback
+            raw = token.unescape_to_bytes().value
+            tok.get_eol()
+        else:
+            raw = rest.encode("utf-8")
+        return CAA(
+            dns.rdataclass.IN, dns.rdatatype.CAA, int(flags), tag.lower().encode("ascii"), raw
         ).to_text()
-    except Exception:  # noqa: BLE001 - any parse failure falls back to raw text
-        return text.lower()
+    except Exception:  # noqa: BLE001 - any parse failure keys as the text
+        return fallback
 
 
 def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets: bool) -> str:
@@ -249,6 +323,8 @@ def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets
       (``aaa.zone.local``) is already absolute, and with it True
       (``a.b``) is ``a.b.zone.local.`` (#1794; see
       :func:`targets_are_relative`).
+    * LOC / TLSA / SSHFP / CAA: the form the AXFR reader prints (#2925);
+      see :func:`rdata_canonical` and :func:`caa_canonical`.
     * Everything else: stripped + lowercased (fine for A/AAAA/IP literals
       where case doesn't matter either).
     """
@@ -259,11 +335,13 @@ def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets
         # form, case kept: TXT content is case-sensitive (DKIM keys,
         # tokens). Not stripped: the renderers serve surrounding spaces.
         return quote_txt(value or "")
-    if rtype in ("LOC", "CAA"):
-        # #2925: ``7m`` and ``7.00m`` are one record, and so are a bare and
-        # a quoted CAA value; the AXFR reader prints dnspython's canonical
-        # form, a typed value can be any spelling.
-        return loc_canonical(rtype, value or "")
+    if rtype in _RDATA_CANONICAL_TYPES:
+        # #2925: ``7m`` and ``7.00m`` are one record; the AXFR reader prints
+        # dnspython's canonical form, a typed value can be any spelling.
+        return rdata_canonical(rtype, value or "")
+    if rtype == "CAA":
+        # #2925: a bare and a quoted CAA value are one record.
+        return caa_canonical(value or "")
     v = (value or "").strip().lower()
     if rtype in ("A", "AAAA"):
         # Canonical form (#1513): an expanded/upper-case address as
