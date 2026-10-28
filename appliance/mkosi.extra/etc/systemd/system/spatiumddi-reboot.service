@@ -14,4 +14,7 @@ ExecStartPre=/bin/sleep 10
 # ``-`` prefix (#553): tolerate an already-moved/absent trigger so this
 # oneshot never ends ``failed`` — the reboot still needs to fire.
 ExecStartPre=-/bin/mv /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
-ExecStart=/usr/bin/systemctl reboot
+# #2974 — hands the PostgreSQL primary off first (up to ~2 min, so the
+# start timeout is widened), then systemctl reboot.
+TimeoutStartSec=300
+ExecStart=/usr/local/bin/spatium-power-action reboot

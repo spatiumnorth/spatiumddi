@@ -5042,18 +5042,23 @@ def do_login(tty_path: str) -> None:
         os.execvp("login", ["login"])
 
 
+# #2974 — reboot / poweroff go through one wrapper that hands the PostgreSQL
+# primary off to another node first (same as the web-UI and Fleet reboots).
+POWER_ACTION = "/usr/local/bin/spatium-power-action"
+
+
 def do_reboot(console: Console) -> None:
     if confirm_modal(console, "Reboot the appliance now?"):
         console.clear()
         console.print("\n\n[bold yellow]Rebooting…[/bold yellow]\n")
-        subprocess.run(["systemctl", "reboot"], check=False)
+        subprocess.run([POWER_ACTION, "reboot"], check=False)
 
 
 def do_shutdown(console: Console) -> None:
     if confirm_modal(console, "Power off the appliance now?"):
         console.clear()
         console.print("\n\n[bold yellow]Powering off…[/bold yellow]\n")
-        subprocess.run(["systemctl", "poweroff"], check=False)
+        subprocess.run([POWER_ACTION, "poweroff"], check=False)
 
 
 def do_cancel_reboot(console: Console) -> None:

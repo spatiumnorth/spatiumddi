@@ -459,6 +459,9 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-clear-shutdown-pods.service
 # off first (spatiumddi-reboot-agent); this uncordons the node at its boot.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-reboot-handoff"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-handoff.service"
+# #2974 — the web-UI reboot and the console's reboot / poweroff go through
+# this, which runs the handoff first.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-power-action"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user
