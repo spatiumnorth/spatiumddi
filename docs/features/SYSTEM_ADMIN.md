@@ -1279,7 +1279,17 @@ Every SemVer release is newer than every CalVer one, and versions are never comp
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
-- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }`
+- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }` to a signed-in caller
+
+**What an anonymous caller sees (#2935).** Version and stack details are for signed-in users only, because the exact release tells a scanner which advisories apply. Without a session or API token:
+
+- `GET /api/v1/version` returns only `product`, `api_level` and `restricted: true`; the version and release-check fields are null / false.
+- `GET /health/platform` returns the rollup `status` only, with no component list (which named every Celery worker by container id or pod name).
+- `/api/openapi.json` answers 401. `/api/docs` and `/api/redoc` load, then ask the reader to sign in.
+- The web tier sends `Server: nginx` with no version (`server_tokens off`), on the console and on the appliance's agent landing page.
+- DNS servers answer `version.bind CH TXT` with `"none"`. BIND9 also stops answering `hostname.bind`, and PowerDNS answers `id.server` (and NSID) with `"none"` instead of the container hostname. Technitium already refuses CHAOS queries.
+
+The public JavaScript bundle still carries the libraries it is built from; that cannot be hidden while the console loads before sign-in.
 
 ### GitHub Release Check
 

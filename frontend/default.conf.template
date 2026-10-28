@@ -62,6 +62,10 @@ server {
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
+    # #2935 — no ``Server: nginx/<version>`` on any response, or the
+    # version on nginx's own error pages: version details are for signed-in
+    # users only. Must not diverge from the other template.
+    server_tokens off;
 
     real_ip_header X-Forwarded-For;
     real_ip_recursive on;
