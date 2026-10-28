@@ -698,6 +698,10 @@ postgresql:
   enabled: true
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
+  # #2955 — standalone only: max_connections. "" derives it from the pools
+  # (see ``postgresql.cnpg.parameters.max_connections``). Changing it, or the
+  # pools / HPA it derives from, restarts the Postgres pod once.
+  maxConnections: ""
   image:
     repository: postgres
     tag: "16-alpine"
@@ -818,7 +822,11 @@ postgresql:
       # the after-commit hooks (#2782); replicas x pool has to stay under
       # this. The appliance's supervisor raises it past 200 when its
       # connection budget does (from five control-plane nodes).
-      max_connections: "200"
+      # #2955 — "" (the default) derives it from the pools: api pods (HPA max)
+      # x (pool + 3) + workers x (concurrency x 3 + 1) + beat + WAL senders +
+      # 10 reserve (helper ``spatiumddi.postgresMaxConnections``, the rule the
+      # appliance's supervisor applies). A set value wins; keep it above that.
+      max_connections: ""
       shared_buffers: "256MB"
       work_mem: "16MB"
       # #2132 / #2240 — WAL kept for a former primary to come back. After a

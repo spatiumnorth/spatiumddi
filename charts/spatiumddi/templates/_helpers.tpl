@@ -776,3 +776,34 @@ Args: ``value`` (bool or nil), ``conflict`` (bool), ``workload``, ``why``.
 hostUsers: {{ .value }}
 {{- end -}}
 {{- end -}}
+
+{{/*
+#2955 — the Postgres ``max_connections`` the configured pools can hold, the
+same rule the appliance applies (``k8s_api.postgres_connection_budget``):
+
+  api pods   x (pool size + maxOverflow + 2 hooks + 1 readiness probe)
+  workers    x (concurrency x (1 + 2 hooks) + 1)
+  celery-beat  2 hooks + 1
+  WAL senders  one per CNPG replica
+  reserve      10 (superuser_reserved_connections' 3, a migrate Job, psql)
+
+The api count is the HPA's maxReplicas while autoscaling is on (the replica
+count the HPA can reach), else ``api.replicas``. An unset
+``api.databasePool`` is the application's own 10 + 20. Used by the standalone
+Postgres StatefulSet and by the CNPG Cluster whenever the operator leaves
+``max_connections`` empty; the appliance sets its own explicitly.
+*/}}
+{{- define "spatiumddi.postgresMaxConnections" -}}
+{{- $pool := .Values.api.databasePool | default dict -}}
+{{- $size := 10 -}}
+{{- if not (kindIs "invalid" $pool.size) }}{{ $size = int $pool.size }}{{ end -}}
+{{- $overflow := 20 -}}
+{{- if not (kindIs "invalid" $pool.maxOverflow) }}{{ $overflow = int $pool.maxOverflow }}{{ end -}}
+{{- $apiPods := int .Values.api.replicas -}}
+{{- if .Values.api.autoscaling.enabled }}{{ $apiPods = max (int .Values.api.autoscaling.maxReplicas) (int .Values.api.autoscaling.minReplicas) }}{{ end -}}
+{{- $api := mul $apiPods (add $size $overflow 2 1) -}}
+{{- $worker := mul (int .Values.worker.replicas) (add (mul (int .Values.worker.concurrency) 3) 1) -}}
+{{- $senders := 0 -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" }}{{ $senders = sub (int .Values.postgresql.cnpg.instances) 1 }}{{ end -}}
+{{- add $api $worker 3 $senders 10 -}}
+{{- end }}

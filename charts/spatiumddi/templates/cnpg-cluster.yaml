@@ -116,7 +116,12 @@ spec:
 
   postgresql:
     parameters:
-      {{- toYaml .Values.postgresql.cnpg.parameters | nindent 6 }}
+      {{- /* #2955 — an empty max_connections is derived from the pools. */}}
+      {{- $params := deepCopy .Values.postgresql.cnpg.parameters }}
+      {{- if not $params.max_connections }}
+      {{- $_ := set $params "max_connections" (include "spatiumddi.postgresMaxConnections" . | trim) }}
+      {{- end }}
+      {{- toYaml $params | nindent 6 }}
 
   bootstrap:
     initdb:

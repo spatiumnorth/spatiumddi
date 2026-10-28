@@ -56,7 +56,8 @@ kubectl create secret generic spatiumddi-secrets \
 kubectl run postgres --image=postgres:16-alpine -n spatiumddi \
   --env=POSTGRES_USER=spatiumddi \
   --env=POSTGRES_PASSWORD=CHANGEME \
-  --env=POSTGRES_DB=spatiumddi
+  --env=POSTGRES_DB=spatiumddi \
+  -- postgres -c max_connections=371   # see "Postgres connection budget" below
 # Give it a Service under the name DATABASE_URL expects. In the HA
 # path CNPG creates `postgres-rw` itself; here the expose creates it
 # (#1547 — a bare `kubectl run` pod has no Service at all).
@@ -165,6 +166,31 @@ under its pooled sessions and refuses new connections for over three minutes
 (the 180 s `smartShutdownTimeout`, then the restart). Change `imageName` and
 `postgresql.parameters` in separate applies: the operator's webhook refuses an
 update that changes both.
+
+### Postgres connection budget (#2955)
+
+The manifests carry static numbers, so `max_connections` is sized for the
+defaults in `k8s/base/` and has to be re-derived if you change them. The rule
+is the one the appliance's supervisor applies
+(`k8s_api.postgres_connection_budget`) and the umbrella chart derives with a
+template helper (`spatiumddi.postgresMaxConnections`):
+
+```
+api pods x (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW + 2 hooks + 1 readiness probe)
++ worker replicas x (concurrency x 3 + 1)
++ celery-beat 3
++ CNPG replicas (WAL senders: instances - 1)
++ 10 reserve (superuser_reserved_connections 3, a migrate Job, psql)
+```
+
+The api count is the HPA's `maxReplicas` (10). Defaults: 10 x (30 + 3) = 330,
+worker 2 x (4 x 3 + 1) = 26, beat 3, 2 WAL senders, 10 reserve = **371**,
+which is what `k8s/ha/postgres-cluster.yaml` sets (it was 200, under the 330
+the api alone can open at the HPA maximum). Changing `max_connections` on
+CloudNativePG rolls the instances; on a standalone Postgres it restarts it.
+Postgres reserves memory per connection, so check the instance's memory limit
+if you raise it further. The CI chart gate (`chart-postgres-connections.py`)
+holds the Helm chart to this rule.
 
 ### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
