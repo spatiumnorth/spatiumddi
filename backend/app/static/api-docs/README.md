@@ -16,8 +16,10 @@ edit them; bump them.
 | `redoc@2.5.4` | `redoc/redoc.standalone.js` (from `bundles/`) | MIT (`redoc/LICENSE`) |
 
 Each bundle's `*.LICENSE.txt` is the license text of the packages bundled
-into it, which the bundle's first line points at. `swagger-ui-init.js` is
-ours: it replaces FastAPI's inline initializer.
+into it, which the bundle's first line points at. `swagger-ui-init.js`,
+`redoc-init.js` and `api-docs-auth.js` are ours: the first two replace
+FastAPI's inline initializers, and the third fetches the OpenAPI document
+with a Bearer, since `/api/openapi.json` is signed-in only (#2935).
 
 npm tarball integrity (`npm view <pkg>@<version> dist.integrity`):
 

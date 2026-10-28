@@ -11852,7 +11852,14 @@ export const metricsApi = {
 };
 
 export interface VersionInfo {
-  version: string;
+  // Always present (#2935): enough to know this is a SpatiumDDI control plane.
+  product: string;
+  api_level: number;
+  // True for an anonymous caller: the version, release-check and appliance
+  // identity fields below are then withheld (null / false). The console only
+  // asks while signed in, so it always sees ``restricted: false``.
+  restricted: boolean;
+  version: string | null;
   latest_version: string | null;
   update_available: boolean;
   latest_release_url: string | null;

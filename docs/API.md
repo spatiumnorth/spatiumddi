@@ -44,7 +44,7 @@ infrastructure rather than application surface:
 | `/health/live` | Liveness probe — 200 if the process is up | none |
 | `/health/ready` | Readiness probe — DB connectivity + **schema-at-head** + Redis; a pod already ready stays ready on a schema a newer release migrated while every table and column it uses is present (#2777) | none |
 | `/health/startup` | Same logic as `/health/ready`, for slow-start k8s containers | none |
-| `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard | none |
+| `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard. Anonymous callers get the rollup `status` only; the component list needs a signed-in caller (#2935) | optional |
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |
 | `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
 
@@ -67,7 +67,7 @@ and [`backend/app/api/docs.py`](https://github.com/spatiumnorth/spatiumddi/blob/
 |---|---|
 | `/api/docs` | Swagger UI |
 | `/api/redoc` | ReDoc |
-| `/api/openapi.json` | The OpenAPI 3.x schema document |
+| `/api/openapi.json` | The OpenAPI 3.x schema document — **signed in only** |
 
 Note the `/api/` prefix on the docs routes — they are **not** under
 `/api/v1`. The api serves the Swagger UI and ReDoc bundles itself, from
@@ -78,6 +78,23 @@ response models on every route, so it always reflects the running
 build. Each router carries a `tags=[...]` label (alphabetised in
 `router.py`) so the Swagger / ReDoc sidebar groups endpoints by
 feature area.
+
+**Signed in only (#2935).** The schema names every route and carries the
+exact running version in `info.version`, so `/api/openapi.json` needs a
+session or an API token (`Authorization: Bearer …`) and answers 401
+otherwise. The two HTML pages still load for anyone, but they carry only
+the page title: each fetches the schema with a token it gets from the
+browser's sign-in cookie (`POST /api/v1/auth/refresh`, the same silent
+refresh a second console tab makes on load). Signed in, the docs work as
+before, and "Try it out" sends that token. Signed out, the page says so and
+links to the sign-in page. From a script, fetch the schema with an API
+token:
+
+```bash
+curl -H "Authorization: Bearer $SPATIUM_TOKEN" https://ddi.example.com/api/openapi.json
+```
+
+The release asset below is unaffected and needs no credential.
 
 ### 2.1 The versioned contract (`openapi.json` release asset)
 
@@ -119,8 +136,8 @@ guarantees and a hand-rolled dump would not:
   public API.
 
 **Version handshake.** A client knows which spec it was built against, and
-`GET /api/v1/version` (unauthenticated — see §7.2) reports what the server
-is running. Gating a feature is then a version comparison rather than
+`GET /api/v1/version` (see §7.2) reports what the server is running, to a
+signed-in caller. Gating a feature is then a version comparison rather than
 probing for an endpoint and interpreting the 404.
 
 The document declares no `servers` block. That is deliberate: there is no
@@ -601,14 +618,44 @@ key is replaced whole. A boolean or integer under a credential-shaped
 key is kept, so a writer's `smtp_password_set: true` still says whether
 the secret was set. Both endpoints need `read` on `audit_log`.
 
-### 7.2 Read the running version (public)
+### 7.2 Read the running version (public, details signed in)
 
-`GET /api/v1/version` is unauthenticated (the login page calls it for
-the release-check banner); the host-identity fields are only populated
-for authenticated callers:
+`GET /api/v1/version` answers everyone, but version and stack details are
+for signed-in users only (#2935). An anonymous caller gets a coarse
+handshake: enough to know it reached a SpatiumDDI control plane, and
+nothing about which release. `restricted: true` says the other fields
+were withheld rather than empty:
 
 ```json
 {
+  "product": "SpatiumDDI",
+  "api_level": 1,
+  "restricted": true,
+  "version": null,
+  "latest_version": null,
+  "update_available": false,
+  "latest_release_url": null,
+  "latest_checked_at": null,
+  "release_check_enabled": false,
+  "latest_check_error": null,
+  "appliance_mode": false,
+  "appliance_version": null,
+  "appliance_hostname": null
+}
+```
+
+`api_level` is the major version of the REST surface (the `/api/v1`
+prefix), and changes only when a v1 client can no longer talk to the
+server. The appliance installer uses `product` to check that the URL it was
+given is a control plane before it wipes a disk.
+
+A signed-in caller (a session or an API token) gets the full answer:
+
+```json
+{
+  "product": "SpatiumDDI",
+  "api_level": 1,
+  "restricted": false,
   "version": "2026.06.25-1",
   "latest_version": null,
   "update_available": false,

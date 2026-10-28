@@ -24,9 +24,12 @@ from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.docs import STATIC_DIR, STATIC_PATH
+from app.api.docs import OPENAPI_URL, STATIC_DIR, STATIC_PATH
 from app.main import app
+
+from ._signed_in import signed_in_headers
 
 PAGES = ("/api/docs", "/api/redoc")
 
@@ -122,14 +125,28 @@ async def test_every_asset_a_docs_page_asks_for_is_served(client: AsyncClient, p
 
 
 @pytest.mark.asyncio
-async def test_swagger_ui_is_pointed_at_the_spec(client: AsyncClient) -> None:
-    """The initializer takes the spec URL from its script tag; it must be the
-    app's own openapi_url, and that document must be served."""
-    _, page = await _page(client, "/api/docs")
-    init = [s for s in page.scripts if s["src"].endswith("/swagger-ui-init.js")]
+@pytest.mark.parametrize(
+    ("path", "init_js"), [("/api/docs", "swagger-ui-init.js"), ("/api/redoc", "redoc-init.js")]
+)
+async def test_docs_page_is_pointed_at_the_spec(
+    client: AsyncClient, db_session: AsyncSession, path: str, init_js: str
+) -> None:
+    """The initializer takes the spec URL from its script tag; it must be
+    the app's spec route, and that document must be served — to a signed-in
+    caller (#2935). The page also names the refresh endpoint it gets the
+    token from, and loads the helper that does it before the initializer."""
+    _, page = await _page(client, path)
+    srcs = [s["src"] for s in page.scripts]
+    init = [s for s in page.scripts if s["src"].endswith("/" + init_js)]
     assert len(init) == 1, page.scripts
-    assert init[0].get("data-openapi-url") == app.openapi_url == "/api/openapi.json"
-    spec = await client.get(init[0]["data-openapi-url"])
+    auth = [i for i, src in enumerate(srcs) if src.endswith("/api-docs-auth.js")]
+    assert auth and auth[0] < srcs.index(init[0]["src"]), srcs
+    assert init[0].get("data-openapi-url") == OPENAPI_URL == "/api/openapi.json"
+    assert init[0].get("data-refresh-url") == "/api/v1/auth/refresh"
+    assert init[0].get("data-login-url") == "/login"
+    spec = await client.get(
+        init[0]["data-openapi-url"], headers=await signed_in_headers(db_session)
+    )
     assert spec.status_code == 200
     assert spec.json()["openapi"].startswith("3.")
 

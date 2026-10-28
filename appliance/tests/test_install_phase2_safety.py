@@ -170,6 +170,49 @@ def test_the_probe_asks_for_the_version_document():
     assert "-fsSL" in fn
 
 
+def test_the_probe_accepts_the_anonymous_handshake():
+    """#2935 — an anonymous caller (this probe has no credential) gets
+    ``"product": "SpatiumDDI"`` and no version string, so matching on the
+    version alone would call every current control plane the wrong host.
+    The version match stays for an older control plane that still sends it."""
+    fn = extract_fn("_probe_control_plane")
+    assert '"product"' in fn and "SpatiumDDI" in fn
+    assert '[ -z "$product" ] && [ -z "$ver" ]' in fn
+
+
+def _probe(body: str) -> str:
+    """Run the shipped probe against a stubbed curl that answers ``body``."""
+    import shlex
+
+    fn = extract_fn("_probe_control_plane")
+    script = (
+        f"curl() {{ printf '%s' {shlex.quote(body)}; return 0; }}\n"
+        f"{fn}\n"
+        '_probe_control_plane https://cp.example; echo " rc=$?"'
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout
+
+
+@pytest.mark.parametrize(
+    "body, verdict",
+    [
+        # What a current control plane tells an anonymous caller (#2935).
+        (
+            '{"product":"SpatiumDDI","api_level":1,"restricted":true,"version":null}',
+            "SpatiumDDI control plane rc=0",
+        ),
+        # An older control plane, which still sent the version anonymously.
+        ('{"version":"2026.10.02-1","latest_version":null}', "SpatiumDDI 2026.10.02-1 rc=0"),
+        # Somebody else's web server.
+        ("<html><body>It works!</body></html>", "rc=1"),
+        ('{"product":"SomethingElse","version":null}', "rc=1"),
+    ],
+)
+def test_the_probe_verdicts(body: str, verdict: str) -> None:
+    out = _probe(body).strip()
+    assert out.endswith(verdict), out
+
+
 def test_the_probe_reports_curls_own_error():
     """DNS failure, refused, TLS and timeout need different fixes, and
     curl already distinguishes them."""

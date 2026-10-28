@@ -1168,6 +1168,11 @@ ask_role() {
 # "is that MY control plane". A typo landing on some other host's web
 # server fails the JSON check rather than passing a reachability ping.
 #
+# #2935 — an anonymous caller (this probe has no credential) now gets only
+# ``"product": "SpatiumDDI"`` and ``api_level``; the version itself is for
+# signed-in users. So the product name is the match, and a version string
+# is shown only when an older control plane, which still sends one, does.
+#
 # The pairing code deliberately is NOT probed. It can only be validated
 # by claiming it, and an unauthenticated "is this code valid" endpoint
 # would be an oracle for guessing eight digits. A reachable control plane
@@ -1209,15 +1214,21 @@ _probe_control_plane() {
         printf '%s' "${body:-curl exited $rc}"
         return 1
     fi
-    # One pass: an empty result IS the "not a version document" verdict,
-    # so the two matchers cannot disagree about what one is.
-    local ver
+    # A current control plane names itself; an older one only sends a
+    # version string. Either is a SpatiumDDI version document, and anything
+    # else (an empty result from both) is the "not one" verdict.
+    local ver product
+    product=$(printf '%s' "$body" | sed -n 's/.*"product"[[:space:]]*:[[:space:]]*"\(SpatiumDDI\)".*/\1/p')
     ver=$(printf '%s' "$body" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    if [ -z "$ver" ]; then
+    if [ -z "$product" ] && [ -z "$ver" ]; then
         printf '%s' "Reachable, but the reply carries no version string. Is this the right host?"
         return 1
     fi
-    printf 'SpatiumDDI %s%s' "$ver" "$insecure"
+    if [ -n "$ver" ]; then
+        printf 'SpatiumDDI %s%s' "$ver" "$insecure"
+    else
+        printf 'SpatiumDDI control plane%s' "$insecure"
+    fi
     return 0
 }
 
