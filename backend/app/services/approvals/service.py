@@ -528,6 +528,12 @@ async def _stamp_apply_failed(
     approval transition was rolled back alongside ``apply()``, so replay it
     before ``mark_failed``. Raises :class:`DecisionError` if the row vanished
     or another actor flipped it mid-apply."""
+    # The caller's rollback expired every loaded object, the signed-in
+    # approver's ``User`` included. Reading ``approver.id`` on an expired
+    # instance triggers a synchronous refresh, which raises MissingGreenlet
+    # under asyncpg (#2911). Refresh it here, awaited, so the stamp (and the
+    # caller's own reference to the user) reads loaded values again.
+    await db.refresh(approver)
     cr = await get_change_request(db, cr_id, for_update=True)
     if cr is None or cr.state != "pending":
         raise DecisionError("Change request vanished or changed state mid-apply — investigate")
@@ -537,6 +543,9 @@ async def _stamp_apply_failed(
         db, cr, approver=approver, requester_id=requester_id, request=request, error=error
     )
     await db.commit()
+    # ``modified_at`` is a server-side onupdate, so the flush expired it; the
+    # callers serialise the row, and a sync lazy-load there is MissingGreenlet.
+    await db.refresh(cr)
     logger.warning(
         "change_request.apply_failed",
         change_request_id=str(cr.id),
