@@ -276,14 +276,44 @@ def test_an_ingest_sweep_writes_what_it_read(
 ) -> None:
     worker = ingest.IngestWorker.__new__(ingest.IngestWorker)
     worker.cfg = type("Cfg", (), {"state_dir": tmp_path})()
-    monkeypatch.setattr(worker, "_sweep_inputs", lambda: (None, [ZONE]))
+    monkeypatch.setattr(
+        worker, "_sweep_inputs", lambda: [ingest.IngestTarget(ZONE, None, None)]
+    )
     monkeypatch.setattr(
         worker,
         "_read_live_zone",
         lambda z, k: [{"name": "dc01", "record_type": "A", "value": "10.9.9.9"}],
     )
     shipped: list[str] = []
-    monkeypatch.setattr(worker, "_ship", lambda z, r: shipped.append(z))
+    monkeypatch.setattr(worker, "_ship", lambda z, r, v=None: shipped.append(z))
     worker._sweep()
     assert ingest.read_seen_keys(tmp_path, ZONE) == {DC01}
     assert shipped == [ZONE]
+
+
+def test_a_read_of_one_views_copy_writes_no_seen_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seen file is keyed by zone name and read only for a zone rendered
+    without views; a read that selects a view must not overwrite it with that
+    view's records."""
+    worker = ingest.IngestWorker.__new__(ingest.IngestWorker)
+    worker.cfg = type("Cfg", (), {"state_dir": tmp_path})()
+    monkeypatch.setattr(
+        worker,
+        "_sweep_inputs",
+        lambda: [
+            ingest.IngestTarget(ZONE, "inside", None),
+            ingest.IngestTarget(ZONE, "outside", None),
+        ],
+    )
+    monkeypatch.setattr(
+        worker,
+        "_read_live_zone",
+        lambda z, k: [{"name": "dc01", "record_type": "A", "value": "10.9.9.9"}],
+    )
+    shipped: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(worker, "_ship", lambda z, r, v=None: shipped.append((z, v)))
+    worker._sweep()
+    assert ingest.read_seen_keys(tmp_path, ZONE) is None
+    assert shipped == [(ZONE, "inside"), (ZONE, "outside")]

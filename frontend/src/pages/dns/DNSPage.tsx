@@ -8191,8 +8191,9 @@ function OptionsTab({ groupId }: { groupId: string }) {
           <div>
             <div className="text-sm font-medium">DNS-over-QUIC (DoQ)</div>
             <div className="text-xs text-muted-foreground">
-              RFC 9250. Technitium groups only — BIND9 has no DoQ listener and
-              PowerDNS speaks none of the encrypted transports.
+              RFC 9250. Technitium groups only today — BIND9 has no DoQ
+              listener, and PowerDNS serves DoT and DoH through its dnsdist
+              front but has no DoQ (tracked in #2886).
             </div>
           </div>
           <label className="flex items-center gap-2 cursor-pointer text-sm">

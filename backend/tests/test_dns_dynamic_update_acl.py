@@ -417,9 +417,10 @@ async def test_cloud_group_caps_unsupported_and_put_422(
 async def test_ingest_endpoint_handles_split_horizon_zone(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Same zone name across two views must not 500 the ingest endpoint (#641
-    review fix): the lookup prefers the global (view_id IS NULL) copy instead
-    of `scalar_one_or_none()` raising MultipleResultsFound."""
+    """Same zone name in two rows must not 500 the ingest endpoint (#641
+    review fix), and a report that names no view is not filed under either:
+    it could be either copy, so filing it would mirror one view's records into
+    the other's zone (see ``test_dns_ingest_views``)."""
     group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
     db_session.add(group)
     await db_session.flush()
@@ -448,19 +449,21 @@ async def test_ingest_endpoint_handles_split_horizon_zone(
 
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
-        r = await client.post(
-            "/api/v1/dns/agents/ingested-records",
-            json={
+        for view_name in (None, "internal"):
+            body: dict = {
                 "zone_name": "split.example.com",
                 "records": [{"name": "dc01", "record_type": "A", "value": "10.0.0.5"}],
-            },
-        )
+            }
+            if view_name is not None:
+                body["view_name"] = view_name
+            r = await client.post("/api/v1/dns/agents/ingested-records", json=body)
+            assert r.status_code == 200, r.text
+            # Both rows are read from "internal" (the global one is rendered
+            # into it too), so naming the view does not settle it either.
+            assert r.json()["skipped"] == "view_ambiguous"
     finally:
         app.dependency_overrides.pop(_auth_agent, None)
 
-    assert r.status_code == 200, r.text
-    assert r.json()["added"] == 1
-    # Mirrored under the global copy, not the view-scoped one.
     externals = (
         (
             await db_session.execute(
@@ -470,8 +473,7 @@ async def test_ingest_endpoint_handles_split_horizon_zone(
         .mappings()
         .all()
     )
-    assert len(externals) == 1
-    assert externals[0]["zone_id"] == zglobal.id
+    assert externals == []
 
 
 # ── PowerDNS (P3, coarse-only) ───────────────────────────────────────────────

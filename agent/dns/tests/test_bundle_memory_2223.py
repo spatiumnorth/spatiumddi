@@ -274,7 +274,7 @@ def test_the_ingest_sweep_does_not_parse_the_records(tmp_path: Path, agent_cfg: 
 
     inputs, _held, peak = _traced(lambda: IngestWorker(agent_cfg, ["tok"])._sweep_inputs())
 
-    assert inputs == (bundle["tsig_keys"][0], ["site00001.example.test"])
+    assert inputs == [("site00001.example.test", None, bundle["tsig_keys"][0])]
     assert peak < size / 4, f"{peak / 1e6:.1f} MB for a {size / 1e6:.1f} MB cache"
 
 

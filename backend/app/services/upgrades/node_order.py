@@ -82,3 +82,27 @@ def next_node_to_upgrade(
         if name != defer:
             return name
     return remaining[0] if remaining else None
+
+
+def drain_order(
+    plan_order: list[str],
+    completed_nodes: Iterable[str],
+    *,
+    current: str,
+    defer: str | None = None,
+) -> list[str]:
+    """The nodes still to upgrade, in the order they will actually drain:
+    ``current`` (the node being driven now) first, then the plan order with
+    ``defer`` (the drive's own node, see ``next_node_to_upgrade``) moved to
+    the end, which is where ``next_node_to_upgrade`` will take it.
+
+    #2870 — the Redis master move steers Sentinel to the replica on the node
+    that drains LAST, so plan order alone is not enough: the drive's own node
+    drains last whatever its place in the plan. A later Lease takeover by a
+    worker on another node (#2809) can still reorder the tail; the steering
+    is a best-effort guess, never a correctness property."""
+    done = set(completed_nodes)
+    rest = [n for n in plan_order if n not in done and n != current]
+    if defer is not None and defer in rest:
+        rest = [n for n in rest if n != defer] + [defer]
+    return [current, *rest]

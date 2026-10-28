@@ -277,7 +277,9 @@ async def test_the_crash_handler_releases_the_identity_the_drive_used(
     used: list[str | None] = []
     released: list[str | None] = []
 
-    async def _drive(_db: Any, _rid: Any, *, holder: str | None = None) -> Any:
+    async def _drive(
+        _db: Any, _rid: Any, *, holder: str | None = None, avoid_version: str | None = None
+    ) -> Any:
         used.append(holder)
         raise RuntimeError("loop crashed")
 
