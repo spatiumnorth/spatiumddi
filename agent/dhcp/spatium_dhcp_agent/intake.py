@@ -75,6 +75,9 @@ drops) are in — which brackets the true remainder at ``t_s`` between a lower
 and an upper bound. Read-ordering skew can then never be mistaken for an
 eviction, at any packet rate: evictions are confirmed only from the lower
 bound, the baseline is only ever lowered from the upper one.
+The first read is also aged (:func:`arrival_age_seconds`) before Kea is
+asked, so a packet merely waiting in a queue below its depth has been taken
+by the worker by the time of the snapshot and is never counted as evicted.
 """
 
 from __future__ import annotations
@@ -167,6 +170,56 @@ def kea_intake_config(path: str | os.PathLike[str]) -> IntakeConfig | None:
     names = tuple(e[0] for e in entries)
     pinned = tuple((e[0], e[1]) for e in entries if len(e) == 2)
     return IntakeConfig(mode, names, pinned)
+
+
+# Kea's default ``packet-queue-size`` when multi-threading is on and the
+# config does not say (kea-dhcp4 3.0).
+KEA_DEFAULT_PACKET_QUEUE_SIZE = 64
+# The slowest service rate the arrivals' age is sized against, in packets a
+# second: well under anything measured for a backlogged kea-dhcp4 (#980,
+# #2889 measured 650-820/s with per-packet logging on, and the #980 floor at
+# 0.25 CPU is above it too).
+SERVICE_RATE_FLOOR = 100.0
+MIN_ARRIVAL_AGE = 2.0
+MAX_ARRIVAL_AGE = 15.0
+
+
+def kea_packet_queue_size(path: str | os.PathLike[str]) -> int | None:
+    """``packet-queue-size`` of the kea-dhcp4 config at ``path``.
+
+    ``0`` when multi-threading is off (no queue), Kea's default when it is on
+    and the size is not given, ``None`` when the config cannot be read.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        mt = doc["Dhcp4"].get("multi-threading") or {}
+        if not mt.get("enable-multi-threading", True):
+            return 0
+        return max(0, int(mt.get("packet-queue-size", KEA_DEFAULT_PACKET_QUEUE_SIZE)))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def arrival_age_seconds(queue_size: int | None) -> float:
+    """How long arrivals must age before they are compared with Kea's counters.
+
+    Kea's queue never holds more than ``queue_size`` packets, so a packet in
+    a queue that is NOT full is taken by the worker within
+    ``queue_size / service rate`` seconds. Wait at least that long, at a
+    deliberately low service rate, between the arrivals read and Kea's
+    snapshot, and a packet counted as arrived but not received at the
+    snapshot is one Kea evicted — not one still waiting in a queue below its
+    depth. Without the wait, a packet merely in flight at two consecutive
+    reads was confirmed as evicted (#2889, the QA walk's case 3).
+
+    The price is paid in the safe direction: requests that arrive during the
+    wait and are served before the snapshot are received but not yet counted
+    as arrived, so continuous background traffic makes the estimate LOW (by
+    up to what was served during the wait) until a quieter read — never high.
+    """
+    size = KEA_DEFAULT_PACKET_QUEUE_SIZE if queue_size is None else queue_size
+    return min(MAX_ARRIVAL_AGE, max(MIN_ARRIVAL_AGE, size / SERVICE_RATE_FLOOR))
 
 
 def build_filter(
@@ -457,9 +510,14 @@ class QueueEvictionEstimator:
     * the reported total is a high-water mark: reported once, never
       negative, and never re-reported when the inputs move down and back.
 
-    That bounds the false part of the total, over the whole baseline, by the
-    largest backlog still in flight at two consecutive reads (a minute
-    apart), which needs sustained overload. A delivery path that counts
+    The poller ages the first read (:func:`arrival_age_seconds`) before
+    Kea's snapshot, so a packet counted in ``L`` and still in flight at the
+    snapshot has waited longer than any queue below its depth can hold it.
+    The false part of the total is therefore limited to packets that waited
+    that long at two consecutive reads (a minute apart) without being
+    evicted — Kea serving under ``SERVICE_RATE_FLOOR`` with a backlog at both
+    — and a backlog below the queue's depth, however long it lasts, adds
+    nothing. A delivery path that counts
     fewer arrivals than Kea receives (traffic Kea reads that the filter does
     not see) only ever lowers the estimate. The cost is a one-bucket lag: an
     eviction is reported by the sample after the one that first saw it.
@@ -520,7 +578,9 @@ __all__ = [
     "IntakeConfig",
     "QueueEvictionEstimator",
     "Resolved",
+    "arrival_age_seconds",
     "build_filter",
     "kea_intake_config",
+    "kea_packet_queue_size",
     "pack_filter",
 ]

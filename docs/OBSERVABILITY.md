@@ -805,8 +805,8 @@ DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
 **All three are nullable, and NULL means UNMEASURED.** `queue_evicted` is
 also NULL when the agent cannot open a raw socket, on a DHCPv6-only server,
-for the bucket after a Kea restart, and for the bucket in which its counting
-socket reopened. An agent older than #980,
+and for the bucket in which its counting socket reopened. (The minute in
+which the agent starts or Kea restarts has no bucket at all, for any counter.) An agent older than #980,
 or one whose runtime cannot read `/proc/net/udp` (or, in raw mode, Kea's
 AF_PACKET sockets), reports no `socket_drop`.
 Readers must render that as unknown — a 0 would say "this server has dropped

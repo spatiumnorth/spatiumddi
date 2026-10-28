@@ -88,8 +88,8 @@ class DHCPMetricSample(Base):
     # The agent derives it — kernel-counted arrivals at Kea's intake, less
     # the DHCPv4 share of ``socket_drop``, less ``pkt4-received``. Loss
     # exactly like ``socket_drop``, and NULL means unmeasured exactly like
-    # it: an agent without ``CAP_NET_RAW``, a v6-only server, a bucket that
-    # straddled a Kea restart, or an agent older than this change.
+    # it: an agent without ``CAP_NET_RAW``, a v6-only server, the bucket in
+    # which its counting socket reopened, or an agent older than this change.
     queue_evicted: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 

@@ -11,16 +11,21 @@
   arrivals − DHCPv4 `socket_drop` − `pkt4-received` per bucket. The
   filter counts only packets to the addresses Kea serves from, and the
   arrivals are read on both sides of Kea's counter snapshot, so the
-  skew between the reads can never be counted as eviction. It reports
-  only an eviction the next sample confirms, so a backlog that is merely
-  in flight at one read is never counted, and an eviction lands one
-  bucket late. The Stats tab's DROPPED line and chip, the
+  skew between the reads can never be counted as eviction. The first read
+  is aged (`packet-queue-size` ÷ 100 s, 10 s as rendered) before Kea is
+  asked, so a request still waiting in a queue below its depth is never
+  counted as evicted, however long the backlog lasts. The price is that
+  under continuous background traffic the count can read low (never
+  high) until a quieter read. An eviction is reported once the next
+  sample confirms it, one bucket late. The Stats tab's DROPPED line and chip, the
   InfluxDB export, `find_dhcp_server_stats`'s `packet_loss` block and
   the default-on `dhcp_packets_dropped` alert include it. NULL means
-  unmeasured: no raw socket, a DHCPv6-only server, the bucket after a
-  Kea restart, or the bucket in which the counting socket reopened
-  because Kea's interfaces or their addresses changed. The filter runs
-  on every inbound IPv4 packet the host receives, not only DHCP. Kea's queue size, worker count and per-packet logging are
+  unmeasured: no raw socket, a DHCPv6-only server, or the bucket in
+  which the counting socket reopened because Kea's interfaces or their
+  addresses changed. The minute in which the agent starts or Kea
+  restarts has no bucket at all, as for every counter since #980. The
+  filter runs on every inbound IPv4 packet the host receives, not only
+  DHCP. Kea's queue size, worker count and per-packet logging are
   unchanged.
 
 ### Migrations

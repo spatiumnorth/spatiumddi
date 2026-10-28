@@ -1161,7 +1161,20 @@ enough to raise the default-on alert in a third of the day's 15-minute
 windows. So the agent reads the arrivals **twice**, once before it sends
 `statistic-get-all` and once after the reply and the socket drops are in.
 That brackets the remainder at Kea's snapshot between a lower and an
-upper bound:
+upper bound.
+
+The first read is also **aged**. The agent waits `packet-queue-size` ÷
+100 seconds between it and the snapshot (10 s for the rendered 1,024,
+clamped to 2-15 s). Kea's queue never holds more than its depth, so in a
+queue that is not full every packet is taken by the worker within depth ÷
+service rate seconds, and 100 packets a second is far below any measured
+Kea rate. A packet counted by the first read and still not received at
+the snapshot is therefore one Kea evicted, not one waiting behind a backlog.
+Without the wait, a few packets still queued at two consecutive reads
+(after a 253 ms Kea stall, in the QA walk) were confirmed as an eviction.
+The wait is taken off the minute, so the poll period is unchanged.
+
+From those two bounds:
 
 - an eviction is confirmed only from the **lower** bound, and only once it
   has held at two reads in a row, so a backlog in flight at one read is
@@ -1173,19 +1186,32 @@ upper bound:
   twice, and an eviction lands in the bucket **after** the one it happened
   in.
 
-The only way left to over-report is a backlog still in flight at two reads
-a minute apart, which needs sustained overload, and that is bounded by one
-queue's depth for the life of the baseline. A delivery path on which Kea
+The only way left to over-report is a packet that waited longer than the
+aging wait at two reads a minute apart, without being evicted: Kea serving
+under 100 packets a second, or stalled for most of the wait, with a backlog
+at both reads. A backlog below the queue's depth, however long it lasts,
+is not enough.
+
+The wait has a price, and it is paid in the safe direction. A request that
+arrives during the wait and is served before the snapshot is counted as
+received but not yet as arrived, so it pulls the remainder down. Under
+continuous background traffic the count can therefore read LOW, by up to
+the requests served during the wait (about 10 s of traffic), until a read
+whose wait was quieter. It never reads high. On bursty load (bursts with
+quiet between them, like the gate load) an eviction is counted exactly,
+one bucket after it happened. A delivery path on which Kea
 receives packets the filter does not count can only lower the estimate.
 
 *NULL is unmeasured, as everywhere above.* `queue_evicted` is NULL when
 the agent cannot open the raw socket (no `CAP_NET_RAW`), on a DHCPv6-only
-server (it counts DHCPv4 only), when `socket_drop` was not measured, for the
-bucket after Kea restarts, and for the bucket in which the counting socket
-was (re)opened because Kea's interfaces, their addresses or the socket mode
+server (it counts DHCPv4 only), when `socket_drop` was not measured, and for
+the bucket in which the counting socket was (re)opened because Kea's interfaces, their addresses or the socket mode
 changed. It is also NULL when Kea's interfaces resolve to more than 200
 interfaces or addresses, which one filter cannot express. It is never 0 in
-those cases.
+those cases. The minute in which the agent starts, or Kea restarts, has **no
+bucket at all**, for every counter, as since #980: it is the baseline the
+next minute is diffed against. Counting resumes in the next bucket, against
+a fresh baseline, so on the Stats tab that minute is a gap, not a NULL.
 
 *Where the identity can be wrong.* Each of these counts as an eviction:
 

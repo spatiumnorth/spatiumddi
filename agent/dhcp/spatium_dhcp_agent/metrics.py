@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -84,7 +85,13 @@ import httpx
 import structlog
 
 from .config import AgentConfig
-from .intake import ArrivalCounter, QueueEvictionEstimator, kea_intake_config
+from .intake import (
+    ArrivalCounter,
+    QueueEvictionEstimator,
+    arrival_age_seconds,
+    kea_intake_config,
+    kea_packet_queue_size,
+)
 from .kea_ctrl import KeaCtrlError, send_command
 from .push import CPPoster, disabled_spool, drain_for, late_bound
 from .socket_drops import SocketDropCounter, kea_socket_type
@@ -257,6 +264,10 @@ class MetricsPoller:
             return None
         return delta
 
+    def _arrival_age(self) -> float:
+        """Seconds to age the first arrivals read (see ``arrival_age_seconds``)."""
+        return arrival_age_seconds(kea_packet_queue_size(self.cfg.kea_config_path))
+
     def _received_delta(self, current: dict[str, int], baseline_ok: bool) -> int | None:
         """``pkt4-received`` over this interval, or ``None`` if unknown.
 
@@ -293,6 +304,7 @@ class MetricsPoller:
     def run(self) -> None:
         while not self._stop.is_set():
             self._shipper.last_send_outcome = None
+            aged = 0.0
             # #2889 — arrivals are read on both sides of Kea's snapshot, so
             # the estimator can bracket the remainder at the instant Kea took
             # it. A single read on one side turns read-ordering skew into
@@ -300,6 +312,15 @@ class MetricsPoller:
             before = self._arrivals.sample()
             pending = self._arrivals_pending
             self._arrivals_pending = None if pending is None or before is None else pending + before
+            # ... and the first read is AGED before Kea is asked: long enough
+            # that anything in a queue below its depth has been taken by the
+            # worker. Otherwise a packet still waiting at two consecutive
+            # reads was confirmed as an eviction (the walk's case 3).
+            if before is not None:
+                started = time.monotonic()
+                if self._stop.wait(timeout=self._arrival_age()):
+                    break
+                aged = time.monotonic() - started
             current = self._poll_kea()
             if current is not None:
                 delta = self._compute_delta(current)
@@ -345,4 +366,9 @@ class MetricsPoller:
             # 60s base + small jitter so paired peers don't hit the
             # control plane in lockstep.
             interval = 60.0 + random.uniform(-3, 3)
+            # The aging wait is inside the tick, so it is taken off this one
+            # and the period between Kea snapshots stays what it was. (The
+            # period was never exactly a minute: 60 s ± 3 s jitter plus the
+            # tick's own work, since #980.)
+            interval -= aged
             self._stop.wait(timeout=max(30.0, interval))

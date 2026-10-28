@@ -472,3 +472,36 @@ def test_unmeasured_during_read_is_unmeasured():
     est = QueueEvictionEstimator()
     assert est.update(100, 0, 100, 3) == 0
     assert est.update(100, 0, 100, None) is None
+
+
+# ── the aging wait (#2889, QA walk case 3) ─────────────────────────────────
+
+
+def test_packet_queue_size_from_the_rendered_config(tmp_path):
+    from spatium_dhcp_agent.intake import kea_packet_queue_size
+
+    def cfg(mt):
+        p = tmp_path / "k.conf"
+        p.write_text(json.dumps({"Dhcp4": {} if mt is None else {"multi-threading": mt}}))
+        return p
+
+    assert kea_packet_queue_size(cfg({"packet-queue-size": 1024})) == 1024
+    assert kea_packet_queue_size(cfg({})) == 64  # Kea's default
+    assert kea_packet_queue_size(cfg(None)) == 64
+    assert kea_packet_queue_size(cfg({"enable-multi-threading": False})) == 0
+    assert kea_packet_queue_size(tmp_path / "absent.conf") is None
+
+
+def test_arrival_age_covers_a_queue_below_its_depth():
+    from spatium_dhcp_agent.intake import (
+        MAX_ARRIVAL_AGE,
+        MIN_ARRIVAL_AGE,
+        SERVICE_RATE_FLOOR,
+        arrival_age_seconds,
+    )
+
+    # A full rendered queue drains within this at the floor rate.
+    assert arrival_age_seconds(1024) * SERVICE_RATE_FLOOR >= 1024
+    assert arrival_age_seconds(0) == MIN_ARRIVAL_AGE  # no queue: socket only
+    assert arrival_age_seconds(None) == arrival_age_seconds(64)
+    assert arrival_age_seconds(10**6) == MAX_ARRIVAL_AGE

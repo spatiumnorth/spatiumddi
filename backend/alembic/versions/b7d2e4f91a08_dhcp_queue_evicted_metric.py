@@ -10,9 +10,9 @@ kernel), less the DHCPv4 share of ``socket_drop``, less ``pkt4-received``.
 
 NULLABLE with no server_default, exactly like ``socket_drop``: NULL means
 nobody measured it — an agent older than this change, one without
-``CAP_NET_RAW``, a v6-only server, or a bucket that straddled a Kea restart
-— and 0 means measured and nothing evicted. A default of 0 would label every
-existing bucket as a server whose queue never overflowed, which is the
+``CAP_NET_RAW``, a v6-only server, or the bucket in which the agent's counting
+socket reopened — and 0 means measured and nothing evicted. A default of 0 would
+label every existing bucket as a server whose queue never overflowed, which is the
 false reassurance the issue was filed about. No backfill, for the same
 reason.
 
