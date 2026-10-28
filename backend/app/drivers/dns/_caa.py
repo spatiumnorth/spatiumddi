@@ -47,6 +47,10 @@ def _unquote(rest: str) -> bytes | None:
                 out.append(n_octet)
                 i += 4
                 continue
+            if rest[i + 1 : i + 2].isascii() and rest[i + 1 : i + 2].isdigit():
+                # ``\1a``: a decimal escape needs exactly three digits; the
+                # zone-file reader (and ``caa_canonical``) refuse it too.
+                return None
             if i + 1 >= n:
                 return None
             out.extend(rest[i + 1].encode("utf-8"))
@@ -109,6 +113,20 @@ def caa_unquoted_value(value: str) -> str | None:
     if parsed is None:
         return None
     return parsed[2].decode("utf-8", errors="replace")
+
+
+def caa_value_octets(text: str) -> bytes:
+    """The octets a provider-held CAA *value field* stands for (#2943).
+
+    Azure keeps the value on its own, and a release before #2943 wrote a
+    quoted stored value there with its quotes, so ``"ca.org"`` in that field
+    is the same record as ``ca.org``: one quoted string is unescaped, any
+    other text is the value as written."""
+    if text.startswith('"'):
+        unquoted = _unquote(text)
+        if unquoted is not None:
+            return unquoted
+    return text.encode("utf-8")
 
 
 def caa_key(value: str) -> str:

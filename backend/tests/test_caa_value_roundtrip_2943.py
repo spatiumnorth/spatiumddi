@@ -166,3 +166,121 @@ def test_technitium_pull_keys_like_the_stored_value(stored: str, plain: str) -> 
 def test_technitium_pull_escapes_an_embedded_quote() -> None:
     value, _ = rdata_to_value("CAA", {"flags": 0, "tag": "issue", "value": 'a"b'})
     assert value == '0 issue "a\\"b"'
+
+
+# ── Edge cases found in validation ───────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("stored", "octets", "presentation"),
+    [
+        # \DDD decimal escapes are undone, and non-ASCII prints as \DDD
+        ('0 issue "\\195\\169t\\195\\169"', "été".encode(), '0 issue "\\195\\169t\\195\\169"'),
+        ('0 issue "été"', "été".encode(), '0 issue "\\195\\169t\\195\\169"'),
+        ('0 issue "x\\059y"', b"x;y", '0 issue "x;y"'),
+        # spaces inside the quotes are the value's own
+        ('0 issue "  pad  "', b"  pad  ", '0 issue "  pad  "'),
+        ('0 issue ""', b"", '0 issue ""'),
+        # the critical flag and tags the RFC registry added later
+        (
+            "128 contactemail ops@example.com",
+            b"ops@example.com",
+            '128 contactemail "ops@example.com"',
+        ),
+        ("0 issuemail ca.example", b"ca.example", '0 issuemail "ca.example"'),
+        # the documented "no CA may issue" form: bare, a zone file reads the
+        # ';' as a comment and refuses the whole zone
+        ("0 issue ;", b";", '0 issue ";"'),
+        # tag case is kept on the wire
+        ('0 IssueWild "ca.org"', b"ca.org", '0 IssueWild "ca.org"'),
+    ],
+)
+def test_edge_values(stored: str, octets: bytes, presentation: str) -> None:
+    parsed = parse_caa(stored)
+    assert parsed is not None and parsed[2] == octets
+    assert caa_presentation(stored) == presentation
+    assert caa_presentation(presentation) == presentation
+
+
+def test_a_short_decimal_escape_is_malformed() -> None:
+    # A zone-file reader (and ``caa_canonical``) refuses ``\1a``.
+    assert parse_caa('0 issue "\\1a"') is None
+    assert caa_presentation('0 issue "\\1a"') == '0 issue "\\1a"'
+
+
+def test_edge_values_reach_azure_and_technitium_unescaped() -> None:
+    drv = AzureDNSDriver()
+    for stored, plain in [
+        ('0 issue "  pad  "', "  pad  "),
+        ('0 issue "\\195\\169t\\195\\169"', "été"),
+        ("128 contactemail ops@example.com", "ops@example.com"),
+    ]:
+        (entry,) = drv._build_record_set_params(_rec(stored))["caa_records"]
+        assert entry["value"] == plain
+        assert record_params("CAA", stored)["value"] == plain
+
+
+# ── Upgrade: Azure entries written with literal quotes before #2943 ──────
+
+
+class _FakeRecordSets:
+    def __init__(self, entries: list[tuple[int, str, str]]) -> None:
+        self.live = SimpleNamespace(
+            ttl=300,
+            caa_records=[SimpleNamespace(flags=f, tag=t, value=v) for f, t, v in entries],
+        )
+        self.puts: list[dict] = []
+        self.deleted = False
+
+    def get(self, *_a: object) -> SimpleNamespace:
+        return self.live
+
+    def create_or_update(self, _rg: str, _z: str, _n: str, _t: str, params: dict) -> None:
+        self.puts.append(params)
+
+    def delete(self, *_a: object) -> None:
+        self.deleted = True
+
+
+async def test_azure_deletes_a_legacy_literally_quoted_entry() -> None:
+    drv = AzureDNSDriver()
+    rs = _FakeRecordSets([(0, "issue", '"ca.org"'), (0, "issue", "other.org")])
+    client = SimpleNamespace(record_sets=rs)
+    await drv._apply_delete(client, "rg", "z", "@", "CAA", _rec('0 issue "ca.org"'))
+    (put,) = rs.puts
+    assert [e["value"] for e in put["caa_records"]] == ["other.org"]
+
+
+async def test_azure_create_replaces_a_legacy_literally_quoted_entry() -> None:
+    drv = AzureDNSDriver()
+    rs = _FakeRecordSets([(0, "issue", '"ca.org"'), (0, "issue", "other.org")])
+    client = SimpleNamespace(record_sets=rs)
+    await drv._apply_create(client, "rg", "z", "@", "CAA", _rec('0 issue "ca.org"'))
+    (put,) = rs.puts
+    assert sorted(e["value"] for e in put["caa_records"]) == ["ca.org", "other.org"]
+
+
+# ── Route 53 / Google zone-delete emptying recognises what was written ───
+
+
+def test_cloud_managed_candidates_include_the_quoted_form() -> None:
+    from app.drivers.dns._cloud_base import provider_value_candidates
+
+    cands = provider_value_candidates(_rec("0 issue ca.org; account=1"))
+    assert '0 issue "ca.org; account=1"' in cands
+
+
+# ── Cloudflare sends and looks up the quoted form ────────────────────────
+
+
+def test_cloudflare_payload_and_lookup_content_are_quoted() -> None:
+    from app.drivers.dns.base import RecordChange
+    from app.drivers.dns.cloudflare import CloudflareDNSDriver, _wire_content
+
+    assert _wire_content("CAA", "0 issue ca.org") == '0 issue "ca.org"'
+    assert _wire_content("TXT", "v=spf1 -all") == "v=spf1 -all"
+    drv = CloudflareDNSDriver()
+    change = RecordChange(
+        op="create", zone_name="example.com.", record=_rec("0 issue ca.org"), target_serial=1
+    )
+    assert drv._record_payload(change, "example.com.")["content"] == '0 issue "ca.org"'

@@ -38,3 +38,26 @@ def test_zone_file_and_powerdns_writers_quote_caa(stored: str) -> None:
     # the quoted spelling is a fixed point, and PowerDNS gets the same text
     assert _wire_value("CAA", wire, {}) == wire
     assert _record_content({"type": "CAA", "value": stored}) == wire
+
+
+@pytest.mark.parametrize(
+    ("stored", "wire"),
+    [
+        ('0 issue "  pad  "', '0 issue "  pad  "'),
+        ('0 issue "été"', '0 issue "\\195\\169t\\195\\169"'),
+        ("0 issue ;", '0 issue ";"'),
+        ("128 contactemail ops@example.com", '128 contactemail "ops@example.com"'),
+        ('0 issue ""', '0 issue ""'),
+    ],
+)
+def test_zone_file_writer_edge_values(stored: str, wire: str) -> None:
+    from spatium_dns_agent.drivers.bind9 import _wire_value
+
+    assert _wire_value("CAA", stored, {}) == wire
+
+
+def test_technitium_keeps_padding_and_unescapes_decimal() -> None:
+    assert _record_params("CAA", '0 issue "  pad  "', {})["value"] == "  pad  "
+    assert (
+        _record_params("CAA", '0 issue "\\195\\169t\\195\\169"', {})["value"] == "été"
+    )
