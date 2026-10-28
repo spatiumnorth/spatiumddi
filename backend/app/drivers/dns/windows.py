@@ -293,6 +293,10 @@ class WindowsDNSDriver(DNSDriver):
             # named a single value while the wire operation addressed the
             # whole RRset, so the siblings the op never mentioned were lost.
             members = change.rrset.members
+            # #2942 — a stored 0 is sent as 0 here and over WinRM. Whether
+            # Windows then serves 0 or substitutes the zone's minimum TTL has
+            # not been verified against a live server; drift cannot flag it
+            # either way, since it never compares TTLs.
             ttl = first_ttl(change.rrset.ttl, rr.ttl, default=3600)
             if not members:
                 update.delete(rel_name, rdtype)
