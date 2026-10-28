@@ -402,9 +402,12 @@ async def _validate_tree(
     # 5. Rules apply would otherwise refuse mid-transaction (#2984, #2986):
     #    the gateway of a planned subnet, and Required custom fields. Both
     #    are the rules New Subnet / New Block use.
+    #    Planned nodes carry no custom fields of their own, so the answer
+    #    per kind is the same for every node: what the anchor chain gives.
     inherited: dict[str, object] = {}
     if tree.existing_block_id:
         inherited = await inherited_block_custom_fields(db, uuid.UUID(tree.existing_block_id))
+    cf_problems: dict[str, str | None] = {}
     for n in _walk(tree):
         if n is tree and tree.existing_block_id:
             continue  # the anchor already exists
@@ -424,9 +427,12 @@ async def _validate_tree(
                         node_id=n.id, network=n.network, kind="invalid_gateway", message=problem
                     )
                 )
-        cf_problem = await missing_required_custom_fields(
-            db, "subnet" if n.kind == "subnet" else "ip_block", None, inherited=inherited
-        )
+        cf_type = "subnet" if n.kind == "subnet" else "ip_block"
+        if cf_type not in cf_problems:
+            cf_problems[cf_type] = await missing_required_custom_fields(
+                db, cf_type, None, inherited=inherited
+            )
+        cf_problem = cf_problems[cf_type]
         if cf_problem:
             conflicts.append(
                 ValidationConflict(
@@ -807,7 +813,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             # (#505). Multicast leaves and v4 /31+/32 / v6 /127+/128 get none.
             is_v6 = isinstance(node_net, ipaddress.IPv6Network)
             gw_row: IPAddress | None = None
-            if _gets_placeholder_rows(node_net, node_kind):
+            if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
                 db.add(
                     IPAddress(
                         subnet_id=subnet.id,

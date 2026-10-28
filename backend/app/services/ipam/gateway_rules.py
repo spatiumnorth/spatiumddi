@@ -1,4 +1,8 @@
-"""The gateway rules New Subnet and Subnet Planner share (#2984)."""
+"""The gateway rule New Subnet, subnet edit and Subnet Planner share (#2984).
+
+One rule and one wording, so the planner's validation and ``POST
+/ipam/subnets`` can never disagree about the same gateway.
+"""
 
 from __future__ import annotations
 
@@ -14,15 +18,16 @@ def gateway_problem(
     """Why ``gateway`` cannot be a subnet's gateway, or None.
 
     ``reject_reserved`` also refuses the network and (IPv4) broadcast address,
-    which the subnet's own placeholder rows already hold; callers pass it only
-    for a subnet that gets those rows.
+    which the subnet's own placeholder rows already hold (the gateway row would
+    meet them on ``uq_ip_address_subnet_address``); callers pass it only for a
+    subnet that gets those rows.
     """
-    if not gateway:
+    if gateway is None:
         return None
     try:
         gw = ipaddress.ip_address(gateway)
     except ValueError:
-        return f"Invalid gateway {gateway!r} on {net}"
+        return f"Invalid gateway IP: {gateway}"
     if gw.version != net.version or gw not in net:
         return f"Gateway {gateway} is not within subnet {net}"
     if reject_reserved:

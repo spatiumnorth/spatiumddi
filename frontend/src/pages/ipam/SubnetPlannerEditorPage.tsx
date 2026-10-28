@@ -245,7 +245,11 @@ export function SubnetPlannerEditorPage() {
               disabled={
                 applied || conflicts.length > 0 || applyMut.isPending || dirty
               }
-              onClick={() => setShowApplyConfirm(true)}
+              onClick={() => {
+                // A refusal from an earlier attempt belongs to that attempt.
+                applyMut.reset();
+                setShowApplyConfirm(true);
+              }}
               className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               title={
                 dirty
@@ -844,6 +848,7 @@ function ApplyErrorBanner({ error }: { error: unknown }) {
             {conflicts.slice(0, 8).map((c, i) => (
               <li key={i}>{c.message}</li>
             ))}
+            {conflicts.length > 8 && <li>…and {conflicts.length - 8} more</li>}
           </ul>
         )}
         {survivors.length > 0 && (

@@ -51,6 +51,25 @@ describe("ApplyConfirmModal", () => {
     ).toBeTruthy();
   });
 
+  it("names each conflict of a refused apply (409)", () => {
+    const conflicts = Array.from({ length: 10 }, (_, i) => ({
+      node_id: `n${i}`,
+      network: `10.0.${i}.0/24`,
+      kind: "invalid_gateway",
+      message: `Gateway 10.0.99.1 is not within subnet 10.0.${i}.0/24`,
+    }));
+    show({
+      response: {
+        data: { detail: { message: "Plan validation failed", conflicts } },
+      },
+    });
+    expect(screen.getByText("Plan validation failed")).toBeTruthy();
+    expect(
+      screen.getByText("Gateway 10.0.99.1 is not within subnet 10.0.0.0/24"),
+    ).toBeTruthy();
+    expect(screen.getByText(/and 2 more/)).toBeTruthy();
+  });
+
   it("shows no banner without an error", () => {
     show(null);
     expect(screen.queryByText(/Operation failed/)).toBeNull();
