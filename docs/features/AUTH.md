@@ -39,6 +39,21 @@ SpatiumDDI's auth stack has three layers:
   else.
 - Access token expires in 15 min. Refresh token expires in 7 days
   (`refresh_token_expire_days` default) and rotates on every use.
+- **Rotation grace window (#2941).** The tabs of one browser share the
+  refresh cookie, so two tabs can refresh at the same moment with the same
+  cookie. For 10 seconds after a rotation (`ROTATION_GRACE` in
+  `backend/app/core/session_rotation.py`) the rotated-away session stands
+  for its successor: a refresh presenting the rotated cookie gets a new
+  access token for the SAME successor session (no third session and no new
+  cookie, since the browser already holds the successor's), and an access
+  token minted for the rotated session is still accepted. Concurrent
+  refreshes serialize on a row lock, so they land on one successor. After
+  the window a rotated cookie is a `401` and its access tokens are refused.
+  The grace applies only to a revocation by rotation, recorded in
+  `user_session.rotated_at` + `rotated_to_id`; a logout, a force-logout
+  from the session viewer, a password change or disabling the account
+  revokes the live session, which ends the old cookie and the old access
+  token at once, with no grace.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
@@ -873,8 +888,9 @@ rather than swallowing the failure. Permission-related rejections
   until an administrator links it; the denied audit row names the account.
   `backend/app/core/auth/user_sync.py`.
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
-  when the token is not in the sessions table, has been revoked, or
-  has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
+  when the token is not in the sessions table, has been revoked (other
+  than by a rotation inside the grace window above), or has passed
+  `expires_at`. `backend/app/api/v1/auth/router.py`.
 - **Disabling an account ends its sessions (#1383).** `PUT
   /api/v1/users/{id}` that changes `is_active` revokes every session
   the account holds, as an admin password reset does, and its audit row

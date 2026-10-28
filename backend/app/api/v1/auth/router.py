@@ -77,6 +77,7 @@ from app.core.security import (
     verify_password,
 )
 from app.core.session_idle import get_session_timeout_minutes, is_idle_expired, last_activity
+from app.core.session_rotation import resolve_live_session_id, rotation_successor
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.auth_provider import PASSWORD_PROVIDER_TYPES, AuthProvider
@@ -891,18 +892,27 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
         )
     token_hash = hash_refresh_token(raw_refresh)
 
+    # Locked, and NOT filtered on ``revoked`` (#2941): two tabs refreshing
+    # with the one cookie serialize here, and the second, once the first has
+    # committed, must see the row as rotated (a ``revoked`` filter would make
+    # Postgres skip the re-checked row) so it can be given the same successor.
     result = await db.execute(
-        select(UserSession)
-        .where(UserSession.refresh_token_hash == token_hash)
-        .where(UserSession.revoked.is_(False))
-        .where(UserSession.expires_at > datetime.now(UTC))
+        select(UserSession).where(UserSession.refresh_token_hash == token_hash).with_for_update()
     )
-    session = result.scalar_one_or_none()
+    presented = result.scalar_one_or_none()
+    now = datetime.now(UTC)
+    # A cookie rotated within the grace window stands for its successor; any
+    # other revoked cookie resolves to None. ``session`` is the live session
+    # this refresh renews.
+    session = await rotation_successor(db, presented, now) if presented is not None else None
+    in_grace = session is not None and session is not presented
     # A session idle past the configured Session Timeout cannot be renewed:
     # the refresh cookie outlives the access token, so this is the gate that
     # actually ends an abandoned session.
-    if session is None or is_idle_expired(
-        session, await get_session_timeout_minutes(db), datetime.now(UTC)
+    if (
+        session is None
+        or session.expires_at <= now
+        or is_idle_expired(session, await get_session_timeout_minutes(db), now)
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
@@ -914,12 +924,24 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
             status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
         )
 
+    if in_grace:
+        # Another tab rotated this cookie a moment ago (#2941). Answer with
+        # the session that rotation produced rather than minting a third:
+        # a new access token for it, and no Set-Cookie, because this browser
+        # already holds the successor's cookie from that rotation (only its
+        # hash is stored, so it could not be sent again anyway).
+        await db.commit()
+        logger.info("token_refreshed_in_grace", user_id=str(user.id))
+        return RefreshResponse(
+            access_token=create_access_token(str(user.id), jti=str(session.id)),
+            force_password_change=user.password_change_required,
+        )
+
     # Rotate: revoke old session, issue new tokens. The new session
     # row's UUID becomes the new access token's ``jti`` (issue #72).
     session.revoked = True
     raw_refresh, refresh_hash = create_refresh_token(str(user.id))
 
-    now = datetime.now(UTC)
     new_session = UserSession(
         user_id=user.id,
         refresh_token_hash=refresh_hash,
@@ -943,6 +965,9 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
     )
     db.add(new_session)
     await db.flush()
+    # Marks this revocation as a rotation, the only kind with a grace window.
+    session.rotated_at = now
+    session.rotated_to_id = new_session.id
     access_token = create_access_token(str(user.id), jti=str(new_session.id))
     await db.commit()
 
@@ -1049,7 +1074,11 @@ async def change_password(
     # point of changing the password. Reuses the exact revocation statement
     # ``/auth/logout`` uses; we spare the caller's *current* session so a
     # routine self-service change doesn't immediately log the user out.
-    current_jti = _current_session_jti(request)
+    # An access token inside its rotation grace (#2941) names the session
+    # its tab's cookie no longer holds: spare the successor it stands for.
+    current_jti = await resolve_live_session_id(
+        db, _current_session_jti(request), datetime.now(UTC)
+    )
     revoke_stmt = update(UserSession).where(
         UserSession.user_id == current_user.id, UserSession.revoked.is_(False)
     )
