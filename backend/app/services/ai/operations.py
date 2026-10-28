@@ -3014,6 +3014,8 @@ async def _preview_create_dhcp_static(
     if args.description:
         d = args.description if len(args.description) < 80 else args.description[:77] + "..."
         parts.append(f"desc={d!r}")
+    # #2901 — apply mirrors the reservation into IPAM, as the REST create does.
+    parts.append("mirrors into IPAM as a static_dhcp address")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
@@ -3021,9 +3023,13 @@ async def _apply_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit
+    from app.api.v1.dhcp.statics import _recount_subnet  # noqa: PLC0415
     from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
     from app.models.ipam import Subnet
+    from app.services.dhcp.static_conflicts import check_static_conflicts  # noqa: PLC0415
+    from app.services.dhcp.static_ipam import upsert_ipam_for_static  # noqa: PLC0415
+    from app.services.dhcp.windows_writethrough import push_static_change  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the DHCP statics
     # router's require_resource_permission("dhcp_static") write gate.
@@ -3043,6 +3049,11 @@ async def _apply_create_dhcp_static(
     if addr_obj not in net:
         raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
 
+    # #2901 — the REST create's conflict check (a MAC already reserved in the
+    # group, a malformed IP). Raises a 4xx HTTPException, which both callers
+    # (approve + proposal apply) roll back on and surface without committing.
+    await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
+
     row = DHCPStaticAssignment(
         scope_id=scope.id,
         ip_address=args.ip_address,
@@ -3053,6 +3064,14 @@ async def _apply_create_dhcp_static(
     )
     db.add(row)
     await db.flush()
+    # #2901 — the same downstream work the REST create runs, in its order:
+    # Windows / cloud write-through (raises before anything commits), agent
+    # wake, the IPAM ``static_dhcp`` mirror, then the cached subnet / block
+    # counts. All in this one transaction, committed below.
+    await push_static_change(db, row, action="create")
+    collect_wake(dhcp_group_channel(scope.group_id))
+    await upsert_ipam_for_static(db, scope, row)
+    await _recount_subnet(db, scope.subnet_id)
 
     write_audit(
         db,
@@ -3069,9 +3088,6 @@ async def _apply_create_dhcp_static(
             "via": "ai_proposal",
         },
     )
-    # #2040 — a reservation is in every group member's bundle; the dispatch
-    # site's collector publishes this after the commit below.
-    collect_wake(dhcp_group_channel(scope.group_id))
     await db.commit()
     await db.refresh(row)
     return {
