@@ -161,6 +161,9 @@ class GroupResponse(BaseModel):
     # Computed: count of Kea servers currently in the group. ≥ 2 means
     # the group renders the libdhcp_ha.so hook on every peer.
     kea_member_count: int = 0
+    # #2963 - names of Kea members with no ``ha_peer_url`` in a group of two or
+    # more: HA is NOT rendered while this is non-empty. Empty otherwise.
+    ha_peer_urls_missing: list[str] = []
     # Member servers rolled up so the UI can render a group detail page
     # without a second round-trip. Empty when nothing's registered.
     servers: list[ServerSummary] = []
@@ -194,6 +197,9 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         kea_thread_pool_size=g.kea_thread_pool_size,
         kea_packet_logging=g.kea_packet_logging,
         kea_member_count=len(kea),
+        ha_peer_urls_missing=(
+            sorted(s.name for s in kea if not s.ha_peer_url) if len(kea) >= 2 else []
+        ),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
         ha_peer_auth_active=len(kea) >= 2
         and all(s.ha_peer_url for s in kea)

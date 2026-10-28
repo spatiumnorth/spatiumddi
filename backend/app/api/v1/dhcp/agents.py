@@ -585,6 +585,11 @@ async def agent_register(
         resource_display=body.hostname,
         new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
     )
+    # #2963 - an appliance-hosted Kea member joining an HA group gets its peer
+    # URL from the node address instead of by hand (empty URLs only).
+    from app.services.dhcp.ha_peer_autofill import autofill_group_ha_peer_urls  # noqa: PLC0415
+
+    await autofill_group_ha_peer_urls(db, server.server_group_id, via="agent_register")
     await db.commit()
     await db.refresh(server)
 
