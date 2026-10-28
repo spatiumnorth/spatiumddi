@@ -22,6 +22,29 @@ COPY pyproject.toml .
 RUN mkdir -p app && touch app/__init__.py && \
     pip install --no-cache-dir --prefix=/install .
 
+# #2895 — the machine-made Python third-party notice list, served by the About
+# page. Generated here, from the packages the runtime image actually receives
+# (the ``/install`` prefix above), and copied into the runtime stage as one
+# static text file. ``pip-licenses`` itself lives in a throwaway venv and never
+# reaches the runtime image. It blanks PYTHONPATH before it asks the interpreter
+# named by ``--python`` for its search path, so ``/opt/py-install`` is a
+# two-line wrapper that puts ``/install`` back; the builder's own pip /
+# setuptools / wheel are left out (the runtime removes pip, #1392). A list that
+# came out empty would look like a clean pass, so the build fails if it does not
+# name a package we know is there.
+ARG PIP_LICENSES_VERSION=5.5.5
+RUN python -m venv /opt/pip-licenses \
+    && /opt/pip-licenses/bin/pip install --no-cache-dir "pip-licenses==${PIP_LICENSES_VERSION}" \
+    && printf '#!/bin/sh\nPYTHONPATH=/install/lib/python3.12/site-packages exec /usr/local/bin/python "$@"\n' > /opt/py-install \
+    && chmod +x /opt/py-install \
+    && mkdir -p /install/share/spatiumddi \
+    && /opt/pip-licenses/bin/pip-licenses --python=/opt/py-install \
+         --format=plain-vertical --with-urls --with-authors --with-license-file \
+         --no-license-path --ignore-packages pip setuptools wheel spatiumddi \
+         --output-file=/install/share/spatiumddi/third-party-python.txt \
+    && grep -q '^fastapi$' /install/share/spatiumddi/third-party-python.txt \
+    && test "$(wc -c < /install/share/spatiumddi/third-party-python.txt)" -gt 50000
+
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime

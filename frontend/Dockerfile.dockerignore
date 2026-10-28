@@ -1,0 +1,13 @@
+# Context is the repo root (frontend/Dockerfile); only frontend/, NOTICE and
+# LICENSE are read from it. Keep local build output and VCS metadata out of
+# the context upload.
+.git
+**/node_modules
+frontend/dist
+backend
+agent
+appliance
+perf
+docs
+charts
+k8s

@@ -3,6 +3,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Github,
+  Info,
   ChevronsLeft,
   ChevronsRight,
   ChevronDown,
@@ -662,6 +663,15 @@ export function Sidebar({
             label="Settings"
             icon={Settings}
             to="/settings"
+            collapsed={effectiveCollapsed}
+            onNavigate={mobileOpen ? onMobileClose : undefined}
+          />
+
+          {/* #2895 — About: version, licence, NOTICE, third-party lists. */}
+          <NavItem
+            label="About"
+            icon={Info}
+            to="/about"
             collapsed={effectiveCollapsed}
             onNavigate={mobileOpen ? onMobileClose : undefined}
           />

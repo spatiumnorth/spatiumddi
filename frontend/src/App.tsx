@@ -9,6 +9,7 @@ import {
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useBrandDocumentTitle } from "@/hooks/usePublicSettings";
 import { LoginPage } from "@/pages/LoginPage";
+import { AboutPage } from "@/pages/AboutPage";
 import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { AccountPage } from "@/pages/AccountPage";
@@ -147,6 +148,9 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/login/callback" element={<LoginCallbackPage />} />
+      {/* #2895 — public on purpose: licence text must reach anyone who is
+          handed the software, so it sits outside ProtectedRoute. */}
+      <Route path="/about" element={<AboutPage />} />
       <Route path="/change-password" element={<ChangePasswordPage />} />
       <Route
         path="/"

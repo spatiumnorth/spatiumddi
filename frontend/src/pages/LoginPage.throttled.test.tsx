@@ -18,6 +18,10 @@ import {
 
 const navigate = vi.fn();
 vi.mock("react-router-dom", () => ({
+  // The footer's About link (#2895) is a router <Link>.
+  Link: ({ to, children }: { to: string; children: React.ReactNode }) => (
+    <a href={to}>{children}</a>
+  ),
   useNavigate: () => navigate,
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));

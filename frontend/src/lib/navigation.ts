@@ -25,6 +25,7 @@ import {
   HardDrive,
   Hash,
   History,
+  Info,
   Inbox,
   KeyRound,
   KeySquare,
@@ -498,6 +499,8 @@ export const footerNav: NavEntry[] = [
   { label: "Appliance", icon: Wrench, to: "/appliance" },
   { label: "Features & Integrations", icon: ToggleLeft, to: "/admin/features" },
   { label: "Settings", icon: Settings, to: "/settings" },
+  // #2895 — Help → About: version, licence, NOTICE, third-party lists.
+  { label: "About", icon: Info, to: "/about" },
 ];
 
 /**
