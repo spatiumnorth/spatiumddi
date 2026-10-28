@@ -132,7 +132,8 @@ export default defineConfig({
     // #2895 — Vite strips licence comments from the minified bundle, so
     // MIT / BSD / ISC notices stop travelling with the copies we serve.
     // This lists exactly the packages that ended up in the bundle (not
-    // devDependencies) with their licence text, beside the app.
+    // devDependencies) with their licence text, into dist-legal/ (signed-in
+    // users only; see LEGAL_OUT_DIR above).
     license({
       thirdParty: {
         includePrivate: false,

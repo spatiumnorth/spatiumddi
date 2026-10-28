@@ -51,9 +51,7 @@ def baked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("url", [PYTHON_URL, SESSION_URL])
-async def test_anonymous_caller_is_refused(
-    client: AsyncClient, baked: Path, url: str
-) -> None:
+async def test_anonymous_caller_is_refused(client: AsyncClient, baked: Path, url: str) -> None:
     resp = await client.get(url)
 
     assert resp.status_code == 401
