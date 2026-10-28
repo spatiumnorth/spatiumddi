@@ -30,6 +30,10 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── public / pre-sign-in ────────────────────────────────────────────
     "/.well-known/acme-challenge/{token}": "ACME HTTP-01 challenge the CA fetches",
     "/api/docs": "OpenAPI viewer, no install data",
+    "/api/v1/about/third-party/python": (
+        f"{_PUBLIC}: the About page's licence notices (#2895), a static file "
+        "baked into the image, no install data"
+    ),
     "/api/redoc": "OpenAPI viewer, no install data",
     "/api/v1/auth/password-policy": f"{_PUBLIC}: the change-password screen renders the policy",
     "/api/v1/auth/providers": f"{_PUBLIC}: the login page lists sign-in buttons",
