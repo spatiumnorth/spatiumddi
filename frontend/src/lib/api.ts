@@ -9047,6 +9047,10 @@ export interface DHCPRateBucket {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPServerStatsResponse {
@@ -11820,6 +11824,10 @@ export interface DHCPMetricsPoint {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPMetricsSeries {

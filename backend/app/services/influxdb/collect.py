@@ -157,7 +157,7 @@ async def collect_dhcp_points(
 ) -> tuple[list[Point], datetime | None]:
     """DHCP message-count deltas — same two-query shape as the DNS side.
 
-    Carries the #980 loss counters too. They are the only reason a field can
+    Carries the #980 + #2889 loss counters too. They are the only reason a field can
     be absent from a point here: everything else is NOT NULL.
     """
 
@@ -187,6 +187,12 @@ async def collect_dhcp_points(
                 **(
                     {"receive_drop": int(sample.receive_drop)}
                     if sample.receive_drop is not None
+                    else {}
+                ),
+                # #2889 — same rule: omitted when the agent did not measure it.
+                **(
+                    {"queue_evicted": int(sample.queue_evicted)}
+                    if sample.queue_evicted is not None
                     else {}
                 ),
             },
