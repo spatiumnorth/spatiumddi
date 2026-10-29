@@ -208,3 +208,63 @@ async def test_apply_refuses_a_mac_reserved_in_another_scope_of_the_group(
     await db_session.rollback()
     n = len((await db_session.execute(select(DHCPStaticAssignment))).scalars().all())
     assert n == 1
+
+
+@pytest.mark.asyncio
+async def test_portal_reservation_whose_mac_was_reserved_meanwhile_ends_failed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2911 — the MAC is reserved elsewhere in the group between submit and
+    approve. apply()'s conflict check raises a 409; the request ends
+    ``failed`` with that reason for the requester to read, not pending."""
+    await _enable_module(db_session, MODULE)
+    scope, _, _ = await _estate(db_session)
+    _, req_token = await _user(db_session, name="req", permissions=REQUESTER_PERMS)
+    appr, appr_token = await _user(
+        db_session,
+        name="appr",
+        permissions=[
+            {"action": "approve", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "change_request"},
+            {"action": "write", "resource_type": "dhcp_static"},
+            {"action": "read", "resource_type": "dhcp_static"},
+        ],
+    )
+    appr_id = appr.id
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(req_token),
+        json={
+            "kind": "dhcp_reservation",
+            "args": {"scope_id": str(scope.id), "ip_address": IP, "mac_address": MAC},
+            "justification": "Printer needs a fixed address.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    req_id = resp.json()["id"]
+
+    # Someone reserves the same MAC at another address in the meantime.
+    db_session.add(
+        DHCPStaticAssignment(scope_id=scope.id, ip_address="10.60.0.77", mac_address=MAC)
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/requests/{req_id}/approve",
+        headers=_auth(appr_token),
+        json={"decision_note": "ok"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "failed"
+    assert f"MAC {MAC} already reserved in this group" in body["error"]
+    assert body["decided_by_user_id"] == str(appr_id)
+
+    # The requester reads the same reason.
+    row = (await client.get(f"/api/v1/requests/{req_id}", headers=_auth(req_token))).json()
+    assert row["state"] == "failed"
+    assert "already reserved" in row["error"]
+    # Nothing was reserved at the requested address.
+    db_session.expire_all()
+    n = len((await db_session.execute(select(DHCPStaticAssignment))).scalars().all())
+    assert n == 1

@@ -22,6 +22,12 @@ it is, which artifact it ships in, what license it carries, and why it is there.
 If the two ever disagree about a license, `NOTICE` wins and the discrepancy is
 a bug worth [filing](https://github.com/spatiumnorth/spatiumddi/issues).
 
+A **third, generated** set complements both: the running product's About page
+(`/about`, reachable without logging in) shows `NOTICE` and links an exhaustive
+list of the npm packages in the web bundle and of the Python packages in the API
+image, each with its licence text, produced at build time from what that build
+actually contains. See [About page](features/SYSTEM_ADMIN.md#about-page-licence-notice-and-third-party-lists).
+
 Neither file enumerates every transitive dependency. They cover components that
 are **bundled, shipped, or directly depended on** — the things an operator can
 point at in a running system, and the things a license auditor asks about. The

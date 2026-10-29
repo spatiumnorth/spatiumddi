@@ -44,6 +44,13 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import (
+    caa_key,
+    caa_text,
+    caa_unquoted_value,
+    caa_value_octets,
+    parse_caa,
+)
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -56,6 +63,9 @@ from app.drivers.dns.base import RecordChange, RecordData
 # self-hosted Linode. The token in the Authorization header is the only
 # per-server input.
 _API_BASE = "https://api.linode.com/v4"
+
+# The CAA property tags Linode's ``DomainRecord.tag`` enum accepts (#2959).
+_CAA_TAGS = frozenset({"issue", "issuewild", "iodef"})
 
 # Linode's per-page maximum is 500; 100 (the API default) keeps responses
 # small while still rarely needing a second round trip for typical zones.
@@ -264,7 +274,7 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                         RecordData(
                             name=self._relativize(rec.get("name") or "", zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["target"],
+                            value=self._read_value(rec),
                             ttl=ttl,
                             priority=rec.get("priority"),
                             # SRV weight/port are their own Linode fields
@@ -279,6 +289,47 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                 page += 1
         return records
 
+    @staticmethod
+    def _read_value(rec: dict[str, Any]) -> str:
+        """The canonical value of a held record. A CAA record keeps its tag
+        and value in ``tag`` / ``target`` and has no flags field, so the
+        canonical ``0 <tag> "<value>"`` is rebuilt (#2959). A CAA row with no
+        ``tag`` (the whole value in ``target``, as a release before #2959
+        sent it) reads as that target, so it keys the same as before. A
+        ``target`` that arrives as one quoted string is unquoted, not escaped."""
+        if str(rec.get("type")).upper() == "CAA" and rec.get("tag"):
+            return caa_text(0, rec["tag"], caa_value_octets(str(rec.get("target") or "")))
+        return str(rec.get("target") or "")
+
+    @staticmethod
+    def record_value_refusal(record_type: str, value: str) -> str | None:
+        """Why Linode cannot hold this record value, or None (#2959).
+
+        Checked by the record API before a record is stored, so the operator
+        gets a 422 instead of a record that fails on every push. Linode's
+        record has ``tag`` and ``target`` for CAA but no flags field (the
+        ``DomainRecord`` schema in github.com/linode/linode-api-docs
+        ``openapi.json``), so a non-zero flags value (the issuer-critical bit)
+        cannot be carried and would silently be dropped. Its ``tag`` is an
+        enum of ``issue`` / ``issuewild`` / ``iodef`` in the same schema, so
+        any other property tag is refused too."""
+        if record_type.upper() != "CAA":
+            return None
+        parsed = parse_caa(value)
+        if parsed is None:
+            return f"Linode: CAA value {value!r} is not '<flags> <tag> <value>'."
+        if parsed[0] != 0:
+            return (
+                f"Linode: CAA flags {parsed[0]} cannot be stored; Linode's CAA "
+                "record has no flags field, so only flags 0 is supported."
+            )
+        if parsed[1].lower() not in _CAA_TAGS:
+            return (
+                f"Linode: CAA tag {parsed[1]!r} is not supported; Linode accepts "
+                f"only {', '.join(sorted(_CAA_TAGS))}."
+            )
+        return None
+
     # ── Record writes ───────────────────────────────────────────────────
     def _record_payload(self, change: RecordChange, zone_fqdn: str) -> dict[str, Any]:
         rec = change.record
@@ -289,6 +340,13 @@ class LinodeDNSDriver(CloudDNSDriverBase):
             # Linode's "use the zone default TTL" is the sentinel 0.
             "ttl_sec": _TTL_DEFAULT if rec.ttl is None else rec.ttl,
         }
+        if rec.record_type.upper() == "CAA":
+            refusal = self.record_value_refusal(rec.record_type, rec.value)
+            parsed = parse_caa(rec.value)
+            if refusal is not None or parsed is None:
+                raise CloudDNSError(refusal or f"Linode: CAA value {rec.value!r} does not parse.")
+            payload["tag"] = parsed[1].lower()
+            payload["target"] = caa_unquoted_value(rec.value)
         if rec.priority is not None:
             payload["priority"] = rec.priority
         if rec.record_type.upper() == "SRV":
@@ -345,8 +403,14 @@ class LinodeDNSDriver(CloudDNSDriverBase):
         # Value-keyed lookup: pick the row whose target (and priority for
         # MX/SRV) actually matches.
         match_priority = priority is not None and record_type in _PRIORITY_TYPES
+        is_caa = record_type.upper() == "CAA"
         for rec in results:
-            if rec.get("target") != target:
+            if is_caa:
+                # One record however it is spelled: split tag/target, or a
+                # whole value in ``target`` from a release before #2959.
+                if caa_key(self._read_value(rec)) != caa_key(target):
+                    continue
+            elif rec.get("target") != target:
                 continue
             if match_priority and rec.get("priority") != priority:
                 continue

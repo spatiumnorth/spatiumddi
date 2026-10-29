@@ -34,6 +34,23 @@ data:
     # pod's env (values: frontend.trustedProxyCidrs) and is rendered into the
     # ${SPATIUM_*} blocks by the image's 16-trusted-proxies.envsh. Empty =
     # no trusted proxy = a client-supplied X-Forwarded-* is never believed.
+
+    # ── /health + /metrics rate limit (#2944) ─────────────────────
+    # /health/ready and /health/platform are unauthenticated and each call runs
+    # database and Redis checks; /health/ready has a single database connection
+    # of its own, so a flood through this proxy could queue the kubelet's probe
+    # behind it. One bucket per client address: $binary_remote_addr is read
+    # after the real_ip module has rewritten it, so behind a proxy listed in
+    # FRONTEND_TRUSTED_PROXY_CIDRS each end client gets its own bucket (an
+    # unlisted proxy shares one bucket for everyone behind it). 5 r/s with a
+    # burst of 20 is far above any monitor polling every few seconds, and a
+    # Prometheus scrape is usually every 15 s. The kubelet probes the api
+    # pod directly, not through here.
+    # /health/platform, the console's own Platform Health call, is exempt
+    # (its own exact location): a browser whose allowance was spent must still
+    # render the card, and its worker ping is cached and single-flight.
+    limit_req_zone $binary_remote_addr zone=spatium_health:1m rate=5r/s;
+
     geo $realip_remote_addr $spatium_proxy_trusted {
         default 0;
     ${SPATIUM_TRUSTED_GEO}}
@@ -88,6 +105,10 @@ data:
         server_name _;
         root /usr/share/nginx/html;
         index index.html;
+        # #2935 — no ``Server: nginx/<version>`` on any response, or the
+        # version on nginx's own error pages: version details are for signed-in
+        # users only. Must not diverge from the other template.
+        server_tokens off;
 
         real_ip_header X-Forwarded-For;
         real_ip_recursive on;
@@ -402,10 +423,65 @@ data:
             proxy_set_header   Connection "";
         }
 
-        location ~ ^/(health|metrics) {
+        # The console's own platform-health call (#2944): exact, so it wins over the
+        # rate-limited regex below and a browser whose allowance another tab or a
+        # script spent still gets its Platform Health card. Its worker ping is
+        # TTL-cached and single-flight; the limit is for /health/ready's one
+        # database connection. Same proxying as the location below, minus limit_req.
+        location = /health/platform {
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass $api_upstream;
             proxy_set_header Host $http_host;
+        }
+
+        location ~ ^/(health|metrics) {
+            # #2944 — see limit_req_zone at the top of this config. Everything but
+            # /health/platform (exact location above): ready, live, startup, metrics.
+            limit_req zone=spatium_health burst=20 nodelay;
+            limit_req_status 429;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass $api_upstream;
+            proxy_set_header Host $http_host;
+        }
+
+        # #2895 — the About page's legal files: NOTICE, LICENSE and the npm
+        # notice list. Signed-in callers only: someone probing the server from
+        # outside must not learn which libraries and tools it runs. The files live
+        # OUTSIDE the web root (/usr/share/spatiumddi/legal, see frontend/Dockerfile),
+        # so no other location here can serve them, and this one asks the api
+        # whether the caller has a session before it does. The SPA fetches them
+        # with its Bearer token, which nginx passes to the sub-request with the rest
+        # of the request headers. 401 / 403 from the api go straight back to the
+        # browser; an api that cannot answer is a 503, never the file. ``^~`` so the
+        # static-asset regex below cannot win for these paths. ``alias`` with no
+        # ``try_files``, so a missing file is a plain 404, not index.html. Labelled
+        # UTF-8 because NOTICE is not ASCII. No add_header, so the server-level
+        # security headers still apply. Must not diverge from
+        # frontend/default.conf.template.
+        location ^~ /legal/ {
+            auth_request /_about_session;
+            error_page 500 502 504 =503 @api_unavailable;
+            alias /usr/share/spatiumddi/legal/;
+            default_type text/plain;
+            charset utf-8;
+        }
+
+        # The About files' gate: 204 for a signed-in caller, 401 / 403 otherwise.
+        location = /_about_session {
+            internal;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass              $api_upstream/api/v1/about/session;
+            proxy_pass_request_body off;
+            proxy_set_header        Content-Length "";
+            proxy_set_header        Host $http_host;
+            proxy_set_header        X-Real-IP $remote_addr;
+            proxy_set_header        X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header        X-Forwarded-Proto $spatium_forwarded_proto;
+            proxy_http_version      1.1;
+            proxy_set_header        Connection "";
+            resolver_timeout        2s;
+            proxy_connect_timeout   2s;
+            proxy_read_timeout      10s;
         }
 
         # Boot gate for the SPA fallback (issue #767). Mirrors

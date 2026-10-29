@@ -1,71 +1,70 @@
 """Running-version + release-check endpoint.
 
-Public (no auth) because the sidebar renders before login and the
-release-check banner is visible even on the login screen. The response
-is tiny and cacheable; no sensitive data leaks beyond the version
-string itself — which is also stamped on every Docker image's OCI
-label anyway.
+Answers everyone, but tells a signed-in caller more (#2935). Version and
+stack details are for signed-in users only: the exact version tells an
+anonymous scanner which advisories apply, so an anonymous caller gets only
+the coarse handshake below — ``product`` and ``api_level`` — with every
+version and release-check field withheld (``restricted`` says so).
 
-SECURITY (#400 / L6): the appliance-specific fields
-(``appliance_version`` / ``appliance_hostname``) DO leak operational
-detail — most notably the host's configured hostname — so they are
-withheld from unauthenticated callers. The endpoint stays public for
-the bare ``version`` + release-check banner; appliance fields populate
-only when a valid Bearer credential is presented.
+Why the route stays public at all: the appliance installer probes it before
+it wipes a disk (#995 item 13), asking "is that URL MY control plane?" with
+no credential to offer. ``product`` answers that. Every console consumer
+(sidebar, update banner, Settings → Updates, the appliance pages) and the
+mobile client's Overview call it signed in, so they keep the full answer.
+
+SECURITY (#400 / L6): the appliance-specific fields (``appliance_version`` /
+``appliance_hostname``) were the first things withheld from anonymous
+callers; #2935 extends the same rule to the product version and the release
+check.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Security
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import APIRouter
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, get_current_user
+from app.api.deps import DB, OptionalUser
 from app.config import settings
 from app.core.versions import canonical_version
-from app.db import get_db
-from app.models.auth import User
 from app.models.settings import PlatformSettings
 
 router = APIRouter(tags=["version"])
 
 _SINGLETON_ID = 1
 
-# Optional-auth bearer — ``auto_error=False`` so an anonymous caller
-# (login screen / sidebar pre-login) still gets a 200 with the public
-# fields. A *present* credential is fully validated; only on success do
-# the appliance fields populate.
-_optional_bearer = HTTPBearer(auto_error=False)
+#: The product name every SpatiumDDI control plane reports, signed in or not.
+PRODUCT = "SpatiumDDI"
 
+#: What ``version`` carries for an anonymous caller (#2935). A placeholder
+#: rather than null, for two readers that predate the change: an installer ISO
+#: built before it matches ``"version": "<non-empty string>"`` to decide the URL
+#: is a SpatiumDDI control plane, and with null it reports a perfectly good
+#: control plane as "NOT reachable … Is this the right host?"; and a client
+#: generated from an older ``openapi.json`` types ``version`` as a non-optional
+#: string. Not a release, so every version parser here reads it as an unknown
+#: version, never an old one (``app.core.versions`` / ``lib/versions.ts``).
+#: ``restricted`` is the machine-readable signal; this is only compatibility.
+RESTRICTED_VERSION = "restricted"
 
-async def _maybe_current_user(
-    request: Request,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_optional_bearer)],
-) -> User | None:
-    """Return the authenticated user if a valid Bearer is presented, else None.
-
-    SECURITY (#400 / L6): never raises — an absent / invalid / expired
-    credential resolves to ``None`` so the version endpoint stays public,
-    but the appliance fields are gated on a non-None return.
-    """
-    if credentials is None:
-        return None
-    try:
-        return await get_current_user(request, db, credentials)
-    except Exception:  # noqa: BLE001 — any auth failure = treat as anonymous
-        return None
-
-
-MaybeUser = Annotated[User | None, Depends(_maybe_current_user)]
+#: The major version of the REST surface (the ``/api/v1`` prefix). Coarse on
+#: purpose: it changes only when a client built against v1 can no longer talk
+#: to this server, so it tells an anonymous caller nothing about patch level.
+API_LEVEL = 1
 
 
 class VersionResponse(BaseModel):
+    # Always present, signed in or not (#2935): enough for a client or the
+    # installer's probe to know it reached a SpatiumDDI control plane.
+    product: str
+    api_level: int
+    # True when the caller is anonymous and every version, release-check and
+    # appliance-identity field below is withheld (null / false). Lets a
+    # client tell "withheld" from "no data" without guessing.
+    restricted: bool
     # The running version (the image tag / env var the operator set).
+    # ``RESTRICTED_VERSION`` for an anonymous caller (#2935).
     version: str
     # GitHub release-check result. All nullable so a deployment with
     # the release check disabled (or that's never successfully checked)
@@ -75,7 +74,8 @@ class VersionResponse(BaseModel):
     latest_release_url: str | None
     latest_checked_at: datetime | None
     # Set when the release check is turned off — so the UI can
-    # distinguish "never checked" from "operator opted out".
+    # distinguish "never checked" from "operator opted out". False for an
+    # anonymous caller, alongside ``restricted``.
     release_check_enabled: bool
     # Most recent error, if any. Null on success or if the check has
     # never run.
@@ -91,47 +91,71 @@ class VersionResponse(BaseModel):
 
 
 def _appliance_fields(authenticated: bool) -> dict[str, str | bool | None]:
-    """Appliance-mode signals.
+    """Appliance-mode signals, for a signed-in caller only.
 
-    SECURITY (#400 / L6): ``appliance_mode`` is a harmless boolean the
-    login page needs to decide whether to even hint at the appliance
-    surface, so it's always returned. ``appliance_version`` and
-    ``appliance_hostname`` disclose the host identity / patch level and
-    are returned ONLY to authenticated callers; anonymous callers get
-    ``None`` for both.
+    SECURITY (#400 / L6, #2935): ``appliance_version`` and
+    ``appliance_hostname`` disclose the host identity and patch level, and
+    ``appliance_mode`` the deployment shape (an OS appliance, so a Debian +
+    k3s stack). #400 L6 kept ``appliance_mode`` public on the belief that the
+    login page reads it; nothing outside the signed-in console does, so an
+    anonymous caller now gets ``False`` / ``None`` for all three.
     """
+    if not authenticated:
+        return {"appliance_mode": False, "appliance_version": None, "appliance_hostname": None}
     return {
         "appliance_mode": settings.appliance_mode,
-        "appliance_version": (settings.appliance_version or None) if authenticated else None,
-        "appliance_hostname": (settings.appliance_hostname or None) if authenticated else None,
+        "appliance_version": settings.appliance_version or None,
+        "appliance_hostname": settings.appliance_hostname or None,
     }
 
 
 @router.get("", response_model=VersionResponse)
-async def get_version(db: DB, current_user: MaybeUser) -> VersionResponse:
-    authenticated = current_user is not None
+async def get_version(db: DB, current_user: OptionalUser) -> VersionResponse:
+    if current_user is None:
+        # #2935 — the coarse handshake only. No DB read either: nothing an
+        # anonymous caller is given depends on the settings row.
+        return VersionResponse(
+            product=PRODUCT,
+            api_level=API_LEVEL,
+            restricted=True,
+            version=RESTRICTED_VERSION,
+            latest_version=None,
+            update_available=False,
+            latest_release_url=None,
+            latest_checked_at=None,
+            release_check_enabled=False,
+            latest_check_error=None,
+            **_appliance_fields(False),
+        )
+    running = canonical_version(settings.version, settings.app_version)
     ps = await db.get(PlatformSettings, _SINGLETON_ID)
     if ps is None:
         # Settings row hasn't been seeded yet (first boot before
         # /admin/settings is opened). Report the runtime version and
         # leave everything else empty — no fabricated state.
         return VersionResponse(
-            version=canonical_version(settings.version, settings.app_version),
+            product=PRODUCT,
+            api_level=API_LEVEL,
+            restricted=False,
+            version=running,
             latest_version=None,
             update_available=False,
             latest_release_url=None,
             latest_checked_at=None,
             release_check_enabled=True,
             latest_check_error=None,
-            **_appliance_fields(authenticated),
+            **_appliance_fields(True),
         )
     return VersionResponse(
-        version=canonical_version(settings.version, settings.app_version),
+        product=PRODUCT,
+        api_level=API_LEVEL,
+        restricted=False,
+        version=running,
         latest_version=ps.latest_version,
         update_available=ps.update_available,
         latest_release_url=ps.latest_release_url,
         latest_checked_at=ps.latest_checked_at,
         release_check_enabled=ps.github_release_check_enabled,
         latest_check_error=ps.latest_check_error,
-        **_appliance_fields(authenticated),
+        **_appliance_fields(True),
     )

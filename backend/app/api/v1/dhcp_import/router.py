@@ -34,6 +34,7 @@ from app.services.dhcp_import import (
     WindowsDHCPImportError,
     commit_import,
     detect_conflicts,
+    drop_unservable_hostnames,
     parse_isc_config,
     parse_kea_config,
     parse_windows_dhcp_server,
@@ -363,6 +364,8 @@ async def _attach_conflicts(
         target_group_id=target_group_id,
         ipam_space_id=ipam_space_id,
     )
+    # #2919 — the preview shows what the commit will store.
+    preview.warnings.extend(drop_unservable_hostnames(preview.scopes))
 
 
 # ── Kea endpoints ────────────────────────────────────────────────────

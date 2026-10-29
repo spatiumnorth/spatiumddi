@@ -497,6 +497,22 @@ function GroupDetailView({
                 {group.description}
               </p>
             )}
+            {(group.ha_peer_urls_missing?.length ?? 0) > 0 && (
+              <p
+                className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+                data-testid="ha-peer-urls-missing"
+              >
+                HA is not running: no HA Peer URL on{" "}
+                {group.ha_peer_urls_missing!.join(", ")}. Set it on each server
+                (Edit server → HA Peer URL), e.g.{" "}
+                <span className="font-mono">http://&lt;host&gt;:8000/</span>.
+                {group.ha_autofill_skipped_reason ===
+                  "more_than_two_kea_members" &&
+                  " Not filled automatically: a third Kea member joins as an HA backup, and roles follow server order, so it could take the primary role from the existing pair."}
+                {group.ha_autofill_skipped_reason === "bridged_network_mode" &&
+                  " Not filled automatically: in bridged mode the node address is not where Kea listens."}
+              </p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <AskAIButton

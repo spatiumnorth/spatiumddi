@@ -1073,8 +1073,10 @@ class PlatformSettings(Base):
     #
     # ``dhcp_relay_vip`` — fronts the relay→server unicast forward on
     # :67 so a DHCP relay's ``forward-to`` target outlives a single Kea
-    # node. Kea KEEPS hostNetwork:67 for direct-attached broadcast reach
-    # — this VIP does NOT replace client-facing :67. Empty = no relay VIP.
+    # node. Kea KEEPS hostNetwork:67, but a group behind this VIP must use
+    # ``dhcp_socket_mode = relay``: in raw mode the announcing node's Kea
+    # drops the relays kube-proxy keeps on it (#2899, see
+    # ``services/dhcp/relay_vip.py``). Empty = no relay VIP.
     dns_vip: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
