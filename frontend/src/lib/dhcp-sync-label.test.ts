@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { syncLabel } from "./dhcp-sync-label";
+import { syncCard, syncLabel } from "./dhcp-sync-label";
 
 const fmt = (s: string) => `<${s}>`;
 const base = {
@@ -40,5 +40,31 @@ describe("syncLabel", () => {
         fmt,
       ),
     ).toBe("Never synced");
+  });
+});
+
+describe("syncCard (#3046)", () => {
+  it("labels an applied agent-managed server's apply time as Config applied", () => {
+    expect(
+      syncCard({ ...base, config_apply_status: "ok", config_apply_at: "T1" }),
+    ).toEqual({ label: "Config applied", at: "T1" });
+  });
+
+  it("has no time for a server that never synced or applied", () => {
+    expect(syncCard(base)).toEqual({ label: "Last sync", at: null });
+    expect(
+      syncCard({
+        ...base,
+        config_apply_status: "reverted",
+        config_apply_at: "T1",
+      }),
+    ).toEqual({ label: "Last sync", at: null });
+  });
+
+  it("shows last_sync_at for an agentless server", () => {
+    expect(syncCard({ ...base, last_sync_at: "T2" })).toEqual({
+      label: "Last sync",
+      at: "T2",
+    });
   });
 });

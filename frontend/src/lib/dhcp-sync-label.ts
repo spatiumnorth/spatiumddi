@@ -20,3 +20,19 @@ export function syncLabel(s: SyncLabelInput, fmt = fmtDate): string {
 function fmtDate(iso: string): string {
   return new Date(iso).toLocaleString();
 }
+
+/** #3046 — the server inspectors' "Last sync" card.
+ *
+ *  Same rule as `syncLabel`, split into a card label and a timestamp. An
+ *  apply report is not a sync, so it is labelled "Config applied" rather
+ *  than shown under "Last sync". `at` is null for a server with neither,
+ *  which the caller renders as its placeholder. */
+export function syncCard(s: SyncLabelInput): {
+  label: string;
+  at: string | null;
+} {
+  if (s.last_sync_at) return { label: "Last sync", at: s.last_sync_at };
+  if (s.config_apply_status === "ok" && s.config_apply_at)
+    return { label: "Config applied", at: s.config_apply_at };
+  return { label: "Last sync", at: null };
+}
