@@ -42,6 +42,7 @@ vi.mock("@/lib/api", async () => {
 });
 
 import { AuditPage } from "./AuditPage";
+import { auditApi } from "@/lib/api";
 
 afterEach(cleanup);
 
@@ -81,5 +82,26 @@ describe("AuditPage details", () => {
     // The API writes `dns_server_group`; `dns_group` matches no row.
     expect(values).toContain("dns_server_group");
     expect(values).not.toContain("dns_group");
+  });
+
+  it("does not say the nightly verify walks the whole chain (#3044)", async () => {
+    vi.mocked(auditApi.integrity).mockResolvedValueOnce({
+      ok: true,
+      rows_checked: 1000,
+      first_seq: 2578,
+      last_seq: 3577,
+      partial: true,
+      breaks: [],
+    });
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AuditPage />
+      </QueryClientProvider>,
+    );
+    const badge = await screen.findByText("Chain verified");
+    const title = badge.closest("span")?.getAttribute("title") ?? "";
+    expect(title).toMatch(/Older rows are not re-checked here/);
+    expect(title).not.toMatch(/walks the whole chain/);
+    expect(title).toMatch(/at least once a week/);
   });
 });

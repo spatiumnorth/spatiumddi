@@ -533,7 +533,7 @@ function ChainIntegrityBadge() {
         className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
         title={
           data.partial
-            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify walks the whole chain.`
+            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify re-checks the whole chain at least once a week.`
             : `Whole chain verified (${data.rows_checked.toLocaleString()} rows)`
         }
       >

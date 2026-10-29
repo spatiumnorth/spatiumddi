@@ -313,3 +313,22 @@ def test_backup_target_rows_written_by_older_builds_read_redacted() -> None:
         "QUNDT1VOVEtFWUJBU0U2NA"
         not in redact_audit_value({"note": stored_patch["config"]["connection_string"]})["note"]
     )
+
+
+def test_openapi_include_details_names_error_detail_3043() -> None:
+    from app.main import app
+
+    params = app.openapi()["paths"]["/api/v1/audit"]["get"]["parameters"]
+    desc = next(p for p in params if p["name"] == "include_details")["description"]
+    for field in ("old_value", "new_value", "changed_fields", "error_detail"):
+        assert field in desc
+
+
+def test_openapi_integrity_description_matches_nightly_verify_3044() -> None:
+    from app.main import app
+
+    desc = app.openapi()["paths"]["/api/v1/audit/integrity"]["get"]["description"]
+    flat = " ".join(desc.split())
+    assert "pre-computes the same answer" not in flat
+    assert "since its last clean run" in flat
+    assert "at least every 7 days" in flat
