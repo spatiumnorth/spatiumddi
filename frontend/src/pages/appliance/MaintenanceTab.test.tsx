@@ -20,6 +20,7 @@ vi.mock("@/hooks/useApplianceAdmin", () => ({
   useApplianceAdminGate: () => ({}),
 }));
 
+import { applianceSystemApi } from "@/lib/api";
 import { MaintenanceTab } from "./MaintenanceTab";
 
 afterEach(cleanup);
@@ -39,5 +40,37 @@ describe("MaintenanceTab copy", () => {
     expect(text).not.toMatch(/future tasks read it/i);
     expect(text).toMatch(/nothing drains DNS\/DHCP traffic from it yet/i);
     expect(text).toMatch(/No scheduled task, agent or service reads the flag/i);
+  });
+});
+
+describe("MaintenanceTab reboot button (#3008)", () => {
+  async function renderWith(info: Record<string, unknown>) {
+    vi.mocked(applianceSystemApi.info).mockResolvedValue(info as never);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MaintenanceTab />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("Maintenance mode");
+  }
+
+  it("stays disabled while the host's reboot is under way, trigger renamed", async () => {
+    await renderWith({
+      reboot_scheduled: false,
+      reboot_in_progress: true,
+    });
+    const btn = await screen.findByRole("button", {
+      name: /already scheduled/i,
+    });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("is enabled when nothing is under way", async () => {
+    await renderWith({
+      reboot_scheduled: false,
+      reboot_in_progress: false,
+    });
+    const btn = await screen.findByRole("button", { name: /reboot now/i });
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
   });
 });

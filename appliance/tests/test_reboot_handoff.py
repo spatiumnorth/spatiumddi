@@ -406,14 +406,54 @@ def test_the_image_enables_the_unit_and_makes_the_runner_executable() -> None:
     assert 'chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-handoff.service"' in text
 
 
-def test_the_agent_hands_off_before_it_reboots_and_undoes_a_reboot_that_failed() -> None:
+def test_the_agent_delegates_to_the_power_action_wrapper() -> None:
+    """#3008 — one implementation: the wrapper owns the handoff, the cancel
+    trap, the marker and the undo; the agent keeps its trigger semantics and
+    runs none of those itself."""
     lines = [ln.strip() for ln in AGENT.read_text().splitlines()
              if ln.strip() and not ln.strip().startswith("#")]
-    before = next(i for i, ln in enumerate(lines) if "--before-reboot" in ln)
-    reboot = next(i for i, ln in enumerate(lines) if ln == "if ! systemctl reboot; then")
-    undo = next(i for i, ln in enumerate(lines) if "--undo" in ln)
-    assert before < reboot < undo
-    assert not any(ln.startswith("exec systemctl reboot") for ln in lines)
+    text = "\n".join(lines)
+    assert '"$POWER_ACTION" reboot' in text
+    assert "--before-reboot" not in text and "--undo" not in text
+    assert "systemctl reboot" not in text.replace("spatium-power-action reboot", "")
+    assert 'mv -f "$TRIGGER" "${TRIGGER}.done"' in text
+    mv = next(i for i, ln in enumerate(lines) if ln.startswith('mv -f "$TRIGGER"'))
+    call = next(i for i, ln in enumerate(lines) if '"$POWER_ACTION" reboot' in ln)
+    assert mv < call
+
+
+def _agent_run(tmp_path: Path, *, wrapper_rc: int):
+    import os
+    import subprocess
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(f'#!/bin/bash\necho "wrapper $*" >> {tmp_path}/calls\nexit {wrapper_rc}\n')
+    wrapper.chmod(0o755)
+    src = AGENT.read_text()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "reboot-pending-fleet").write_text("stamp-1\n")
+    src = (src.replace("/var/lib/spatiumddi/release-state", str(state))
+              .replace("/var/log/spatiumddi", str(tmp_path / "log"))
+              .replace("GRACE_SECONDS=5", "GRACE_SECONDS=0"))
+    script = tmp_path / "agent"
+    script.write_text(src)
+    script.chmod(0o755)
+    proc = subprocess.run([str(script)], env={**os.environ, "SPATIUM_POWER_ACTION": str(wrapper)},
+                          capture_output=True, text=True, timeout=30)
+    return proc, state
+
+
+def test_the_agent_renames_the_trigger_and_runs_the_wrapper(tmp_path: Path) -> None:
+    proc, state = _agent_run(tmp_path, wrapper_rc=0)
+    assert proc.returncode == 0
+    assert (tmp_path / "calls").read_text().splitlines() == ["wrapper reboot"]
+    assert not (state / "reboot-pending-fleet").exists()
+    assert (state / "reboot-pending-fleet.done").exists()
+
+
+def test_the_agent_fails_when_the_wrapper_does(tmp_path: Path) -> None:
+    proc, _ = _agent_run(tmp_path, wrapper_rc=1)
+    assert proc.returncode == 1
 
 
 # ---- pure: what CNPG would do, and when the handoff is done ------------------------

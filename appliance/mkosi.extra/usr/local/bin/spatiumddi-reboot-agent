@@ -20,8 +20,9 @@
 #           re-fire after the box comes back up (next-boot will see
 #           the same dir contents otherwise — we want a clean state)
 #        c. Issues ``systemctl reboot`` with a small grace window so
-#           in-flight DNS / DHCP responses can finish. On a cluster node
-#           holding the PostgreSQL primary, it first hands the primary
+#           in-flight DNS / DHCP responses can finish, then runs
+#           ``spatium-power-action reboot`` (#3008), which on a cluster
+#           node holding the PostgreSQL primary first hands the primary
 #           off to another node (spatium-reboot-handoff, #2849).
 #
 # Idempotent — if a stale .done file already exists it's overwritten;
@@ -35,7 +36,7 @@ TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending-fleet
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/reboot-agent.log"
 GRACE_SECONDS=5
-HANDOFF=/usr/local/bin/spatium-reboot-handoff
+POWER_ACTION="${SPATIUM_POWER_ACTION:-/usr/local/bin/spatium-power-action}"
 
 mkdir -p "$LOG_DIR"
 
@@ -56,33 +57,17 @@ mv -f "$TRIGGER" "${TRIGGER}.done" || true
 log "operator-triggered reboot accepted (agent stamp: ${TRIGGER_PAYLOAD:-unknown})"
 log "scheduling reboot in ${GRACE_SECONDS}s"
 
-# ``systemctl reboot`` goes through logind, which first lets the
-# kubelet's graceful node shutdown run (#1976): the kubelet holds a
-# delay lock, reports the node NotReady, stops its pods within their
-# grace period (up to 60 s, kubelet.conf.d/50-spatium-graceful-shutdown
-# .conf) so the cluster moves their traffic and replaces them, and
-# then releases the lock. Only after that does systemd stop the
-# services. The grace window above is in addition to that.
-sleep "$GRACE_SECONDS"
-
-# #2849 — the kubelet would stop CloudNativePG's primary with the node's
-# other pods, and the failover would then run while this node shuts down.
-# On a cluster node holding the primary, the handoff cordons the node and
-# waits (bounded) for CNPG to switch the primary over to another node, as an
-# upgrade's drain makes it do, and for the old primary to run again as a
-# standby, so the reboot never stops it in the middle of its demotion; the
-# node is uncordoned at its next boot
-# (spatiumddi-reboot-handoff.service). Anywhere else it returns at once. It
-# always exits 0; its lines go to this log.
-if [ -x "$HANDOFF" ]; then
-    "$HANDOFF" --before-reboot 2>&1 | while IFS= read -r line; do log "$line"; done || true
-fi
-
-log "issuing systemctl reboot"
-if ! systemctl reboot; then
-    log "systemctl reboot failed: the node stays up, so the handoff's cordon is undone"
-    if [ -x "$HANDOFF" ]; then
-        "$HANDOFF" --undo 2>&1 | while IFS= read -r line; do log "$line"; done || true
-    fi
+# #3008 — the same wrapper the web-UI reboot and the console use
+# (spatium-power-action, #2974), so there is one implementation: it hands
+# the PostgreSQL primary off first when this node holds it (#2849), then runs
+# ``systemctl reboot`` (through logind, which first lets the kubelet's
+# graceful node shutdown run, #1976; the grace window above is in addition
+# to that). It holds the in-progress marker and lock, so the console shows
+# the handoff and the web UI keeps its Reboot button disabled, and a stop
+# before systemctl (this unit being stopped) undoes the handoff's cordon. It
+# undoes it too when systemctl fails. Its lines go to this log.
+log "handing over to spatium-power-action reboot"
+if ! "$POWER_ACTION" reboot >>"$LOG" 2>&1; then
+    log "spatium-power-action reboot failed: the node stays up"
     exit 1
 fi

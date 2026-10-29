@@ -49,6 +49,7 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
            "SPATIUM_REBOOT_HANDOFF": str(handoff_sh),
            "SPATIUM_POWER_ACTION_MARKER": str(tmp_path / "marker"),
+           "SPATIUM_POWER_ACTION_LOCK": str(tmp_path / "lock"),
            "SPATIUM_POWER_ACTION_HANDOFF_CAP_S": str(cap_s)}
     proc = subprocess.Popen([str(SCRIPT), action], env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
@@ -163,3 +164,34 @@ def test_the_image_makes_the_wrapper_executable() -> None:
     assert 'chmod 0755 "$BUILDROOT/usr/local/bin/spatium-power-action"' in text
     assert 'chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-power-action@.service"' in text
     assert os.access(SCRIPT, os.X_OK)
+
+
+def _lock_held(path: Path) -> bool:
+    import fcntl
+    try:
+        with open(path, "rb") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            return False
+    except OSError:
+        return False
+
+
+def test_the_lock_the_api_reads_is_held_while_it_runs_and_freed_after(tmp_path: Path) -> None:
+    """#3008 — the api's flock probe of the release-state file."""
+    proc, log = _run(tmp_path, "reboot", handoff="hang")
+    _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
+    assert _lock_held(tmp_path / "lock")
+    proc.terminate()
+    assert proc.wait(20) == 1
+    assert not _lock_held(tmp_path / "lock")
+
+
+def test_a_killed_wrapper_leaves_no_lock_even_with_the_handoff_alive(tmp_path: Path) -> None:
+    proc, log = _run(tmp_path, "reboot", handoff="hang")
+    _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
+    proc.kill()
+    proc.wait(10)
+    assert not _lock_held(tmp_path / "lock")

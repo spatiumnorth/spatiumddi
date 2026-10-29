@@ -23,6 +23,7 @@ so we don't need a second compose mount.
 
 from __future__ import annotations
 
+import fcntl
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,13 @@ logger = structlog.get_logger(__name__)
 _STATE_DIR = Path("/var/lib/spatiumddi-host/release-state")
 _MAINT_FLAG = _STATE_DIR / "maintenance.flag"
 _REBOOT_TRIGGER = _STATE_DIR / "reboot-pending"
+# #3008 — spatium-power-action holds an flock on this file for as long as a
+# reboot or poweroff is under way (the primary handoff, then systemctl).
+# The trigger is renamed before the handoff, so ``reboot_scheduled`` alone
+# reads false while it runs. A lock dies with its holder, so a killed wrapper
+# never leaves this stuck; a pid check would be wrong from here, the api has
+# its own pid namespace.
+_POWER_ACTION_LOCK = _STATE_DIR / "power-action-active"
 # Debian uses /var/run/reboot-required; we expose the host's via a
 # bind mount on the appliance compose. Falls back to a non-existent
 # path if the bind isn't mounted (dev), so is_reboot_pending() just
@@ -51,6 +59,9 @@ class SystemInfo:
     maintenance_mode: bool
     reboot_pending_from_host: bool
     reboot_scheduled: bool
+    # A reboot or poweroff is running on the host (the handoff of the
+    # database primary included), whichever path started it.
+    reboot_in_progress: bool
     # None = unknown (the pods were not given APPLIANCE_VERSION); same
     # representation as /api/v1/version.
     appliance_version: str | None
@@ -65,9 +76,28 @@ def get_system_info() -> SystemInfo:
         maintenance_mode=is_maintenance_mode(),
         reboot_pending_from_host=_HOST_REBOOT_REQUIRED.exists(),
         reboot_scheduled=_REBOOT_TRIGGER.exists(),
+        reboot_in_progress=power_action_in_progress(),
         appliance_version=settings.appliance_version or None,
         appliance_mode=settings.appliance_mode,
     )
+
+
+def power_action_in_progress() -> bool:
+    """True while the host's spatium-power-action holds its lock (#3008).
+
+    Tries a shared, non-blocking lock on the file: it fails only while the
+    wrapper holds its exclusive one. A missing or unreadable file (not an
+    appliance, the mount absent) is False."""
+    try:
+        with open(_POWER_ACTION_LOCK, "rb") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
 
 
 def is_maintenance_mode() -> bool:

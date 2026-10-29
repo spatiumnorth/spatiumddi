@@ -53,6 +53,10 @@ export function MaintenanceTab() {
   });
 
   const data = info.data;
+  // #3008 — the trigger file is renamed before the primary handoff, so
+  // reboot_scheduled reads false while the handoff runs; reboot_in_progress
+  // (the host wrapper's lock) covers that until the node goes down.
+  const rebootUnderway = !!(data?.reboot_scheduled || data?.reboot_in_progress);
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
@@ -78,7 +82,7 @@ export function MaintenanceTab() {
         </div>
       )}
 
-      {data?.reboot_scheduled && (
+      {rebootUnderway && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
           <Activity className="mt-0.5 h-4 w-4 shrink-0 animate-pulse text-amber-600 dark:text-amber-400" />
           <div className="text-amber-700 dark:text-amber-400">
@@ -150,12 +154,12 @@ export function MaintenanceTab() {
           <button
             type="button"
             onClick={() => setConfirmReboot(true)}
-            disabled={data?.reboot_scheduled}
+            disabled={rebootUnderway}
             className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
             {...applianceGate}
           >
             <Power className="h-3.5 w-3.5" />
-            {data?.reboot_scheduled ? "Already scheduled" : "Reboot now"}
+            {rebootUnderway ? "Already scheduled" : "Reboot now"}
           </button>
         </div>
       </section>

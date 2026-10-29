@@ -27,13 +27,21 @@
 # While it runs, MARKER holds "<pid> <action>", so the console shows the
 # reboot or poweroff as under way and F9 can cancel it. /run is a tmpfs:
 # nothing of it outlives the reboot.
-# The Fleet path (spatiumddi-reboot-agent) does the same steps itself.
+# The Fleet path (spatiumddi-reboot-agent) calls this wrapper too (#3008).
+#
+# The api cannot see /run, so the wrapper also holds an flock(2) on LOCK, a
+# file in the release-state directory the api has mounted: the web UI keeps
+# its Reboot button disabled while the lock is held, i.e. from the moment the
+# trigger is renamed until the node goes down. A lock is released by the
+# kernel when its holder dies, so a wrapper killed outright leaves nothing
+# stuck (the api checks no pid: it has no view of the host's).
 
 set -uo pipefail
 
 HANDOFF="${SPATIUM_REBOOT_HANDOFF:-/usr/local/bin/spatium-reboot-handoff}"
 HANDOFF_CAP_S="${SPATIUM_POWER_ACTION_HANDOFF_CAP_S:-240}"
 MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
+LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state/power-action-active}"
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -82,10 +90,16 @@ trap on_signal TERM INT HUP
 
 printf '%s %s\n' "$$" "$ACTION" > "$MARKER" 2>/dev/null || true
 
+# fd 9 holds the lock for the life of this process; the children get it
+# closed (9>&-) so a stray child cannot keep it held after we are gone.
+if { exec 9>"$LOCK"; } 2>/dev/null; then
+    flock -n 9 || log "another power action holds $LOCK: going on regardless"
+fi
+
 if [ -x "$HANDOFF" ]; then
     # In the background and waited for, so a stop is acted on at once: bash
     # runs a trap only once a foreground command has finished.
-    timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 &
+    timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 9>&- &
     child=$!
     wait "$child"
     rc=$?
@@ -97,7 +111,7 @@ fi
 
 issued=1
 log "issuing systemctl $ACTION"
-if ! systemctl "$ACTION"; then
+if ! systemctl "$ACTION" 9>&-; then
     log "systemctl $ACTION failed: the node stays up, so the handoff's cordon is undone"
     undo
     clear_marker
