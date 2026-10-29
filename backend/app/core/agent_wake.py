@@ -45,6 +45,7 @@ from typing import Any
 import structlog
 
 from app.config import settings
+from app.core import shutdown as _shutdown
 from app.core.redis_client import make_async_redis
 
 logger = structlog.get_logger(__name__)
@@ -72,6 +73,9 @@ LONGPOLL_POLL_INTERVAL_FALLBACK = 2.0
 # Short connect timeout so a wedged Redis can't stall a request thread —
 # the publish swallows the failure and the subscribe degrades to poll.
 _CONNECT_TIMEOUT = 2.0
+
+# How often a parked pub/sub read looks up to check for shutdown (#3015).
+_SHUTDOWN_SLICE_S = 0.25
 
 _PREFIX = "spatium:wake:"
 _METRIC_PREFIX = "spatium:wake:metrics:published:"
@@ -263,6 +267,7 @@ class WakeResult(StrEnum):
     WAKE = "wake"  # a real wake message arrived → re-check now
     TIMEOUT = "timeout"  # tick elapsed with no wake → re-check anyway
     UNAVAILABLE = "unavailable"  # Redis error → degraded to poll fallback
+    SHUTDOWN = "shutdown"  # this api process is stopping (#3015) → answer now
 
 
 class WakeSubscription:
@@ -283,25 +288,34 @@ class WakeSubscription:
         message, TIMEOUT when the tick elapses, UNAVAILABLE (after a
         fallback sleep) on any Redis error so the caller keeps looping
         at the old cadence."""
+        if _shutdown.shutdown_requested():
+            return WakeResult.SHUTDOWN
         if self.degraded or self._pubsub is None:
-            await asyncio.sleep(min(timeout, LONGPOLL_POLL_INTERVAL_FALLBACK))
+            if await _shutdown.sleep_or_shutdown(min(timeout, LONGPOLL_POLL_INTERVAL_FALLBACK)):
+                return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         try:
             while True:
+                if _shutdown.shutdown_requested():
+                    return WakeResult.SHUTDOWN
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return WakeResult.TIMEOUT
+                # Sliced, not one long read, so a shutdown is noticed within
+                # _SHUTDOWN_SLICE_S without cancelling a read mid-frame.
                 msg = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=remaining
+                    ignore_subscribe_messages=True,
+                    timeout=min(remaining, _SHUTDOWN_SLICE_S),
                 )
                 if msg is not None and msg.get("type") == "message":
                     return WakeResult.WAKE
         except Exception as exc:  # noqa: BLE001 — degrade to poll, never fail the poll
             logger.warning("agent_wake_wait_failed", error=str(exc))
             self.degraded = True
-            await asyncio.sleep(LONGPOLL_POLL_INTERVAL_FALLBACK)
+            if await _shutdown.sleep_or_shutdown(LONGPOLL_POLL_INTERVAL_FALLBACK):
+                return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
 
 

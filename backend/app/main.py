@@ -430,6 +430,13 @@ def _log_backup_section_catalog_gap() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
+    # #3015 — startup runs inside uvicorn's Server.capture_signals, so its
+    # SIGTERM handler is installed by now: wrap it so long-polls end the
+    # moment a stop begins rather than after uvicorn's graceful-shutdown cut.
+    from app.core import shutdown as _shutdown  # noqa: PLC0415
+
+    _shutdown.reset()
+    _shutdown.install_signal_hook()
     logger.info("startup", service="api", version=settings.version, debug=settings.debug)
     await _seed_default_admin()
     await _seed_builtin_roles()
@@ -970,6 +977,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pcap_orphan_task: asyncio.Task[None] = asyncio.create_task(_pcap_orphan_loop())
 
     yield
+    _shutdown.request_shutdown()
 
     if cert_reconcile_task is not None:
         cert_reconcile_task.cancel()

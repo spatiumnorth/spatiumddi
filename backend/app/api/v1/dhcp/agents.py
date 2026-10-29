@@ -27,6 +27,7 @@ from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     collect_wake,
     dhcp_wake_channels,
     wake_subscription,
@@ -1081,7 +1082,11 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)

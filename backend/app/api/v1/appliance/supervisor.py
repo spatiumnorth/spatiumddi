@@ -3215,7 +3215,10 @@ async def _supervisor_heartbeat(
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         break
-                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.WAKE:
+                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) in (
+                        WakeResult.WAKE,
+                        WakeResult.SHUTDOWN,  # #3015 — api stopping: answer now
+                    ):
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
