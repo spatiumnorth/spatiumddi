@@ -72,9 +72,7 @@ async def list_audit_log(
     source_ip: str | None = Query(default=None),
     include_details: bool = Query(
         default=False,
-        description=(
-            "Also return old_value / new_value / changed_fields / error_detail " "per row."
-        ),
+        description="Also return old_value / new_value / changed_fields / error_detail per row.",
     ),
 ) -> AuditLogPage:
     q = select(AuditLog)
@@ -237,9 +235,11 @@ async def get_audit_integrity(
 ) -> IntegrityResponse:
     """Walk the audit_log chain and report any tamper. Slow on tables
     past ~1M rows. The nightly Celery task checks only the rows added
-    since its last clean run, and re-walks the whole chain at least
-    every 7 days; it writes an alert event when it finds a break, so
-    the UI hit is mostly for ad-hoc operator confirmation."""
+    since its last clean run. It starts again from the first row once
+    its last full pass is more than 7 days old (so roughly every eighth
+    nightly run, later if runs fail), or when its checkpoint cannot be
+    trusted. It writes an alert event when it finds a break, so the UI
+    hit is mostly for ad-hoc operator confirmation."""
     result = await verify_chain(db, max_rows=max_rows, newest=newest)
     return IntegrityResponse(
         ok=result.ok,

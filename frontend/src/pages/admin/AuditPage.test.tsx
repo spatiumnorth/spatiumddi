@@ -102,6 +102,7 @@ describe("AuditPage details", () => {
     const title = badge.closest("span")?.getAttribute("title") ?? "";
     expect(title).toMatch(/Older rows are not re-checked here/);
     expect(title).not.toMatch(/walks the whole chain/);
-    expect(title).toMatch(/at least once a week/);
+    expect(title).not.toMatch(/at least/);
+    expect(title).toMatch(/once its last full pass is more than 7 days old/);
   });
 });

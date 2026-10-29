@@ -331,4 +331,25 @@ def test_openapi_integrity_description_matches_nightly_verify_3044() -> None:
     flat = " ".join(desc.split())
     assert "pre-computes the same answer" not in flat
     assert "since its last clean run" in flat
-    assert "at least every 7 days" in flat
+    # The full pass starts only once the last one is MORE than 7 days old,
+    # measured from when it finished, so a nightly task re-walks on the
+    # eighth night; "at least every 7 days" would be a promise it breaks.
+    assert "at least" not in flat
+    assert "more than 7 days old" in flat
+
+
+def test_full_pass_waits_until_the_last_one_is_over_7_days_old_3044() -> None:
+    # The integrity route and the Audit Log badge describe the nightly
+    # verify's full pass as starting once the last one is MORE than 7 days
+    # old. Pin that rule, so the wording cannot drift from the code: a pass
+    # that finished 7 days ago less a minute does not trigger one, which is
+    # why a 02:00 nightly task re-walks on the eighth night, not the seventh.
+    from datetime import UTC, datetime, timedelta
+
+    from app.services.audit_chain import FULL_PASS_INTERVAL
+    from app.tasks.audit_chain_verify import _full_pass_reason
+
+    now = datetime.now(UTC)
+    assert FULL_PASS_INTERVAL == timedelta(days=7)
+    assert _full_pass_reason(now - timedelta(days=7) + timedelta(minutes=1), now) is None
+    assert _full_pass_reason(now - timedelta(days=7, minutes=1), now) == "stale"

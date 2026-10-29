@@ -6,5 +6,6 @@
   names `error_detail` too. The Audit Log chain badge's tooltip and the
   description of `GET /api/v1/audit/integrity` said the nightly verify
   walks the whole chain; it checks the rows added since its last clean
-  run, and re-walks the whole chain at least once every 7 days. Both
-  texts now say that.
+  run, and walks the whole chain again once its last full pass is more
+  than 7 days old. Both texts now say that, and so does SYSTEM_ADMIN.md,
+  which had promised a full pass "at least once every 7 days".
