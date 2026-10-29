@@ -71,3 +71,81 @@ def test_the_info_names_the_node_it_describes(monkeypatch):
     assert sysmod.get_system_info().node == "ddi2"
     monkeypatch.setattr(settings, "node_name", "")
     assert sysmod.get_system_info().node is None
+
+
+# ---- the whole window (#3008, QA case 3) -------------------------------------
+# The lock alone covered 0.4-1.8 s of a one-node reboot: nothing during the
+# Fleet agent's grace, nothing after the wrapper had issued systemctl while the
+# node was still going down.
+
+BOOT = "11111111-2222-3333-4444-555555555555"
+
+
+def _window(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    monkeypatch.setattr(sysmod, "_POWER_ACTION_LOCK", state)
+    monkeypatch.setattr(sysmod, "_REBOOT_TRIGGER", state / "reboot-pending")
+    monkeypatch.setattr(sysmod, "_FLEET_TRIGGER", state / "reboot-pending-fleet")
+    monkeypatch.setattr(sysmod, "_FLEET_GRACE_MARKER", state / "reboot-fleet-grace")
+    monkeypatch.setattr(sysmod, "_POWER_ACTION_ISSUED", state / "power-action-issued")
+    monkeypatch.setattr(sysmod, "_BOOT_ID", boot)
+    return state
+
+
+def test_nothing_under_way_reads_false(tmp_path, monkeypatch):
+    _window(tmp_path, monkeypatch)
+    assert sysmod.reboot_in_progress() is False
+    assert sysmod.get_system_info().reboot_in_progress is False
+
+
+def test_a_pending_trigger_reads_true(tmp_path, monkeypatch):
+    state = _window(tmp_path, monkeypatch)
+    (state / "reboot-pending-fleet").write_text("stamp\n")
+    assert sysmod.reboot_in_progress() is True
+    (state / "reboot-pending-fleet").unlink()
+    (state / "reboot-pending").write_text("stamp\n")
+    assert sysmod.reboot_in_progress() is True
+
+
+def test_the_fleet_agents_grace_marker_reads_true_in_this_boot_only(tmp_path, monkeypatch):
+    state = _window(tmp_path, monkeypatch)
+    marker = state / "reboot-fleet-grace"
+    marker.write_text(f"4242 {BOOT}\n")
+    assert sysmod.reboot_in_progress() is True
+    marker.write_text("4242 99999999-0000-0000-0000-000000000000\n")
+    assert sysmod.reboot_in_progress() is False
+
+
+def test_a_grace_marker_left_by_a_killed_agent_expires(tmp_path, monkeypatch):
+    """The api cannot check the agent's pid (its own pid namespace); an aged
+    marker counts for nothing, and the wrapper's lock is the answer by then."""
+    state = _window(tmp_path, monkeypatch)
+    marker = state / "reboot-fleet-grace"
+    marker.write_text(f"4242 {BOOT}\n")
+    old = marker.stat().st_mtime - sysmod._GRACE_MARKER_MAX_AGE_S - 5
+    os.utime(marker, (old, old))
+    assert sysmod.reboot_in_progress() is False
+
+
+def test_an_issued_marker_of_this_boot_reads_true_and_of_another_boot_false(tmp_path, monkeypatch):
+    """Written by the wrapper just before systemctl reboot; the lock ends with
+    the wrapper, the node is not down yet. A new boot has a new boot id, so the
+    marker expires by itself."""
+    state = _window(tmp_path, monkeypatch)
+    issued = state / "power-action-issued"
+    issued.write_text(f"reboot {BOOT}\n")
+    assert sysmod.reboot_in_progress() is True
+    assert sysmod.get_system_info().reboot_in_progress is True
+    (tmp_path / "boot_id").write_text("99999999-0000-0000-0000-000000000000\n")
+    assert sysmod.reboot_in_progress() is False
+
+
+def test_markers_without_a_boot_id_to_compare_read_false(tmp_path, monkeypatch):
+    state = _window(tmp_path, monkeypatch)
+    (state / "power-action-issued").write_text(f"reboot {BOOT}\n")
+    (state / "reboot-fleet-grace").write_text("garbage\n")
+    monkeypatch.setattr(sysmod, "_BOOT_ID", tmp_path / "absent")
+    assert sysmod.reboot_in_progress() is False

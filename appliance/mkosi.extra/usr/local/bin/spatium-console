@@ -3469,12 +3469,42 @@ def reboot_pending() -> bool:
     Surfacing either warns the on-console operator that the box is about
     to go offline — and that pressing F5 lets them ack it gracefully
     rather than have the machine vanish mid-keystroke. Plain
-    ``exists()`` checks (no subprocess)."""
+    ``exists()`` checks (no subprocess).
+
+    #3008 — the fleet runner renames its trigger BEFORE its 5 s grace, and
+    the wrapper's marker only exists once the grace is over, so the grace
+    itself is the runner's own marker (``fleet_reboot_in_grace``); without
+    it F9 answered "No reboot is currently pending" and the node rebooted."""
     return (
         (_RELEASE_STATE_DIR / "reboot-pending-fleet").exists()
         or (_RELEASE_STATE_DIR / "reboot-pending").exists()
+        or fleet_reboot_in_grace()
         or power_action_in_progress() is not None
     )
+
+
+#: #3008 — spatiumddi-reboot-agent writes "<pid> <boot_id>" here from taking
+#: the fleet trigger until it exits (its grace, then the wrapper's run).
+FLEET_GRACE_MARKER = _RELEASE_STATE_DIR / "reboot-fleet-grace"
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+
+
+def fleet_reboot_in_grace() -> bool:
+    """#3008 — True while the fleet reboot runner holds its grace marker. A
+    marker whose process is gone (a runner killed outright) or that was
+    written in another boot counts for nothing. Two small reads, no
+    subprocess."""
+    try:
+        pid, boot = FLEET_GRACE_MARKER.read_text().split()[:2]
+    except (OSError, ValueError):
+        return False
+    try:
+        current = BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        current = ""
+    if current and boot != current:
+        return False
+    return pid.isdigit() and os.path.exists(f"/proc/{pid}")
 
 
 #: #2974 — spatium-power-action writes "<pid> <action>" here while it runs
@@ -4444,9 +4474,12 @@ def render_kpi_slot(state: "DashboardState") -> Panel:
         border = "yellow"
     elif (power := power_action_in_progress()) is not None:
         # #2974 — the handoff of the PostgreSQL primary runs first (up to a
-        # few minutes on the primary's node); F9 still cancels it.
+        # few minutes on the primary's node); F9 still cancels it. #3008 — a
+        # one-node install has no primary to hand off, so it is named only on
+        # a multi-node cluster.
         what = "REBOOT" if power == "reboot" else "POWER-OFF"
-        rows.append(Text(f"{what} under way — handing off DB primary · F9 cancel",
+        handoff = " — handing off DB primary" if len(state.nodes) > 1 else ""
+        rows.append(Text(f"{what} under way{handoff} · F9 cancel",
                          style="bold bright_yellow"))
         border = "yellow"
     elif reboot_pending():
@@ -5093,8 +5126,14 @@ def _start_power_action(console: Console, state: "DashboardState | None", action
     except (OSError, subprocess.TimeoutExpired) as exc:
         ok, why = False, str(exc)
     if ok:
-        msg = (f"{label}: handing off the database primary first "
-               "(up to a few minutes) · F9 cancels")
+        # #3008 — the handoff runs only on a multi-node control plane (and
+        # there only on the node holding the primary); a one-node install
+        # has no primary to hand off.
+        if state is not None and len(state.nodes) > 1:
+            msg = (f"{label}: the database primary is handed off first if this "
+                   "node holds it (up to a few minutes) · F9 cancels")
+        else:
+            msg = f"{label} · F9 cancels"
     else:
         msg = f"{label} could not be started: {why.splitlines()[-1] if why else 'no output'}"
     if state is not None:
@@ -5120,7 +5159,8 @@ def do_cancel_reboot(console: Console) -> None:
     window before ``systemctl reboot`` — 10 s for the web-UI path
     (``spatiumddi-reboot.service``, which sleeps then renames the
     trigger, so ``reboot-pending`` stays visible for the whole window)
-    and 5 s for the fleet path (``spatiumddi-reboot-agent.service``).
+    and 5 s for the fleet path (``spatiumddi-reboot-agent.service``, which
+    renames its trigger first and holds ``reboot-fleet-grace`` instead, #3008).
     Cancelling = ``systemctl stop`` that service mid-grace (kills the
     sleep before the reboot ExecStart) + remove the trigger so the edge-
     triggered ``.path`` unit has nothing to re-fire on.
@@ -5157,7 +5197,11 @@ def do_cancel_reboot(console: Console) -> None:
     # (edge-triggered on PathChanged, not level-triggered) have nothing to
     # re-fire on. The services rename the trigger to .done as part of their
     # run; unlink the live form if the service was stopped before it did.
-    for name in ("reboot-pending", "reboot-pending-fleet"):
+    # #3008 — and the fleet runner's grace marker, which the runner removes
+    # itself when stopped; this covers one that was killed outright. The
+    # supervisor writes a fleet trigger at most once per boot (#1446), so a
+    # cancelled Fleet reboot is not fired again before the next boot.
+    for name in ("reboot-pending", "reboot-pending-fleet", "reboot-fleet-grace"):
         try:
             (_RELEASE_STATE_DIR / name).unlink()
         except FileNotFoundError:

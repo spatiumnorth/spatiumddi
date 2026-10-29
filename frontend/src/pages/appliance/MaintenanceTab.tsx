@@ -34,7 +34,13 @@ export function MaintenanceTab() {
   const info = useQuery({
     queryKey: ["appliance", "system", "info"],
     queryFn: applianceSystemApi.info,
-    refetchInterval: 15_000,
+    // #3008 — a reboot started from Fleet or the console can be seconds
+    // from request to the node going down; 15 s missed it entirely. The
+    // endpoint is a few file stats, and only this open tab polls this fast.
+    refetchInterval: (q) =>
+      q.state.data?.reboot_scheduled || q.state.data?.reboot_in_progress
+        ? 2_000
+        : 5_000,
   });
 
   const toggleMaint = useMutation({

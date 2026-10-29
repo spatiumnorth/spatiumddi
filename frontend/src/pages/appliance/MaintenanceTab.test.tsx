@@ -83,3 +83,47 @@ describe("MaintenanceTab reboot button (#3008)", () => {
     expect(await screen.findByText(/Reboot in flight on ddi2\./)).toBeTruthy();
   });
 });
+
+describe("MaintenanceTab polling (#3008, QA case 3)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("sees a Fleet or console reboot within 5 s and then polls every 2 s", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const info = vi.mocked(applianceSystemApi.info);
+    info.mockReset();
+    info.mockResolvedValue({
+      reboot_scheduled: false,
+      reboot_in_progress: false,
+    } as never);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MaintenanceTab />
+      </QueryClientProvider>,
+    );
+    const btn = await screen.findByRole("button", { name: /reboot now/i });
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+    const before = info.mock.calls.length;
+
+    // a reboot started elsewhere; the old 15 s interval missed it entirely
+    info.mockResolvedValue({
+      reboot_scheduled: false,
+      reboot_in_progress: true,
+    } as never);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(info.mock.calls.length).toBe(before + 1);
+    expect(
+      (
+        (await screen.findByRole("button", {
+          name: /already scheduled/i,
+        })) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(await screen.findByText(/Reboot in flight/)).toBeTruthy();
+
+    const during = info.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(info.mock.calls.length).toBe(during + 1);
+  });
+});

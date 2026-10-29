@@ -40,6 +40,15 @@
 # file there could be a symlink planted to make root create or truncate any
 # path on the host (GHSA-h2j9-qrg7-grfw's threat model). The directory is
 # the api's mount point; it cannot replace it.
+#
+# The lock ends when this script does, moments after systemctl was issued and
+# before the node is actually down. So just before systemctl the wrapper also
+# writes ISSUED, "<action> <boot_id>" (#3008), which the api reads as still
+# under way while the boot id is the host's current one: it expires by itself
+# with the reboot (a new boot has a new id) and needs no cleanup. A failed
+# systemctl removes it. It is written under a fresh name and renamed into
+# place (state_write), never through the name, for the same planted-symlink
+# reason as the lock.
 
 set -uo pipefail
 
@@ -47,6 +56,8 @@ HANDOFF="${SPATIUM_REBOOT_HANDOFF:-/usr/local/bin/spatium-reboot-handoff}"
 HANDOFF_CAP_S="${SPATIUM_POWER_ACTION_HANDOFF_CAP_S:-240}"
 MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
 LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state}"
+ISSUED="${SPATIUM_POWER_ACTION_ISSUED:-/var/lib/spatiumddi/release-state/power-action-issued}"
+BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -69,6 +80,18 @@ undo() {
 
 clear_marker() {
     rm -f "$MARKER" 2>/dev/null || true
+}
+
+# Root writes in release-state go under a fresh name and are renamed onto the
+# target (GHSA-h2j9-qrg7-grfw).
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
 }
 
 child=""
@@ -117,10 +140,18 @@ if [ -x "$HANDOFF" ]; then
     fi
 fi
 
+# Written while the lock is still held, so the api never sees a gap between
+# the two.
+boot_id="$(cat "$BOOT_ID_FILE" 2>/dev/null || true)"
+if [ -n "$boot_id" ]; then
+    printf '%s %s\n' "$ACTION" "$boot_id" | state_write "$ISSUED" 9>&- \
+        || log "could not write $ISSUED"
+fi
 issued=1
 log "issuing systemctl $ACTION"
 if ! systemctl "$ACTION" 9>&-; then
     log "systemctl $ACTION failed: the node stays up, so the handoff's cordon is undone"
+    rm -f -- "$ISSUED" 2>/dev/null || true
     undo
     clear_marker
     exit 1
