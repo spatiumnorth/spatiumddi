@@ -36,6 +36,7 @@ from app.core.agent_wake import (
 )
 from app.core.http_etag import etag_matches, format_etag
 from app.core.redis_client import make_async_redis
+from app.core.versions import is_installed_target
 from app.drivers.dns import get_driver as get_dns_driver
 from app.metrics import (
     AGENT_BUNDLE_INLINE_FAILURES,
@@ -1147,7 +1148,9 @@ async def agent_heartbeat(
         if (
             server.desired_appliance_version is not None
             and server.installed_appliance_version
-            and server.installed_appliance_version == server.desired_appliance_version
+            and is_installed_target(
+                server.installed_appliance_version, server.desired_appliance_version
+            )
             and (server.last_upgrade_state in ("done", None))
         ):
             server.desired_appliance_version = None
