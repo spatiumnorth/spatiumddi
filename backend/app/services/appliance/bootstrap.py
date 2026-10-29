@@ -332,7 +332,7 @@ async def _generate_activate_deploy(
         valid_to=info["valid_to"],
         notes=(
             "Auto-generated on first boot. Replace with an uploaded "
-            "cert, a CSR-signed cert, or a Let's Encrypt cert via the "
+            "cert, a CSR-signed cert, or a Let's Encrypt cert via "
             "Appliance → Fleet → Web UI Certificate."
         ),
     )

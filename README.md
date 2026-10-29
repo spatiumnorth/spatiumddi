@@ -983,8 +983,8 @@ Operators get a real Kubernetes node without managing one.
 #### Access
 
 Browse to `https://<appliance-ip>/`. Accept the self-signed
-cert warning (you'll replace it through **Appliance → Web UI
-Certificate** as soon as you're logged in). Sign in with
+cert warning (you'll replace it through **Appliance → Fleet →
+Web UI Certificate** as soon as you're logged in). Sign in with
 `admin / admin` — you'll be forced to set a real password on
 first login.
 
@@ -1297,7 +1297,10 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 
 Turn it on per group under **DNS → Server Groups → Options → Encrypted
 transports**, after linking a TLS certificate (upload one, or issue it
-from Let's Encrypt under **Appliance → Web UI Certificate**). Both
+from Let's Encrypt under **Appliance → Fleet → Web UI Certificate**;
+a Docker or Kubernetes control plane has no certificate page, so there
+it goes through `POST /api/v1/appliance/tls/upload` or
+`POST /api/v1/appliance/acme/issue`). Both
 listeners are additive — plain DNS on `:53` keeps working.
 
 The listener port lives in the database; what you change to make it

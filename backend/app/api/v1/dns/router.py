@@ -128,6 +128,7 @@ from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
 )
+from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns import dnssec_signers, technitium_api_scope
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
@@ -3620,7 +3621,8 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
             raise HTTPException(
                 422,
                 "A TLS certificate is required to enable DoT, DoH or DoQ. "
-                "Upload or issue one under Appliance → Fleet → Web UI Certificate first.",
+                "Upload or issue one through "
+                f"{certificate_store_location(settings.appliance_mode)} first.",
             )
         cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
         if cert is None:

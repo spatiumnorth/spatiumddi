@@ -54,8 +54,8 @@ etcd-snapshot-retention: 8
 
 # Disable bundled components we replace or don't need:
 #   * traefik    — operator-facing TLS still goes through our nginx
-#                  reverse proxy (existing Appliance → Web UI Cert
-#                  flow). No second ingress controller.
+#                  reverse proxy (existing Appliance → Fleet → Web UI
+#                  Certificate flow). No second ingress controller.
 #   * servicelb  — single-node, no LoadBalancer service IPs to hand
 #                  out; klipper-lb would just add a noisy DaemonSet.
 #   * metrics-server — defer until Phase 8; we don't surface metrics
