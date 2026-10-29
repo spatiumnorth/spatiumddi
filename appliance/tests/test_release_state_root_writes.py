@@ -526,8 +526,15 @@ def test_no_unit_renames_onto_a_release_state_name_without_t() -> None:
         if not u.is_file():
             continue
         for i, ln in enumerate(u.read_text(errors="replace").splitlines(), 1):
-            m = re.match(r"Exec\w*=[-@+!:]*(?:/usr)?/bin/mv\s+((?:-\S+\s+)*)", ln)
-            if m and "release-state" in ln and "T" not in m.group(1):
+            m = re.match(r"Exec\w*=[-@+!:]*(?:/usr)?/bin/mv(?=\s)", ln)
+            if not m or "release-state" not in ln:
+                continue
+            flags = []
+            for tok in ln[m.end() :].split():
+                if not tok.startswith("-"):
+                    break
+                flags.append(tok)
+            if not any("T" in f for f in flags):
                 bad.append(f"{u.name}:{i}: {ln}")
     assert not bad, "\n".join(bad)
 
