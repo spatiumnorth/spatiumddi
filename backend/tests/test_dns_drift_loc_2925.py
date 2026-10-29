@@ -31,12 +31,23 @@ def test_loc_unparseable_does_not_raise() -> None:
     assert _n("LOC", " Garbage ") == "garbage"
 
 
+# Hash data of the length its type declares: dnspython 2.9.1 refuses a TLSA
+# or SSHFP whose data does not fit the hash type (#3031), and an unparsed
+# value falls back to lower-cased text, which would not exercise the fold.
+_SHA256 = "abcdef01" * 8  # TLSA matching type 1: 32 bytes
+_SHA1 = "abcdef01" * 5  # SSHFP fingerprint type 1: 20 bytes
+
+
+def _spaced(data: str) -> str:
+    return " ".join(data[i : i + 4] for i in range(0, len(data), 4))
+
+
 @pytest.mark.parametrize(
     "rtype,a,b",
     [
         ("CAA", "0 issue letsencrypt.org", '0 issue "letsencrypt.org"'),
-        ("SSHFP", "1 1 ABCDEF12", "1 1 abcdef12"),
-        ("TLSA", "3 1 1 ABCD", "3 1 1 abcd"),
+        ("SSHFP", f"1 1 {_SHA1.upper()}", f"1 1 {_SHA1}"),
+        ("TLSA", f"3 1 1 {_SHA256.upper()}", f"3 1 1 {_SHA256}"),
     ],
 )
 def test_probe_other_free_form(rtype: str, a: str, b: str) -> None:
@@ -103,9 +114,9 @@ def test_caa_unparseable_keeps_case() -> None:
 @pytest.mark.parametrize(
     "rtype,typed,wire",
     [
-        ("TLSA", "3 1 1 ABCD EF01", "3 1 1 abcdef01"),
-        ("TLSA", "03  01 1 abcdef01", "3 1 1 abcdef01"),
-        ("SSHFP", "1 1 AB CD", "1 1 abcd"),
+        ("TLSA", f"3 1 1 {_spaced(_SHA256.upper())}", f"3 1 1 {_SHA256}"),
+        ("TLSA", f"03  01 1 {_SHA256}", f"3 1 1 {_SHA256}"),
+        ("SSHFP", f"1 1 {_spaced(_SHA1.upper())}", f"1 1 {_SHA1}"),
     ],
 )
 def test_hex_types_fold_spacing_and_padding(rtype: str, typed: str, wire: str) -> None:
