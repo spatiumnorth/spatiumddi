@@ -129,6 +129,9 @@ from app.services.ipam.zone_binding import (
     stored_zone_uuid,
 )
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
+from app.services.search.providers import IP_MAC_NORMALIZED_SQL
+from app.services.search.ranking import escape_like, like_pattern
+from app.services.search.schemas import shape_of
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
@@ -9210,6 +9213,52 @@ _ADDRESS_SORT_KEYS = {"address", "hostname", "status", "mac", "last_seen", "desc
 _SEARCH_IDS_CAP = 5000
 
 
+_MAC_GROUPED_RE = re.compile(r"[0-9a-f]{2}(?:([:-])[0-9a-f]{2})(?:\1[0-9a-f]{2}){0,4}")
+_MAC_CISCO_RE = re.compile(r"[0-9a-f]{4}(?:\.[0-9a-f]{4}){1,2}")
+
+
+def _mac_colon_form(q: str) -> str | None:
+    """The stored (colon) spelling of a MAC-shaped query, or None (#2991).
+
+    Only a query written the way a MAC is written counts: a full MAC in any
+    notation, or a partial one in whole octets with ``:`` / ``-`` (``aa-bb-cc``)
+    or Cisco 4-hex groups (``aabb.cc00``). Matching that colon form against
+    ``CAST(mac_address AS text)`` keeps the match octet-aligned. Bare hex and
+    digit-and-dot queries (``cafe``, ``123``, ``10.0.5``) are hostname or
+    address fragments, so they keep the plain substring match, where a colon
+    MAC can only hold them within one octet; normalising them instead would
+    match across octet boundaries and widen the set "Select all" hands to the
+    bulk actions.
+    """
+    s = q.strip().lower()
+    shape = shape_of(s)
+    if shape.is_ip or shape.is_cidr:
+        return None
+    if shape.is_mac:
+        hexs = shape.mac_normalized
+    elif _MAC_GROUPED_RE.fullmatch(s) or _MAC_CISCO_RE.fullmatch(s):
+        hexs = re.sub(r"[:\-.]", "", s)
+    else:
+        return None
+    return ":".join(hexs[i : i + 2] for i in range(0, len(hexs), 2))
+
+
+def _mac_like_condition(value: str) -> Any:
+    """Wildcard-safe MAC substring match for the ``mac`` filter (#2991).
+
+    Octet-aligned when the value is written as a MAC; otherwise (bare hex
+    such as an OUI ``aabbcc``) separator-insensitive, since the field says
+    the operator means a MAC.
+    """
+    colon = _mac_colon_form(value)
+    if colon:
+        return sa_cast(IPAddress.mac_address, String).ilike(like_pattern(colon), escape="\\")
+    norm = shape_of(value.strip()).mac_normalized
+    return text(f"{IP_MAC_NORMALIZED_SQL} ILIKE :mac_norm").bindparams(
+        mac_norm=f"%{escape_like(norm)}%"
+    )
+
+
 def _address_search_conditions(
     *,
     q: str | None,
@@ -9228,20 +9277,25 @@ def _address_search_conditions(
     if status_filter:
         conds.append(IPAddress.status == status_filter)
     if hostname:
-        conds.append(IPAddress.hostname.ilike(f"%{hostname}%"))
+        conds.append(IPAddress.hostname.ilike(like_pattern(hostname), escape="\\"))
     if mac:
-        conds.append(sa_cast(IPAddress.mac_address, String).ilike(f"%{mac}%"))
+        conds.append(_mac_like_condition(mac))
     if q:
-        pat = f"%{q}%"
-        conds.append(
-            or_(
-                func.host(IPAddress.address).ilike(pat),
-                IPAddress.hostname.ilike(pat),
-                IPAddress.fqdn.ilike(pat),
-                IPAddress.description.ilike(pat),
-                sa_cast(IPAddress.mac_address, String).ilike(pat),
+        pat = like_pattern(q)
+        alternatives = [
+            func.host(IPAddress.address).ilike(pat, escape="\\"),
+            IPAddress.hostname.ilike(pat, escape="\\"),
+            IPAddress.fqdn.ilike(pat, escape="\\"),
+            IPAddress.description.ilike(pat, escape="\\"),
+        ]
+        # A MAC in any notation, octet-aligned (#2991); see _mac_colon_form.
+        mac_q = _mac_colon_form(q)
+        alternatives.append(
+            sa_cast(IPAddress.mac_address, String).ilike(
+                like_pattern(mac_q) if mac_q else pat, escape="\\"
             )
         )
+        conds.append(or_(*alternatives))
     return conds
 
 
