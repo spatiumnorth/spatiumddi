@@ -352,7 +352,18 @@ function OverviewInfo({ server }: { server: DNSServer }) {
         label="Last health check"
         value={fmtRelative(server.last_health_check_at)}
       />
-      <InfoCard label={sync.label} value={fmtRelative(sync.at)} />
+      {/* #3046 — nothing records a sync for an agentless DNS server
+          (Windows, cloud, technitium_api): no code writes its last_sync_at
+          and it has no agent apply report. Say so, rather than show the
+          placeholder that reads as "never synced". */}
+      <InfoCard
+        label={sync.label}
+        value={
+          !sync.at && server.is_agentless
+            ? "Not recorded for agentless servers"
+            : fmtRelative(sync.at)
+        }
+      />
       <InfoCard
         label="Config ETag (last acked)"
         value={server.last_config_etag ?? "—"}
