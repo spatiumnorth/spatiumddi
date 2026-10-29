@@ -2894,11 +2894,15 @@ function ServerDetailView({
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
     },
     onError: (e) => {
-      const status = (e as { response?: { status?: number } })?.response
-        ?.status;
-      if (status === 409) {
+      const response = (e as { response?: { status?: number } })?.response;
+      if (response?.status === 409) {
+        // The response alone, so a 409 without a detail still names the
+        // conflict instead of axios's "Request failed with status code 409".
         setAdoptConflict(
-          formatApiError(e, "A DHCP server already exists on the interface."),
+          formatApiError(
+            { response },
+            "A DHCP server already exists on the interface.",
+          ),
         );
       } else {
         setSyncBanner(formatApiError(e, "Force sync failed"));

@@ -957,7 +957,14 @@ export function FleetTab({
         response?: { status?: number; data?: { detail?: string } };
       };
       if (e?.response?.status === 403) {
-        setDeletePwError(formatApiError(e, "Current password incorrect."));
+        // The response alone, so a 403 without a detail still says why
+        // instead of axios's "Request failed with status code 403".
+        setDeletePwError(
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
+        );
       } else {
         setDeletePwError("Delete failed. Try again.");
       }
@@ -1005,7 +1012,10 @@ export function FleetTab({
       };
       if (e?.response?.status === 403) {
         setPermanentDeletePwError(
-          formatApiError(e, "Current password incorrect."),
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setPermanentDeletePwError("Permanent delete failed. Try again.");
