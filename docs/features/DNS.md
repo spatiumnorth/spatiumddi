@@ -512,7 +512,7 @@ DNSTrustAnchor
 - **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). `yes` with no anchor validates nothing in BIND 9.20, so the options response carries a `dnssec_warnings` entry (advisory, never a 422); `auto` uses the built-in root anchor
 - **PowerDNS / Technitium / agentless drivers:** have no equivalent, so adding a trust anchor to a group with such a server is a 422. Values are validated (zone name, algorithm 1-255, key tag, base64 key) because they land verbatim in `named.conf`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
-- UI shows DNSSEC chain validation status for each zone
+- The UI has no per-zone chain validation status: the group's DNSSEC validation option sits on the server options, and a zone's signing state shows on its DNSSEC card
 
 > **Validation vs. signing.** The setting above controls whether the
 > server *validates* answers as a resolver. *Signing* your own zones is a
@@ -657,7 +657,7 @@ blackhole:         ["198.51.100.0/24"]            -- silently drop known bad act
 
 - **BIND9:** ACLs are emitted as `acl "<name>" { ... };` blocks at the top of `named.conf`, before `options {}` and `view {}` blocks
 - ACLs are managed at the **server group** level; views and zones within that group reference them by name
-- UI: ACL editor under DNS Server Group settings — list of named ACLs, each with an ordered entry list; drag-to-reorder entries; inline negation toggle
+- UI: the **ACLs** tab of the DNS server group lists the named ACLs; **New ACL** creates one from a name and a textarea of entries (one per line, `!` prefix for negation), and an ACL can be deleted. There is no in-place edit, drag-to-reorder or negation toggle in the console yet; editing an existing ACL is API-only (`PUT /dns/groups/{group_id}/acls/{acl_id}`)
 
 ### 3.8 Rate limiting (RRL) + amplification defenses (issue #146)
 
@@ -771,7 +771,7 @@ Every subnet can be assigned:
 - A **forward DNS zone** (for auto-creating A/AAAA records)
 - A **reverse DNS zone** (for auto-creating PTR records)
 
-When a subnet is created or edited, the UI prompts: *"Auto-create reverse zone for 10.1.2.0/24?"* — which generates `2.1.10.in-addr.arpa.` on the designated server group.
+There is no prompt. Once the subnet has an effective DNS server group, creating it also creates the matching reverse zone(s) on that group (`2.1.10.in-addr.arpa.` for `10.1.2.0/24`) unless the create request sets `skip_reverse_zone` (API-only; the console has no control for it). A subnet created without one picks its zones up from the reverse-zone backfill.
 
 A subnet gets one reverse zone per `/24` it spans (#1840), never one enclosing zone: a `/16` zone for a `10.1.2.0/23` would make SpatiumDDI authoritative for addresses outside the subnet and shadow reverse DNS someone else serves. A `/24` or longer gets its own `/24` (`2.1.10.in-addr.arpa.`; a `/25` shares its `/24`'s zone with its neighbours), a `/23` gets two, a `/20` sixteen and a `/17` 128. The bound for wide subnets is the `/16`: a `/9`–`/16` gets one zone per `/16` it contains (a `/16` its one `/16` zone, a `/12` sixteen), and a `/8` or wider one per `/8`, because per-`/24` would mean up to 32,768 zones and each `/16` lies wholly inside the subnet anyway. IPv6 uses one zone per nibble-aligned piece: a `/48`, `/56` and `/64` get one zone each, and a `/55` gets its two `/56` zones. The zones of a subnet are a set: delete retires every zone of it (a zone another subnet still lives in is re-linked to that subnet instead), a resize grow adds the zones for the new range, and the reverse-zone backfill creates the missing ones. Which zone takes an address's PTR is decided per address, as the most specific reverse zone in the subnet's group that covers it, so an install's earlier first-`/24` zone for a `/23` keeps serving its addresses and the second `/24`'s zone is added on the next allocation or backfill.
 
@@ -932,10 +932,10 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 ### Enabling DDNS (quick walkthrough)
 
 1. **Pick a subnet** with a DNS forward + reverse zone already assigned.
-2. Open the subnet editor → **Dynamic DNS (from DHCP)** section → toggle **Enabled**, pick a policy, optionally set a domain override or TTL. Save.
+2. Open the subnet editor → **DDNS** tab (shown when the subnet has both DHCP and DNS) → **Dynamic DNS (from DHCP)** section → toggle **Enabled**, pick a policy, optionally set a domain override or TTL. Save.
 3. Make sure the subnet's DNS group has at least one healthy server (BIND9 via agent, or Windows DNS — Path A or B).
-4. Ensure **Settings → DHCP Lease Sync** is enabled (the agentless poll loop — currently the only lease source that fires DDNS).
-5. Issue a lease on the Windows DHCP scope covering the subnet. Wait for the next poll (default 5 min) or hit **Sync Leases** on the server detail page.
+4. For a Windows DHCP (agentless) server, ensure **Settings → DHCP Lease Sync** is enabled; its poll loop fires DDNS. Kea agent servers need nothing here: their lease events fire DDNS as they arrive.
+5. Issue a lease on a scope covering the subnet. On Windows DHCP, wait for the next poll (default 5 min) or hit **Sync Leases** on the server detail page; on Kea the DNS records follow the lease event.
 6. The IPAM subnet page shows the IP with its hostname; the DNS zone shows the matching A + PTR.
 
 ### Not-yet (planned follow-ups)
