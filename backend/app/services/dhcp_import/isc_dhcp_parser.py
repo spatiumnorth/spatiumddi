@@ -268,15 +268,30 @@ def _parse_ranges(body: list[_Stmt]) -> tuple[list[ImportedPool], list[str]]:
 
 def _range_to_pool(st: _Stmt, *, class_restriction: str | None = None) -> ImportedPool | None:
     # range [dynamic-bootp|dynamic|static] <start> [<end>];
+    # range6 <start> <end>; | range6 <prefix/len> [temporary];
     ips = [
         p.value
         for p in st.parts[1:]
-        if p.kind == "word" and p.value.lower() not in ("dynamic-bootp", "dynamic", "static")
+        if p.kind == "word"
+        and p.value.lower() not in ("dynamic-bootp", "dynamic", "static", "temporary")
     ]
     if not ips:
         return None
     start_ip = ips[0]
     end_ip = ips[1] if len(ips) > 1 else ips[0]
+    if len(ips) == 1 and "/" in start_ip:
+        try:
+            net = ipaddress.ip_network(start_ip, strict=False)
+        except ValueError:
+            pass  # left as is; the subnet check names it in a warning
+        else:
+            start_ip, end_ip = str(net[0]), str(net[-1])
+    # dhcpd takes a range written high-to-low as the same range (#3037).
+    try:
+        if ipaddress.ip_address(start_ip) > ipaddress.ip_address(end_ip):
+            start_ip, end_ip = end_ip, start_ip
+    except (ValueError, TypeError):
+        pass  # not addresses, or mixed families; the subnet check names it
     return ImportedPool(
         start_ip=start_ip, end_ip=end_ip, pool_type="dynamic", class_restriction=class_restriction
     )

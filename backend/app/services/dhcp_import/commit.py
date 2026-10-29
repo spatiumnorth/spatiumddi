@@ -30,7 +30,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import validate_optional_hostname
@@ -56,6 +56,7 @@ from .canonical import (
     ImportPreview,
     ImportSource,
     ScopeConflict,
+    pool_problem,
 )
 
 logger = structlog.get_logger(__name__)
@@ -144,14 +145,40 @@ def drop_unservable_hostnames(scopes: list[ImportedScope]) -> list[str]:
     return warnings
 
 
+def drop_invalid_pools(scopes: list[ImportedScope]) -> list[str]:
+    """Remove every pool that is not a range of its scope's subnet (#3037).
+
+    The parsers already drop these with a parse warning; this runs again on
+    the commit, which takes the plan the client sends back rather than the
+    parser's, and on a source whose parser does not check (Windows). The
+    scope is still imported, as with every other per-item drop here, and
+    each dropped pool is named in the returned warnings.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        kept = []
+        for pool in scope.pools:
+            problem = pool_problem(pool.start_ip, pool.end_ip, scope.subnet_cidr)
+            if problem is None:
+                kept.append(pool)
+            else:
+                warnings.append(
+                    f"{scope.subnet_cidr}: pool {pool.start_ip!r} - {pool.end_ip!r} "
+                    f"not imported: {problem}"
+                )
+        scope.pools = kept
+    return warnings
+
+
 def _canonical_cidr(raw: str) -> str:
     return str(ipaddress.ip_network(raw, strict=False))
 
 
 def _scope_error(exc: Exception) -> str:
-    """Operator-facing reason a scope failed. A database error's own text
-    carries the SQL statement and bound values, so it never goes out."""
-    if isinstance(exc, DBAPIError):
+    """Operator-facing reason a scope failed. A statement error's own text
+    (a driver error, or a bind value SQLAlchemy could not process) carries
+    the SQL statement and bound values, so it never goes out."""
+    if isinstance(exc, StatementError):
         logger.warning("dhcp_import_scope_db_error", error=str(exc.orig))
         return (
             "the database refused this scope's data (a value is not valid for its "
@@ -601,6 +628,7 @@ async def commit_import(
     results: list[CommitScopeResult] = []
     warnings = list(preview.warnings)
     warnings.extend(drop_unservable_hostnames(preview.scopes))
+    warnings.extend(drop_invalid_pools(preview.scopes))
 
     # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
     # importer keeps an unmapped option as ``opt-NN``), whatever the target

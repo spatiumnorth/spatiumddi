@@ -681,7 +681,9 @@ async def test_kea_commit_bad_pool_error_has_no_sql_3037(
     await db_session.commit()
 
     plan = (await _kea_preview(client, token, str(group.id))).json()
-    plan["scopes"][0]["pools"][0]["start_ip"] = "192.0.2.10-192.0.2.100"
+    # A value the column refuses at the database (the MACADDR cast), so the
+    # failure is the driver's own error, which carries the SQL.
+    plan["scopes"][0]["reservations"][0]["mac_address"] = "not-a-mac"
     resp = await client.post(
         "/api/v1/dhcp/import/kea/commit",
         headers={"Authorization": f"Bearer {token}"},
@@ -698,3 +700,71 @@ async def test_kea_commit_bad_pool_error_has_no_sql_3037(
     assert scope["action_taken"] == "failed"
     assert "SQL" not in scope["error"] and "INSERT" not in scope["error"]
     assert "asyncpg" not in scope["error"]
+
+
+@pytest.mark.parametrize("pool", ["10.0.0.1-10.0.0.2-10.0.0.3", "", "   "])
+def test_kea_pool_kea_rejects_is_a_preview_warning_3037(pool: str) -> None:
+    sc = _kea_pools("10.0.0.0/24", pool)
+    assert sc.pools == []
+    assert len(sc.parse_warnings) == 1
+
+
+def test_isc_range_written_high_to_low_is_kept_3037() -> None:
+    """dhcpd reads ``range high low`` as the same range, so the import must
+    not drop it as invalid."""
+    p = parse_isc_config(
+        b"subnet 10.0.0.0 netmask 255.255.255.0 {\n  range 10.0.0.50 10.0.0.10;\n}\n"
+    )
+    sc = p.scopes[0]
+    assert [(x.start_ip, x.end_ip) for x in sc.pools] == [("10.0.0.10", "10.0.0.50")]
+    assert sc.parse_warnings == []
+
+
+def test_isc_range6_prefix_and_temporary_3037() -> None:
+    p = parse_isc_config(
+        b"subnet6 2001:db8::/64 {\n  range6 2001:db8::/120 temporary;\n"
+        b"  range6 2001:db8::1:0 2001:db8::1:ff;\n}\n"
+    )
+    sc = p.scopes[0]
+    assert [(x.start_ip, x.end_ip) for x in sc.pools] == [
+        ("2001:db8::", "2001:db8::ff"),
+        ("2001:db8::1:0", "2001:db8::1:ff"),
+    ]
+    assert sc.parse_warnings == []
+
+
+@pytest.mark.asyncio
+async def test_kea_commit_rechecks_pools_in_the_plan_3037(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The commit takes the plan the client sends back, so a pool the parser
+    would have refused (here, valid addresses outside the subnet, which an
+    INET column accepts) is dropped and named there too, not stored."""
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "192.0.2.0/24")
+    await db_session.commit()
+
+    plan = (await _kea_preview(client, token, str(group.id))).json()
+    plan["scopes"][0]["pools"].append(
+        {**plan["scopes"][0]["pools"][0], "start_ip": "10.1.1.1", "end_ip": "10.1.1.9"}
+    )
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": plan,
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scopes"][0]["action_taken"] == "created"
+    assert body["scopes"][0]["pools_created"] == 1
+    assert any("10.1.1.1" in w for w in body["warnings"]), body["warnings"]
+    starts = (await db_session.execute(select(DHCPPool.start_ip))).scalars().all()
+    assert [str(x) for x in starts] == ["192.0.2.10"]
