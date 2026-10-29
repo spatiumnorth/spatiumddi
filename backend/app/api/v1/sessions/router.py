@@ -19,6 +19,11 @@ One write:
 * ``DELETE /sessions/{id}`` — revokes the session. The owner can
   always revoke their own session; only a superadmin can revoke
   someone else's.
+  A row a refresh has rotated since the list was fetched is followed to
+  its live successor, which is what is revoked (#2941).
+
+``is_current`` marks the row the caller's own access token stands for,
+resolved through the refresh-rotation grace (#2941).
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +41,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
 from app.core.session_idle import get_session_timeout_minutes, idle_cutoff
+from app.core.session_rotation import (
+    request_session_jti,
+    resolve_live_session_id,
+    revoke_session_chain,
+)
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 
@@ -94,6 +104,14 @@ async def _exclude_idle(stmt: Select[Any], db: AsyncSession, now: datetime) -> S
     return stmt.where(func.coalesce(UserSession.last_seen_at, UserSession.created_at) > cutoff)
 
 
+async def _caller_session_id(request: Request, db: AsyncSession, now: datetime) -> str | None:
+    """The session the caller's access token stands for, resolved through
+    the rotation grace (#2941): a tab whose token names a session another
+    tab rotated a moment ago is the successor's session, which is the row
+    the list shows live."""
+    return await resolve_live_session_id(db, request_session_jti(request), now)
+
+
 def _is_superadmin(user: User) -> bool:
     return bool(user.is_superadmin) or user_has_permission(user, "*", "*")
 
@@ -101,6 +119,7 @@ def _is_superadmin(user: User) -> bool:
 @router.get("/me", response_model=list[SessionRow])
 async def list_my_sessions(
     current_user: CurrentUser,
+    request: Request,
     db: DB,
     include_expired: bool = Query(default=False),
 ) -> list[SessionRow]:
@@ -114,12 +133,13 @@ async def list_my_sessions(
         stmt = await _exclude_idle(stmt, db, now)
     stmt = stmt.order_by(UserSession.created_at.desc())
     rows = (await db.execute(stmt)).scalars().all()
+    current_jti = await _caller_session_id(request, db, now)
     return [
         _row(
             s,
             username=current_user.username,
             display_name=current_user.display_name,
-            current_jti=None,  # /me doesn't carry the live jti — UI flags via comparison
+            current_jti=current_jti,
         )
         for s in rows
     ]
@@ -128,6 +148,7 @@ async def list_my_sessions(
 @router.get("", response_model=list[SessionRow])
 async def list_all_sessions(
     current_user: CurrentUser,
+    request: Request,
     db: DB,
     include_expired: bool = Query(default=False),
 ) -> list[SessionRow]:
@@ -144,12 +165,13 @@ async def list_all_sessions(
         stmt = await _exclude_idle(stmt, db, now)
     stmt = stmt.order_by(UserSession.created_at.desc())
     rows = (await db.execute(stmt)).all()
+    current_jti = await _caller_session_id(request, db, now)
     return [
         _row(
             session,
             username=user.username,
             display_name=user.display_name,
-            current_jti=None,
+            current_jti=current_jti,
         )
         for session, user in rows
     ]
@@ -175,9 +197,13 @@ async def revoke_session(
             detail="Cannot revoke another user's session without superadmin",
         )
 
-    if session.revoked:
+    # Follows a rotation to the live end of the chain (#2941): the row an
+    # operator picked from the list may have been rotated since, and
+    # revoking only it would leave its successor live, along with the
+    # rotated cookie's grace into it. None when nothing live is left.
+    revoked = await revoke_session_chain(db, session.id)
+    if revoked is None:
         return  # idempotent
-    session.revoked = True
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -191,6 +217,7 @@ async def revoke_session(
             new_value={
                 "target_user_id": str(session.user_id),
                 "is_self": is_self,
+                "revoked_session_id": str(revoked.id),
             },
         )
     )
@@ -198,6 +225,7 @@ async def revoke_session(
     logger.info(
         "session_revoked",
         session_id=str(session.id),
+        revoked_session_id=str(revoked.id),
         target_user_id=str(session.user_id),
         actor=current_user.username,
         is_self=is_self,

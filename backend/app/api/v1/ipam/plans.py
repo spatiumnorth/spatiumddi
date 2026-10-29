@@ -29,6 +29,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
+from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
 
 _V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
 _V6_MULTICAST = ipaddress.ip_network("ff00::/8")
@@ -139,7 +140,9 @@ class SubnetPlanUpdate(BaseModel):
 class ValidationConflict(BaseModel):
     node_id: str
     network: str
-    kind: str  # "overlap_existing" | "out_of_parent" | "sibling_overlap" | "duplicate_id" | "missing_block"
+    # "overlap_existing" | "out_of_parent" | "sibling_overlap" | "duplicate_id"
+    # | "missing_block" | "invalid_kind" | "invalid_binding"
+    kind: str
     message: str
 
 
@@ -205,6 +208,9 @@ def _to_read(plan: SubnetPlan) -> SubnetPlanRead:
 
 # ── Validation ────────────────────────────────────────────────────────────
 
+# The node fields that name another resource by id.
+_PLAN_ID_FIELDS = ("dns_group_id", "dns_zone_id", "dhcp_server_group_id", "vlan_ref_id")
+
 
 async def _validate_tree(
     db: AsyncSession, space_id: uuid.UUID, tree: PlanNode
@@ -250,6 +256,29 @@ async def _validate_tree(
                     ),
                 )
             )
+
+    # 1c. Resource bindings are ids: apply writes ``dns_zone_id`` /
+    #     ``dns_group_id`` onto the new rows as given and parses the other two
+    #     with ``uuid.UUID``, so a value that is not a UUID either landed on a
+    #     block / subnet as a binding to nothing or raised a 500 (#2923).
+    #     Reported here, like a bad ``existing_block_id``, so a plan already
+    #     saved with one is refused with a reason instead of crashing apply.
+    for n in _walk(tree):
+        for field in _PLAN_ID_FIELDS:
+            raw = getattr(n, field)
+            if not raw:
+                continue
+            try:
+                uuid.UUID(str(raw))
+            except ValueError:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"{field} is not a valid UUID: {raw}",
+                    )
+                )
 
     # 2. If the root references an existing block, the block must exist
     #    AND its CIDR must equal the root's CIDR (the operator can't
@@ -694,7 +723,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 name=node.name or "",
                 description=node.description or "",
                 dns_group_ids=dns_group_ids,
-                dns_zone_id=node.dns_zone_id,
+                dns_zone_id=node.dns_zone_id or None,
                 dns_inherit_settings=not dns_explicit,
                 dhcp_server_group_id=(
                     uuid.UUID(node.dhcp_server_group_id) if node.dhcp_server_group_id else None
@@ -746,7 +775,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 utilization_percent=0.0,
                 kind=node_kind,
                 dns_group_ids=[node.dns_group_id] if node.dns_group_id else None,
-                dns_zone_id=node.dns_zone_id,
+                dns_zone_id=node.dns_zone_id or None,
                 dns_inherit_settings=not dns_explicit,
                 dhcp_server_group_id=(
                     uuid.UUID(node.dhcp_server_group_id) if node.dhcp_server_group_id else None
@@ -760,39 +789,15 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             created_subnets.append(str(subnet.id))
             # Placeholder network/broadcast/gateway rows, mirroring create_subnet
             # (#505). Multicast leaves and v4 /31+/32 / v6 /127+/128 get none.
-            is_v6 = isinstance(node_net, ipaddress.IPv6Network)
             gw_row: IPAddress | None = None
-            if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
-                db.add(
-                    IPAddress(
-                        subnet_id=subnet.id,
-                        address=str(node_net.network_address),
-                        status="network",
-                        description="Network address",
-                        created_by_user_id=current_user.id,
-                    )
-                )
-                if not is_v6:
-                    db.add(
-                        IPAddress(
-                            subnet_id=subnet.id,
-                            address=str(node_net.broadcast_address),
-                            status="broadcast",
-                            description="Broadcast address",
-                            created_by_user_id=current_user.id,
-                        )
-                    )
-                gw_addr = gateway or str(node_net.network_address + 1)
-                gw_row = IPAddress(
-                    subnet_id=subnet.id,
-                    address=gw_addr,
-                    status="reserved",
-                    description="Gateway",
-                    hostname="gateway",
+            if has_boundary_rows(node_net, node_kind):
+                _, gw_row = await create_placeholder_rows(
+                    db,
+                    subnet,
+                    node_net,
+                    gateway=gateway,
                     created_by_user_id=current_user.id,
                 )
-                db.add(gw_row)
-                subnet.gateway = gw_addr
                 await db.flush()
             # spatiumddi#1150 — the two DNS steps create_subnet runs, so a
             # planned subnet is in sync with DNS from apply rather than from
@@ -808,17 +813,24 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
     await materialise(tree, None, is_root=True)
 
     # Every created subnet holds placeholder rows and every created block
-    # rolls them up; the counters were seeded at 0 (#2412). Deepest first.
+    # rolls them up; the counters were seeded at 0 (#2412). A plan anchored to
+    # an existing block that creates no block of its own still changes that
+    # block's subnets, so the blocks the created subnets sit in are recounted
+    # too, chains included (#2981). Each block on the chains is counted once.
     from app.api.v1.ipam.router import (  # noqa: PLC0415
-        _update_block_utilization,
-        _update_utilization,
+        _update_blocks_utilization,
+        _update_subnets_utilization,
     )
 
-    for sid in created_subnets:
-        await _update_utilization(db, uuid.UUID(sid))
+    subnet_ids = [uuid.UUID(sid) for sid in created_subnets]
+    await _update_subnets_utilization(db, subnet_ids)
     await db.flush()
-    for bid in reversed(created_blocks):
-        await _update_block_utilization(db, uuid.UUID(bid))
+    parent_ids = (
+        (await db.execute(select(Subnet.block_id).where(Subnet.id.in_(subnet_ids)))).scalars().all()
+        if subnet_ids
+        else []
+    )
+    await _update_blocks_utilization(db, [*(uuid.UUID(b) for b in created_blocks), *parent_ids])
 
     plan.applied_at = datetime.now(UTC)
     plan.applied_resource_ids = {

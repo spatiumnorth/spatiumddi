@@ -59,7 +59,11 @@ spec:
 
   postgresql:
     parameters:
-      max_connections: "200"
+      # #2955 — 371 = api HPA max 10 x (30 pool + 2 hooks + 1 probe) + worker
+      # 2 x (4 x 3 + 1) + beat 3 + 2 WAL senders + 10 reserve. Re-derive it
+      # when k8s/base's HPA, pool or worker concurrency change; the formula is
+      # in k8s/README.md "Postgres connection budget".
+      max_connections: "371"
       shared_buffers: "256MB"
       work_mem: "16MB"
       # #2132 — WAL kept for a former primary to pg_rewind and rejoin after

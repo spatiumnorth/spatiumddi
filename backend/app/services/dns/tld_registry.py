@@ -180,7 +180,7 @@ def _version_sort_key(version: str) -> tuple[int, int | str]:
     crash on an unexpected shape, and never let an unparseable snapshot
     version silently outrank a numeric bundled one."""
     v = version.strip()
-    if v.isdigit():
+    if v.isascii() and v.isdigit():
         return (1, int(v))
     return (0, v)
 

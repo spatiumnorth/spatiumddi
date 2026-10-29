@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import {
@@ -7905,7 +7905,7 @@ export function DnsSyncModal({
   );
 }
 
-function OrphansModal({
+export function OrphansModal({
   subnetId,
   subnetLabel,
   onClose,
@@ -7916,6 +7916,7 @@ function OrphansModal({
 }) {
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [purgeError, setPurgeError] = useState<string | null>(null);
   const { data: addrs, isLoading } = useQuery({
     queryKey: ["addresses", subnetId],
     queryFn: () => ipamApi.listAddresses(subnetId),
@@ -7924,6 +7925,8 @@ function OrphansModal({
 
   const mut = useMutation({
     mutationFn: () => ipamApi.purgeOrphans(subnetId, Array.from(selected)),
+    // A refused purge (404 subnet in Trash, 403, 502) says why, not nothing (#2992).
+    onError: (err) => setPurgeError(formatApiError(err, "Purge failed")),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -8002,7 +8005,15 @@ function OrphansModal({
             </div>
           </div>
         )}
-        <div className="flex justify-end gap-2 pt-2">
+        {purgeError && (
+          <p
+            role="alert"
+            className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            {purgeError}
+          </p>
+        )}
+        <div className="flex flex-wrap justify-end gap-2 pt-2">
           {orphans.length === 0 ? (
             <button
               onClick={onClose}
@@ -8020,7 +8031,10 @@ function OrphansModal({
               </button>
               <button
                 disabled={selected.size === 0 || mut.isPending}
-                onClick={() => mut.mutate()}
+                onClick={() => {
+                  setPurgeError(null);
+                  mut.mutate();
+                }}
                 className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-40"
               >
                 {mut.isPending ? "Purging…" : `Purge ${selected.size}`}
@@ -11380,7 +11394,12 @@ function BulkDeleteAddressesModal({
 
 // ─── Subnet Row in tree ───────────────────────────────────────────────────────
 
-function SubnetRow({
+/** Tree-row chips give way before the CIDR does: capped, ellipsised, and
+ *  `block` because `truncate` does nothing on an `inline-flex` box. The full
+ *  text is the chip's own `title`. */
+export const TREE_CHIP_CLS = "block min-w-0 max-w-[6rem] shrink truncate";
+
+export function SubnetRow({
   subnet,
   isSelected,
   onSelect,
@@ -11425,17 +11444,30 @@ function SubnetRow({
             ·
           </div>
           <Network className="h-3.5 w-3.5 flex-shrink-0" />
-          <div className="flex min-w-0 flex-1 flex-col">
-            <span className="truncate font-mono text-xs">{subnet.network}</span>
-            {subnet.name && (
-              <span className="truncate text-xs text-muted-foreground/60">
-                {subnet.name}
-              </span>
-            )}
-          </div>
-          <CustomerChip customerId={subnet.customer_id} />
-          <SiteChip siteId={subnet.site_id} />
-          <BgpAdvertisedChip spaceId={subnet.space_id} subnetId={subnet.id} />
+          {/* One flex row. The CIDR is a direct, non-shrinking child of the
+              row, so `shrink-0` acts on its width (#2822 does the same for
+              the block row); inside a flex column it acted on the height
+              and the column still collapsed to 0 px (#3005, #2993). The
+              name and the chips are what give way. */}
+          <span className="shrink-0 whitespace-nowrap font-mono text-xs">
+            {subnet.network}
+          </span>
+          <span
+            className="min-w-0 flex-1 truncate text-xs text-muted-foreground/60"
+            title={subnet.name || undefined}
+          >
+            {subnet.name}
+          </span>
+          <CustomerChip
+            customerId={subnet.customer_id}
+            className={TREE_CHIP_CLS}
+          />
+          <SiteChip siteId={subnet.site_id} className={TREE_CHIP_CLS} />
+          <BgpAdvertisedChip
+            spaceId={subnet.space_id}
+            subnetId={subnet.id}
+            className={TREE_CHIP_CLS}
+          />
           <UtilizationDot
             percent={subnet.utilization_percent}
             uncountable={isUncountable(subnet.total_ips)}
@@ -15770,6 +15802,7 @@ export function SpaceSection({
   onSelectSubnet,
   onSelectBlock,
   filter = "",
+  onHiddenChange,
 }: {
   space: IPSpace;
   selectedSubnetId: string | null;
@@ -15782,6 +15815,9 @@ export function SpaceSection({
   // When set, non-matching nodes are hidden, ancestors of matches are kept
   // so the path renders, and the whole space auto-expands.
   filter?: string;
+  // Told whether the quick-filter hides this whole space (read, and nothing
+  // in it matches), so the tree can say nothing matched (#2994).
+  onHiddenChange?: (spaceId: string, hidden: boolean) => void;
 }) {
   const [expanded, setExpanded] = useSessionState<boolean>(
     `spatium.ipam.expandedSpace.${space.id}`,
@@ -15888,6 +15924,19 @@ export function SpaceSection({
       matchCount: keptBlocks.length + keptSubnets.length,
     };
   }, [blocks, subnets, filtering, filterQ, spaceMatches]);
+
+  // Hidden only once both reads answered: an unread space is unknown, and
+  // reporting it hidden would flash "no match" while the tree loads (#2994).
+  const hiddenByFilter =
+    filtering &&
+    !spaceMatches &&
+    matchCount === 0 &&
+    subnets !== undefined &&
+    blocks !== undefined;
+  useEffect(() => {
+    onHiddenChange?.(space.id, hiddenByFilter);
+    return () => onHiddenChange?.(space.id, false);
+  }, [onHiddenChange, space.id, hiddenByFilter]);
 
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
@@ -16731,6 +16780,14 @@ export function IPAMPage() {
   const [showIpSearch, setShowIpSearch] = useState(false);
   // Tree quick-filter (network / name substring across every space).
   const [treeFilter, setTreeFilter] = useState("");
+  const [hiddenSpaces, setHiddenSpaces] = useState<Record<string, boolean>>({});
+  const onSpaceHiddenChange = useCallback(
+    (id: string, hidden: boolean) =>
+      setHiddenSpaces((prev) =>
+        !!prev[id] === hidden ? prev : { ...prev, [id]: hidden },
+      ),
+    [],
+  );
   // Progressive disclosure: dense by default, opt-in help layer. When on, a
   // glossary of the IPAM visual vocabulary appears so newcomers aren't lost
   // while experts keep the uncluttered default (#465). Sticky per-user.
@@ -17092,8 +17149,27 @@ export function IPAMPage() {
               onSelectSubnet={selectSubnet}
               onSelectBlock={selectBlock}
               filter={treeFilter}
+              onHiddenChange={onSpaceHiddenChange}
             />
           ))}
+          {treeFilter.trim() &&
+            spaces != null &&
+            spaces.length > 0 &&
+            spaces.every((sp) => hiddenSpaces[sp.id]) && (
+              <p
+                role="status"
+                className="px-2 py-3 text-xs text-muted-foreground"
+              >
+                Nothing in the tree matches “{treeFilter.trim()}”.{" "}
+                <button
+                  type="button"
+                  onClick={() => setTreeFilter("")}
+                  className="text-primary hover:underline"
+                >
+                  Clear the filter
+                </button>
+              </p>
+            )}
         </div>
       </div>
 

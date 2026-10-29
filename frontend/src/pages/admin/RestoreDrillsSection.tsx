@@ -21,7 +21,8 @@ import {
   type RestoreDrillAssertion,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
-import { ListEmpty } from "@/components/ui/list-read-error";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { isRefused } from "@/lib/refusal";
 
 /**
  * Restore Drills section on the Backup admin page (issue #702).
@@ -178,7 +179,11 @@ export function RestoreDrillsSection() {
     // A drill is synchronous but slow; poll while one is in flight so
     // the row flips without the operator hitting Refresh.
     refetchInterval: (q) =>
-      (q.state.data ?? []).some((d) => d.state === "running") ? 5000 : false,
+      !isRefused(q.state.error) &&
+      (q.state.data ?? []).some((d) => d.state === "running")
+        ? 5000
+        : false,
+    retry: (n, err) => !isRefused(err) && n < 3,
   });
 
   const runDrill = useMutation({
@@ -368,6 +373,10 @@ export function RestoreDrillsSection() {
         {drillsQ.isLoading ? (
           <div className="px-4 py-6 text-sm text-muted-foreground">
             Loading&hellip;
+          </div>
+        ) : drillsQ.isError ? (
+          <div className="px-4 py-6 text-sm">
+            <ListReadError error={drillsQ.error} what="the drill history" />
           </div>
         ) : drills.length === 0 ? (
           <div className="px-4 py-6 text-sm text-muted-foreground">
