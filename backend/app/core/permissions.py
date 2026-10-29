@@ -24,6 +24,7 @@ Two entry points are exported:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from typing import Annotated, NoReturn
 from uuid import UUID
@@ -755,7 +756,12 @@ def action_for_request(request: Request) -> str:
     return _METHOD_TO_ACTION.get(method, "write")
 
 
-def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[User]]:
+def require_resource_permission(
+    resource_type: str,
+    instance_routes: tuple[str, str, frozenset[str], frozenset[str]] | None = None,
+    instance_param: str | None = None,
+    prefix: str | None = None,
+) -> Callable[..., Awaitable[User]]:
     """Router-level dependency that enforces permissions by HTTP method.
 
     The mapping is: GET/HEAD/OPTIONS → ``read``, POST/PUT/PATCH → ``write``,
@@ -766,6 +772,12 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
 
     Per-row checks should still be performed inside handlers that know the
     resource UUID, using :func:`user_has_permission`.
+
+    ``instance_routes`` / ``instance_param`` / ``prefix`` (#3039) additionally
+    admit a grant scoped to ONE ``resource_type`` instance on an allow-list of
+    routes naming it in their path, and on the collection route, whose handler
+    must narrow its rows (see :func:`_instance_scoped_admit`). ``prefix`` is the
+    router's mount point (``/customers``) the route templates are relative to.
     """
 
     async def _dep(
@@ -775,6 +787,18 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
     ) -> User:
         action = action_for_request(request)
         if user_has_permission(current_user, action, resource_type):
+            return current_user
+        if (
+            instance_routes
+            and instance_param
+            and _instance_scoped_admit(
+                request,
+                current_user,
+                action,
+                {instance_param: instance_routes},
+                prefix or "/ipam",
+            )
+        ):
             return current_user
         await _record_denial(db, current_user, request, action, resource_type, None)
         raise HTTPException(
@@ -850,7 +874,7 @@ def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
     return False
 
 
-def request_route_key(request: Request) -> str:
+def request_route_key(request: Request, prefix: str = "/ipam") -> str:
     """``"METHOD /path-template"`` of the matched route, relative to the IPAM
     router's ``/ipam`` prefix (``"PUT /addresses/{address_id}"``).
 
@@ -860,8 +884,8 @@ def request_route_key(request: Request) -> str:
     which entry matches.
     """
     route = request.scope.get("route")
-    template = getattr(route, "path", "") or ""
-    return f"{request.method.upper()} {template.split('/ipam', 1)[-1]}"
+    template = re.sub(r"\{(\w+):\w+\}", r"{\1}", getattr(route, "path", "") or "")
+    return f"{request.method.upper()} {template.split(prefix, 1)[-1] or '/'}"
 
 
 def _instance_scoped_admit(
@@ -869,13 +893,15 @@ def _instance_scoped_admit(
     user: User,
     action: str,
     instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]],
+    prefix: str = "/ipam",
 ) -> bool:
     """True when ``user`` holds ``action`` on the ONE resource the route's path
     names, via a grant scoped to that resource (or an unscoped one).
 
     ``instance_routes`` maps a path parameter (``subnet_id``) to
     ``(resource_type, list_route, read_routes, write_routes)``. Every route is
-    a ``"METHOD /path"`` template relative to the router's ``/ipam`` prefix,
+    a ``"METHOD /path"`` template relative to the router's ``prefix`` (``/ipam``
+    by default; the collection route is ``"GET /"`` for a router mounted at it),
     and the lists are allow-lists: a route added later is NOT reachable by a
     scoped grant until someone decides it should be (#2438).
 
@@ -885,7 +911,7 @@ def _instance_scoped_admit(
       caller holds any read grant on the type; its handler must narrow the
       rows to the granted ones.
     """
-    key = request_route_key(request)
+    key = request_route_key(request, prefix)
     for pname, (rtype, list_route, read_routes, write_routes) in instance_routes.items():
         raw = request.path_params.get(pname)
         if raw is None:

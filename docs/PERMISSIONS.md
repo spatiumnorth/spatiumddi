@@ -21,7 +21,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | --------------- | -------- | ---------------------------------------------------------------------- |
 | `action`        | yes      | What the user may do. See **Actions** below.                           |
 | `resource_type` | yes      | Which resource kind. See **Resource types** below.                     |
-| `resource_id`   | no       | Scope to a specific UUID. Omit / `null` for "any instance of the type". |
+| `resource_id`   | no       | Scope to a specific UUID. Omit / `null` for "any instance of the type". Honoured for `subnet`, `ip_space`, `ip_block`, `customer`, `site`, `provider`, `address_set`, `dns_zone` and API-token grants; see rule 4 |
 
 ### Actions
 
@@ -151,6 +151,18 @@ on inactive.
    resize / split / merge / next-IP / bulk / DNS-sync, and editing or
    deleting an existing address stay refused unless a type-level grant
    covers them.
+   **IPAM spaces and blocks, customers, sites and providers (#3039).** A
+   `read` / `write` grant scoped to one IP space, one IP block, one customer,
+   one site or one provider reaches that item's detail (`GET`), its edit
+   (`PUT`) and the collection, which is narrowed to the granted items, and
+   nothing else. The grant names the item itself: it does **not** inherit down
+   a tree (a block grant does not reach child blocks or the subnets inside it,
+   a space grant does not reach its blocks), and delete, create and every
+   other route of the type stay refused unless a type-level grant covers them
+   (a customer's `/summary` too). Through the scoped grant the holder may not
+   point the item at another resource (DNS / DHCP server groups, zones, DDNS
+   domain, VRF, ASN, customer, site, parent block / site, a provider's default
+   ASN); re-sending the current value passes.
    **IPAM address sets (#103).** A `write` / `admin` grant on an address set
    (the Address Set Editor role, scoped to one set) reaches an allow-list of
    address routes and nothing else in IPAM: create, next-IP, bulk-allocate
