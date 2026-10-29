@@ -240,7 +240,7 @@ async def apply_txt_update(db: AsyncSession, account: ACMEAccount, txt: str) -> 
                 "name": oldest.name,
                 "type": "TXT",
                 "value": oldest.value,
-                "ttl": oldest.ttl or ACME_TXT_TTL,
+                "ttl": oldest.ttl if oldest.ttl is not None else ACME_TXT_TTL,
             },
             target_serial=target_serial,
         )
@@ -309,7 +309,7 @@ async def apply_txt_delete(db: AsyncSession, account: ACMEAccount) -> list[DNSRe
                 "name": rec.name,
                 "type": "TXT",
                 "value": rec.value,
-                "ttl": rec.ttl or ACME_TXT_TTL,
+                "ttl": rec.ttl if rec.ttl is not None else ACME_TXT_TTL,
             },
             target_serial=target_serial,
         )
@@ -528,7 +528,7 @@ async def sweep_stale_txt_records(db: AsyncSession, *, max_age_seconds: int = 24
                 "name": rec.name,
                 "type": "TXT",
                 "value": rec.value,
-                "ttl": rec.ttl or ACME_TXT_TTL,
+                "ttl": rec.ttl if rec.ttl is not None else ACME_TXT_TTL,
             },
             target_serial=target_serial,
         )
@@ -569,7 +569,7 @@ async def sweep_stale_txt_records(db: AsyncSession, *, max_age_seconds: int = 24
                 "name": rec.name,
                 "type": "TXT",
                 "value": rec.value,
-                "ttl": rec.ttl or ACME_TXT_TTL,
+                "ttl": rec.ttl if rec.ttl is not None else ACME_TXT_TTL,
             },
             target_serial=target_serial,
         )

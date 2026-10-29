@@ -62,6 +62,13 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "charts/spatiumddi/templates/worker.yaml",
         "k8s/base/worker.yaml",
     ),
+    # #2944: uvicorn's graceful-shutdown timeout must stay below the api's grace periods.
+    "test_api_graceful_shutdown.py": (
+        "k8s/base/api.yaml",
+        "charts/spatiumddi/templates/api.yaml",
+        "docker-compose.yml",
+        "docker-compose.dev.yml",
+    ),
     "test_ci_tested_on_pr_head.py": (
         ".github/scripts/ci-tested-on-pr-head.sh",
         ".github/scripts/ci-full-suite-passed.sh",
@@ -99,6 +106,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_technitium_svcb_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
     # #1760 — the TXT helper is duplicated, whole, in the agent.
     "test_txt_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_txt.py"),
+    "test_caa_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_caa.py"),
     # #1765 — the BIND address-match translator is duplicated in the agent.
     "test_technitium_acl_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
     # #2121 — the forward-zone transport helper is duplicated, whole, in the
@@ -136,6 +144,13 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/40-tls-reload-watch.sh",
         "frontend/Dockerfile",
         "charts/spatiumddi/templates/frontend.yaml",
+    ),
+    # #2895 — the About page's legal files sit outside the web root and both
+    # nginx configs serve them only behind the api's session check.
+    "test_about_files_gated_2895.py": (
+        "frontend/Dockerfile",
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
 }
 
@@ -247,7 +262,7 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "frontend/src/App.tsx",
         "frontend/package.json",
         "charts/spatiumddi/values.yaml",
-        "k8s/base/api.yaml",
+        "k8s/base/frontend.yaml",
         # #968 — perf/ has its own Perf — Tests job; before it was denied a
         # perf-only PR ran all 8 backend shards (PR #955, measured).
         "perf/generators/orchestrator/relay_sockets.py",

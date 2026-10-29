@@ -16,6 +16,21 @@
        Image: stock ``nginx:1.31.8-alpine``, preloaded into containerd
        at bake time alongside the SpatiumDDI service images. */}}
 {{- if .Values.agentLanding.enabled }}
+# #2935 — the stock image answers ``Server: nginx/<version>`` on every
+# response (and prints the version on its own error pages). The stock
+# nginx.conf includes conf.d/*.conf inside ``http {}``, so one file turns it
+# off for the whole server without replacing the image's config.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-landing-nginx
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-landing
+data:
+  server-tokens.conf: |
+    server_tokens off;
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -77,9 +92,16 @@ spec:
             - name: html
               mountPath: /usr/share/nginx/html
               readOnly: true
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d/server-tokens.conf
+              subPath: server-tokens.conf
+              readOnly: true
       volumes:
         - name: html
           hostPath:
             path: {{ .Values.agentLanding.hostMounts.htmlDir }}
             type: DirectoryOrCreate
+        - name: nginx-conf
+          configMap:
+            name: agent-landing-nginx
 {{- end }}

@@ -53,6 +53,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-publish-k3s-token.path \
             k3s.service \
             spatiumddi-clear-shutdown-pods.service \
+            spatiumddi-reboot-handoff.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
             spatiumddi-chrony-reload.path \
@@ -454,6 +455,14 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.path"
 # ended and nothing else deletes (a ReplicaSet's).
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-clear-shutdown-pods"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-clear-shutdown-pods.service"
+# #2849 — a Fleet reboot of the node holding the PostgreSQL primary hands it
+# off first (spatiumddi-reboot-agent); this uncordons the node at its boot.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-reboot-handoff"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-handoff.service"
+# #2974 — the web-UI reboot and the console's reboot / poweroff go through
+# this, which runs the handoff first.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-power-action"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-power-action@.service"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user

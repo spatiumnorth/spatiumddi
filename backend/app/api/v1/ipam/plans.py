@@ -139,7 +139,9 @@ class SubnetPlanUpdate(BaseModel):
 class ValidationConflict(BaseModel):
     node_id: str
     network: str
-    kind: str  # "overlap_existing" | "out_of_parent" | "sibling_overlap" | "duplicate_id" | "missing_block"
+    # "overlap_existing" | "out_of_parent" | "sibling_overlap" | "duplicate_id"
+    # | "missing_block" | "invalid_kind" | "invalid_binding"
+    kind: str
     message: str
 
 
@@ -205,6 +207,9 @@ def _to_read(plan: SubnetPlan) -> SubnetPlanRead:
 
 # ── Validation ────────────────────────────────────────────────────────────
 
+# The node fields that name another resource by id.
+_PLAN_ID_FIELDS = ("dns_group_id", "dns_zone_id", "dhcp_server_group_id", "vlan_ref_id")
+
 
 async def _validate_tree(
     db: AsyncSession, space_id: uuid.UUID, tree: PlanNode
@@ -250,6 +255,29 @@ async def _validate_tree(
                     ),
                 )
             )
+
+    # 1c. Resource bindings are ids: apply writes ``dns_zone_id`` /
+    #     ``dns_group_id`` onto the new rows as given and parses the other two
+    #     with ``uuid.UUID``, so a value that is not a UUID either landed on a
+    #     block / subnet as a binding to nothing or raised a 500 (#2923).
+    #     Reported here, like a bad ``existing_block_id``, so a plan already
+    #     saved with one is refused with a reason instead of crashing apply.
+    for n in _walk(tree):
+        for field in _PLAN_ID_FIELDS:
+            raw = getattr(n, field)
+            if not raw:
+                continue
+            try:
+                uuid.UUID(str(raw))
+            except ValueError:
+                conflicts.append(
+                    ValidationConflict(
+                        node_id=n.id,
+                        network=n.network,
+                        kind="invalid_binding",
+                        message=f"{field} is not a valid UUID: {raw}",
+                    )
+                )
 
     # 2. If the root references an existing block, the block must exist
     #    AND its CIDR must equal the root's CIDR (the operator can't
@@ -694,7 +722,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 name=node.name or "",
                 description=node.description or "",
                 dns_group_ids=dns_group_ids,
-                dns_zone_id=node.dns_zone_id,
+                dns_zone_id=node.dns_zone_id or None,
                 dns_inherit_settings=not dns_explicit,
                 dhcp_server_group_id=(
                     uuid.UUID(node.dhcp_server_group_id) if node.dhcp_server_group_id else None
@@ -746,7 +774,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 utilization_percent=0.0,
                 kind=node_kind,
                 dns_group_ids=[node.dns_group_id] if node.dns_group_id else None,
-                dns_zone_id=node.dns_zone_id,
+                dns_zone_id=node.dns_zone_id or None,
                 dns_inherit_settings=not dns_explicit,
                 dhcp_server_group_id=(
                     uuid.UUID(node.dhcp_server_group_id) if node.dhcp_server_group_id else None
