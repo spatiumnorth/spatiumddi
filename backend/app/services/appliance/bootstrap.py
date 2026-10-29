@@ -276,7 +276,7 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
                 "this is the cert the OS wrote at first boot, kept so the "
                 "appliance presents one cert identity across the whole boot. "
                 "Replace it with an uploaded cert, a CSR-signed cert, or a "
-                "Let's Encrypt cert via the Appliance → Web UI Certificate tab."
+                "Let's Encrypt cert via Appliance → Fleet → Web UI Certificate."
             )
             if self_signed
             else (
@@ -285,7 +285,7 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
                 "database row — most likely a factory reset or a restore into "
                 "an empty schema. Recorded as operator-owned so nothing "
                 "auto-replaces it. It will NOT auto-renew: re-issue or "
-                "re-upload it via the Appliance → Web UI Certificate tab "
+                "re-upload it via Appliance → Fleet → Web UI Certificate "
                 "before it expires."
             )
         ),
@@ -333,7 +333,7 @@ async def _generate_activate_deploy(
         notes=(
             "Auto-generated on first boot. Replace with an uploaded "
             "cert, a CSR-signed cert, or a Let's Encrypt cert via the "
-            "Appliance → Web UI Certificate tab."
+            "Appliance → Fleet → Web UI Certificate."
         ),
     )
     db.add(row)
@@ -448,7 +448,7 @@ async def sync_active_cert_to_secret() -> dict[str, object]:
     bootstrap's Path A (which has always overwritten a Secret that differs
     from it); this makes that reconcile continuous instead of once per api
     start. A cert set by hand in the Secret is therefore replaced within a
-    tick — upload it through the Web UI Certificate tab instead.
+    tick — upload it under Appliance → Fleet → Web UI Certificate instead.
 
     The Secret PATCH is the whole deploy: the frontend pods reload nginx
     themselves when their mounted copy changes (#1173), so there is no

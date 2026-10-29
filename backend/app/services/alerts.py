@@ -3579,7 +3579,7 @@ async def _matching_secret_expiring_subjects(
             f"Let's Encrypt Web UI certificate '{c.subject_cn or c.name}' "
             f"{_descriptor(days)} ({valid_to.isoformat()}, threshold "
             f"{threshold_days} d). Auto-renewal may be stuck — check "
-            f"Appliance → Web UI Certificate.{stale_note}"
+            f"Appliance → Fleet → Web UI Certificate.{stale_note}"
         )
         matches.append(
             (f"appliance_cert_tls:{c.id}", f"{c.subject_cn or c.name} (LE)", message, sev)

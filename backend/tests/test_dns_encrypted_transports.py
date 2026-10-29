@@ -100,6 +100,9 @@ async def test_enabling_listener_without_cert_is_422(
     )
     assert r.status_code == 422
     assert "certificate" in r.json()["detail"].lower()
+    # #3045: Web UI Certificate is an entry under Appliance -> Fleet, not an
+    # Appliance tab; the refusal names it by its real path.
+    assert "Appliance → Fleet → Web UI Certificate" in r.json()["detail"]
 
 
 async def test_enabling_listener_with_csr_pending_cert_is_422(

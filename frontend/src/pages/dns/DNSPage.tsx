@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import {
@@ -7291,7 +7291,7 @@ export function RevealedSecretModal({
 
 // ── Options Tab ───────────────────────────────────────────────────────────────
 
-function OptionsTab({ groupId }: { groupId: string }) {
+export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
   const { isSuperadmin } = useDnsGrants();
@@ -8134,10 +8134,14 @@ function OptionsTab({ groupId }: { groupId: string }) {
           </select>
         </Field>
         <p className="text-xs text-muted-foreground">
-          Managed under Appliance → Web UI Certificate — upload one, or issue it
-          from Let's Encrypt with the built-in ACME client. Renewals are picked
-          up automatically. A listener with no usable certificate is skipped and
-          the server stays Do53-only rather than failing to start.
+          Managed under{" "}
+          <Link to="/appliance?tab=tls" className="underline">
+            Appliance → Fleet → Web UI Certificate
+          </Link>{" "}
+          — upload one, or issue it from Let's Encrypt with the built-in ACME
+          client. Renewals are picked up automatically. A listener with no
+          usable certificate is skipped and the server stays Do53-only rather
+          than failing to start.
         </p>
 
         <div className="flex items-center justify-between border-t pt-3">

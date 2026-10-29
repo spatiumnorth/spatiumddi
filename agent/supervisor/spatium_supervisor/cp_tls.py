@@ -31,7 +31,7 @@ The model:
 What this does not cover, stated so nobody reads more into it: an attacker
 present at pairing who also substitutes the CA certificate the supervisor
 receives at approval. That needs an out-of-band check (the operator comparing
-the fingerprint this module logs with the one shown under Appliance -> TLS on
+the fingerprint this module logs with the one shown under Appliance -> Fleet -> Web UI Certificate on
 the control plane).
 
 Plain ``http`` control-plane URLs are left alone: the in-cluster
@@ -305,7 +305,7 @@ def _pin_first_contact(state_dir: Path, target: str) -> str:
         sha256=display_fingerprint(cert_sha256(presented)),
         detail=(
             "Trusting this certificate from now on. It should match the "
-            "fingerprint shown under Appliance -> TLS on the control plane; if "
+            "fingerprint shown under Appliance -> Fleet -> Web UI Certificate on the control plane; if "
             "it does not, something intercepted this connection."
         ),
     )
@@ -411,7 +411,7 @@ def try_repin(state_dir: Path, url: str) -> bool:
                 detail=(
                     "The control plane presents the pinned certificate, yet the "
                     "handshake still fails verification: most likely it has "
-                    "expired. Renew or replace it under Appliance -> TLS."
+                    "expired. Renew or replace it under Appliance -> Fleet -> Web UI Certificate."
                 ),
             )
             return False
@@ -490,6 +490,6 @@ def check_pin_vouched_once(state_dir: Path, url: str) -> None:
             "The certificate this supervisor pinned when it first contacted the "
             "control plane is not one the control plane's CA vouches for. "
             "Either something intercepted the first contact, or the certificate "
-            "has changed since; compare with Appliance -> TLS on the control plane."
+            "has changed since; compare with Appliance -> Fleet -> Web UI Certificate on the control plane."
         ),
     )

@@ -3620,7 +3620,7 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
             raise HTTPException(
                 422,
                 "A TLS certificate is required to enable DoT, DoH or DoQ. "
-                "Upload or issue one under Appliance → Web UI Certificate first.",
+                "Upload or issue one under Appliance → Fleet → Web UI Certificate first.",
             )
         cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
         if cert is None:
