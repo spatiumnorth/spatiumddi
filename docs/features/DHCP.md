@@ -515,7 +515,7 @@ empty.
 **Prerequisite — create a scope for the subnet.** A scope lives on a DHCP
 **server group** that has at least one Kea member (DHCP is group-centric —
 scopes / pools / statics / classes all belong to the group). Create it from
-**IPAM → the subnet → "DHCP Pools" tab → Create Scope**, or from
+**IPAM → the subnet → DHCP tab → Create Scope**, or from
 **DHCP → the server group → Scopes tab → "+ Serve leases on subnet…"** (pick the subnet). A dynamic pool is optional;
 the scope alone is enough to emit the `subnet4` block that reservations hang off.
 
@@ -1523,15 +1523,15 @@ the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 ### Push (IPAM → DHCP Server)
 Triggered by:
 - Scope/pool/static assignment create/update/delete
-- Manual "Force Sync" from UI (agent-managed servers)
+- Manual "Force Sync" from UI (every server except Windows DHCP)
 
 There is no scheduled full push. Kea agents long-poll the control plane for the whole config bundle by ETag, so any change that alters the rendered config reaches them within seconds; the agent applies the bundle it gets rather than a diff.
 
 ### Pull (DHCP Server → IPAM)
 Triggered by:
 - Lease events (real-time via webhook or Kea hook)
-- Scheduled lease pull for agentless (Windows DHCP) servers, gated by **Settings → DHCP Lease Sync**
-- Manual **Sync Leases** on an agentless server's detail page (an agent-managed server shows Force Sync instead)
+- Scheduled lease pull for agentless servers (Windows DHCP, FortiGate), gated by **Settings → DHCP Lease Sync**
+- Manual **Sync Leases** on a Windows DHCP server's detail page (other servers show Force Sync instead)
 
 There is no DHCP reconciliation report in the console or the API; drift between IPAM and a live DHCP server is not reported as a diff.
 

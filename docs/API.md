@@ -380,7 +380,8 @@ password-recovery allowlist (`/auth/change-password`, `/auth/logout`,
 
 takes no body: the refresh token is read from the `spatium_refresh` cookie
 the login set. Without the cookie the answer is 401 "Missing refresh token".
-It returns a fresh `{ access_token, token_type }` and sets the rotated
+It returns a fresh `{ access_token, token_type, force_password_change }`
+and sets the rotated
 refresh token as the cookie again. Refresh is **rotating**: the presented
 refresh token's session is revoked and a new session (and new refresh
 token) is issued. Each access token carries the issuing session's UUID
@@ -511,7 +512,7 @@ for new endpoints that can grow unbounded. The audit list answers
 `{total, items}`. Check the route's schema in `/api/docs` rather than
 assuming one shape.
 
-### 6.1 `{items, total, limit, offset}` envelope (preferred)
+### 6.1 `{items, total, limit, offset}` envelope
 
 The network-modeling and newer routers (circuits, services, ASNs,
 VRFs, overlays, multicast, TLS certs, …) accept `limit` + `offset`
@@ -809,8 +810,9 @@ server-side log lines for that request (non-negotiable #7).
 - **CORS** — origins come from the `CORS_ORIGINS` env var (comma-
   separated; default `*`). With a wildcard, credentialed CORS is
   disabled by construction (the API authenticates via the
-  `Authorization` header; the only cookie is the HttpOnly refresh cookie
-  the browser UI uses for `/auth/refresh`). Pin explicit origins to enable
+  `Authorization` header; the HttpOnly `spatium_refresh` cookie and the
+  short-lived OIDC / SAML sign-in flow cookies are scoped to
+  `/api/v1/auth`). Pin explicit origins to enable
   `allow_credentials`.
 - **Trusted hosts** — `TRUSTED_HOSTS` (default `*`) gates the inbound
   `Host` header; set it to your real hostnames to harden against

@@ -295,7 +295,7 @@ Default ruleset (enforced, cannot be deleted):
 Separate from IP-range-scoped permissions — this section manages:
 - Local user accounts (create, edit, enable/disable, reset password). Users enrol their own MFA from the Account page; there is no per-user "require MFA" switch
 - Local groups (create, manage membership)
-- LDAP / OIDC group mapping: each auth provider carries group mappings (external group → SpatiumDDI group). There is no directory sync job, interval or "Sync Now": a user's groups are replaced from the mappings at each sign-in (see [AUTH.md](AUTH.md))
+- External auth provider group mapping (LDAP, OIDC, SAML, RADIUS, TACACS+): each provider carries group mappings (external group → SpatiumDDI group). There is no directory sync job, interval or "Sync Now": a user's groups are replaced from the mappings at each sign-in (see [AUTH.md](AUTH.md))
 - Last login per user
 - Active sessions (with revoke capability)
 
@@ -306,9 +306,11 @@ APIToken
   id, name, description
   token_hash: str        -- only the sha256 hash is stored; token shown once on creation
   prefix: str            -- short identifier shown in the UI
+  scope: str            -- always "user" today (see below)
   user_id (FK)           -- the owning user; the token acts as that user
   scopes: list[str]      -- coarse scopes (below); empty = no scope restriction
-  resource_grants: list  -- optional binding to one subnet or DNS zone
+  resource_grants: list  -- optional binding to specific subnets / DNS zones
+  allowed_paths, permissions: JSONB -- reserved columns, not set or read today
   expires_at: timestamp (nullable)
   last_used_at: timestamp
   created_by_user_id, created_at
@@ -317,7 +319,7 @@ APIToken
 
 - **User tokens** are the only kind the build issues: a token acts as its owning user and cannot exceed that user's rights. A token with no owner (a "global" token) is refused with 401 "Global-scope API tokens are not yet supported"; use a dedicated service user for automation, CI/CD and Terraform instead
 - Tokens are displayed once on creation (sha256 hash stored)
-- Instead of typing API paths, the create dialog offers five fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write`, `dhcp:write` and `agent`. A token may also be bound to one subnet or DNS zone (`resource_grants`)
+- Instead of typing API paths, the create dialog offers five fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write`, `dhcp:write` and `agent`. A token may also be bound to specific subnets or DNS zones (`resource_grants`; the create dialog binds one)
 
 ### 2.6 Syslog / Log Forwarding
 
@@ -970,12 +972,11 @@ link would not send, so the page fetches each file through its API client and
 shows it inline rather than linking it for a new tab. Nothing is inlined into
 the JS bundle.
 
-That is about the **content**. The version number itself is also served by
-other unauthenticated surfaces that predate this page (for example
-`GET /api/v1/version`, which the installer probe and the mobile client use).
-Since #2935 an anonymous caller gets `version: "restricted"` from that route and
-only a signed-in one sees the number (see API.md §7.2); those surfaces are
-separate decisions and are not changed here.
+That is about the **content**. The version number is a separate decision,
+made on its own route: `GET /api/v1/version`, which the installer probe and
+the mobile client use, answers everyone, but since #2935 an anonymous caller
+gets `version: "restricted"` and only a signed-in caller sees the release (see
+[API.md](../API.md) §7.2).
 
 A `make dev` or `npm run dev` session has none of these files, and the page
 says "not available in this build" rather than show an empty list. Agent images

@@ -720,7 +720,16 @@ spatiumddi_api_request_duration_seconds{method, path_template} (histogram)
 spatiumddi_api_active_requests (gauge)
 ```
 
-Plus two counters declared but not yet wired to a call site (read zero):
+The DNS agent config long-poll (#1111) adds three counters, labelled
+`family="dns"` (the DHCP long-poll does not count yet):
+
+```
+spatiumddi_agent_bundle_served_total{family, outcome}   # full / not_modified / client_gone
+spatiumddi_agent_bundle_inline_renders_total{family}
+spatiumddi_agent_bundle_inline_failures_total{family}
+```
+
+Plus two counters declared but not yet wired to a call site (no samples):
 
 ```
 spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oidc
@@ -1094,15 +1103,15 @@ running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The
 conformity evaluator follows the same rules.
 
-Rule types described on this page. The build accepts more than are listed
-here (over 70): `GET /api/v1/alerts/rule-types` returns every
-type the API will take, and some are documented on their own feature page
+Rule types described on this page. The build has 73 (`RULE_TYPES` in
+`backend/app/services/alerts.py`) and 41 of them have a row below.
+`GET /api/v1/alerts/rule-types` lists every type whose feature module is
+enabled, with its parameters, and some are documented on their own feature page
 instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in
 IPAM.md). Among those with no row below are `tls_cert_expiring` and the other
 `tls_cert_*` rules, `secret_expiring`, `new_mac_seen`, `rogue_dhcp`,
 `restore_drill_failed`, `schema_behind_head` and the `dns_*_suspected`
 threat-analytics rules.
-
 
 | Type | Fires when |
 |---|---|
@@ -1235,17 +1244,19 @@ automatically. MCP: `find_bgp_hijacks` / `count_bgp_hijacks` /
 
 ### 9.2 Prometheus alerting rules (external)
 
-The control plane's `/metrics` endpoint exposes eight `spatiumddi_*` series
-(beside the client library's standard `process_*` and `python_*`). Alert
-rules can be written against these today:
+The control plane's `/metrics` registry declares eight `spatiumddi_*` series
+(beside the client library's standard `process_*` and `python_*`). Six carry
+samples today; the two `auth` counters are declared but nothing increments
+them yet, so they carry no samples, and the agent-bundle counters only ever
+see `family="dns"`:
 
 | Series | Type | Labels |
 |---|---|---|
 | `spatiumddi_api_requests_total` | counter | `method`, `path_template`, `status_code` |
 | `spatiumddi_api_request_duration_seconds` | histogram | `method`, `path_template` |
 | `spatiumddi_api_active_requests` | gauge | |
-| `spatiumddi_auth_login_total` | counter | `method`, `result` |
-| `spatiumddi_auth_token_usage_total` | counter | `scope` |
+| `spatiumddi_auth_login_total` | counter (no samples yet) | `method`, `result` |
+| `spatiumddi_auth_token_usage_total` | counter (no samples yet) | `scope` |
 | `spatiumddi_agent_bundle_served_total` | counter | `family`, `outcome` |
 | `spatiumddi_agent_bundle_inline_renders_total` | counter | `family` |
 | `spatiumddi_agent_bundle_inline_failures_total` | counter | `family` |

@@ -284,7 +284,7 @@ On the subnet create form:
 
 *What this does: turns a documented subnet into a range the DHCP server actually serves — until now the subnet only exists on paper.*
 
-With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab → **New Scope**. The form pre-fills the subnet's gateway as the router, the defaults from Settings (DNS servers, domain, search list, NTP, lease time) and, on an IPv4 subnet of /28 or larger, a suggested **Initial pool**: a dynamic range from the tenth host address to the last usable one (`.10–.254` on a /24). Most scopes are a one-click save; change or clear the initial pool when part of that range is meant for static addresses.
+With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab → **Create Scope**. The form pre-fills the subnet's gateway as the router, the defaults from Settings (DNS servers, domain, search list, NTP, lease time) and, on an IPv4 subnet of /28 or larger, a suggested **Initial pool**: a dynamic range from the tenth host address to the last usable one (`.10–.254` on a /24). Most scopes are a one-click save; change or clear the initial pool when part of that range is meant for static addresses.
 
 [Pools](#dhcp-pool) go under scopes:
 - **Dynamic** — handed out to clients.

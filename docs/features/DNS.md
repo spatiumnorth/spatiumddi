@@ -771,7 +771,7 @@ Every subnet can be assigned:
 - A **forward DNS zone** (for auto-creating A/AAAA records)
 - A **reverse DNS zone** (for auto-creating PTR records)
 
-There is no prompt. Once the subnet has an effective DNS server group, creating it also creates the matching reverse zone(s) on that group (`2.1.10.in-addr.arpa.` for `10.1.2.0/24`) unless the create request sets `skip_reverse_zone` (API-only; the console has no control for it). A subnet created without one picks its zones up from the reverse-zone backfill.
+There is no prompt. Once the subnet has an effective DNS server group, creating it also creates the matching reverse zone(s) on that group (`2.1.10.in-addr.arpa.` for `10.1.2.0/24`) unless the request sets `skip_reverse_zone` (API-only, on create or update; the console has no control for it). The flag is stored on the subnet, so the later backfill honours it too. A subnet created before it had a DNS group picks its zones up from the reverse-zone backfill, which also runs on the next address allocation.
 
 A subnet gets one reverse zone per `/24` it spans (#1840), never one enclosing zone: a `/16` zone for a `10.1.2.0/23` would make SpatiumDDI authoritative for addresses outside the subnet and shadow reverse DNS someone else serves. A `/24` or longer gets its own `/24` (`2.1.10.in-addr.arpa.`; a `/25` shares its `/24`'s zone with its neighbours), a `/23` gets two, a `/20` sixteen and a `/17` 128. The bound for wide subnets is the `/16`: a `/9`–`/16` gets one zone per `/16` it contains (a `/16` its one `/16` zone, a `/12` sixteen), and a `/8` or wider one per `/8`, because per-`/24` would mean up to 32,768 zones and each `/16` lies wholly inside the subnet anyway. IPv6 uses one zone per nibble-aligned piece: a `/48`, `/56` and `/64` get one zone each, and a `/55` gets its two `/56` zones. The zones of a subnet are a set: delete retires every zone of it (a zone another subnet still lives in is re-linked to that subnet instead), a resize grow adds the zones for the new range, and the reverse-zone backfill creates the missing ones. Which zone takes an address's PTR is decided per address, as the most specific reverse zone in the subnet's group that covers it, so an install's earlier first-`/24` zone for a `/23` keeps serving its addresses and the second `/24`'s zone is added on the next allocation or backfill.
 
@@ -932,7 +932,7 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 ### Enabling DDNS (quick walkthrough)
 
 1. **Pick a subnet** with a DNS forward + reverse zone already assigned.
-2. Open the subnet editor → **DDNS** tab (shown when the subnet has both DHCP and DNS) → **Dynamic DNS (from DHCP)** section → toggle **Enabled**, pick a policy, optionally set a domain override or TTL. Save.
+2. Open the subnet editor → **DDNS** tab (shown when both the DHCP and DNS feature modules are on) → **Dynamic DNS (from DHCP)** section → toggle **Enabled**, pick a policy, optionally set a domain override or TTL. Save.
 3. Make sure the subnet's DNS group has at least one healthy server (BIND9 via agent, or Windows DNS — Path A or B).
 4. For a Windows DHCP (agentless) server, ensure **Settings → DHCP Lease Sync** is enabled; its poll loop fires DDNS. Kea agent servers need nothing here: their lease events fire DDNS as they arrive.
 5. Issue a lease on a scope covering the subnet. On Windows DHCP, wait for the next poll (default 5 min) or hit **Sync Leases** on the server detail page; on Kea the DNS records follow the lease event.
@@ -2662,7 +2662,7 @@ on :53 stays up, so turning DoT on never cuts off existing clients.
 The listeners serve a certificate from the existing
 `appliance_certificate` store — the same one behind the Web UI cert and
 the embedded ACME client (#438). Issue or upload once under
-Appliance → Web UI Certificate, then point the group at it
+Appliance → Fleet → Web UI Certificate, then point the group at it
 (`dns_server_options.tls_certificate_id`).
 
 The FK is `ON DELETE SET NULL`, so deleting a certificate can never delete
