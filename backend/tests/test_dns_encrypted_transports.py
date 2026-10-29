@@ -439,6 +439,39 @@ async def test_delete_cert_linked_but_listeners_off_succeeds(
     assert r.status_code == 204, r.text
 
 
+async def test_delete_active_cert_off_appliance_succeeds(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """#3061 — ``is_active`` means "the cert nginx serves" and only an
+    appliance has one, yet an ACME issue sets it anywhere. Refusing the
+    delete would leave an issued cert undeletable on compose / k8s."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", False)
+    headers = await _superadmin(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = True
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 204, r.text
+
+
+async def test_delete_active_cert_on_appliance_is_409(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", True)
+    headers = await _superadmin(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = True
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+
+
 # ── MCP read tool (#2887) ───────────────────────────────────────────────
 
 

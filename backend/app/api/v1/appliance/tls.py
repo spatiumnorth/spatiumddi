@@ -543,7 +543,11 @@ async def delete_certificate(
     row = await db.get(ApplianceCertificate, cert_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "certificate not found")
-    if row.is_active:
+    # ``is_active`` only means something on an appliance, where it names the
+    # cert nginx serves. Off-appliance nothing serves it, yet an ACME issue
+    # still sets it, so refusing here would leave an issued cert undeletable
+    # on Docker Compose / Kubernetes with no "activate another" to escape to.
+    if row.is_active and settings.appliance_mode:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "this certificate is currently active — activate a different one first",
