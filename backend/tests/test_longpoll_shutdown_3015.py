@@ -130,13 +130,81 @@ def test_signal_hook_never_wraps_a_default_disposition() -> None:
         signal.signal(signal.SIGINT, old_int)
 
 
-def test_lifespan_installs_the_hook() -> None:
-    import inspect
+async def test_lifespan_calls_install_signal_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Behavioural, not source text: run ``app.main``'s real lifespan and stop
+    it at the hook. The uvicorn subprocess test proves the hook works when
+    installed from a lifespan; this proves the production lifespan installs it.
+    """
+    from app import main as app_main
 
-    from app.main import lifespan
+    class _Stop(Exception):
+        pass
 
-    src = inspect.getsource(lifespan)
-    assert "install_signal_hook()" in src and "request_shutdown()" in src
+    calls: list[str] = []
+
+    def _record() -> bool:
+        calls.append("install")
+        raise _Stop
+
+    monkeypatch.setattr(app_main, "configure_logging", lambda: None)
+    monkeypatch.setattr(shutdown, "install_signal_hook", _record)
+    with pytest.raises(_Stop):
+        async with app_main.lifespan(app):
+            pass
+    assert calls == ["install"]
+
+
+def test_signal_hook_chains_even_if_request_shutdown_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[int] = []
+
+    def previous(signum: int, frame: Any) -> None:
+        seen.append(signum)
+
+    def _boom() -> None:
+        raise RuntimeError("boom")
+
+    old = signal.signal(signal.SIGTERM, previous)
+    old_int = signal.signal(signal.SIGINT, signal.SIG_DFL)
+    try:
+        assert shutdown.install_signal_hook() is True
+        handler = signal.getsignal(signal.SIGTERM)
+        monkeypatch.setattr(shutdown, "request_shutdown", _boom)
+        with pytest.raises(RuntimeError):
+            handler(signal.SIGTERM, None)  # type: ignore[operator]
+        assert seen == [signal.SIGTERM], "uvicorn's handler must run regardless"
+    finally:
+        signal.signal(signal.SIGTERM, old)
+        signal.signal(signal.SIGINT, old_int)
+
+
+def test_signal_hook_warns_when_there_is_nothing_to_wrap() -> None:
+    from structlog.testing import capture_logs
+
+    old = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        with capture_logs() as logs:
+            assert shutdown.install_signal_hook() is False
+        assert any(e["event"] == "shutdown_hook_not_installed" for e in logs), logs
+    finally:
+        signal.signal(signal.SIGTERM, old)
+        signal.signal(signal.SIGINT, old_int)
+
+
+async def test_get_or_shutdown_hands_out_an_item_that_lands_with_the_shutdown() -> None:
+    """A put landing in the same loop iteration as the shutdown is handed out,
+    not stranded behind a "nothing" answer."""
+    q: asyncio.Queue[str] = asyncio.Queue()
+    task = asyncio.create_task(shutdown.get_or_shutdown(q, 30))
+    await asyncio.sleep(0.05)
+    loop = asyncio.get_running_loop()
+    # Both land before the poll's task runs again.
+    shutdown.request_shutdown()
+    loop.call_soon(q.put_nowait, "job")
+    assert await asyncio.wait_for(task, 2) == ("job", False)
+    assert q.empty()
 
 
 # ── WakeSubscription / queues ───────────────────────────────────────────────
@@ -162,6 +230,41 @@ async def test_wake_wait_returns_shutdown_when_already_shutting_down(degraded: b
     shutdown.request_shutdown()
     sub = agent_wake.WakeSubscription(None if degraded else _PubSub(), None, degraded)
     assert await asyncio.wait_for(sub.wait(12), 1) == WakeResult.SHUTDOWN
+
+
+async def test_wake_wait_does_not_spin_and_degrades_after_a_cut_read() -> None:
+    """One read per wait (no slicing), and a read abandoned by shutdown leaves
+    the subscription degraded so it is never read again mid-frame."""
+    calls: list[float] = []
+
+    class _Counting(_PubSub):
+        async def get_message(
+            self, ignore_subscribe_messages: bool = True, timeout: float = 0
+        ) -> Any:
+            calls.append(timeout)
+            return await super().get_message(ignore_subscribe_messages, timeout)
+
+    sub = agent_wake.WakeSubscription(_Counting(), None, False)
+    task = asyncio.create_task(sub.wait(12))
+    await asyncio.sleep(1.0)
+    assert len(calls) == 1 and calls[0] > 11
+    shutdown.request_shutdown()
+    assert await asyncio.wait_for(task, 2) == WakeResult.SHUTDOWN
+    assert sub.degraded is True
+
+
+async def test_wake_wait_still_returns_a_wake() -> None:
+    class _OneMessage:
+        async def get_message(
+            self, ignore_subscribe_messages: bool = True, timeout: float = 0
+        ) -> Any:
+            await asyncio.sleep(0.05)
+            return {"type": "message", "data": b"x"}
+
+    sub = agent_wake.WakeSubscription(_OneMessage(), None, False)
+    assert await asyncio.wait_for(sub.wait(12), 2) == WakeResult.WAKE
+    assert sub.degraded is False
+    assert shutdown._waiters == set()
 
 
 @pytest.mark.parametrize(
@@ -216,6 +319,36 @@ async def test_dhcp_config_poll_answers_304(
             before,
         )
     assert resp.status_code == 304
+
+
+async def test_dhcp_config_poll_serves_a_change_that_landed_unannounced(
+    db_session: AsyncSession, fresh_session_per_request: None
+) -> None:
+    """Shutdown ends the wait, never decides content: the last pass compares
+    the ETag, so a change committed during the hold (with no wake published)
+    is served as a 200, not answered 304."""
+    from app.models.dhcp import DHCPScope
+
+    ids = await _dhcp_estate(db_session)
+    headers = {"Authorization": f"Bearer {ids['token']}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        first = await ac.get("/api/v1/dhcp/agents/config", headers=headers)
+        etag = first.json()["etag"]
+        task = asyncio.create_task(
+            ac.get("/api/v1/dhcp/agents/config", headers={**headers, "If-None-Match": f'"{etag}"'})
+        )
+        await asyncio.sleep(1.0)
+        assert not task.done(), "the poll should be parked"
+        async with _TestSessionLocal() as other:
+            scope = await other.get(DHCPScope, ids["scope"])
+            assert scope is not None
+            scope.lease_time = 4242
+            await other.commit()
+        shutdown.request_shutdown()
+        resp = await asyncio.wait_for(task, PROMPT_S)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["etag"] != etag
+    assert resp.json()["bundle"]["scopes"][0]["lease_time"] == 4242
 
 
 @pytest.mark.parametrize("before", [False, True], ids=["mid-wait", "before-request"])

@@ -74,9 +74,6 @@ LONGPOLL_POLL_INTERVAL_FALLBACK = 2.0
 # the publish swallows the failure and the subscribe degrades to poll.
 _CONNECT_TIMEOUT = 2.0
 
-# How often a parked pub/sub read looks up to check for shutdown (#3015).
-_SHUTDOWN_SLICE_S = 0.25
-
 _PREFIX = "spatium:wake:"
 _METRIC_PREFIX = "spatium:wake:metrics:published:"
 
@@ -298,17 +295,12 @@ class WakeSubscription:
         deadline = loop.time() + timeout
         try:
             while True:
-                if _shutdown.shutdown_requested():
-                    return WakeResult.SHUTDOWN
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return WakeResult.TIMEOUT
-                # Sliced, not one long read, so a shutdown is noticed within
-                # _SHUTDOWN_SLICE_S without cancelling a read mid-frame.
-                msg = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=min(remaining, _SHUTDOWN_SLICE_S),
-                )
+                msg, ended = await self._read_or_shutdown(remaining)
+                if ended:
+                    return WakeResult.SHUTDOWN
                 if msg is not None and msg.get("type") == "message":
                     return WakeResult.WAKE
         except Exception as exc:  # noqa: BLE001 — degrade to poll, never fail the poll
@@ -317,6 +309,36 @@ class WakeSubscription:
             if await _shutdown.sleep_or_shutdown(LONGPOLL_POLL_INTERVAL_FALLBACK):
                 return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
+
+    async def _read_or_shutdown(self, timeout: float) -> tuple[Any, bool]:
+        """One pub/sub read of up to ``timeout``, raced against api shutdown
+        (#3015). Returns ``(message_or_None, shutdown_won)``.
+
+        A race rather than a short read in a loop: a parked poll then costs
+        one timer per wake tick instead of several wakeups a second, which
+        matters with a whole fleet parked on one pod. When shutdown wins the
+        read is cancelled, possibly mid-frame, so the subscription is marked
+        degraded and never read again — it is torn down with the request
+        anyway (``wake_subscription`` owns a dedicated connection).
+        """
+        read = asyncio.ensure_future(
+            self._pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
+        )
+        stop = _shutdown.shutdown_future()
+        try:
+            await asyncio.wait({read, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            _shutdown.discard(stop)
+            if not read.done():
+                read.cancel()
+                self.degraded = True
+                try:
+                    await read
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001 — abandoned read
+                    pass
+        if read.cancelled():
+            return None, True
+        return read.result(), False
 
 
 @asynccontextmanager

@@ -114,31 +114,55 @@ async def get_or_shutdown(queue: asyncio.Queue[Any], timeout: float) -> tuple[An
         except asyncio.CancelledError:
             pass
     if getter.cancelled():
+        # A put that lands while the getter is being cancelled leaves the
+        # item in the queue (asyncio.Queue.get re-raises without taking it):
+        # hand it out rather than strand it behind a "nothing" answer.
+        if not queue.empty():
+            return queue.get_nowait(), False
         return None, True
     return getter.result(), False
 
 
 def install_signal_hook() -> bool:
     """Wrap the current SIGTERM / SIGINT handlers so they call
-    :func:`request_shutdown` first. Returns False when it cannot (not the main
-    thread, or a handler that is not a Python callable — wrapping SIG_DFL
-    would swallow the termination)."""
+    :func:`request_shutdown` first. Returns True when at least one is hooked
+    (now or by an earlier call). Returns False — and logs a warning, so a
+    uvicorn release that changes how it captures signals is visible rather
+    than silently bringing #3015 back — when it cannot: not the main thread,
+    or no handler that is a Python callable (wrapping SIG_DFL would swallow
+    the termination)."""
     if threading.current_thread() is not threading.main_thread():
+        logger.warning("shutdown_hook_not_installed", reason="not the main thread")
         return False
     installed = False
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             current = signal.getsignal(sig)
-            if not callable(current) or getattr(current, _HOOK_MARK, False):
+            if getattr(current, _HOOK_MARK, False):
+                installed = True
+                continue
+            if not callable(current):
                 continue
 
             def _hook(signum: int, frame: Any, _chain: Any = current) -> None:
-                request_shutdown()
-                _chain(signum, frame)
+                # Runs in a Python signal handler: the chain to uvicorn's
+                # own handler must happen whatever request_shutdown does,
+                # or a stop (and a second, force-exit SIGINT) is lost.
+                try:
+                    request_shutdown()
+                finally:
+                    _chain(signum, frame)
 
             setattr(_hook, _HOOK_MARK, True)
             signal.signal(sig, _hook)
             installed = True
         except (ValueError, OSError) as exc:  # pragma: no cover - platform quirks
             logger.warning("shutdown_hook_install_failed", signal=int(sig), error=str(exc))
+    if not installed:
+        logger.warning(
+            "shutdown_hook_not_installed",
+            reason="no Python SIGTERM/SIGINT handler to wrap",
+            sigterm=repr(signal.getsignal(signal.SIGTERM)),
+            sigint=repr(signal.getsignal(signal.SIGINT)),
+        )
     return installed
