@@ -59,7 +59,7 @@ from uuid import UUID
 import structlog
 from fastapi import HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -212,12 +212,18 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
     so the two can never drift. Mirrors the inline handler's count query.
     """
     from app.models.dhcp import DHCPScope
-    from app.models.ipam import IPAddress
+    from app.models.ipam import IPAddress, Subnet
+    from app.services.ipam.subnet_placeholders import untouched_gateway_row
 
+    # The rows the subnet's own create added (network / broadcast / the
+    # untouched Gateway row, #3042) are not contents.
     user_ip_count = (
         await db.execute(
-            select(func.count(IPAddress.id)).where(
+            select(func.count(IPAddress.id))
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(
                 IPAddress.subnet_id == subnet_id,
+                not_(untouched_gateway_row()),
                 IPAddress.status.notin_(["network", "broadcast", "orphan"]),
                 IPAddress.auto_from_lease.is_(False),
             )

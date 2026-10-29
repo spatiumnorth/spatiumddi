@@ -19,6 +19,7 @@ from __future__ import annotations
 import ipaddress
 import uuid
 
+from sqlalchemy import ColumnElement, and_, false, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
@@ -55,6 +56,47 @@ def boundary_rows(net: IPNetwork, kind: str | None = "unicast") -> list[tuple[st
     return rows
 
 
+# The gateway row ``create_placeholder_rows`` writes, as one name each, so the
+# row it makes and the test for "still untouched" cannot drift apart.
+GATEWAY_STATUS = "reserved"
+GATEWAY_DESCRIPTION = "Gateway"
+GATEWAY_HOSTNAME = "gateway"
+
+
+def untouched_gateway_row() -> ColumnElement[bool]:
+    """SQL: this ``ip_address`` row is still the gateway placeholder its subnet's
+    create added (#3042) — reserved, "Gateway" / ``gateway``, sitting on
+    ``subnet.gateway`` and nothing more. Needs ``Subnet`` in the FROM. A row the
+    operator renamed, gave a MAC / DNS / owner / tags to, or turned into a real
+    allocation is not it, and neither is a hand-made row at another address.
+    NULL-safe: a subnet with no stored gateway has no placeholder."""
+    return func.coalesce(
+        and_(
+            IPAddress.status == GATEWAY_STATUS,
+            IPAddress.description == GATEWAY_DESCRIPTION,
+            IPAddress.hostname == GATEWAY_HOSTNAME,
+            IPAddress.address == Subnet.gateway,
+            IPAddress.role.is_(None),
+            IPAddress.mac_address.is_(None),
+            IPAddress.fqdn.is_(None),
+            IPAddress.managed_by.is_(None),
+            IPAddress.owner_user_id.is_(None),
+            IPAddress.owner_group_id.is_(None),
+            IPAddress.reserved_until.is_(None),
+            IPAddress.decom_date.is_(None),
+            IPAddress.forward_zone_id.is_(None),
+            IPAddress.reverse_zone_id.is_(None),
+            IPAddress.dns_record_id.is_(None),
+            IPAddress.dhcp_lease_id.is_(None),
+            IPAddress.static_assignment_id.is_(None),
+            IPAddress.auto_from_lease.is_(False),
+            IPAddress.custom_fields == text("'{}'::jsonb"),
+            IPAddress.tags == text("'{}'::jsonb"),
+        ),
+        false(),
+    )
+
+
 async def create_placeholder_rows(
     db: AsyncSession,
     subnet: Subnet,
@@ -84,9 +126,9 @@ async def create_placeholder_rows(
     gw_row = IPAddress(
         subnet_id=subnet.id,
         address=gw_addr,
-        status="reserved",
-        description="Gateway",
-        hostname="gateway",
+        status=GATEWAY_STATUS,
+        description=GATEWAY_DESCRIPTION,
+        hostname=GATEWAY_HOSTNAME,
         created_by_user_id=created_by_user_id,
     )
     db.add(gw_row)
