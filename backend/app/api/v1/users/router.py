@@ -7,13 +7,14 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import refuse_and_audit
 from app.core.security import hash_password
+from app.core.session_rotation import revoke_live_sessions
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.auth_provider import AuthProvider
@@ -488,13 +489,7 @@ async def update_user(
         # use while the account is disabled, as login and refresh refuse it.
         changes.update(
             is_active=body.is_active,
-            sessions_revoked=(
-                await db.execute(
-                    update(UserSession)
-                    .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
-                    .values(revoked=True)
-                )
-            ).rowcount,
+            sessions_revoked=(await revoke_live_sessions(db, UserSession.user_id == user.id)),
         )
         user.is_active = body.is_active
     if body.is_superadmin is not None:
@@ -578,11 +573,7 @@ async def reset_password(
     # here (unlike the self-service path): the admin is acting on someone
     # else's account, so all of the target's sessions die. Same revocation
     # statement ``/auth/logout`` uses.
-    await db.execute(
-        update(UserSession)
-        .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
-        .values(revoked=True)
-    )
+    await revoke_live_sessions(db, UserSession.user_id == user.id)
     audit = _audit(
         current_user, "reset_password", str(user.id), f"Reset password for {user.username}"
     )
@@ -676,11 +667,7 @@ async def link_provider(
     # administrator repairs one a second provider signed in as before #1235.
     # Sessions opened under the old identity must not outlive that, the
     # same reasoning as the admin password reset above (#400).
-    await db.execute(
-        update(UserSession)
-        .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
-        .values(revoked=True)
-    )
+    await revoke_live_sessions(db, UserSession.user_id == user.id)
     db.add(
         AuditLog(
             user_id=current_user.id,

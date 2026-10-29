@@ -10,7 +10,7 @@ import dns.rdataclass
 import dns.rdatatype
 import dns.zone
 
-from app.models.dns import servable_ttl
+from app.models.dns import DNS_TTL_MAX, servable_ttl
 
 # Record types SpatiumDDI stores in DNSRecord (matches VALID_RECORD_TYPES in router).
 SUPPORTED_RECORD_TYPES = {
@@ -55,6 +55,10 @@ class ParsedRecord:
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
+    # The file's TTL when it is past what a server can serve (RFC 2181's
+    # 2^31-1). ``ttl`` is then None, so the BIND9 configuration importer keeps
+    # inheriting $TTL; the zone-file import reports the row (#2913).
+    bad_ttl: int | None = None
 
     def key(self) -> tuple[str, str, str]:
         """Identity tuple used for diffing (name, type, value)."""
@@ -184,6 +188,7 @@ def parse_zone_file(text: str, zone_name: str) -> ParsedZone:
                 skipped_types[rtype_text] = skipped_types.get(rtype_text, 0) + len(rdataset)
                 continue
 
+            raw_ttl = int(rdataset.ttl)
             for rdata in rdataset:
                 value, pri, wgt, prt = _format_rdata(rdataset.rdtype, rdata)
                 records.append(
@@ -192,8 +197,10 @@ def parse_zone_file(text: str, zone_name: str) -> ParsedZone:
                         record_type=rtype_text,
                         value=value,
                         # #2073 — dnspython accepts up to 2^32-1; past RFC
-                        # 2181's 2^31-1 (and int4) the record inherits $TTL.
-                        ttl=servable_ttl(int(rdataset.ttl)) if rdataset.ttl else None,
+                        # 2181's 2^31-1 (and int4) the TTL is not servable.
+                        # A TTL of 0 is a TTL (#2913), never "none".
+                        ttl=servable_ttl(raw_ttl),
+                        bad_ttl=raw_ttl if raw_ttl > DNS_TTL_MAX else None,
                         priority=pri,
                         weight=wgt,
                         port=prt,

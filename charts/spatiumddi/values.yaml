@@ -175,7 +175,12 @@ api:
   # DATABASE_MAX_OVERFLOW. Unset (the default) leaves the application's own
   # 10 + 20. Every api pod holds its pool against the same Postgres, so
   # replicas x (size + maxOverflow) is what Postgres' max_connections and its
-  # memory limit have to hold. The appliance's supervisor sets it from the
+  # memory limit have to hold, plus three per pod outside the pool: the
+  # after-commit hooks' two (#2782) and the readiness probe's one (#2944).
+  # At the defaults (2..10 replicas, 33 each) that is 66..330 api
+  # connections, against the standalone postgres image's default
+  # max_connections of 100 and CloudNativePG's 200: an install that lets the
+  # HPA scale past two replicas should size the pool or max_connections. The appliance's supervisor sets it from the
   # control-plane node count (fewer per pod past four nodes).
   databasePool:
     size:
@@ -826,8 +831,8 @@ postgresql:
     parameters:
       # #2156 — every api pod's pool (api.databasePool) and every worker
       # process connects here, plus two per api / worker / beat process for
-      # the after-commit hooks (#2782); replicas x pool has to stay under
-      # this. The appliance's supervisor raises it past 200 when its
+      # the after-commit hooks (#2782) and one per api pod for its readiness
+      # probe (#2944); replicas x pool has to stay under this. The appliance's supervisor raises it past 200 when its
       # connection budget does (from five control-plane nodes).
       # #2955 — "" (the default) derives it from the pools: api pods (HPA max)
       # x (pool + 3) + workers x (concurrency x 3 + 1) + beat + WAL senders +

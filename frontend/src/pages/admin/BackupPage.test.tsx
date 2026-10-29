@@ -218,5 +218,8 @@ describe("Backup page", () => {
     fireEvent.click(screen.getByRole("button", { name: "Restore Drills" }));
     await screen.findByText(/permission to see backup targets/i);
     expect(screen.queryByText(/No backup targets configured yet/)).toBeNull();
+    // The drill history read was refused too (#2948): not "No drills".
+    await screen.findByText(/permission to see the drill history/i);
+    expect(screen.queryByText(/No drills have run yet/)).toBeNull();
   });
 });

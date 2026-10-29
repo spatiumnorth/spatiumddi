@@ -255,6 +255,17 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), nullable=False, index=True
     )
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # #2941 — set only by ``/auth/refresh`` when it rotates this row away, and
+    # never by any other revocation. They mark the revocation as a rotation,
+    # which is the only kind that gets the short grace window in
+    # ``app.core.session_rotation``: inside it, this row's cookie and access
+    # tokens stand for ``rotated_to_id``. NULL on every row revoked any other
+    # way (logout, force-logout, password change), which is refused at once.
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # No foreign key on purpose: a successor deleted with its user is simply
+    # not found, and a self-referencing FK would make every session delete
+    # scan this column.
+    rotated_to_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     # Issue #72 — admin session viewer. ``auth_source`` mirrors the
     # provider this session was minted against ("local" / provider

@@ -2367,8 +2367,13 @@ _API_CPU_MAX = 4
 # api's own pool: two more connections per api pod, per worker process and
 # for the one celery-beat.
 #
+# #2944 — ``/health/ready`` checks the database over its own one-connection
+# engine (``app.db.probe_engine``), outside the request pool and the hooks',
+# so a pool saturated by load cannot fail the probe: one more connection per
+# api pod, held open at idle.
+#
 # ``max_connections`` is the chart's 200 until the budget passes it (from
-# five nodes with four worker processes, eight with two), then the budget, so a pool is never refused a connection it was sized for
+# five nodes with four worker processes, seven with two), then the budget, so a pool is never refused a connection it was sized for
 # (``tests/test_postgres_connection_budget_2156.py`` holds that). It moves
 # with the memory limit, so it costs no restart of its own.
 _API_DB_POOL_SIZE = 10
@@ -2378,6 +2383,8 @@ _API_DB_CONN_CLUSTER = 120
 _WORKER_DB_CONN_SLACK = 1
 # #2782 — the after-commit hooks' engine, per api / worker / beat process.
 _HOOK_DB_CONN_PER_PROCESS = 2
+# #2944 — the readiness probe's own engine, per api pod.
+_PROBE_DB_CONN_PER_API_POD = 1
 _PG_CONN_RESERVE = 10
 _PG_BACKEND_BASE_MIB = 14
 _PG_FIXED_MIB = 256
@@ -2407,8 +2414,8 @@ def postgres_connection_budget(cp_size: int, worker_concurrency: int) -> int:
     """PURE (#2156): the backends the cluster can hold open on the primary —
     every api pod's whole pool, every worker's processes plus one, the
     #2782 after-commit hooks' two per api pod, per worker process and for
-    celery-beat, the WAL senders (one per replica) and a fixed reserve
-    (CloudNativePG's own and superuser connections, celery-beat's own, a
+    celery-beat, the #2944 readiness probe's one per api pod, the WAL
+    senders (one per replica) and a fixed reserve (CloudNativePG's own and superuser connections, celery-beat's own, a
     migrate Job, an operator's psql)."""
     cp = max(cp_size, 1)
     pool = api_db_pool(cp)
@@ -2417,6 +2424,7 @@ def postgres_connection_budget(cp_size: int, worker_concurrency: int) -> int:
         pool["size"]
         + pool["maxOverflow"]
         + hooks  # the api pod's hooks (#2782)
+        + _PROBE_DB_CONN_PER_API_POD  # the api pod's readiness probe (#2944)
         + worker_concurrency * (1 + hooks)  # each worker process, and its hooks
         + _WORKER_DB_CONN_SLACK
     )

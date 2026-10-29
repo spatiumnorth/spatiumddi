@@ -82,6 +82,69 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
+# ── Readiness-probe engine (#2944) ─────────────────────────────────────────
+#
+# /health/ready used to check a connection out of the request pool above. Under
+# load (about 90 concurrent bulk writes) that pool is exhausted, the probe's
+# checkout queued behind request traffic, blew its 4 s bound and took a busy but
+# healthy pod out of the Service. The probe now has ONE connection of its own
+# that no request can take, so it waits only on the database. A database that is
+# really down still fails it: the connect or the SELECT raises or times out.
+#
+# ``pool_timeout`` is under the endpoint's 4 s bound so two overlapping probes
+# answer "busy" rather than hang. The connection is created lazily for the
+# running event loop (an asyncpg connection is bound to its loop) and rebuilt if
+# the loop or process changes, as ``services.dispatch_db`` does.
+
+PROBE_POOL_TIMEOUT_S = 3
+
+
+class _ProbeEngineState:
+    engine: Any = None
+    loop: Any = None
+    pid: int | None = None
+
+
+_probe_state = _ProbeEngineState()
+
+
+def probe_engine() -> Any:
+    """The readiness probe's private one-connection engine."""
+    import asyncio  # noqa: PLC0415
+    import os  # noqa: PLC0415
+
+    loop = asyncio.get_running_loop()
+    if _probe_state.engine is not None and (
+        _probe_state.loop is not loop or _probe_state.pid != os.getpid()
+    ):
+        _probe_state.engine.sync_engine.dispose(close=False)
+        _probe_state.engine = None
+    if _probe_state.engine is None:
+        _probe_state.engine = create_async_engine(
+            settings.database_url,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=PROBE_POOL_TIMEOUT_S,
+            pool_pre_ping=True,
+            echo=False,
+            connect_args={"timeout": 5, "command_timeout": 30},
+        )
+        _probe_state.loop, _probe_state.pid = loop, os.getpid()
+    return _probe_state.engine
+
+
+def ProbeSessionLocal() -> AsyncSession:  # noqa: N802 - sessionmaker-shaped factory
+    """A session on the readiness probe's own engine."""
+    return AsyncSession(probe_engine(), expire_on_commit=False)
+
+
+async def dispose_probe_engine() -> None:
+    """Close the probe connection. Awaited from the api lifespan shutdown."""
+    engine, _probe_state.engine = _probe_state.engine, None
+    if engine is not None:
+        await engine.dispose()
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:

@@ -175,7 +175,14 @@ export function SessionsPage() {
                     className="border-b last:border-0 hover:bg-muted/20"
                   >
                     <td className="px-4 py-3">
-                      <div className="font-medium">{s.username}</div>
+                      <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                        {s.username}
+                        {s.is_current && (
+                          <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-normal text-sky-800 dark:bg-sky-900/30 dark:text-sky-300">
+                            this session
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-muted-foreground">
                         {s.display_name}
                       </div>

@@ -15,6 +15,8 @@ from app.config import settings
 from app.core.versions import canonical_version, nightly_build_date, parse_release
 from app.models.dns import DNSServer, DNSServerGroup
 
+from ._signed_in import signed_in_headers
+
 STAMP = "0.0.0-nightly-20261012+abc1234"
 
 
@@ -40,22 +42,23 @@ def test_everything_else_is_unchanged(v: str) -> None:
 
 @pytest.mark.asyncio
 async def test_version_endpoint_reports_the_agents_spelling(
-    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "version", "nightly-20261012")
     monkeypatch.setattr(settings, "app_version", STAMP)
-    resp = await client.get("/api/v1/version")
+    # The version is for signed-in callers only (#2935).
+    resp = await client.get("/api/v1/version", headers=await signed_in_headers(db_session))
     assert resp.status_code == 200
     assert resp.json()["version"] == STAMP
 
 
 @pytest.mark.asyncio
 async def test_version_endpoint_leaves_a_release_alone(
-    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "version", "2026.09.04-1")
     monkeypatch.setattr(settings, "app_version", "")
-    resp = await client.get("/api/v1/version")
+    resp = await client.get("/api/v1/version", headers=await signed_in_headers(db_session))
     assert resp.json()["version"] == "2026.09.04-1"
 
 
