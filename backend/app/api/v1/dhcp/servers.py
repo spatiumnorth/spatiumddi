@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -38,6 +38,7 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
@@ -257,6 +258,13 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2962 — who the current not-``ok`` daemon state came from: ``agent``
+    # (its own heartbeat) or ``supervisor`` (the appliance's supervisor, from
+    # the kubelet's container state, when the agent died with its container
+    # or has gone silent). ``null`` on ``ok`` or never reported. Derived
+    # (``container_oom.daemon_reported_by``), the same reading the alert's
+    # wording uses.
+    daemon_reported_by: Literal["agent", "supervisor"] | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -333,6 +341,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
             created_at=s.created_at,
             modified_at=s.modified_at,
         )

@@ -583,7 +583,12 @@ on its last-known-good config — so the chip, the banner and the alert all
 leave it to `agent_config_rejected`. They read one server-side
 classification, `daemon_not_serving` on the server response, so they
 cannot disagree. NULL means the agent has never reported one — a
-pre-#1061 agent, or an agentless driver — and is unknown, never healthy.
+pre-#1061 agent, or an agentless driver — and is unknown, never healthy;
+it is also what a row reads once its agent has been silent long enough for
+the health sweep to call the server `unreachable` (#2961), instead of the
+last `ok`. On an appliance the supervisor supplies the verdict the agent
+cannot (OOM kill, crash loop, a silent agent) from the kubelet's container
+state; the alert says so (`Supervisor reported: …`).
 
 ### Push spool — the reporting half of an outage (issue #1077)
 
