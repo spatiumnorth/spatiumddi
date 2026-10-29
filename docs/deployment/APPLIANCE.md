@@ -64,6 +64,10 @@ The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footp
 | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
 | **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 32 GiB SSD |
 
+Measured memory, CPU and disk for these roles and for a three-node control
+plane, the minimums, and how to measure your own install are in
+[`SIZING.md`](SIZING.md).
+
 **Measured floors (single node, 2026-09).** The recommendation above was
 tested against a fixed load rather than guessed: a single-node control
 plane serving one agent-based DNS group of **250k A records (+250k PTR)**
@@ -172,7 +176,12 @@ recommendation (4 vCPU / 8 GiB); the members carry the same api / worker /
 Postgres / Redis replicas. Measured on `main` (2026-09-03): three 6.5 GiB /
 4 vCPU nodes formed cleanly and kept every api replica and every k3s
 server up through the same 250k-record / 20k-device load and a kill-leader
-drill (0 k3s restarts, at most one api restart).
+drill (0 k3s restarts, at most one api restart). Measured again on 1.0
+pre-release builds (October 2026): a first node of 4 vCPU / 8 GiB with two
+of 2 vCPU / 6 GiB ran the realistic load, the HA drills and a rolling
+upgrade with no OOM kill, using at most 4.4 GiB on any node. Give every node
+48 GiB of disk: a slot upgrade followed by a rolling upgrade took `/var` on
+40 GiB disks to the 80% disk warning. See [`SIZING.md`](SIZING.md).
 
 **Data disk for large installs (#2240).** Everything that grows with the data lives on `/var`: the Postgres volumes, etcd, the container images and the logs. `/var` is what the disk has left after about 17 GiB of fixed partitions (`spatium-install`: the boot partitions, a 256 MiB state partition and two 8 GiB root slots), so a 40 GiB disk gives 23 GiB of `/var` and a 64 GiB disk 47 GiB. On a seven-node test cluster with 40 GiB disks and every node serving DNS, `/var` reached 88 to 91% on every node at about 1.5M records (about 770,000 devices, an A record and its PTR each), growing about 2 GB an hour per node while records were added at 80 to 190 a second. With the disks grown online to 64 GiB, `/var` read 43 to 45%, and the cluster went on to store 1M devices (2M records). So **for about 1M devices, give every control-plane node a disk of 64 GiB or more**: the 40 GiB above goes with the load the floors were measured at (250k A records and their PTRs). Leave room beyond that for Postgres WAL. After a failover, a primary that still holds replication slots for standbys that cannot follow keeps every WAL segment, and on 64 GiB disks one node's `/var` reached 87% with 26 GB of WAL against 3.3 GB of data (#2317). The default-on `appliance_disk_usage` alert watches `/var` on every node: a warning at 80% and critical at 87%, a few points before the kubelet starts evicting pods at about 90%. Those figures count the 5% that ext4 keeps for root as free, so `df` shows a few points more (see [`OBSERVABILITY.md`](../OBSERVABILITY.md)).
 

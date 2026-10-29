@@ -302,6 +302,12 @@ Every workload has `resources.requests`/`limits` defaults in
 blocks) and a per-component `nodeSelector` / `tolerations` / `affinity` /
 `podAnnotations`. Override them under the matching key.
 
+Per-pod memory measured on the appliance, which runs this same chart, is in
+[`SIZING.md`](SIZING.md#kubernetes). The api process alone held 0.4 to 0.85
+GiB there, above the default `api.resources.limits.memory` of 512Mi, so set
+it to `1Gi` or more. These figures come from the appliance and are not yet
+measured on another Kubernetes cluster.
+
 The **api Deployment has a HorizontalPodAutoscaler** (`autoscaling/v2`), gated
 on `api.autoscaling.enabled` (**default `true`**):
 
