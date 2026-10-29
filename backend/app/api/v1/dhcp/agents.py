@@ -35,6 +35,7 @@ from app.core.celery_dispatch import dispatch
 from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -1134,7 +1135,9 @@ async def agent_heartbeat(
     if (
         server.desired_appliance_version is not None
         and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
+        and is_installed_target(
+            server.installed_appliance_version, server.desired_appliance_version
+        )
         and (server.last_upgrade_state in ("done", None))
     ):
         server.desired_appliance_version = None
