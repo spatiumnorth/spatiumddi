@@ -45,15 +45,19 @@ function shortenUA(ua: string | null): string {
 }
 
 export function SessionsPage() {
-  const { data: me } = useQuery({
+  const { data: me, isPending: meLoading } = useQuery({
     queryKey: ["auth-me"],
     queryFn: () => authApi.me(),
     staleTime: 60_000,
   });
   const isSuperadmin = !!me?.is_superadmin;
-  const [scope, setScope] = useState<"mine" | "all">(
-    isSuperadmin ? "all" : "mine",
-  );
+  // #3010: the scope follows `me` until the operator picks one. It used to be
+  // useState's initial value, read once on the first render, so a page load
+  // where auth-me had not answered yet (a URL, a bookmark, a reload) started a
+  // superadmin on "My sessions" for good. A pick is kept whatever auth-me
+  // answers later, and a user who is not a superadmin is always on "mine".
+  const [pickedScope, setScope] = useState<"mine" | "all" | null>(null);
+  const scope = isSuperadmin ? (pickedScope ?? "all") : "mine";
   const [includeExpired, setIncludeExpired] = useState(false);
   const qc = useQueryClient();
 
@@ -63,7 +67,10 @@ export function SessionsPage() {
       scope === "all"
         ? sessionsApi.listAll(includeExpired)
         : sessionsApi.listMine(includeExpired),
+    // Until auth-me answers, the page cannot know which list it is showing.
+    enabled: !meLoading,
   });
+  const loading = meLoading || isLoading;
 
   const revoke = useMutation({
     mutationFn: (id: string) => sessionsApi.revoke(id),
@@ -89,6 +96,7 @@ export function SessionsPage() {
               <div className="flex rounded-md border bg-background p-0.5 text-xs">
                 <button
                   onClick={() => setScope("all")}
+                  aria-pressed={scope === "all"}
                   className={cn(
                     "rounded px-2 py-1",
                     scope === "all"
@@ -100,6 +108,7 @@ export function SessionsPage() {
                 </button>
                 <button
                   onClick={() => setScope("mine")}
+                  aria-pressed={scope === "mine"}
                   className={cn(
                     "rounded px-2 py-1",
                     scope === "mine"
@@ -121,7 +130,7 @@ export function SessionsPage() {
             </label>
             <button
               onClick={() => refetch()}
-              disabled={isFetching}
+              disabled={isFetching || meLoading}
               className={headerCls}
             >
               <RefreshCcw
@@ -147,7 +156,7 @@ export function SessionsPage() {
               </tr>
             </thead>
             <tbody className={zebraBodyCls}>
-              {isLoading && (
+              {loading && (
                 <tr>
                   <td
                     colSpan={8}
@@ -157,7 +166,7 @@ export function SessionsPage() {
                   </td>
                 </tr>
               )}
-              {!isLoading && (data?.length ?? 0) === 0 && (
+              {!loading && (data?.length ?? 0) === 0 && (
                 <tr>
                   <td
                     colSpan={8}
