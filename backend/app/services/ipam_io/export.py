@@ -140,6 +140,7 @@ async def _collect(
             "name": b.name,
             "description": b.description,
             "utilization_percent": b.utilization_percent,
+            "allocated_ips": b.allocated_ips,
             "custom_fields": b.custom_fields or {},
         }
         for b in blocks_raw

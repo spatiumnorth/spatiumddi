@@ -106,8 +106,8 @@ not the operator's:
   about 120 api connections in all), and the limit is never below
   shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
   can open 52 connections at one node, 134 at three and 227 at nine (two
-  worker processes); `max_connections` stays the chart's 200 until that
-  passes it, then follows it. One node of 8 GiB or more keeps the share
+  worker processes); `max_connections` stays at the appliance floor of 200
+  until that passes it, then follows it. One node of 8 GiB or more keeps the share
   above; a three-node cluster on a 12 GiB seed gets 3019Mi, a nine-node one
   4507Mi. A promote or demote that moves the limit is one CloudNativePG
   rolling restart.

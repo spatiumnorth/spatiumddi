@@ -3693,6 +3693,8 @@ export interface SearchResponse {
   total: number;
   results: SearchResult[];
   searched_types: SearchTypeInfo[];
+  /** True when `total` is a floor — a type hit the server's fetch cap. */
+  total_capped?: boolean;
 }
 
 export const searchApi = {
@@ -5547,6 +5549,11 @@ export interface DaemonStateFields {
   daemon_reason: string | null;
   daemon_status_since: string | null;
   daemon_not_serving: boolean | null;
+  /** #2962 — who reported the current not-`ok` state: the agent itself, or
+   * the appliance's supervisor from the kubelet's container state (the agent
+   * died with its container, or has gone silent). Null on `ok` / never
+   * reported. Optional: an older server omits it, which reads as `agent`. */
+  daemon_reported_by?: "agent" | "supervisor" | null;
 }
 
 export interface DNSServer {

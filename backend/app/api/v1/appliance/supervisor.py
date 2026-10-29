@@ -124,8 +124,8 @@ from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
 from app.services.agents.container_oom import (
     apply_container_oom,
-    container_oom_report,
-    is_oom_reason,
+    carry_restart_history,
+    verdict_needs_write,
 )
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
@@ -2239,8 +2239,10 @@ _HEARTBEAT_HOLD_CAP_S = 28.0
 
 
 async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
-    """Stamp a current ``OOMKilled`` from ``appliance.role_health`` onto the
-    DNS and DHCP server rows this appliance's containers serve (#2018, #2023).
+    """Stamp the supervisor's verdict from ``appliance.role_health`` onto the
+    DNS and DHCP server rows this appliance's containers serve: a current
+    ``OOMKilled`` (#2018, #2023), a crash loop whatever the kubelet calls the
+    cause, or an agent that has gone silent under a live supervisor (#2961).
     See ``app.services.agents.container_oom``.
 
     One row per engine: the most recently seen of the rows this appliance
@@ -2286,12 +2288,7 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
                 getattr(best, seen_attr) or floor
             ):
                 live[server.driver] = server
-        ids = [
-            s.id
-            for s in live.values()
-            if container_oom_report(health, s.driver, now) is not None
-            and not is_oom_reason(s.daemon_reason)
-        ]
+        ids = [s.id for s in live.values() if verdict_needs_write(s, health, now)]
         if not ids:
             continue
         locked = (
@@ -2465,6 +2462,9 @@ async def _supervisor_heartbeat(
     if refusal is not None:
         raise refusal
 
+    # #2961 — the previous heartbeat, so the role_health carry can tell an
+    # unbroken run of supervisor heartbeats from one resuming after a gap.
+    supervisor_prev_seen = row.last_seen_at
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
     if body.capabilities is not None:
@@ -2634,7 +2634,19 @@ async def _supervisor_heartbeat(
         # entries when the operator removes a role, and the
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
-        row.role_health = dict(body.role_health)
+        # #2961 — the kubelet's restartCount is lifetime, so the restarts
+        # inside the crash-loop window are measured across heartbeats: each
+        # container's observed counts are carried forward from the stored
+        # row (a backend-owned key; one the supervisor sends is dropped).
+        # It also stamps when the supervisor's current unbroken run of
+        # heartbeats began, which bounds how long a silent agent can be said
+        # to have been silent.
+        row.role_health = carry_restart_history(
+            row.role_health,
+            dict(body.role_health),
+            datetime.now(UTC),
+            supervisor_last_seen=supervisor_prev_seen,
+        )
         # #2018 — the kubelet's OOMKilled for a DNS role container, onto the
         # server row. The agent died in the same group kill and cannot say
         # it; while the container crash-loops this is the only report.

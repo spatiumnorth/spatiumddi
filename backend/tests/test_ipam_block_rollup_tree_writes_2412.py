@@ -5,6 +5,10 @@ writes still skipped it: Move to Trash of a subnet / block, a New Block that
 adopts existing subnets, the cross-space block move, plan apply, and a trash
 restore. After each, ``allocated_ips`` of a block must equal the sum over the
 live subnets of its subtree.
+
+Each subnet counts in its block with its network and broadcast addresses
+(a block's utilisation is the share of its CIDR in use, #2982), so every
+IPv4 subnet below /31 here adds ``_NB`` more to its block than to itself.
 """
 
 from __future__ import annotations
@@ -16,6 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPBlock, IPSpace
 from tests.test_ipam_alias_cname_exclusive_2080 import _headers
+
+# What an IPv4 subnet below /31 adds to its block beyond its own count:
+# its network + broadcast addresses (#2982).
+_NB = 2
 
 
 async def _space_block(db: AsyncSession, net: str) -> tuple[str, str]:
@@ -65,7 +73,7 @@ async def test_trash_subnet_and_new_block_adoption(client: AsyncClient, db_sessi
     s0 = await _subnet(client, h, space, root, "10.227.0.0/24")
     s1 = await _subnet(client, h, space, root, "10.227.1.0/24")
     s40 = await _subnet(client, h, space, root, "10.227.40.0/24")
-    per_subnet = await _alloc(client, h, "subnets", s0)
+    per_subnet = await _alloc(client, h, "subnets", s0) + _NB
     assert await _alloc(client, h, "blocks", root) == 3 * per_subnet
 
     # Move to Trash of one /24: the parent block stops counting it.
@@ -87,7 +95,7 @@ async def test_trash_subnet_and_new_block_adoption(client: AsyncClient, db_sessi
     assert r.status_code == 201, r.text
     assert r.json()["allocated_ips"] == per_subnet
     assert r.json()["total_ips"] == 1024
-    assert await _alloc(client, h, "subnets", s40) == per_subnet
+    assert await _alloc(client, h, "subnets", s40) + _NB == per_subnet
     assert await _alloc(client, h, "blocks", root) == 2 * per_subnet
 
     # Restoring the trashed subnet brings it back into the rollup.
@@ -108,11 +116,11 @@ async def test_trash_block_updates_parent(client: AsyncClient, db_session: Async
     child = r.json()["id"]
     await _subnet(client, h, space, child, "10.228.1.0/25")
     keep = await _subnet(client, h, space, root, "10.228.2.0/24")
-    assert await _alloc(client, h, "blocks", root) > await _alloc(client, h, "subnets", keep)
+    assert await _alloc(client, h, "blocks", root) > await _alloc(client, h, "subnets", keep) + _NB
 
     d = await client.delete(f"/api/v1/ipam/blocks/{child}", headers=h)
     assert d.status_code == 204, d.text
-    assert await _alloc(client, h, "blocks", root) == await _alloc(client, h, "subnets", keep)
+    assert await _alloc(client, h, "blocks", root) == await _alloc(client, h, "subnets", keep) + _NB
 
 
 async def test_cross_space_block_move_rolls_up_both_sides(
@@ -133,7 +141,7 @@ async def test_cross_space_block_move_rolls_up_both_sides(
     )
     mv = r.json()["id"]
     s = await _subnet(client, h, space_a, mv, "10.229.1.0/25")
-    per = await _alloc(client, h, "subnets", s)
+    per = await _alloc(client, h, "subnets", s) + _NB
     assert await _alloc(client, h, "blocks", root_a) == per
 
     # Move 10.229.1.0/24 into space B under 10.230.0.0/16 (needs a non-overlapping
@@ -151,7 +159,7 @@ async def test_cross_space_block_move_rolls_up_both_sides(
     assert r.status_code == 201
     mv2 = r.json()["id"]
     s2 = await _subnet(client, h, space_a, mv2, "10.229.9.0/25")
-    per2 = await _alloc(client, h, "subnets", s2)
+    per2 = await _alloc(client, h, "subnets", s2) + _NB
     assert await _alloc(client, h, "blocks", root_a) == per + per2
 
     cm = await client.post(
@@ -198,8 +206,9 @@ async def test_plan_apply_rolls_up_created_rows(client: AsyncClient, db_session:
     ap = await client.post(f"/api/v1/ipam/plans/{c.json()['id']}/apply", headers=h)
     assert ap.status_code == 200, ap.text
     sub_ids = ap.json()["subnet_ids"]
-    per = [await _alloc(client, h, "subnets", sid) for sid in sub_ids]
-    assert all(p > 0 for p in per)  # placeholder rows
+    own = [await _alloc(client, h, "subnets", sid) for sid in sub_ids]
+    assert all(p > 0 for p in own)  # placeholder rows
+    per = [p + _NB for p in own]
     bid = ap.json()["block_ids"][-1]
     assert await _alloc(client, h, "blocks", bid) == sum(per)
     assert await _alloc(client, h, "blocks", root) == sum(per)
