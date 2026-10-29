@@ -39,6 +39,9 @@ services:
   api:
     image: ghcr.io/spatiumnorth/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
+    # #2944 — above the image's uvicorn --timeout-graceful-shutdown (20 s) so
+    # lifespan shutdown runs before the kill; Docker's default is 10 s.
+    stop_grace_period: 30s
     networks:
       - spatiumddi
     ports:

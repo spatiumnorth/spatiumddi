@@ -214,7 +214,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # peer, and applies X-Real-IP / X-Forwarded-Proto only when that peer is
 # in TRUSTED_PROXY_CIDRS, so audit rows still record the end user's IP
 # behind nginx rather than the nginx container's.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]
+#
+# --timeout-graceful-shutdown (#2944): without it uvicorn waits for every
+# in-flight request, so one started just before a stop can outlast the
+# orchestrator's grace period and the kill lands before lifespan shutdown
+# (which disposes the after-commit hooks' engine, #2782). 20 s must stay BELOW
+# every grace period that stops this image: 30 s in k8s/base, the chart and the
+# compose files' api ``stop_grace_period`` (Docker's own default is 10 s, so
+# compose sets it). tests/test_api_graceful_shutdown.py pins the ordering.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers", "--timeout-graceful-shutdown", "20"]
 
 
 # ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────

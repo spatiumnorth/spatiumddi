@@ -190,6 +190,9 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-slot-image-mirror.py" "$file" \
         || failures=$((failures + 1))
+    # #2955 — the api / worker / beat pools must fit max_connections.
+    python3 "$ROOT/.github/scripts/chart-postgres-connections.py" "$file" \
+        || failures=$((failures + 1))
     # #2317 / #2132 — CNPG WAL bounded at half its volume; the supervisor may
     # re-clone a stuck instance.
     python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" "$file" \
@@ -436,6 +439,42 @@ PYEOF
     failures=$((failures + 1))
 else
     echo "   ok: worker without APPLIANCE_MODE refused"
+fi
+# #2955 — the derived max_connections holds the pools at several HPA shapes,
+# on both Postgres kinds, and the derived memory limit holds those connections;
+# a pinned too-small value must be refused.
+echo "── Postgres connection budget (umbrella, #2955)"
+for shape in "std::" "hpa30::--set api.autoscaling.maxReplicas=30" \
+    "nohpa::--set api.autoscaling.enabled=false --set api.replicas=4" \
+    "pool::--set api.databasePool.size=5 --set api.databasePool.maxOverflow=5 --set worker.concurrency=8"; do
+    for kind in standalone cnpg; do
+        # shellcheck disable=SC2086
+        helm template pgc "$UMBRELLA" --kube-version "$K8S_VERSION" \
+            --set postgresql.kind=$kind ${shape#*::} \
+            | python3 "$ROOT/.github/scripts/chart-postgres-connections.py" --require --check-memory - \
+            || { echo "   FAIL: ${shape%%::*}/$kind" >&2; failures=$((failures + 1)); }
+    done
+done
+echo "── negative control: a pinned max_connections below the pools must fail"
+# Decided on the guard's own message, not its exit status alone: a guard that
+# crashed would exit non-zero too, and read as a refusal.
+pgc_out=$(helm template pgc "$UMBRELLA" --kube-version "$K8S_VERSION" --set postgresql.maxConnections=100 \
+    | python3 "$ROOT/.github/scripts/chart-postgres-connections.py" --require - 2>&1 || true)
+if printf '%s' "$pgc_out" | grep -q "but max_connections is 100 (#2955)"; then
+    echo "   ok: max_connections=100 refused"
+else
+    echo "   FAIL: chart-postgres-connections.py did not refuse max_connections=100: $pgc_out" >&2
+    failures=$((failures + 1))
+fi
+echo "── negative control: a max_connections the memory limit cannot hold must fail"
+# A pinned max_connections leaves the limit at the chart's 1Gi.
+pgc_out=$(helm template pgc "$UMBRELLA" --kube-version "$K8S_VERSION" --set postgresql.maxConnections=369 \
+    | python3 "$ROOT/.github/scripts/chart-postgres-connections.py" --require --check-memory - 2>&1 || true)
+if printf '%s' "$pgc_out" | grep -q "the Postgres memory limit is 1024Mi"; then
+    echo "   ok: 369 connections in 1Gi refused"
+else
+    echo "   FAIL: chart-postgres-connections.py did not refuse 369 connections in 1Gi: $pgc_out" >&2
+    failures=$((failures + 1))
 fi
 POSTURE_ARGS="--require-priority"
 render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"

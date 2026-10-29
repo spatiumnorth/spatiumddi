@@ -35,6 +35,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
+from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
 from app.tasks.module_gate import module_gated
 
@@ -100,6 +101,9 @@ async def _check_health(server_id: uuid.UUID) -> None:
                     server.status = "active"
                 else:
                     server.status = "unreachable"
+                    # #2961 — no heartbeat, so no current daemon state: the
+                    # last ``ok`` is not evidence of anything any more.
+                    forget_stale_ok(server)
 
             server.last_health_check_at = now
             await db.commit()

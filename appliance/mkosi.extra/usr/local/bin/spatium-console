@@ -1829,8 +1829,10 @@ def detect_slot_info() -> tuple[str, str] | None:
         future boots will land on; differs from current during a
         TRIAL boot before spatiumddi-firstboot commits via
         grub-set-default after /health/live passes).
-    Cached for the life of the process — neither value changes at
-    runtime under normal operation."""
+    ``current`` never changes while we run, so it is cached for the life of
+    the process. ``durable`` DOES: the console starts before
+    ``spatiumddi-firstboot`` commits a trial boot with ``grub-set-default``,
+    so the 5 s data tier re-reads it via ``refresh_durable_slot()`` (#3026)."""
     cmdline = ""
     try:
         cmdline = Path("/proc/cmdline").read_text()
@@ -1898,6 +1900,20 @@ def slot_info() -> tuple[str, str] | None:
     return _SLOT_INFO_CACHE  # type: ignore[return-value]
 
 
+def refresh_durable_slot(saved_entry: str | None) -> None:
+    """#3026 — fold a freshly-read grubenv ``saved_entry`` into the cached slot
+    info. Only ``durable`` is replaced; ``current`` (the slot we booted from)
+    is static. ``None`` (grubenv unreadable) keeps the last known value so a
+    transient probe failure cannot flip the verdict; ``""`` (readable, no
+    saved_entry) is stored as-is, matching ``detect_slot_info()``."""
+    global _SLOT_INFO_CACHE
+    cached = _SLOT_INFO_CACHE
+    if cached is _UNPROBED or cached is None or saved_entry is None:
+        return
+    current, _old = cached  # type: ignore[misc]
+    _SLOT_INFO_CACHE = (current, saved_entry)
+
+
 # P0.8 — per-slot installed versions, written by ``spatium-upgrade-slot
 # sync-versions`` on every boot + at the end of every apply. On the host
 # the supervisor's ``/var/lib/spatiumddi-host/release-state/`` resolves to
@@ -1920,17 +1936,9 @@ def read_slot_versions() -> tuple[str | None, str | None]:
     return (a if isinstance(a, str) else None), (b if isinstance(b, str) else None)
 
 
-def read_grub_next_entry() -> str | None:
-    """Read grubenv's one-shot ``next_entry`` — set by
-    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
-    different slot than the durable default (a queued trial boot). Cleared
-    by grub on the next boot. ``None`` when unset / unreadable.
-
-    Unlike ``detect_slot_info()``'s ``saved_entry`` read (process-lifetime
-    cached because the slot we booted from never changes mid-run),
-    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, so this
-    must be read fresh on the 5 s data tier — never cached for the process
-    lifetime."""
+def read_grubenv() -> dict[str, str] | None:
+    """``grub-editenv list`` as a dict, or ``None`` when unreadable. One
+    subprocess — call it on the 5 s data tier only, never the render path."""
     try:
         out = subprocess.run(
             ["grub-editenv", "/boot/efi/grub/grubenv", "list"],
@@ -1939,11 +1947,26 @@ def read_grub_next_entry() -> str | None:
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired, OSError):
         return None
+    env: dict[str, str] = {}
     for line in out.splitlines():
-        if line.startswith("next_entry="):
-            val = line.split("=", 1)[1].strip()
-            return val or None
-    return None
+        key, sep, val = line.partition("=")
+        if sep:
+            env[key] = val.strip()
+    return env
+
+
+def read_grub_next_entry() -> str | None:
+    """Read grubenv's one-shot ``next_entry`` — set by
+    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
+    different slot than the durable default (a queued trial boot). Cleared
+    by grub on the next boot. ``None`` when unset / unreadable.
+
+    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, and
+    ``saved_entry`` is moved by firstboot after the console started (#3026),
+    so both are read fresh on the 5 s data tier — never cached for the
+    process lifetime."""
+    env = read_grubenv()
+    return (env.get("next_entry") or None) if env else None
 
 
 def appliance_version_string(env: dict[str, str]) -> str:
@@ -2809,8 +2832,9 @@ def render_header(
     spinner is derived live from mono_t so its rotation animates at the
     render cadence — that's the one thing operators want jittery (visible
     "alive" indicator). The verdict title chip + border colour (P0.3) are
-    unchanged. No subprocess on this path: ``slot_info()`` is process-cached
-    and ``supervisor_watchdog_status()`` is a file-stat — both already lived
+    unchanged. No subprocess on this path: ``slot_info()`` is a memory read
+    (its durable half is refreshed on the 5 s tier) and
+    ``supervisor_watchdog_status()`` is a file-stat — both already lived
     here pre-Phase-2 and feed only the verdict roll-up.
     """
     env = state.env
@@ -3473,7 +3497,30 @@ def reboot_pending() -> bool:
     return (
         (_RELEASE_STATE_DIR / "reboot-pending-fleet").exists()
         or (_RELEASE_STATE_DIR / "reboot-pending").exists()
+        or power_action_in_progress() is not None
     )
+
+
+#: #2974 — spatium-power-action writes "<pid> <action>" here while it runs
+#: (the handoff of the PostgreSQL primary, then systemctl). /run is a tmpfs.
+POWER_ACTION_MARKER = Path("/run/spatium-power-action")
+
+
+def power_action_in_progress() -> str | None:
+    """#2974 — "reboot" or "poweroff" while spatium-power-action runs (from
+    the web UI or F5 / F6), else None. The web-UI unit renames its trigger
+    before the handoff, so without this the console would show nothing
+    pending for the up to few minutes the handoff takes, and F9 would say
+    there is nothing to cancel. A marker whose process is gone (a wrapper
+    killed outright) counts as nothing under way. One small read, no
+    subprocess."""
+    try:
+        pid, action = POWER_ACTION_MARKER.read_text().split()[:2]
+    except (OSError, ValueError):
+        return None
+    if not pid.isdigit() or action not in ("reboot", "poweroff"):
+        return None
+    return action if os.path.exists(f"/proc/{pid}") else None
 
 
 def upgrade_status() -> tuple[str, str] | None:
@@ -4180,7 +4227,7 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
 # ── Phase 2 KPI ribbon (§4) ────────────────────────────────────────────
 # A row of fixed-height (3 body + 2 border = 5) stat boxes placed in the
 # ``kpi`` Layout. Every box reads state.* ONLY (the few file-stats here —
-# slot_info() process-cached, reboot_pending()/upgrade_status() stat the
+# slot_info() a memory read, reboot_pending()/upgrade_status() stat the
 # release-state dir — already rode the PHASE-1 header render path, so this
 # is no regression). Each box is rendered through ``_kpi_safe`` so a single
 # malformed value degrades to a dim "n/a" box rather than blanking the frame.
@@ -4418,6 +4465,13 @@ def render_kpi_slot(state: "DashboardState") -> Panel:
         elif step:
             t.append(f" · {step}", style="dim")
         rows.append(t)
+        border = "yellow"
+    elif (power := power_action_in_progress()) is not None:
+        # #2974 — the handoff of the PostgreSQL primary runs first (up to a
+        # few minutes on the primary's node); F9 still cancels it.
+        what = "REBOOT" if power == "reboot" else "POWER-OFF"
+        rows.append(Text(f"{what} under way — handing off DB primary · F9 cancel",
+                         style="bold bright_yellow"))
         border = "yellow"
     elif reboot_pending():
         # #556 — F5 acks (reboots now), F9 aborts the queued reboot.
@@ -4681,7 +4735,7 @@ class DashboardState:
         }
         # P0.8 — per-slot versions + grubenv next_entry. These change at
         # RUNTIME (an apply restamps versions; a Fleet trial-boot sets
-        # next_entry), so unlike slot_info()'s process-lifetime cache
+        # next_entry), so unlike the static half of slot_info()
         # they're refreshed on the 5 s data tier.
         self.slot_a_version: str | None = None
         self.slot_b_version: str | None = None
@@ -4867,7 +4921,16 @@ class DashboardState:
             # (one subprocess, fine at 5 s). Cached so the render path
             # never touches disk / grub for these runtime-changing values.
             self.slot_a_version, self.slot_b_version = read_slot_versions()
-            self.slot_next_entry = read_grub_next_entry()
+            _grub = read_grubenv()
+            self.slot_next_entry = ((_grub or {}).get("next_entry")) or None
+            # #3026 — saved_entry moves when firstboot commits a trial boot,
+            # after this process started; keep the verdict in step. A
+            # readable grubenv with no saved_entry is "no durable default"
+            # (what detect_slot_info() reports); only an UNREADABLE one
+            # (None) keeps the last value.
+            refresh_durable_slot(
+                _grub.get("saved_entry", "") if _grub is not None else None
+            )
             try:
                 self.env = read_env()
             except Exception:
@@ -5042,18 +5105,45 @@ def do_login(tty_path: str) -> None:
         os.execvp("login", ["login"])
 
 
-def do_reboot(console: Console) -> None:
+# #2974 — reboot / poweroff go through one wrapper, spatium-power-action,
+# that hands the PostgreSQL primary off to another node first (as the web-UI
+# and Fleet reboots do). It runs as a systemd unit, started without waiting:
+# the handoff can take a few minutes, during which the dashboard keeps
+# rendering (the banner shows it under way, F9 cancels it), and the run
+# belongs to systemd, so a console restart cannot kill it mid-handoff and
+# leave the node cordoned with no reboot.
+POWER_ACTION_UNIT = "spatium-power-action@{}.service"
+
+
+def _start_power_action(console: Console, state: "DashboardState | None", action: str,
+                        label: str) -> None:
+    unit = POWER_ACTION_UNIT.format(action)
+    try:
+        res = subprocess.run(["systemctl", "start", "--no-block", unit],
+                             capture_output=True, text=True, timeout=15,
+                             check=False)
+        ok, why = res.returncode == 0, (res.stderr or res.stdout).strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        ok, why = False, str(exc)
+    if ok:
+        msg = (f"{label}: handing off the database primary first "
+               "(up to a few minutes) · F9 cancels")
+    else:
+        msg = f"{label} could not be started: {why.splitlines()[-1] if why else 'no output'}"
+    if state is not None:
+        state.flash(msg, ttl=20 if ok else 10)
+    else:
+        console.print(f"\n\n[bold yellow]{msg}[/bold yellow]\n")
+
+
+def do_reboot(console: Console, state: "DashboardState | None" = None) -> None:
     if confirm_modal(console, "Reboot the appliance now?"):
-        console.clear()
-        console.print("\n\n[bold yellow]Rebooting…[/bold yellow]\n")
-        subprocess.run(["systemctl", "reboot"], check=False)
+        _start_power_action(console, state, "reboot", "Rebooting")
 
 
-def do_shutdown(console: Console) -> None:
+def do_shutdown(console: Console, state: "DashboardState | None" = None) -> None:
     if confirm_modal(console, "Power off the appliance now?"):
-        console.clear()
-        console.print("\n\n[bold yellow]Powering off…[/bold yellow]\n")
-        subprocess.run(["systemctl", "poweroff"], check=False)
+        _start_power_action(console, state, "poweroff", "Powering off")
 
 
 def do_cancel_reboot(console: Console) -> None:
@@ -5068,9 +5158,14 @@ def do_cancel_reboot(console: Console) -> None:
     sleep before the reboot ExecStart) + remove the trigger so the edge-
     triggered ``.path`` unit has nothing to re-fire on.
 
-    Best-effort: if the grace already elapsed there's nothing to stop and
-    the box reboots anyway — same as before this key existed. Stopping an
-    inactive unit is a harmless no-op."""
+    #2974 — the web-UI unit and the console's F5 / F6 unit then hand the
+    PostgreSQL primary off before ``systemctl reboot`` (up to a few
+    minutes); stopping them during that makes ``spatium-power-action``
+    undo the handoff's cordon, and nothing reboots.
+
+    Best-effort: if ``systemctl reboot`` has already been issued there's
+    nothing to stop and the box reboots anyway — same as before this key
+    existed. Stopping an inactive unit is a harmless no-op."""
     if not reboot_pending():
         console.clear()
         console.print("\n\n[dim]No reboot is currently pending.[/dim]\n")
@@ -5082,9 +5177,12 @@ def do_cancel_reboot(console: Console) -> None:
     console.print("\n\n[bold yellow]Cancelling pending reboot…[/bold yellow]\n")
     # Stop both reboot services — one owns the web-UI path, the other the
     # fleet path; only one is active, and stopping the idle one is a no-op.
+    # #2974 — and the console's own F5 / F6 runs; stopping one mid-handoff
+    # makes spatium-power-action undo the handoff's cordon.
     subprocess.run(
         ["systemctl", "stop",
-         "spatiumddi-reboot.service", "spatiumddi-reboot-agent.service"],
+         "spatiumddi-reboot.service", "spatiumddi-reboot-agent.service",
+         POWER_ACTION_UNIT.format("reboot"), POWER_ACTION_UNIT.format("poweroff")],
         check=False,
     )
     # Remove the trigger(s) so reboot_pending() clears and the .path units
@@ -6262,9 +6360,9 @@ def main() -> int:
                                     _prepare_tty_for_subprocess(args.tty)
                                     do_login(args.tty)  # noreturn
                                 elif action == "reboot":
-                                    do_reboot(console)
+                                    do_reboot(console, state)
                                 elif action == "shutdown":
-                                    do_shutdown(console)
+                                    do_shutdown(console, state)
                                 elif action == "cancel_reboot":
                                     do_cancel_reboot(console)
                                 elif action == "monitor":

@@ -51,6 +51,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     ),
     # #1468 — the group-name rule must match the supervisor's own pattern.
     "test_appliance_group_names.py": ("agent/supervisor/spatium_supervisor/role_orchestrator.py"),
+    # #3026 — the supervisor's "is the booted slot the target?" copy must
+    # answer exactly as the control plane's.
+    "test_nightly_upgrade_cleared_3026.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
     # #1465: runs the demo seeder's own template payloads through the API model.
@@ -61,6 +66,13 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_rolling_upgrade_redis_master_2815.py": (
         "charts/spatiumddi/templates/worker.yaml",
         "k8s/base/worker.yaml",
+    ),
+    # #2944: uvicorn's graceful-shutdown timeout must stay below the api's grace periods.
+    "test_api_graceful_shutdown.py": (
+        "k8s/base/api.yaml",
+        "charts/spatiumddi/templates/api.yaml",
+        "docker-compose.yml",
+        "docker-compose.dev.yml",
     ),
     "test_ci_tested_on_pr_head.py": (
         ".github/scripts/ci-tested-on-pr-head.sh",
@@ -255,7 +267,7 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "frontend/src/App.tsx",
         "frontend/package.json",
         "charts/spatiumddi/values.yaml",
-        "k8s/base/api.yaml",
+        "k8s/base/frontend.yaml",
         # #968 — perf/ has its own Perf — Tests job; before it was denied a
         # perf-only PR ran all 8 backend shards (PR #955, measured).
         "perf/generators/orchestrator/relay_sockets.py",

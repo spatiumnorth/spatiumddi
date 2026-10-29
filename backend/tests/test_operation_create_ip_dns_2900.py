@@ -148,6 +148,7 @@ async def test_approved_portal_request_creates_a_record(
     admin = await _user(db_session, "admin")
     sid, zone, _ = await _subnet_with_zone(db_session, client, admin)
     zone_id = zone.id
+    zone_name = zone.name.rstrip(".")
     db_session.add(FeatureModule(id="governance.requests", enabled=True))
     await db_session.flush()
     feature_modules.invalidate_cache()
@@ -201,7 +202,8 @@ async def test_approved_portal_request_creates_a_record(
 
     # A second request for the same name collides with the first (the REST
     # FQDN check). The approve refuses, and the transaction boundary holds:
-    # no address row, no record, and the request stays pending.
+    # no address row, no record. The request ends failed with the clash
+    # spelled out for the requester (#2911).
     resp = await client.post(
         "/api/v1/requests",
         headers=req_hdr,
@@ -216,11 +218,15 @@ async def test_approved_portal_request_creates_a_record(
     resp = await client.post(
         f"/api/v1/requests/{rid2}/approve", headers=appr_hdr, json={"decision_note": "ok"}
     )
-    assert resp.status_code == 409, resp.text
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "failed"
+    assert resp.json()["error"] == (
+        f"The name app01.{zone_name} is already used by 10.98.5.20 in 10.98.5.0/24."
+    )
     cr = await db_session.get(ChangeRequest, uuid.UUID(rid2))
     assert cr is not None
     await db_session.refresh(cr)
-    assert cr.state == "pending"
+    assert cr.state == "failed"
     clash = (
         await db_session.execute(
             select(IPAddress).where(

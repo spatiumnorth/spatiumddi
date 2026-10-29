@@ -43,6 +43,8 @@ spec:
                   matchLabels:
                     app: spatiumddi-api
                 topologyKey: kubernetes.io/hostname
+      # #2944 — the image's uvicorn runs --timeout-graceful-shutdown 20, below
+      # this, so lifespan shutdown (engine dispose) runs before the SIGKILL.
       terminationGracePeriodSeconds: 30
       containers:
         - name: api

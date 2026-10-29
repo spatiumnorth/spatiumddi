@@ -47,6 +47,9 @@ UNION_FLAGS: tuple[str, ...] = (
     "hipaa_scope",
     "internet_facing",
     "do_not_probe",
+    # The opt-out from the auto reverse zone (#2735): dropping it makes the
+    # first named address create a zone the operator declined (#2978).
+    "skip_reverse_zone",
 )
 
 # Merge sources that disagree on these are refused: they say who owns the

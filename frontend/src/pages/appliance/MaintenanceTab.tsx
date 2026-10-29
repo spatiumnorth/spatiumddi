@@ -20,7 +20,8 @@ import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
  *  1. Toggle maintenance-mode flag (file-backed; recorded and shown,
  *     nothing reads it yet — #2618).
  *  2. Schedule a host reboot (writes a trigger file; host-side
- *     systemd Path unit waits 10 s + runs ``systemctl reboot``).
+ *     systemd Path unit waits 10 s, hands the PostgreSQL primary off
+ *     when this node holds it (#2974), then runs ``systemctl reboot``).
  *
  * Plus the reboot-pending banner mirrored from the Network tab so
  * operators don't have to flip back and forth.
@@ -84,7 +85,9 @@ export function MaintenanceTab() {
           <div className="text-amber-700 dark:text-amber-400">
             <strong>Reboot in flight.</strong> The host's systemd Path unit has
             the trigger; it'll call <code>systemctl reboot</code> after a
-            10-second grace. The browser will lose connection shortly.
+            10-second grace, and on the node holding the database primary only
+            once the primary has moved to another node (up to a few minutes).
+            The browser will lose connection shortly.
           </div>
         </div>
       )}
@@ -140,7 +143,9 @@ export function MaintenanceTab() {
             <p className="mt-0.5 text-[11px] text-muted-foreground">
               Reboots the OS (not just the container stack). Useful after an
               unattended-upgrade kernel install. 10-second grace before the host
-              actually issues <code>systemctl reboot</code>.
+              actually issues <code>systemctl reboot</code>; on the node holding
+              the database primary, the primary moves to another node first (up
+              to a few minutes).
             </p>
             {data?.reboot_available === false && (
               <p
@@ -180,9 +185,11 @@ export function MaintenanceTab() {
         title="Reboot appliance?"
         message={
           <span>
-            The host will power-cycle in ~10 seconds. Existing DHCP leases keep
-            their state (DB-backed); DNS zones reload from the served config;
-            the web UI will be unreachable for ~1 minute.
+            The host will power-cycle in ~10 seconds (up to a few minutes on the
+            node holding the database primary, which moves to another node
+            first). Existing DHCP leases keep their state (DB-backed); DNS zones
+            reload from the served config; the web UI will be unreachable for ~1
+            minute.
           </span>
         }
         confirmLabel="Reboot now"

@@ -29,6 +29,7 @@ from app.core.auth.radius import test_connection as radius_test_connection
 from app.core.auth.saml import probe_metadata as saml_probe_metadata
 from app.core.auth.tacacs import test_connection as tacacs_test_connection
 from app.core.crypto import decrypt_dict, encrypt_dict
+from app.core.session_rotation import revoke_live_sessions
 from app.models.audit import AuditLog
 from app.models.auth import Group, User, UserSession
 from app.models.auth_provider import (
@@ -328,19 +329,10 @@ async def delete_provider(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     # And their sessions, as a link does: deleting the provider withdraws the
     # authority those sessions were issued on, so none outlives it until its
     # refresh token happens to expire.
-    sessions_revoked = (
-        await db.execute(
-            update(UserSession)
-            .where(
-                UserSession.user_id.in_(
-                    select(User.id).where(User.auth_provider_id == provider.id)
-                ),
-                UserSession.revoked.is_(False),
-            )
-            .values(revoked=True)
-            .execution_options(synchronize_session=False)
-        )
-    ).rowcount
+    sessions_revoked = await revoke_live_sessions(
+        db,
+        UserSession.user_id.in_(select(User.id).where(User.auth_provider_id == provider.id)),
+    )
     db.add(
         AuditLog(
             user_id=user.id,

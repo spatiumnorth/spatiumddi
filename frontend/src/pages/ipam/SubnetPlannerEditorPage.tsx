@@ -245,7 +245,11 @@ export function SubnetPlannerEditorPage() {
               disabled={
                 applied || conflicts.length > 0 || applyMut.isPending || dirty
               }
-              onClick={() => setShowApplyConfirm(true)}
+              onClick={() => {
+                // A refusal from an earlier attempt belongs to that attempt.
+                applyMut.reset();
+                setShowApplyConfirm(true);
+              }}
               className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               title={
                 dirty
@@ -263,7 +267,7 @@ export function SubnetPlannerEditorPage() {
             </button>
           </div>
         </div>
-        {applyMut.isError && (
+        {applyMut.isError && !showApplyConfirm && (
           <ApplyErrorBanner error={applyMut.error as unknown} />
         )}
         {reopenMut.isError && (
@@ -356,28 +360,34 @@ export function SubnetPlannerEditorPage() {
           spaceName={spaceName}
           onCancel={() => setShowApplyConfirm(false)}
           onConfirm={() => {
-            setShowApplyConfirm(false);
-            applyMut.mutate();
+            // Stay open while the call runs: a refusal shows here, where
+            // this confirm said it would (#2984); success closes it.
+            applyMut.mutate(undefined, {
+              onSuccess: () => setShowApplyConfirm(false),
+            });
           }}
           isPending={applyMut.isPending}
+          error={applyMut.isError ? (applyMut.error as unknown) : null}
         />
       )}
     </div>
   );
 }
 
-function ApplyConfirmModal({
+export function ApplyConfirmModal({
   tree,
   spaceName,
   onCancel,
   onConfirm,
   isPending,
+  error,
 }: {
   tree: PlanNode;
   spaceName: string | undefined;
   onCancel: () => void;
   onConfirm: () => void;
   isPending: boolean;
+  error?: unknown;
 }) {
   const counts = useMemo(() => countNodes(tree), [tree]);
   return (
@@ -413,6 +423,7 @@ function ApplyConfirmModal({
           If anything fails (overlap, missing parent, drifted state) the whole
           transaction rolls back and you'll see the conflicts here.
         </p>
+        {error != null && <ApplyErrorBanner error={error} />}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -837,6 +848,7 @@ function ApplyErrorBanner({ error }: { error: unknown }) {
             {conflicts.slice(0, 8).map((c, i) => (
               <li key={i}>{c.message}</li>
             ))}
+            {conflicts.length > 8 && <li>…and {conflicts.length - 8} more</li>}
           </ul>
         )}
         {survivors.length > 0 && (

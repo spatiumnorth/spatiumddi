@@ -1228,3 +1228,138 @@ def test_overall_verdict_healthy_array_does_not_alarm(m):
     state.storage_chips = [("md0 raid1 ok 2/2", "green", "")]
     verdict, _offender = m.overall_verdict(state)
     assert verdict == "HEALTHY"
+
+
+# ── #2974: reboot / poweroff hand the PostgreSQL primary off first ─────────
+
+
+def test_power_action_in_progress_reads_a_live_marker(m, monkeypatch, tmp_path):
+    import os
+
+    marker = tmp_path / "power-action"
+    monkeypatch.setattr(m, "POWER_ACTION_MARKER", marker)
+    assert m.power_action_in_progress() is None
+    marker.write_text(f"{os.getpid()} poweroff\n")
+    assert m.power_action_in_progress() == "poweroff"
+
+
+def test_power_action_in_progress_ignores_a_dead_or_garbled_marker(m, monkeypatch, tmp_path):
+    """A wrapper killed outright leaves its marker: that must not pin a
+    'REBOOT under way' banner on the console for good."""
+    marker = tmp_path / "power-action"
+    monkeypatch.setattr(m, "POWER_ACTION_MARKER", marker)
+    marker.write_text("999999999 reboot\n")
+    assert m.power_action_in_progress() is None
+    marker.write_text("garbage\n")
+    assert m.power_action_in_progress() is None
+    marker.write_text("1 halt\n")
+    assert m.power_action_in_progress() is None
+
+
+def test_a_power_action_under_way_counts_as_a_pending_reboot(m, monkeypatch, tmp_path):
+    """The web-UI unit renames its trigger before the handoff: without the
+    marker, F9 would say nothing is pending for the whole handoff."""
+    import os
+
+    monkeypatch.setattr(m, "_RELEASE_STATE_DIR", tmp_path / "release-state")
+    marker = tmp_path / "power-action"
+    monkeypatch.setattr(m, "POWER_ACTION_MARKER", marker)
+    assert m.reboot_pending() is False
+    marker.write_text(f"{os.getpid()} reboot\n")
+    assert m.reboot_pending() is True
+
+
+@pytest.mark.parametrize(("fn", "action"), [("do_reboot", "reboot"), ("do_shutdown", "poweroff")])
+def test_console_power_keys_start_the_unit_without_waiting(m, monkeypatch, fn, action):
+    """F5 / F6 hand the run to systemd and return at once, so the dashboard
+    keeps rendering through a handoff of up to a few minutes."""
+    calls = []
+
+    class _Res:
+        returncode = 0
+        stdout = stderr = ""
+
+    def _run(argv, **kw):
+        calls.append(argv)
+        return _Res()
+
+    monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: True)
+    monkeypatch.setattr(m.subprocess, "run", _run)
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    getattr(m, fn)(Console(file=io.StringIO()), state)
+    assert calls == [["systemctl", "start", "--no-block", f"spatium-power-action@{action}.service"]]
+    assert "handing off the database primary" in state.status_message
+
+
+def test_console_power_key_failure_is_reported(m, monkeypatch):
+    class _Res:
+        returncode = 5
+        stdout = ""
+        stderr = "Failed to start spatium-power-action@reboot.service: Unit not found.\n"
+
+    monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: True)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Res())
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    m.do_reboot(Console(file=io.StringIO()), state)
+    assert "could not be started" in state.status_message
+    assert "Unit not found" in state.status_message
+
+
+def test_console_power_key_declined_starts_nothing(m, monkeypatch):
+    monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: False)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail("nothing should run"))
+    m.do_shutdown(Console(file=io.StringIO()), m.DashboardState({}, _FakeTail(), "/dev/tty1"))
+
+
+# ── #3026: a committed slot upgrade clears the trial-boot verdict ─────────
+
+
+def test_committed_slot_clears_trial_boot_on_the_data_tier(m, monkeypatch):
+    """The console starts before firstboot runs grub-set-default. It read
+    saved_entry=slot_a once and showed 'trial boot — reboot reverts' until the
+    next reboot, although slot_b had been committed (#3026)."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_a"))
+    grubenv = {"saved_entry": "slot_a"}
+    monkeypatch.setattr(m, "read_grubenv", lambda: dict(grubenv))
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_a")
+    assert m.overall_verdict(st) == ("DEGRADED", "trial boot — reboot reverts")
+
+    # firstboot commits slot_b; the next data-tier refresh must notice.
+    grubenv["saved_entry"] = "slot_b"
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_b")
+    assert "trial" not in m.overall_verdict(st)[1]
+
+
+def test_unreadable_grubenv_keeps_the_last_known_durable_slot(m, monkeypatch):
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_b"))
+    m.refresh_durable_slot(None)
+    assert m.slot_info() == ("slot_b", "slot_b")
+
+
+def test_refresh_durable_slot_ignores_a_box_without_ab_slots(m, monkeypatch):
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", None)
+    m.refresh_durable_slot("slot_a")
+    assert m.slot_info() is None
+
+
+def test_readable_grubenv_without_saved_entry_reports_no_durable_default(m, monkeypatch):
+    """A grubenv that reads fine but carries no saved_entry is "no durable
+    default" — what detect_slot_info() reports — not "keep the old value"."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_a"))
+    monkeypatch.setattr(m, "read_grubenv", lambda: {"next_entry": ""})
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "")
+
+
+def test_unreadable_grubenv_on_the_data_tier_keeps_the_committed_slot(m, monkeypatch):
+    """A failed grub-editenv on one 5 s tick must not flip a committed box
+    back to a trial-boot verdict (#3026)."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_b"))
+    monkeypatch.setattr(m, "read_grubenv", lambda: None)
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_b")
