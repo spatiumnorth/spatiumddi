@@ -307,6 +307,12 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         [],
     ),
     (
+        a.RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
+        "DHCP group in direct mode behind the relay VIP",
+        "DHCP",
+        [],
+    ),
+    (
         a.RULE_TYPE_WOL_WAKE_FAILED,
         "Wake-on-LAN failed",
         "DHCP",
