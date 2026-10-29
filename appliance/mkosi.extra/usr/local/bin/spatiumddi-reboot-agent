@@ -35,7 +35,7 @@ set -euo pipefail
 TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending-fleet
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/reboot-agent.log"
-GRACE_SECONDS=5
+GRACE_SECONDS="${SPATIUM_REBOOT_AGENT_GRACE_S:-5}"
 POWER_ACTION="${SPATIUM_POWER_ACTION:-/usr/local/bin/spatium-power-action}"
 
 mkdir -p "$LOG_DIR"
@@ -57,15 +57,22 @@ mv -f "$TRIGGER" "${TRIGGER}.done" || true
 log "operator-triggered reboot accepted (agent stamp: ${TRIGGER_PAYLOAD:-unknown})"
 log "scheduling reboot in ${GRACE_SECONDS}s"
 
+# The grace lets in-flight DNS / DHCP responses finish. It runs before the
+# wrapper, so a cancel during it (the console's F9 stops this unit) has no
+# cordon to undo.
+sleep "$GRACE_SECONDS"
+
 # #3008 — the same wrapper the web-UI reboot and the console use
 # (spatium-power-action, #2974), so there is one implementation: it hands
 # the PostgreSQL primary off first when this node holds it (#2849), then runs
 # ``systemctl reboot`` (through logind, which first lets the kubelet's
-# graceful node shutdown run, #1976; the grace window above is in addition
-# to that). It holds the in-progress marker and lock, so the console shows
+# graceful node shutdown run, #1976; the grace window is in addition to
+# that). It holds the in-progress marker and lock, so the console shows
 # the handoff and the web UI keeps its Reboot button disabled, and a stop
 # before systemctl (this unit being stopped) undoes the handoff's cordon. It
-# undoes it too when systemctl fails. Its lines go to this log.
+# undoes it too when systemctl fails. Its lines go to this log: a file
+# redirect, not a pipe through log(), because a stop kills a pipe's reader
+# and the wrapper's undo would then die of SIGPIPE on its first line.
 log "handing over to spatium-power-action reboot"
 if ! "$POWER_ACTION" reboot >>"$LOG" 2>&1; then
     log "spatium-power-action reboot failed: the node stays up"

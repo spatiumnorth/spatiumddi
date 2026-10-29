@@ -420,6 +420,11 @@ def test_the_agent_delegates_to_the_power_action_wrapper() -> None:
     mv = next(i for i, ln in enumerate(lines) if ln.startswith('mv -f "$TRIGGER"'))
     call = next(i for i, ln in enumerate(lines) if '"$POWER_ACTION" reboot' in ln)
     assert mv < call
+    # the grace for in-flight DNS / DHCP responses is still served, before
+    # the wrapper (the first cut of #3008 dropped it with the old block)
+    grace = next(i for i, ln in enumerate(lines) if ln == 'sleep "$GRACE_SECONDS"')
+    assert mv < grace < call
+    assert 'GRACE_SECONDS="${SPATIUM_REBOOT_AGENT_GRACE_S:-5}"' in text
 
 
 def _agent_run(tmp_path: Path, *, wrapper_rc: int):
@@ -433,12 +438,12 @@ def _agent_run(tmp_path: Path, *, wrapper_rc: int):
     state.mkdir()
     (state / "reboot-pending-fleet").write_text("stamp-1\n")
     src = (src.replace("/var/lib/spatiumddi/release-state", str(state))
-              .replace("/var/log/spatiumddi", str(tmp_path / "log"))
-              .replace("GRACE_SECONDS=5", "GRACE_SECONDS=0"))
+              .replace("/var/log/spatiumddi", str(tmp_path / "log")))
     script = tmp_path / "agent"
     script.write_text(src)
     script.chmod(0o755)
-    proc = subprocess.run([str(script)], env={**os.environ, "SPATIUM_POWER_ACTION": str(wrapper)},
+    proc = subprocess.run([str(script)], env={**os.environ, "SPATIUM_POWER_ACTION": str(wrapper),
+                                              "SPATIUM_REBOOT_AGENT_GRACE_S": "0"},
                           capture_output=True, text=True, timeout=30)
     return proc, state
 

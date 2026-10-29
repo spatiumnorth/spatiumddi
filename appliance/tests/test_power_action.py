@@ -46,10 +46,11 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
         f'exit {systemctl_rc}\n'
     )
     sc.chmod(0o755)
+    (tmp_path / "state").mkdir(exist_ok=True)
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
            "SPATIUM_REBOOT_HANDOFF": str(handoff_sh),
            "SPATIUM_POWER_ACTION_MARKER": str(tmp_path / "marker"),
-           "SPATIUM_POWER_ACTION_LOCK": str(tmp_path / "lock"),
+           "SPATIUM_POWER_ACTION_LOCK": str(tmp_path / "state"),
            "SPATIUM_POWER_ACTION_HANDOFF_CAP_S": str(cap_s)}
     proc = subprocess.Popen([str(SCRIPT), action], env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
@@ -167,26 +168,29 @@ def test_the_image_makes_the_wrapper_executable() -> None:
 
 
 def _lock_held(path: Path) -> bool:
+    """The api's probe (backend/app/services/appliance/system.py)."""
     import fcntl
     try:
-        with open(path, "rb") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            return False
+        fd = os.open(path, os.O_RDONLY)
     except OSError:
         return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
 
 
 def test_the_lock_the_api_reads_is_held_while_it_runs_and_freed_after(tmp_path: Path) -> None:
-    """#3008 — the api's flock probe of the release-state file."""
+    """#3008 — the api's flock probe of the release-state directory."""
     proc, log = _run(tmp_path, "reboot", handoff="hang")
     _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
-    assert _lock_held(tmp_path / "lock")
+    assert _lock_held(tmp_path / "state")
     proc.terminate()
     assert proc.wait(20) == 1
-    assert not _lock_held(tmp_path / "lock")
+    assert not _lock_held(tmp_path / "state")
 
 
 def test_a_killed_wrapper_leaves_no_lock_even_with_the_handoff_alive(tmp_path: Path) -> None:
@@ -194,4 +198,44 @@ def test_a_killed_wrapper_leaves_no_lock_even_with_the_handoff_alive(tmp_path: P
     _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
     proc.kill()
     proc.wait(10)
-    assert not _lock_held(tmp_path / "lock")
+    assert not _lock_held(tmp_path / "state")
+
+
+def test_the_lock_creates_nothing_and_follows_no_planted_symlink(tmp_path: Path) -> None:
+    """#3008 — the api and the supervisor can write in release-state and the
+    wrapper runs as root: a lock FILE there could be a symlink planted to make
+    root create or truncate any host path. The directory itself is locked,
+    opened read-only."""
+    victim = tmp_path / "victim"
+    victim.write_text("precious\n")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "power-action-active").symlink_to(victim)
+    proc, log = _run(tmp_path, "reboot")
+    assert proc.wait(30) == 0
+    assert victim.read_text() == "precious\n"
+    assert sorted(p.name for p in (tmp_path / "state").iterdir()) == ["power-action-active"]
+    text = SCRIPT.read_text()
+    assert 'exec 9<"$LOCK"' in text and 'exec 9>' not in text
+    assert 'LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state}"' in text
+
+
+def test_a_probe_holding_the_lock_for_an_instant_does_not_cost_the_wrapper_it(
+    tmp_path: Path,
+) -> None:
+    """#3008 — the api's shared probe can coincide with the wrapper's start;
+    with ``flock -n`` that ran the whole action unlocked, the web UI's button
+    enabled throughout. The wrapper waits briefly instead."""
+    import fcntl
+    (tmp_path / "state").mkdir()
+    fd = os.open(tmp_path / "state", os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        proc, log = _run(tmp_path, "reboot", handoff="hang")
+        time.sleep(1)
+    finally:
+        os.close(fd)
+    _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
+    _wait_for(lambda: _lock_held(tmp_path / "state"))
+    proc.terminate()
+    assert proc.wait(20) == 1
+    assert "going on regardless" not in (proc.stdout.read() if proc.stdout else "")

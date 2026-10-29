@@ -14251,6 +14251,9 @@ export interface ApplianceSystemInfo {
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
   reboot_in_progress?: boolean;
+  // #3008 — the node the reboot fields describe (the api pod's own node);
+  // null off-appliance.
+  node?: string | null;
   appliance_version: string | null;
   appliance_mode: boolean;
 }

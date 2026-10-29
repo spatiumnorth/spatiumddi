@@ -86,11 +86,14 @@ export function MaintenanceTab() {
         <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
           <Activity className="mt-0.5 h-4 w-4 shrink-0 animate-pulse text-amber-600 dark:text-amber-400" />
           <div className="text-amber-700 dark:text-amber-400">
-            <strong>Reboot in flight.</strong> The host's systemd Path unit has
-            the trigger; it'll call <code>systemctl reboot</code> after a
-            10-second grace, and on the node holding the database primary only
-            once the primary has moved to another node (up to a few minutes).
-            The browser will lose connection shortly.
+            <strong>
+              Reboot in flight{data?.node ? ` on ${data.node}` : ""}.
+            </strong>{" "}
+            The host calls <code>systemctl reboot</code> after a short grace (10
+            s from this page), and on the node holding the database primary only
+            once the primary has moved to another node (up to a few minutes). A
+            reboot started from Fleet or the console shows here too. The browser
+            may lose connection shortly.
           </div>
         </div>
       )}

@@ -5125,10 +5125,11 @@ def do_cancel_reboot(console: Console) -> None:
     sleep before the reboot ExecStart) + remove the trigger so the edge-
     triggered ``.path`` unit has nothing to re-fire on.
 
-    #2974 — the web-UI unit and the console's F5 / F6 unit then hand the
-    PostgreSQL primary off before ``systemctl reboot`` (up to a few
-    minutes); stopping them during that makes ``spatium-power-action``
-    undo the handoff's cordon, and nothing reboots.
+    #2974 — the web-UI unit, the fleet unit (#3008) and the console's
+    F5 / F6 unit then hand the PostgreSQL primary off before
+    ``systemctl reboot`` (up to a few minutes); stopping them during that
+    makes ``spatium-power-action`` undo the handoff's cordon, and nothing
+    reboots.
 
     Best-effort: if ``systemctl reboot`` has already been issued there's
     nothing to stop and the box reboots anyway — same as before this key

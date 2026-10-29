@@ -1,9 +1,9 @@
 #!/bin/bash
 # spatium-power-action — the one entry point for an operator-initiated
-# reboot or poweroff of an appliance node that is not the Fleet reboot
-# (#2974): the web-UI local reboot (spatiumddi-reboot.service) and the
-# console's F5 / F6 (spatium-power-action@reboot|poweroff.service, so that
-# systemd owns the run and not the console process).
+# reboot or poweroff of an appliance node (#2974): the web-UI local reboot
+# (spatiumddi-reboot.service), the Fleet reboot (spatiumddi-reboot-agent,
+# #3008) and the console's F5 / F6 (spatium-power-action@reboot|poweroff
+# .service, so that systemd owns the run and not the console process).
 #
 # Usage: spatium-power-action reboot|poweroff
 #
@@ -27,21 +27,26 @@
 # While it runs, MARKER holds "<pid> <action>", so the console shows the
 # reboot or poweroff as under way and F9 can cancel it. /run is a tmpfs:
 # nothing of it outlives the reboot.
-# The Fleet path (spatiumddi-reboot-agent) calls this wrapper too (#3008).
 #
-# The api cannot see /run, so the wrapper also holds an flock(2) on LOCK, a
-# file in the release-state directory the api has mounted: the web UI keeps
-# its Reboot button disabled while the lock is held, i.e. from the moment the
-# trigger is renamed until the node goes down. A lock is released by the
-# kernel when its holder dies, so a wrapper killed outright leaves nothing
-# stuck (the api checks no pid: it has no view of the host's).
+# The api cannot see /run, so the wrapper also holds an flock(2) on LOCK,
+# the release-state DIRECTORY itself, which the api has mounted (#3008): the
+# web UI keeps its Reboot button disabled while the lock is held, i.e. from
+# the moment the trigger is renamed until systemctl has been issued (the
+# node's own api pod is stopped moments later by the kubelet's graceful
+# shutdown). A lock is released by the kernel when its holder dies, so a
+# wrapper killed outright leaves nothing stuck (the api checks no pid: it has
+# no view of the host's). The directory and not a file in it, because the api
+# and the supervisor can write in that directory and this runs as root: a
+# file there could be a symlink planted to make root create or truncate any
+# path on the host (GHSA-h2j9-qrg7-grfw's threat model). The directory is
+# the api's mount point; it cannot replace it.
 
 set -uo pipefail
 
 HANDOFF="${SPATIUM_REBOOT_HANDOFF:-/usr/local/bin/spatium-reboot-handoff}"
 HANDOFF_CAP_S="${SPATIUM_POWER_ACTION_HANDOFF_CAP_S:-240}"
 MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
-LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state/power-action-active}"
+LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state}"
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -92,8 +97,11 @@ printf '%s %s\n' "$$" "$ACTION" > "$MARKER" 2>/dev/null || true
 
 # fd 9 holds the lock for the life of this process; the children get it
 # closed (9>&-) so a stray child cannot keep it held after we are gone.
-if { exec 9>"$LOCK"; } 2>/dev/null; then
-    flock -n 9 || log "another power action holds $LOCK: going on regardless"
+# Opened read-only: nothing is created or written. A short wait, not -n: the
+# api's probe takes a shared lock for an instant, and failing on that would
+# run the whole action without the lock, the button enabled throughout.
+if { exec 9<"$LOCK"; } 2>/dev/null; then
+    flock -w 5 9 || log "another power action holds $LOCK: going on regardless"
 fi
 
 if [ -x "$HANDOFF" ]; then

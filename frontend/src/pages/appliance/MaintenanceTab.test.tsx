@@ -73,4 +73,13 @@ describe("MaintenanceTab reboot button (#3008)", () => {
     const btn = await screen.findByRole("button", { name: /reboot now/i });
     expect((btn as HTMLButtonElement).disabled).toBe(false);
   });
+
+  it("names the node the banner is about", async () => {
+    await renderWith({
+      reboot_scheduled: false,
+      reboot_in_progress: true,
+      node: "ddi2",
+    });
+    expect(await screen.findByText(/Reboot in flight on ddi2\./)).toBeTruthy();
+  });
 });
