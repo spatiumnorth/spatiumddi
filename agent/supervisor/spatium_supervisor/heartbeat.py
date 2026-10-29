@@ -225,23 +225,16 @@ def _detect_storage_type() -> str:
 
 
 def _detect_host_nics() -> list[str]:
-    """Return the appliance's physical / virtual NIC names (e.g.
-    ``["ens18", "eth0"]``). Skips loopback, docker bridges, virtual
-    veth pairs, and the container's own bridge interface so the list
-    is the operator-visible host hardware."""
-    nics: list[str] = []
-    try:
-        import os
+    """Host NIC names for ``capabilities.host_nics`` (#2884).
 
-        for name in sorted(os.listdir("/sys/class/net")):
-            if name == "lo":
-                continue
-            if name.startswith(("docker", "br-", "veth", "virbr", "tailscale")):
-                continue
-            nics.append(name)
-    except OSError:
-        pass
-    return nics
+    Delegates to ``appliance_state.host_network_interfaces()`` — the
+    udev-based source that also feeds ``appliance.host_interfaces`` — so
+    Fleet's "Host NICs" and the packet-capture picker can never disagree.
+    The supervisor pod is not ``hostNetwork``, so reading its own
+    ``/sys/class/net`` (the old implementation) reported the pod's
+    ``eth0``, which does not exist on the host.
+    """
+    return appliance_state.host_network_interfaces()
 
 
 def _capabilities_payload() -> dict[str, Any]:
@@ -264,8 +257,8 @@ def _capabilities_payload() -> dict[str, Any]:
     * ``supervisor_version`` — packaging metadata.
     * ``cpu_count`` / ``memory_mb`` — host capacity from /proc.
     * ``storage_type`` — ``"ssd"`` / ``"hdd"`` / ``"unknown"``.
-    * ``host_nics`` — physical / virtual NIC names (lo + docker
-      bridges filtered out).
+    * ``host_nics`` — the host's NIC names (udev, same list as
+      ``host_interfaces``; loopback / pod veths / docker filtered).
     """
     out: dict[str, Any] = {
         "has_baked_images": appliance_state.detect_deployment_kind() == "appliance",

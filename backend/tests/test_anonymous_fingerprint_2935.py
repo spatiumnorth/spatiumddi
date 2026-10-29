@@ -154,6 +154,21 @@ async def test_docs_pages_are_shells_without_the_spec(
 _PASSWORD = "Sup3r-secret!"
 
 
+@pytest.fixture(autouse=True)
+def _no_login_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The docs-spec tests sign in over HTTP from the one test-client
+    address, so alongside another file that does the same in one shard
+    (the #2941 grace tests) they outrun the per-IP login budget (30 a
+    minute) and the next sign-in is a 429. That throttle is not what these
+    tests are about."""
+    from app.api.v1.auth import router as auth_router
+
+    async def _not_limited(_ip: str | None) -> bool:
+        return False
+
+    monkeypatch.setattr(auth_router, "login_rate_limited", _not_limited)
+
+
 async def _logged_in(client: AsyncClient, db: AsyncSession, **user_kw: Any) -> User:
     user = User(
         username=f"docs-{uuid.uuid4().hex[:8]}",
@@ -228,13 +243,58 @@ async def test_docs_spec_by_cookie_without_a_session_is_401(
     assert (await client.get("/api/v1/auth/openapi.json")).status_code == 401
 
 
-async def test_docs_spec_by_cookie_refuses_a_rotated_cookie(
+async def _rotate_and_present_stale(client: AsyncClient, db: AsyncSession) -> tuple[str, str]:
+    """Sign in, refresh once, then put the rotated-away cookie back.
+    Returns ``(stale, access token of the successor)``."""
+    await _logged_in(client, db)
+    stale = client.cookies.get("spatium_refresh")
+    r = await client.post("/api/v1/auth/refresh")
+    assert r.status_code == 200, r.text
+    client.cookies.clear()
+    client.cookies.set("spatium_refresh", stale, path="/api/v1/auth")
+    return stale, r.json()["access_token"]
+
+
+async def test_docs_spec_by_cookie_honours_the_rotation_grace(
     client: AsyncClient, db_session: AsyncSession, running: None
 ) -> None:
-    await _logged_in(client, db_session)
-    stale = client.cookies.get("spatium_refresh")
-    assert (await client.post("/api/v1/auth/refresh")).status_code == 200
-    client.cookies.clear()
+    """A cookie another tab rotated a moment ago stands for its successor,
+    by the same rule ``/auth/refresh`` applies (#2941), so the docs tab
+    still loads the schema. Reading it rotates nothing further."""
+    await _rotate_and_present_stale(client, db_session)
+    r = await client.get("/api/v1/auth/openapi.json")
+    assert r.status_code == 200, r.text
+    assert not [c for c in r.headers.get_list("set-cookie") if c.startswith("spatium_refresh=")]
+
+
+async def test_docs_spec_by_cookie_refuses_a_rotated_cookie_past_the_window(
+    client: AsyncClient, db_session: AsyncSession, running: None
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    from app.core.security import hash_refresh_token
+    from app.core.session_rotation import ROTATION_GRACE
+
+    stale, _ = await _rotate_and_present_stale(client, db_session)
+    await db_session.execute(
+        update(UserSession)
+        .where(UserSession.refresh_token_hash == hash_refresh_token(stale))
+        .values(rotated_at=datetime.now(UTC) - ROTATION_GRACE - timedelta(seconds=1))
+    )
+    await db_session.commit()
+    assert (await client.get("/api/v1/auth/openapi.json")).status_code == 401
+
+
+async def test_docs_spec_by_cookie_refuses_a_rotated_cookie_after_logout(
+    client: AsyncClient, db_session: AsyncSession, running: None
+) -> None:
+    """Signing out revokes the successor, which ends the rotated cookie's
+    grace at once: the docs route gets no more out of it than a refresh."""
+    stale, token = await _rotate_and_present_stale(client, db_session)
+    r = await client.post("/api/v1/auth/logout", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 204, r.text
     client.cookies.set("spatium_refresh", stale, path="/api/v1/auth")
     assert (await client.get("/api/v1/auth/openapi.json")).status_code == 401
 
