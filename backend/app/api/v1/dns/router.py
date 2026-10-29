@@ -7881,7 +7881,9 @@ async def create_zone_from_template(
     for r in record_payloads:
         if r["record_type"] in VALID_RECORD_TYPES:
             await _check_driver_gated_record_type(r["record_type"], group_id, db)
-    await _check_driver_ttl([r["ttl"] for r in record_payloads], group_id, db)
+    await _check_driver_refusals(
+        [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
+    )
 
     guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(

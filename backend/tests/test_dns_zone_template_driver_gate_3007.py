@@ -163,4 +163,6 @@ async def test_every_shipped_template_passes_the_gate_on_every_ranged_provider(
         tpl = zone_templates.get_template(tid)
         assert tpl is not None
         recs: list[dict[str, Any]] = zone_templates.materialize(tpl, "z.example.", params)
-        await dns_router._check_driver_ttl([r["ttl"] for r in recs], grp.id, db_session)
+        await dns_router._check_driver_refusals(
+            [(r["record_type"], r["value"], r["ttl"]) for r in recs], grp.id, db_session
+        )
