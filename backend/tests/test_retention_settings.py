@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import pytest
 from httpx import AsyncClient
@@ -26,6 +25,7 @@ from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.models.settings import PlatformSettings
 from app.tasks import prune_logs, prune_metrics
+from tests.conftest import _test_engine
 
 # field -> (non-default value, defaults, lowest accepted, highest accepted)
 RETENTION: dict[str, tuple[int, int, int, int]] = {
@@ -171,12 +171,14 @@ async def _qnames(db: AsyncSession, server: DNSServer) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_prune_logs_honours_log_retention_hours(db_session: AsyncSession) -> None:
+async def test_partition_retention_honours_log_retention_hours(db_session: AsyncSession) -> None:
+    from app.services.logs import partitions as log_partitions
+
     row = await _settings_row(db_session)
     row.log_retention_hours = 72
     server = await _dns_server(db_session)
     now = datetime.now(UTC)
-    for qname, age in (("30h.example", 30), ("80h.example", 80)):
+    for qname, age in (("30h.example", 30), ("6d.example", 6 * 24)):
         db_session.add(
             DNSQueryLogEntry(
                 server_id=server.id, ts=now - timedelta(hours=age), qname=qname, raw=qname
@@ -184,30 +186,15 @@ async def test_prune_logs_honours_log_retention_hours(db_session: AsyncSession) 
         )
     await db_session.commit()
 
-    result: dict[str, Any] = await prune_logs._sweep_with_session(db_session)
+    hours = await prune_logs.log_retention_hours(db_session)
+    assert hours == 72
+    async with _test_engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await log_partitions.maintain(conn, log_partitions.DNS_QUERY_LOG, hours, now=now)
 
-    assert result["retention_hours"] == 72
-    # Under the old fixed 24 h window the 30 h row would be gone.
+    # Under the old fixed 24 h window the 30 h row would be gone; the 6 day row
+    # sits in a partition wholly past the 72 h window.
     assert await _qnames(db_session, server) == {"30h.example"}
-
-
-@pytest.mark.asyncio
-async def test_prune_logs_shorter_window_removes_more(db_session: AsyncSession) -> None:
-    row = await _settings_row(db_session)
-    row.log_retention_hours = 2
-    server = await _dns_server(db_session)
-    now = datetime.now(UTC)
-    for qname, age in (("1h.example", 1), ("5h.example", 5)):
-        db_session.add(
-            DNSQueryLogEntry(
-                server_id=server.id, ts=now - timedelta(hours=age), qname=qname, raw=qname
-            )
-        )
-    await db_session.commit()
-
-    await prune_logs._sweep_with_session(db_session)
-
-    assert await _qnames(db_session, server) == {"1h.example"}
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,404 @@
+"""Time partitioning for the agent-shipped log tables (#2185).
+
+``dns_query_log_entry``, ``dhcp_log_entry`` and ``dns_rpz_hit`` are
+``PARTITION BY RANGE (ts)``. Retention is a partition drop instead of a
+mass ``DELETE``: no WAL burst, no bloat, no long autovacuum competing with
+the control plane's own reads and writes.
+
+:func:`maintain` is the whole lifecycle for one table, run by the
+``maintain_log_partitions`` beat task every 15 minutes:
+
+* **create ahead** — a partition is created as a plain table and then
+  ``ATTACH``ed, which takes ``SHARE UPDATE EXCLUSIVE`` on the parent, so it
+  neither waits for a long reader nor queues the agents' inserts behind it.
+  (Attaching also takes ``SHARE ROW EXCLUSIVE`` on ``dns_server`` /
+  ``dhcp_server`` for the foreign key, briefly, under ``lock_timeout``.)
+  Partitions are created from the end of the last one, so the ranges never
+  overlap and a few skipped ticks change nothing.
+* **retire** — a partition whose whole range is older than the retention
+  window is ``DETACH ... CONCURRENTLY`` and dropped. If the concurrent
+  detach times out PostgreSQL leaves the partition marked detach-pending
+  and refuses to start another, so the next tick finishes it with
+  ``DETACH ... FINALIZE``.
+* **orphans** — a table left by a crash between the two statements of either
+  step is dropped on the next tick.
+
+There is deliberately no ``DEFAULT`` partition. Ingest drops lines outside
+what the partitions cover (:func:`coverage`), counted with the lines that
+are already too old, so nothing ever has to be moved out of a default
+before a partition can be created, and ``DETACH ... CONCURRENTLY`` stays
+available (PostgreSQL refuses it when a default partition exists).
+
+The grain is hourly for the DNS query log while its window is
+:data:`HOURLY_MAX_WINDOW` or shorter, daily above that, and daily for the
+other two tables. It is decided from ``log_retention_hours`` as each new
+partition is created: mixed hourly and daily ranges are fine as long as
+they do not overlap, so changing the setting needs no re-partitioning.
+
+Retention is applied at the grain of the partitions, so rows can outlive
+the window by up to one partition (an hour, or a day).
+
+Every step is idempotent, so a retried or overlapping run is harmless
+(non-negotiable #9); a session advisory lock per table keeps two workers
+from racing anyway.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import structlog
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+
+logger = structlog.get_logger(__name__)
+
+HOUR = timedelta(hours=1)
+DAY = timedelta(days=1)
+
+#: RPZ policy hits are kept far longer than raw queries (issue #699): a hit
+#: is summary-shaped, and "has this host been reaching for blocked domains
+#: all week" is unanswerable inside the query-log window. Matches the
+#: threat rollup's retention so both age out together.
+RPZ_HIT_RETENTION_DAYS = 30
+
+#: The DNS query log uses hourly partitions while its window is this long
+#: or shorter.
+HOURLY_MAX_WINDOW = timedelta(hours=48)
+#: How far ahead of now partitions are created. Ingest drops lines dated
+#: beyond what is covered, so this is also how far an agent's clock may run
+#: ahead.
+HOURLY_LEAD = timedelta(hours=24)
+DAILY_LEAD = timedelta(days=3)
+#: A bound on one tick's DDL, in case the table was left empty for a long time.
+MAX_CREATES_PER_TICK = 400
+
+#: Namespace for the per-table session advisory lock (the table name hashes
+#: into the second key).
+LOCK_NAMESPACE = 0x4C4F4750  # "LOGP"
+#: Every DDL statement here waits at most this long for its lock. A timeout
+#: is retried by the next tick.
+LOCK_TIMEOUT_MS = 3000
+
+#: How long a process trusts what it read of a table's partitions.
+COVERAGE_TTL_S = 30.0
+
+
+@dataclass(frozen=True)
+class LogTable:
+    """One partitioned log table and its retention rule."""
+
+    name: str
+    #: The retention window, given ``PlatformSettings.log_retention_hours``.
+    window: Callable[[int], timedelta]
+    #: Whether partitions are hourly while the window is short.
+    hourly_ok: bool = False
+
+    def hourly(self, window: timedelta) -> bool:
+        return self.hourly_ok and window <= HOURLY_MAX_WINDOW
+
+
+DNS_QUERY_LOG = LogTable(
+    "dns_query_log_entry", lambda hours: timedelta(hours=hours), hourly_ok=True
+)
+DHCP_LOG = LogTable("dhcp_log_entry", lambda hours: timedelta(hours=hours))
+DNS_RPZ_HIT = LogTable("dns_rpz_hit", lambda _hours: timedelta(days=RPZ_HIT_RETENTION_DAYS))
+LOG_TABLES: tuple[LogTable, ...] = (DNS_QUERY_LOG, DHCP_LOG, DNS_RPZ_HIT)
+
+
+@dataclass(frozen=True)
+class Partition:
+    name: str
+    lower: datetime | None
+    upper: datetime | None
+    detach_pending: bool = False
+
+    @property
+    def is_default(self) -> bool:
+        return self.lower is None
+
+
+@dataclass
+class MaintenanceResult:
+    table: str
+    created: int = 0
+    dropped: int = 0
+    finalized: int = 0
+    orphans_dropped: int = 0
+    failed: int = 0
+    skipped_locked: bool = False
+    errors: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "created": self.created,
+            "dropped": self.dropped,
+            "finalized": self.finalized,
+            "orphans_dropped": self.orphans_dropped,
+            "failed": self.failed,
+            "skipped_locked": self.skipped_locked,
+        }
+
+
+# ── The catalog ────────────────────────────────────────────────────────────
+
+_BOUNDS = re.compile(r"FROM \('([^']+)'\) TO \('([^']+)'\)")
+
+
+def _parse_bound(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+async def list_partitions(conn: AsyncConnection | AsyncSession, table: str) -> list[Partition]:
+    """The partitions of ``table`` as the catalog has them, detach-pending ones included."""
+    rows = await conn.execute(
+        text(
+            "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid), i.inhdetachpending "
+            "FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
+            "WHERE i.inhparent = to_regclass(:parent) ORDER BY c.relname"
+        ),
+        {"parent": table},
+    )
+    out: list[Partition] = []
+    for name, bound, pending in rows:
+        match = _BOUNDS.search(bound or "")
+        if match is None:  # DEFAULT, or a shape this does not manage
+            out.append(Partition(name, None, None, bool(pending)))
+            continue
+        out.append(Partition(name, _parse_bound(match[1]), _parse_bound(match[2]), bool(pending)))
+    return out
+
+
+# ── What ingest may store ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """The time range a table's attached partitions cover."""
+
+    lower: datetime | None
+    upper: datetime | None
+
+    def contains(self, ts: datetime) -> bool:
+        if self.lower is None or self.upper is None:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return self.lower <= ts < self.upper
+
+
+_coverage_cache: dict[str, tuple[float, Coverage]] = {}
+
+
+def invalidate_coverage_cache() -> None:
+    _coverage_cache.clear()
+
+
+async def coverage(db: AsyncSession, table: LogTable) -> Coverage:
+    """What ``table`` can store right now, cached for :data:`COVERAGE_TTL_S`.
+
+    A line outside it has no partition to land in; ingest counts it with the
+    lines that are already too old instead of failing the whole batch.
+    """
+    cached = _coverage_cache.get(table.name)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < COVERAGE_TTL_S:
+        return cached[1]
+    lowers: list[datetime] = []
+    uppers: list[datetime] = []
+    for p in await list_partitions(db, table.name):
+        if p.lower is not None and p.upper is not None and not p.detach_pending:
+            lowers.append(p.lower)
+            uppers.append(p.upper)
+    result = Coverage(min(lowers), max(uppers)) if lowers else Coverage(None, None)
+    if not lowers:
+        logger.warning("log_table_has_no_partitions", table=table.name)
+    _coverage_cache[table.name] = (now, result)
+    return result
+
+
+# ── Maintenance ────────────────────────────────────────────────────────────
+
+
+def _floor(moment: datetime, unit: timedelta) -> datetime:
+    moment = moment.astimezone(UTC)
+    if unit == DAY:
+        return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    return moment.replace(minute=0, second=0, microsecond=0)
+
+
+def _partition_name(table: str, lower: datetime, upper: datetime) -> str:
+    """``<table>_p20261027`` for a whole day, ``<table>_p2026102713`` otherwise."""
+    if upper - lower == DAY and lower == _floor(lower, DAY):
+        return f"{table}_p{lower:%Y%m%d}"
+    return f"{table}_p{lower:%Y%m%d%H}"
+
+
+def partition_name_pattern(table: str) -> str:
+    """The names :func:`_partition_name` gives ``table``'s partitions, as a regex."""
+    return rf"{table}_p[0-9]{{8}}([0-9]{{2}})?"
+
+
+def _orphan_pattern(table: str) -> str:
+    return f"^{partition_name_pattern(table)}$"
+
+
+async def _lock(conn: AsyncConnection, table: str, *, acquire: bool) -> bool:
+    fn = "pg_try_advisory_lock" if acquire else "pg_advisory_unlock"
+    row = await conn.execute(
+        text(f"SELECT {fn}(:ns, hashtext(:t))"), {"ns": LOCK_NAMESPACE, "t": table}
+    )
+    return bool(row.scalar())
+
+
+async def _drop_orphans(conn: AsyncConnection, table: str, result: MaintenanceResult) -> None:
+    rows = await conn.execute(
+        text(
+            "SELECT c.relname FROM pg_class c "
+            "WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind = 'r' "
+            "AND NOT c.relispartition AND c.relname ~ :pattern"
+        ),
+        {"pattern": _orphan_pattern(table)},
+    )
+    for (name,) in rows.fetchall():
+        try:
+            await conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{name}"')
+        except DBAPIError as exc:
+            result.failed += 1
+            result.errors.append(f"drop orphan {name}: {exc.orig!r}")
+            logger.warning("log_partition_orphan_drop_failed", table=table, partition=name)
+        else:
+            result.orphans_dropped += 1
+
+
+async def _create_ahead(
+    conn: AsyncConnection,
+    table: LogTable,
+    window: timedelta,
+    now: datetime,
+    result: MaintenanceResult,
+) -> None:
+    hourly = table.hourly(window)
+    uppers = [
+        p.upper
+        for p in await list_partitions(conn, table.name)
+        if p.upper is not None and not p.detach_pending
+    ]
+    start = _floor(now - window, HOUR if hourly else DAY)
+    cursor = max([start, *uppers])
+    target = now + (HOURLY_LEAD if hourly else DAILY_LEAD)
+
+    while cursor < target and result.created < MAX_CREATES_PER_TICK:
+        # Daily once a day starts at midnight; the hours left over from an
+        # earlier hourly grain are one partition up to the next midnight.
+        upper = cursor + HOUR if hourly else _floor(cursor, DAY) + DAY
+        name = _partition_name(table.name, cursor, upper)
+        try:
+            await conn.exec_driver_sql(f'CREATE TABLE "{name}" (LIKE "{table.name}")')
+            try:
+                await conn.exec_driver_sql(
+                    f'ALTER TABLE "{table.name}" ATTACH PARTITION "{name}" '
+                    f"FOR VALUES FROM ('{cursor.isoformat()}') TO ('{upper.isoformat()}')"
+                )
+            except BaseException:
+                with suppress(Exception):
+                    await conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{name}"')
+                raise
+        except DBAPIError as exc:
+            result.failed += 1
+            result.errors.append(f"create {name}: {exc.orig!r}")
+            logger.warning(
+                "log_partition_create_failed",
+                table=table.name,
+                partition=name,
+                error=repr(exc.orig),
+            )
+            return
+        result.created += 1
+        cursor = upper
+
+
+async def _retire(
+    conn: AsyncConnection,
+    table: LogTable,
+    window: timedelta,
+    now: datetime,
+    result: MaintenanceResult,
+) -> None:
+    parts = await list_partitions(conn, table.name)
+    # PostgreSQL refuses ``DETACH ... CONCURRENTLY`` while a default partition
+    # exists. We never create one; an operator might have.
+    concurrent = "" if any(p.is_default for p in parts) else " CONCURRENTLY"
+    cutoff = now - window
+    # A timed-out concurrent detach leaves its partition pending, and no other
+    # detach can start on the table until that one is finished: so those come
+    # first, and the first failure ends the pass (the next tick retries).
+    todo = [(p, True) for p in parts if p.detach_pending] + [
+        (p, False)
+        for p in parts
+        if not p.detach_pending and p.upper is not None and p.upper <= cutoff
+    ]
+    for p, pending in todo:
+        try:
+            if pending:
+                await conn.exec_driver_sql(
+                    f'ALTER TABLE "{table.name}" DETACH PARTITION "{p.name}" FINALIZE'
+                )
+                result.finalized += 1
+            else:
+                await conn.exec_driver_sql(
+                    f'ALTER TABLE "{table.name}" DETACH PARTITION "{p.name}"{concurrent}'
+                )
+            await conn.exec_driver_sql(f'DROP TABLE "{p.name}"')
+        except DBAPIError as exc:
+            result.failed += 1
+            result.errors.append(f"retire {p.name}: {exc.orig!r}")
+            logger.warning(
+                "log_partition_retire_failed",
+                table=table.name,
+                partition=p.name,
+                error=repr(exc.orig),
+            )
+            return
+        result.dropped += 1
+
+
+async def maintain(
+    conn: AsyncConnection,
+    table: LogTable,
+    retention_hours: int,
+    *,
+    now: datetime | None = None,
+) -> MaintenanceResult:
+    """Run one table's whole lifecycle once.
+
+    ``conn`` must be in ``AUTOCOMMIT``: ``DETACH ... CONCURRENTLY`` cannot
+    run inside a transaction block, and the advisory lock is held by this
+    connection for the length of the run.
+    """
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    window = table.window(retention_hours)
+    result = MaintenanceResult(table.name)
+    if not await _lock(conn, table.name, acquire=True):
+        result.skipped_locked = True
+        return result
+    try:
+        await conn.exec_driver_sql(f"SET lock_timeout = {LOCK_TIMEOUT_MS}")
+        await conn.exec_driver_sql("SET TIME ZONE 'UTC'")
+        # Creating comes before retiring: ingest stalls without a partition
+        # to write into, while an expired one that lingers costs only space.
+        await _drop_orphans(conn, table.name, result)
+        await _create_ahead(conn, table, window, now, result)
+        await _retire(conn, table, window, now, result)
+    finally:
+        await _lock(conn, table.name, acquire=False)
+        _coverage_cache.pop(table.name, None)
+    return result
