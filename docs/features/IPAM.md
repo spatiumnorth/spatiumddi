@@ -1051,8 +1051,8 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 
 ## 9. Utilization Tracking
 
-- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule)
-- `IPBlock.utilization_percent` is computed by rolling up child subnet utilization
+- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
+- `IPBlock.utilization_percent` is the share of the block's **whole CIDR** in use (#2982). `total_ips` is the CIDR size (clamped to 2^63 - 1 for huge IPv6 blocks). `allocated_ips` rolls up every descendant subnet's `allocated_ips` **plus that subnet's non-usable addresses** — network and broadcast for IPv4 below /31, the network address for IPv6 below /127, nothing for /31, /32, /127 and /128 — each counted once even when a row already sits on it. So a /30 block holding one full /30 subnet reads 4 / 4, 100%, while the subnet itself reads 2 / 2. A block is clamped to its CIDR size and never reads over 100%. Both counters are rewritten on every write under the block and by the hourly `recount_ipam_utilization` sweep.
 - Alerts are configured in the notification system when utilization exceeds thresholds (default: warn at 80%, critical at 95%)
 
 ---

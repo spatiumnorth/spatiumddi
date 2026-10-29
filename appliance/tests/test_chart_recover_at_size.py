@@ -38,8 +38,11 @@ def test_cnpg_keeps_wal_for_a_former_primary() -> None:
     assert _mb(params["wal_keep_size"]) > CNPG_DEFAULT_WAL_KEEP_MB
     # The Cluster renders the whole parameters map, so the default reaches the
     # CR beside whatever the supervisor's HelmChartConfig sets (shared_buffers).
+    # Since #2955 the map is deep-copied (to derive an empty max_connections)
+    # and the copy is rendered whole.
     cluster = (UMBRELLA / "templates" / "cnpg-cluster.yaml").read_text(encoding="utf-8")
-    assert "toYaml .Values.postgresql.cnpg.parameters" in cluster
+    assert "deepCopy .Values.postgresql.cnpg.parameters" in cluster
+    assert "toYaml $params" in cluster
 
 
 def test_size_parser_negative_control() -> None:

@@ -85,6 +85,7 @@ from app.drivers.dns import (
     get_driver,
     is_agentless,
     supports_topology_pull,
+    ttl_refusal,
 )
 from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
@@ -118,6 +119,7 @@ from app.models.dns import (
     dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
+from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
@@ -716,6 +718,13 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2962 — who the current not-``ok`` daemon state came from: ``agent``
+    # (its own heartbeat) or ``supervisor`` (the appliance's supervisor, from
+    # the kubelet's container state, when the agent died with its container
+    # or has gone silent). ``null`` on ``ok`` or never reported. Derived
+    # (``container_oom.daemon_reported_by``), the same reading the alert's
+    # wording uses.
+    daemon_reported_by: Literal["agent", "supervisor"] | None = None
     # #2044 — a second live agent process is polling as this server (a cloned
     # VM or a copied state dir keeps the agent_id) and is being refused: only
     # the most recent process is served record ops. Derived
@@ -795,6 +804,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
             **_duplicate_agent_fields(s),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
@@ -1264,7 +1274,7 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
             raise ValueError(
                 f"master {entry!r} must be a bare IPv4/IPv6 address (optionally 'ip@port')"
             ) from exc
-        if sep and (not port.isdigit() or not (1 <= int(port) <= 65535)):
+        if sep and (not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535)):
             raise ValueError(f"master {entry!r}: port must be an integer in 1..65535")
         cleaned.append(entry)
     return cleaned
@@ -4099,7 +4109,7 @@ def _plain_port_forwarders(entries: list[str] | None) -> list[str]:
     out = []
     for entry in entries or []:
         port = str(entry).partition("@")[2].strip()
-        if port.isdigit() and int(port) == 53:
+        if port.isascii() and port.isdigit() and int(port) == 53:
             out.append(entry)
     return out
 
@@ -7874,6 +7884,16 @@ async def create_zone_from_template(
             detail="A zone with that name already exists in this group/view",
         )
 
+    # Every provider-refusal gate runs on the whole record set BEFORE the zone
+    # exists or is pushed anywhere, so a refusal is atomic (#3007).
+    record_payloads = materialize(template, body.zone_name, body.params)
+    for r in record_payloads:
+        if r["record_type"] in VALID_RECORD_TYPES:
+            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    await _check_driver_refusals(
+        [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
+    )
+
     guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(
         group_id=group_id,
@@ -7887,7 +7907,6 @@ async def create_zone_from_template(
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
-    record_payloads = materialize(template, body.zone_name, body.params)
     created_records: list[DNSRecord] = []
     for r in record_payloads:
         if r["record_type"] not in VALID_RECORD_TYPES:
@@ -8602,6 +8621,7 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
@@ -8732,6 +8752,12 @@ async def update_record(
         return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
+    if "value" in changes or "ttl" in changes:
+        # #2959 / #2942 — before the row is touched, so a refusal leaves it as
+        # it was. Only what the request changes is checked.
+        await _check_driver_refusals(
+            [(record.record_type, changes.get("value"), changes.get("ttl"))], group_id, db
+        )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -9298,6 +9324,9 @@ async def bulk_create_records(
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_refusals(
+        [(r.record_type, r.value, r.ttl) for r in body.records], group_id, db
+    )
 
     # Normalise first: MX defaults its priority to 10, so an MX with and one
     # without an explicit 10 are the same record and must compare equal.
@@ -9838,6 +9867,12 @@ async def import_zone_commit(
     _reject_if_synthesised_zone(zone, "import")
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_refusals(
+        [(c.record_type, c.value, c.ttl) for c in diff.to_create]
+        + [(c.record_type, None, c.ttl) for c in diff.to_update],
+        group_id,
+        db,
+    )
 
     # #2275 — a view-scoped import creates or deletes records in that view,
     # which moves where the zone renders.
@@ -10548,6 +10583,20 @@ async def import_zone_spreadsheet_commit(
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
 
+    await _check_driver_refusals(
+        [(c.record_type, c.value, c.ttl) for c in plan.creates]
+        + [
+            (
+                u.candidate.record_type,
+                u.candidate.value if "value" in u.changed else None,
+                u.candidate.ttl,
+            )
+            for u in plan.updates
+        ],
+        group_id,
+        db,
+    )
+
     # #2275 — rows carry a view, and a record's view places its zone there.
     render_guard = await RenderGuard.capture(db, group_id, [zone.name])
     batch_id = uuid.uuid4()
@@ -10913,6 +10962,51 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                     "public resolvers."
                 ),
             )
+
+
+async def _check_driver_refusals(
+    records: Iterable[tuple[str, str | None, int | None]], group_id: uuid.UUID, db: DB
+) -> None:
+    """422 a record a driver in the zone's group would refuse (#2942, #2959).
+
+    ``records`` is ``(record_type, value, ttl)``; a ``None`` value or TTL is
+    not checked (an update that leaves it alone, or a TTL that inherits). One
+    gate, one query, for both things a driver can refuse about a record:
+
+    * its **value** — through the driver's optional
+      ``record_value_refusal(record_type, value) -> str | None`` (Linode
+      cannot carry non-zero CAA flags, for example; #2959). Without it the
+      record would be stored and then fail on every push.
+    * its **TTL** — :func:`app.drivers.dns.ttl_refusal` against
+      ``PROVIDER_TTL_RANGES`` (#2942). Without it a TTL of 0 reaches
+      Cloudflare (refused, so the stored record never publishes) or Vultr /
+      Linode (read as "automatic", so a different TTL publishes).
+
+    Values are checked before TTLs, and the first refusal is the 422, in the
+    provider's own words. Same fail-soft semantics as
+    ``_check_driver_gated_record_type``: an empty group passes, and the
+    driver re-checks at apply time.
+    """
+    rows = list(records)
+    values = [(rtype, value) for rtype, value, _ in rows if value is not None]
+    ttls = sorted({ttl for _, _, ttl in rows if ttl is not None})
+    if not values and not ttls:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    drivers = sorted({d for d in res.scalars().all() if d})
+    for driver in drivers:
+        check = getattr(_DNS_DRIVERS.get(driver), "record_value_refusal", None)
+        if check is None:
+            continue
+        for record_type, value in values:
+            refusal = check(record_type, value)
+            if refusal:
+                raise HTTPException(status_code=422, detail=refusal)
+    for driver in drivers:
+        for ttl in ttls:
+            reason = ttl_refusal(driver, ttl)
+            if reason is not None:
+                raise HTTPException(status_code=422, detail=reason)
 
 
 async def _require_record(

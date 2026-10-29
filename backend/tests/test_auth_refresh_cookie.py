@@ -15,13 +15,16 @@ HttpOnly + SameSite=Strict cookie the browser manages. This pins the contract:
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import hash_password
-from app.models.auth import User
+from app.core.security import decode_access_token, hash_password, hash_refresh_token
+from app.core.session_rotation import ROTATION_GRACE
+from app.models.auth import User, UserSession
 
 _PASSWORD = "Sup3r-secret!"
 
@@ -97,10 +100,33 @@ async def test_refresh_reads_cookie_rotates_and_returns_access_only(
     rotated = _refresh_set_cookie(resp)
     assert first_cookie not in rotated
 
-    # Single-use: replaying the ORIGINAL (pre-rotation) refresh token must be
-    # rejected — the old session was revoked. Without this a broken rotation
-    # that mints a new cookie but forgets ``session.revoked = True`` would
-    # still pass the value-differs check above.
+    # Single-use: the ORIGINAL (pre-rotation) refresh token must be revoked.
+    # Without this a broken rotation that mints a new cookie but forgets
+    # ``session.revoked = True`` would still pass the value-differs check
+    # above. Inside the #2941 grace window a replay is answered with the
+    # SAME successor (no new session, no new cookie); once the window has
+    # passed it is a 401.
+    old_row = (
+        await db_session.execute(
+            select(UserSession).where(
+                UserSession.refresh_token_hash == hash_refresh_token(first_cookie)
+            )
+        )
+    ).scalar_one()
+    assert old_row.revoked is True
+    client.cookies.clear()
+    client.cookies.set("spatium_refresh", first_cookie)
+    replay = await client.post("/api/v1/auth/refresh")
+    assert replay.status_code == 200, replay.text
+    assert not any(h.startswith("spatium_refresh=") for h in replay.headers.get_list("set-cookie"))
+    assert decode_access_token(replay.json()["access_token"])["jti"] == str(old_row.rotated_to_id)
+
+    await db_session.execute(
+        update(UserSession)
+        .where(UserSession.id == old_row.id)
+        .values(rotated_at=datetime.now(UTC) - ROTATION_GRACE - timedelta(seconds=1))
+    )
+    await db_session.commit()
     client.cookies.clear()
     client.cookies.set("spatium_refresh", first_cookie)
     replay = await client.post("/api/v1/auth/refresh")

@@ -52,6 +52,7 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
+from ._caa import caa_presentation
 from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, SERIAL_UNREAD, DriverBase, HeldZone
 
@@ -1053,6 +1054,10 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
         # truncates SPF/DMARC at a comment and spaces split the value
         # into separate character-strings resolvers concatenate wrong.
         return _quote_txt(value)
+    if rtype_u == "CAA":
+        # Quoted and escaped (#2943): a bare ``ca.org; account=1`` would lose
+        # everything after the ``;`` as a zone-file comment.
+        return caa_presentation(value)
     if rtype_u == "MX":
         pri = fields.get("priority")
         if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
@@ -3275,6 +3280,8 @@ class Bind9Driver(DriverBase):
             if rtype == "TXT":
                 # Quote TXT (issue #1514) — see _wire_value.
                 value = _quote_txt(value)
+            elif rtype == "CAA":
+                value = caa_presentation(value)
             elif rtype == "MX" and rec.get("priority") is not None:
                 if not value.lstrip().split(" ", 1)[0].isdigit():
                     value = f"{rec['priority']} {value}"
@@ -5424,7 +5431,8 @@ class Bind9Driver(DriverBase):
         overlay[key] = new
         before = _zone_apex(_apex_zone(state))
         after = _zone_apex(_apex_zone(new))
-        ttl = int(state.get("ttl") or 3600)
+        _state_ttl = state.get("ttl")
+        ttl = int(_state_ttl) if _state_ttl is not None else 3600
         glue = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
         if after.placeholder_glue and not before.placeholder_glue:
             upd.add(glue, ttl, "A", _PLACEHOLDER_NS_ADDRESS)

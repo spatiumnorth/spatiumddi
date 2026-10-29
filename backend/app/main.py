@@ -985,6 +985,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.services import after_commit_dispatch  # noqa: PLC0415
 
     await after_commit_dispatch.shutdown()
+    from app.db import dispose_probe_engine  # noqa: PLC0415
+
+    await dispose_probe_engine()
     logger.info("shutdown", service="api")
 
 

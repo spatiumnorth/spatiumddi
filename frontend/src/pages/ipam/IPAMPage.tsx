@@ -11394,6 +11394,11 @@ function BulkDeleteAddressesModal({
 
 // ─── Subnet Row in tree ───────────────────────────────────────────────────────
 
+/** Tree-row chips give way before the CIDR does: capped, ellipsised, and
+ *  `block` because `truncate` does nothing on an `inline-flex` box. The full
+ *  text is the chip's own `title`. */
+export const TREE_CHIP_CLS = "block min-w-0 max-w-[6rem] shrink truncate";
+
 export function SubnetRow({
   subnet,
   isSelected,
@@ -11439,20 +11444,30 @@ export function SubnetRow({
             ·
           </div>
           <Network className="h-3.5 w-3.5 flex-shrink-0" />
-          {/* The CIDR never shrinks; the name is what gets cut (#2993). */}
-          <div className="flex min-w-0 flex-1 flex-col">
-            <span className="shrink-0 whitespace-nowrap font-mono text-xs">
-              {subnet.network}
-            </span>
-            {subnet.name && (
-              <span className="min-w-0 truncate text-xs text-muted-foreground/60">
-                {subnet.name}
-              </span>
-            )}
-          </div>
-          <CustomerChip customerId={subnet.customer_id} />
-          <SiteChip siteId={subnet.site_id} />
-          <BgpAdvertisedChip spaceId={subnet.space_id} subnetId={subnet.id} />
+          {/* One flex row. The CIDR is a direct, non-shrinking child of the
+              row, so `shrink-0` acts on its width (#2822 does the same for
+              the block row); inside a flex column it acted on the height
+              and the column still collapsed to 0 px (#3005, #2993). The
+              name and the chips are what give way. */}
+          <span className="shrink-0 whitespace-nowrap font-mono text-xs">
+            {subnet.network}
+          </span>
+          <span
+            className="min-w-0 flex-1 truncate text-xs text-muted-foreground/60"
+            title={subnet.name || undefined}
+          >
+            {subnet.name}
+          </span>
+          <CustomerChip
+            customerId={subnet.customer_id}
+            className={TREE_CHIP_CLS}
+          />
+          <SiteChip siteId={subnet.site_id} className={TREE_CHIP_CLS} />
+          <BgpAdvertisedChip
+            spaceId={subnet.space_id}
+            subnetId={subnet.id}
+            className={TREE_CHIP_CLS}
+          />
           <UtilizationDot
             percent={subnet.utilization_percent}
             uncountable={isUncountable(subnet.total_ips)}

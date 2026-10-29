@@ -71,6 +71,12 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+    has_boundary_rows,
+)
 from app.services.ipam.subnet_carry import (
     merge_conflicts_and_warnings,
     merged_carried,
@@ -157,6 +163,65 @@ def _is_default_placeholder(row: IPAddress) -> bool:
     if is_user_named or has_custom_desc or row.dns_record_id is not None:
         return False
     return True
+
+
+def _is_default_gateway_row(row: IPAddress) -> bool:
+    """The Gateway row create_subnet seeds, untouched (same test as resize)."""
+    return (
+        row.status == "reserved"
+        and row.hostname == "gateway"
+        and row.description == "Gateway"
+        and row.dns_record_id is None
+    )
+
+
+def _gateway_plan(
+    sources: list[Subnet], merged: IPNetwork, rows: list[IPAddress]
+) -> tuple[str | None, set[str]]:
+    """``(surviving_gateway, retired_gateway_addresses)`` for a merge (#2976).
+
+    One gateway among the sources survives as-is. When they differ, a subnet
+    created at the merged prefix would get its gateway at network + 1, so a
+    source gateway there wins, and every other source's gateway is retired
+    when it is still the default row create seeded at that source's own
+    network + 1 (an operator-set or renamed gateway is kept, and the merged
+    subnet's gateway field stays empty as before). Otherwise nothing wins.
+    """
+    gateways: dict[str, Subnet] = {}
+    for src in sources:
+        if not src.gateway:
+            continue
+        try:
+            gw = str(ipaddress.ip_address(str(src.gateway)))
+        except ValueError:
+            continue
+        gateways.setdefault(gw, src)
+    in_merged = {gw for gw in gateways if ipaddress.ip_address(gw) in merged}
+    if len(gateways) == 1:
+        return (next(iter(in_merged)) if in_merged else None), set()
+    if not gateways or not has_boundary_rows(merged, sources[0].kind):
+        return None, set()
+    create_gw = str(merged.network_address + 1)
+    if create_gw not in in_merged:
+        return None, set()
+    retired: set[str] = set()
+    by_addr = {str(r.address): r for r in rows}
+    for gw, src in gateways.items():
+        if gw == create_gw:
+            continue
+        try:
+            src_net = ipaddress.ip_network(str(src.network), strict=False)
+        except ValueError:
+            continue
+        row = by_addr.get(gw)
+        if (
+            row is not None
+            and row.subnet_id == src.id
+            and gw == str(src_net.network_address + 1)
+            and _is_default_gateway_row(row)
+        ):
+            retired.add(gw)
+    return create_gw, retired
 
 
 async def _load_sources(
@@ -355,6 +420,55 @@ async def preview_subnet_merge(
     )
     warnings.extend(carry_warnings)
 
+    # A host on the merged subnet's network / broadcast address would sit
+    # where no client can use it and count against a total that excludes it
+    # (#2976). Hosts only: default placeholders are pruned and recreated.
+    if merged is not None:
+        src_ids = [s.id for s in sources]
+        host_rows = (
+            (await db.execute(select(IPAddress).where(IPAddress.subnet_id.in_(src_ids))))
+            .scalars()
+            .all()
+        )
+        # A host already on its own source's network / broadcast address is
+        # existing data the merge does not move (#2976): only a boundary the
+        # merge creates is refused.
+        already: set[str] = set()
+        for src in sources:
+            try:
+                src_net = ipaddress.ip_network(str(src.network), strict=False)
+            except ValueError:
+                continue
+            already |= boundary_addresses(src_net, src.kind)
+        for detail in boundary_host_conflicts(
+            host_rows, [merged], kind=sources[0].kind, already=already
+        ):
+            conflicts.append(
+                MergeConflict(
+                    type="host_on_merged_boundary",
+                    detail=detail.replace(" first.", " before merging."),
+                )
+            )
+
+        surviving_gw, retired_gw = _gateway_plan(sources, merged, list(host_rows))
+        if len({str(src.gateway) for src in sources if src.gateway}) > 1:
+            if surviving_gw is None:
+                warnings.append(
+                    "Sources have different gateways; the merged subnet's gateway "
+                    "is left empty and every gateway row is kept. Set it after "
+                    "the merge."
+                )
+            else:
+                kept = (
+                    f"The default Gateway row(s) at {', '.join(sorted(retired_gw))} " "are retired."
+                    if retired_gw
+                    else "The other sources' gateway rows were edited and are kept."
+                )
+                warnings.append(
+                    f"Sources have different gateways; the merged subnet's gateway "
+                    f"is {surviving_gw}, where a subnet created at {merged} gets it. " + kept
+                )
+
     # DHCP scope handling — at most one survivor.
     scopes = (
         (
@@ -470,18 +584,20 @@ async def commit_subnet_merge(
     else:
         total_ips_new = merged_net.num_addresses - 2
 
-    # Take the gateway from whichever source contained it. If multiple
-    # sources had gateways and they're equal, keep it; if they differ,
-    # null it out (operator can re-set).
-    gateways = {str(s.gateway) for s in sources if s.gateway}
-    surviving_gateway: str | None = None
-    if len(gateways) == 1:
-        gw = next(iter(gateways))
-        try:
-            if ipaddress.ip_address(gw) in merged_net:
-                surviving_gateway = gw
-        except ValueError:
-            pass
+    # Take the gateway from whichever source contained it. If the sources'
+    # gateways differ, the one create_subnet would make (network + 1) wins
+    # and the other sources' untouched default Gateway rows are retired
+    # (#2976); with no such winner it is nulled (operator can re-set).
+    source_rows = list(
+        (
+            await db.execute(
+                select(IPAddress).where(IPAddress.subnet_id.in_([s.id for s in sources]))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    surviving_gateway, retired_gateways = _gateway_plan(sources, merged_net, source_rows)
 
     merged_subnet = Subnet(
         space_id=target.space_id,
@@ -529,12 +645,12 @@ async def commit_subnet_merge(
         except ValueError:
             continue
         source_boundary_ips.add(str(sn.network_address))
-        if isinstance(sn, ipaddress.IPv4Network) and sn.prefixlen <= 30:
-            source_boundary_ips.add(str(sn.broadcast_address))
+        source_boundary_ips |= boundary_addresses(sn)
 
     # Migrate IPAddress rows.
     moved = 0
     deleted_default = 0
+    retired_gateway_rows = 0
     for s in sources:
         rows = (
             (await db.execute(select(IPAddress).where(IPAddress.subnet_id == s.id))).scalars().all()
@@ -543,6 +659,10 @@ async def commit_subnet_merge(
             if str(row.address) in source_boundary_ips and _is_default_placeholder(row):
                 await db.delete(row)
                 deleted_default += 1
+                continue
+            if str(row.address) in retired_gateways and _is_default_gateway_row(row):
+                await db.delete(row)
+                retired_gateway_rows += 1
                 continue
             row.subnet_id = merged_subnet.id
             moved += 1
@@ -588,43 +708,13 @@ async def commit_subnet_merge(
     await db.flush()
 
     # Recreate default-named placeholders on the merged subnet.
-    placeholders_created = 0
-    if merged_net.prefixlen < 31:
-        existing = (
-            (
-                await db.execute(
-                    select(IPAddress.address).where(IPAddress.subnet_id == merged_subnet.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        existing_set = {str(a) for a in existing}
-        net_addr = str(merged_net.network_address)
-        if net_addr not in existing_set:
-            db.add(
-                IPAddress(
-                    subnet_id=merged_subnet.id,
-                    address=net_addr,
-                    status="network",
-                    description="Network address",
-                    created_by_user_id=(current_user.id if current_user is not None else None),
-                )
-            )
-            placeholders_created += 1
-        if isinstance(merged_net, ipaddress.IPv4Network) and merged_net.prefixlen <= 30:
-            bcast = str(merged_net.broadcast_address)
-            if bcast not in existing_set:
-                db.add(
-                    IPAddress(
-                        subnet_id=merged_subnet.id,
-                        address=bcast,
-                        status="broadcast",
-                        description="Broadcast address",
-                        created_by_user_id=(current_user.id if current_user is not None else None),
-                    )
-                )
-                placeholders_created += 1
+    placeholders_created = await ensure_boundary_rows(
+        db,
+        merged_subnet.id,
+        merged_net,
+        current_user.id if current_user is not None else None,
+        kind=merged_subnet.kind,
+    )
     await db.flush()
 
     # Bump DHCP config bundles on agent-based servers in any affected
@@ -692,6 +782,8 @@ async def commit_subnet_merge(
     ]
     if deleted_default:
         summary.append(f"Deleted {deleted_default} default-named source-boundary row(s)")
+    if retired_gateway_rows:
+        summary.append(f"Retired {retired_gateway_rows} default Gateway row(s) of other sources")
     if dhcp_scope_rebind:
         summary.append("Re-bound 1 DHCP scope to the merged subnet")
     if dhcp_servers_notified:

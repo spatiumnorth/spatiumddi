@@ -112,8 +112,19 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.utilization import (
+    block_allocated,
+    block_subnet_contribution_sql,
+    block_utilization_percent,
+    counts_toward_utilization,
+)
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
+from app.services.ipam.zone_binding import (
+    check_group_uuid_list,
+    check_zone_uuid,
+    check_zone_uuid_list,
+    stored_zone_uuid,
+)
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
@@ -439,17 +450,21 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
 async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> None:
     """Recompute utilization_percent for a block by summing allocated IPs across all
     descendant subnets (recursive), expressed as a fraction of the block's CIDR size.
-    Also updates all ancestor blocks up the tree.
+    Each subnet's network/broadcast addresses count as used here (#2982), so a
+    block fully carved into full subnets reads 100%; the subnet's own counter
+    still leaves them out (#2411). Also updates all ancestor blocks up the tree.
     """
     block = await db.get(IPBlock, block_id)
     if block is None:
         return
 
-    # Sum allocated_ips for all subnets in this block and all descendant blocks
+    # Sum each subnet's contribution (allocated_ips + its network/broadcast)
+    # over this block and all descendant blocks.
     # deleted_at IS NULL guards: raw SQL bypasses the ORM soft-delete filter,
     # so trashed blocks/subnets would otherwise inflate the rollup (#490).
+    contribution = block_subnet_contribution_sql("s")
     result = await db.execute(
-        text("""
+        text(f"""
             WITH RECURSIVE descendants AS (
                 SELECT id FROM ip_block
                 WHERE id = CAST(:block_id AS uuid) AND deleted_at IS NULL
@@ -458,20 +473,17 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
                     INNER JOIN descendants d ON b.parent_block_id = d.id
                 WHERE b.deleted_at IS NULL
             )
-            SELECT COALESCE(SUM(s.allocated_ips), 0)
+            SELECT COALESCE(SUM({contribution}), 0)
             FROM subnet s
             WHERE s.block_id IN (SELECT id FROM descendants)
               AND s.deleted_at IS NULL
-        """),
+        """),  # the fragment is a constant: no request input reaches it
         {"block_id": str(block_id)},
     )
-    allocated = result.scalar() or 0
-
     net = ipaddress.ip_network(str(block.network), strict=False)
     block_total = net.num_addresses
-    block.utilization_percent = (
-        round(float(allocated) / block_total * 100, 2) if block_total > 0 else 0.0
-    )
+    allocated = block_allocated(int(result.scalar() or 0), net)
+    block.utilization_percent = block_utilization_percent(allocated, net)
     # Cache the raw counts too so block rows can render Used IPs (not just a
     # utilization bar). total_ips clamps to BIGINT for huge IPv6 blocks.
     block.allocated_ips = int(allocated)
@@ -500,7 +512,7 @@ async def _resolve_effective_dns(
     """
     # Subnet override wins if inherit is off.
     if not subnet.dns_inherit_settings:
-        zone_id = uuid.UUID(subnet.dns_zone_id) if subnet.dns_zone_id else None
+        zone_id = stored_zone_uuid(subnet.dns_zone_id)
         return (
             list(subnet.dns_group_ids or []),
             zone_id,
@@ -510,7 +522,7 @@ async def _resolve_effective_dns(
     current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
     while current is not None:
         if not current.dns_inherit_settings:
-            zone_id = uuid.UUID(current.dns_zone_id) if current.dns_zone_id else None
+            zone_id = stored_zone_uuid(current.dns_zone_id)
             return (
                 list(current.dns_group_ids or []),
                 zone_id,
@@ -524,7 +536,7 @@ async def _resolve_effective_dns(
             space = await db.get(IPSpace, current.space_id)
             if space is None:
                 break
-            zone_id = uuid.UUID(space.dns_zone_id) if space.dns_zone_id else None
+            zone_id = stored_zone_uuid(space.dns_zone_id)
             return (
                 list(space.dns_group_ids or []),
                 zone_id,
@@ -3384,6 +3396,21 @@ class IPSpaceCreate(BaseModel):
             )
         return v
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
+
 
 class IPSpaceUpdate(BaseModel):
     name: str | None = None
@@ -3421,6 +3448,21 @@ class IPSpaceUpdate(BaseModel):
     @classmethod
     def _v(cls, v: str | None) -> str | None:
         return _validate_ddns_policy_optional(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPSpaceResponse(BaseModel):
@@ -3512,6 +3554,21 @@ class IPBlockCreate(BaseModel):
             )
         return v
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
+
 
 class IPBlockUpdate(BaseModel):
     name: str | None = None
@@ -3542,6 +3599,21 @@ class IPBlockUpdate(BaseModel):
     @classmethod
     def _v(cls, v: str | None) -> str | None:
         return _validate_ddns_policy_optional(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPBlockResponse(BaseModel):
@@ -3687,12 +3759,7 @@ class SubnetCreate(BaseModel):
         # The binding is stored as text but must name a zone: a body that
         # sends garbage here used to be accepted because the field was
         # dropped on the floor (spatiumddi#1066); now it is refused.
-        if v is None or v == "":
-            return None
-        try:
-            return str(uuid.UUID(str(v)))
-        except ValueError as exc:
-            raise ValueError("dns_zone_id must be the UUID of a DNS zone") from exc
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("subnet_role")
     @classmethod
@@ -3778,6 +3845,16 @@ class SubnetCreate(BaseModel):
         if v is None or not v.strip():
             return v
         return validate_fqdn(v, field="domain_name")
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class SubnetUpdate(BaseModel):
@@ -3909,6 +3986,21 @@ class SubnetUpdate(BaseModel):
         if v is None or not v.strip():
             return v
         return validate_fqdn(v, field="domain_name")
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class SubnetVLANRef(BaseModel):
@@ -4245,6 +4337,16 @@ class IPAddressCreate(BaseModel):
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
+    @field_validator("extra_zone_ids")
+    @classmethod
+    def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="extra_zone_ids")
+
 
 class IPAddressUpdate(BaseModel):
     status: str | None = None
@@ -4299,6 +4401,16 @@ class IPAddressUpdate(BaseModel):
     @classmethod
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
+    @field_validator("extra_zone_ids")
+    @classmethod
+    def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
 class IPAddressResponse(BaseModel):
@@ -4473,6 +4585,16 @@ class NextIPRequest(BaseModel):
     @classmethod
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
+    @field_validator("extra_zone_ids")
+    @classmethod
+    def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
 # ── IP Spaces ──────────────────────────────────────────────────────────────────
@@ -10655,6 +10777,11 @@ class BulkAllocateRequest(BaseModel):
     # IPAM. Empty dict means "no tags".
     tags: dict[str, Any] = Field(default_factory=dict)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
 
 
 class BulkAllocatePreviewResponse(BaseModel):

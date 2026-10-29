@@ -30,14 +30,13 @@ from typing import Any
 import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
-import dns.tokenizer
 import structlog
-from dns.rdtypes.ANY.CAA import CAA
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import collect_wake, dns_server_channel
 from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
+from app.drivers.dns._caa import caa_key
 from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
@@ -236,9 +235,6 @@ _RDATA_CANONICAL_TYPES = frozenset({"LOC", "TLSA", "SSHFP"})
 #: A LOC direction letter written in lower case, which dnspython refuses.
 _LOC_DIRECTION = re.compile(r"(?<=\s)([nsew])(?=\s|$)")
 
-#: ``<flags> <tag> <value>``; the value is everything after the tag.
-_CAA_FIELDS = re.compile(r"^(\d+)\s+(\S+)\s+(.*)$", re.S)
-
 
 def _wire_canonical(rtype: str, text: str) -> str:
     """``text`` as dnspython prints it after a wire round trip, which is what
@@ -279,37 +275,17 @@ def caa_canonical(value: str) -> str:
     """A CAA value in the AXFR reader's form (#2925): ``0 issue ca.org`` and
     ``0 issue "ca.org"`` are one record.
 
-    Parsed by hand rather than as a zone-file line, because a zone-file
-    parse would key two genuinely different records together: an unquoted
-    ``ca.org; account=1`` reads as ``ca.org`` and a comment, and a provider
-    that takes the value as given (Azure) serves all of it. So an unquoted
-    value is the rest of the text as written, and only a quoted one is
-    unescaped. The tag is lower-cased, since tags match case-insensitively
-    (RFC 8659 §4.1); the value keeps its case, since an ``iodef`` URL or an
-    account URI is case-sensitive. The flags compare as a number. A value
-    that does not parse keys as its text with runs of whitespace folded,
-    case kept for the same reason."""
-    text = value.strip()
-    fallback = " ".join(text.split())
-    m = _CAA_FIELDS.match(text)
-    if m is None:
-        return fallback
-    flags, tag, rest = m.groups()
-    try:
-        if rest.startswith('"'):
-            tok = dns.tokenizer.Tokenizer(rest)
-            token = tok.get()
-            if not token.is_quoted_string():
-                return fallback
-            raw = token.unescape_to_bytes().value
-            tok.get_eol()
-        else:
-            raw = rest.encode("utf-8")
-        return CAA(
-            dns.rdataclass.IN, dns.rdatatype.CAA, int(flags), tag.lower().encode("ascii"), raw
-        ).to_text()
-    except Exception:  # noqa: BLE001 - any parse failure keys as the text
-        return fallback
+    This is :func:`app.drivers.dns._caa.caa_key`, the key the drivers write
+    and match with (#2943), so drift, Sync and the drivers share ONE CAA
+    canonical form. An unquoted value is the rest of the text as written
+    (``ca.org; account=1`` is all one value, not a value and a comment), a
+    quoted one is unescaped, the tag is lower-cased (RFC 8659 §4.1), the
+    value keeps its case (an ``iodef`` URL is case-sensitive), and the flags
+    compare as a number. Its presentation is the one dnspython prints for the
+    same rdata, so a stored value keys identically to the AXFR reader's
+    output. A value that does not parse keys as its text with runs of
+    whitespace folded, case kept."""
+    return caa_key(value)
 
 
 def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets: bool) -> str:
