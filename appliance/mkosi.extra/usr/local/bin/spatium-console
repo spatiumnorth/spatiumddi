@@ -5155,8 +5155,12 @@ def do_shutdown(console: Console, state: "DashboardState | None" = None) -> None
 #: #3008 — "<boot_id>" of the boot a reboot was cancelled in. The supervisor
 #: reports it on its next heartbeat, so the control plane retires the Fleet
 #: request (``reboot_requested``) at once instead of at its 900 s give-up, and
-#: then removes it. Written under a fresh name and renamed into place: the api
+#: then empties it. Written under a fresh name and renamed into place: the api
 #: and the supervisor can create names in this directory and this runs as root.
+#: Published 0660 to the directory's shared gid: the directory is sticky, so the
+#: unprivileged supervisor can never unlink a root-owned file in it, only
+#: truncate one it may write — without that the marker outlived its ack and was
+#: reported on every heartbeat for the rest of the boot.
 REBOOT_CANCEL_MARKER = _RELEASE_STATE_DIR / "reboot-cancelled"
 
 
@@ -5170,8 +5174,10 @@ def _record_reboot_cancel() -> None:
     tmp = REBOOT_CANCEL_MARKER.with_name(f".reboot-cancelled.{os.getpid()}")
     try:
         tmp.unlink(missing_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as fh:
+            os.fchown(fh.fileno(), -1, _RELEASE_STATE_DIR.stat().st_gid)
+            os.fchmod(fh.fileno(), 0o660)
             fh.write(boot + "\n")
         os.replace(tmp, REBOOT_CANCEL_MARKER)
     except OSError:

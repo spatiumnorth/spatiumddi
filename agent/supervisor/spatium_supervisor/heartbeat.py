@@ -1443,9 +1443,14 @@ def heartbeat_once(
     desired_next_boot_slot = body_out.get("desired_next_boot_slot")
     desired_default_slot = body_out.get("desired_default_slot")
     reboot_requested = bool(body_out.get("reboot_requested"))
-    # #3008 — the control plane has this heartbeat's cancel report (retired
-    # the request, or had none to retire): the marker has done its job.
-    appliance_state.ack_reboot_cancel()
+    # #3008 — the cancel this heartbeat reported is done with only when the
+    # response proves the request retired (``reboot_requested`` false); an
+    # older api ignores the report and still sends ``true``.
+    reboot_in_response = body_out.get("reboot_requested")
+    appliance_state.ack_reboot_cancel(
+        state.get("reboot_cancelled_boot_id"),  # type: ignore[arg-type]
+        reboot_in_response if isinstance(reboot_in_response, bool) else None,
+    )
     clear_upgrade_requested = bool(body_out.get("clear_upgrade_requested"))
 
     # #786 — an explicit "Clear failed upgrade" outranks everything below.

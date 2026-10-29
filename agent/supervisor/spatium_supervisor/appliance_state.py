@@ -1696,20 +1696,42 @@ def read_reboot_cancel() -> str | None:
     return boot if boot and boot == read_boot_id() else None
 
 
-def ack_reboot_cancel() -> None:
-    """#3008 — the control plane has the cancel: drop the marker, and the
-    once-per-boot fire marker, which exists to stop a heartbeat re-writing the
-    trigger of a reboot that is going ahead. A cancelled one is not, and a new
-    request in this boot must be able to fire."""
-    boot = read_reboot_cancel()
-    for path in (_REBOOT_CANCEL_MARKER,) if boot is None else (
-        _REBOOT_CANCEL_MARKER,
-        _REBOOT_FIRED_BOOT_MARKER,
-    ):
-        try:
-            path.unlink()
-        except OSError:
-            pass
+def _clear_reboot_cancel() -> None:
+    """Empty the cancel marker in place. The console writes it as root in the
+    sticky release-state dir, so this process can never unlink or rename over
+    it; the console publishes it 0660 to the dir's shared gid so it can be
+    truncated, and an empty marker reads as no cancel. ``O_NOFOLLOW`` so a
+    name planted by another writer of the dir is never followed."""
+    try:
+        fd = os.open(_REBOOT_CANCEL_MARKER, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    except OSError:
+        return
+    os.close(fd)
+
+
+def ack_reboot_cancel(sent: str | None, reboot_requested: bool | None) -> None:
+    """#3008 — retire the console's cancel once the control plane has.
+
+    ``sent`` is the boot id THIS heartbeat reported (None when it reported
+    none), ``reboot_requested`` what the response said (None when it said
+    nothing). Only a response that carried the report AND answers that no
+    reboot is requested proves the request is retired; then the cancel marker
+    is emptied and the once-per-boot fire marker dropped, so a new Fleet
+    request in this boot can fire. Anything else — an older api that ignores
+    the report, a boot-id mismatch, a cancel written while the heartbeat was in
+    flight — keeps both: the fire marker is what stops the request still on
+    the row from rebooting the node the operator just cancelled."""
+    if not sent or reboot_requested is not False:
+        return
+    if read_reboot_cancel() != sent:
+        return
+    _clear_reboot_cancel()
+    try:
+        _REBOOT_FIRED_BOOT_MARKER.unlink()
+    except OSError:
+        # Absent (a console-started reboot was cancelled, nothing was fired)
+        # or not ours to remove: nothing to re-arm either way.
+        pass
 
 
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
@@ -1756,6 +1778,9 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
         tmp.replace(_REBOOT_TRIGGER_FILE)
         if boot_id:
             _REBOOT_FIRED_BOOT_MARKER.write_text(boot_id + "\n", encoding="utf-8")
+        # #3008 — a cancel made before this fire is not a cancel of it:
+        # reported on, it would have the control plane retire this request.
+        _clear_reboot_cancel()
         return True
     except OSError:
         return False

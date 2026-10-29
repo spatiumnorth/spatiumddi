@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -477,4 +478,9 @@ def test_the_console_cancel_leaves_a_marker_for_the_supervisor(tmp_path: Path) -
     con = _console(state, boot, lambda argv: None)
     fc = _FakeConsole()
     con["do_cancel_reboot"](fc)
-    assert (state / "reboot-cancelled").read_text().strip() == BOOT
+    marker = state / "reboot-cancelled"
+    assert marker.read_text().strip() == BOOT
+    # Group-writable to release-state's shared gid: the sticky dir lets the
+    # unprivileged supervisor empty it once acknowledged, never unlink it.
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o660
+    assert marker.stat().st_gid == state.stat().st_gid

@@ -54,5 +54,9 @@
   console leaves a `reboot-cancelled` marker (boot id); the supervisor
   reports it as `reboot_cancelled_boot_id` on its next heartbeat and the
   control plane retires `reboot_requested` at once, instead of at its
-  900 s give-up; the supervisor then drops the marker and the
-  once-per-boot fire marker, so a new request in the same boot can fire.
+  900 s give-up. Only a heartbeat answer that reports the request
+  retired makes the supervisor empty the marker and drop the
+  once-per-boot fire marker, so a new request in the same boot can fire;
+  an older control plane that ignores the report keeps both, and the
+  cancelled reboot is not fired again. F6 (power off) holds the same
+  10 s grace.
