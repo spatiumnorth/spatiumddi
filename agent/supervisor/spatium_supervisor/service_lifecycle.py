@@ -591,7 +591,11 @@ def shared_chart_hold_refusal(hold: dict[str, str] | None) -> str | None:
     if not hold:
         return None
     target = str(hold.get("target_version") or "")
-    if not target or appliance_state.read_installed_version() != target:
+    # #3026 — not a string compare: a nightly run's target is its release
+    # tag, which never equals the slot's ``0.0.0-nightly-…+<sha>``.
+    if not appliance_state.installed_is_target(
+        appliance_state.read_installed_version(), target
+    ):
         return None
     held = hold.get("from_tag") or "the version it runs"
     return (
