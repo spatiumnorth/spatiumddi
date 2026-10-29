@@ -178,6 +178,17 @@ describe("Kea tab (#3038)", () => {
     expect(await screen.findByText(/file: Field required/)).toBeTruthy();
   });
 
+  it("uploads an ISC dhcpd.conf as multipart form fields", async () => {
+    const { container } = await show(<DHCPImportPage />);
+    fireEvent.click(screen.getByRole("button", { name: /^ISC DHCP$/ }));
+    await act(async () => {});
+    const file = await fillAndPreview(container, "dhcpd.conf");
+    const req = previewRequest();
+    expect(req.url).toBe("/dhcp/import/isc/preview");
+    expect(req.data).toBeInstanceOf(FormData);
+    expect(((req.data as FormData).get("file") as File).name).toBe(file.name);
+  });
+
   it("shows a plain string detail unchanged", async () => {
     previewStatus = 400;
     previewDetail = "Not valid Kea JSON";
