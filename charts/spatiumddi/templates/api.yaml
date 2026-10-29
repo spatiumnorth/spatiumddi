@@ -42,6 +42,8 @@ spec:
           - {{ .Values.api.applianceHostMounts.hostGroupGid }}
         {{- end }}
       {{- end }}
+      # #2944 — the image's uvicorn runs --timeout-graceful-shutdown 20, below
+      # this, so lifespan shutdown (engine dispose) runs before the SIGKILL.
       terminationGracePeriodSeconds: 30
       {{- if .Values.api.serviceAccount.enabled }}
       # Phase 11 wave 4 (#183) — the api uses kubeapi for two things

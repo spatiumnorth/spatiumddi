@@ -1028,15 +1028,16 @@ _render_control_helmchart() {
         if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
         # #2156 — the Postgres limit holds the connections the cluster can open
         # (k8s_api.postgres_connection_budget). A fresh install is one node:
-        # the api pod's whole pool (10 + 20) and its #2782 after-commit hooks
-        # (2), each worker process with its hooks (1 + 2) plus one, no WAL
-        # sender, the reserve of 10 and celery-beat's hooks (2). One backend
-        # costs 14 MiB plus the page tables mapping shared_buffers
-        # (shared_buffers / 512, rounded up); the limit is never below
+        # the api pod's whole pool (10 + 20), its #2782 after-commit hooks
+        # (2) and its #2944 readiness-probe connection (1), each worker
+        # process with its hooks (1 + 2) plus one, no WAL sender, the reserve
+        # of 10 and celery-beat's hooks (2). One backend costs 14 MiB plus the
+        # page tables mapping shared_buffers (shared_buffers / 512, rounded
+        # up); the limit is never below
         # shared_buffers + 256 MiB + the connections x that. Only ever raises
         # the share above (a node under ~6 GiB), so shared_buffers, the
         # request and the worker stay as sized.
-        PG_CONNECTIONS=$(( 1 * (10 + 20 + 2 + WORKER_CONCURRENCY * (1 + 2) + 1) + 0 + 10 + 2 ))
+        PG_CONNECTIONS=$(( 1 * (10 + 20 + 2 + 1 + WORKER_CONCURRENCY * (1 + 2) + 1) + 0 + 10 + 2 ))
         PG_BACKEND_MIB=$(( 14 + (POSTGRES_SHARED_BUFFERS_MB + 511) / 512 ))
         PG_NEED_MIB=$(( POSTGRES_SHARED_BUFFERS_MB + 256 + PG_CONNECTIONS * PG_BACKEND_MIB ))
         if [ "$POSTGRES_MEM_MIB" -lt "$PG_NEED_MIB" ]; then POSTGRES_MEM_MIB=$PG_NEED_MIB; fi

@@ -190,8 +190,8 @@ async def list_interfaces(
         else:
             note = (
                 "No interfaces reported yet — the supervisor enumerates them on "
-                'its heartbeat (~30 s). Type a NIC name (e.g. eth0) or "any" '
-                "meanwhile."
+                "its heartbeat (~30 s). Re-open this page shortly, or type the "
+                'host NIC name (as `ip link` shows it on the appliance) or "any".'
             )
         return PcapInterfacesResponse(interfaces=ifaces, note=note)
     raise HTTPException(status_code=422, detail=f"unknown vantage: {vantage!r}")

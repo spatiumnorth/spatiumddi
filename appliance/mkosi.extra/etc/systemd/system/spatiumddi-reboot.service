@@ -17,4 +17,10 @@ ExecStartPre=/bin/sleep 10
 # without it a directory (or a link to one) at ``reboot-pending.done`` would
 # receive the trigger, i.e. root would move it wherever that link points.
 ExecStartPre=-/bin/mv -T /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
-ExecStart=/usr/bin/systemctl reboot
+# #2974 — hands the PostgreSQL primary off first, then systemctl reboot.
+# No start timeout (a oneshot's default, stated here so nobody adds one):
+# a timeout stops the wrapper, which it takes as a cancel, undoing the
+# cordon and NOT rebooting. The wrapper caps the handoff itself and then
+# reboots whatever the handoff did.
+TimeoutStartSec=infinity
+ExecStart=/usr/local/bin/spatium-power-action reboot
