@@ -1246,59 +1246,60 @@ def create_app() -> FastAPI:
     # Not captured to the diagnostics surface on purpose: the capture opens
     # a database session, and during the outage that is another 5 s connect
     # timeout in front of the 503. The warning line carries the route.
+    from sqlalchemy.exc import PendingRollbackError as SAPendingRollbackError  # noqa: PLC0415
     from sqlalchemy.exc import TimeoutError as SAPoolTimeoutError  # noqa: PLC0415
 
-    # The dependency-down exceptions this converts to 503. asyncpg's pre-ping
-    # times out as a bare ``TimeoutError``; a fresh checkout onto the not-yet-
-    # listening new primary raises ``ConnectionError`` (``ConnectionRefusedError``
-    # is a subclass); the pool's own checkout timeout is ``sqlalchemy.exc
-    # .TimeoutError``. All observed live on nightly-2026.09.12's partition rig
-    # while CNPG promoted a new primary.
-    _dependency_down = (TimeoutError, ConnectionError, SAPoolTimeoutError)
+    from app.core.dependency_down import (  # noqa: PLC0415
+        dependency_down_response,
+        is_dependency_down,
+        split_dependency_down,
+    )
 
-    def _dependency_down_response(request: Request, error_class: str, detail: str) -> Response:
-        from fastapi.responses import JSONResponse  # noqa: PLC0415
-
-        logger.warning(
-            "dependency_unavailable",
-            method=request.method,
-            path=request.url.path,
-            error_class=error_class,
-            error=detail[:200],
-        )
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": (
-                    "A backend dependency did not answer in time "
-                    "(database failover or restart in progress). Retry."
-                )
-            },
-            headers={"Retry-After": "2"},
-        )
+    # The classification (timeouts, connection errors, the pool checkout
+    # timeout, network-unreachable OSErrors by errno, an invalidated-connection
+    # PendingRollbackError) lives in ``app.core.dependency_down`` so the
+    # maintenance-mode middleware and ``get_db``'s cleanup, which run outside
+    # these handlers, agree with it (#3017).
+    def _dependency_down_response(request: Request, exc: BaseException) -> Response:
+        return dependency_down_response(request.method, request.url.path, exc, logger)
 
     @app.exception_handler(TimeoutError)
     @app.exception_handler(ConnectionError)
     @app.exception_handler(SAPoolTimeoutError)
     async def _dependency_unavailable(request: Request, exc: Exception) -> Response:
-        return _dependency_down_response(request, type(exc).__name__, str(exc))
+        return _dependency_down_response(request, exc)
 
-    # The same timeout sometimes arrives WRAPPED. SQLAlchemy's asyncpg driver
-    # runs the connection on an anyio task group, so a pre-ping timeout can
-    # surface as an ``ExceptionGroup`` rather than a bare ``TimeoutError`` —
-    # observed on ``GET /appliance/cluster/health`` on the partition rig
-    # (``ExceptionGroup`` over one ``TimeoutError`` from ``asyncpg _async_ping``).
-    # A group whose leaves are ALL dependency-down errors is the same 503; a
-    # group carrying anything else re-raises unchanged so a real bug still
-    # reaches the 500 path and the diagnostics capture.
+    # A plain OSError is only dependency-down for an unreachable-network errno
+    # (EHOSTUNREACH / ENETUNREACH are not ConnectionError subclasses); any
+    # other OSError, a disk error for one, re-raises to the 500 path.
+    @app.exception_handler(OSError)
+    async def _dependency_unavailable_oserror(request: Request, exc: OSError) -> Response:
+        if not is_dependency_down(exc):
+            raise exc
+        return _dependency_down_response(request, exc)
+
+    # A session whose connection was invalidated mid-request. Only that shape;
+    # the flush-failure PendingRollbackError is a logic error and re-raises.
+    @app.exception_handler(SAPendingRollbackError)
+    async def _dependency_unavailable_pending_rollback(
+        request: Request, exc: SAPendingRollbackError
+    ) -> Response:
+        if not is_dependency_down(exc):
+            raise exc
+        return _dependency_down_response(request, exc)
+
+    # The same errors sometimes arrive WRAPPED. SQLAlchemy's asyncpg driver
+    # runs the connection on an anyio task group, so they can surface as an
+    # ``ExceptionGroup`` rather than bare (observed on ``GET
+    # /appliance/cluster/health``). A group whose leaves are ALL dependency-down
+    # is the same 503; a group carrying anything else re-raises unchanged so a
+    # real bug still reaches the 500 path and the diagnostics capture.
     @app.exception_handler(ExceptionGroup)
     async def _dependency_unavailable_group(request: Request, exc: ExceptionGroup) -> Response:
-        matched, rest = exc.split(_dependency_down)
+        matched, rest = split_dependency_down(exc)
         if rest is not None or matched is None:
             raise exc
-        leaves = getattr(matched, "exceptions", ())
-        first = leaves[0] if leaves else exc
-        return _dependency_down_response(request, type(first).__name__, str(first))
+        return _dependency_down_response(request, exc)
 
     from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
@@ -1466,10 +1467,21 @@ def create_app() -> FastAPI:
         # base which Alembic also imports at migration time).
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
+        from app.core.dependency_down import (  # noqa: PLC0415
+            dependency_down_response,
+            is_only_dependency_down,
+        )
         from app.db import AsyncSessionLocal  # noqa: PLC0415
         from app.services.diagnostics import (  # noqa: PLC0415
             record_unhandled_exception_async,
         )
+
+        # Anything that reaches the last-resort handler from OUTSIDE the
+        # ExceptionMiddleware (a middleware's own database read) and is purely
+        # a dependency-down error is still the 503, and must not try a
+        # diagnostics capture: that needs the database that is away (#3017).
+        if is_only_dependency_down(exc):
+            return dependency_down_response(request.method, request.url.path, exc, logger)
 
         # The id RequestContextMiddleware generated, not only one the client
         # sent (#1201): this used to read the request header alone, so a

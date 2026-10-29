@@ -43,6 +43,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.core.dependency_down import dependency_down_response, is_only_dependency_down
+
 logger = structlog.get_logger(__name__)
 
 # Methods that mutate state. Everything else (GET / HEAD / OPTIONS /
@@ -256,8 +258,24 @@ class MaintenanceModeMiddleware(BaseHTTPMiddleware):
         # extra work — no bearer decode, no DB — and pass straight through.
         from app.db import AsyncSessionLocal  # noqa: PLC0415
 
-        async with AsyncSessionLocal() as db:
-            enabled, message, started_at = await get_maintenance_state(db)
+        #
+        # This read happens in a BaseHTTPMiddleware, OUTSIDE Starlette's
+        # ExceptionMiddleware, so the app's 503 exception handlers never see
+        # what it raises (#3017): during a PostgreSQL switchover a refused
+        # connection or a timeout here answered 500 on every agent POST.
+        # A failed read therefore answers the same 503 + Retry-After the
+        # route itself would (the classifier is the app's own, shared in
+        # ``app.core.dependency_down``). It does NOT fall back to "assume not
+        # in maintenance": with the flag unknowable, letting the request
+        # through could run a mutation inside a maintenance window, and the
+        # database that failed this read is the one the route would need.
+        try:
+            async with AsyncSessionLocal() as db:
+                enabled, message, started_at = await get_maintenance_state(db)
+        except Exception as exc:  # noqa: BLE001 — classified, else re-raised
+            if not is_only_dependency_down(exc):
+                raise
+            return dependency_down_response(method, request.url.path, exc, logger)
         if not enabled:
             return await call_next(request)  # type: ignore[operator,no-any-return]
 
