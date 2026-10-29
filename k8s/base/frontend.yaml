@@ -115,6 +115,10 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # ingress-nginx defaults to 1m and would 413 imports and backup /
+    # slot-image uploads; the frontend nginx and the api apply the real
+    # per-route limits behind it (#3036).
+    nginx.ingress.kubernetes.io/proxy-body-size: "4g"
     # Uncomment to enable cert-manager / Let's Encrypt:
     # cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:

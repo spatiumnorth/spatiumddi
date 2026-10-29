@@ -713,8 +713,9 @@ over it is refused before any of the body is read; a body sent without one
 is counted as it arrives and refused once it passes the cap. The cap is
 `MAX_REQUEST_BODY_BYTES` (default **8 MiB**, minimum 64 KiB), set in the
 api's environment: `.env` on Docker Compose, `api.env` in the Helm chart.
-It applies to the api port itself; traffic through the bundled nginx is
-already limited to 1 MiB on `/api/`.
+It applies to the api port itself. The bundled nginx lets `/api/` bodies
+up to 128 MiB through (backups and upgrade images have their own larger
+locations), so the limits below are the api's own ([#3036](https://github.com/spatiumnorth/spatiumddi/issues/3036)).
 
 Routes that take larger bodies keep their own limits, which the cap never
 lowers:

@@ -421,10 +421,18 @@ ${SPATIUM_REAL_IP_FROM}
     # Proxy API calls to the backend. Using a variable for proxy_pass
     # forces nginx to re-resolve the upstream on each request via the
     # resolver above (instead of binding at config-load time).
+    # Import / upload routes sit under this location too (DNS importers
+    # 50 MiB, DHCP / IPAM 25 MiB, the DNS agent's ingested-records push
+    # 64 MiB, a pcap upload 116 MiB - backend/app/core/body_limit.py).
+    # nginx's 1 MiB default would 413 them before the api's own,
+    # per-route, auth-checked caps run (#3036), so this is sized to the
+    # largest of those; backup and upgrade-image have their own locations.
+    # The api still enforces each route's exact limit.
     location /api/ {
         error_page 502 504 @api_unavailable;
         set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass         $api_upstream;
+        client_max_body_size 128m;
         proxy_set_header   Host $http_host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;

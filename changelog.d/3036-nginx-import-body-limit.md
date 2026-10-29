@@ -1,0 +1,3 @@
+### Fixed
+
+- **Imports over 1 MiB no longer fail with an nginx 413 through the bundled web port (#3036).** The `/api/` location of the frontend nginx (Compose image and appliance chart) kept nginx's 1 MiB default, so a BIND9 archive, Kea / ISC file or IPAM CSV over 1 MiB, or a commit carrying a large preview, was refused before the api saw it, though the importers accept 50 MiB (DNS) and 25 MiB (DHCP, IPAM). `/api/` now allows 128 MiB (the largest non-backup route limit); the api still enforces each route's own cap. The raw Kubernetes Ingress sets `proxy-body-size: 4g` and the chart's Ingress values suggest it.
