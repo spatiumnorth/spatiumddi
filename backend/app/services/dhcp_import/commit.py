@@ -30,6 +30,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import validate_optional_hostname
@@ -145,6 +146,18 @@ def drop_unservable_hostnames(scopes: list[ImportedScope]) -> list[str]:
 
 def _canonical_cidr(raw: str) -> str:
     return str(ipaddress.ip_network(raw, strict=False))
+
+
+def _scope_error(exc: Exception) -> str:
+    """Operator-facing reason a scope failed. A database error's own text
+    carries the SQL statement and bound values, so it never goes out."""
+    if isinstance(exc, DBAPIError):
+        logger.warning("dhcp_import_scope_db_error", error=str(exc.orig))
+        return (
+            "the database refused this scope's data (a value is not valid for its "
+            "column); check the scope's pools, reservations and options"
+        )
+    return str(exc)
 
 
 async def _find_subnet(db: AsyncSession, cidr: str, space_id: uuid.UUID | None) -> Subnet | None:
@@ -640,7 +653,7 @@ async def commit_import(
             result = CommitScopeResult(
                 subnet_cidr=cidr,
                 action_taken="failed",
-                error=str(exc),
+                error=_scope_error(exc),
             )
         results.append(result)
 

@@ -608,3 +608,93 @@ async def test_kea_commit_failed_scope_does_not_poison_the_next_2816(
         .all()
     )
     assert len(audits) == 1
+
+
+# ── Pool syntax (#3037) ──────────────────────────────────────────────
+
+
+def _kea_pools(subnet: str, *pools: str):
+    import json
+
+    body = {
+        "subnet4" if ":" not in subnet else "subnet6": [
+            {"subnet": subnet, "pools": [{"pool": p} for p in pools]}
+        ]
+    }
+    return parse_kea_config(json.dumps(body).encode()).scopes[0]
+
+
+@pytest.mark.parametrize(
+    "pool",
+    [
+        "10.0.0.100-10.0.0.150",
+        "10.0.0.100 - 10.0.0.150",
+        "10.0.0.100 -10.0.0.150",
+        " 10.0.0.100- 10.0.0.150 ",
+    ],
+)
+def test_kea_pool_dash_with_any_spacing_3037(pool: str) -> None:
+    sc = _kea_pools("10.0.0.0/24", pool)
+    assert [(p.start_ip, p.end_ip) for p in sc.pools] == [("10.0.0.100", "10.0.0.150")]
+    assert sc.parse_warnings == []
+
+
+def test_kea_pool_v6_no_spaces_3037() -> None:
+    sc = _kea_pools("2001:db8::/64", "2001:db8::10-2001:db8::20")
+    assert [(p.start_ip, p.end_ip) for p in sc.pools] == [("2001:db8::10", "2001:db8::20")]
+
+
+def test_kea_pool_v6_prefix_form_3037() -> None:
+    sc = _kea_pools("2001:db8::/64", "2001:db8::/120")
+    assert (sc.pools[0].start_ip, sc.pools[0].end_ip) == ("2001:db8::", "2001:db8::ff")
+
+
+@pytest.mark.parametrize(
+    "pool",
+    ["not-an-ip", "10.0.0.150-10.0.0.100", "10.1.0.1-10.1.0.9", "10.0.0.1-", "banana"],
+)
+def test_kea_bad_pool_is_a_preview_warning_3037(pool: str) -> None:
+    sc = _kea_pools("10.0.0.0/24", pool)
+    assert sc.pools == []
+    assert len(sc.parse_warnings) == 1
+    assert repr(pool) in sc.parse_warnings[0]
+
+
+def test_isc_range_outside_subnet_is_a_preview_warning_3037() -> None:
+    p = parse_isc_config(
+        b"subnet 10.0.0.0 netmask 255.255.255.0 {\n"
+        b"  range 10.0.0.10 10.0.0.20;\n  range 10.5.0.10 10.5.0.20;\n}\n"
+    )
+    sc = p.scopes[0]
+    assert [(x.start_ip, x.end_ip) for x in sc.pools] == [("10.0.0.10", "10.0.0.20")]
+    assert any("10.5.0.10" in w for w in sc.parse_warnings)
+
+
+@pytest.mark.asyncio
+async def test_kea_commit_bad_pool_error_has_no_sql_3037(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "192.0.2.0/24")
+    await db_session.commit()
+
+    plan = (await _kea_preview(client, token, str(group.id))).json()
+    plan["scopes"][0]["pools"][0]["start_ip"] = "192.0.2.10-192.0.2.100"
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": plan,
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    scope = resp.json()["scopes"][0]
+    assert scope["action_taken"] == "failed"
+    assert "SQL" not in scope["error"] and "INSERT" not in scope["error"]
+    assert "asyncpg" not in scope["error"]

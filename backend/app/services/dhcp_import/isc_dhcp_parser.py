@@ -38,6 +38,7 @@ from .canonical import (
     ImportedReservation,
     ImportedScope,
     ImportPreview,
+    pool_problem,
 )
 from .options import coerce_option_value, isc_option_to_canonical, normalise_mac
 
@@ -338,6 +339,14 @@ def _build_scope(
     body = st.children or []
     options, lease_time, min_lt, max_lt, opt_warnings = _parse_options_and_leases(body)
     pools, range_warnings = _parse_ranges(body)
+    kept: list[ImportedPool] = []
+    for pool in pools:
+        problem = pool_problem(pool.start_ip, pool.end_ip, cidr)
+        if problem is None:
+            kept.append(pool)
+        else:
+            range_warnings.append(f"Range {pool.start_ip} {pool.end_ip} not imported: {problem}.")
+    pools = kept
 
     # host reservations declared directly inside the subnet block
     inline_res: list[ImportedReservation] = []
