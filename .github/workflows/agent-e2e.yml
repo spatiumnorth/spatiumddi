@@ -152,7 +152,15 @@ jobs:
               echo "pull attempt $attempt failed; retrying after 10s..."
               sleep 10
             done
-            kind load docker-image "$img" --name spatium-e2e
+            # ``kind load docker-image`` imports with ``--all-platforms``, but
+            # the runner's Docker pulls only its own platform out of a
+            # multi-arch index, so an index that lists other platforms fails
+            # with "content digest ... not found". Save just this platform
+            # and load the archive instead.
+            docker save --platform "linux/$(docker version -f '{{.Server.Arch}}')" \
+              -o /tmp/preload.tar "$img"
+            kind load image-archive /tmp/preload.tar --name spatium-e2e
+            rm -f /tmp/preload.tar
           done
 
       - name: Install chart
