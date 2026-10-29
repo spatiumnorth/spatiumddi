@@ -178,10 +178,12 @@ api:
   # memory limit have to hold, plus three per pod outside the pool: the
   # after-commit hooks' two (#2782) and the readiness probe's one (#2944).
   # At the defaults (2..10 replicas, 33 each) that is 66..330 api
-  # connections, against the standalone postgres image's default
-  # max_connections of 100 and CloudNativePG's 200: an install that lets the
-  # HPA scale past two replicas should size the pool or max_connections. The appliance's supervisor sets it from the
-  # control-plane node count (fewer per pod past four nodes).
+  # connections. Postgres' max_connections is derived from this pool and the
+  # HPA maximum when it is left empty (#2955, ``postgresql.maxConnections`` /
+  # ``postgresql.cnpg.parameters.max_connections``), so changing the pool or
+  # the HPA moves it; a pinned max_connections has to be sized by hand. The
+  # appliance's supervisor sets the pool from the control-plane node count
+  # (fewer per pod past four nodes).
   databasePool:
     size:
     maxOverflow:
@@ -832,8 +834,9 @@ postgresql:
       # #2156 — every api pod's pool (api.databasePool) and every worker
       # process connects here, plus two per api / worker / beat process for
       # the after-commit hooks (#2782) and one per api pod for its readiness
-      # probe (#2944); replicas x pool has to stay under this. The appliance's supervisor raises it past 200 when its
-      # connection budget does (from five control-plane nodes).
+      # probe (#2944); replicas x pool has to stay under this. The appliance's
+      # supervisor always writes a value: 200 as a floor, raised past it when
+      # its connection budget does (from five control-plane nodes).
       # #2955 — "" (the default) derives it from the pools: api pods (HPA max)
       # x (pool + 3) + workers x (concurrency x 3 + 1) + beat + WAL senders +
       # 10 reserve (helper ``spatiumddi.postgresMaxConnections``, the rule the

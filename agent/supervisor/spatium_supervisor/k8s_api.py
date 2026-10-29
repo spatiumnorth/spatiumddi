@@ -2372,7 +2372,7 @@ _API_CPU_MAX = 4
 # so a pool saturated by load cannot fail the probe: one more connection per
 # api pod, held open at idle.
 #
-# ``max_connections`` is the chart's 200 until the budget passes it (from
+# ``max_connections`` is the appliance's floor of 200 until the budget passes it (from
 # five nodes with four worker processes, seven with two), then the budget, so a pool is never refused a connection it was sized for
 # (``tests/test_postgres_connection_budget_2156.py`` holds that). It moves
 # with the memory limit, so it costs no restart of its own.
@@ -2494,7 +2494,7 @@ def control_plane_sizing(mem_total_mib: int, cp_size: int = 1) -> dict[str, int]
         "shared_buffers": shared_buffers_mb,
         "concurrency": concurrency,
         "postgres_connections": connections,
-        # The chart's 200 until the budget passes it (#2156, #2782).
+        # The appliance's floor of 200 until the budget passes it (#2156, #2782).
         "max_connections": max(_PG_CHART_MAX_CONNECTIONS, connections),
         # CloudNativePG refuses a Cluster whose memory request is below
         # shared_buffers (Postgres reads MB as MiB, so the two compare one
