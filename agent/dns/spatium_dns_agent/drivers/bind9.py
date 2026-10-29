@@ -52,11 +52,25 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
+from ._caa import caa_presentation
 from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, SERIAL_UNREAD, DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
+# #2935 — ``version`` / ``hostname`` in ``options`` below set what named
+# says about itself over CHAOS-class queries. Version and
+# stack details are for signed-in users only, and ``version.bind CH TXT`` is
+# the first question a DNS fingerprinting scan asks. ``version "none"``
+# keeps the query ANSWERED (with the string ``none``) rather than refused,
+# so a liveness check that digs it still gets a reply. ``hostname none``
+# stops ``hostname.bind`` naming the container (a container id on Compose,
+# the node on the appliance's host network). ``server-id`` (``id.server`` +
+# NSID) already defaults to none. A static part of the rendered config, not
+# a bundle field: no option turns it back on, and the first render after an
+# agent upgrade picks it up like any other template change. Mirrored by the
+# control plane's ``named.conf.j2``. The heartbeat's ``daemon_version`` is
+# unaffected — it reads ``named -v``, not the CHAOS answer.
 NAMED_CONF_SKELETON = """\
 {acl_statements}{tls_statements}options {{
     directory "/var/cache/bind";
@@ -68,6 +82,8 @@ NAMED_CONF_SKELETON = """\
 {blackhole}    dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
+    version "none";
+    hostname none;
 {max_cache_size}{query_log}{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
 }};
 statistics-channels {{
@@ -1038,6 +1054,10 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
         # truncates SPF/DMARC at a comment and spaces split the value
         # into separate character-strings resolvers concatenate wrong.
         return _quote_txt(value)
+    if rtype_u == "CAA":
+        # Quoted and escaped (#2943): a bare ``ca.org; account=1`` would lose
+        # everything after the ``;`` as a zone-file comment.
+        return caa_presentation(value)
     if rtype_u == "MX":
         pri = fields.get("priority")
         if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
@@ -3260,6 +3280,8 @@ class Bind9Driver(DriverBase):
             if rtype == "TXT":
                 # Quote TXT (issue #1514) — see _wire_value.
                 value = _quote_txt(value)
+            elif rtype == "CAA":
+                value = caa_presentation(value)
             elif rtype == "MX" and rec.get("priority") is not None:
                 if not value.lstrip().split(" ", 1)[0].isdigit():
                     value = f"{rec['priority']} {value}"
@@ -5409,7 +5431,8 @@ class Bind9Driver(DriverBase):
         overlay[key] = new
         before = _zone_apex(_apex_zone(state))
         after = _zone_apex(_apex_zone(new))
-        ttl = int(state.get("ttl") or 3600)
+        _state_ttl = state.get("ttl")
+        ttl = int(_state_ttl) if _state_ttl is not None else 3600
         glue = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
         if after.placeholder_glue and not before.placeholder_glue:
             upd.add(glue, ttl, "A", _PLACEHOLDER_NS_ADDRESS)

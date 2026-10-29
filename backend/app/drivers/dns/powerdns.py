@@ -43,6 +43,7 @@ from typing import Any
 import structlog
 
 from app.core.dns_names import strip_control_chars
+from app.drivers.dns._caa import caa_presentation
 from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
@@ -104,6 +105,10 @@ def _record_content(rr: RecordData) -> str:
     value = strip_control_chars(rr.value)
     if rtype == "TXT":
         return _quote_txt(value)
+    if rtype == "CAA":
+        # A bare value is quoted and escaped (#2943); a zone-file reader takes
+        # the ``;`` in ``ca.org; account=1`` as a comment.
+        return caa_presentation(value)
     if rtype == "MX":
         prio = rr.priority if rr.priority is not None else 10
         return f"{prio} {value}"
@@ -193,6 +198,11 @@ def render_pdns_conf(
             # with the version, an outbound connection nobody configured
             # (non-negotiable #17, #1353). Mirrors the agent's renderer.
             "security-poll-suffix=",
+            # #2935 — nothing about the daemon over CHAOS queries: the
+            # version and the container hostname answer "none". Mirrors the
+            # agent's renderer.
+            "version-string=none",
+            "server-id=none",
             # RFC 2136 dynamic updates (issue #641). Enabled globally; per-zone
             # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata gates
             # actual acceptance, so this is a no-op for zones without an ACL.
@@ -279,7 +289,7 @@ class PowerDNSDriver(DNSDriver):
             {
                 "name": qname,
                 "type": rtype,
-                "ttl": records[0].ttl or zone.ttl,
+                "ttl": records[0].ttl if records[0].ttl is not None else zone.ttl,
                 "records": rrs,
             }
             for (qname, rtype), rrs in sorted(rrsets.items())

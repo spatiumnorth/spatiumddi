@@ -79,10 +79,12 @@ export function BgpAdvertisedChip({
   spaceId,
   subnetId,
   blockId,
+  className,
 }: {
   spaceId: string;
   subnetId?: string;
   blockId?: string;
+  className?: string;
 }) {
   const { enabled } = useFeatureModules();
   // The route search takes read on 'bgp_lg_peer'. Without it the search is
@@ -101,7 +103,7 @@ export function BgpAdvertisedChip({
   const worst = worstRpki(routes);
   return (
     <span
-      className={cn(chipBaseCls, RPKI_CHIP_COLOR[worst])}
+      className={cn(chipBaseCls, RPKI_CHIP_COLOR[worst], className)}
       title={`Advertised by BGP — ${routes.length} route${routes.length === 1 ? "" : "s"}, worst RPKI: ${worst}`}
     >
       BGP

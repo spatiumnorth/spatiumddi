@@ -714,6 +714,16 @@ async def update_server(
             appliance_repointed_id = owner.id
             collect_wake(appliance_channel(owner.id))
 
+    # #2963 - a server moved into a group is a membership change: the group's
+    # appliance-hosted Kea members get an empty HA peer URL derived from the
+    # node address (host-networked HA-mode groups only; never overwrites).
+    if s.server_group_id is not None and s.server_group_id != old_group_id:
+        from app.services.dhcp.ha_peer_autofill import (  # noqa: PLC0415
+            autofill_group_ha_peer_urls,
+        )
+
+        await autofill_group_ha_peer_urls(db, s.server_group_id, via="server_update")
+
     # Credentials handling:
     #   * None → leave alone
     #   * {}   → clear

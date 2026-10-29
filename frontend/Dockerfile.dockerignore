@@ -1,0 +1,21 @@
+# Context is the repo root (frontend/Dockerfile, #2895), and the Dockerfile
+# reads only frontend/, NOTICE and LICENSE from it. An ALLOWLIST rather than a
+# denylist: the root carries a developer's .env (SECRET_KEY, POSTGRES_PASSWORD),
+# .claude/, .charts-render/ and appliance build output, none of which belongs in
+# a build context, and a denylist only covers the entries someone remembered.
+# BuildKit reads this file in place of a root .dockerignore because it sits
+# beside the Dockerfile as <Dockerfile>.dockerignore.
+*
+!frontend
+!NOTICE
+!LICENSE
+
+# A developer's local install and build output: npm install in the image
+# must not inherit a host node_modules (wrong platform binaries), and dist/
+# and dist-legal/ are rebuilt there. frontend/legal is where the Dockerfile
+# puts NOTICE and LICENSE; a stale host copy must not shadow the root files.
+frontend/node_modules
+frontend/dist
+frontend/dist-legal
+frontend/legal
+**/.DS_Store

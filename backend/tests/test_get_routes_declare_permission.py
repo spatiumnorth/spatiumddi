@@ -29,8 +29,10 @@ _SELF = "returns only the caller's own rows"
 NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     # ── public / pre-sign-in ────────────────────────────────────────────
     "/.well-known/acme-challenge/{token}": "ACME HTTP-01 challenge the CA fetches",
-    "/api/docs": "OpenAPI viewer, no install data",
-    "/api/redoc": "OpenAPI viewer, no install data",
+    "/api/docs": "OpenAPI viewer shell, no install data; fetches the spec signed in (#2935)",
+    "/api/redoc": "OpenAPI viewer shell, no install data; fetches the spec signed in (#2935)",
+    "/api/openapi.json": "the API schema, any signed-in caller (#2935); no install data",
+    "/api/v1/auth/openapi.json": "the API schema for the docs pages, by refresh cookie (#2935)",
     "/api/v1/auth/password-policy": f"{_PUBLIC}: the change-password screen renders the policy",
     "/api/v1/auth/providers": f"{_PUBLIC}: the login page lists sign-in buttons",
     "/api/v1/auth/{provider_id}/authorize": f"{_PUBLIC}: OIDC / SAML redirect",
@@ -38,9 +40,9 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/auth/{provider_id}/metadata": f"{_PUBLIC}: SAML SP metadata",
     "/api/v1/settings/public": f"{_PUBLIC}: login banner + branding",
     "/api/v1/settings/public/logo": f"{_PUBLIC}: login page logo",
-    "/api/v1/version": "version handshake for clients, no install data",
+    "/api/v1/version": "version handshake; the version itself only when signed in (#2935)",
     "/health/live": "liveness probe",
-    "/health/platform": "platform health probe",
+    "/health/platform": "platform health probe; components only when signed in (#2935)",
     "/health/ready": "readiness probe",
     "/health/startup": "startup probe",
     # ── authenticated by something other than a user session ────────────
@@ -80,6 +82,14 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/saved-views": _SELF,
     "/api/v1/sessions/me": _SELF,
     # ── shell / static reference data every signed-in screen needs ──────
+    "/api/v1/about/session": (
+        "the About page's gate (#2895): nginx auth_request asks only whether "
+        "the caller is signed in; returns no data"
+    ),
+    "/api/v1/about/third-party/python": (
+        "the About page's licence notices (#2895), a static file baked into "
+        "the image; any signed-in user, never anonymous"
+    ),
     "/api/v1/admin/feature-modules": "the sidebar reads which modules are on",
     "/api/v1/ai/available": "whether the copilot is configured, no install data",
     "/api/v1/ai/mcp": "MCP server info + the count of tools this caller may call",

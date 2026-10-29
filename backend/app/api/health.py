@@ -13,8 +13,9 @@ from sqlalchemy import text
 from starlette import status
 from starlette.responses import JSONResponse
 
+from app.api.deps import OptionalUser
 from app.core.schema_check import SchemaCheck, missing_from_database, schema_at_head
-from app.db import AsyncSessionLocal
+from app.db import AsyncSessionLocal, ProbeSessionLocal
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["health"])
@@ -137,7 +138,7 @@ async def _judge_newer_schema(
         missing = checked[1]
     else:
         try:
-            tables, columns = await missing_from_database()
+            tables, columns = await missing_from_database(session_factory=ProbeSessionLocal)
         except Exception as exc:  # noqa: BLE001
             # A read that could not run proves nothing: fail closed, keep nothing.
             first = (str(exc).splitlines() or [""])[0][:160]
@@ -174,7 +175,7 @@ async def _check_schema_ready() -> tuple[str, str]:
     ``("error", "<detail>")`` with an operator-actionable message. It reads
     the latch; only ``readiness`` sets it.
     """
-    result = await schema_at_head()
+    result = await schema_at_head(session_factory=ProbeSessionLocal)
     missing: tuple[str, ...] = ()
     if result.ok:
         verdict, detail = "ok", result.detail
@@ -232,7 +233,7 @@ async def readiness() -> JSONResponse:
     # probe response itself honest-and-fast while that happens.
     try:
         async with asyncio.timeout(4):
-            async with AsyncSessionLocal() as session:
+            async with ProbeSessionLocal() as session:
                 await session.execute(text("SELECT 1"))
         checks["database"] = "ok"
     except TimeoutError:
@@ -375,7 +376,7 @@ async def _worker_ping() -> dict[str, Any] | None:
 
 
 @router.get("/health/platform")
-async def platform_health() -> JSONResponse:
+async def platform_health(current_user: OptionalUser) -> JSONResponse:
     """Dashboard-oriented rollup of every control-plane component.
 
     Distinct from ``/health/ready`` in that this one is dashboard-
@@ -388,15 +389,25 @@ async def platform_health() -> JSONResponse:
     components into a single ``ok`` / ``degraded`` verdict for headline
     display.
 
-    SECURITY (#400 / M5): this endpoint is mounted UNAUTHENTICATED
-    (the AppLayout polls it before login for the demo-mode /
-    maintenance banner), so component ``detail`` fields must never echo
+    SECURITY (#400 / M5): this endpoint is mounted UNAUTHENTICATED (an
+    uptime monitor or a client probe needs no credential), and even a
+    signed-in caller is not entitled to backend internals, so component
+    ``detail`` fields must never echo
     raw backend exception strings — those can leak DSNs, internal
     hostnames, driver versions, and stack-frame paths to an anonymous
     caller. On error we log the full ``str(exc)`` server-side (where
     operators can see it) and return only a fixed, generic detail
     string. The ``ok`` / ``error`` / ``warn`` status semantics are
     unchanged, so the per-component dots still render correctly.
+
+    #2935 — the component list is for signed-in callers only. It names
+    every Celery worker (``celery@<hostname>``, a container id on Compose
+    and a pod name on Kubernetes) and describes the stack, which is
+    fingerprinting material. An anonymous caller gets the rollup
+    ``status`` and nothing else: enough for an uptime monitor or a client
+    asking "is this a working control plane", and nothing about what it is
+    built from. The banners that read ``demo_mode`` / ``maintenance_*``
+    render inside the signed-in console, which sends its Bearer.
     """
     components: list[dict[str, Any]] = [{"name": "api", "status": "ok", "detail": "responding"}]
 
@@ -585,6 +596,11 @@ async def platform_health() -> JSONResponse:
             break
         if c["status"] == "warn" and rollup == "ok":
             rollup = "degraded"
+
+    if current_user is None:
+        # #2935 — status only. Returned before the maintenance read, which an
+        # anonymous caller has no use for.
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": rollup})
 
     # Surface demo-mode to the frontend so AppLayout can render a
     # persistent banner. Cheap to bundle here — every authenticated

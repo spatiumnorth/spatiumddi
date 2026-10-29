@@ -215,6 +215,28 @@ async def get_current_user(
     return await authenticate_bearer(db, credentials.credentials, request)
 
 
+async def get_optional_user(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
+) -> User | None:
+    """The signed-in user, or ``None`` for an anonymous caller.
+
+    For the few routes that answer everyone but tell a signed-in caller more
+    (``/api/v1/version``, ``/health/platform``; #400 L6, #2935). It never
+    raises: an absent, invalid or expired credential, a disabled account and
+    one that must change its password all resolve to ``None``, so the caller
+    gets the anonymous answer rather than a 401 / 403 from an endpoint that
+    is public by design. Any failure falls the same way, towards less.
+    """
+    if credentials is None:
+        return None
+    try:
+        return await authenticate_bearer(db, credentials.credentials, request)
+    except Exception:  # noqa: BLE001 — any auth failure = treat as anonymous
+        return None
+
+
 async def authenticate_bearer(
     db: AsyncSession, raw: str, request: Request, *, record_activity: bool = True
 ) -> User:
@@ -393,5 +415,6 @@ def ensure_superadmin(user: User) -> None:
 
 # Type aliases for injection
 CurrentUser = Annotated[User, Depends(get_current_user)]
+OptionalUser = Annotated[User | None, Depends(get_optional_user)]
 SuperAdmin = Annotated[User, Depends(require_superadmin)]
 DB = Annotated[AsyncSession, Depends(get_db)]

@@ -341,7 +341,7 @@ image_source_paths() {
         dhcp-kea)            echo "agent/dhcp" ;;
         looking-glass)       echo "agent/looking-glass" ;;
         spatiumddi-api)      echo "backend" ;;
-        spatiumddi-frontend) echo "frontend" ;;
+        spatiumddi-frontend) echo "frontend NOTICE LICENSE" ;;
         *) return 1 ;;
     esac
 }

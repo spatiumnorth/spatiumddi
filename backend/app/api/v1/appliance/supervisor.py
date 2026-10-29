@@ -8519,7 +8519,9 @@ async def pcap_upload(
         return {"status": "failed"}
 
     packets_q = request.query_params.get("packets")
-    packet_count = int(packets_q) if packets_q and packets_q.isdigit() else None
+    packet_count = (
+        int(packets_q) if packets_q and packets_q.isascii() and packets_q.isdigit() else None
+    )
     # Generous transfer ceiling: the configured byte cap + 16 MiB headroom
     # (pcap framing), never above the hard ceiling + headroom.
     cap = min((row.max_bytes or HARD_MAX_BYTES), HARD_MAX_BYTES) + 16 * 1024 * 1024

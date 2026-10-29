@@ -39,6 +39,46 @@ SpatiumDDI's auth stack has three layers:
   else.
 - Access token expires in 15 min. Refresh token expires in 7 days
   (`refresh_token_expire_days` default) and rotates on every use.
+- **Rotation grace window (#2941).** The tabs of one browser share the
+  refresh cookie, so two tabs can refresh at the same moment with the same
+  cookie. For 10 seconds after a rotation (`ROTATION_GRACE` in
+  `backend/app/core/session_rotation.py`) the rotated-away session stands
+  for its successor: a refresh presenting the rotated cookie gets a new
+  access token for the SAME successor session (no third session and no new
+  cookie, since the browser already holds the successor's), and an access
+  token minted for the rotated session is still accepted. Concurrent
+  refreshes serialize on a row lock, so they land on one successor. After
+  the window a rotated cookie is a `401` and its access tokens are refused.
+  The grace applies only to a revocation by rotation, recorded in
+  `user_session.rotated_at` + `rotated_to_id`; a logout, a force-logout
+  from the session viewer, a password change or disabling the account
+  revokes the live session, which ends the old cookie and the old access
+  token at once, with no grace.
+  The API docs' spec route (`GET /api/v1/auth/openapi.json`, #2935), which
+  reads the refresh cookie without rotating it, applies the same rule: a
+  docs tab holding a cookie another tab rotated within the window still
+  loads the schema, and one revoked any other way does not.
+  - **The window is anchored to the rotation.** A refresh inside the window
+    does not rotate again, so it never moves `rotated_at`; replaying the old
+    cookie over and over cannot stretch the 10 seconds. The successor's own
+    absolute expiry and idle timeout are checked on every grace answer, and
+    a grace refresh does not count as activity.
+  - **What a captured cookie is worth.** A refresh cookie captured from a
+    rotated session and replayed inside those 10 seconds is answered like
+    the browser it came from: with an ordinary 15-minute access token for
+    the successor session. That is the trade the window makes, and why it
+    is 10 seconds rather than the minute some identity providers allow:
+    long enough for a concurrent refresh, and requests already in flight
+    with the old access token, to land; short enough that a cookie copied
+    out of a rotated session is useless almost at once. Revoking the
+    successor (logout, force-logout, a password change) ends that access
+    token too, since it names the successor.
+  - **Revocation cannot be raced by a rotation.** The bulk revocations lock
+    the account's live sessions before revoking them, so a refresh rotating
+    one at the same moment either finishes first (and its successor is
+    revoked with the rest) or waits and is refused. A force-logout from the
+    session viewer follows a row that was rotated after the list was
+    fetched to its live successor, and revokes that.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
@@ -873,8 +913,9 @@ rather than swallowing the failure. Permission-related rejections
   until an administrator links it; the denied audit row names the account.
   `backend/app/core/auth/user_sync.py`.
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
-  when the token is not in the sessions table, has been revoked, or
-  has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
+  when the token is not in the sessions table, has been revoked (other
+  than by a rotation inside the grace window above), or has passed
+  `expires_at`. `backend/app/api/v1/auth/router.py`.
 - **Disabling an account ends its sessions (#1383).** `PUT
   /api/v1/users/{id}` that changes `is_active` revokes every session
   the account holds, as an admin password reset does, and its audit row

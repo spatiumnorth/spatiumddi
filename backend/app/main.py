@@ -985,6 +985,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.services import after_commit_dispatch  # noqa: PLC0415
 
     await after_commit_dispatch.shutdown()
+    from app.db import dispose_probe_engine  # noqa: PLC0415
+
+    await dispose_probe_engine()
     logger.info("shutdown", service="api")
 
 
@@ -1059,7 +1062,11 @@ def create_app() -> FastAPI:
         # pages load them from a CDN, which the web tier's CSP refuses.
         docs_url=None,
         redoc_url=None,
-        openapi_url="/api/openapi.json",
+        # #2935 — /api/openapi.json is served by install_api_docs() too, to
+        # signed-in callers only. FastAPI's own route would serve the whole
+        # API surface and the exact version to anyone. ``app.openapi()`` is
+        # unaffected, so the release asset (#903) is generated as before.
+        openapi_url=None,
         lifespan=lifespan,
     )
 

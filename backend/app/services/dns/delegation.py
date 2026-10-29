@@ -147,7 +147,12 @@ async def compute_delegation(
 
     for ns in apex_ns:
         ns_value = ns.value.rstrip(".") + "."
-        rec = _PendingRecord(name=label, record_type="NS", value=ns_value, ttl=ns.ttl or child.ttl)
+        rec = _PendingRecord(
+            name=label,
+            record_type="NS",
+            value=ns_value,
+            ttl=ns.ttl if ns.ttl is not None else child.ttl,
+        )
         if ns_value.rstrip(".").lower() in parent_ns_at_label:
             preview.existing_ns_records.append(rec)
         else:
@@ -188,7 +193,7 @@ async def compute_delegation(
                 name=glue_label,
                 record_type=ar.record_type,
                 value=ar.value,
-                ttl=ar.ttl or child.ttl,
+                ttl=ar.ttl if ar.ttl is not None else child.ttl,
             )
             if existing:
                 preview.existing_glue_records.append(rec)
