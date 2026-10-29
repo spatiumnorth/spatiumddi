@@ -128,6 +128,28 @@ def is_not_serving(status: str | None, reason: str | None) -> bool | None:
     return not is_config_apply_verdict(reason)
 
 
+def forget_stale_ok(server: _HasDaemonStateColumns) -> bool:
+    """An agent that cannot report no longer vouches for ``ok`` (#2961).
+
+    ``ok`` is the agent's own word, and the only thing that retires it is the
+    agent's next heartbeat. Once the health sweep reads the server
+    ``unreachable`` that heartbeat is not coming, so a row left at ``ok``
+    asserts a daemon is serving on the strength of a report the control plane
+    has stopped receiving: measured, a Kea killed six times in four minutes read
+    ``unreachable`` beside a stale ``daemon_status=ok``. The convention for
+    "nothing current to say" is NULL (unknown), which no alert or chip reads as
+    healthy or as failing. Only ``ok`` is retired: a ``degraded`` is a report
+    of a failure that is still unresolved, and the supervisor's own verdicts
+    (``container_oom``) live in the same columns. Returns whether it wrote.
+    """
+    if server.daemon_status != STATUS_OK:
+        return False
+    server.daemon_status = None
+    server.daemon_reason = None
+    server.daemon_status_since = None
+    return True
+
+
 def apply_reported_daemon_state(
     server: _HasDaemonStateColumns,
     reported: dict[str, Any] | None,

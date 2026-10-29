@@ -50,6 +50,7 @@ from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
+from app.services.ipam.address_create_rules import holds_address, take_address_row
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
 from app.services.pcap import (
@@ -410,6 +411,7 @@ async def _apply_create_ip_address(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet.id,
                 IPAddress.address == args.address,
+                holds_address(),  # an ``available`` row is a free slot (#2980)
             )
         )
     ).scalar_one_or_none()
@@ -472,9 +474,12 @@ async def _apply_create_ip_address(
     )
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
 
-    row = IPAddress(
-        subnet_id=subnet.id,
-        address=args.address,
+    # An ``available`` row is a free slot, taken over in place (#2980).
+    row = await take_address_row(
+        db,
+        subnet,
+        args.address,
+        user,
         status=args.status,
         hostname=args.hostname,
         fqdn=args.fqdn,
@@ -482,8 +487,6 @@ async def _apply_create_ip_address(
         description=args.description or "",
         created_by_user_id=user.id,
     )
-    db.add(row)
-    await db.flush()
 
     # #2900 — the downstream work the REST create runs that needs no
     # hostname: MAC history, the DHCP reservation a ``static_dhcp`` row owns
@@ -3134,8 +3137,9 @@ async def _apply_create_dhcp_static(
         raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
 
     # #2901 — the REST create's conflict check (a MAC already reserved in the
-    # group, a malformed IP). Raises a 4xx HTTPException, which both callers
-    # (approve + proposal apply) roll back on and surface without committing.
+    # group, a malformed IP). Raises a 4xx HTTPException; both callers roll
+    # back on it. An approve records the request ``failed`` with the detail
+    # (#2911); a proposal apply reports it as the proposal's error.
     await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
 
     row = DHCPStaticAssignment(

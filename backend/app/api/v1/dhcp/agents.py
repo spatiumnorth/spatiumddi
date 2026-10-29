@@ -546,6 +546,7 @@ async def agent_register(
 
     require_approval = os.environ.get("DHCP_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
     pending_approval = False
+    created = server is None
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
         server = DHCPServer(
@@ -601,6 +602,17 @@ async def agent_register(
         resource_display=body.hostname,
         new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
     )
+    # #2963 - an appliance-hosted Kea member joining an HA group gets its peer
+    # URL from the node address instead of by hand (empty URLs only). Only
+    # when this registration CREATED the row: an agent re-registers on every
+    # restart, and refilling then would undo an operator who cleared a URL to
+    # keep the pair from forming.
+    if created:
+        from app.services.dhcp.ha_peer_autofill import (  # noqa: PLC0415
+            autofill_group_ha_peer_urls,
+        )
+
+        await autofill_group_ha_peer_urls(db, server.server_group_id, via="agent_register")
     await db.commit()
     await db.refresh(server)
 
