@@ -34,7 +34,7 @@ _FLUSH = (
 )
 
 
-def _from_driver(exc: BaseException) -> BaseException:
+def _from_driver(exc: Exception) -> Exception:
     """``exc`` as the database driver raises it: with a frame from a
     ``sqlalchemy`` module in its traceback, which is what tells a failover's
     ``OSError`` 113 from one an outbound call raised (``db_transient``)."""
@@ -42,7 +42,7 @@ def _from_driver(exc: BaseException) -> BaseException:
     exec("def _raise(e):\n    raise e\n", ns)  # noqa: S102 — fixed source
     try:
         ns["_raise"](exc)
-    except BaseException as raised:  # noqa: BLE001
+    except Exception as raised:
         return raised
     raise AssertionError("unreachable")
 
@@ -194,7 +194,7 @@ class _NullSession:
 async def _dispatch(monkeypatch: pytest.MonkeyPatch, raised: BaseException | None) -> Response:
     import app.db as dbmod
 
-    monkeypatch.setattr(dbmod, "AsyncSessionLocal", lambda: _NullSession())
+    monkeypatch.setattr(dbmod, "AsyncSessionLocal", _NullSession)
 
     async def fake_state(db: Any) -> Any:
         if raised is not None:

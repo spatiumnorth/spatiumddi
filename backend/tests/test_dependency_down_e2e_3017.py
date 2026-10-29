@@ -81,7 +81,7 @@ def _assert_503(r: Any) -> None:
     "exc_factory",
     [
         lambda: ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
-        lambda: TimeoutError(),
+        TimeoutError,
         lambda: ExceptionGroup("tg", [ConnectionRefusedError(111, "Connection refused")]),
         lambda: ExceptionGroup("tg", [TimeoutError()]),
     ],
