@@ -382,18 +382,40 @@ data:
             proxy_read_timeout 60s;
         }
 
-        # Import / upload routes sit under this location too (DNS importers
-        # 50 MiB, DHCP / IPAM 25 MiB, the DNS agent's ingested-records push
-        # 64 MiB, a pcap upload 116 MiB - backend/app/core/body_limit.py).
-        # nginx's 1 MiB default would 413 them before the api's own,
-        # per-route, auth-checked caps run (#3036), so this is sized to the
-        # largest of those; backup and upgrade-image have their own locations.
-        # The api still enforces each route's exact limit.
+        # Large-body api routes (#3036): the DNS / DHCP / IPAM importers (a
+        # file, or the preview posted back to commit), the DNS zone spreadsheet
+        # import, the supervisor's pcap upload and the DNS agent's
+        # ingested-records push. Each takes more than nginx's 1 MiB default, so
+        # under the generic /api/ location below they were 413'd by nginx, as
+        # an HTML page, before the api read them. Their limits are the api's
+        # ALLOWANCES in backend/app/core/body_limit.py (largest: the pcap
+        # upload, 117 MiB); 128m covers every one, and the api answers anything
+        # over a route's own limit with a JSON 413.
+        #
+        # ``proxy_request_buffering off`` is what keeps the raised limit to
+        # these routes safe: the body streams to the api, whose pre-body auth
+        # check and Content-Length cap run before any of it is read, instead of
+        # nginx spooling up to 128 MiB to disk for an anonymous caller first.
+        # Every other /api/ route keeps the 1 MiB default.
+        location ~ ^/api/v1/((dns|dhcp|ipam)/import/|dns/groups/[^/]+/zones/[^/]+/import/spreadsheet/|appliance/supervisor/pcap/upload/|dns/agents/ingested-records$) {
+            error_page 502 504 @api_unavailable;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass               $api_upstream;
+            proxy_set_header         Host $http_host;
+            proxy_set_header         X-Real-IP $remote_addr;
+            proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header         X-Forwarded-Proto $spatium_forwarded_proto;
+            proxy_http_version       1.1;
+            proxy_set_header         Connection "";
+            client_max_body_size     128m;
+            proxy_request_buffering  off;
+            proxy_read_timeout       60s;
+        }
+
         location /api/ {
             error_page 502 504 @api_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass         $api_upstream;
-            client_max_body_size 128m;
             proxy_set_header   Host $http_host;
             proxy_set_header   X-Real-IP $remote_addr;
             proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;

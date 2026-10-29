@@ -666,6 +666,7 @@ ingress:
   annotations: {}
     # nginx.ingress.kubernetes.io/proxy-buffering: "off"      # SSE: AI chat, cluster health, logs (#1868)
     # nginx.ingress.kubernetes.io/proxy-body-size: "4g"       # ingress-nginx's 1m default 413s imports + backup / slot-image uploads (#3036)
+    # nginx.ingress.kubernetes.io/proxy-request-buffering: "off"  # stream bodies to the frontend nginx, which applies the per-route limits
     # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # cert-manager.io/cluster-issuer: letsencrypt-prod
