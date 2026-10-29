@@ -149,41 +149,35 @@ async def dispose_probe_engine() -> None:
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    # Not ``async with AsyncSessionLocal()``: its ``__aexit__`` closes the
-    # session too, and that close (a rollback) is where a failover surfaces
-    # AFTER the response has started, as ``InterfaceError: cannot call
-    # Transaction.rollback(): the underlying connection is closed`` or a
-    # ``TimeoutError``. Raised from a dependency's cleanup at that point it
-    # becomes "Caught handled exception, but response already started" (#3017),
-    # a 500 line for a request that already answered. Only dependency-down
-    # failures are swallowed (and logged); a real bug still propagates.
+    # The close is where a failover surfaces AFTER the response has started:
+    # its rollback meets ``InterfaceError: cannot call Transaction.rollback():
+    # the underlying connection is closed`` or a ``TimeoutError``. Raised from
+    # a dependency's cleanup at that point it became "Caught handled
+    # exception, but response already started" (#3017), a 500 line for a
+    # request that had already answered. Only dependency-down failures are
+    # swallowed (and logged); a real bug in the close still propagates, and a
+    # route's own exception is never replaced by a swallowed close failure.
     session = AsyncSessionLocal()
     try:
         yield session
     finally:
         try:
-            await session.close()
+            # ``__aexit__`` rather than a bare ``close()``: it runs the close
+            # to completion even if this task is cancelled meanwhile (a
+            # client gone mid-request), which ``async with`` did here before
+            # and a bare ``await session.close()`` would not, abandoning the
+            # connection's return to the pool halfway.
+            await session.__aexit__(None, None, None)
         except Exception as exc:  # noqa: BLE001 — classified, else re-raised
-            if not _cleanup_failure_is_dependency_down(exc):
+            from app.core.dependency_down import is_only_dependency_down  # noqa: PLC0415
+
+            if not is_only_dependency_down(exc):
                 raise
             _db_logger.warning(
                 "db_session_cleanup_dependency_down",
                 error_class=type(exc).__name__,
                 error=str(exc)[:200],
             )
-
-
-def _cleanup_failure_is_dependency_down(exc: BaseException) -> bool:
-    """A close/rollback that failed because the connection went away."""
-    from sqlalchemy.exc import InterfaceError  # noqa: PLC0415
-
-    from app.core.dependency_down import is_only_dependency_down  # noqa: PLC0415
-
-    if is_only_dependency_down(exc):
-        return True
-    # asyncpg's "cannot call Transaction.rollback(): the underlying connection
-    # is closed" reaches here wrapped as an InterfaceError.
-    return isinstance(exc, InterfaceError) and "connection is closed" in str(exc).lower()
 
 
 # ── Per-task DB session for Celery ────────────────────────────────────────

@@ -34,6 +34,19 @@ _FLUSH = (
 )
 
 
+def _from_driver(exc: BaseException) -> BaseException:
+    """``exc`` as the database driver raises it: with a frame from a
+    ``sqlalchemy`` module in its traceback, which is what tells a failover's
+    ``OSError`` 113 from one an outbound call raised (``db_transient``)."""
+    ns: dict[str, Any] = {"__name__": "sqlalchemy.pool.base"}
+    exec("def _raise(e):\n    raise e\n", ns)  # noqa: S102 — fixed source
+    try:
+        ns["_raise"](exc)
+    except BaseException as raised:  # noqa: BLE001
+        return raised
+    raise AssertionError("unreachable")
+
+
 def _request(method: str = "GET", path: str = "/api/v1/appliance/cluster/health") -> Request:
     return Request(
         {"type": "http", "method": method, "path": path, "headers": [], "query_string": b""}
@@ -67,9 +80,9 @@ def _closed_interface_error() -> InterfaceError:
 @pytest.mark.parametrize(
     "exc",
     [
-        OSError(errno.EHOSTUNREACH, "No route to host"),
-        OSError(errno.ENETUNREACH, "Network is unreachable"),
-        OSError(errno.EHOSTDOWN, "Host is down"),
+        _from_driver(OSError(errno.EHOSTUNREACH, "No route to host")),
+        _from_driver(OSError(errno.ENETUNREACH, "Network is unreachable")),
+        _from_driver(OSError(errno.EHOSTDOWN, "Host is down")),
         TimeoutError("t"),
         ConnectionRefusedError(111, "Connection refused"),
         PendingRollbackError(_INVALIDATED),
@@ -84,6 +97,10 @@ def test_classifier_accepts(exc: BaseException) -> None:
     [
         OSError(errno.ENOSPC, "No space left on device"),
         OSError(errno.EIO, "I/O error"),
+        _from_driver(OSError(errno.ENOSPC, "No space left on device")),
+        # An unreachable host an OUTBOUND call hit (WinRM, a webhook) is not
+        # the database failing over.
+        OSError(errno.EHOSTUNREACH, "No route to host"),
         FileNotFoundError(2, "nope"),
         PermissionError(13, "denied"),
         ValueError("x"),
@@ -105,9 +122,14 @@ def test_pending_rollback_with_dependency_cause_is_down() -> None:
 
 
 def test_group_needs_every_leaf_down() -> None:
-    assert is_only_dependency_down(ExceptionGroup("g", [OSError(errno.EHOSTUNREACH, "x")]))
+    assert is_only_dependency_down(
+        ExceptionGroup("g", [_from_driver(OSError(errno.EHOSTUNREACH, "x"))])
+    )
+    assert is_only_dependency_down(
+        _from_driver(ExceptionGroup("g", [OSError(errno.EHOSTUNREACH, "x")]))
+    )
     assert not is_only_dependency_down(
-        ExceptionGroup("g", [OSError(errno.EHOSTUNREACH, "x"), ValueError("bug")])
+        ExceptionGroup("g", [_from_driver(OSError(errno.EHOSTUNREACH, "x")), ValueError("bug")])
     )
 
 
@@ -115,14 +137,16 @@ def test_group_needs_every_leaf_down() -> None:
 
 
 async def test_oserror_113_inside_group_answers_503() -> None:
-    exc = ExceptionGroup("unhandled errors in a TaskGroup", [OSError(113, "No route to host")])
+    exc = ExceptionGroup(
+        "unhandled errors in a TaskGroup", [_from_driver(OSError(113, "No route to host"))]
+    )
     resp = await _handler_for(exc)(_request(), exc)
     _assert_503(resp)
 
 
 @pytest.mark.parametrize("code", [errno.EHOSTUNREACH, errno.ENETUNREACH])
 async def test_bare_unreachable_oserror_answers_503(code: int) -> None:
-    exc = OSError(code, "unreachable")
+    exc = _from_driver(OSError(code, "unreachable"))
     _assert_503(await _handler_for(exc)(_request(), exc))
 
 
@@ -130,7 +154,7 @@ async def test_disk_error_is_not_swallowed_as_503() -> None:
     exc = OSError(errno.ENOSPC, "No space left on device")
     with pytest.raises(OSError):
         await _handler_for(exc)(_request(), exc)
-    grp = ExceptionGroup("g", [OSError(113, "x"), OSError(errno.EIO, "io")])
+    grp = ExceptionGroup("g", [_from_driver(OSError(113, "x")), OSError(errno.EIO, "io")])
     with pytest.raises(ExceptionGroup):
         await _handler_for(grp)(_request(), grp)
 
@@ -185,7 +209,8 @@ async def _dispatch(monkeypatch: pytest.MonkeyPatch, raised: BaseException | Non
         return JSONResponse({"ok": True})
 
     mw = maintenance_mode.MaintenanceModeMiddleware(app)
-    resp = await mw.dispatch(_request("POST", "/api/v1/dhcp/agents/heartbeat"), call_next)
+    # Not an exempt path: those skip the read entirely (see the e2e tests).
+    resp = await mw.dispatch(_request("POST", "/api/v1/ipam/spaces"), call_next)
     resp.called_next = bool(called)  # type: ignore[attr-defined]
     return resp
 
@@ -197,7 +222,7 @@ async def _dispatch(monkeypatch: pytest.MonkeyPatch, raised: BaseException | Non
         TimeoutError("connect"),
         ExceptionGroup("tg", [ConnectionRefusedError(111, "Connection refused")]),
         ExceptionGroup("tg", [TimeoutError("ping")]),
-        ExceptionGroup("tg", [OSError(113, "No route to host")]),
+        ExceptionGroup("tg", [_from_driver(OSError(113, "No route to host"))]),
     ],
     ids=["refused", "timeout", "group-refused", "group-timeout", "group-113"],
 )
@@ -236,6 +261,9 @@ class _FakeSession:
         if self.close_exc is not None:
             raise self.close_exc
 
+    async def __aexit__(self, *_a: Any) -> None:
+        await self.close()
+
 
 async def _run_get_db(
     monkeypatch: pytest.MonkeyPatch,
@@ -256,7 +284,11 @@ async def _run_get_db(
 
 @pytest.mark.parametrize(
     "close_exc",
-    [_closed_interface_error(), TimeoutError("rollback"), OSError(113, "No route to host")],
+    [
+        _closed_interface_error(),
+        TimeoutError("rollback"),
+        _from_driver(OSError(113, "No route to host")),
+    ],
     ids=["closed-connection", "timeout", "113"],
 )
 async def test_get_db_swallows_dependency_down_cleanup(
@@ -276,3 +308,60 @@ async def test_get_db_cleanup_real_bug_propagates(monkeypatch: pytest.MonkeyPatc
 async def test_get_db_body_exception_still_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(KeyError):
         await _run_get_db(monkeypatch, TimeoutError("rollback"), body_exc=KeyError("route bug"))
+
+
+# ── DBAPIError shapes of the same failover ─────────────────────────────────
+
+
+async def test_old_primary_shutting_down_mid_statement_answers_503() -> None:
+    """The old primary's 57P01 ("the database system is shutting down" /
+    "terminating connection due to administrator command") reaches a route
+    as a bare DBAPIError; it used to fall to the 500 path."""
+    import asyncpg
+    from sqlalchemy.exc import DBAPIError
+
+    exc = DBAPIError(
+        "SELECT 1",
+        {},
+        asyncpg.exceptions.AdminShutdownError(
+            "terminating connection due to administrator command"
+        ),
+    )
+    _assert_503(await _handler_for(exc)(_request(), exc))
+
+
+async def test_invalidated_operational_error_answers_503() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    exc = OperationalError(
+        "SELECT 1", {}, Exception("server went away"), connection_invalidated=True
+    )
+    _assert_503(await _handler_for(exc)(_request(), exc))
+
+
+async def test_dbapi_error_controls_unchanged() -> None:
+    """A data error is still the 422, a query bug still the 500 path."""
+    import asyncpg
+    from sqlalchemy.exc import DBAPIError, ProgrammingError
+
+    data = DBAPIError("INSERT", {}, asyncpg.exceptions.InvalidTextRepresentationError("bad inet"))
+    data.orig.sqlstate = "22P02"  # type: ignore[union-attr]
+    resp = await _handler_for(data)(_request("POST"), data)
+    assert resp.status_code == 422
+    bug = ProgrammingError("SELECT nope", {}, Exception('column "nope" does not exist'))
+    with pytest.raises(ProgrammingError):
+        await _handler_for(bug)(_request(), bug)
+
+
+def test_gaierror_only_temporary_and_only_from_the_driver() -> None:
+    import socket
+
+    from app.core.db_transient import is_transient_db_error
+
+    again = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    noname = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    assert is_transient_db_error(_from_driver(again))
+    assert is_dependency_down(_from_driver(socket.gaierror(socket.EAI_AGAIN, "x")))
+    assert not is_transient_db_error(_from_driver(noname))
+    # A lookup an outbound call made (a webhook host) is not the database.
+    assert not is_dependency_down(socket.gaierror(socket.EAI_AGAIN, "x"))

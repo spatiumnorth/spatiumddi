@@ -6,7 +6,8 @@ Code that waits through it (the rolling upgrade's drive) has to tell that
 apart from a bug: the first is retried, the second must still fail at once.
 
 Transient here means "the connection, not the statement": the connect was
-refused or timed out, the connection closed under the statement, or the
+refused or timed out, the host was unreachable or its name did not resolve
+for now, the connection closed under the statement, or the
 server said it is shutting down, starting up or no longer the primary. A
 statement the database rejected (a constraint, a syntax error, a missing
 row) is never transient, whatever the connection's state.
@@ -15,6 +16,7 @@ row) is never transient, whatever the connection's state.
 from __future__ import annotations
 
 import errno
+import socket
 
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import InterfaceError as SAInterfaceError
@@ -79,6 +81,14 @@ _UNREACHABLE_ERRNOS = frozenset(
 def _socket_unreachable(exc: BaseException) -> bool:
     if not isinstance(exc, OSError) or isinstance(exc, ConnectionError):
         return False
+    # A resolver that did not answer (EAI_AGAIN, "Temporary failure in name
+    # resolution"): the database host's name, while the CoreDNS replica a
+    # node resolves through is on the node that just went away (#1718,
+    # #3017). Only the temporary code: a name that does not exist
+    # (EAI_NONAME) is a configuration error, not a failover. The gaierror
+    # codes are their own (negative) space, so this is checked by class.
+    if isinstance(exc, socket.gaierror):
+        return exc.errno == socket.EAI_AGAIN
     if exc.errno in _UNREACHABLE_ERRNOS:
         return True
     return exc.errno is None and str(exc).startswith("Multiple exceptions:")

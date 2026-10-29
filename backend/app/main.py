@@ -1207,6 +1207,17 @@ def create_app() -> FastAPI:
             or "server closed the connection unexpectedly" in text
         )
         if not is_connection_closed:
+            from app.core.dependency_down import (  # noqa: PLC0415
+                dependency_down_response,
+                is_dependency_down,
+            )
+
+            # A disconnect SQLAlchemy flagged (``connection_invalidated``) or
+            # the old primary's "shutting down" during a failover (#3017),
+            # in words this message match does not know: the same 503 every
+            # other dependency-down path answers.
+            if is_dependency_down(exc):
+                return dependency_down_response(request.method, request.url.path, exc, logger)
             # Some other InterfaceError — let it fall through to
             # the unhandled-exception path so it gets captured.
             raise exc
@@ -1252,7 +1263,7 @@ def create_app() -> FastAPI:
     from app.core.dependency_down import (  # noqa: PLC0415
         dependency_down_response,
         is_dependency_down,
-        split_dependency_down,
+        is_only_dependency_down,
     )
 
     # The classification (timeouts, connection errors, the pool checkout
@@ -1269,9 +1280,11 @@ def create_app() -> FastAPI:
     async def _dependency_unavailable(request: Request, exc: Exception) -> Response:
         return _dependency_down_response(request, exc)
 
-    # A plain OSError is only dependency-down for an unreachable-network errno
-    # (EHOSTUNREACH / ENETUNREACH are not ConnectionError subclasses); any
-    # other OSError, a disk error for one, re-raises to the 500 path.
+    # A plain OSError is dependency-down only for an unreachable host or
+    # network (EHOSTUNREACH / ENETUNREACH are not ConnectionError subclasses)
+    # AND only when the database driver raised it; any other OSError, a disk
+    # error or an outbound call's unreachable target, re-raises to the 500
+    # path it had before #3017.
     @app.exception_handler(OSError)
     async def _dependency_unavailable_oserror(request: Request, exc: OSError) -> Response:
         if not is_dependency_down(exc):
@@ -1296,8 +1309,7 @@ def create_app() -> FastAPI:
     # real bug still reaches the 500 path and the diagnostics capture.
     @app.exception_handler(ExceptionGroup)
     async def _dependency_unavailable_group(request: Request, exc: ExceptionGroup) -> Response:
-        matched, rest = split_dependency_down(exc)
-        if rest is not None or matched is None:
+        if not is_only_dependency_down(exc):
             raise exc
         return _dependency_down_response(request, exc)
 
@@ -1406,11 +1418,20 @@ def create_app() -> FastAPI:
         arrive as bare DBAPIError), so the discriminator is the error itself:
         SQLSTATE class 22 is "data exception" by definition, and asyncpg's
         client-side bind failures subclass asyncpg.exceptions.DataError.
-        Anything else (ProgrammingError — OUR query is wrong; transient
-        connection errors — their own handler above, which wins by being the
-        more specific registered class) re-raises unchanged."""
+        A database that went away mid-statement (a disconnect, or the old
+        primary's 57P01 / 25006 during a failover, which the asyncpg adapter
+        hands up as a bare DBAPIError) is the dependency-down 503 (#3017).
+        Anything else (ProgrammingError — OUR query is wrong) re-raises
+        unchanged."""
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
+        # A connection SQLAlchemy flagged as a disconnect, or the old
+        # primary's "shutting down" / read-only answer, is the database
+        # being away mid-statement (#3017): the 503, not a 500. It is checked
+        # first because this handler is the one Starlette picks for every
+        # DBAPIError subclass, OperationalError and InterfaceError included.
+        if is_dependency_down(exc):
+            return _dependency_down_response(request, exc)
         orig = getattr(exc, "orig", None)
         sqlstate = str(getattr(orig, "sqlstate", "") or "")
         is_data = sqlstate.startswith("22") or any(

@@ -254,6 +254,16 @@ class MaintenanceModeMiddleware(BaseHTTPMiddleware):
         if method not in _MUTATING_METHODS:
             return await call_next(request)  # type: ignore[operator,no-any-return]
 
+        # Exempt paths flow whether the window is on or off, so they need no
+        # flag at all. Checked BEFORE the read (#3017): these are the agent
+        # and supervisor POSTs, the busiest mutating traffic, and a failed
+        # read must not stand between an agent and a route whose own
+        # failover handling (#2845's heartbeat hold) is better than a blanket
+        # 503. Same outcome for every request as checking after the read.
+        path = request.url.path
+        if _is_exempt_path(path):
+            return await call_next(request)  # type: ignore[operator,no-any-return]
+
         # Read the cached flag. When OFF (the common case) we do ZERO
         # extra work — no bearer decode, no DB — and pass straight through.
         from app.db import AsyncSessionLocal  # noqa: PLC0415
@@ -275,13 +285,8 @@ class MaintenanceModeMiddleware(BaseHTTPMiddleware):
         except Exception as exc:  # noqa: BLE001 — classified, else re-raised
             if not is_only_dependency_down(exc):
                 raise
-            return dependency_down_response(method, request.url.path, exc, logger)
+            return dependency_down_response(method, path, exc, logger)
         if not enabled:
-            return await call_next(request)  # type: ignore[operator,no-any-return]
-
-        # Maintenance mode is ON. Exempt paths still flow.
-        path = request.url.path
-        if _is_exempt_path(path):
             return await call_next(request)  # type: ignore[operator,no-any-return]
 
         # Superadmin bypass — decode the bearer if present. Any failure
