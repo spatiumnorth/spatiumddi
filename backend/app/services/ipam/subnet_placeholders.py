@@ -19,7 +19,7 @@ from __future__ import annotations
 import ipaddress
 import uuid
 
-from sqlalchemy import ColumnElement, and_, false, func, text
+from sqlalchemy import ColumnElement, and_, exists, false, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
@@ -67,31 +67,54 @@ def untouched_gateway_row() -> ColumnElement[bool]:
     """SQL: this ``ip_address`` row is still the gateway placeholder its subnet's
     create added (#3042) — reserved, "Gateway" / ``gateway``, sitting on
     ``subnet.gateway`` and nothing more. Needs ``Subnet`` in the FROM. A row the
-    operator renamed, gave a MAC / DNS / owner / tags to, or turned into a real
+    operator renamed, gave DNS zones / an owner / tags to, or turned into a real
     allocation is not it, and neither is a hand-made row at another address.
-    NULL-safe: a subnet with no stored gateway has no placeholder."""
+    NULL-safe: a subnet with no stored gateway has no placeholder.
+
+    What the system writes onto the row by itself does not disqualify it: the
+    create's own PTR publish (``fqdn``, ``reverse_zone_id``), discovery's
+    ``last_seen_*`` and the MAC it fills in from ARP (a MAC on a row nothing has
+    seen came from an operator, so that one still counts), profiling. Anything
+    an operator edit leaves behind does: ``user_modified_at`` (stamped by every
+    hostname / description / status / MAC edit), the API-settable fields
+    without that stamp, integration or import ownership, and a registry record
+    (BACnet / OT / E911 / multicast) that would cascade away with the row."""
+    from app.models.bacnet import BACnetDevice  # noqa: PLC0415
+    from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.multicast import MulticastMembership  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
+    from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS  # noqa: PLC0415
+
+    unowned = [getattr(IPAddress, fk).is_(None) for fk in sorted(INTEGRATION_OWNERSHIP_FKS)]
+    unreferenced = [
+        ~exists().where(child.ip_address_id == IPAddress.id)
+        for child in (BACnetDevice, OTDevice, ERLBinding, MulticastMembership)
+    ]
     return func.coalesce(
         and_(
             IPAddress.status == GATEWAY_STATUS,
             IPAddress.description == GATEWAY_DESCRIPTION,
             IPAddress.hostname == GATEWAY_HOSTNAME,
             IPAddress.address == Subnet.gateway,
+            IPAddress.user_modified_at.is_(None),
             IPAddress.role.is_(None),
-            IPAddress.mac_address.is_(None),
-            IPAddress.fqdn.is_(None),
+            or_(IPAddress.mac_address.is_(None), IPAddress.last_seen_at.is_not(None)),
             IPAddress.managed_by.is_(None),
             IPAddress.owner_user_id.is_(None),
             IPAddress.owner_group_id.is_(None),
             IPAddress.reserved_until.is_(None),
             IPAddress.decom_date.is_(None),
             IPAddress.forward_zone_id.is_(None),
-            IPAddress.reverse_zone_id.is_(None),
             IPAddress.dns_record_id.is_(None),
+            IPAddress.extra_zone_ids == text("'[]'::jsonb"),
             IPAddress.dhcp_lease_id.is_(None),
             IPAddress.static_assignment_id.is_(None),
             IPAddress.auto_from_lease.is_(False),
+            IPAddress.import_source.is_(None),
             IPAddress.custom_fields == text("'{}'::jsonb"),
             IPAddress.tags == text("'{}'::jsonb"),
+            *unowned,
+            *unreferenced,
         ),
         false(),
     )
