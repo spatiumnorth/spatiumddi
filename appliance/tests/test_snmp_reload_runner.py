@@ -68,7 +68,8 @@ while IFS= read -r line; do
         BADDIRECTIVE*) echo "$conf: line $n: Error: Blank line following BADDIRECTIVE token.";;
         "view qa2378view included") echo "$conf: line $n: Error: missing SUBTREE parameter";;
         fooBarToken*) echo "$conf: line $n: Warning: Unknown token: fooBarToken.";;
-        CRASHME*) kill -SEGV $$;;
+        # no core file: it would land in the checkout the tests run from
+        CRASHME*) ulimit -c 0; kill -SEGV $$;;
     esac
 done < "$conf"
 held=0
