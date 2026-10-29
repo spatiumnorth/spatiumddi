@@ -21,7 +21,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | --------------- | -------- | ---------------------------------------------------------------------- |
 | `action`        | yes      | What the user may do. See **Actions** below.                           |
 | `resource_type` | yes      | Which resource kind. See **Resource types** below.                     |
-| `resource_id`   | no       | Scope to a specific UUID. Omit / `null` for "any instance of the type". Honoured for `subnet`, `ip_space`, `ip_block`, `customer`, `site`, `provider`, `address_set`, `dns_zone` and API-token grants; see rule 4 |
+| `resource_id`   | no       | Scope to a specific UUID. Omit / `null` for "any instance of the type". A role grant scoped this way opens that one item only for `subnet`, `ip_space`, `ip_block`, `customer`, `site`, `provider` and `address_set` (rule 4); a `dns_zone`-scoped grant only lets a subnet-scoped holder name that zone. API tokens bind to a `subnet` or `dns_zone` |
 
 ### Actions
 
@@ -162,7 +162,10 @@ on inactive.
    (a customer's `/summary` too). Through the scoped grant the holder may not
    point the item at another resource (DNS / DHCP server groups, zones, DDNS
    domain, VRF, ASN, customer, site, parent block / site, a provider's default
-   ASN); re-sending the current value passes.
+   ASN), nor change a setting the subnets underneath inherit from a space or
+   block (DDNS on / policy / TTL / inherit, the DNS and DHCP inherit switches,
+   split-horizon, do-not-probe), since those subnets are outside the grant;
+   re-sending the current value passes.
    **IPAM address sets (#103).** A `write` / `admin` grant on an address set
    (the Address Set Editor role, scoped to one set) reaches an allow-list of
    address routes and nothing else in IPAM: create, next-IP, bulk-allocate

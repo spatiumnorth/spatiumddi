@@ -1045,7 +1045,12 @@ _SUBNET_BINDING_FIELDS = (
 
 # The same rule for a grant scoped to one space or one block (#3039): the grant
 # names that item, not the DNS / DHCP servers, zones, customer, site, VRF, ASN
-# or parent it would be attached to.
+# or parent it would be attached to. Nor does it name the subnets underneath,
+# so the settings those subnets INHERIT from the item (DDNS, the DNS / DHCP
+# inherit switches, split-horizon, do-not-probe) are refused too: flipping one
+# re-points or re-enables every descendant, none of which the grant reaches
+# (clearing a space's do-not-probe would open every fragile subnet in it to
+# sweeps, #722).
 _SPACE_BINDING_FIELDS = (
     "dns_group_ids",
     "dns_zone_id",
@@ -1055,22 +1060,63 @@ _SPACE_BINDING_FIELDS = (
     "vrf_id",
     "asn_id",
     "customer_id",
+    "ddns_enabled",
+    "ddns_hostname_policy",
+    "ddns_ttl",
+    "do_not_probe",
 )
-_BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + ("parent_block_id", "site_id")
+_BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
+    "parent_block_id",
+    "site_id",
+    "dns_inherit_settings",
+    "dhcp_inherit_settings",
+    "dns_split_horizon",
+    "ddns_inherit_settings",
+)
+# Fields whose handler treats an explicit null as "leave unchanged" (the
+# ``exclude_none`` dump), so a null there changes nothing and must not be
+# refused as a change.
+_SPACE_NULL_IS_NOOP = frozenset(
+    {
+        "dns_group_ids",
+        "dns_additional_zone_ids",
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "do_not_probe",
+    }
+)
+_BLOCK_NULL_IS_NOOP = frozenset(
+    {
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "ddns_inherit_settings",
+        "do_not_probe",
+        "dns_split_horizon",
+    }
+)
 
 
 def _assert_scoped_item_bindings(
-    user: Any, rtype: str, body: BaseModel, row: Any, fields: tuple[str, ...]
+    user: Any,
+    rtype: str,
+    body: BaseModel,
+    row: Any,
+    fields: tuple[str, ...],
+    null_is_noop: frozenset[str] = frozenset(),
 ) -> None:
     """403 when a holder of a grant scoped to one ``rtype`` row changes a field
-    that points it at another resource (#3039). Re-sending the current value
-    passes, and so does a caller holding the type-level write."""
+    that points it at another resource, or that its descendants inherit
+    (#3039). Re-sending the current value passes, and so does a caller holding
+    the type-level write."""
     if user_has_permission(user, "write", rtype):
         return
     for field in fields:
         if field not in body.model_fields_set:
             continue
-        if _binding_value(getattr(body, field)) != _binding_value(getattr(row, field, None)):
+        value = getattr(body, field)
+        if value is None and field in null_is_noop:
+            continue
+        if _binding_value(value) != _binding_value(getattr(row, field, None)):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Permission denied: changing '{field}' needs 'write' on '{rtype}'",
@@ -4803,7 +4849,9 @@ async def update_space(
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
-    _assert_scoped_item_bindings(current_user, "ip_space", body, space, _SPACE_BINDING_FIELDS)
+    _assert_scoped_item_bindings(
+        current_user, "ip_space", body, space, _SPACE_BINDING_FIELDS, _SPACE_NULL_IS_NOOP
+    )
     await _enforce_zone_token_scope(
         db,
         current_user,
@@ -5278,7 +5326,9 @@ async def update_block(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
-    _assert_scoped_item_bindings(current_user, "ip_block", body, block, _BLOCK_BINDING_FIELDS)
+    _assert_scoped_item_bindings(
+        current_user, "ip_block", body, block, _BLOCK_BINDING_FIELDS, _BLOCK_NULL_IS_NOOP
+    )
     await _enforce_zone_token_scope(
         db,
         current_user,
