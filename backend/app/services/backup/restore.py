@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 import tempfile
 import zlib
@@ -85,6 +86,7 @@ from app.services.backup.rewrap import (
     rewrap_secrets,
 )
 from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
+from app.services.logs.partitions import LOG_TABLES, partition_name_pattern
 
 logger = structlog.get_logger(__name__)
 
@@ -755,7 +757,86 @@ def _sql_text_array(values: list[str]) -> str:
     return "ARRAY[" + ", ".join("'" + v.replace("'", "''") + "'" for v in values) + "]::text[]"
 
 
-def _selective_prelude(tables: list[str]) -> str:
+#: Tables a selective restore reloads through their parent, because they are
+#: ``PARTITION BY RANGE`` (#2185): a custom-format archive holds their rows under
+#: the partitions, and ``pg_restore --table <parent>`` selects a table that owns
+#: no data.
+_PARTITIONED_TABLES = frozenset(t.name for t in LOG_TABLES)
+
+#: A partition ``pg_restore --list`` shows with data of its own.
+_TABLE_DATA_ENTRY = re.compile(r"\bTABLE DATA public (\S+)")
+
+#: The head of a ``COPY`` statement, whether or not the archive quoted its identifiers.
+_COPY_HEAD = re.compile(rb'^COPY ("?public"?\.)("?)([^"\s(]+)\2 ')
+
+
+def _restore_default_partition(table: str) -> str:
+    return f"{table}_restore_default"
+
+
+async def _archive_partitions(dump_path: Path, tables: list[str]) -> dict[str, str]:
+    """The partitions of ``tables`` the archive holds rows for, each mapped to its parent.
+
+    An archive taken before the tables were partitioned has none, and the parent
+    itself is the entry ``pg_restore --table`` finds.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "pg_restore",
+        "--list",
+        str(dump_path),
+        env=_pg_subprocess_env({}),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise BackupRestoreError(
+            f"pg_restore --list failed (exit {proc.returncode}): "
+            f"{err.decode(errors='replace')[:500]}"
+        )
+    patterns = {t: re.compile(partition_name_pattern(t)) for t in tables}
+    found: dict[str, str] = {}
+    for line in out.decode(errors="replace").splitlines():
+        match = _TABLE_DATA_ENTRY.search(line)
+        if match is None:
+            continue
+        for table, pattern in patterns.items():
+            if pattern.fullmatch(match[1]):
+                found[match[1]] = table
+    return found
+
+
+async def _route_partition_copies(chunks, parents: dict[str, str]):
+    """Rewrite each ``COPY`` into an archived partition to load through its parent.
+
+    The partitions in the archive are not the ones the install has now: they
+    were made at the time of the backup. Loading through the parent puts every
+    row where it belongs today, or into the temporary default partition when
+    nothing covers it (see :func:`_selective_prelude`). Lines inside a ``COPY``
+    block are rows and are passed on as they are.
+    """
+    pending = b""
+    in_copy = False
+    async for chunk in chunks:
+        *lines, pending = (pending + chunk).split(b"\n")
+        out = []
+        for line in lines:
+            if in_copy:
+                in_copy = line != b"\\."
+            elif line.startswith(b"COPY "):
+                head = _COPY_HEAD.match(line)
+                parent = parents.get(head[3].decode()) if head else None
+                if head and parent:
+                    line = head[0].replace(head[3], parent.encode(), 1) + line[head.end() :]
+                in_copy = True
+            out.append(line + b"\n")
+        if out:
+            yield b"".join(out)
+    if pending:
+        yield pending
+
+
+def _selective_prelude(tables: list[str], partitioned: list[str] | None = None) -> str:
     """What a selective replay runs before the archive's rows, in the same
     transaction: take the locks the way the full restore's clearing does,
     then ``TRUNCATE … RESTART IDENTITY CASCADE`` the tables it reloads.
@@ -792,17 +873,31 @@ def _selective_prelude(tables: list[str]) -> str:
         # columns it dropped; put them back so its COPY loads. The restore
         # folds and drops them again after the migration step.
         + selective_readd_sql(tables)
+        # A time-partitioned table takes the archive's rows through its parent,
+        # and a row dated outside every partition it has now would fail the
+        # whole load. A default partition catches them for the length of the
+        # transaction; the postlude drops it, and with it rows that are older
+        # than the retention window, or ahead of it, and not worth keeping.
+        + "".join(
+            f'CREATE TABLE "public"."{_restore_default_partition(t)}" '
+            f'PARTITION OF "public"."{t}" DEFAULT;\n'
+            for t in partitioned or ()
+        )
     )
 
 
-def _selective_postlude(tables: list[str]) -> str:
+def _selective_postlude(tables: list[str], partitioned: list[str] | None = None) -> str:
     """What a selective replay runs after the archive's rows, before its one
     transaction commits: put the foreign keys back, which checks every row
     loaded (:data:`_PUT_BACK_FOREIGN_KEYS_SQL`), then set each sequence the
     reloaded tables own past their rows
     (:data:`_PUT_SEQUENCES_PAST_THEIR_ROWS_SQL`)."""
-    return _PUT_BACK_FOREIGN_KEYS_SQL + _PUT_SEQUENCES_PAST_THEIR_ROWS_SQL.format(
-        tables=_sql_text_array(tables)
+    return (
+        "".join(
+            f'DROP TABLE "public"."{_restore_default_partition(t)}";\n' for t in partitioned or ()
+        )
+        + _PUT_BACK_FOREIGN_KEYS_SQL
+        + _PUT_SEQUENCES_PAST_THEIR_ROWS_SQL.format(tables=_sql_text_array(tables))
     )
 
 
@@ -841,7 +936,9 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
         "--no-acl",
         "--file=-",
     ]
-    for table in tables:
+    partitioned = [t for t in tables if t in _PARTITIONED_TABLES]
+    archived_partitions = await _archive_partitions(dump_path, partitioned) if partitioned else {}
+    for table in [*tables, *archived_partitions]:
         cmd.extend(["--table", table])
     cmd.append(str(dump_path))
     producer = await asyncio.create_subprocess_exec(
@@ -860,11 +957,15 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
 
     try:
         await _replay_clean(
-            script(),
+            (
+                _route_partition_copies(script(), archived_partitions)
+                if archived_partitions
+                else script()
+            ),
             db_url,
             producer=producer,
-            prelude=_selective_prelude(tables),
-            postlude=_selective_postlude(tables),
+            prelude=_selective_prelude(tables, partitioned),
+            postlude=_selective_postlude(tables, partitioned),
         )
     finally:
         # As in _run_pg_restore: reap the producer on a failure before the

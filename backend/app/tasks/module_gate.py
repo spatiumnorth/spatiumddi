@@ -163,6 +163,7 @@ UNGATED_BEAT_TASKS: Final[dict[str, str]] = {
     # ── Retention / prune: must run regardless, or data a disabled module
     #    left behind is kept past its retention window ──
     "app.tasks.trash_purge.purge_expired_soft_deletes": "retention",
+    "app.tasks.log_partitions.maintain_log_partitions": "retention (the log tables' partitions)",
     "app.tasks.prune_logs.prune_log_entries": "retention",
     "app.tasks.prune_metrics.prune_metric_samples": "retention",
     "app.tasks.prune_internal_errors.prune_internal_errors": "retention",
