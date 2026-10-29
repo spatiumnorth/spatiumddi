@@ -182,3 +182,11 @@ charts/spatiumddi/templates/frontend.yaml
 # broker grace that stays bounded, and the two must agree.
 charts/spatiumddi/templates/worker.yaml
 k8s/base/worker.yaml
+
+# test_api_graceful_shutdown.py (#2944) pins uvicorn's graceful-shutdown
+# timeout below every grace period that stops the api: the manifests, the chart
+# template and the compose files.
+charts/spatiumddi/templates/api.yaml
+k8s/base/api.yaml
+docker-compose.yml
+docker-compose.dev.yml
