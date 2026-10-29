@@ -125,7 +125,7 @@ def bind_zone_forwarder(entry: str, tls_name: str | None) -> str:
     ip, _, port = entry.strip().partition("@")
     ip = ip.strip()
     port = port.strip()
-    if not port.isdigit():
+    if not (port.isascii() and port.isdigit()):
         port = "853" if tls_name else ""
     out = ip
     if port:

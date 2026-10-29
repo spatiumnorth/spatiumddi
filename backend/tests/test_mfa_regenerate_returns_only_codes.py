@@ -69,7 +69,10 @@ async def test_regenerate_answers_with_the_codes_only(
 
 @pytest.mark.asyncio
 async def test_regenerate_schema_declares_no_secret(client: AsyncClient):
-    spec = (await client.get("/api/openapi.json")).json()
+    from app.main import app
+
+    # The served document is signed-in only (#2935); it is app.openapi().
+    spec = app.openapi()
     ref = spec["paths"]["/api/v1/auth/mfa/recovery-codes/regenerate"]["post"]["responses"]["200"][
         "content"
     ]["application/json"]["schema"]["$ref"]

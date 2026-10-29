@@ -23,6 +23,19 @@ from typing import Any, Literal
 # ── Neutral record / zone data shapes ──────────────────────────────────────
 
 
+def first_ttl(*candidates: int | None, default: int) -> int:
+    """First candidate that is not ``None``, else ``default``.
+
+    A TTL of ``0`` is a real, publishable value (the record API accepts
+    ``ge=0``), so ``ttl or default`` is wrong: it reads 0 as missing and
+    publishes the default instead (#2942). Only ``None`` falls through.
+    """
+    for c in candidates:
+        if c is not None:
+            return int(c)
+    return default
+
+
 @dataclass(frozen=True)
 class RecordData:
     """A single DNS resource record, relative to its zone."""

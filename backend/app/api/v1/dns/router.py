@@ -85,6 +85,7 @@ from app.drivers.dns import (
     get_driver,
     is_agentless,
     supports_topology_pull,
+    ttl_refusal,
 )
 from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
@@ -255,6 +256,7 @@ from app.services.dns_io import (
     write_zone_file,
 )
 from app.services.dns_io import spreadsheet as sheet_io
+from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     SoftDeleteBatch,
@@ -1263,7 +1265,7 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
             raise ValueError(
                 f"master {entry!r} must be a bare IPv4/IPv6 address (optionally 'ip@port')"
             ) from exc
-        if sep and (not port.isdigit() or not (1 <= int(port) <= 65535)):
+        if sep and (not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535)):
             raise ValueError(f"master {entry!r}: port must be an integer in 1..65535")
         cleaned.append(entry)
     return cleaned
@@ -4098,7 +4100,7 @@ def _plain_port_forwarders(entries: list[str] | None) -> list[str]:
     out = []
     for entry in entries or []:
         port = str(entry).partition("@")[2].strip()
-        if port.isdigit() and int(port) == 53:
+        if port.isascii() and port.isdigit() and int(port) == 53:
             out.append(entry)
     return out
 
@@ -7873,6 +7875,16 @@ async def create_zone_from_template(
             detail="A zone with that name already exists in this group/view",
         )
 
+    # Every provider-refusal gate runs on the whole record set BEFORE the zone
+    # exists or is pushed anywhere, so a refusal is atomic (#3007).
+    record_payloads = materialize(template, body.zone_name, body.params)
+    for r in record_payloads:
+        if r["record_type"] in VALID_RECORD_TYPES:
+            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    await _check_driver_refusals(
+        [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
+    )
+
     guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(
         group_id=group_id,
@@ -7886,7 +7898,6 @@ async def create_zone_from_template(
     adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
-    record_payloads = materialize(template, body.zone_name, body.params)
     created_records: list[DNSRecord] = []
     for r in record_payloads:
         if r["record_type"] not in VALID_RECORD_TYPES:
@@ -8601,6 +8612,7 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
@@ -8731,6 +8743,12 @@ async def update_record(
         return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
+    if "value" in changes or "ttl" in changes:
+        # #2959 / #2942 — before the row is touched, so a refusal leaves it as
+        # it was. Only what the request changes is checked.
+        await _check_driver_refusals(
+            [(record.record_type, changes.get("value"), changes.get("ttl"))], group_id, db
+        )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -9297,6 +9315,9 @@ async def bulk_create_records(
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_refusals(
+        [(r.record_type, r.value, r.ttl) for r in body.records], group_id, db
+    )
 
     # Normalise first: MX defaults its priority to 10, so an MX with and one
     # without an explicit 10 are the same record and must compare equal.
@@ -9581,8 +9602,103 @@ async def _diff_zone_file(
         replace=replace,
         zone_name=zone.name,
     )
+    # #2913 — a TTL past what a server can serve is refused like the
+    # spreadsheet import refuses it, not stored as "no TTL" (which a merge then
+    # wrote over an explicit one). The row still goes through the diff, so a
+    # ``replace`` reads the record it names as present in the file and leaves
+    # it alone rather than deleting it; only its create / update is withheld.
+    unservable = _withhold_unservable_ttls(diff, parsed)
+    # #2912 — a new row meets the record API's own rules (the ones the
+    # spreadsheet import runs), or it is left out with the reason.
+    await _apply_record_rules_to_import(db, zone, diff)
     apply_cname_rule(diff, existing, replace=replace)
+    diff.skipped = unservable + diff.skipped
     return diff
+
+
+def _withhold_unservable_ttls(diff: ZoneDiff, parsed: list[ParsedRecord]) -> list[str]:
+    """Take every create / update / unchanged entry whose file row carries a
+    TTL past ``DNS_TTL_MAX`` out of ``diff`` (#2913), and return one skipped
+    line per such row."""
+    bad = {(p.name, p.record_type, p.value): p.bad_ttl for p in parsed if p.bad_ttl is not None}
+    if not bad:
+        return []
+
+    def keep(c: RecordChange) -> bool:
+        return (c.name, c.record_type, c.value) not in bad
+
+    diff.to_create = [c for c in diff.to_create if keep(c)]
+    diff.to_update = [c for c in diff.to_update if keep(c)]
+    diff.unchanged = [c for c in diff.unchanged if keep(c)]
+    return [
+        f"{name} {rtype} {value}: skipped - TTL {ttl} is above the maximum of {DNS_TTL_MAX}"
+        for (name, rtype, value), ttl in bad.items()
+    ]
+
+
+# The longest ``skipped`` list a zone-file import returns (and audits). A file
+# of nothing but refused rows is bounded only by the request body cap, and
+# the list is echoed in the response AND stored in the audit row.
+_IMPORT_SKIPPED_MAX = 500
+
+
+def _cap_skipped(skipped: list[str]) -> list[str]:
+    if len(skipped) <= _IMPORT_SKIPPED_MAX:
+        return skipped
+    more = len(skipped) - _IMPORT_SKIPPED_MAX
+    return [*skipped[:_IMPORT_SKIPPED_MAX], f"... and {more} more row(s) left alone"]
+
+
+async def _apply_record_rules_to_import(db: DB, zone: DNSZone, diff: ZoneDiff) -> None:
+    """Move every ``to_create`` row the record API would refuse into
+    ``diff.skipped`` (#2912).
+
+    Uses ``_sheet_row_validator`` — the record API's own checks (owner rule,
+    TTL bounds, value rules, BIND's check-names) as a per-row verdict — rather
+    than a second copy. BIND refuses a zone holding one bad owner whole and
+    keeps serving the last good copy, so storing such a row also held back
+    every good row imported beside it. An update names a record that already
+    exists, so its name, type and value are unchanged and are not re-judged
+    (the record API's update re-judges only what changes); an update writes
+    only the TTL and priority / weight / port, which the parser bounds
+    (``bad_ttl``; the wire format caps the others at 16 bits).
+    """
+    if not diff.to_create:
+        return
+    needs_absolute = any(
+        dotless_target(c.record_type, c.value) is not None for c in diff.to_create
+    ) and await group_needs_absolute_targets(db, zone.group_id)
+    check = _sheet_row_validator(zone, {}, needs_absolute)
+    keep: list[RecordChange] = []
+    for i, c in enumerate(diff.to_create, start=1):
+        verdict = check(
+            sheet_io.SheetRow(
+                row=i,
+                name=c.name,
+                type=c.record_type,
+                value=c.value,
+                ttl=c.ttl,
+                priority=c.priority,
+                weight=c.weight,
+                port=c.port,
+            ),
+            c.view_id,
+            None,
+        )
+        if isinstance(verdict, str):
+            diff.skipped.append(f"{c.name} {c.record_type} {c.value}: skipped - {verdict}")
+        else:
+            keep.append(c)
+    diff.to_create = keep
+
+
+def _skipped_type_notes(parsed: ParsedZone) -> list[str]:
+    """One line per record type the file carries that SpatiumDDI does not
+    store (#2914), so the preview and the result name what is not imported."""
+    return [
+        f"{rtype}: {n} record(s) skipped - SpatiumDDI does not store {rtype} records"
+        for rtype, n in sorted(parsed.skipped_types.items())
+    ]
 
 
 def _change_to_response(c: RecordChange) -> RecordChangeResponse:
@@ -9661,6 +9777,7 @@ async def import_zone_preview(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
+    diff.skipped = _cap_skipped(_skipped_type_notes(parsed) + diff.skipped)
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -9722,6 +9839,7 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
+    diff.skipped = _cap_skipped(_skipped_type_notes(parsed) + diff.skipped)
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
@@ -9740,6 +9858,12 @@ async def import_zone_commit(
     _reject_if_synthesised_zone(zone, "import")
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_refusals(
+        [(c.record_type, c.value, c.ttl) for c in diff.to_create]
+        + [(c.record_type, None, c.ttl) for c in diff.to_update],
+        group_id,
+        db,
+    )
 
     # #2275 — a view-scoped import creates or deletes records in that view,
     # which moves where the zone renders.
@@ -10450,6 +10574,20 @@ async def import_zone_spreadsheet_commit(
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
 
+    await _check_driver_refusals(
+        [(c.record_type, c.value, c.ttl) for c in plan.creates]
+        + [
+            (
+                u.candidate.record_type,
+                u.candidate.value if "value" in u.changed else None,
+                u.candidate.ttl,
+            )
+            for u in plan.updates
+        ],
+        group_id,
+        db,
+    )
+
     # #2275 — rows carry a view, and a record's view places its zone there.
     render_guard = await RenderGuard.capture(db, group_id, [zone.name])
     batch_id = uuid.uuid4()
@@ -10815,6 +10953,51 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                     "public resolvers."
                 ),
             )
+
+
+async def _check_driver_refusals(
+    records: Iterable[tuple[str, str | None, int | None]], group_id: uuid.UUID, db: DB
+) -> None:
+    """422 a record a driver in the zone's group would refuse (#2942, #2959).
+
+    ``records`` is ``(record_type, value, ttl)``; a ``None`` value or TTL is
+    not checked (an update that leaves it alone, or a TTL that inherits). One
+    gate, one query, for both things a driver can refuse about a record:
+
+    * its **value** — through the driver's optional
+      ``record_value_refusal(record_type, value) -> str | None`` (Linode
+      cannot carry non-zero CAA flags, for example; #2959). Without it the
+      record would be stored and then fail on every push.
+    * its **TTL** — :func:`app.drivers.dns.ttl_refusal` against
+      ``PROVIDER_TTL_RANGES`` (#2942). Without it a TTL of 0 reaches
+      Cloudflare (refused, so the stored record never publishes) or Vultr /
+      Linode (read as "automatic", so a different TTL publishes).
+
+    Values are checked before TTLs, and the first refusal is the 422, in the
+    provider's own words. Same fail-soft semantics as
+    ``_check_driver_gated_record_type``: an empty group passes, and the
+    driver re-checks at apply time.
+    """
+    rows = list(records)
+    values = [(rtype, value) for rtype, value, _ in rows if value is not None]
+    ttls = sorted({ttl for _, _, ttl in rows if ttl is not None})
+    if not values and not ttls:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    drivers = sorted({d for d in res.scalars().all() if d})
+    for driver in drivers:
+        check = getattr(_DNS_DRIVERS.get(driver), "record_value_refusal", None)
+        if check is None:
+            continue
+        for record_type, value in values:
+            refusal = check(record_type, value)
+            if refusal:
+                raise HTTPException(status_code=422, detail=refusal)
+    for driver in drivers:
+        for ttl in ttls:
+            reason = ttl_refusal(driver, ttl)
+            if reason is not None:
+                raise HTTPException(status_code=422, detail=reason)
 
 
 async def _require_record(

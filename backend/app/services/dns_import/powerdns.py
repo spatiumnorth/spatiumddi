@@ -236,7 +236,8 @@ def _build_imported_zone(
     for rrset in full.get("rrsets") or []:
         rtype = str(rrset.get("type") or "").upper()
         rname = str(rrset.get("name") or "")
-        ttl = int(rrset.get("ttl") or 3600)
+        raw_ttl = rrset.get("ttl")
+        ttl = int(raw_ttl) if raw_ttl is not None else 3600
         rec_list = rrset.get("records") or []
 
         if rtype == "SOA":
