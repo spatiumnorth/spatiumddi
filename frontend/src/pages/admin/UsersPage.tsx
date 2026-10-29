@@ -19,6 +19,7 @@ import {
 import {
   authProvidersApi,
   formatApiError,
+  formatDialogError,
   usersApi,
   type AppUser,
 } from "@/lib/api";
@@ -28,15 +29,8 @@ import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { stepUpBody } from "@/lib/stepup";
 
-/**
- * A refused user dialog says what is wrong in words (#2435). A 422's detail
- * is an array of field errors, which used to be printed as raw JSON; and
- * pydantic prefixes a validator's message with "Value error, ", which names
- * nothing the reader can act on.
- */
-function userDialogError(err: unknown, fallback: string): string {
-  return formatApiError(err, fallback).replace(/(^|: |; )Value error, /g, "$1");
-}
+/** A refused user dialog says what is wrong in words (#2435, #3040). */
+const userDialogError = formatDialogError;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
