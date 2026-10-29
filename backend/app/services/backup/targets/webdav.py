@@ -308,7 +308,7 @@ class WebDAVDestination(BackupDestination):
                             f"{scrub_url(body, target)[:300]}"
                         )
                     length = resp.headers.get("content-length")
-                    if length and length.isdigit():
+                    if length and length.isascii() and length.isdigit():
                         check_size(name, int(length), max_bytes)
                     out = bytearray()
                     async for chunk in resp.aiter_bytes():
