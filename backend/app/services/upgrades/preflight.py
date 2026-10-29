@@ -74,7 +74,7 @@ from app.models.appliance import (
     Appliance,
     ApplianceUpgradeImage,
 )
-from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dhcp import HA_MODES, DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer
 from app.services.appliance import var_disk
 from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
@@ -1149,6 +1149,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                     await db.execute(
                         select(
                             DHCPServerGroup.name.label("group_name"),
+                            DHCPServerGroup.mode.label("group_mode"),
                             DHCPServer.name.label("server_name"),
                             DHCPServer.kea_version.label("kea_version"),
                             DHCPServer.ha_peer_url.label("ha_peer_url"),
@@ -1181,7 +1182,8 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     ha_groups = {
         name: members
         for name, members in by_group.items()
-        if len(members) >= 2
+        if members[0]["group_mode"] in HA_MODES
+        and len(members) >= 2
         and all(m["ha_peer_url"] for m in members)
         and any(m["on_appliance"] for m in members)
     }

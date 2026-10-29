@@ -581,6 +581,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dhcp_scope_uncoordinated_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # Relay-VIP direct-socket alert rule — singleton, ENABLED by default
+    # (issue #2899). Silent unless a MetalLB DHCP relay VIP fronts a group in
+    # direct (raw socket) mode. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dhcp_relay_vip_direct_socket_alert_rule,
+        )
+
+        await seed_dhcp_relay_vip_direct_socket_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dhcp_relay_vip_direct_socket_alert_rule_seed_skipped", reason=str(exc))
     # Stale blocklist feed alert rule — singleton, ENABLED by default
     # (issue #2313). Silent unless a feed list stopped refreshing. Idempotent.
     try:
