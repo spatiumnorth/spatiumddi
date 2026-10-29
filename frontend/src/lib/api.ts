@@ -205,6 +205,24 @@ export const api = createClient();
  * site in the app.
  */
 export function formatApiError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, false);
+}
+
+/**
+ * formatApiError for a form dialog: also drops the "Value error, " pydantic
+ * puts in front of a validator's message (#2435, #3041), which names nothing
+ * the reader can act on. Only a 422 entry's own `msg` is trimmed, and only at
+ * its start, so the same words inside a real message are left alone.
+ */
+export function formatDialogError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, true);
+}
+
+function formatError(
+  err: unknown,
+  fallback: string,
+  stripPydanticPrefix: boolean,
+): string {
   const anyErr = err as {
     response?: { data?: { detail?: unknown } };
     message?: string;
@@ -220,7 +238,12 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
         const loc = Array.isArray(rec.loc)
           ? rec.loc.filter((s) => s !== "body").join(".")
           : "";
-        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(e);
+        const msg =
+          typeof rec.msg === "string"
+            ? stripPydanticPrefix
+              ? rec.msg.replace(/^Value error, /, "")
+              : rec.msg
+            : JSON.stringify(e);
         return loc ? `${loc}: ${msg}` : msg;
       })
       .filter(Boolean);
@@ -261,15 +284,6 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
   if (typeof anyErr?.message === "string" && anyErr.message)
     return anyErr.message;
   return fallback;
-}
-
-/**
- * formatApiError for a form dialog: also drops the "Value error, " pydantic
- * puts in front of a validator's message (#2435, #3041), which names nothing
- * the reader can act on.
- */
-export function formatDialogError(err: unknown, fallback = "Error"): string {
-  return formatApiError(err, fallback).replace(/(^|: |; )Value error, /g, "$1");
 }
 
 // Typed API helpers

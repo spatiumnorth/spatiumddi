@@ -28,9 +28,35 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { stepUpBody } from "@/lib/stepup";
+import { parsePasswordError } from "@/lib/password-policy";
 
 /** A refused user dialog says what is wrong in words (#2435, #3040). */
 const userDialogError = formatDialogError;
+
+/**
+ * A password-policy refusal's rules (#3040): the 400's
+ * `{reason: "password_policy", errors: [...]}`, listed one per line as
+ * ChangePasswordPage lists them (#1004). Empty for any other refusal, which
+ * goes through userDialogError instead.
+ */
+function passwordPolicyErrors(err: unknown): string[] {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })
+    ?.response?.data?.detail;
+  return detail && typeof detail === "object" && !Array.isArray(detail)
+    ? parsePasswordError(detail, "").fieldErrors
+    : [];
+}
+
+function PolicyErrorList({ errors }: { errors: string[] }) {
+  if (errors.length === 0) return null;
+  return (
+    <ul className="list-disc space-y-1 pl-5 text-xs text-destructive">
+      {errors.map((e) => (
+        <li key={e}>{e}</li>
+      ))}
+    </ul>
+  );
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -71,6 +97,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   const providers = useQuery({
     queryKey: ["auth-providers"],
     queryFn: authProvidersApi.list,
@@ -93,7 +120,11 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
       onClose();
     },
     onError: (err: unknown) => {
-      setError(userDialogError(err, "Failed to create user"));
+      const rules = passwordPolicyErrors(err);
+      setPolicyErrors(rules);
+      setError(
+        rules.length ? null : userDialogError(err, "Failed to create user"),
+      );
     },
   });
 
@@ -182,6 +213,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
           />
         )}
         {error && <p className="text-xs text-destructive">{error}</p>}
+        <PolicyErrorList errors={policyErrors} />
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -192,6 +224,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
           <button
             onClick={() => {
               setError(null);
+              setPolicyErrors([]);
               mutation.mutate();
             }}
             disabled={
@@ -412,6 +445,7 @@ function ResetPasswordModal({
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   // The server asks for a step-up on an effective superadmin (flag or a
   // wildcard role), the caller's own account included.
   const needsStepUp = user.is_effective_superadmin ?? user.is_superadmin;
@@ -425,7 +459,11 @@ function ResetPasswordModal({
       ),
     onSuccess: onClose,
     onError: (err: unknown) => {
-      setError(userDialogError(err, "Failed to reset password"));
+      const rules = passwordPolicyErrors(err);
+      setPolicyErrors(rules);
+      setError(
+        rules.length ? null : userDialogError(err, "Failed to reset password"),
+      );
     },
   });
 
@@ -467,6 +505,7 @@ function ResetPasswordModal({
           />
         )}
         {error && <p className="text-xs text-destructive">{error}</p>}
+        <PolicyErrorList errors={policyErrors} />
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -477,6 +516,7 @@ function ResetPasswordModal({
           <button
             onClick={() => {
               setError(null);
+              setPolicyErrors([]);
               mutation.mutate();
             }}
             disabled={

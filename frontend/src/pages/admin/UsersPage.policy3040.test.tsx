@@ -90,11 +90,12 @@ function open() {
 afterEach(cleanup);
 
 function expectWordsNotJson() {
-  const line = document.querySelector("p.text-destructive");
-  expect(line).not.toBeNull();
-  for (const e of ERRORS) expect(line!.textContent).toContain(e);
-  expect(line!.textContent).not.toContain("{");
-  expect(line!.textContent).not.toContain("password_policy");
+  // One rule per line, as ChangePasswordPage lists them (#1004).
+  const items = [...document.querySelectorAll("ul.text-destructive li")];
+  expect(items.map((li) => li.textContent)).toEqual(ERRORS);
+  const text = document.body.textContent ?? "";
+  expect(text).not.toContain("password_policy");
+  expect(text).not.toContain('{"');
 }
 
 describe("user dialogs, a refused password", () => {
