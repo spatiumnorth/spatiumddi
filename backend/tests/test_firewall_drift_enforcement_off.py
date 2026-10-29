@@ -49,6 +49,15 @@ def _reset_caches():
     invalidate_cache()
 
 
+@pytest.fixture(autouse=True)
+def _bind_session(db_session: AsyncSession):
+    # Every test reads through _eff, not only the first one: a test that ran
+    # alone in its shard found the list empty.
+    _SESSION[:] = [db_session]
+    yield
+    _SESSION.clear()
+
+
 async def _setup(db: AsyncSession, *, enabled: bool) -> tuple[Appliance, str, dict, User]:
     s = await db.get(PlatformSettings, 1)
     if s is None:

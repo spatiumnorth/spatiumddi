@@ -28,9 +28,10 @@ from app.api.v1.dhcp._failover_schemas import (
     GroupFailoverResponse,
 )
 from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
-from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.agent_wake import appliance_channel, collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPServerGroup
+from app.models.appliance import Appliance
+from app.models.dhcp import HA_MODES, DHCPServerGroup
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteGroupArgs
 from app.services.appliance.group_names import (
@@ -220,7 +221,8 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
             autofill_skipped_reason(g, len(kea)) if any(not s.ha_peer_url for s in kea) else None
         ),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
-        ha_peer_auth_active=len(kea) >= 2
+        ha_peer_auth_active=g.mode in HA_MODES
+        and len(kea) >= 2
         and all(s.ha_peer_url for s in kea)
         and peer_auth_ready(g, kea),
         servers=[
@@ -515,6 +517,7 @@ async def update_group(
         problem = group_name_problem("dhcp", new_name)
         if problem is not None:
             raise HTTPException(status_code=422, detail=problem)
+    was_ha = g.mode in HA_MODES
     # #2899 — a group behind the MetalLB relay VIP cannot read raw sockets:
     # relays whose flows land on the node announcing the VIP would get no
     # answer. Only on a change to ``direct``, so re-saving is never refused.
@@ -524,6 +527,15 @@ async def update_group(
             raise HTTPException(status_code=422, detail=refusal_for_groups(vip, [g.name]))
     for k, v in changes.items():
         setattr(g, k, v)
+    # #2969 — the HA listener firewall rule (#1167) follows the mode too, and
+    # it rides the supervisor heartbeat, not the DHCP bundle. A mode change
+    # into or out of HA wakes each appliance serving this group so the rule
+    # opens (or closes) with the hook instead of a heartbeat interval later.
+    if (g.mode in HA_MODES) != was_ha:
+        for appliance_id in (
+            await db.execute(select(Appliance.id).where(Appliance.assigned_dhcp_group_id == g.id))
+        ).scalars():
+            collect_wake(appliance_channel(appliance_id))
     # HA tuning (mode / heartbeat / delays / auto-failover), the Kea socket
     # mode (#365) and the packet-worker pool size (#980) all render into
     # every member's bundle, so wake the group channel — the bundle ETag

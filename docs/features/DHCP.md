@@ -27,7 +27,7 @@ DHCPServer
 
 ### DHCP Server Groups
 
-**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a group with two Kea members is implicitly an HA pair, driving the `libdhcp_ha.so` hook.
+**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a `hot-standby` or `load-balancing` group with two Kea members is an HA pair, driving the `libdhcp_ha.so` hook. A `standalone` group never renders HA (#2969).
 
 ```
 DHCPServerGroup
@@ -1693,7 +1693,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
-- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
+- A group with **one Kea member** is standalone; HA fields are ignored. A group whose `mode` is `hot-standby` or `load-balancing` with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A `standalone` group never does, whatever URLs its members carry (#2969): Kea refuses `"mode": "standalone"` and would reject the whole config. The HA listener firewall rule and the `kea_ha_version_skew` pre-flight follow the same rule. A standalone group with two or more Kea members and an active scope has every member serving that scope uncoordinated, and raises the `dhcp_scope_uncoordinated` alert naming the group. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
 - Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
@@ -1861,7 +1861,7 @@ Two Windows DHCP servers only share a scope safely inside a **failover relations
 - **Relationships are managed from the group's panel** — create, edit, delete, add or remove scopes, replicate one partner's configuration over the other's — over the CredSSP WinRM transport, which is the only one that can reach the partner from the server a cmdlet runs on.
 - The lease-sync poll records each server's relationships and the scopes it holds; one member imports each shared scope and the others are compared against it for drift.
 - A lease's shared IPAM mirror and DDNS records are not torn down while another server in the group still holds the lease.
-- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating.
+- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating, and per `standalone` group with two or more Kea members (#2969).
 
 The group page shows it all under **Windows DHCP failover**; the scopes table and the IPAM subnet's scope card carry a **Windows** badge. REST: `GET /dhcp/server-groups/{id}/failover`, `GET /dhcp/scopes/{id}/failover`, and the management routes under `/dhcp/server-groups/{id}/failover/relationships` (superadmin, audited — never the shared secret); MCP: `find_dhcp_failover_relationships` (read-only — deliberately no `propose_*` for relationship changes). Setup and every refusal: [WINDOWS.md](../deployment/WINDOWS.md#more-than-one-windows-dhcp-server-in-a-group). Internals: [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#failover-relationships-and-multi-member-groups-1110).
 
