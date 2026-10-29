@@ -58,6 +58,15 @@ MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
 LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state}"
 ISSUED="${SPATIUM_POWER_ACTION_ISSUED:-/var/lib/spatiumddi/release-state/power-action-issued}"
 BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+# #3008 — a grace between taking the lock and the handoff / systemctl. The
+# console's unit sets it (10 s, as the web-UI reboot has); the web-UI and Fleet
+# paths sleep their own grace before calling this, so they leave it 0. It is
+# spent while the lock and the marker are held, so the web UI reads the reboot
+# under way and F9 can cancel it, and the api answers long enough for the
+# Maintenance tab's poll to see it on a one-node install (where systemctl would
+# otherwise be issued within a second of the console's confirm).
+GRACE_S="${SPATIUM_POWER_ACTION_GRACE_S:-0}"
+case "$GRACE_S" in ''|*[!0-9]*) GRACE_S=0 ;; esac
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -125,6 +134,15 @@ printf '%s %s\n' "$$" "$ACTION" > "$MARKER" 2>/dev/null || true
 # run the whole action without the lock, the button enabled throughout.
 if { exec 9<"$LOCK"; } 2>/dev/null; then
     flock -w 5 9 || log "another power action holds $LOCK: going on regardless"
+fi
+
+if [ "$GRACE_S" -gt 0 ]; then
+    log "$ACTION in ${GRACE_S}s (a stop cancels it)"
+    # In the background and waited for, so a stop is acted on at once.
+    sleep "$GRACE_S" 9>&- &
+    child=$!
+    wait "$child"
+    child=""
 fi
 
 if [ -x "$HANDOFF" ]; then

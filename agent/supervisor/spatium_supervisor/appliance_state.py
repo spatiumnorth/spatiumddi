@@ -589,6 +589,11 @@ _REBOOT_TRIGGER_FILE = Path(
 _REBOOT_FIRED_BOOT_MARKER = Path(
     "/var/lib/spatiumddi-host/release-state/reboot-fleet-fired-boot"
 )
+# #3008 — written by the console's F9 ("<boot_id>\n") when it cancels a
+# reboot. The heartbeat reports it so the control plane retires the request.
+_REBOOT_CANCEL_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-cancelled"
+)
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
 # failed apply (which renames the trigger to ``.failed.<ts>`` and would
@@ -1679,6 +1684,32 @@ def read_boot_id() -> str | None:
     except OSError:
         return None
     return value or None
+
+
+def read_reboot_cancel() -> str | None:
+    """#3008 — the boot id a reboot was cancelled in from the console, or None.
+    Only a cancel from THIS boot counts."""
+    try:
+        boot = _REBOOT_CANCEL_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return boot if boot and boot == read_boot_id() else None
+
+
+def ack_reboot_cancel() -> None:
+    """#3008 — the control plane has the cancel: drop the marker, and the
+    once-per-boot fire marker, which exists to stop a heartbeat re-writing the
+    trigger of a reboot that is going ahead. A cancelled one is not, and a new
+    request in this boot must be able to fire."""
+    boot = read_reboot_cancel()
+    for path in (_REBOOT_CANCEL_MARKER,) if boot is None else (
+        _REBOOT_CANCEL_MARKER,
+        _REBOOT_FIRED_BOOT_MARKER,
+    ):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
@@ -4728,6 +4759,8 @@ def collect() -> dict[str, object]:
         # different boot, instead of on a 15 s stopwatch that could expire
         # before the request was ever delivered.
         "boot_id": read_boot_id() if is_appliance else None,
+        # #3008 — a console F9 cancelled a reboot in this boot.
+        "reboot_cancelled_boot_id": read_reboot_cancel() if is_appliance else None,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
         # #386 Part C — full upgrade status for the Fleet UI.

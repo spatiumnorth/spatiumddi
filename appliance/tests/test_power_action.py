@@ -29,7 +29,7 @@ BOOT = "11111111-2222-3333-4444-555555555555"
 
 
 def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "ok",
-         systemctl_sleep: float = 0, cap_s: int = 240):
+         systemctl_sleep: float = 0, cap_s: int = 240, extra_env: dict | None = None):
     log = tmp_path / "calls.log"
     handoff_sh = tmp_path / "handoff"
     # --undo always returns at once; only --before-reboot takes the body
@@ -53,6 +53,7 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
     (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "boot_id").write_text(BOOT + "\n")
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
+           **(extra_env or {}),
            "SPATIUM_REBOOT_HANDOFF": str(handoff_sh),
            "SPATIUM_POWER_ACTION_MARKER": str(tmp_path / "marker"),
            "SPATIUM_POWER_ACTION_LOCK": str(tmp_path / "state"),
@@ -300,7 +301,8 @@ AGENT = EXTRA / "usr" / "local" / "bin" / "spatiumddi-reboot-agent"
 _CONSOLE_NAMES = {
     "_RELEASE_STATE_DIR", "FLEET_GRACE_MARKER", "BOOT_ID_FILE", "POWER_ACTION_MARKER",
     "POWER_ACTION_UNIT", "reboot_pending", "fleet_reboot_in_grace",
-    "power_action_in_progress", "do_cancel_reboot",
+    "power_action_in_progress", "do_cancel_reboot", "REBOOT_CANCEL_MARKER",
+    "_record_reboot_cancel",
 }
 
 
@@ -339,6 +341,7 @@ def _console(state: Path, boot_id: Path, run) -> dict:
     ns["_RELEASE_STATE_DIR"] = state
     ns["FLEET_GRACE_MARKER"] = state / "reboot-fleet-grace"
     ns["BOOT_ID_FILE"] = boot_id
+    ns["REBOOT_CANCEL_MARKER"] = state / "reboot-cancelled"
     ns["POWER_ACTION_MARKER"] = state.parent / "no-power-action-marker"
     return ns
 
@@ -431,3 +434,47 @@ def test_the_console_names_the_handoff_only_on_a_multi_node_cluster() -> None:
     text = CONSOLE.read_text()
     assert 'handoff = " — handing off DB primary" if len(state.nodes) > 1 else ""' in text
     assert "if state is not None and len(state.nodes) > 1:" in text
+
+
+def test_the_console_unit_gives_a_grace_so_the_api_outlives_the_confirm() -> None:
+    """#3008 defect A — on one node nothing else delayed systemctl, and the api
+    answered for ~1 s, less than the Maintenance tab's 5 s poll."""
+    assert re.search(r"^Environment=SPATIUM_POWER_ACTION_GRACE_S=(\d+)$",
+                     TEMPLATE_UNIT.read_text(), re.M)
+    n = int(re.search(r"GRACE_S=(\d+)", TEMPLATE_UNIT.read_text()).group(1))
+    assert n >= 10
+
+
+def test_the_grace_holds_lock_and_marker_before_systemctl(tmp_path: Path) -> None:
+    proc, log = _run(tmp_path, "reboot", extra_env={"SPATIUM_POWER_ACTION_GRACE_S": "3"})
+    _wait_for(lambda: (tmp_path / "marker").exists())
+    time.sleep(0.5)
+    assert _calls(log) == []  # nothing issued during the grace
+    assert _lock_held(tmp_path / "state")  # the api reads the reboot under way
+    assert proc.wait(30) == 0
+    assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
+
+
+def test_a_stop_during_the_grace_never_reboots(tmp_path: Path) -> None:
+    proc, log = _run(tmp_path, "reboot", extra_env={"SPATIUM_POWER_ACTION_GRACE_S": "30"})
+    _wait_for(lambda: (tmp_path / "marker").exists())
+    time.sleep(0.3)
+    started = time.monotonic()
+    proc.terminate()
+    assert proc.wait(20) == 1
+    assert time.monotonic() - started < 10
+    assert "systemctl reboot" not in _calls(log)
+    assert not (tmp_path / "marker").exists()
+    assert not _lock_held(tmp_path / "state")
+
+
+def test_the_console_cancel_leaves_a_marker_for_the_supervisor(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    (state / "reboot-pending").write_text("x")
+    con = _console(state, boot, lambda argv: None)
+    fc = _FakeConsole()
+    con["do_cancel_reboot"](fc)
+    assert (state / "reboot-cancelled").read_text().strip() == BOOT

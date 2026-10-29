@@ -5152,6 +5152,37 @@ def do_shutdown(console: Console, state: "DashboardState | None" = None) -> None
         _start_power_action(console, state, "poweroff", "Powering off")
 
 
+#: #3008 — "<boot_id>" of the boot a reboot was cancelled in. The supervisor
+#: reports it on its next heartbeat, so the control plane retires the Fleet
+#: request (``reboot_requested``) at once instead of at its 900 s give-up, and
+#: then removes it. Written under a fresh name and renamed into place: the api
+#: and the supervisor can create names in this directory and this runs as root.
+REBOOT_CANCEL_MARKER = _RELEASE_STATE_DIR / "reboot-cancelled"
+
+
+def _record_reboot_cancel() -> None:
+    try:
+        boot = BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        return
+    if not boot:
+        return
+    tmp = REBOOT_CANCEL_MARKER.with_name(f".reboot-cancelled.{os.getpid()}")
+    try:
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(boot + "\n")
+        os.replace(tmp, REBOOT_CANCEL_MARKER)
+    except OSError:
+        # Best effort: without it the control plane retires the request on
+        # its own give-up, as before.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def do_cancel_reboot(console: Console) -> None:
     """#556 — abort a queued reboot from the physical console.
 
@@ -5212,6 +5243,7 @@ def do_cancel_reboot(console: Console) -> None:
             # Non-fatal — the service is already stopped, so the reboot is
             # cancelled regardless of whether the trigger file lingers.
             console.print(f"[dim](left {name}: {exc})[/dim]")
+    _record_reboot_cancel()
     console.print("[green]Reboot cancelled.[/green]\n")
     time.sleep(1.5)
 

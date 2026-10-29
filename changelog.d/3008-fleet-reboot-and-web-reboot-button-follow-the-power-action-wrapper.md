@@ -43,3 +43,16 @@
 - **The console no longer says it is handing off the database primary on
   a one-node install,** where there is no primary to hand off; it names
   the handoff only on a multi-node cluster.
+- **A reboot started from the console now shows on the Maintenance tab,
+  and cancelling a Fleet reboot at the console clears its "reboot
+  queued" flag (#3008).** On a one-node install the console's F5 issued
+  `systemctl reboot` within a second, less than the tab's 5 s poll, so
+  the tab never read it. The console's `spatium-power-action@.service`
+  now sets `SPATIUM_POWER_ACTION_GRACE_S=10`: the wrapper holds its lock
+  and marker through a 10 s grace (as the web-UI reboot has) before the
+  handoff and `systemctl`, and F9 cancels it. After a console F9 the
+  console leaves a `reboot-cancelled` marker (boot id); the supervisor
+  reports it as `reboot_cancelled_boot_id` on its next heartbeat and the
+  control plane retires `reboot_requested` at once, instead of at its
+  900 s give-up; the supervisor then drops the marker and the
+  once-per-boot fire marker, so a new request in the same boot can fire.

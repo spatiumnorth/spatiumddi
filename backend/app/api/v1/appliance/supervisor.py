@@ -1660,6 +1660,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     # #1446 — this boot's kernel boot id. A reboot request is retired when a
     # heartbeat arrives from a different boot. None from an older supervisor.
     boot_id: str | None = Field(default=None, max_length=64)
+    # #3008 — set when the console's F9 cancelled a reboot in this boot: the
+    # boot id the cancel was made in. A Fleet request stamped for this boot is
+    # retired at once rather than at the give-up. None from an older supervisor.
+    reboot_cancelled_boot_id: str | None = Field(default=None, max_length=64)
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
     # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
@@ -3072,6 +3076,23 @@ async def _supervisor_heartbeat(
     # command below: delivering it again from the new boot would reboot the
     # node a second time.
     deliver_reboot = False
+    if (
+        row.reboot_requested
+        and body.reboot_cancelled_boot_id
+        and body.reboot_cancelled_boot_id == body.boot_id
+        and row.reboot_requested_boot_id == body.boot_id
+    ):
+        # #3008 — cancelled from the console in this boot, after the request
+        # reached it (its boot id was recorded when it was first delivered).
+        # Nothing can fire again in this boot: retire it now, not at 900 s.
+        logger.info(
+            "appliance_reboot_cancelled_at_console",
+            appliance_id=str(row.id),
+            hostname=row.hostname,
+        )
+        row.reboot_requested = False
+        row.reboot_requested_at = None
+        row.reboot_requested_boot_id = None
     if row.reboot_requested:
         if body.boot_id:
             if row.reboot_requested_boot_id is None:
