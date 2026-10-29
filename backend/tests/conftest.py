@@ -93,6 +93,7 @@ import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncConnection,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -140,6 +141,37 @@ async def _ensure_worker_database() -> None:
         await conn.close()
 
 
+#: The agent-shipped log tables are partitioned by time (#2185) and a row needs a
+#: partition to land in. ``create_all`` makes the parents only, so the suite
+#: gets daily partitions around "now", wide enough for every age the tests use
+#: (RPZ hits are kept 30 days). Named as ``maintain_log_partitions`` names them,
+#: so a test of the lifecycle finds them where it expects.
+_LOG_TABLES = ("dns_query_log_entry", "dhcp_log_entry", "dns_rpz_hit")
+_LOG_PARTITION_DAYS_BACK = 45
+_LOG_PARTITION_DAYS_AHEAD = 2
+
+
+async def create_test_log_partitions(conn: AsyncConnection) -> None:
+    for table in _LOG_TABLES:
+        await conn.execute(text(f"""
+DO $$
+DECLARE
+  today date := (now() AT TIME ZONE 'UTC')::date;
+  d date;
+BEGIN
+  FOR i IN -{_LOG_PARTITION_DAYS_BACK}..{_LOG_PARTITION_DAYS_AHEAD} LOOP
+    d := today + i;
+    EXECUTE format(
+      'CREATE TABLE IF NOT EXISTS %I PARTITION OF {table} FOR VALUES FROM (%L) TO (%L)',
+      '{table}_p' || to_char(d, 'YYYYMMDD'),
+      (d::timestamp AT TIME ZONE 'UTC'),
+      ((d + 1)::timestamp AT TIME ZONE 'UTC')
+    );
+  END LOOP;
+END $$;
+"""))
+
+
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def create_test_schema() -> AsyncGenerator[None, None]:
     await _ensure_worker_database()
@@ -150,6 +182,7 @@ async def create_test_schema() -> AsyncGenerator[None, None]:
         await conn.execute(text("DROP SCHEMA public CASCADE"))
         await conn.execute(text("CREATE SCHEMA public"))
         await conn.run_sync(Base.metadata.create_all)
+        await create_test_log_partitions(conn)
     yield
     # No session-teardown drop. The setup above already wipes any prior
     # schema, so a teardown ``DROP SCHEMA … CASCADE`` is purely cosmetic —
@@ -207,6 +240,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # clock, so a test that ran with no subscription / target would keep the
     # next test's after-commit publish and forward from running.
     from app.services import audit_forward, event_publisher
+    from app.services.logs import partitions as log_partitions
 
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
@@ -216,8 +250,13 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     from app.core import shutdown
 
     shutdown.reset()
+    # What ingest may store is cached per table for a short while, keyed on the
+    # clock rather than the per-test DB, so a test that reshapes the partitions
+    # would otherwise leave the next test a stale answer.
+    log_partitions.invalidate_coverage_cache()
     yield
     shutdown.reset()
+    log_partitions.invalidate_coverage_cache()
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
     maintenance_mode.invalidate_cache()

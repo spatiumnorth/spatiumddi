@@ -152,6 +152,7 @@ celery_app = Celery(
         "app.tasks.backup_drill",
         "app.tasks.dns_threat",
         "app.tasks.prune_internal_errors",
+        "app.tasks.log_partitions",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
         "app.tasks.influxdb_push",
@@ -232,6 +233,7 @@ celery_app.conf.update(
         "app.tasks.backup_drill.*": {"queue": "default"},
         "app.tasks.dns_threat.*": {"queue": "default"},
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
+        "app.tasks.log_partitions.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.influxdb_push.*": {"queue": "default"},
@@ -508,10 +510,17 @@ celery_app.conf.update(
             "task": "app.tasks.subnet_utilization_snapshot.snapshot_subnet_utilization",
             "schedule": schedule(run_every=24 * 3600.0),
         },
-        # Nightly prune of agent-shipped query / activity log entries
-        # older than the retention window (default 24 h). Query logs
-        # are a firehose; the short window keeps the tables manageable
-        # without operator tuning.
+        # Every 15 minutes: create the next partitions of the agent-shipped
+        # query / activity / RPZ-hit log tables and drop the ones past the
+        # retention window (default 24 h). Query logs are a firehose; a
+        # partition drop keeps the tables bounded without a mass DELETE
+        # (#2185). Idempotent and advisory-locked per table.
+        "log-partitions-maintain": {
+            "task": "app.tasks.log_partitions.maintain_log_partitions",
+            "schedule": schedule(run_every=15 * 60.0),
+        },
+        # Nightly prune of the agent ingest receipts (#1077), the replay-dedupe
+        # state for those same pushes.
         "log-entries-prune": {
             "task": "app.tasks.prune_logs.prune_log_entries",
             "schedule": schedule(run_every=24 * 3600.0),

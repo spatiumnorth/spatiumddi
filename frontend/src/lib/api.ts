@@ -3973,7 +3973,7 @@ export interface PlatformSettings {
    *  firewall keeps its unconditional port-22 floor and the list is
    *  inert; on, that floor is retired and the scope applies. */
   ssh_lockdown: boolean;
-  /** Data retention (#2273) — read by the nightly prune tasks.
+  /** Data retention (#2273) — read by the prune and partition-maintenance tasks.
    *  Superadmin-only to change. */
   soft_delete_purge_days: number;
   dhcp_lease_history_retention_days: number;

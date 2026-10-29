@@ -78,6 +78,8 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
+from app.services.logs.partitions import DHCP_LOG
+from app.services.logs.partitions import coverage as log_coverage
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -405,8 +407,9 @@ class DHCPLogAck(IngestAck):
     inserted: int = 0
     dropped: int = 0
     #: Lines older than the control plane's activity-log retention
-    #: (``PlatformSettings.log_retention_hours``, #2273), skipped rather than
-    #: inserted into a table the nightly prune would empty straight away.
+    #: (``PlatformSettings.log_retention_hours``, #2273), or dated beyond the
+    #: partitions the table has (#2185, an agent clock running far ahead),
+    #: skipped rather than inserted into a table that has nowhere to keep them.
     expired: int = 0
 
 
@@ -2011,9 +2014,11 @@ async def agent_log_entries(
 
     Lines whose own timestamp is older than the activity-log retention
     window are counted as ``expired`` and not inserted (#1077): a replayed
-    outage backlog would otherwise write rows the nightly prune deletes on
-    its next run. A line with no parseable timestamp is stamped with the
-    arrival time by the parser, so it is never expired.
+    outage backlog would otherwise write rows the next partition drop
+    removes. So are lines dated beyond the partitions the table has (#2185):
+    the table is time-partitioned, with no default partition to catch them.
+    A line with no parseable timestamp is stamped with the arrival time by
+    the parser, so it is never expired.
     """
     from app.services.logs.kea_parser import parse_kea_line  # noqa: PLC0415
 
@@ -2024,13 +2029,14 @@ async def agent_log_entries(
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
     expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
+    storable = await log_coverage(db, DHCP_LOG)
     inserted = 0
     expired = 0
     for raw in capped:
         parsed = parse_kea_line(raw, fallback_ts=now)
         if parsed is None:
             continue
-        if parsed.ts < expired_cutoff:
+        if parsed.ts < expired_cutoff or not storable.contains(parsed.ts):
             expired += 1
             continue
         db.add(

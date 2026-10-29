@@ -108,6 +108,8 @@ from app.services.dns.soa_timers import (
 from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
+from app.services.logs.partitions import DNS_QUERY_LOG, DNS_RPZ_HIT
+from app.services.logs.partitions import coverage as log_coverage
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -1887,8 +1889,10 @@ class QueryLogAck(IngestAck):
     responses_unmatched: int = 0
     dropped: int = 0
     #: Query lines older than the control plane's own query-log retention
-    #: (``PlatformSettings.log_retention_hours``, #2273) — skipped rather than
-    #: inserted into a table the nightly prune would empty straight away.
+    #: (``PlatformSettings.log_retention_hours``, #2273), or lines (RPZ hits
+    #: included) dated beyond the partitions the table has (#2185, an agent
+    #: clock running far ahead) — skipped rather than inserted into a table
+    #: that has nowhere to keep them.
     expired: int = 0
 
 
@@ -1918,11 +1922,16 @@ async def agent_query_log_entries(
 
     Query lines whose own timestamp is older than the query-log retention
     window are counted as ``expired`` and not inserted (#1077): a replay of
-    a long outage's backlog would otherwise write rows the nightly prune
-    deletes on its next run. The agent drops by spool age too; this is the
+    a long outage's backlog would otherwise write rows the next partition
+    drop removes. The agent drops by spool age too; this is the
     server-side belt. A line with no parseable timestamp is stamped with
     the arrival time by the parser and is therefore never expired. RPZ
-    hits are exempt — they are kept for 30 days, not 24 h.
+    hits are exempt from the query-log window — they are kept for 30 days,
+    not 24 h.
+
+    The log tables are time-partitioned, with no default partition (#2185),
+    so a line dated beyond what the partitions cover, RPZ hits included, is
+    counted as ``expired`` as well instead of failing the batch.
     """
     from app.services.logs import bind9_parser, pdns_parser  # noqa: PLC0415
 
@@ -1971,6 +1980,8 @@ async def agent_query_log_entries(
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
     expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
+    query_storable = await log_coverage(db, DNS_QUERY_LOG)
+    rpz_storable = await log_coverage(db, DNS_RPZ_HIT) if rpz_capable else None
     inserted = 0
     expired = 0
     rpz_inserted = 0
@@ -2000,6 +2011,9 @@ async def agent_query_log_entries(
         if rpz_capable:
             rpz = bind9_parser.parse_rpz_line(raw, fallback_ts=now)
             if rpz is not None:
+                if rpz_storable is not None and not rpz_storable.contains(rpz.ts):
+                    expired += 1
+                    continue
                 db.add(
                     DNSRPZHit(
                         server_id=server.id,
@@ -2036,7 +2050,7 @@ async def agent_query_log_entries(
         parsed = parse_fn(raw, fallback_ts=now)
         if parsed is None or parsed.qname is None:
             continue
-        if parsed.ts < expired_cutoff:
+        if parsed.ts < expired_cutoff or not query_storable.contains(parsed.ts):
             expired += 1
             continue
         entry = DNSQueryLogEntry(
