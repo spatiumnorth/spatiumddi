@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 import { authApi, type LoginResponse } from "@/lib/api";
 import {
+  broadcastLogout,
+  initCrossTabAuth,
+  sharedRefresh,
+} from "@/lib/crossTabAuth";
+import {
   getAccessToken,
   getAuthSnapshot,
   markBooted,
@@ -33,8 +38,13 @@ let bootstrapPromise: Promise<void> | null = null;
 
 function bootstrapAuth(): Promise<void> {
   if (bootstrapPromise) return bootstrapPromise;
-  bootstrapPromise = authApi
-    .refresh()
+  // Shared across tabs (#2960): reloading several tabs makes one refresh,
+  // which supersedes the tradeoff above wherever Web Locks + BroadcastChannel
+  // exist. A boot refresh may adopt a token another tab already minted: it is
+  // what this tab's own refresh would return from the shared cookie.
+  bootstrapPromise = sharedRefresh((signal) => authApi.refresh(signal), null, {
+    allowAdoptWithoutToken: true,
+  })
     .then((resp) => {
       // Only adopt the refreshed token if nothing else set one meanwhile.
       // An explicit login() racing this boot refresh always wins — its token
@@ -67,6 +77,8 @@ export function useAuth() {
   // Fire the one-shot boot refresh. Skip it if we already have a token in
   // memory (a fresh login this tab) — there's nothing to restore.
   useEffect(() => {
+    // Hear sign-outs + rotated tokens from the other tabs (#2960).
+    initCrossTabAuth();
     if (getAccessToken()) {
       markBooted();
       return;
@@ -114,6 +126,8 @@ export function useAuth() {
       await authApi.logout();
     } finally {
       setAccessToken(null);
+      // Every other tab signs out too (#2960).
+      broadcastLogout();
     }
   }, []);
 

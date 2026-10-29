@@ -76,6 +76,7 @@ import httpx
 import structlog
 
 from ..secure_io import write_private
+from ._caa import parse_caa
 from ._forwarders import zone_forward_transport as _zone_forward_transport
 from ._process import find_running_daemon, is_zombie
 from ._txt import txt_strings
@@ -829,9 +830,9 @@ def _svcb_norm_key(key: str) -> str:
     """``ALPN`` / ``key1`` / ``1`` -> ``alpn``; ``key065000`` / ``65000`` ->
     ``key65000``. Technitium reports an unnamed key by its bare number."""
     k = key.strip().lower().replace("_", "-")
-    if k.isdigit():
+    if k.isascii() and k.isdigit():
         num = int(k)
-    elif k.startswith("key") and k[3:].isdigit():
+    elif k.startswith("key") and k[3:].isascii() and k[3:].isdigit():
         num = int(k[3:])
     else:
         return k
@@ -841,13 +842,13 @@ def _svcb_norm_key(key: str) -> str:
 def _svcb_key_num(key: str) -> int:
     if key in _SVCB_KEY_NUM:
         return _SVCB_KEY_NUM[key]
-    if key.startswith("key") and key[3:].isdigit():
+    if key.startswith("key") and key[3:].isascii() and key[3:].isdigit():
         return int(key[3:])
     return 65536
 
 
 def _svcb_is_generic(key: str) -> bool:
-    return key.startswith("key") and key[3:].isdigit()
+    return key.startswith("key") and key[3:].isascii() and key[3:].isdigit()
 
 
 def _svcb_split(value: str) -> list[str]:
@@ -892,7 +893,7 @@ def _svcb_unescape(text: str) -> bytes:
         ch = text[i]
         if ch == "\\" and i + 1 < len(text):
             digits = text[i + 1 : i + 4]
-            if len(digits) == 3 and digits.isdigit() and int(digits) < 256:
+            if len(digits) == 3 and digits.isascii() and digits.isdigit() and int(digits) < 256:
                 out.append(int(digits))
                 i += 4
                 continue
@@ -945,7 +946,7 @@ def _svcb_canon_value(key: str, val: str | None, from_daemon: bool) -> str | Non
     if key in ("ipv4hint", "ipv6hint"):
         return ",".join(_svcb_ip(a) for a in val.split(",") if a.strip())
     if key == "port":
-        return str(int(val)) if val.strip().isdigit() else val
+        return str(int(val)) if val.strip().isascii() and val.strip().isdigit() else val
     if key == "ech":
         data = _svcb_hex_bytes(val) if from_daemon else _svcb_b64_bytes(val)
         return base64.b64encode(data).decode("ascii") if data is not None else val
@@ -1052,7 +1053,7 @@ def _svcb_parse(value: str, origin: str | None) -> tuple[int, str, list[tuple[st
     tokens = _svcb_split(value)
     if len(tokens) < 2:
         return (1, ".", [])
-    priority = int(tokens[0]) if tokens[0].isdigit() else 1
+    priority = int(tokens[0]) if tokens[0].isascii() and tokens[0].isdigit() else 1
     items: list[tuple[str, str | None]] = []
     for tok in tokens[2:]:
         key, eq, raw = tok.partition("=")
@@ -2171,8 +2172,20 @@ def _record_params(
         }
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
+        # ``raw``, not ``value``: a CAA value is text, and the rstrip above
+        # would eat a bare value's trailing full stop.
+        parsed = parse_caa(raw)
+        if parsed is not None:
+            # Unescaped by the shared parser, which also keeps a bare value
+            # with spaces or quotes whole (#2943). Tag lower-cased: Technitium
+            # stores it that way (#1768).
+            return {
+                "flags": parsed[0],
+                "tag": parsed[1].lower(),
+                "value": parsed[2].decode("utf-8", errors="replace"),
+            }
         tokens = shlex.split(value)
-        flags = int(tokens[0]) if tokens and tokens[0].isdigit() else 0
+        flags = int(tokens[0]) if tokens and tokens[0].isascii() and tokens[0].isdigit() else 0
         # Lower-cased: Technitium stores the tag that way (#1768).
         tag = tokens[1].lower() if len(tokens) > 1 else "issue"
         target = tokens[2] if len(tokens) > 2 else ""
@@ -4270,7 +4283,7 @@ class TechnitiumDriver(DriverBase):
         soa_changed = False
         desired_soa = apex.get("soa") or {}
         ttl = apex.get("ttl")
-        if soa is not None and (desired_soa or ttl):
+        if soa is not None and (desired_soa or ttl is not None):
             current = soa.get("rData") or {}
             current_fields: dict[str, Any] = {
                 key: str(current.get(key) or "").rstrip(".").lower()
@@ -4278,7 +4291,7 @@ class TechnitiumDriver(DriverBase):
             }
             current_fields.update({f: current.get(f) for f in _SOA_TIMERS})
             differs = any(current_fields.get(k) != v for k, v in desired_soa.items())
-            if ttl and soa.get("ttl") != ttl:
+            if ttl is not None and soa.get("ttl") != ttl:
                 differs = True
             if differs:
                 params: dict[str, Any] = {
@@ -4286,7 +4299,7 @@ class TechnitiumDriver(DriverBase):
                     "domain": zone,
                     "type": "SOA",
                     "serial": current.get("serial"),
-                    "ttl": ttl or soa.get("ttl"),
+                    "ttl": ttl if ttl is not None else soa.get("ttl"),
                     **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
                     **{f: current.get(f) for f in _SOA_TIMERS},
                 }
@@ -4345,7 +4358,7 @@ class TechnitiumDriver(DriverBase):
                         "zone": zone,
                         "domain": zone,
                         "type": "NS",
-                        "ttl": ns_ttl if ns_ttl is not None else (ttl or 3600),
+                        "ttl": ns_ttl if ns_ttl is not None else (ttl if ttl is not None else 3600),
                         "nameServer": target,
                     },
                 ).json()
