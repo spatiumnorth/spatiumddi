@@ -52,7 +52,8 @@ vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({ ready: true, enabled: () => true }),
 }));
 
-const { OrphansModal, SubnetRow, SpaceSection } = await import("./IPAMPage");
+const { OrphansModal, SubnetRow, TREE_CHIP_CLS, SpaceSection } =
+  await import("./IPAMPage");
 
 afterEach(() => {
   cleanup();
@@ -157,9 +158,23 @@ describe("SubnetRow CIDR width (#2993)", () => {
     expect(cidr.className).toContain("shrink-0");
     expect(cidr.className).toContain("whitespace-nowrap");
     expect(cidr.className).not.toMatch(/\bflex-1\b|\btruncate\b/);
+    // #3005: shrink-0 only protects the width when the parent is a flex ROW.
+    // In a flex column it acts on the height and the column collapsed to 0 px.
+    const row = cidr.parentElement as HTMLElement;
+    expect(row.getAttribute("role")).toBe("treeitem");
+    expect(row.className).toMatch(/\bflex\b/);
+    expect(row.className).not.toMatch(/\bflex-col\b/);
     const name = screen.getByText(subnet.name as string);
+    expect(name.parentElement).toBe(row);
     expect(name.className).toContain("min-w-0");
     expect(name.className).toContain("truncate");
+    expect(name.getAttribute("title")).toBe(subnet.name);
+    // The chips are capped, ellipsised and block-level (truncate is inert
+    // on inline-flex), so a long customer name cannot starve the CIDR.
+    expect(TREE_CHIP_CLS).toMatch(/\bmax-w-/);
+    expect(TREE_CHIP_CLS).toContain("truncate");
+    expect(TREE_CHIP_CLS).toContain("min-w-0");
+    expect(TREE_CHIP_CLS).toMatch(/\bblock\b/);
   });
 });
 

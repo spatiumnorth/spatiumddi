@@ -178,10 +178,12 @@ api:
   # memory limit have to hold, plus three per pod outside the pool: the
   # after-commit hooks' two (#2782) and the readiness probe's one (#2944).
   # At the defaults (2..10 replicas, 33 each) that is 66..330 api
-  # connections, against the standalone postgres image's default
-  # max_connections of 100 and CloudNativePG's 200: an install that lets the
-  # HPA scale past two replicas should size the pool or max_connections. The appliance's supervisor sets it from the
-  # control-plane node count (fewer per pod past four nodes).
+  # connections. Postgres' max_connections is derived from this pool and the
+  # HPA maximum when it is left empty (#2955, ``postgresql.maxConnections`` /
+  # ``postgresql.cnpg.parameters.max_connections``), so changing the pool or
+  # the HPA moves it; a pinned max_connections has to be sized by hand. The
+  # appliance's supervisor sets the pool from the control-plane node count
+  # (fewer per pod past four nodes).
   databasePool:
     size:
     maxOverflow:
@@ -703,6 +705,11 @@ postgresql:
   enabled: true
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
+  # #2955 — standalone only: max_connections. "" derives it from the pools
+  # (see ``postgresql.cnpg.parameters.max_connections``) and raises the memory
+  # limit below to hold it (see ``resources``). Changing it, or the pools /
+  # HPA it derives from, restarts the Postgres pod once.
+  maxConnections: ""
   image:
     repository: postgres
     tag: "16-alpine"
@@ -720,6 +727,12 @@ postgresql:
     enabled: true
     size: 8Gi
     storageClass: ""             # empty → cluster default StorageClass
+  # #2955 — while max_connections is derived (the default, either kind) the
+  # chart RAISES the memory limit to shared_buffers + 256 MiB +
+  # max_connections x (14 MiB + shared_buffers / 512), the appliance's rule
+  # (#2156): ~14 MiB is one busy backend. At the defaults that is 5919Mi
+  # standalone and 6077Mi on CNPG. The request is not touched, so scheduling
+  # is unchanged; set max_connections (and smaller pools) to keep a lower limit.
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }
@@ -821,9 +834,16 @@ postgresql:
       # #2156 — every api pod's pool (api.databasePool) and every worker
       # process connects here, plus two per api / worker / beat process for
       # the after-commit hooks (#2782) and one per api pod for its readiness
-      # probe (#2944); replicas x pool has to stay under this. The appliance's supervisor raises it past 200 when its
-      # connection budget does (from five control-plane nodes).
-      max_connections: "200"
+      # probe (#2944); replicas x pool has to stay under this. The appliance's
+      # supervisor always writes a value: 200 as a floor, raised past it when
+      # its connection budget does (from five control-plane nodes).
+      # #2955 — "" (the default) derives it from the pools: api pods (HPA max)
+      # x (pool + 3) + workers x (concurrency x 3 + 1) + beat + WAL senders +
+      # 10 reserve (helper ``spatiumddi.postgresMaxConnections``, the rule the
+      # appliance's supervisor applies), and the memory limit is raised to
+      # hold it (``postgresql.resources``). A set value wins, and then the
+      # memory limit is yours too; keep both above what the pools need.
+      max_connections: ""
       shared_buffers: "256MB"
       work_mem: "16MB"
       # #2132 / #2240 — WAL kept for a former primary to come back. After a

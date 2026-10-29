@@ -27,7 +27,7 @@ DHCPServer
 
 ### DHCP Server Groups
 
-**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a group with two Kea members is implicitly an HA pair, driving the `libdhcp_ha.so` hook.
+**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a `hot-standby` or `load-balancing` group with two Kea members is an HA pair, driving the `libdhcp_ha.so` hook. A `standalone` group never renders HA (#2969).
 
 ```
 DHCPServerGroup
@@ -57,6 +57,47 @@ change re-renders the running Kea within a heartbeat. It is distinct from
 `network_mode` (host vs bridged), which controls the *container's* network
 namespace on supervisor-managed appliances — a directly-attached server
 typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
+
+**Behind the MetalLB DHCP relay VIP, a group must be `relay` (#2899).**
+The relay VIP (`dhcp_relay_vip`, Fleet → Network → MetalLB → Advanced) is a
+LoadBalancer Service over every Kea pod in the appliance cluster, with
+`externalTrafficPolicy: Cluster`. kube-proxy on the node announcing the VIP
+keeps about one relay flow in N on that node's own Kea. In `direct` mode
+Kea's raw socket sees that frame before netfilter, still addressed to the
+VIP, and its filter (broadcast or the socket's own address only) drops it;
+the DNATed copy reaches Kea's UDP socket, which raw mode drains and
+discards. So those relays' clients get no address, and no counter shows it —
+the #2889 arrival counter leaves VIP-addressed frames out on purpose. In
+`relay` mode Kea reads that UDP socket, so every relay is answered. Kea
+replies to the relay's `giaddr`, from the node's own address — the same way
+the other nodes already answer the flows forwarded to them — so the reply
+comes back from the VIP only when the relay sends from its `giaddr`.
+
+"Behind the VIP" means a node of the control plane's own k3s cluster: the
+seed, and every promoted member. An approved Additional node that was never
+promoted runs its own single-node k3s with no MetalLB, so a branch appliance
+serving its directly attached VLAN in `direct` mode is not affected and is
+never refused or alerted on.
+
+There is no way to serve both through the VIP: Kea cannot mix raw and UDP
+sockets in one daemon, and SpatiumDDI does not switch a group's mode on its
+own, because `relay` stops directly attached clients being served. Instead:
+
+- `PUT …/control-plane/metallb` refuses (422) to **turn on** a relay VIP
+  while any group it would front is `direct`, naming the groups;
+- `PUT /dhcp/server-groups/{id}` refuses to change a group behind the VIP
+  **to** `direct`; while a VIP is set, the Fleet / Copilot role assignment
+  refuses to point a cluster node's DHCP role at a `direct` group (or to add
+  the role to a node already pointed at one), `PUT /dhcp/servers/{id}`
+  refuses to move a cluster node's Kea into a `direct` group, and a
+  control-plane promote refuses a joiner that serves one;
+- the default-on `dhcp_relay_vip_direct_socket` alert (critical, one event
+  per group) and the MetalLB card report the state whenever it exists — an
+  install that had it before these checks, or a path they do not cover.
+
+A group that must also serve directly attached clients keeps `direct`, and its
+relays forward to every DHCP node's own address (several `ip helper-address`
+lines) rather than to the VIP.
 See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#dhcp-server-kea-doesnt-respond-to-discover)
 for the "no DHCPOFFER" diagnosis flow.
 
@@ -1652,7 +1693,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
-- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
+- A group with **one Kea member** is standalone; HA fields are ignored. A group whose `mode` is `hot-standby` or `load-balancing` with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A `standalone` group never does, whatever URLs its members carry (#2969): Kea refuses `"mode": "standalone"` and would reject the whole config. The HA listener firewall rule and the `kea_ha_version_skew` pre-flight follow the same rule. A standalone group with two or more Kea members and an active scope has every member serving that scope uncoordinated, and raises the `dhcp_scope_uncoordinated` alert naming the group. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
 - Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
@@ -1707,7 +1748,7 @@ Kea's HA hook parses peer URLs with Boost asio, which only accepts IP literals �
 
 ### Managing HA
 
-HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops the hook on the next config push.
+HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. **On appliances this is filled for you (#2963):** when an appliance-hosted Kea server joins a host-networked group in `hot-standby` or `load-balancing` mode and the group then has exactly two Kea members, each empty URL is set to `http://<node IP>:8000/`, using the node's k3s InternalIP as the supervisor reports it (the first IPv4, else IPv6) — the same address the cluster join URL and the HA firewall rule use. It happens when a member joins: an agent registering a new server row, a Fleet or Copilot role assignment that moves the server in, or a server PUT that changes its group. An agent restart is not a join, so a URL you clear to keep the pair from forming stays cleared. Never derived: a URL you set (never overwritten), a `standalone` group (the operator's "no HA"), `bridged` groups (the node IP is not where Kea listens), a member that is not an approved appliance, and a third or later member — it would join as an HA `backup`, and because roles follow server order it could take the primary role from the live pair, so that stays your decision. The group API reports `ha_peer_urls_missing` (members still without a URL in an HA-mode group) and `ha_autofill_skipped_reason` (`bridged_network_mode` / `more_than_two_kea_members`), and the group page shows the same warning. A derived URL is not refreshed if the node is later re-addressed; re-enter it, or clear it and re-assign the role. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops the hook on the next config push.
 
 **On appliances, the firewall opens the HA listener to the pair (#1167).** The host `input` chain is `policy drop`, and nothing used to open the HA port, so two appliances in one HA group could not reach each other. The control plane now works out, for each appliance in a rendered HA group, the port in its own member's `ha_peer_url` (80 / 443 when the URL names none) and the addresses of the group's other Kea members. A partner's address is the IP literal in its URL, else the node IPs of the appliance running it, else the address its agent last connected from. The rule is scoped to those addresses and never opened to `any`: the HA API accepts lease updates, and a group whose peer credential is not yet active (below) runs it without authentication. It follows the same readiness rule as the HA hook, so the port is open exactly while Kea listens on it. A change reaches the firewall on the appliance's next heartbeat, within about 30 s. The Fleet → Firewall effective view shows the rule as `role:dhcp-ha`.
 
@@ -1820,7 +1861,7 @@ Two Windows DHCP servers only share a scope safely inside a **failover relations
 - **Relationships are managed from the group's panel** — create, edit, delete, add or remove scopes, replicate one partner's configuration over the other's — over the CredSSP WinRM transport, which is the only one that can reach the partner from the server a cmdlet runs on.
 - The lease-sync poll records each server's relationships and the scopes it holds; one member imports each shared scope and the others are compared against it for drift.
 - A lease's shared IPAM mirror and DDNS records are not torn down while another server in the group still holds the lease.
-- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating.
+- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating, and per `standalone` group with two or more Kea members (#2969).
 
 The group page shows it all under **Windows DHCP failover**; the scopes table and the IPAM subnet's scope card carry a **Windows** badge. REST: `GET /dhcp/server-groups/{id}/failover`, `GET /dhcp/scopes/{id}/failover`, and the management routes under `/dhcp/server-groups/{id}/failover/relationships` (superadmin, audited — never the shared secret); MCP: `find_dhcp_failover_relationships` (read-only — deliberately no `propose_*` for relationship changes). Setup and every refusal: [WINDOWS.md](../deployment/WINDOWS.md#more-than-one-windows-dhcp-server-in-a-group). Internals: [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#failover-relationships-and-multi-member-groups-1110).
 

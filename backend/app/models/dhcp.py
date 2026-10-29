@@ -47,6 +47,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # ── Server Group / Server ────────────────────────────────────────────────────
 
 
+# Only these group modes render a Kea HA relationship (#2969). Kea refuses
+# ``"mode": "standalone"`` in libdhcp_ha, which rejects the whole config.
+HA_MODES = frozenset({"hot-standby", "load-balancing"})
+
+
 class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Logical cluster of DHCP servers. Primary configuration container.
 

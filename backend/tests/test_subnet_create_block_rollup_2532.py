@@ -56,4 +56,7 @@ async def test_block_counts_new_subnet_own_rows(
     block_allocated = await db_session.scalar(
         select(IPBlock.allocated_ips).where(IPBlock.id == uuid.UUID(block_id))
     )
-    assert block_allocated == sub_allocated
+    # An IPv4 subnet's network + broadcast also count in its block (#2982);
+    # an IPv6 subnet's network row is already in its own count.
+    extra = 2 if ":" not in subnet_net else 0
+    assert block_allocated == sub_allocated + extra

@@ -38,6 +38,7 @@ from app.drivers.dhcp.base import (
     StaticAssignmentDef,
 )
 from app.models.dhcp import (
+    HA_MODES,
     DHCPClientClass,
     DHCPMACBlock,
     DHCPPhoneProfile,
@@ -98,6 +99,10 @@ async def _resolve_failover(
     whole group (the operator hasn't finished setting things up yet).
     """
     if group is None:
+        return None
+    # A standalone group never renders HA, whatever peer URLs its members
+    # carry (#2969).
+    if group.mode not in HA_MODES:
         return None
     kea_peers = [s for s in group.servers if s.driver == "kea"]
     if len(kea_peers) < 2:

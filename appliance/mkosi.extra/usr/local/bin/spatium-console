@@ -1829,8 +1829,10 @@ def detect_slot_info() -> tuple[str, str] | None:
         future boots will land on; differs from current during a
         TRIAL boot before spatiumddi-firstboot commits via
         grub-set-default after /health/live passes).
-    Cached for the life of the process — neither value changes at
-    runtime under normal operation."""
+    ``current`` never changes while we run, so it is cached for the life of
+    the process. ``durable`` DOES: the console starts before
+    ``spatiumddi-firstboot`` commits a trial boot with ``grub-set-default``,
+    so the 5 s data tier re-reads it via ``refresh_durable_slot()`` (#3026)."""
     cmdline = ""
     try:
         cmdline = Path("/proc/cmdline").read_text()
@@ -1898,6 +1900,20 @@ def slot_info() -> tuple[str, str] | None:
     return _SLOT_INFO_CACHE  # type: ignore[return-value]
 
 
+def refresh_durable_slot(saved_entry: str | None) -> None:
+    """#3026 — fold a freshly-read grubenv ``saved_entry`` into the cached slot
+    info. Only ``durable`` is replaced; ``current`` (the slot we booted from)
+    is static. ``None`` (grubenv unreadable) keeps the last known value so a
+    transient probe failure cannot flip the verdict; ``""`` (readable, no
+    saved_entry) is stored as-is, matching ``detect_slot_info()``."""
+    global _SLOT_INFO_CACHE
+    cached = _SLOT_INFO_CACHE
+    if cached is _UNPROBED or cached is None or saved_entry is None:
+        return
+    current, _old = cached  # type: ignore[misc]
+    _SLOT_INFO_CACHE = (current, saved_entry)
+
+
 # P0.8 — per-slot installed versions, written by ``spatium-upgrade-slot
 # sync-versions`` on every boot + at the end of every apply. On the host
 # the supervisor's ``/var/lib/spatiumddi-host/release-state/`` resolves to
@@ -1920,17 +1936,9 @@ def read_slot_versions() -> tuple[str | None, str | None]:
     return (a if isinstance(a, str) else None), (b if isinstance(b, str) else None)
 
 
-def read_grub_next_entry() -> str | None:
-    """Read grubenv's one-shot ``next_entry`` — set by
-    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
-    different slot than the durable default (a queued trial boot). Cleared
-    by grub on the next boot. ``None`` when unset / unreadable.
-
-    Unlike ``detect_slot_info()``'s ``saved_entry`` read (process-lifetime
-    cached because the slot we booted from never changes mid-run),
-    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, so this
-    must be read fresh on the 5 s data tier — never cached for the process
-    lifetime."""
+def read_grubenv() -> dict[str, str] | None:
+    """``grub-editenv list`` as a dict, or ``None`` when unreadable. One
+    subprocess — call it on the 5 s data tier only, never the render path."""
     try:
         out = subprocess.run(
             ["grub-editenv", "/boot/efi/grub/grubenv", "list"],
@@ -1939,11 +1947,26 @@ def read_grub_next_entry() -> str | None:
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired, OSError):
         return None
+    env: dict[str, str] = {}
     for line in out.splitlines():
-        if line.startswith("next_entry="):
-            val = line.split("=", 1)[1].strip()
-            return val or None
-    return None
+        key, sep, val = line.partition("=")
+        if sep:
+            env[key] = val.strip()
+    return env
+
+
+def read_grub_next_entry() -> str | None:
+    """Read grubenv's one-shot ``next_entry`` — set by
+    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
+    different slot than the durable default (a queued trial boot). Cleared
+    by grub on the next boot. ``None`` when unset / unreadable.
+
+    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, and
+    ``saved_entry`` is moved by firstboot after the console started (#3026),
+    so both are read fresh on the 5 s data tier — never cached for the
+    process lifetime."""
+    env = read_grubenv()
+    return (env.get("next_entry") or None) if env else None
 
 
 def appliance_version_string(env: dict[str, str]) -> str:
@@ -2809,8 +2832,9 @@ def render_header(
     spinner is derived live from mono_t so its rotation animates at the
     render cadence — that's the one thing operators want jittery (visible
     "alive" indicator). The verdict title chip + border colour (P0.3) are
-    unchanged. No subprocess on this path: ``slot_info()`` is process-cached
-    and ``supervisor_watchdog_status()`` is a file-stat — both already lived
+    unchanged. No subprocess on this path: ``slot_info()`` is a memory read
+    (its durable half is refreshed on the 5 s tier) and
+    ``supervisor_watchdog_status()`` is a file-stat — both already lived
     here pre-Phase-2 and feed only the verdict roll-up.
     """
     env = state.env
@@ -4233,7 +4257,7 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
 # ── Phase 2 KPI ribbon (§4) ────────────────────────────────────────────
 # A row of fixed-height (3 body + 2 border = 5) stat boxes placed in the
 # ``kpi`` Layout. Every box reads state.* ONLY (the few file-stats here —
-# slot_info() process-cached, reboot_pending()/upgrade_status() stat the
+# slot_info() a memory read, reboot_pending()/upgrade_status() stat the
 # release-state dir — already rode the PHASE-1 header render path, so this
 # is no regression). Each box is rendered through ``_kpi_safe`` so a single
 # malformed value degrades to a dim "n/a" box rather than blanking the frame.
@@ -4744,7 +4768,7 @@ class DashboardState:
         }
         # P0.8 — per-slot versions + grubenv next_entry. These change at
         # RUNTIME (an apply restamps versions; a Fleet trial-boot sets
-        # next_entry), so unlike slot_info()'s process-lifetime cache
+        # next_entry), so unlike the static half of slot_info()
         # they're refreshed on the 5 s data tier.
         self.slot_a_version: str | None = None
         self.slot_b_version: str | None = None
@@ -4930,7 +4954,16 @@ class DashboardState:
             # (one subprocess, fine at 5 s). Cached so the render path
             # never touches disk / grub for these runtime-changing values.
             self.slot_a_version, self.slot_b_version = read_slot_versions()
-            self.slot_next_entry = read_grub_next_entry()
+            _grub = read_grubenv()
+            self.slot_next_entry = ((_grub or {}).get("next_entry")) or None
+            # #3026 — saved_entry moves when firstboot commits a trial boot,
+            # after this process started; keep the verdict in step. A
+            # readable grubenv with no saved_entry is "no durable default"
+            # (what detect_slot_info() reports); only an UNREADABLE one
+            # (None) keeps the last value.
+            refresh_durable_slot(
+                _grub.get("saved_entry", "") if _grub is not None else None
+            )
             try:
                 self.env = read_env()
             except Exception:

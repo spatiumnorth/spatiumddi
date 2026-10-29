@@ -99,3 +99,24 @@ async def enforce_required_custom_fields(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Required custom field(s) need a value: " + ", ".join(missing),
         )
+
+
+async def missing_required_custom_fields(
+    db: AsyncSession,
+    resource_type: str,
+    new_values: Mapping[str, Any] | None,
+    *,
+    inherited: Mapping[str, Any] | None = None,
+) -> str | None:
+    """The 422 detail ``enforce_required_custom_fields`` would raise on create, or None.
+
+    One rule, two callers: the handlers raise it, and Subnet Planner
+    validation reports it as a conflict so Apply never meets it (#2986).
+    """
+    try:
+        await enforce_required_custom_fields(
+            db, resource_type, new_values, inherited=inherited, creating=True
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None

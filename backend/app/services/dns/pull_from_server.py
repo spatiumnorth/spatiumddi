@@ -787,7 +787,6 @@ async def _queue_for_agent(
     zone: DNSZone,
     rows: list[DNSRecord],
     payloads: list[dict[str, Any]],
-    target_serial: int,
 ) -> PushResult:
     """Agent-managed server: hand the missing rows to its record-op queue (#2667).
 
@@ -796,6 +795,12 @@ async def _queue_for_agent(
     ``apply_record_changes`` failed every record. Ops are queued for THIS
     server only — Sync with Servers is per-server. A row whose identical
     create is already pending / in flight is not queued twice.
+
+    #3004: the zone's next serial is taken here, once, and only when at
+    least one new op is queued: every new op carries it, so the agent can
+    report it. A row whose create is already queued adds no op and takes no
+    serial; the queued op already carries the serial the zone was given
+    when it was queued.
     """
     queued = (
         (
@@ -819,7 +824,7 @@ async def _queue_for_agent(
         )
         for o in queued
     }
-    new_ops: list[DNSRecordOp] = []
+    new_records: list[dict[str, Any]] = []
     pushed_records: list[dict[str, Any]] = []
     for row, payload in zip(rows, payloads, strict=True):
         rec = payload["record"]
@@ -834,19 +839,23 @@ async def _queue_for_agent(
         )
         if (rec["name"], rec["type"], rec["value"]) in already:
             continue
-        new_ops.append(
-            DNSRecordOp(
-                server_id=server.id,
-                zone_id=zone.id,
-                zone_name=zone.name,
-                op="create",
-                record=payload["record"],
-                target_serial=target_serial,
-                state="pending",
-            )
+        new_records.append(rec)
+    if new_records:
+        target_serial = bump_zone_serial(zone)
+        db.add_all(
+            [
+                DNSRecordOp(
+                    server_id=server.id,
+                    zone_id=zone.id,
+                    zone_name=zone.name,
+                    op="create",
+                    record=rec,
+                    target_serial=target_serial,
+                    state="pending",
+                )
+                for rec in new_records
+            ]
         )
-    if new_ops:
-        db.add_all(new_ops)
         await db.flush()
         collect_wake(dns_server_channel(server.id))
     return PushResult(
@@ -884,8 +893,6 @@ async def _additive_push(
 
     pushed_records: list[dict[str, Any]] = []
     push_errors: list[str] = []
-
-    target_serial = bump_zone_serial(zone) if apply else 0
 
     # Build the candidate list — DB rows whose (name, type, value) isn't
     # already on the wire. Keeping this as a list (not a generator) so we
@@ -925,6 +932,18 @@ async def _additive_push(
             push_errors=push_errors,
         )
 
+    # #3004: nothing to send takes no serial. The bump used to come before
+    # this scan, so a sync that found the server already serving every row
+    # still moved ``last_serial``, and its callers commit it (the group route
+    # once per enabled server). No op carried that serial to an agent-managed
+    # server, so the zone read out of sync until the next record change. The
+    # serial is now taken only where something is sent: below for an
+    # agentless push, in ``_queue_for_agent`` for a new agent op.
+    if not candidate_rows:
+        return PushResult(
+            candidates=0, pushed=0, pushed_records=pushed_records, push_errors=push_errors
+        )
+
     # Each op carries the complete DB set at its (name, type), as the record
     # op path does (#783). Without it a driver that writes a whole RRset
     # (technitium_api ``overwrite=true``, Windows) replaces the set with the
@@ -948,6 +967,11 @@ async def _additive_push(
         for row in candidate_rows
     ]
     await stamp_rrsets_for_ops(db, zone, payloads)
+
+    if not is_agentless(primary.driver):
+        return await _queue_for_agent(db, primary, zone, candidate_rows, payloads)
+
+    target_serial = bump_zone_serial(zone)
     changes: list[RecordChange] = [
         RecordChange(
             op="create",
@@ -966,14 +990,6 @@ async def _additive_push(
         )
         for row, payload in zip(candidate_rows, payloads, strict=True)
     ]
-
-    if not changes:
-        return PushResult(
-            candidates=0, pushed=0, pushed_records=pushed_records, push_errors=push_errors
-        )
-
-    if not is_agentless(primary.driver):
-        return await _queue_for_agent(db, primary, zone, candidate_rows, payloads, target_serial)
 
     try:
         results = await driver.apply_record_changes(primary, changes)

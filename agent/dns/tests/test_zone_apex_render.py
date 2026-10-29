@@ -331,6 +331,15 @@ _LOADABLE = {
     "ns1-addressed-v6": _zone(
         "corp.example.test.", [_rec("ns1", "AAAA", "2001:db8::53")]
     ),
+    # #3003: a zone whose own name is not a host name.
+    "underscore-unconfigured": _zone("_msdcs.corp.example.test."),
+    "underscore-primary-ns-elsewhere": _zone(
+        "_msdcs.corp.example.test.", primary_ns="dc1.corp.example.test"
+    ),
+    "underscore-declared-ns": _zone(
+        "_msdcs.corp.example.test.",
+        [_rec("@", "NS", "dc1.corp.example.test."), _rec("gc", "A", "10.0.0.5")],
+    ),
 }
 
 
@@ -367,8 +376,11 @@ def test_named_checkzone_loads_every_rendered_apex(tmp_path: Path, case: str) ->
     zone = _LOADABLE[case]
     _write(tmp_path, zone)
     path = tmp_path / "zones" / f"{zone['name'].rstrip('.')}.db"
+    # ``-k fail``: check-names as the agent's own zone check applies it
+    # (``_checkzone``). named-checkzone only warns by default, which let a
+    # placeholder BIND refuses pass here (#3003).
     res = subprocess.run(
-        ["named-checkzone", zone["name"], str(path)],
+        ["named-checkzone", "-k", "fail", zone["name"], str(path)],
         capture_output=True,
         text=True,
         check=False,

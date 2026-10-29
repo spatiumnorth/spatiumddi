@@ -417,7 +417,12 @@ jobs:
   # it now lives only behind ``make test-cov``.
   backend-test-shard:
     name: Backend — Tests (shard ${{ matrix.shard }}/12)
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: backup / restore tests run the RUNNER's
+    # pg_dump against the postgres:16 service, and ubuntu-26.04 ships a
+    # newer client whose dumps carry `SET transaction_timeout`, which a 16
+    # server refuses on replay. The image pins postgresql-client-16 for the
+    # same reason (backend/Dockerfile). Move this with the postgres image.
+    runs-on: ubuntu-24.04
     # #813 — skipped when the PR touches nothing the suite covers. The
     # aggregator below stays green in that case, so no required check
     # notices. ``changes`` failing leaves this skipped too, and the
@@ -469,6 +474,14 @@ jobs:
 
       - name: Install dependencies
         run: pip install -e ".[dev]"
+
+      - name: The runner's pg_dump matches the postgres 16 service
+        # Fail here, by name, rather than as dozens of restore tests whose
+        # replay a 16 server refuses.
+        run: |
+          set -euo pipefail
+          pg_dump --version
+          pg_dump --version | grep -Eq ' 16\.'
 
       - name: Run migrations
         env:

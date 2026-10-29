@@ -106,8 +106,8 @@ not the operator's:
   about 120 api connections in all), and the limit is never below
   shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
   can open 52 connections at one node, 134 at three and 227 at nine (two
-  worker processes); `max_connections` stays the chart's 200 until that
-  passes it, then follows it. One node of 8 GiB or more keeps the share
+  worker processes); `max_connections` stays at the appliance floor of 200
+  until that passes it, then follows it. One node of 8 GiB or more keeps the share
   above; a three-node cluster on a 12 GiB seed gets 3019Mi, a nine-node one
   4507Mi. A promote or demote that moves the limit is one CloudNativePG
   rolling restart.
@@ -708,8 +708,10 @@ state on its heartbeat:
   selects every engine's pods, so the VIP follows an engine switch,
   #1510) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
-  relay→server unicast forward — Kea keeps `hostNetwork` for
-  direct-attached broadcast). Both live on the same `platform_settings`
+  relay→server unicast forward — Kea keeps `hostNetwork`, but every DHCP
+  group behind the VIP must use `relay` client reachability, or relays
+  landing on the announcing node get no answer; see
+  [DHCP.md](../features/DHCP.md) §Client reachability, #2899). Both live on the same `platform_settings`
   singleton + the `…/control-plane/metallb` endpoint; the seed merges
   them into the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
   `dns.vip` / `dhcpKea.relayVIP`) via
@@ -1697,7 +1699,7 @@ By default the appliance boots quietly (`loglevel=3` — only kernel errors reac
 - **`text_console`** — verbose boot, then a standard getty login (`spatium-console=off`) instead of the cockpit — boot looks like a regular Linux server end-to-end.
 
 - **Mechanism.** Backed by `platform_settings.console_mode` (Literal-validated to the three values; migration `a7c3e9f1b405` adds it, backfills from the old `verbose_boot` flag — `True` → `text_console` — then drops `verbose_boot`). It rides the same host-config plane as timezone / NTP / SNMP (PlatformSettings → supervisor heartbeat `console_mode` → `maybe_fire_console_mode` → host runner). Because the kernel cmdline lives in `grub.cfg` (not a file the running OS re-reads), the runner flips a **grubenv variable** (`spatium_verbose`) that a `0` / `1` / `2` conditional in the per-slot menuentries reads (rendered by #395's `spatium-grub-render`). The mode → grubenv map keeps `dashboard = 0` + `text_console = 1` so pre-#393 grubenv values still resolve fail-closed; `verbose_dashboard = 2` is the new branch. grubenv lives on the shared ESP, so the setting **survives A/B slot upgrades + rollbacks + the /etc overlay** verbatim.
-- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot.
+- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot. On a multi-node control plane that tab links to Fleet instead, because the local reboot acts on whichever node answers the request and is refused there (#3011); reboot each node from its Fleet drilldown.
 - **`text_console` gets a real login.** `getty@tty1` is gated on `spatium-console=off` (the mirror of the dashboard's gate) and enabled into `getty.target.wants`, so the dashboard and getty are mutually exclusive by their opposite conditions and `text_console` lands a standard agetty login. (A unit-load-time `Conflicts=getty` leak that left `text_console` with *no* login was fixed in #393 / #394 — see CHANGELOG.)
 - **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` + the dashboard. The always-present GRUB verbose-boot menuentry remains the zero-config one-shot fallback (drops the loglevel cap for a single boot, selectable from the boot menu with no reinstall).
 

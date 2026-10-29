@@ -320,7 +320,11 @@ export function CreateServerModal({
         {driver === "kea" && (
           <Field
             label="HA Peer URL (optional)"
-            hint="This server's own Kea HA hook listener endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
+            hint={
+              groups.find((g) => g.id === groupId)?.mode === "standalone"
+                ? "The selected group is standalone, so this URL is ignored: Kea HA renders only in a hot-standby or load-balancing group. Change the group's mode to pair its Kea servers."
+                : "This server's own Kea HA hook listener endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
+            }
           >
             <input
               className={inputCls}

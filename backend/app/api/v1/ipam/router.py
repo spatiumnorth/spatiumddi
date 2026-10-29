@@ -93,6 +93,8 @@ from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
     assert_static_dhcp_has_mac,
     assert_subnet_takes_addresses,
+    holds_address,
+    take_address_row,
 )
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
@@ -105,6 +107,7 @@ from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
 )
+from app.services.ipam.gateway_rules import gateway_problem
 from app.services.ipam.hygiene import (
     DEFAULT_FREE_RESPONDING_DAYS,
     DEFAULT_SQUAT_DAYS,
@@ -112,7 +115,13 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
+from app.services.ipam.utilization import (
+    block_allocated,
+    block_subnet_contribution_sql,
+    block_utilization_percent,
+    counts_toward_utilization,
+)
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.ipam.zone_binding import (
     check_group_uuid_list,
@@ -121,6 +130,9 @@ from app.services.ipam.zone_binding import (
     stored_zone_uuid,
 )
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
+from app.services.search.providers import IP_MAC_NORMALIZED_SQL
+from app.services.search.ranking import escape_like, like_pattern
+from app.services.search.schemas import shape_of
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
@@ -445,17 +457,39 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
 async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> None:
     """Recompute utilization_percent for a block by summing allocated IPs across all
     descendant subnets (recursive), expressed as a fraction of the block's CIDR size.
-    Also updates all ancestor blocks up the tree.
+    Each subnet's network/broadcast addresses count as used here (#2982), so a
+    block fully carved into full subnets reads 100%; the subnet's own counter
+    still leaves them out (#2411). Also updates all ancestor blocks up the tree.
     """
     block = await db.get(IPBlock, block_id)
-    if block is None:
-        return
+    while block is not None:
+        await _recount_block(db, block)
+        block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
 
-    # Sum allocated_ips for all subnets in this block and all descendant blocks
+
+async def _update_blocks_utilization(db: AsyncSession, block_ids: Iterable[uuid.UUID]) -> None:
+    """``_update_block_utilization`` for many blocks at once (#2981): every
+    block on the union of their chains is recounted exactly once, rather than
+    once per block below it. A block's sum reads its descendant SUBNETS, not
+    its child blocks, so the order does not matter."""
+    seen: set[uuid.UUID] = set()
+    for start in block_ids:
+        block = await db.get(IPBlock, start)
+        while block is not None and block.id not in seen:
+            seen.add(block.id)
+            await _recount_block(db, block)
+            block = await db.get(IPBlock, block.parent_block_id) if block.parent_block_id else None
+
+
+async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
+    """Recount one block's cached counters from its descendant subnets."""
+    # Sum each subnet's contribution (allocated_ips + its network/broadcast)
+    # over this block and all descendant blocks.
     # deleted_at IS NULL guards: raw SQL bypasses the ORM soft-delete filter,
     # so trashed blocks/subnets would otherwise inflate the rollup (#490).
+    contribution = block_subnet_contribution_sql("s")
     result = await db.execute(
-        text("""
+        text(f"""
             WITH RECURSIVE descendants AS (
                 SELECT id FROM ip_block
                 WHERE id = CAST(:block_id AS uuid) AND deleted_at IS NULL
@@ -464,28 +498,45 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
                     INNER JOIN descendants d ON b.parent_block_id = d.id
                 WHERE b.deleted_at IS NULL
             )
-            SELECT COALESCE(SUM(s.allocated_ips), 0)
+            SELECT COALESCE(SUM({contribution}), 0)
             FROM subnet s
             WHERE s.block_id IN (SELECT id FROM descendants)
               AND s.deleted_at IS NULL
-        """),
-        {"block_id": str(block_id)},
+        """),  # the fragment is a constant: no request input reaches it
+        {"block_id": str(block.id)},
     )
-    allocated = result.scalar() or 0
-
     net = ipaddress.ip_network(str(block.network), strict=False)
     block_total = net.num_addresses
-    block.utilization_percent = (
-        round(float(allocated) / block_total * 100, 2) if block_total > 0 else 0.0
-    )
+    allocated = block_allocated(int(result.scalar() or 0), net)
+    block.utilization_percent = block_utilization_percent(allocated, net)
     # Cache the raw counts too so block rows can render Used IPs (not just a
     # utilization bar). total_ips clamps to BIGINT for huge IPv6 blocks.
     block.allocated_ips = int(allocated)
     block.total_ips = min(block_total, _BIGINT_MAX)
 
-    # Walk up the tree and update each ancestor
-    if block.parent_block_id:
-        await _update_block_utilization(db, block.parent_block_id)
+
+async def _update_subnets_utilization(db: AsyncSession, subnet_ids: Iterable[uuid.UUID]) -> None:
+    """``_update_utilization`` for many subnets in one grouped count (#2981)."""
+    ids = list(dict.fromkeys(subnet_ids))
+    if not ids:
+        return
+    counts: dict[uuid.UUID, int] = {
+        sid: int(n)
+        for sid, n in (
+            await db.execute(
+                select(IPAddress.subnet_id, func.count())
+                .where(IPAddress.subnet_id.in_(ids))
+                .where(counts_toward_utilization())
+                .group_by(IPAddress.subnet_id)
+            )
+        ).all()
+    }
+    for subnet in (await db.execute(select(Subnet).where(Subnet.id.in_(ids)))).scalars():
+        allocated = counts.get(subnet.id, 0)
+        subnet.allocated_ips = allocated
+        subnet.utilization_percent = (
+            round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
+        )
 
 
 async def _resolve_effective_dns(
@@ -1311,7 +1362,12 @@ async def _pick_next_available_ip(
     """
     net = _parse_network(str(subnet.network))
     used_result = await db.execute(
-        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
+        select(IPAddress.address).where(
+            IPAddress.subnet_id == subnet.id,
+            # An ``available`` row is free (#2980): the counters say so and the
+            # create takes it over in place.
+            holds_address(),
+        )
     )
     used: set[str] = {str(row[0]) for row in used_result}
 
@@ -6061,17 +6117,21 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
 
     await _assert_no_overlap(db, body.space_id, canonical)
 
-    # Validate gateway is within the subnet if explicitly provided
-    if body.gateway:
-        try:
-            gw = ipaddress.ip_address(body.gateway)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"Invalid gateway IP: {body.gateway}")
-        if gw not in net:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Gateway {body.gateway} is not within subnet {canonical}",
-            )
+    # Validate an explicit gateway: inside the subnet, and not on the network
+    # or broadcast address its own placeholder rows hold (which used to reach
+    # the unique constraint as a generic 409). Subnet Planner runs the same
+    # rule (#2984).
+    gw_problem = gateway_problem(
+        body.gateway or None,
+        net,
+        reject_reserved=(
+            subnet_kind != "multicast"
+            and not body.skip_auto_addresses
+            and net.prefixlen < (127 if net.version == 6 else 31)
+        ),
+    )
+    if gw_problem:
+        raise HTTPException(status_code=422, detail=gw_problem)
 
     total = _total_ips(net)
 
@@ -6160,55 +6220,15 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # doesn't apply.
     auto_created: list[str] = []
     gw_row: IPAddress | None = None
-    is_v6 = isinstance(net, ipaddress.IPv6Network)
-    # Threshold is version-aware: a v4 /31+/32 has no network/broadcast concept
-    # (RFC 3021), and the v6 analogue is /127+/128. The old flat ``< 31`` was v4
-    # logic, so EVERY realistic v6 subnet (/48, /64, /112) fell through and got
-    # no network/gateway pseudo-rows despite the branch's IPv6 handling (#506).
-    placeholder_threshold = 127 if is_v6 else 31
-    if (
-        net.prefixlen < placeholder_threshold
-        and not body.skip_auto_addresses
-        and subnet_kind != "multicast"
-    ):
-        # Network address (e.g. 10.0.1.0 / 2001:db8::)
-        db.add(
-            IPAddress(
-                subnet_id=subnet.id,
-                address=str(net.network_address),
-                status="network",
-                description="Network address",
-                created_by_user_id=current_user.id,
-            )
-        )
-        auto_created.append(str(net.network_address))
-
-        if not is_v6:
-            # Broadcast address (IPv4 only — IPv6 has no broadcast)
-            db.add(
-                IPAddress(
-                    subnet_id=subnet.id,
-                    address=str(net.broadcast_address),
-                    status="broadcast",
-                    description="Broadcast address",
-                    created_by_user_id=current_user.id,
-                )
-            )
-            auto_created.append(str(net.broadcast_address))
-
-        # Gateway — use provided or default to first usable host
-        gw_addr = body.gateway or str(net.network_address + 1)
-        gw_row = IPAddress(
-            subnet_id=subnet.id,
-            address=gw_addr,
-            status="reserved",
-            description="Gateway",
-            hostname="gateway",
+    # Version-aware (#506): a v4 /31+/32 and a v6 /127+/128 get none.
+    if has_boundary_rows(net, subnet_kind) and not body.skip_auto_addresses:
+        auto_created, gw_row = await create_placeholder_rows(
+            db,
+            subnet,
+            net,
+            gateway=body.gateway,
             created_by_user_id=current_user.id,
         )
-        db.add(gw_row)
-        subnet.gateway = gw_addr
-        auto_created.append(gw_addr)
 
     db.add(
         _audit(
@@ -7210,18 +7230,11 @@ async def update_subnet(
                 detail=f"Subnet {subnet.network} is not contained within block {target.network}",
             )
 
-    # Validate new gateway is within the subnet
+    # Validate new gateway is within the subnet (same rule as create, #2984).
     if body.gateway is not None:
-        try:
-            gw = ipaddress.ip_address(body.gateway)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"Invalid gateway IP: {body.gateway}")
-        net = _parse_network(str(subnet.network))
-        if gw not in net:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Gateway {body.gateway} is not within subnet {subnet.network}",
-            )
+        gw_problem = gateway_problem(body.gateway, _parse_network(str(subnet.network)))
+        if gw_problem:
+            raise HTTPException(status_code=422, detail=gw_problem)
 
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:
@@ -9198,6 +9211,52 @@ _ADDRESS_SORT_KEYS = {"address", "hostname", "status", "mac", "last_seen", "desc
 _SEARCH_IDS_CAP = 5000
 
 
+_MAC_GROUPED_RE = re.compile(r"[0-9a-f]{2}(?:([:-])[0-9a-f]{2})(?:\1[0-9a-f]{2}){0,4}")
+_MAC_CISCO_RE = re.compile(r"[0-9a-f]{4}(?:\.[0-9a-f]{4}){1,2}")
+
+
+def _mac_colon_form(q: str) -> str | None:
+    """The stored (colon) spelling of a MAC-shaped query, or None (#2991).
+
+    Only a query written the way a MAC is written counts: a full MAC in any
+    notation, or a partial one in whole octets with ``:`` / ``-`` (``aa-bb-cc``)
+    or Cisco 4-hex groups (``aabb.cc00``). Matching that colon form against
+    ``CAST(mac_address AS text)`` keeps the match octet-aligned. Bare hex and
+    digit-and-dot queries (``cafe``, ``123``, ``10.0.5``) are hostname or
+    address fragments, so they keep the plain substring match, where a colon
+    MAC can only hold them within one octet; normalising them instead would
+    match across octet boundaries and widen the set "Select all" hands to the
+    bulk actions.
+    """
+    s = q.strip().lower()
+    shape = shape_of(s)
+    if shape.is_ip or shape.is_cidr:
+        return None
+    if shape.is_mac:
+        hexs = shape.mac_normalized
+    elif _MAC_GROUPED_RE.fullmatch(s) or _MAC_CISCO_RE.fullmatch(s):
+        hexs = re.sub(r"[:\-.]", "", s)
+    else:
+        return None
+    return ":".join(hexs[i : i + 2] for i in range(0, len(hexs), 2))
+
+
+def _mac_like_condition(value: str) -> Any:
+    """Wildcard-safe MAC substring match for the ``mac`` filter (#2991).
+
+    Octet-aligned when the value is written as a MAC; otherwise (bare hex
+    such as an OUI ``aabbcc``) separator-insensitive, since the field says
+    the operator means a MAC.
+    """
+    colon = _mac_colon_form(value)
+    if colon:
+        return sa_cast(IPAddress.mac_address, String).ilike(like_pattern(colon), escape="\\")
+    norm = shape_of(value.strip()).mac_normalized
+    return text(f"{IP_MAC_NORMALIZED_SQL} ILIKE :mac_norm").bindparams(
+        mac_norm=f"%{escape_like(norm)}%"
+    )
+
+
 def _address_search_conditions(
     *,
     q: str | None,
@@ -9216,20 +9275,25 @@ def _address_search_conditions(
     if status_filter:
         conds.append(IPAddress.status == status_filter)
     if hostname:
-        conds.append(IPAddress.hostname.ilike(f"%{hostname}%"))
+        conds.append(IPAddress.hostname.ilike(like_pattern(hostname), escape="\\"))
     if mac:
-        conds.append(sa_cast(IPAddress.mac_address, String).ilike(f"%{mac}%"))
+        conds.append(_mac_like_condition(mac))
     if q:
-        pat = f"%{q}%"
-        conds.append(
-            or_(
-                func.host(IPAddress.address).ilike(pat),
-                IPAddress.hostname.ilike(pat),
-                IPAddress.fqdn.ilike(pat),
-                IPAddress.description.ilike(pat),
-                sa_cast(IPAddress.mac_address, String).ilike(pat),
+        pat = like_pattern(q)
+        alternatives = [
+            func.host(IPAddress.address).ilike(pat, escape="\\"),
+            IPAddress.hostname.ilike(pat, escape="\\"),
+            IPAddress.fqdn.ilike(pat, escape="\\"),
+            IPAddress.description.ilike(pat, escape="\\"),
+        ]
+        # A MAC in any notation, octet-aligned (#2991); see _mac_colon_form.
+        mac_q = _mac_colon_form(q)
+        alternatives.append(
+            sa_cast(IPAddress.mac_address, String).ilike(
+                like_pattern(mac_q) if mac_q else pat, escape="\\"
             )
         )
+        conds.append(or_(*alternatives))
     return conds
 
 
@@ -9449,6 +9513,15 @@ async def create_address(
     if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
+        # An ``available`` row at this address is the slot being taken (#2980):
+        # its own name and PTR are retracted by the take, not a collision.
+        free_row_id = await db.scalar(
+            select(IPAddress.id).where(
+                IPAddress.subnet_id == subnet_id,
+                IPAddress.address == body.address,
+                IPAddress.status == "available",
+            )
+        )
         warnings = await _check_ip_collisions(
             db,
             hostname=body.hostname,
@@ -9457,6 +9530,7 @@ async def create_address(
             role=body.role,
             subnet=subnet,
             address=body.address,
+            exclude_ip_id=free_row_id,
         )
         # Public-facing safety guard (issue #25). Append to the same
         # warnings list so the operator sees both surfaces in one
@@ -9488,15 +9562,19 @@ async def create_address(
         address=body.address,
         zone_id=explicit_zone,
     )
-    ip = IPAddress(
-        subnet_id=subnet_id,
-        created_by_user_id=current_user.id,
-        **body.model_dump(exclude={"dns_zone_id", "force", "aliases"}),
-    )
+    # An ``available`` row at this address is a free slot (#2980): taken over
+    # in place (its DNS retracted, its identity kept), not duplicated.
+    fields = body.model_dump(exclude={"address", "dns_zone_id", "force", "aliases"})
     if no_dns:
-        ip.extra_zone_ids = []
-    db.add(ip)
-    await db.flush()
+        fields["extra_zone_ids"] = []
+    ip = await take_address_row(
+        db,
+        subnet,
+        body.address,
+        current_user,
+        created_by_user_id=current_user.id,
+        **fields,
+    )
 
     # Stamp a MAC observation row. Idempotent on the (ip_id, mac)
     # uniqueness — a future PUT bumps last_seen instead of inserting.
@@ -11414,9 +11492,11 @@ async def allocate_next_ip(
         address=chosen,
         zone_id=explicit_zone,
     )
-    ip = IPAddress(
-        subnet_id=subnet_id,
-        address=str(chosen),
+    ip = await take_address_row(
+        db,
+        subnet,
+        str(chosen),
+        current_user,
         status=body.status,
         hostname=body.hostname,
         mac_address=body.mac_address,
@@ -11429,8 +11509,6 @@ async def allocate_next_ip(
         decom_date=body.decom_date,
         created_by_user_id=current_user.id,
     )
-    db.add(ip)
-    await db.flush()
 
     if body.mac_address:
         await _record_mac_history(db, ip.id, body.mac_address)

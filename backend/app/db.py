@@ -3,11 +3,14 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import structlog
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, with_loader_criteria
 
 from app.config import settings
+
+_db_logger = structlog.get_logger(__name__)
 
 
 def _json_serializer(value: Any) -> str:
@@ -146,11 +149,35 @@ async def dispose_probe_engine() -> None:
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
+    # The close is where a failover surfaces AFTER the response has started:
+    # its rollback meets ``InterfaceError: cannot call Transaction.rollback():
+    # the underlying connection is closed`` or a ``TimeoutError``. Raised from
+    # a dependency's cleanup at that point it became "Caught handled
+    # exception, but response already started" (#3017), a 500 line for a
+    # request that had already answered. Only dependency-down failures are
+    # swallowed (and logged); a real bug in the close still propagates, and a
+    # route's own exception is never replaced by a swallowed close failure.
+    session = AsyncSessionLocal()
+    try:
+        yield session
+    finally:
         try:
-            yield session
-        finally:
-            await session.close()
+            # ``__aexit__`` rather than a bare ``close()``: it runs the close
+            # to completion even if this task is cancelled meanwhile (a
+            # client gone mid-request), which ``async with`` did here before
+            # and a bare ``await session.close()`` would not, abandoning the
+            # connection's return to the pool halfway.
+            await session.__aexit__(None, None, None)
+        except Exception as exc:  # noqa: BLE001 — classified, else re-raised
+            from app.core.dependency_down import is_only_dependency_down  # noqa: PLC0415
+
+            if not is_only_dependency_down(exc):
+                raise
+            _db_logger.warning(
+                "db_session_cleanup_dependency_down",
+                error_class=type(exc).__name__,
+                error=str(exc)[:200],
+            )
 
 
 # ── Per-task DB session for Celery ────────────────────────────────────────
