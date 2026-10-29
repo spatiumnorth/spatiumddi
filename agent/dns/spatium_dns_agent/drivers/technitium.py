@@ -76,6 +76,7 @@ import httpx
 import structlog
 
 from ..secure_io import write_private
+from ._caa import parse_caa
 from ._forwarders import zone_forward_transport as _zone_forward_transport
 from ._process import find_running_daemon, is_zombie
 from ._txt import txt_strings
@@ -2171,6 +2172,18 @@ def _record_params(
         }
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
+        # ``raw``, not ``value``: a CAA value is text, and the rstrip above
+        # would eat a bare value's trailing full stop.
+        parsed = parse_caa(raw)
+        if parsed is not None:
+            # Unescaped by the shared parser, which also keeps a bare value
+            # with spaces or quotes whole (#2943). Tag lower-cased: Technitium
+            # stores it that way (#1768).
+            return {
+                "flags": parsed[0],
+                "tag": parsed[1].lower(),
+                "value": parsed[2].decode("utf-8", errors="replace"),
+            }
         tokens = shlex.split(value)
         flags = int(tokens[0]) if tokens and tokens[0].isascii() and tokens[0].isdigit() else 0
         # Lower-cased: Technitium stores the tag that way (#1768).

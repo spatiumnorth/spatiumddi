@@ -31,6 +31,7 @@ from typing import Any
 
 import structlog
 
+from app.drivers.dns._caa import caa_value_octets, parse_caa
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -382,8 +383,14 @@ class AzureDNSDriver(CloudDNSDriverBase):
             existing = self._get_record_set(client, rg, zone_label, relative, rtype)
             entries = [] if existing is None else self._existing_entries(existing, rtype)
             # Dedupe: if this value is already in the set, it's a no-op.
-            present = {self._entry_key(rtype, e) for e in entries}
-            if self._entry_key(rtype, new_entry) not in present:
+            new_key = self._entry_key(rtype, new_entry)
+            if rtype == "CAA":
+                # Replace rather than keep: a CAA entry a release before
+                # #2943 wrote with its literal quotes keys as this one, and
+                # keeping it would go on serving the quotes.
+                entries = [e for e in entries if self._entry_key(rtype, e) != new_key]
+                entries = entries + [new_entry]
+            elif new_key not in {self._entry_key(rtype, e) for e in entries}:
                 entries = entries + [new_entry]
             # TTL: prefer the change's ttl, fall back to the existing set's,
             # then the driver default.
@@ -541,6 +548,16 @@ class AzureDNSDriver(CloudDNSDriverBase):
         """
         if rtype == "TXT":
             return ("TXT", "".join(entry.get("value", [])))
+        if rtype == "CAA":
+            # Tag case-insensitive (RFC 8659 §4.1); a value written with its
+            # literal quotes before #2943 is the same record as the bare one,
+            # so an upgrade can still delete or correct it.
+            return (
+                "CAA",
+                int(entry.get("flags") or 0),
+                str(entry.get("tag") or "").lower(),
+                caa_value_octets(str(entry.get("value") or "")),
+            )
         return (rtype, tuple(sorted(entry.items(), key=lambda kv: kv[0])))
 
     def _build_record_set_params(self, record: RecordData) -> dict[str, Any]:
@@ -581,8 +598,23 @@ class AzureDNSDriver(CloudDNSDriverBase):
         elif rtype == "PTR":
             params["ptr_records"] = [{"ptrdname": value}]
         elif rtype == "CAA":
-            flags, tag, caa_value = (value.split(None, 2) + ["", "", ""])[:3]
-            params["caa_records"] = [{"flags": int(flags), "tag": tag, "value": caa_value.strip()}]
+            # Azure takes the value itself, never its quoted presentation
+            # form: a stored ``0 issue "ca.org"`` would otherwise be served
+            # with the literal quotes (#2943).
+            parsed = parse_caa(value)
+            if parsed is None:
+                flags, tag, caa_value = (value.split(None, 2) + ["", "", ""])[:3]
+                params["caa_records"] = [
+                    {"flags": int(flags), "tag": tag, "value": caa_value.strip()}
+                ]
+            else:
+                params["caa_records"] = [
+                    {
+                        "flags": parsed[0],
+                        "tag": parsed[1],
+                        "value": parsed[2].decode("utf-8", errors="replace"),
+                    }
+                ]
         else:
             raise CloudDNSError(f"azure_dns: unsupported record type {rtype!r}")
         return params
