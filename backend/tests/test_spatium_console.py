@@ -1309,3 +1309,37 @@ def test_console_power_key_declined_starts_nothing(m, monkeypatch):
     monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: False)
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail("nothing should run"))
     m.do_shutdown(Console(file=io.StringIO()), m.DashboardState({}, _FakeTail(), "/dev/tty1"))
+
+
+# ── #3026: a committed slot upgrade clears the trial-boot verdict ─────────
+
+
+def test_committed_slot_clears_trial_boot_on_the_data_tier(m, monkeypatch):
+    """The console starts before firstboot runs grub-set-default. It read
+    saved_entry=slot_a once and showed 'trial boot — reboot reverts' until the
+    next reboot, although slot_b had been committed (#3026)."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_a"))
+    grubenv = {"saved_entry": "slot_a"}
+    monkeypatch.setattr(m, "read_grubenv", lambda: dict(grubenv))
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_a")
+    assert m.overall_verdict(st) == ("DEGRADED", "trial boot — reboot reverts")
+
+    # firstboot commits slot_b; the next data-tier refresh must notice.
+    grubenv["saved_entry"] = "slot_b"
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_b")
+    assert "trial" not in m.overall_verdict(st)[1]
+
+
+def test_unreadable_grubenv_keeps_the_last_known_durable_slot(m, monkeypatch):
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_b"))
+    m.refresh_durable_slot(None)
+    assert m.slot_info() == ("slot_b", "slot_b")
+
+
+def test_refresh_durable_slot_ignores_a_box_without_ab_slots(m, monkeypatch):
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", None)
+    m.refresh_durable_slot("slot_a")
+    assert m.slot_info() is None

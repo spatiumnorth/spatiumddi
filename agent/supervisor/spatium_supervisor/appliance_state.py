@@ -889,6 +889,30 @@ _HOST_PATCHES_LEDGER = Path(
 )
 
 
+_NIGHTLY_INSTALLED_RE = re.compile(r"^0\.0\.0-nightly-(\d{4})(\d{2})(\d{2})(?:\+[0-9A-Za-z.-]+)?$")
+_NIGHTLY_TAG_RE = re.compile(r"^nightly-(\d{4})\.?(\d{2})\.?(\d{2})$")
+
+
+def installed_is_target(installed: str | None, target: str | None) -> bool:
+    """#3026 — is the booted slot already the build ``target`` names?
+
+    A release installs under its own tag (equal strings). A nightly's tag is
+    ``nightly-YYYY.MM.DD`` while the slot reports
+    ``0.0.0-nightly-YYYYMMDD+<sha>``; a string compare never matched, so a
+    finished nightly upgrade was fired again over the rollback slot. Mirrors
+    ``app.core.versions.is_installed_target`` (separate package, so a copy).
+    """
+    installed = (installed or "").strip()
+    target = (target or "").strip()
+    if not installed or not target:
+        return False
+    if installed == target:
+        return True
+    have = _NIGHTLY_INSTALLED_RE.match(installed)
+    want = _NIGHTLY_TAG_RE.match(target)
+    return bool(have and want and have.groups() == want.groups())
+
+
 def maybe_fire_fleet_upgrade(
     desired_version: str | None,
     desired_url: str | None,
@@ -950,7 +974,9 @@ def maybe_fire_fleet_upgrade(
         )
         return False
     installed = read_installed_version()
-    if installed and installed == desired_version:
+    # Never fire a target the booted slot already is: the write goes to the
+    # INACTIVE slot, i.e. the only rollback (#3026).
+    if installed_is_target(installed, desired_version):
         return False
     # Fire-once: skip if we already wrote a trigger for this exact
     # desired-state (same URL incl. nonce).

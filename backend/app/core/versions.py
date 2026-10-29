@@ -156,3 +156,29 @@ def upgrade_direction(installed: str | None, target: str | None) -> str:
     if includes is None:
         return "unknown"
     return "backward" if includes else "forward"
+
+
+_NIGHTLY_TAG_RE = re.compile(r"^nightly-(\d{4})\.?(\d{2})\.?(\d{2})$")
+
+
+def is_installed_target(installed: str | None, target: str | None) -> bool:
+    """Whether a node reporting ``installed`` is already running ``target`` (#3026).
+
+    A release is installed under its own tag, so the two strings are equal.
+    A nightly is not: its release tag is ``nightly-YYYY.MM.DD`` (the bare
+    image tag ``nightly-YYYYMMDD`` is accepted too) while the slot reports
+    ``0.0.0-nightly-YYYYMMDD+<sha>``. A plain string compare never matched
+    them, so a completed nightly upgrade stayed "pending" and the supervisor
+    could fire it again over the rollback slot.
+    """
+    installed = (installed or "").strip()
+    target = (target or "").strip()
+    if not installed or not target:
+        return False
+    if installed == target:
+        return True
+    night = nightly_build_date(installed)
+    match = _NIGHTLY_TAG_RE.match(target)
+    if night is None or match is None:
+        return False
+    return f"{night:%Y%m%d}" == "".join(match.groups())
