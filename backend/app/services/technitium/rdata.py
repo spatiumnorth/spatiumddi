@@ -50,6 +50,7 @@ import ipaddress
 import shlex
 from typing import Any
 
+from app.drivers.dns._caa import caa_text, parse_caa
 from app.drivers.dns._txt import txt_strings, txt_value
 
 # Record types both directions model. Technitium-proprietary types
@@ -253,9 +254,9 @@ def _svcb_norm_key(key: str) -> str:
     """``ALPN`` / ``key1`` / ``1`` -> ``alpn``; ``key065000`` / ``65000`` ->
     ``key65000``. Technitium reports an unnamed key by its bare number."""
     k = key.strip().lower().replace("_", "-")
-    if k.isdigit():
+    if k.isascii() and k.isdigit():
         num = int(k)
-    elif k.startswith("key") and k[3:].isdigit():
+    elif k.startswith("key") and k[3:].isascii() and k[3:].isdigit():
         num = int(k[3:])
     else:
         return k
@@ -265,13 +266,13 @@ def _svcb_norm_key(key: str) -> str:
 def _svcb_key_num(key: str) -> int:
     if key in _SVCB_KEY_NUM:
         return _SVCB_KEY_NUM[key]
-    if key.startswith("key") and key[3:].isdigit():
+    if key.startswith("key") and key[3:].isascii() and key[3:].isdigit():
         return int(key[3:])
     return 65536
 
 
 def _svcb_is_generic(key: str) -> bool:
-    return key.startswith("key") and key[3:].isdigit()
+    return key.startswith("key") and key[3:].isascii() and key[3:].isdigit()
 
 
 def _svcb_split(value: str) -> list[str]:
@@ -316,7 +317,7 @@ def _svcb_unescape(text: str) -> bytes:
         ch = text[i]
         if ch == "\\" and i + 1 < len(text):
             digits = text[i + 1 : i + 4]
-            if len(digits) == 3 and digits.isdigit() and int(digits) < 256:
+            if len(digits) == 3 and digits.isascii() and digits.isdigit() and int(digits) < 256:
                 out.append(int(digits))
                 i += 4
                 continue
@@ -369,7 +370,7 @@ def _svcb_canon_value(key: str, val: str | None, from_daemon: bool) -> str | Non
     if key in ("ipv4hint", "ipv6hint"):
         return ",".join(_svcb_ip(a) for a in val.split(",") if a.strip())
     if key == "port":
-        return str(int(val)) if val.strip().isdigit() else val
+        return str(int(val)) if val.strip().isascii() and val.strip().isdigit() else val
     if key == "ech":
         data = _svcb_hex_bytes(val) if from_daemon else _svcb_b64_bytes(val)
         return base64.b64encode(data).decode("ascii") if data is not None else val
@@ -476,7 +477,7 @@ def _svcb_parse(value: str, origin: str | None) -> tuple[int, str, list[tuple[st
     tokens = _svcb_split(value)
     if len(tokens) < 2:
         return (1, ".", [])
-    priority = int(tokens[0]) if tokens[0].isdigit() else 1
+    priority = int(tokens[0]) if tokens[0].isascii() and tokens[0].isdigit() else 1
     items: list[tuple[str, str | None]] = []
     for tok in tokens[2:]:
         key, eq, raw = tok.partition("=")
@@ -597,9 +598,12 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
         extra["port"] = int_or(rdata.get("port"), 0)
         return _dotted_target(rdata.get("target")), extra
     if rtype == "CAA":
+        # Escaped: a value holding a quote or backslash must keep keying as
+        # the stored record does (#2943).
         return (
-            f"{int_or(rdata.get('flags'), 0)} {rdata.get('tag') or 'issue'} "
-            f"\"{rdata.get('value') or ''}\"",
+            caa_text(
+                int_or(rdata.get("flags"), 0), rdata.get("tag") or "issue", rdata.get("value") or ""
+            ),
             extra,
         )
     if rtype == "TLSA":
@@ -742,8 +746,15 @@ def record_params(
         }
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
+        parsed = parse_caa(value)
+        if parsed is not None:
+            return {
+                "flags": parsed[0],
+                "tag": parsed[1],
+                "value": parsed[2].decode("utf-8", errors="replace"),
+            }
         tokens = shlex.split(value)
-        flags = int(tokens[0]) if tokens and tokens[0].isdigit() else 0
+        flags = int(tokens[0]) if tokens and tokens[0].isascii() and tokens[0].isdigit() else 0
         tag = tokens[1] if len(tokens) > 1 else "issue"
         target = tokens[2] if len(tokens) > 2 else ""
         return {"flags": flags, "tag": tag, "value": target}

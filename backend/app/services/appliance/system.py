@@ -10,8 +10,11 @@ Three surfaces:
   drain traffic. Today the flag is just operator-visible — actual
   drain logic is a follow-up.
 * ``request_reboot()`` — writes ``reboot-pending`` to the same state
-  dir; the host's ``spatiumddi-reboot.path`` unit notices and runs
-  ``systemctl reboot`` after a 10 s grace.
+  dir; the host's ``spatiumddi-reboot.path`` unit notices and, after a
+  10 s grace, runs ``spatium-power-action reboot``: on a cluster node
+  holding the PostgreSQL primary that first hands the primary off (up to
+  a few minutes, #2974), then ``systemctl reboot``. Fire-and-forget: the
+  caller never waits on the host.
 
 All file paths live in ``/var/lib/spatiumddi-host/release-state/``
 (the same bind-mounted RW dir used for the release trigger in 4c)
@@ -96,7 +99,11 @@ def request_reboot(grace_seconds: int = 10) -> None:
 
     The host's spatiumddi-reboot.path notices, waits ``grace_seconds``
     (configured in the service unit, not here) so in-flight HTTP
-    responses can flush, then runs ``systemctl reboot``.
+    responses can flush, then runs ``spatium-power-action reboot``, which
+    hands the PostgreSQL primary off first when this node holds it (#2974)
+    and then runs ``systemctl reboot``. The unit renames the trigger
+    before that handoff, so ``reboot_scheduled`` reads false while it
+    runs.
     """
     if not settings.appliance_mode:
         raise RuntimeError("reboot is only supported on the SpatiumDDI OS appliance")

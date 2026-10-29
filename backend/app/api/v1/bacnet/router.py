@@ -480,7 +480,7 @@ def _apply_device_filters(
         # 22-bit value and Python ints are unbounded — a 40-digit
         # "search term" must not reach the query as an integer compare.
         digits = q.strip()
-        if digits.isdigit():
+        if digits.isascii() and digits.isdigit():
             value = int(digits)
             if BACNET_INSTANCE_MIN <= value <= BACNET_INSTANCE_MAX:
                 clauses.append(BACnetDevice.device_instance == value)

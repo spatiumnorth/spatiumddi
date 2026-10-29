@@ -33,6 +33,7 @@ from app.services.ipam.templates import (
     find_block_instances,
     find_subnet_instances,
 )
+from app.services.ipam.zone_binding import check_zone_uuid, check_zone_uuid_list
 
 router = APIRouter(
     prefix="/templates",
@@ -109,6 +110,18 @@ class IPAMTemplateBase(BaseModel):
     ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     child_layout: dict[str, Any] | None = None
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _v_dns_zone_id(cls, v: str | None) -> str | None:
+        # The template stamps this onto a block / subnet: refuse a value that
+        # names no zone rather than store it there (#2923).
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _v_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
     @field_validator("applies_to")
     @classmethod
     def _v_applies_to(cls, v: str) -> str:
@@ -167,6 +180,18 @@ class IPAMTemplateUpdate(BaseModel):
     clear_child_layout: bool = False
     clear_ddns_domain_override: bool = False
     clear_ddns_ttl: bool = False
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _v_dns_zone_id(cls, v: str | None) -> str | None:
+        # The template stamps this onto a block / subnet: refuse a value that
+        # names no zone rather than store it there (#2923).
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _v_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
 
     @field_validator("ddns_hostname_policy")
     @classmethod

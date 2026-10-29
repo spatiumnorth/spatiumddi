@@ -4,6 +4,7 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 import { idleHeader } from "@/lib/activity";
+import { sharedRefresh } from "@/lib/crossTabAuth";
 import {
   getAccessToken,
   setAccessToken,
@@ -119,7 +120,24 @@ function createClient(): AxiosInstance {
         }
 
         originalRequest._retry = true;
+        // The token THIS request carried, not the tab's current one: another
+        // tab's broadcast may already have moved this tab to a fresh token
+        // while the request was in flight (#2960). Then there is nothing to
+        // refresh: retry with the current token. Refreshing anyway would
+        // rotate again and kill the other tabs' tokens, the very churn this
+        // is meant to stop.
+        const sentAuth = originalRequest.headers?.Authorization;
+        const sentToken =
+          typeof sentAuth === "string" && sentAuth.startsWith("Bearer ")
+            ? sentAuth.slice("Bearer ".length)
+            : null;
+        const currentToken = getAccessToken();
+        if (sentToken && currentToken && sentToken !== currentToken) {
+          originalRequest.headers.Authorization = `Bearer ${currentToken}`;
+          return client(originalRequest);
+        }
         isRefreshing = true;
+        const staleToken = sentToken ?? currentToken;
         try {
           // The refresh token rides the HttpOnly cookie automatically; the
           // rotated refresh token comes back as a new Set-Cookie and the fresh
@@ -127,12 +145,19 @@ function createClient(): AxiosInstance {
           // cookie flow on a cross-ORIGIN (but same-site) API host when CORS
           // credentials are enabled; the cookie is SameSite=Strict, so a
           // genuinely cross-SITE SPA/API split is not supported by design.
-          const res = await client.post<RefreshResponse>(
-            "/auth/refresh",
-            {},
-            { withCredentials: true },
+          // One refresh for every tab of this browser (#2960): another tab
+          // may already have rotated, in which case its token is adopted.
+          const { access_token, force_password_change } = await sharedRefresh(
+            async (signal) =>
+              (
+                await client.post<RefreshResponse>(
+                  "/auth/refresh",
+                  {},
+                  { withCredentials: true, signal },
+                )
+              ).data,
+            staleToken,
           );
-          const { access_token, force_password_change } = res.data;
           setAccessToken(access_token);
           setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
@@ -2970,6 +2995,11 @@ export interface BackupManifestPreviewResponse {
   /** True only for a custom-format dump — the one shape the API accepts
    *  a selective restore of. */
   selective_restore_supported?: boolean;
+  /** False when the restore itself would refuse this archive (no dump, no
+   *  secrets.enc, a newer format_version); `restore_refusal` says why.
+   *  Absent from a server older than #2949. */
+  restorable?: boolean;
+  restore_refusal?: string | null;
 }
 
 export const backupApi = {
@@ -8466,6 +8496,18 @@ export interface DHCPServerGroup {
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
+  /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
+   *  of two or more. HA does not render while this is non-empty. Empty for a
+   *  standalone group. Optional so fixtures predating it still type-check. */
+  ha_peer_urls_missing?: string[];
+  /** #2963 — why the control plane did not derive the missing URL(s):
+   *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
+   *  becomes a Kea backup and can take over the primary role, so it is left
+   *  to the operator). Null when it is derivable or nothing is missing. */
+  ha_autofill_skipped_reason?:
+    | "bridged_network_mode"
+    | "more_than_two_kea_members"
+    | null;
   // Member servers (rolled up by the /server-groups response).
   servers: DHCPServerGroupMember[];
   created_at: string;
@@ -10105,9 +10147,13 @@ export const authApi = {
   logout: () => api.post("/auth/logout", undefined, { withCredentials: true }),
   /** Exchange the HttpOnly refresh cookie for a fresh access token. No
    *  argument — the cookie rides the request automatically (#484). */
-  refresh: () =>
+  refresh: (signal?: AbortSignal) =>
     api
-      .post<RefreshResponse>("/auth/refresh", {}, { withCredentials: true })
+      .post<RefreshResponse>(
+        "/auth/refresh",
+        {},
+        { withCredentials: true, signal },
+      )
       .then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {
@@ -11852,6 +11898,14 @@ export const metricsApi = {
 };
 
 export interface VersionInfo {
+  // Always present (#2935): enough to know this is a SpatiumDDI control plane.
+  product: string;
+  api_level: number;
+  // True for an anonymous caller: the version, release-check and appliance
+  // identity fields below are then withheld (null / false), and ``version`` is
+  // the placeholder "restricted", which parseRelease reads as unknown. The
+  // console only asks while signed in, so it always sees ``restricted: false``.
+  restricted: boolean;
   version: string;
   latest_version: string | null;
   update_available: boolean;

@@ -133,6 +133,52 @@ TOPOLOGY_PULL_DRIVERS: frozenset[str] = CREDENTIALED_DNS_DRIVERS | {"windows_dns
 AXFR_TSIG_DRIVERS: frozenset[str] = frozenset({"bind9", "technitium"})
 
 
+# #2942 — the record TTLs a hosted provider can hold EXACTLY, as an inclusive
+# ``(min, max)`` (``max=None``: no bound beyond the record API's own). A
+# driver absent from this table publishes any 0..DNS_TTL_MAX value as stored
+# (BIND9, PowerDNS, Technitium, Route 53, Google Cloud DNS, Windows).
+#
+# The record API refuses a TTL outside the range with a 422 rather than
+# letting the driver coerce it, because both alternatives are worse: the
+# provider refusing the write leaves a stored record that never publishes,
+# and clamping publishes a TTL the database does not hold. ``None`` (inherit)
+# is never refused — every provider has its own default for it.
+#
+# Several of these minimums are a SENTINEL rather than a floor, which is why
+# 0 cannot be passed through: Vultr and Linode read 0 as "automatic / zone
+# default", and Cloudflare reads 1 as "automatic". Sources (checked
+# 2026-10-28): Cloudflare 60-86400, 30 on Enterprise (the gate uses 30 so an
+# Enterprise account is not refused — below 60 on another plan the provider
+# still refuses); Azure 1-2147483647; DigitalOcean 30 minimum; Hetzner 60
+# minimum. Linode also ROUNDS any value outside its fixed set (300, 3600, ...)
+# to the nearest one, which this range does not express.
+PROVIDER_TTL_RANGES: dict[str, tuple[int, int | None]] = {
+    "cloudflare": (30, 86400),
+    "azure_dns": (1, None),
+    "digitalocean": (30, None),
+    "hetzner": (60, None),
+    "linode": (1, None),
+    "vultr": (1, None),
+}
+
+
+def ttl_refusal(driver_name: str, ttl: int | None) -> str | None:
+    """Why ``driver_name`` cannot publish ``ttl`` exactly, or None if it can."""
+    if ttl is None:
+        return None
+    bounds = PROVIDER_TTL_RANGES.get(driver_name)
+    if bounds is None:
+        return None
+    lo, hi = bounds
+    if ttl >= lo and (hi is None or ttl <= hi):
+        return None
+    span = f"{lo}-{hi}" if hi is not None else f"{lo} or more"
+    return (
+        f"TTL {ttl} cannot be published on {driver_name}: it accepts {span} seconds. "
+        "Choose a TTL in that range, or leave the TTL empty to use the provider's default."
+    )
+
+
 def is_agentless(driver_name: str) -> bool:
     """True if the driver runs from the control plane without an agent."""
     return driver_name in AGENTLESS_DRIVERS
