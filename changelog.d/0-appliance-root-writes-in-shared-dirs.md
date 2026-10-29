@@ -13,9 +13,10 @@
   writes through it. The firewall auto-revert keeps its lock in `/run`,
   and restores only a snapshot and deadline it wrote itself. The packet
   capture and storage runners work from inside their directories (which
-  the supervisor owns), create the capture `O_EXCL|O_NOFOLLOW`, and keep
-  tcpdump's stderr in a private temp file. The trigger guard, the slot
-  runners and the k3s token publisher rename with `-T`; the slot
+  the supervisor owns), start Python isolated (`python3 -I`) so nothing
+  in that directory is imported, create the capture
+  `O_EXCL|O_NOFOLLOW`, and keep tcpdump's stderr in a private temp file. The trigger guard, the slot
+  runners, the k3s token publisher and the reboot unit rename with `-T`; the slot
   sidecars are re-moded only when root owns them; firstboot re-modes the
   capture directory from inside it. A cluster join keeps its k3s
   identity backup in a fresh `mktemp -d` directory, and a leave restores

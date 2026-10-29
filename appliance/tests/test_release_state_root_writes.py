@@ -446,6 +446,76 @@ def test_storage_runner_result_uses_no_fixed_temp_name(tmp_path: Path) -> None:
     assert '"ok": false' in (storage / "r1.result.json").read_text()
 
 
+def test_storage_runner_imports_no_module_from_its_working_directory(tmp_path: Path) -> None:
+    """The runner works from inside ``storage/``, which the supervisor owns.
+    A ``python3 -`` started there puts that directory first on sys.path, so a
+    ``json.py`` placed in it would run as root when the request is parsed."""
+    storage = tmp_path / "rs" / "storage"
+    storage.mkdir(parents=True)
+    src = (BIN / "spatiumddi-storage-action").read_text()
+    for a, b in (
+        ("STATE_DIR=/var/lib/spatiumddi/release-state/storage", f"STATE_DIR={storage}"),
+        ("LOG_DIR=/var/log/spatiumddi", f"LOG_DIR={tmp_path}"),
+    ):
+        assert a in src, a
+        src = src.replace(a, b)
+    script = tmp_path / "storage-action"
+    script.write_text(src)
+    marker = tmp_path / "imported-from-storage-dir"
+    for mod in ("json", "re", "tempfile"):
+        (storage / f"{mod}.py").write_text(
+            f"open({str(marker)!r}, 'a').write({mod!r} + '\\n')\n"
+        )
+    (storage / "r1.request.json").write_text('{"action": "no-such-action"}')
+    r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60,
+                       cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists(), marker.read_text()
+    assert '"ok": false' in (storage / "r1.result.json").read_text()
+
+
+def test_pcap_runner_imports_no_module_from_its_working_directory(tmp_path: Path) -> None:
+    """Same for ``pcap/``: the capture opener is a ``python3 -c`` started
+    there. A directory at the capture's name makes it raise, and printing the
+    traceback imports ``traceback`` (Python 3.13+), from the working
+    directory unless Python runs isolated."""
+    rs = tmp_path / "rs"
+    pcap = rs / "pcap"
+    pcap.mkdir(parents=True)
+    src = (BIN / "spatium-pcap-runner").read_text()
+    script = tmp_path / "pcap-runner"
+    script.write_text(src.replace("/var/lib/spatiumddi/release-state/pcap", str(pcap)))
+    bindir = tmp_path / "bin"
+    _stub(bindir, "tcpdump", "#!/bin/bash\nprintf PCAPDATA\n")
+    _stub(bindir, "logger", "#!/bin/bash\nexit 0\n")
+    marker = tmp_path / "imported-from-pcap-dir"
+    for mod in ("traceback", "linecache"):
+        (pcap / f"{mod}.py").write_text(
+            f"open({str(marker)!r}, 'a').write({mod!r} + '\\n')\n"
+        )
+    (pcap / "c1.pcap").mkdir()
+    (pcap / "c1.request").write_text("capture_id=c1\ninterface=any\nmax_duration_s=5\nbpf=\n")
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "TMPDIR": str(tmp_path)}
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True,
+                       timeout=60, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists(), marker.read_text()
+    assert "state=failed" in (pcap / "c1.state").read_text()
+
+
+def test_runners_working_inside_a_supervisor_directory_run_python_isolated() -> None:
+    """Structural half of the two tests above, for the Python versions whose
+    exception display imports nothing: every python3 these runners start
+    from inside their directory is ``-I``."""
+    for name in ("spatium-pcap-runner", "spatiumddi-storage-action"):
+        code = "\n".join(ln for ln in (BIN / name).read_text().splitlines()
+                         if not ln.lstrip().startswith("#"))
+        calls = re.findall(r"\bpython3\b[^\n]*", code)
+        assert calls, name
+        for c in calls:
+            assert re.match(r"python3 -I\b", c), f"{name}: {c}"
+
+
 # ── cluster-join's parked manifests ─────────────────────────────────────────
 
 def _aside(tmp_path: Path, call: str) -> subprocess.CompletedProcess[str]:

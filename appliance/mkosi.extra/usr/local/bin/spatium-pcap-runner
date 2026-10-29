@@ -47,6 +47,10 @@ GRACE_S=10
 # name (a symlink included) is refused rather than opened, and nothing is
 # ever opened through it. tcpdump writes the capture to stdout (-w -).
 # argv: <capture path> <tcpdump argv...>
+# Run with ``python3 -I``: the runner's working directory is PCAP_DIR, which
+# the supervisor owns, and without -I Python puts the working directory first
+# on sys.path, so a module file placed there (traceback.py, imported to print
+# an uncaught exception) would run as root.
 OPEN_NEW_CAPTURE='
 import os, sys
 path = sys.argv[1]
@@ -171,7 +175,7 @@ errfile=$(mktemp "${TMPDIR:-/tmp}/spatium-pcap-stderr.XXXXXX") || {
   write_state "$cid" failed "" 0 "could not create a temp file"
   exit 0
 }
-setsid python3 -c "$OPEN_NEW_CAPTURE" "$pcap" "${argv[@]}" 2>"$errfile" &
+setsid python3 -I -c "$OPEN_NEW_CAPTURE" "$pcap" "${argv[@]}" 2>"$errfile" &
 pid=$!
 pgid=$pid
 

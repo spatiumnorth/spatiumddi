@@ -55,6 +55,10 @@ mkdir -p "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
 # directory, which a later rename of the name cannot move. Inside it, files
 # are only ever created under a fresh name (mkstemp, O_EXCL) and renamed
 # with -T / os.replace, neither of which writes through a link.
+#
+# Every python3 below runs with -I. Without it Python puts the working
+# directory, i.e. STATE_DIR, first on sys.path, and a ``json.py`` the
+# supervisor placed there would be imported and run as root.
 _state_parent=$(cd -P -- "$(dirname -- "$STATE_DIR")" 2>/dev/null && pwd -P) || exit 0
 if ! cd -P -- "$STATE_DIR" 2>/dev/null \
         || [ "$(pwd -P)" != "$_state_parent/$(basename -- "$STATE_DIR")" ]; then
@@ -90,7 +94,7 @@ log() {
 # Write the result and stop. ``$1`` ok(0/1), ``$2`` detail, ``$3`` output.
 emit() {
     local ok="$1" detail="$2" output="${3:-}"
-    python3 - "$RESULT" "$ok" "$ACTION" "$detail" "$output" <<'PYEOF'
+    python3 -I - "$RESULT" "$ok" "$ACTION" "$detail" "$output" <<'PYEOF'
 import json, os, sys, tempfile
 path, ok, action, detail, output = sys.argv[1:6]
 # A fresh name (O_EXCL), not a fixed one a symlink could be waiting at.
@@ -143,7 +147,7 @@ for REQUEST in "$STATE_DIR"/*.request.json; do
     # with a shell regex: the values are device paths and array names
     # that reach argv, and a hand-rolled parser is how one of those
     # becomes a second argument.
-    read -r ACTION ARRAY DEVICE < <(python3 - "$REQUEST" <<'PYEOF'
+    read -r ACTION ARRAY DEVICE < <(python3 -I - "$REQUEST" <<'PYEOF'
 import json, re, sys
 try:
     with open(sys.argv[1]) as fh:
