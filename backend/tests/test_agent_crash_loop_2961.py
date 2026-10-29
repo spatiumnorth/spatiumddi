@@ -495,7 +495,7 @@ async def test_the_wording_follows_the_source(db_session: AsyncSession) -> None:
     from app.services.agents.container_oom import container_oom_report
 
     now = datetime.now(UTC).replace(microsecond=0)
-    appliance, _t = await _appliance(db_session, "ddi-loop-5")
+    await _appliance(db_session, "ddi-loop-5")
     own, _h = await _kea_server(db_session, host="ddi-loop-5")
     own.daemon_status = STATUS_DEGRADED
     own.daemon_reason = "oom_killed: Kea was killed for exceeding its memory limit"
