@@ -84,11 +84,16 @@ def test_the_connection_budget_at_one_three_and_nine_nodes(
 
 
 def _chart_max_connections() -> int:
+    """The floor the appliance keeps. Since #2955 the chart derives
+    ``max_connections`` from its own pools when the value is empty (its
+    default), so the appliance must always set one: its floor is the chart's
+    pre-#2955 200, kept so an appliance under the crossing does not roll."""
     for parent in Path(__file__).resolve().parents:
         values = parent / "charts" / "spatiumddi" / "values.yaml"
         if values.is_file():
             doc = yaml.safe_load(values.read_text(encoding="utf-8"))
-            return int(doc["postgresql"]["cnpg"]["parameters"]["max_connections"])
+            assert doc["postgresql"]["cnpg"]["parameters"]["max_connections"] in ("", None)
+            return 200
     raise AssertionError("could not find charts/spatiumddi/values.yaml")
 
 

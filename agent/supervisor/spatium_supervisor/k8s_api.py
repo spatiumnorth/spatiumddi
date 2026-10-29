@@ -2388,7 +2388,10 @@ _PROBE_DB_CONN_PER_API_POD = 1
 _PG_CONN_RESERVE = 10
 _PG_BACKEND_BASE_MIB = 14
 _PG_FIXED_MIB = 256
-# charts/spatiumddi/values.yaml: postgresql.cnpg.parameters.max_connections.
+# The appliance's floor: charts/spatiumddi/values.yaml's pre-#2955 200. The
+# chart now derives max_connections (and the memory limit) from its own pools
+# when the value is empty, so the appliance always writes one; keeping 200
+# below the crossing means an existing appliance does not roll.
 _PG_CHART_MAX_CONNECTIONS = 200
 
 
