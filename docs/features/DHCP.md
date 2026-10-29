@@ -57,6 +57,47 @@ change re-renders the running Kea within a heartbeat. It is distinct from
 `network_mode` (host vs bridged), which controls the *container's* network
 namespace on supervisor-managed appliances — a directly-attached server
 typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
+
+**Behind the MetalLB DHCP relay VIP, a group must be `relay` (#2899).**
+The relay VIP (`dhcp_relay_vip`, Fleet → Network → MetalLB → Advanced) is a
+LoadBalancer Service over every Kea pod in the appliance cluster, with
+`externalTrafficPolicy: Cluster`. kube-proxy on the node announcing the VIP
+keeps about one relay flow in N on that node's own Kea. In `direct` mode
+Kea's raw socket sees that frame before netfilter, still addressed to the
+VIP, and its filter (broadcast or the socket's own address only) drops it;
+the DNATed copy reaches Kea's UDP socket, which raw mode drains and
+discards. So those relays' clients get no address, and no counter shows it —
+the #2889 arrival counter leaves VIP-addressed frames out on purpose. In
+`relay` mode Kea reads that UDP socket, so every relay is answered. Kea
+replies to the relay's `giaddr`, from the node's own address — the same way
+the other nodes already answer the flows forwarded to them — so the reply
+comes back from the VIP only when the relay sends from its `giaddr`.
+
+"Behind the VIP" means a node of the control plane's own k3s cluster: the
+seed, and every promoted member. An approved Additional node that was never
+promoted runs its own single-node k3s with no MetalLB, so a branch appliance
+serving its directly attached VLAN in `direct` mode is not affected and is
+never refused or alerted on.
+
+There is no way to serve both through the VIP: Kea cannot mix raw and UDP
+sockets in one daemon, and SpatiumDDI does not switch a group's mode on its
+own, because `relay` stops directly attached clients being served. Instead:
+
+- `PUT …/control-plane/metallb` refuses (422) to **turn on** a relay VIP
+  while any group it would front is `direct`, naming the groups;
+- `PUT /dhcp/server-groups/{id}` refuses to change a group behind the VIP
+  **to** `direct`; while a VIP is set, the Fleet / Copilot role assignment
+  refuses to point a cluster node's DHCP role at a `direct` group (or to add
+  the role to a node already pointed at one), `PUT /dhcp/servers/{id}`
+  refuses to move a cluster node's Kea into a `direct` group, and a
+  control-plane promote refuses a joiner that serves one;
+- the default-on `dhcp_relay_vip_direct_socket` alert (critical, one event
+  per group) and the MetalLB card report the state whenever it exists — an
+  install that had it before these checks, or a path they do not cover.
+
+A group that must also serve directly attached clients keeps `direct`, and its
+relays forward to every DHCP node's own address (several `ip helper-address`
+lines) rather than to the VIP.
 See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#dhcp-server-kea-doesnt-respond-to-discover)
 for the "no DHCPOFFER" diagnosis flow.
 

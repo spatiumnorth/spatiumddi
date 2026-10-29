@@ -41,6 +41,11 @@ from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
 from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
 from app.services.dhcp.ha_peer_autofill import HA_GROUP_MODES, autofill_skipped_reason
+from app.services.dhcp.relay_vip import (
+    group_ids_behind_relay_vip,
+    load_relay_vip,
+    refusal_for_groups,
+)
 from app.services.dhcp.windows_failover_report import group_failover_report
 
 router = APIRouter(
@@ -510,6 +515,13 @@ async def update_group(
         problem = group_name_problem("dhcp", new_name)
         if problem is not None:
             raise HTTPException(status_code=422, detail=problem)
+    # #2899 — a group behind the MetalLB relay VIP cannot read raw sockets:
+    # relays whose flows land on the node announcing the VIP would get no
+    # answer. Only on a change to ``direct``, so re-saving is never refused.
+    if changes.get("dhcp_socket_mode") == "direct" and g.dhcp_socket_mode != "direct":
+        vip = await load_relay_vip(db)
+        if vip and g.id in await group_ids_behind_relay_vip(db):
+            raise HTTPException(status_code=422, detail=refusal_for_groups(vip, [g.name]))
     for k, v in changes.items():
         setattr(g, k, v)
     # HA tuning (mode / heartbeat / delays / auto-failover), the Kea socket

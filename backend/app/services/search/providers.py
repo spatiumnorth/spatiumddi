@@ -292,10 +292,12 @@ async def search_subnets(db: AsyncSession, s: QueryShape, limit: int) -> list[Se
     stmt = select(Subnet, IPSpace).join(IPSpace, Subnet.space_id == IPSpace.id)
 
     if s.is_cidr:
-        stmt = stmt.where(text("CAST(subnet.network AS cidr) <<= CAST(:q AS cidr)").params(q=s.raw))
+        stmt = stmt.where(
+            text("CAST(subnet.network AS cidr) <<= CAST(:q AS cidr)").params(q=s.cidr)
+        )
         rank: Any = EXACT
     elif s.is_ip:
-        stmt = stmt.where(text("CAST(subnet.network AS cidr) >> CAST(:q AS inet)").params(q=s.raw))
+        stmt = stmt.where(text("CAST(subnet.network AS cidr) >>= CAST(:q AS inet)").params(q=s.raw))
         rank = EXACT
     else:
         stmt = stmt.where(_text_clauses(s.raw, Subnet.name, Subnet.description))
@@ -337,12 +339,12 @@ async def search_blocks(db: AsyncSession, s: QueryShape, limit: int) -> list[Sea
 
     if s.is_cidr:
         stmt = stmt.where(
-            text("CAST(ip_block.network AS cidr) <<= CAST(:q AS cidr)").params(q=s.raw)
+            text("CAST(ip_block.network AS cidr) <<= CAST(:q AS cidr)").params(q=s.cidr)
         )
         rank: Any = EXACT
     elif s.is_ip:
         stmt = stmt.where(
-            text("CAST(ip_block.network AS cidr) >> CAST(:q AS inet)").params(q=s.raw)
+            text("CAST(ip_block.network AS cidr) >>= CAST(:q AS inet)").params(q=s.raw)
         )
         rank = EXACT
     else:
