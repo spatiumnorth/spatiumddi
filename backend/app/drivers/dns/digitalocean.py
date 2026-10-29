@@ -29,6 +29,13 @@ from typing import Any
 
 import httpx
 
+from app.drivers.dns._caa import (
+    caa_key,
+    caa_text,
+    caa_unquoted_value,
+    caa_value_octets,
+    parse_caa,
+)
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -218,7 +225,7 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
                         RecordData(
                             name=self._relativize(rec.get("name", "@"), zone_fqdn),
                             record_type=rec["type"],
-                            value=rec.get("data", ""),
+                            value=self._read_value(rec),
                             ttl=ttl,
                             priority=rec.get("priority"),
                             weight=rec.get("weight"),
@@ -230,6 +237,32 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
                 page += 1
         return records
 
+    @staticmethod
+    def _read_value(rec: dict[str, Any]) -> str:
+        """The canonical value of a pulled record. DigitalOcean keeps a CAA
+        record's flags, tag and value in three fields (``flags`` / ``tag`` /
+        ``data``); the canonical ``<flags> <tag> "<value>"`` is rebuilt (#2959).
+        Field names from the ``domain_record`` model in
+        github.com/digitalocean/openapi (``flags`` 0-255, ``tag``, ``data`` =
+        "the domain name of the CA"). A ``data`` that arrives as one quoted
+        string is unquoted rather than escaped, so either spelling keys the
+        same. A CAA row with no ``tag`` (the whole value in ``data``, as a
+        release before #2959 sent it) reads as that text."""
+        if str(rec.get("type")).upper() == "CAA" and rec.get("tag"):
+            return caa_text(
+                rec.get("flags") or 0, rec["tag"], caa_value_octets(str(rec.get("data") or ""))
+            )
+        return str(rec.get("data", ""))
+
+    @staticmethod
+    def record_value_refusal(record_type: str, value: str) -> str | None:
+        """Why DigitalOcean cannot hold this record value, or None (#2959).
+        A CAA record is sent as separate ``flags`` / ``tag`` / ``data``, so a
+        value that does not parse as ``<flags> <tag> <value>`` cannot be sent."""
+        if record_type.upper() == "CAA" and parse_caa(value) is None:
+            return f"DigitalOcean: CAA value {value!r} is not '<flags> <tag> <value>'."
+        return None
+
     # ── Record writes ───────────────────────────────────────────────────
     def _record_payload(self, change: RecordChange) -> dict[str, Any]:
         rec = change.record
@@ -238,6 +271,15 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
             "name": self._write_name(rec.name),
             "data": rec.value,
         }
+        if rec.record_type.upper() == "CAA":
+            parsed = parse_caa(rec.value)
+            if parsed is None:
+                raise CloudDNSError(
+                    self.record_value_refusal(rec.record_type, rec.value) or "bad CAA value"
+                )
+            payload["flags"] = parsed[0]
+            payload["tag"] = parsed[1]
+            payload["data"] = caa_unquoted_value(rec.value)
         # Omit ttl when None so DigitalOcean applies its account default
         # (1800s), mirroring the auto-TTL round-trip on the read path.
         if rec.ttl is not None:
@@ -293,7 +335,10 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
                     if first_match is None:
                         first_match = int(rec["id"])
                     continue
-                if rec.get("data") != value:
+                if record_type == "CAA":
+                    if caa_key(self._read_value(rec)) != caa_key(value):
+                        continue
+                elif rec.get("data") != value:
                     continue
                 if priority is not None and rec.get("priority") != priority:
                     continue

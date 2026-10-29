@@ -561,24 +561,30 @@ async def approve_request(
     3. Approver holds ``{approve, change_request}``.
     4. Approver holds the underlying operation's ``required_permission`` —
        they can't rubber-stamp a delete they couldn't perform themselves.
-    5. The operation's ``preview()`` re-runs under the approver; a stale
-       request (target gone / now non-empty / synthesised) does NOT execute
-       (409, left ``pending`` so the requester can cancel).
+    5. The operation's ``preview()`` re-runs under the approver. If it
+       refuses (target gone / now non-empty / synthesised), the operation
+       does NOT execute and the row ends ``failed`` with the reason (200,
+       #2911). If it still succeeds but its scope differs from what the
+       approver reviewed, the approve answers 409 and the row stays
+       ``pending``: the requester can cancel and re-submit.
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
-       in ``old_value.requested_by``. A client 4xx raised by ``apply()``
-       leaves the row ``pending`` and surfaces the status; a server fault
-       marks it ``failed``.
+       in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx
+       or any other exception — the row is stamped ``approved`` then
+       ``failed`` with the reason in ``error`` and the call answers 200
+       (#2911), so the requester can read why. The one exception is a
+       permission error about this approver: 403, left ``pending``, since a
+       different approver may still approve.
     """
     await _assert_gate_row(db, cr_id)
     note = body.decision_note if body is not None else None
 
     # Delegate to the single two-person spine (services/approvals/service.py)
     # so this HTTP path and the AI propose→apply path enforce the IDENTICAL
-    # invariants (#5 fail-closed on a deleted requester, #11 client-4xx from
-    # apply leaves the row pending, #13 expiry routes through the audited
-    # mark_expired, #14 mark_failed carries the requester id, #15 guarded
-    # rollback). DecisionError subclasses carry the right HTTP status.
+    # invariants (#5 fail-closed on a deleted requester, #2911 every apply
+    # refusal but a permission error ends failed, #13 expiry routes through
+    # the audited mark_expired, #14 mark_failed carries the requester id,
+    # #15 guarded rollback). DecisionError subclasses carry the right HTTP status.
     try:
         cr = await approve_change_request(
             db, cr_id, approver=current_user, request=request, note=note

@@ -49,6 +49,7 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
+from ._caa import caa_presentation
 from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, DriverBase
 
@@ -154,6 +155,8 @@ def _record_content(rec: dict[str, Any], zone: str | None = None) -> str:
     value = rec.get("value") or ""
     if rtype == "TXT":
         return _quote_txt(value)
+    if rtype == "CAA":
+        return caa_presentation(value)
     if rtype in ("CNAME", "DNAME", "NS", "PTR", "ALIAS"):
         return _qualify_target(value.strip(), zone)
     if rtype == "MX":
@@ -2403,6 +2406,18 @@ class PowerDNSDriver(DriverBase):
                 # SpatiumDDI releases instead. A startup setting: takes effect on
                 # pdns's next start, like ``dnsupdate`` below.
                 "security-poll-suffix=",
+                # #2935 — what pdns says about itself over CHAOS queries.
+                # By default ``version.bind`` names the exact build and
+                # ``id.server`` (and NSID) the container hostname, a
+                # container id on Compose. Version and stack details are for
+                # signed-in users only. Literal "none" rather than
+                # ``version-string=anonymous``: that one answers SERVFAIL,
+                # which reads as a fault on a monitor, while "none" keeps both
+                # queries answered — so the chart's readiness probe and the
+                # image HEALTHCHECK (``dig id.server CH TXT``) still get a
+                # reply. Startup settings, like ``dnsupdate`` below.
+                "version-string=none",
+                "server-id=none",
                 # ALIAS-record resolution requires both ``expand-alias=yes``
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through

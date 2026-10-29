@@ -58,7 +58,7 @@ from app.drivers.dns._cloud_base import (
     split_structured_rdata,
     value_is_managed,
 )
-from app.drivers.dns.base import RecordChange, RecordData
+from app.drivers.dns.base import RecordChange, RecordData, first_ttl
 
 logger = structlog.get_logger(__name__)
 
@@ -316,10 +316,10 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             # the common single-value rrset (CNAME, a host with one A/TXT).
             if change.rrset is not None and change.rrset.members:
                 values = [compose_structured_rdata(m) for m in change.rrset.as_records(rr)]
-                ttl = int(change.rrset.ttl or (rr.ttl if rr.ttl else 0) or 300)
+                ttl = first_ttl(change.rrset.ttl, rr.ttl, default=300)
             else:
                 values = [composed]
-                ttl = int(rr.ttl) if rr.ttl else 300
+                ttl = first_ttl(rr.ttl, default=300)
             existing = self._find_rrset(zone, absolute, rtype)
             if existing is not None:
                 changes.delete_record_set(existing)
@@ -362,7 +362,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         merged: list[str] = list(self._rrdatas(existing)) if existing is not None else []
         if value not in merged:
             merged.append(value)
-        if change_ttl:
+        if change_ttl is not None:
             ttl = int(change_ttl)
         elif existing is not None and existing.ttl is not None:
             ttl = int(existing.ttl)
