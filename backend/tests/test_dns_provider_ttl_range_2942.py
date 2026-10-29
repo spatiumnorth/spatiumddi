@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.dns.router import _check_driver_ttl
+from app.api.v1.dns.router import _check_driver_refusals
 from app.core.security import create_access_token, hash_password
 from app.drivers.dns import _DRIVERS, PROVIDER_TTL_RANGES, ttl_refusal
 from app.models.auth import User
@@ -181,9 +181,9 @@ async def test_bulk_create_ttl_zero_on_linode_is_422(
 @pytest.mark.asyncio
 async def test_gate_passes_inherit_and_in_range(db_session: AsyncSession) -> None:
     zone = await _zone(db_session, "cloudflare")
-    await _check_driver_ttl([None, 300], zone.group_id, db_session)
+    await _check_driver_refusals([("A", None, None), ("A", None, 300)], zone.group_id, db_session)
     with pytest.raises(HTTPException) as exc:
-        await _check_driver_ttl([None, 0], zone.group_id, db_session)
+        await _check_driver_refusals([("A", None, None), ("A", None, 0)], zone.group_id, db_session)
     assert exc.value.status_code == 422
 
 
@@ -192,4 +192,4 @@ async def test_gate_passes_an_empty_group(db_session: AsyncSession) -> None:
     grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
     db_session.add(grp)
     await db_session.flush()
-    await _check_driver_ttl([0], grp.id, db_session)
+    await _check_driver_refusals([("A", None, 0)], grp.id, db_session)
