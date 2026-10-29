@@ -37,6 +37,23 @@
 
 set -euo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/ntp-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/ntp-config-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/ntp-status
@@ -72,7 +89,7 @@ nft_reload() {
 # heartbeat re-read on each tick — eventually-consistent.
 update_sync_status() {
     if ! command -v chronyc >/dev/null 2>&1; then
-        echo "unknown" > "$STATUS_SIDECAR"
+        echo "unknown" | state_write "$STATUS_SIDECAR"
         return
     fi
     # ``chronyc tracking`` exits 0 even when unsynchronised — we
@@ -84,13 +101,13 @@ update_sync_status() {
     leap=$(chronyc -h 127.0.0.1 tracking 2>/dev/null | awk -F': *' '/^Leap status/ {print $2}')
     case "$leap" in
         "Normal"|"Insert second"|"Delete second")
-            echo "synchronized" > "$STATUS_SIDECAR"
+            echo "synchronized" | state_write "$STATUS_SIDECAR"
             ;;
         "Not synchronised")
-            echo "unsynchronized" > "$STATUS_SIDECAR"
+            echo "unsynchronized" | state_write "$STATUS_SIDECAR"
             ;;
         *)
-            echo "unknown" > "$STATUS_SIDECAR"
+            echo "unknown" | state_write "$STATUS_SIDECAR"
             ;;
     esac
 }
@@ -122,8 +139,8 @@ echo "  body size:     $(wc -c < "$TMP_BODY") bytes"
 
 if [ "$MARKER" != "enabled" ]; then
     echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
 
@@ -137,15 +154,15 @@ fi
 # on the appliance before #387.
 if ! command -v chronyd >/dev/null 2>&1; then
     echo "  ✗ chronyd binary not found — is chrony installed?"
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
 if ! chronyd -p -f "$TMP_BODY" >/tmp/spatium-chrony-validate.log 2>&1; then
     echo "  ✗ chronyd -p failed for staged config:"
     sed 's/^/      /' /tmp/spatium-chrony-validate.log
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
 echo "  ✓ chronyd -p passed"
@@ -183,8 +200,8 @@ elif systemctl restart chrony.service >/dev/null 2>&1; then
 else
     echo "  ✗ chrony reload + restart both failed"
     systemctl status chrony.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
 
@@ -213,7 +230,7 @@ fi
 # Capture post-reload sync state for the heartbeat.
 update_sync_status
 
-echo "$HASH" > "$HASH_SIDECAR"
-echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+echo "$HASH" | state_write "$HASH_SIDECAR"
+echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
 echo "  ✓ done — sync state: $(cat "$STATUS_SIDECAR")"

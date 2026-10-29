@@ -51,7 +51,7 @@ fi
 # Read the trigger payload (just a timestamp from the agent) for the
 # audit log, then move it aside so the path unit doesn't re-fire.
 TRIGGER_PAYLOAD="$(cat "$TRIGGER" 2>/dev/null || true)"
-mv -f "$TRIGGER" "${TRIGGER}.done" || true
+mv -fT "$TRIGGER" "${TRIGGER}.done" || true
 
 log "operator-triggered reboot accepted (agent stamp: ${TRIGGER_PAYLOAD:-unknown})"
 log "scheduling reboot in ${GRACE_SECONDS}s"

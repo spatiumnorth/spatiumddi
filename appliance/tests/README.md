@@ -30,6 +30,7 @@ helm or a cluster.
 | `test_live_session_sudoers.py` | The live ISO's session sudoers rule staying off installed systems: live-config's account components removed from the image, the installer's excludes, `spatium-etc-reconcile`'s exact-content cleanup, and `user` / `debian` reserved as admin usernames |
 | `test_preseed_lint.py` | `spatium-install --check-preseed` linter |
 | `test_preseed_security.py` | The #549 preseed installer's security guards (#581) |
+| `test_release_state_root_writes.py` | Root host runners writing in the release-state directory (and the supervisor-owned `pcap/` / `storage/`, a removable disk, `tls/`) only under fresh temp names renamed over with `-T`, executed against planted symlinks and directories, plus a whole-tree sweep for direct writes |
 | `test_slot_status_active_version.py` | `spatium-upgrade-slot status` reading the active slot's version without a mount (#788) |
 | `test_slot_upgrade_runner.py` | `spatiumddi-slot-upgrade` dead/stalled-apply guards (#421) |
 

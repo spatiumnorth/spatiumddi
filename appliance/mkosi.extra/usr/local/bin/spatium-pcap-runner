@@ -29,7 +29,7 @@
 # re-fires it (via the .path unit) for the next one.
 set -u
 
-PCAP_DIR=/var/lib/spatiumddi/release-state/pcap
+PCAP_DIR="${SPATIUM_PCAP_DIR:-/var/lib/spatiumddi/release-state/pcap}"
 IFACE_RE='^[A-Za-z0-9_.:@-]{1,64}$'
 # #555 — capture_id becomes $PCAP_DIR/$cid.{pcap,cancel,state}; a value
 # with ``/`` or ``..`` would escape PCAP_DIR. Validate the charset here too
@@ -42,32 +42,67 @@ CID_RE='^[A-Za-z0-9._-]{1,128}$'
 POLL_S=1
 GRACE_S=10
 
+# Runs tcpdump with its stdout on a capture file this creates itself:
+# O_CREAT|O_EXCL|O_NOFOLLOW, so whatever the supervisor may have put at that
+# name (a symlink included) is refused rather than opened, and nothing is
+# ever opened through it. tcpdump writes the capture to stdout (-w -).
+# argv: <capture path> <tcpdump argv...>
+OPEN_NEW_CAPTURE='
+import os, sys
+path = sys.argv[1]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass  # the usual case: nothing there yet
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+os.dup2(fd, 1)
+os.close(fd)
+os.execvp(sys.argv[2], sys.argv[2:])
+'
+
 log() { logger -t spatium-pcap-runner "$*" 2>/dev/null || echo "spatium-pcap-runner: $*" >&2; }
+
+# PCAP_DIR belongs to the supervisor (uid 100, chowned by firstboot) and this
+# runs as root: by name, anything in it, the directory itself included, can
+# be swapped for a symlink at any moment. So the runner works from inside it:
+# ``cd -P`` resolves it once, the check refuses a PCAP_DIR that resolved
+# somewhere else (a symlink), and every path below is relative to the working
+# directory, which a later rename of the name cannot move. Inside it nothing
+# is opened for write by a name the supervisor could have prepared: the state
+# file is written under a fresh mktemp name and renamed over (-T), the capture
+# is created O_EXCL|O_NOFOLLOW (see open_new_capture), and tcpdump's stderr
+# goes to a private temp file outside it.
+[ -d "$PCAP_DIR" ] || exit 0
+_pcap_parent=$(cd -P -- "$(dirname -- "$PCAP_DIR")" 2>/dev/null && pwd -P) || exit 0
+if ! cd -P -- "$PCAP_DIR" 2>/dev/null \
+     || [ "$(pwd -P)" != "$_pcap_parent/$(basename -- "$PCAP_DIR")" ]; then
+  log "refusing to run: $PCAP_DIR is not a directory here"
+  exit 0
+fi
+PCAP_DIR=.
 
 write_state() {
   # $1=cid $2=state $3=packets $4=bytes $5=error
   local cid="$1" tmp
-  tmp="$PCAP_DIR/$cid.state.tmp"
+  tmp=$(mktemp "$PCAP_DIR/.$cid.state.XXXXXX") || return 0
   {
     echo "state=$2"
     echo "packets=${3:-}"
     echo "bytes=${4:-0}"
     echo "error=${5:-}"
   } > "$tmp"
-  mv -f "$tmp" "$PCAP_DIR/$cid.state"
+  chmod 0644 "$tmp"
+  mv -fT "$tmp" "$PCAP_DIR/$cid.state" || rm -f "$tmp"
 }
 
 # Pick the oldest pending request (skip already-claimed *.request.running).
-req=""
-if [ -d "$PCAP_DIR" ]; then
-  req=$(ls -1tr "$PCAP_DIR"/*.request 2>/dev/null | head -1)
-fi
+req=$(ls -1tr "$PCAP_DIR"/*.request 2>/dev/null | head -1)
 [ -z "$req" ] && exit 0
 
 # Claim it immediately so the .path glob stops matching + a concurrent
 # runner can't double-process.
 running="$req.running"
-mv -f "$req" "$running" 2>/dev/null || exit 0
+mv -fT "$req" "$running" 2>/dev/null || exit 0
 
 # Parse the line-based request.
 cid=""; interface="any"; snaplen=256; promiscuous=0
@@ -117,7 +152,7 @@ if [ -n "$free_mb" ] && [ "$free_mb" -lt "$want_mb" ]; then
 fi
 
 # ── Build the tcpdump argv as an ARRAY (no eval, no shell re-split). ──
-argv=(tcpdump -n -U -i "$interface" -s "$snaplen" -w "$pcap")
+argv=(tcpdump -n -U -i "$interface" -s "$snaplen" -w -)
 [ "$promiscuous" != "1" ] && argv+=(-p)
 [ -n "$max_packets" ] && [[ "$max_packets" =~ ^[0-9]+$ ]] && argv+=(-c "$max_packets")
 # BPF filter is a single trailing argv element. Empty → omit.
@@ -129,8 +164,14 @@ log "starting capture $cid on $interface (snaplen=$snaplen dur=${max_duration_s:
 write_state "$cid" running "" 0 ""
 
 # Spawn tcpdump in its own process group so we can kill the whole group.
-errfile="$PCAP_DIR/$cid.stderr"
-setsid "${argv[@]}" 2>"$errfile" &
+# Its stderr goes to a private temp file: the tail of it is copied into the
+# state file, so a name in PCAP_DIR could be a link to any host file whose
+# contents would then be handed to the supervisor.
+errfile=$(mktemp "${TMPDIR:-/tmp}/spatium-pcap-stderr.XXXXXX") || {
+  write_state "$cid" failed "" 0 "could not create a temp file"
+  exit 0
+}
+setsid python3 -c "$OPEN_NEW_CAPTURE" "$pcap" "${argv[@]}" 2>"$errfile" &
 pid=$!
 pgid=$pid
 

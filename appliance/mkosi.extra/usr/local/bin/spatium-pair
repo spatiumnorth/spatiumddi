@@ -165,8 +165,16 @@ else
     # pin fails every handshake and the old CA refuses the new one's
     # signed list, so the supervisor could never reach it to be told it is
     # revoked and re-register. The next contact pins the new certificate.
-    rm -f /var/persist/spatium-supervisor/tls/control-plane.pem \
-          /var/persist/spatium-supervisor/tls/ca-chain.pem
+    #
+    # tls/ belongs to the supervisor, which could make it a symlink to any
+    # directory and have root delete files of these names there. So the
+    # removal runs from inside it, once it is checked to resolve to itself.
+    _persist_real=$(cd -P /var/persist/spatium-supervisor 2>/dev/null && pwd -P) || _persist_real=""
+    if [ -n "$_persist_real" ] && [ ! -L /var/persist/spatium-supervisor/tls ]; then
+        ( cd -P /var/persist/spatium-supervisor/tls 2>/dev/null \
+            && [ "$(pwd -P)" = "$_persist_real/tls" ] \
+            && rm -f control-plane.pem ca-chain.pem ) || true
+    fi
 fi
 
 # Issue #183 Phase 7 — bounce the supervisor pod via kubectl so it
