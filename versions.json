@@ -574,6 +574,14 @@
       ],
       "upstream": { "kind": "github-release", "repo": "Redocly/redoc", "track": "^v2\\." },
       "note": "The redoc standalone bundle behind /api/redoc, vendored the same way and for the same reasons as swagger-ui (#1157). Tracks 2.x, FastAPI's own default major (3.x is still a release candidate on npm's `next` tag). The same after-bump check applies: load /api/redoc through the web tier and read the console."
+    },
+    "pip-licenses": {
+      "version": "5.5.5",
+      "pinned_in": [
+        { "path": "backend/Dockerfile", "match": "ARG PIP_LICENSES_VERSION={version}", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Build-time only (#2895): the backend image's builder stage installs it into a throwaway venv to generate the About page's Python third-party list; it never reaches the runtime image. Not a shipped component, so no NOTICE / THIRD_PARTY.md entry. Upstream tags it `v-5.5.5`, which the github-release resolver cannot compare, so check https://pypi.org/project/pip-licenses/ by hand."
     }
   },
 

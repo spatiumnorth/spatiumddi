@@ -73,6 +73,9 @@ services:
       # minimal — see backend/Dockerfile.
       target: dev
     restart: unless-stopped
+    # #2944 — above the image's uvicorn --timeout-graceful-shutdown (20 s) so
+    # lifespan shutdown runs before the kill; Docker's default is 10 s.
+    stop_grace_period: 30s
     networks:
       - spatiumddi
     ports:
@@ -231,8 +234,8 @@ services:
   frontend:
     image: spatiumddi-frontend:dev
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend/Dockerfile
     restart: unless-stopped
     networks:
       - spatiumddi

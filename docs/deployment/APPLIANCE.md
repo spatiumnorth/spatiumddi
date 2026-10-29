@@ -100,15 +100,16 @@ not the operator's:
   can open, which grow with the control-plane node count (#2156): every
   node runs an api pod with its own database pool and a worker, every api,
   worker and beat process holds up to two more for the after-commit hooks
-  (#2782), and the primary runs a WAL sender per replica. So the api's pool
+  (#2782), every api pod holds one more for its readiness probe (#2944), and
+  the primary runs a WAL sender per replica. So the api's pool
   per pod shrinks past four nodes (10 + 20 up to four, 10 + 3 at nine;
   about 120 api connections in all), and the limit is never below
   shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
-  can open 51 connections at one node, 131 at three and 218 at nine (two
+  can open 52 connections at one node, 134 at three and 227 at nine (two
   worker processes); `max_connections` stays the chart's 200 until that
   passes it, then follows it. One node of 8 GiB or more keeps the share
-  above; a three-node cluster on a 12 GiB seed gets 2971Mi, a nine-node one
-  4363Mi. A promote or demote that moves the limit is one CloudNativePG
+  above; a three-node cluster on a 12 GiB seed gets 3019Mi, a nine-node one
+  4507Mi. A promote or demote that moves the limit is one CloudNativePG
   rolling restart.
   These limits are keys the supervisor **owns**, so a different value written
   into that HelmChartConfig by hand is put back on the next heartbeat; there

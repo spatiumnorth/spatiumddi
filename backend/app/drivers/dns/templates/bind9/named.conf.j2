@@ -63,6 +63,11 @@ options {
     blackhole { {% for a in options.blackhole %}{{ a }}; {% endfor %}};
     {%- endif %}
     dnssec-validation {{ options.dnssec_validation }};
+    {#- #2935: nothing about the daemon over CHAOS queries. ``version.bind``
+        answers "none" and ``hostname.bind`` is off; mirrors the agent
+        renderer (``NAMED_CONF_SKELETON``). #}
+    version "none";
+    hostname none;
     {#- Explicit query-logging switch (issue #2249), mirroring the agent
         renderer. Without it BIND decides query logging from the
         ``queries`` category only when named starts; ``rndc reconfig``

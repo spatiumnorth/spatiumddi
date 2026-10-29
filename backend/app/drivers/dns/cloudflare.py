@@ -33,6 +33,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.drivers.dns._caa import caa_key, caa_presentation
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -84,6 +85,15 @@ _PER_PAGE = 50
 # "let the provider decide" rather than a literal 1-second TTL.
 _TTL_AUTO = 1
 
+# Cloudflare CANNOT represent a TTL of 0 (#2942): the API accepts 1 (auto)
+# or 60-86400 (30 on Enterprise) and rejects anything else. A stored 0 is
+# therefore sent as 0, not mapped to ``_TTL_AUTO`` or a floor: only ``None``
+# means "let the provider decide", and substituting a different TTL would
+# publish a value the database does not hold. The record API refuses such a
+# TTL up front for a Cloudflare group (``PROVIDER_TTL_RANGES`` in
+# ``app.drivers.dns``), so it only reaches here from a row stored before that
+# gate or moved in from another group, and Cloudflare then refuses the write.
+
 # Types whose priority is part of the record's identity (two MX with the
 # same exchange and different preferences are two records).
 _PRIORITY_TYPES = frozenset({"MX", "SRV", "URI"})
@@ -109,6 +119,9 @@ def _content_key(record_type: str, content: str) -> str:
         if len(value) >= 2 and value[0] == value[-1] == '"' and '" "' not in value:
             return value[1:-1]
         return value
+    if rtype == "CAA":
+        # Bare and quoted spellings are one record (#2943).
+        return caa_key(value)
     if rtype in ("A", "AAAA"):
         try:
             return ipaddress.ip_address(value).compressed
@@ -116,6 +129,15 @@ def _content_key(record_type: str, content: str) -> str:
             return value.lower()
     if rtype in _NAME_CONTENT_TYPES:
         return value.rstrip(".").lower()
+    return value
+
+
+def _wire_content(record_type: str, value: str) -> str:
+    """The ``content`` sent for a value: a CAA value in its quoted form
+    (#2943), so a bare stored value neither goes out bare nor misses the
+    quoted row in the server-side ``content`` filter of a lookup."""
+    if record_type.upper() == "CAA":
+        return caa_presentation(value)
     return value
 
 
@@ -157,7 +179,7 @@ def _srv_row_key(row: dict[str, Any]) -> tuple[int, int, int, str] | None:
     # Cloudflare's own SRV content omits the priority ("<weight> <port>
     # <target>") and carries it as the row's top-level ``priority``.
     parts = content.split(None, 2)
-    if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+    if len(parts) == 3 and all(p.isascii() and p.isdigit() for p in parts[:2]):
         try:
             prio = int(row.get("priority") or 0)
         except (TypeError, ValueError):
@@ -388,7 +410,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 "target": rec.value,
             }
             return payload
-        payload["content"] = rec.value
+        payload["content"] = _wire_content(rec.record_type, rec.value)
         if rec.priority is not None:
             payload["priority"] = rec.priority
         return payload
@@ -443,7 +465,9 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         # MX/SRV) actually matches — the server-side filter is a narrowing
         # hint, not a guarantee.
         for rec in results:
-            if rec.get("content") != content:
+            if _content_key(record_type, str(rec.get("content") or "")) != _content_key(
+                record_type, content
+            ):
                 continue
             if priority is not None and rec.get("priority") != priority:
                 continue
@@ -519,7 +543,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 }
                 match = next((r for r in unmatched if _srv_row_key(r) == srv_key), None)
             else:
-                payload["content"] = member.value
+                payload["content"] = _wire_content(rtype, member.value)
                 if member.priority is not None:
                     payload["priority"] = member.priority
                 key = _content_key(rtype, member.value)
@@ -595,7 +619,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     content=(
                         compose_structured_rdata(change.record)
                         if change.record.record_type.upper() == "SRV"
-                        else change.record.value
+                        else _wire_content(change.record.record_type, change.record.value)
                     ),
                     priority=change.record.priority,
                 )
@@ -625,7 +649,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     content=(
                         compose_structured_rdata(change.record)
                         if change.record.record_type.upper() == "SRV"
-                        else change.record.value
+                        else _wire_content(change.record.record_type, change.record.value)
                     ),
                     priority=change.record.priority,
                 )
