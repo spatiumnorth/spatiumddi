@@ -112,6 +112,10 @@ async def live_access_session(db: Any, payload: dict[str, Any]) -> Any:
     idle past the configured Session Timeout is refused the same way
     (``app.core.session_idle``).
 
+    A session revoked by a refresh rotation within the last few seconds
+    resolves to the session that rotation produced, which is what is
+    returned (``app.core.session_rotation``, #2941).
+
     Returns None only for a token with no ``jti``, which
     :func:`decode_access_token` has already refused outside the test suite.
     """
@@ -128,6 +132,13 @@ async def live_access_session(db: Any, payload: dict[str, Any]) -> Any:
         raise JWTError("Session revoked or expired") from exc
     session = await db.get(UserSession, session_id)
     now = datetime.now(UTC)
+    if session is not None and session.revoked:
+        # A session rotated away by a refresh moments ago stands for its
+        # successor (#2941), so another tab's token survives the refresh.
+        # Any other revocation resolves to None and is refused at once.
+        from app.core.session_rotation import rotation_successor  # noqa: PLC0415
+
+        session = await rotation_successor(db, session, now)
     if session is None or session.revoked or session.expires_at <= now:
         raise JWTError("Session revoked or expired")
     if str(session.user_id) != str(payload.get("sub")):

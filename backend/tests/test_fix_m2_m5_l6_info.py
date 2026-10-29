@@ -16,8 +16,8 @@ M5: ``GET /api/v1/health/platform`` is mounted UNAUTHENTICATED and
 
 L6: ``GET /api/v1/version`` disclosed the appliance hostname +
     appliance version to UNAUTHENTICATED callers. After the fix those
-    two fields are returned only to authenticated callers; the bare
-    ``version`` + release-check banner stay public.
+    two fields are returned only to authenticated callers. (#2935 later
+    withheld the bare ``version`` and the release check too.)
 """
 
 from __future__ import annotations
@@ -182,10 +182,15 @@ async def test_security_summary_requires_auth(client: AsyncClient) -> None:
 # ── M5: unauthenticated platform-health never leaks str(exc) ────────────────
 
 
-async def test_platform_health_sanitises_error_details(client: AsyncClient, monkeypatch) -> None:
+async def test_platform_health_sanitises_error_details(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
     """Force every component check to raise with a secret-bearing message
-    and confirm none of it reaches the unauthenticated response body."""
+    and confirm none of it reaches the response body — anonymous or signed
+    in. Since #2935 only a signed-in caller sees component details at all."""
     secret = "postgresql://spatium:SUPERSECRET@db-internal.prod.local:5432/ddi"
+    user = await _user(db_session)
+    await db_session.commit()
 
     class _BoomSession:
         async def __aenter__(self):  # noqa: ANN001
@@ -197,8 +202,14 @@ async def test_platform_health_sanitises_error_details(client: AsyncClient, monk
     # Postgres + the maintenance read both go through AsyncSessionLocal.
     monkeypatch.setattr(health_module, "AsyncSessionLocal", lambda: _BoomSession())
 
-    # No Authorization header — this is the anonymous attack surface.
+    # No Authorization header — the anonymous attack surface gets the
+    # rollup only (#2935), and the DSN appears nowhere in it.
     r = await client.get("/health/platform")
+    assert r.status_code == 200, r.text
+    assert secret not in r.text
+    assert r.json() == {"status": "degraded"}
+
+    r = await client.get("/health/platform", headers=_bearer(user))
     assert r.status_code == 200, r.text
     body = r.json()
     # The DSN must not appear anywhere in the serialised response.
@@ -227,9 +238,12 @@ async def test_version_hides_appliance_fields_when_anonymous(
     r = await client.get("/api/v1/version")
     assert r.status_code == 200, r.text
     body = r.json()
-    # Bare version + appliance_mode flag stay public...
-    assert body["version"]
-    assert body["appliance_mode"] is True
+    # Only the coarse handshake stays public (#2935)...
+    assert body["product"] == "SpatiumDDI"
+    assert body["restricted"] is True
+    assert body["version"] == "restricted"
+    # ...not even the deployment shape...
+    assert body["appliance_mode"] is False
     # ...but the host identity / patch level is withheld from anonymous callers.
     assert body["appliance_hostname"] is None
     assert body["appliance_version"] is None
@@ -269,3 +283,4 @@ async def test_version_invalid_token_treated_as_anonymous(
     r = await client.get("/api/v1/version", headers={"Authorization": "Bearer not-a-real-token"})
     assert r.status_code == 200, r.text
     assert r.json()["appliance_hostname"] is None
+    assert r.json()["restricted"] is True

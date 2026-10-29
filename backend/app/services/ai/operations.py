@@ -3137,8 +3137,9 @@ async def _apply_create_dhcp_static(
         raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
 
     # #2901 — the REST create's conflict check (a MAC already reserved in the
-    # group, a malformed IP). Raises a 4xx HTTPException, which both callers
-    # (approve + proposal apply) roll back on and surface without committing.
+    # group, a malformed IP). Raises a 4xx HTTPException; both callers roll
+    # back on it. An approve records the request ``failed`` with the detail
+    # (#2911); a proposal apply reports it as the proposal's error.
     await check_static_conflicts(db, scope, args.ip_address, args.mac_address.lower())
 
     row = DHCPStaticAssignment(

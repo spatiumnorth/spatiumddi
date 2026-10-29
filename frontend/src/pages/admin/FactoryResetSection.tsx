@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   AlertTriangle,
   Eraser,
@@ -92,8 +93,11 @@ export function FactoryResetSection() {
           Loading section catalog…
         </div>
       ) : sectionsQ.isError ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          Failed to load section catalog.
+        <div className="rounded-md border bg-card px-3 py-2 text-sm">
+          <ListReadError
+            error={sectionsQ.error}
+            what="the factory reset section catalog"
+          />
         </div>
       ) : (
         <div className="space-y-6">

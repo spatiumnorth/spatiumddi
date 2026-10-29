@@ -67,7 +67,8 @@ async def test_import_subnets_makes_the_create_rows(client: AsyncClient, db_sess
     # The auto parent block rolled the counts up.
     blocks = (await client.get(f"/api/v1/ipam/blocks?space_id={space.id}", headers=h)).json()
     blocks = blocks["items"] if isinstance(blocks, dict) else blocks
-    assert {b["network"]: b["allocated_ips"] for b in blocks}["10.233.67.0/24"] == 1
+    # A block also counts each subnet's network + broadcast (#2982): 1 + 2.
+    assert {b["network"]: b["allocated_ips"] for b in blocks}["10.233.67.0/24"] == 3
 
 
 async def test_import_subnet_gateway_on_network_address_is_a_row_error(
@@ -120,8 +121,9 @@ async def test_import_addresses_recounts_subnet_and_blocks(
     assert r.status_code == 200, r.text
     assert r.json()["created"] == 5
     assert await _alloc(client, h, "subnets", sid) == 5  # available is free
-    assert await _alloc(client, h, "blocks", mid_id) == 5
-    assert await _alloc(client, h, "blocks", root) == 5
+    # 5 addresses + the subnet's network and broadcast (#2982).
+    assert await _alloc(client, h, "blocks", mid_id) == 7
+    assert await _alloc(client, h, "blocks", root) == 7
 
 
 async def test_anchored_plan_without_new_block_rolls_up_anchor(
@@ -147,7 +149,8 @@ async def test_anchored_plan_without_new_block_rolls_up_anchor(
     ap = await client.post(f"/api/v1/ipam/plans/{c.json()['id']}/apply", headers=h)
     assert ap.status_code == 200, ap.text
     assert ap.json()["block_ids"] == []
-    assert await _alloc(client, h, "blocks", root) == 2
+    # 2 gateways + each subnet's network and broadcast (#2982).
+    assert await _alloc(client, h, "blocks", root) == 6
 
 
 # ── #2980 ────────────────────────────────────────────────────────────────
@@ -381,5 +384,6 @@ async def test_import_many_subnets_rolls_up_a_shared_chain(
     )
     assert r.status_code == 200, r.text
     assert r.json()["created_subnets"] == 5
-    assert await _alloc(client, h, "blocks", mid.json()["id"]) == 5
-    assert await _alloc(client, h, "blocks", root) == 5
+    # 5 gateways + each of the 5 subnets' network and broadcast (#2982).
+    assert await _alloc(client, h, "blocks", mid.json()["id"]) == 15
+    assert await _alloc(client, h, "blocks", root) == 15

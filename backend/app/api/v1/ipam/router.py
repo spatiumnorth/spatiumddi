@@ -29,7 +29,7 @@ from app.core.agent_wake import collect_wake
 from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
-    name_in_zone_error,
+    host_in_zone_error,
     publishable_host_owner_error,
     validate_fqdn,
     validate_host_label,
@@ -115,8 +115,19 @@ from app.services.ipam.hygiene import (
 )
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
-from app.services.ipam.utilization import counts_toward_utilization
+from app.services.ipam.utilization import (
+    block_allocated,
+    block_subnet_contribution_sql,
+    block_utilization_percent,
+    counts_toward_utilization,
+)
 from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
+from app.services.ipam.zone_binding import (
+    check_group_uuid_list,
+    check_zone_uuid,
+    check_zone_uuid_list,
+    stored_zone_uuid,
+)
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
@@ -442,7 +453,9 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
 async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> None:
     """Recompute utilization_percent for a block by summing allocated IPs across all
     descendant subnets (recursive), expressed as a fraction of the block's CIDR size.
-    Also updates all ancestor blocks up the tree.
+    Each subnet's network/broadcast addresses count as used here (#2982), so a
+    block fully carved into full subnets reads 100%; the subnet's own counter
+    still leaves them out (#2411). Also updates all ancestor blocks up the tree.
     """
     block = await db.get(IPBlock, block_id)
     while block is not None:
@@ -466,11 +479,13 @@ async def _update_blocks_utilization(db: AsyncSession, block_ids: Iterable[uuid.
 
 async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
     """Recount one block's cached counters from its descendant subnets."""
-    # Sum allocated_ips for all subnets in this block and all descendant blocks
+    # Sum each subnet's contribution (allocated_ips + its network/broadcast)
+    # over this block and all descendant blocks.
     # deleted_at IS NULL guards: raw SQL bypasses the ORM soft-delete filter,
     # so trashed blocks/subnets would otherwise inflate the rollup (#490).
+    contribution = block_subnet_contribution_sql("s")
     result = await db.execute(
-        text("""
+        text(f"""
             WITH RECURSIVE descendants AS (
                 SELECT id FROM ip_block
                 WHERE id = CAST(:block_id AS uuid) AND deleted_at IS NULL
@@ -479,20 +494,17 @@ async def _recount_block(db: AsyncSession, block: IPBlock) -> None:
                     INNER JOIN descendants d ON b.parent_block_id = d.id
                 WHERE b.deleted_at IS NULL
             )
-            SELECT COALESCE(SUM(s.allocated_ips), 0)
+            SELECT COALESCE(SUM({contribution}), 0)
             FROM subnet s
             WHERE s.block_id IN (SELECT id FROM descendants)
               AND s.deleted_at IS NULL
-        """),
+        """),  # the fragment is a constant: no request input reaches it
         {"block_id": str(block.id)},
     )
-    allocated = result.scalar() or 0
-
     net = ipaddress.ip_network(str(block.network), strict=False)
     block_total = net.num_addresses
-    block.utilization_percent = (
-        round(float(allocated) / block_total * 100, 2) if block_total > 0 else 0.0
-    )
+    allocated = block_allocated(int(result.scalar() or 0), net)
+    block.utilization_percent = block_utilization_percent(allocated, net)
     # Cache the raw counts too so block rows can render Used IPs (not just a
     # utilization bar). total_ips clamps to BIGINT for huge IPv6 blocks.
     block.allocated_ips = int(allocated)
@@ -541,7 +553,7 @@ async def _resolve_effective_dns(
     """
     # Subnet override wins if inherit is off.
     if not subnet.dns_inherit_settings:
-        zone_id = uuid.UUID(subnet.dns_zone_id) if subnet.dns_zone_id else None
+        zone_id = stored_zone_uuid(subnet.dns_zone_id)
         return (
             list(subnet.dns_group_ids or []),
             zone_id,
@@ -551,7 +563,7 @@ async def _resolve_effective_dns(
     current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
     while current is not None:
         if not current.dns_inherit_settings:
-            zone_id = uuid.UUID(current.dns_zone_id) if current.dns_zone_id else None
+            zone_id = stored_zone_uuid(current.dns_zone_id)
             return (
                 list(current.dns_group_ids or []),
                 zone_id,
@@ -565,7 +577,7 @@ async def _resolve_effective_dns(
             space = await db.get(IPSpace, current.space_id)
             if space is None:
                 break
-            zone_id = uuid.UUID(space.dns_zone_id) if space.dns_zone_id else None
+            zone_id = stored_zone_uuid(space.dns_zone_id)
             return (
                 list(space.dns_group_ids or []),
                 zone_id,
@@ -1837,7 +1849,9 @@ async def _assert_alias_names_fit(
     aliases: list[Any],
     zone_id: uuid.UUID | None,
 ) -> None:
-    """422 an alias whose name inside its zone passes 253 characters.
+    """422 an alias whose name inside its zone passes 253 characters, or
+    whose full owner the record API's check-names rule refuses (#2918: an
+    A alias under a zone whose own name carries an underscore label).
 
     ``AliasInput`` checks the alias on its own; only here is the zone known.
     A name longer than a DNS name can carry makes BIND refuse the whole zone
@@ -1864,6 +1878,11 @@ async def _assert_alias_names_fit(
                     "the server applying its configuration."
                 ),
             )
+        names_err = bind_check_names_error(
+            al.record_type, f"{fqdn}.", None, origin=zone_domain, check_target=False
+        )
+        if names_err is not None:
+            raise HTTPException(status_code=422, detail=f"alias '{al.name}': {names_err}")
 
 
 async def _create_alias_records(
@@ -2309,14 +2328,20 @@ async def _operator_ptr_twin(
 
 
 def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bool:
-    """True when ``<hostname>.<zone>`` is not a legal DNS name (#2072).
+    """True when ``<hostname>.<zone>`` is not a publishable DNS name (#2072, #2918).
+
+    Past 253 characters, or an owner the record API's check-names rule refuses
+    in that zone (an underscore label in the zone's own name).
 
     ``strict`` raises the 422 instead (the request paths); otherwise the
     caller skips the zone, and this logs why.
     """
-    err = name_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
+    err = host_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
     if err is None:
         return False
+    # Read by importers that report what they published (#2921); not a
+    # mapped column, lives for this request.
+    ip._dns_skip_reason = err  # type: ignore[attr-defined]
     if strict:
         raise HTTPException(status_code=422, detail=err)
     logger.warning(
@@ -2324,6 +2349,7 @@ def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bo
         ip=str(ip.address),
         zone=zone_domain,
         hostname_length=len(ip.hostname or ""),
+        reason=err,
     )
     return True
 
@@ -2583,6 +2609,7 @@ async def _sync_dns_record(
     if owner_err is not None:
         if strict:
             raise HTTPException(status_code=422, detail=owner_err)
+        ip._dns_skip_reason = owner_err  # type: ignore[attr-defined]
         logger.warning(
             "ipam_dns_hostname_unpublishable",
             ip=str(ip.address),
@@ -3415,6 +3442,21 @@ class IPSpaceCreate(BaseModel):
             )
         return v
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
+
 
 class IPSpaceUpdate(BaseModel):
     name: str | None = None
@@ -3452,6 +3494,21 @@ class IPSpaceUpdate(BaseModel):
     @classmethod
     def _v(cls, v: str | None) -> str | None:
         return _validate_ddns_policy_optional(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPSpaceResponse(BaseModel):
@@ -3543,6 +3600,21 @@ class IPBlockCreate(BaseModel):
             )
         return v
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
+
 
 class IPBlockUpdate(BaseModel):
     name: str | None = None
@@ -3573,6 +3645,21 @@ class IPBlockUpdate(BaseModel):
     @classmethod
     def _v(cls, v: str | None) -> str | None:
         return _validate_ddns_policy_optional(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class IPBlockResponse(BaseModel):
@@ -3718,12 +3805,7 @@ class SubnetCreate(BaseModel):
         # The binding is stored as text but must name a zone: a body that
         # sends garbage here used to be accepted because the field was
         # dropped on the floor (spatiumddi#1066); now it is refused.
-        if v is None or v == "":
-            return None
-        try:
-            return str(uuid.UUID(str(v)))
-        except ValueError as exc:
-            raise ValueError("dns_zone_id must be the UUID of a DNS zone") from exc
+        return check_zone_uuid(v, blank=None)
 
     @field_validator("subnet_role")
     @classmethod
@@ -3809,6 +3891,16 @@ class SubnetCreate(BaseModel):
         if v is None or not v.strip():
             return v
         return validate_fqdn(v, field="domain_name")
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class SubnetUpdate(BaseModel):
@@ -3940,6 +4032,21 @@ class SubnetUpdate(BaseModel):
         if v is None or not v.strip():
             return v
         return validate_fqdn(v, field="domain_name")
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _validate_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
+    @field_validator("dns_group_ids")
+    @classmethod
+    def _validate_dns_group_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_group_uuid_list(v)
 
 
 class SubnetVLANRef(BaseModel):
@@ -4276,6 +4383,16 @@ class IPAddressCreate(BaseModel):
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
+    @field_validator("extra_zone_ids")
+    @classmethod
+    def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="extra_zone_ids")
+
 
 class IPAddressUpdate(BaseModel):
     status: str | None = None
@@ -4330,6 +4447,16 @@ class IPAddressUpdate(BaseModel):
     @classmethod
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
+    @field_validator("extra_zone_ids")
+    @classmethod
+    def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
 class IPAddressResponse(BaseModel):
@@ -4504,6 +4631,16 @@ class NextIPRequest(BaseModel):
     @classmethod
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
+    @field_validator("extra_zone_ids")
+    @classmethod
+    def _validate_extra_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="extra_zone_ids")
 
 
 # ── IP Spaces ──────────────────────────────────────────────────────────────────
@@ -9904,7 +10041,23 @@ async def update_address(
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
         zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
-        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
+        try:
+            await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
+        except HTTPException as exc:
+            # The Edit dialog sends its hostname on every Save, so the sync
+            # runs on an edit of an unrelated field too. A name a later rule
+            # refuses (#2918: an underscore label in the zone's own name;
+            # #2072: past 253 characters) must not block such an edit (the
+            # #1228 / #2467 changed-fields rule): the refusal comes before
+            # anything is written, so the address's DNS is left as it was.
+            # Changing the hostname, the zone or the extras is still refused.
+            if exc.status_code != 422 or (hostname_changed or zone_changed or extra_zones_touched):
+                raise
+            logger.warning(
+                "ipam_dns_unchanged_name_not_republished",
+                ip=str(ip.address),
+                reason=exc.detail,
+            )
     elif subnet and restoring:
         await _sync_dns_record(
             db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
@@ -10645,6 +10798,11 @@ class BulkAllocateRequest(BaseModel):
     tags: dict[str, Any] = Field(default_factory=dict)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _validate_dns_zone_id(cls, v: str | None) -> str | None:
+        return check_zone_uuid(v, blank="")
+
 
 class BulkAllocatePreviewResponse(BaseModel):
     total: int
@@ -10852,7 +11010,21 @@ async def bulk_allocate_preview(
         except ValueError:
             return True
 
-    items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
+    items, warnings, preview_zone_id = await _build_bulk_allocate_candidates(db, subnet, body)
+    # #2920 — the commit publishes each row it creates with the strict sync,
+    # which refuses (422) a name that does not fit its zone and aborts the
+    # batch. Name that here, with the commit's own rule and words, for the
+    # rows the commit would actually publish.
+    if body.create_dns_records and preview_zone_id is not None:
+        preview_zone = await db.get(DNSZone, preview_zone_id)
+        if preview_zone is not None and preview_zone.deleted_at is None:
+            zone_domain = preview_zone.name.rstrip(".")
+            for i in items:
+                if i.in_use or i.in_dynamic_pool or i.fqdn_collision or _no_perm(i.address):
+                    continue
+                name_err = host_in_zone_error(i.hostname, zone_domain, field="hostname")
+                if name_err is not None:
+                    raise HTTPException(status_code=422, detail=name_err)
     in_use = sum(1 for i in items if i.in_use)
     in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
     fqdn_coll = sum(1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision)
