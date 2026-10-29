@@ -14223,6 +14223,10 @@ export interface ApplianceSystemInfo {
   reboot_scheduled: boolean;
   appliance_version: string | null;
   appliance_mode: boolean;
+  /** #3011 — false on a multi-node control plane: the local reboot acts on
+   *  whichever node answers, so Fleet's per-appliance reboot is the path. */
+  reboot_available: boolean;
+  reboot_unavailable_reason: string | null;
 }
 
 export const applianceSystemApi = {
