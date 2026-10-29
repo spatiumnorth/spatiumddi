@@ -1,0 +1,19 @@
+[Unit]
+Description=SpatiumDDI appliance %i from the console, after the PostgreSQL primary handoff (#2974)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/2974
+# Started by spatium-console's F5 (reboot) / F6 (poweroff) with
+# ``systemctl start --no-block``, so systemd owns the run: the console
+# stays responsive during the handoff (up to a few minutes on the node of
+# the PostgreSQL primary), and a console restart cannot kill the wrapper
+# mid-handoff and leave the node cordoned without a reboot. F9 cancels it
+# with ``systemctl stop``. %i is reboot or poweroff; the wrapper refuses
+# anything else.
+
+[Service]
+Type=oneshot
+# No start timeout (a oneshot's default, stated so nobody adds one): a
+# timeout stops the wrapper, which it takes as a cancel. The wrapper caps
+# the handoff itself.
+TimeoutStartSec=infinity
+ExecStart=/usr/local/bin/spatium-power-action %i
+# No Install section — only started by spatium-console.

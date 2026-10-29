@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 import { authApi, type LoginResponse } from "@/lib/api";
 import {
+  broadcastLogout,
+  initCrossTabAuth,
+  sharedRefresh,
+} from "@/lib/crossTabAuth";
+import {
   getAccessToken,
   getAuthSnapshot,
   markBooted,
@@ -22,20 +27,24 @@ import {
 // components mount useAuth(). The promise is memoised; ``markBooted`` flips
 // the shared ``booted`` flag when it settles either way.
 //
-// KNOWN TRADEOFF (multi-tab reload): /auth/refresh rotates + revokes the old
-// session server-side. Because the access token is now memory-only, a reload
-// always boot-refreshes, so reloading two tabs at once makes both present the
-// same cookie — the loser's token is already revoked and that tab is bounced
-// to /login (fail-closed: a spurious re-login, never a privilege leak). The
-// pre-#484 localStorage flow avoided this only by not refreshing on reload at
-// all. A proper fix (cross-tab Web Locks / a short rotation grace window) is
-// tracked separately; single-tab and staggered-tab use is unaffected.
+// MULTI-TAB (#2941): /auth/refresh rotates + revokes the old session, and a
+// reload always boot-refreshes, so two tabs reloading at once present the
+// same cookie. The server gives a rotation a short grace window: the second
+// refresh is answered with the session the first one produced (and sets no
+// new cookie), and another tab's access token for the rotated session keeps
+// working for those few seconds. So neither tab is bounced to /login. Outside
+// the window a rotated cookie is still a 401.
 let bootstrapPromise: Promise<void> | null = null;
 
 function bootstrapAuth(): Promise<void> {
   if (bootstrapPromise) return bootstrapPromise;
-  bootstrapPromise = authApi
-    .refresh()
+  // Shared across tabs (#2960): reloading several tabs makes one refresh,
+  // which supersedes the tradeoff above wherever Web Locks + BroadcastChannel
+  // exist. A boot refresh may adopt a token another tab already minted: it is
+  // what this tab's own refresh would return from the shared cookie.
+  bootstrapPromise = sharedRefresh((signal) => authApi.refresh(signal), null, {
+    allowAdoptWithoutToken: true,
+  })
     .then((resp) => {
       // Only adopt the refreshed token if nothing else set one meanwhile.
       // An explicit login() racing this boot refresh always wins — its token
@@ -68,6 +77,8 @@ export function useAuth() {
   // Fire the one-shot boot refresh. Skip it if we already have a token in
   // memory (a fresh login this tab) — there's nothing to restore.
   useEffect(() => {
+    // Hear sign-outs + rotated tokens from the other tabs (#2960).
+    initCrossTabAuth();
     if (getAccessToken()) {
       markBooted();
       return;
@@ -115,6 +126,8 @@ export function useAuth() {
       await authApi.logout();
     } finally {
       setAccessToken(null);
+      // Every other tab signs out too (#2960).
+      broadcastLogout();
     }
   }, []);
 

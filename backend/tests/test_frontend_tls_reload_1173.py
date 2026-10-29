@@ -185,7 +185,7 @@ def test_the_image_launches_it_and_the_kubelet_can_update_the_files() -> None:
     assert os.access(_SCRIPT, os.X_OK), f"{_SCRIPT.name} must be executable"
     dockerfile = _DOCKERFILE.read_text()
     assert re.search(
-        r"^COPY 40-tls-reload-watch\.sh /docker-entrypoint\.d/40-tls-reload-watch\.sh$",
+        r"^COPY frontend/40-tls-reload-watch\.sh /docker-entrypoint\.d/40-tls-reload-watch\.sh$",
         dockerfile,
         re.M,
     )

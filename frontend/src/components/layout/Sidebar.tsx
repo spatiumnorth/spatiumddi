@@ -3,6 +3,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Github,
+  Info,
   ChevronsLeft,
   ChevronsRight,
   ChevronDown,
@@ -112,6 +113,11 @@ function SubNavLabel({
     </div>
   );
 }
+
+/** A footer utility (About, GitHub, Collapse): icon only, with the label as
+ *  both tooltip and accessible name (#2895). */
+const FOOTER_ICON_CLS =
+  "inline-flex shrink-0 items-center justify-center rounded-md p-2 text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
 
 function NavItem({
   label,
@@ -589,45 +595,18 @@ export function Sidebar({
           </NavSection>
         </nav>
 
-        {/* Footer */}
+        {/* Footer (#2895 — compacted). The three destinations an operator
+            reads by name stay as text rows; the utilities (About, GitHub,
+            Collapse) share ONE row with the version, as icon buttons with a
+            tooltip and an aria-label. Collapsed, everything is an icon in a
+            column, as before. The palette still lists every page from
+            ``footerNav`` in lib/navigation.ts, About included. */}
         <div
           className={cn(
             "border-t border-sidebar-border p-2 space-y-1",
             effectiveCollapsed && "flex flex-col items-center",
           )}
         >
-          {!effectiveCollapsed && (
-            <div className="flex items-center gap-2 px-3 py-1">
-              <span className="text-xs font-mono text-sidebar-muted-foreground/80">
-                v{displayVersion}
-              </span>
-              {updateAvailable && latestReleaseUrl && (
-                <a
-                  href={latestReleaseUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  title={`Update available: ${latestVersion ?? "newer release"}`}
-                  className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/25 dark:text-emerald-400"
-                >
-                  <Sparkles className="h-3 w-3" />
-                  update
-                </a>
-              )}
-              {versionInfo && <UpdateCheckError compact info={versionInfo} />}
-            </div>
-          )}
-          {effectiveCollapsed && updateAvailable && latestReleaseUrl && (
-            <a
-              href={latestReleaseUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={`Update available: ${latestVersion ?? "newer release"}`}
-              className="flex items-center justify-center rounded-md p-2 text-emerald-600 hover:bg-sidebar-accent dark:text-emerald-400"
-            >
-              <Sparkles className="h-4 w-4" />
-            </a>
-          )}
-
           {/*
             Appliance management — always visible. When the API host
             itself runs the SpatiumDDI OS appliance ISO, /appliance
@@ -666,38 +645,92 @@ export function Sidebar({
             onNavigate={mobileOpen ? onMobileClose : undefined}
           />
 
-          <a
-            href="https://github.com/spatiumnorth/spatiumddi"
-            target="_blank"
-            rel="noopener noreferrer"
-            title={effectiveCollapsed ? "GitHub" : undefined}
+          <div
+            data-testid="sidebar-utility-row"
             className={cn(
-              "flex items-center rounded-md px-3 py-2 text-sm font-medium text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors",
-              effectiveCollapsed ? "justify-center" : "gap-3",
+              "flex",
+              effectiveCollapsed
+                ? "flex-col items-center gap-1"
+                : "items-center gap-1 pl-3",
             )}
           >
-            <Github className="h-4 w-4 flex-shrink-0" />
-            {!effectiveCollapsed && "GitHub"}
-          </a>
+            {!effectiveCollapsed && (
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate text-xs font-mono text-sidebar-muted-foreground/80">
+                  v{displayVersion}
+                </span>
+                {updateAvailable && latestReleaseUrl && (
+                  <a
+                    href={latestReleaseUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={`Update available: ${latestVersion ?? "newer release"}`}
+                    className="inline-flex shrink-0 items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/25 dark:text-emerald-400"
+                  >
+                    <Sparkles className="h-3 w-3" />
+                    update
+                  </a>
+                )}
+                {versionInfo && <UpdateCheckError compact info={versionInfo} />}
+              </div>
+            )}
+            {effectiveCollapsed && updateAvailable && latestReleaseUrl && (
+              <a
+                href={latestReleaseUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`Update available: ${latestVersion ?? "newer release"}`}
+                aria-label={`Update available: ${latestVersion ?? "newer release"}`}
+                className={FOOTER_ICON_CLS}
+              >
+                <Sparkles className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+              </a>
+            )}
 
-          {/* Collapse toggle — desktop only */}
-          <button
-            onClick={toggle}
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            className={cn(
-              "hidden md:flex w-full items-center rounded-md px-3 py-2 text-sm text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors",
-              collapsed ? "justify-center" : "gap-3",
-            )}
-          >
-            {collapsed ? (
-              <ChevronsRight className="h-4 w-4 flex-shrink-0" />
-            ) : (
-              <>
-                <ChevronsLeft className="h-4 w-4 flex-shrink-0" />
-                <span>Collapse</span>
-              </>
-            )}
-          </button>
+            {/* #2895 — About: version, licence, NOTICE, third-party lists. */}
+            <NavLink
+              to="/about"
+              title="About"
+              aria-label="About"
+              onClick={mobileOpen ? onMobileClose : undefined}
+              className={({ isActive }) =>
+                cn(
+                  FOOTER_ICON_CLS,
+                  isActive &&
+                    "bg-sidebar-primary text-sidebar-primary-foreground hover:bg-sidebar-primary hover:text-sidebar-primary-foreground",
+                )
+              }
+            >
+              <Info className="h-4 w-4" aria-hidden />
+            </NavLink>
+
+            <a
+              href="https://github.com/spatiumnorth/spatiumddi"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="GitHub"
+              aria-label="GitHub (opens in a new tab)"
+              className={FOOTER_ICON_CLS}
+            >
+              <Github className="h-4 w-4" aria-hidden />
+            </a>
+
+            {/* Collapse toggle — desktop only; the mobile drawer has none. */}
+            <button
+              type="button"
+              onClick={toggle}
+              title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!collapsed}
+              className={cn(FOOTER_ICON_CLS, "hidden md:inline-flex")}
+            >
+              {collapsed ? (
+                <ChevronsRight className="h-4 w-4" aria-hidden />
+              ) : (
+                <ChevronsLeft className="h-4 w-4" aria-hidden />
+              )}
+            </button>
+          </div>
         </div>
       </aside>
     </>
