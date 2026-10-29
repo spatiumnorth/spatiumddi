@@ -417,12 +417,12 @@ jobs:
   # it now lives only behind ``make test-cov``.
   backend-test-shard:
     name: Backend — Tests (shard ${{ matrix.shard }}/12)
-    # Pinned, not ubuntu-latest: backup / restore tests run the RUNNER's
-    # pg_dump against the postgres:16 service, and ubuntu-26.04 ships a
-    # newer client whose dumps carry `SET transaction_timeout`, which a 16
-    # server refuses on replay. The image pins postgresql-client-16 for the
-    # same reason (backend/Dockerfile). Move this with the postgres image.
-    runs-on: ubuntu-24.04
+    # Backup / restore tests run the runner's pg_dump against the
+    # postgres:16 service, so the client is installed below rather than
+    # taken from the runner image: ubuntu-26.04 ships a newer one whose
+    # dumps carry `SET transaction_timeout`, which a 16 server refuses on
+    # replay. Pinned to 26.04 so every shard runs on one image.
+    runs-on: ubuntu-26.04
     # #813 — skipped when the PR touches nothing the suite covers. The
     # aggregator below stays green in that case, so no required check
     # notices. ``changes`` failing leaves this skipped too, and the
@@ -475,11 +475,27 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
+      - name: Install the PostgreSQL 16 client
+        # From PGDG, as backend/Dockerfile does: the client major must match
+        # the postgres service. Move both with the postgres image.
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends postgresql-client-16
+          # Ahead of the runner's own client on PATH for every later step.
+          echo /usr/lib/postgresql/16/bin >> "$GITHUB_PATH"
+
       - name: The runner's pg_dump matches the postgres 16 service
         # Fail here, by name, rather than as dozens of restore tests whose
         # replay a 16 server refuses.
         run: |
           set -euo pipefail
+          command -v pg_dump
           pg_dump --version
           pg_dump --version | grep -Eq ' 16\.'
 
