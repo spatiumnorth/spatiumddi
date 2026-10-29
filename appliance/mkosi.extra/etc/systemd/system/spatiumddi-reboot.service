@@ -13,5 +13,8 @@ ExecStartPre=/bin/sleep 10
 # Rename the trigger to .done so it doesn't re-fire on next boot.
 # ``-`` prefix (#553): tolerate an already-moved/absent trigger so this
 # oneshot never ends ``failed`` — the reboot still needs to fire.
-ExecStartPre=-/bin/mv /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
+# ``-T``: the api and the supervisor can create names in release-state, and
+# without it a directory (or a link to one) at ``reboot-pending.done`` would
+# receive the trigger, i.e. root would move it wherever that link points.
+ExecStartPre=-/bin/mv -T /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
 ExecStart=/usr/bin/systemctl reboot

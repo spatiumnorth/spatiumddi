@@ -516,6 +516,22 @@ def test_runners_working_inside_a_supervisor_directory_run_python_isolated() -> 
             assert re.match(r"python3 -I\b", c), f"{name}: {c}"
 
 
+def test_no_unit_renames_onto_a_release_state_name_without_t() -> None:
+    """A unit's Exec line runs as root too: ``mv`` onto a release-state name
+    without -T moves the file into a directory, or a link to one, planted at
+    that name."""
+    units = REPO / "appliance/mkosi.extra/etc/systemd/system"
+    bad = []
+    for u in sorted(units.iterdir()):
+        if not u.is_file():
+            continue
+        for i, ln in enumerate(u.read_text(errors="replace").splitlines(), 1):
+            m = re.match(r"Exec\w*=[-@+!:]*(?:/usr)?/bin/mv\s+((?:-\S+\s+)*)", ln)
+            if m and "release-state" in ln and "T" not in m.group(1):
+                bad.append(f"{u.name}:{i}: {ln}")
+    assert not bad, "\n".join(bad)
+
+
 # ── cluster-join's parked manifests ─────────────────────────────────────────
 
 def _aside(tmp_path: Path, call: str) -> subprocess.CompletedProcess[str]:
