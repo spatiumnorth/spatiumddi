@@ -782,3 +782,77 @@ async def test_an_empty_schema_first_on_the_search_path_hides_nothing(
             await conn.execute(text(f"DROP SCHEMA IF EXISTS {quoted}"))
             await conn.commit()
     assert (tables, columns) == ([], [])
+
+
+# ── #2944: the probe has its own connection ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_readiness_answers_while_request_pool_is_exhausted(client: AsyncClient) -> None:
+    """Every connection of the request pool checked out (what ~90 bulk
+    requests do): the probe must still reach the database and answer inside
+    its 4 s bound, not queue on the pool."""
+    pool_cap = engine.pool.size() + engine.pool._max_overflow  # noqa: SLF001
+    held = []
+    try:
+        for _ in range(pool_cap):
+            held.append(await engine.connect())
+        started = monotonic()
+        response = await client.get("/health/ready")
+        elapsed = monotonic() - started
+    finally:
+        for conn in held:
+            await conn.close()
+    assert elapsed < 4, elapsed
+    body = response.json()
+    assert body["checks"]["database"] == "ok", body
+    assert body["checks"]["schema"].startswith("ok"), body
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_when_database_is_down(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A really-down database still answers 503 on the probe's engine."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app import db as db_module
+
+    await db_module.dispose_probe_engine()
+    dead = create_async_engine(
+        "postgresql+asyncpg://nobody:x@127.0.0.1:1/none",
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"timeout": 1},
+    )
+    monkeypatch.setattr(db_module, "probe_engine", lambda: dead)
+    try:
+        response = await client.get("/health/ready")
+    finally:
+        await dead.dispose()
+    assert response.status_code == 503
+    assert response.json()["checks"]["database"].startswith("error")
+    assert "schema" not in response.json()["checks"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_recovers_when_the_probe_connection_is_killed(
+    client: AsyncClient,
+) -> None:
+    """A failover or a Postgres restart kills the probe's one pooled
+    connection. The next probe must reconnect (pre-ping), not answer 503 until
+    something else recycles it: a probe that stays failed after a failover
+    takes every api pod out of the Service at once."""
+    from app.db import probe_engine
+
+    assert (await client.get("/health/ready")).status_code == 200
+    async with probe_engine().connect() as conn:
+        pid = (await conn.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+    async with engine.connect() as conn:
+        killed = (
+            await conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+        ).scalar_one()
+    assert killed is True
+    response = await client.get("/health/ready")
+    assert response.status_code == 200, response.json()
+    assert response.json()["checks"]["database"] == "ok"

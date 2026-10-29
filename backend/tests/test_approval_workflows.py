@@ -13,8 +13,8 @@ Covers the acceptance criteria pinned in the issue:
   requester id (in ``old_value.requested_by``) AND the approver id
   (``user_id``).
 * **Stale request** — the subnet became non-empty between submit and
-  approve; approve re-runs preview and refuses (409); the row stays
-  pending and the subnet is untouched.
+  approve; approve re-runs preview, which refuses: the row ends
+  ``failed`` with the reason (#2911) and the subnet is untouched.
 * **Expiry sweep** flips a ``pending`` row past its TTL to ``expired``.
 * **Superadmin** still needs a *second* superadmin to approve when the
   matched policy has ``applies_to_superadmin=True``.
@@ -344,8 +344,8 @@ async def test_approver_without_underlying_perm_denied(
 @pytest.mark.asyncio
 async def test_stale_request_refuses(client: AsyncClient, db_session: AsyncSession) -> None:
     """A permanent-delete request whose subnet became non-empty between
-    submit and approve re-runs preview and refuses (409); the row stays
-    pending and the subnet survives."""
+    submit and approve re-runs preview, which refuses: the request ends
+    ``failed`` with the reason (#2911), and the subnet survives."""
     await _enable_module(db_session)
     # applies_to_superadmin so the superadmin requester is gated (needed
     # because the permanent path requires superadmin).
@@ -368,12 +368,14 @@ async def test_stale_request_refuses(client: AsyncClient, db_session: AsyncSessi
     r2 = await client.post(
         f"/api/v1/change-requests/{cr_id}/approve", headers=_auth(atoken), json={}
     )
-    assert r2.status_code == 409, r2.text
-    assert "not empty" in r2.json()["detail"].lower()
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["state"] == "failed"
+    assert "not empty" in r2.json()["error"].lower()
 
-    # Left pending; subnet untouched.
+    # Recorded failed; subnet untouched.
+    db_session.expire_all()
     cr = await db_session.get(ChangeRequest, uuid.UUID(cr_id))
-    assert cr is not None and cr.state == "pending"
+    assert cr is not None and cr.state == "failed"
     await db_session.refresh(subnet)
     assert subnet.deleted_at is None
 

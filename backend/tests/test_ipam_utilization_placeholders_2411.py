@@ -60,9 +60,11 @@ async def test_full_slash29_reads_100_percent(client: AsyncClient, db_session: A
     assert got["total_ips"] == 6
     assert got["utilization_percent"] == 100.0
 
-    # The block rollup and the hourly recount agree with the inline count.
+    # The block rollup counts the subnet's network + broadcast as used too
+    # (its total is the full CIDR, #2982), and the hourly recount agrees
+    # with the inline subnet count.
     blk = (await client.get(f"/api/v1/ipam/blocks/{bid}", headers=headers)).json()
-    assert blk["allocated_ips"] == 6
+    assert blk["allocated_ips"] == 8
     await recount_utilization(db_session)
     got = (await client.get(f"/api/v1/ipam/subnets/{sid}", headers=headers)).json()
     assert (got["allocated_ips"], got["utilization_percent"]) == (6, 100.0)

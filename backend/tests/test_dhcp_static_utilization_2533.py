@@ -60,6 +60,7 @@ async def test_static_create_update_delete_recount(
     headers = {"Authorization": f"Bearer {token}"}
 
     assert await _counts(db_session, subnet_id, block_id) == (0, 0)
+    # From here the block also counts the /24's network + broadcast (#2982).
 
     resp = await client.post(
         f"/api/v1/dhcp/scopes/{scope_id}/statics",
@@ -68,7 +69,7 @@ async def test_static_create_update_delete_recount(
     )
     assert resp.status_code == 201, resp.text
     static_id = resp.json()["id"]
-    assert await _counts(db_session, subnet_id, block_id) == (1, 1)
+    assert await _counts(db_session, subnet_id, block_id) == (1, 3)
 
     resp = await client.post(
         f"/api/v1/dhcp/scopes/{scope_id}/statics",
@@ -76,7 +77,7 @@ async def test_static_create_update_delete_recount(
         json={"ip_address": "10.50.0.12", "mac_address": "aa:bb:cc:dd:ee:02"},
     )
     assert resp.status_code == 201, resp.text
-    assert await _counts(db_session, subnet_id, block_id) == (2, 2)
+    assert await _counts(db_session, subnet_id, block_id) == (2, 4)
 
     # Re-addressing frees the old row and takes the new one: still two.
     resp = await client.put(
@@ -85,8 +86,8 @@ async def test_static_create_update_delete_recount(
         json={"ip_address": "10.50.0.13"},
     )
     assert resp.status_code == 200, resp.text
-    assert await _counts(db_session, subnet_id, block_id) == (2, 2)
+    assert await _counts(db_session, subnet_id, block_id) == (2, 4)
 
     resp = await client.delete(f"/api/v1/dhcp/statics/{static_id}", headers=headers)
     assert resp.status_code == 204, resp.text
-    assert await _counts(db_session, subnet_id, block_id) == (1, 1)
+    assert await _counts(db_session, subnet_id, block_id) == (1, 3)

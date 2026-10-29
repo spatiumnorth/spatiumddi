@@ -33,14 +33,31 @@ function sinceLabel(since: Date): string {
   return `${hours} h ${mins % 60} min`;
 }
 
+/**
+ * #2962 — the wording follows who reported, as the alert's does. The
+ * server derives `daemon_reported_by` from the reason (the same function the
+ * `agent_daemon_degraded` message uses), so the chip and the alert agree. A
+ * supervisor verdict (an OOM kill or crash loop read from the kubelet, or an
+ * agent gone silent) is exactly the case where "the agent is heartbeating"
+ * is false.
+ */
+function bySupervisor(server: Partial<DaemonStateFields>): boolean {
+  return server.daemon_reported_by === "supervisor";
+}
+
 function explain(server: Partial<DaemonStateFields>): string {
   const status = server.daemon_status ?? "";
   const since = server.daemon_status_since
     ? new Date(server.daemon_status_since)
     : null;
+  const supervisor = bySupervisor(server);
   return [
-    `The agent reports its daemon is ${status.replace(/_/g, " ")}: it is heartbeating, but not serving.`,
-    server.daemon_reason ? `\n\nAgent reported: ${server.daemon_reason}` : "",
+    supervisor
+      ? `The appliance's supervisor reports this server's daemon is ${status.replace(/_/g, " ")}, from the kubelet's container state: the agent cannot report it itself.`
+      : `The agent reports its daemon is ${status.replace(/_/g, " ")}: it is heartbeating, but not serving.`,
+    server.daemon_reason
+      ? `\n\n${supervisor ? "Supervisor" : "Agent"} reported: ${server.daemon_reason}`
+      : "",
     since ? `\n\nSince: ${since.toLocaleString()} (${sinceLabel(since)})` : "",
   ].join("");
 }
@@ -85,9 +102,9 @@ export function DaemonStateBanner({
     <div className="rounded border border-rose-600/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-300">
       <div className="font-medium">Daemon {status.replace(/_/g, " ")}</div>
       <p className="mt-0.5 opacity-90">
-        The agent is heartbeating, but reports that its daemon is not serving.
-        Reachability, the health check and the last-seen stamp all read normal
-        in this state; only this report says otherwise.
+        {bySupervisor(server)
+          ? "The appliance's supervisor reports, from the kubelet's container state, that this server's daemon is not serving. The agent died with its container or has stopped heartbeating, so it cannot report this itself."
+          : "The agent is heartbeating, but reports that its daemon is not serving. Reachability, the health check and the last-seen stamp all read normal in this state; only this report says otherwise."}
       </p>
       {server.daemon_reason && (
         <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-black/5 p-2 font-mono text-[11px] dark:bg-white/5">

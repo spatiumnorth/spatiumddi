@@ -163,4 +163,32 @@ describe("restore card gates selective restore on the dump format (#2201)", () =
     expect(screen.getByText(NOTICE)).toBeTruthy();
     expect(applyButton().disabled).toBe(true);
   });
+
+  it.each([
+    ["no dump", "archive is missing the database dump member"],
+    ["no secrets", "archive is missing required member: secrets.enc"],
+    ["a newer format", "unsupported backup format_version: 3"],
+  ])(
+    "refuses a Full restore of an archive the restore refuses: %s (#2949)",
+    async (_name, reason) => {
+      await pickAndFill({
+        ...REGULAR,
+        restorable: false,
+        restore_refusal: reason,
+      });
+      expect(screen.getAllByText(/cannot be restored/).length).toBe(2);
+      expect(screen.queryByText("Recognised SpatiumDDI backup")).toBeNull();
+      expect(applyButton().disabled).toBe(true);
+      fireEvent.click(screen.getByText("stub-selective"));
+      expect(applyButton().disabled).toBe(true);
+      // No "switch to Full restore" advice pointing at a refused mode.
+      expect(screen.queryByText(NOTICE)).toBeNull();
+    },
+  );
+
+  it("still offers Apply when the server says the archive is restorable", async () => {
+    await pickAndFill({ ...REGULAR, restorable: true, restore_refusal: null });
+    expect(screen.getByText("Recognised SpatiumDDI backup")).toBeTruthy();
+    expect(applyButton().disabled).toBe(false);
+  });
 });

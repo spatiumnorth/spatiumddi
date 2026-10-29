@@ -100,15 +100,16 @@ not the operator's:
   can open, which grow with the control-plane node count (#2156): every
   node runs an api pod with its own database pool and a worker, every api,
   worker and beat process holds up to two more for the after-commit hooks
-  (#2782), and the primary runs a WAL sender per replica. So the api's pool
+  (#2782), every api pod holds one more for its readiness probe (#2944), and
+  the primary runs a WAL sender per replica. So the api's pool
   per pod shrinks past four nodes (10 + 20 up to four, 10 + 3 at nine;
   about 120 api connections in all), and the limit is never below
   shared_buffers + 256 MiB + those connections × ~15 MiB each. The cluster
-  can open 51 connections at one node, 131 at three and 218 at nine (two
-  worker processes); `max_connections` stays the chart's 200 until that
-  passes it, then follows it. One node of 8 GiB or more keeps the share
-  above; a three-node cluster on a 12 GiB seed gets 2971Mi, a nine-node one
-  4363Mi. A promote or demote that moves the limit is one CloudNativePG
+  can open 52 connections at one node, 134 at three and 227 at nine (two
+  worker processes); `max_connections` stays at the appliance floor of 200
+  until that passes it, then follows it. One node of 8 GiB or more keeps the share
+  above; a three-node cluster on a 12 GiB seed gets 3019Mi, a nine-node one
+  4507Mi. A promote or demote that moves the limit is one CloudNativePG
   rolling restart.
   These limits are keys the supervisor **owns**, so a different value written
   into that HelmChartConfig by hand is put back on the next heartbeat; there
@@ -1673,6 +1674,7 @@ Surfacing: a fresh `blocked` verdict renders in bold red on the console identity
 The Talos-style console got a wave of usability fixes:
 
 - F9 / Diag chip removed (handler was a no-op). *(Later, #556) F9 is repurposed to **Cancel pending reboot** — shown only while a reboot is queued; it stops the reboot service mid-grace and removes the trigger, aborting a web-UI / Fleet reboot from the physical console. The Slot-box indicator reads `REBOOT pending — F5 now · F9 cancel`.*
+- *(#2974)* **Every operator-initiated reboot or power-off hands the PostgreSQL primary off first.** The web-UI reboot (`spatiumddi-reboot.service`) and the console's F5 / F6 (`spatium-power-action@reboot|poweroff.service`, started without waiting, so the dashboard keeps rendering and a console restart cannot kill the run) all go through `spatium-power-action`, which runs `spatium-reboot-handoff --before-reboot` (as the Fleet reboot does, #2849) and then `systemctl reboot` / `poweroff`. On the node holding the primary that adds up to a few minutes, bounded: the handoff is capped at 240 s and the reboot goes on whatever it did. The Slot box reads `REBOOT under way — handing off DB primary · F9 cancel` meanwhile, and F9 stops it and uncordons the node. The node stays cordoned through the reboot and uncordons itself at its next boot (`spatiumddi-reboot-handoff.service`); **a node powered off for good stays cordoned in the cluster** until it is booted again or removed from the cluster.
 - Control-plane reachability chip (#556, appliance role only) — a ≤ 2 s TCP probe of `CONTROL_PLANE_URL`, fanned out in the data-tier pool so it overlaps the kubectl forks. Rendered on the header identity row so an operator can distinguish "network-partitioned" from "unapproved" (which `pairing_status` alone can't). Off on the control-plane role (empty URL).
 - Live-log noise filter — Python traceback frames, caret indicators, systemd restart-counter spam dropped before they hit the renderer; `--since` window 10 min → 2 min so crash spam clears 5× faster.
 - CPU usage 92 % → 1.4 % — Rich Live had its background `auto_refresh` thread + main loop both rendering at 4 Hz. Fixed with `auto_refresh=False` + main-loop tick 0.25 s → 0.5 s.
