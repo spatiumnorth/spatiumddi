@@ -343,7 +343,7 @@ async def axfr_zone_records(
                         name=rel_label,
                         record_type=rtype,
                         value=value,
-                        ttl=int(rdataset.ttl) if rdataset.ttl else None,
+                        ttl=int(rdataset.ttl),
                         priority=priority,
                         weight=weight,
                         port=port_field,

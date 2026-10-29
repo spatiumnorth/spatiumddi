@@ -125,4 +125,13 @@ async def move_appliance_dhcp_servers(
                 result="success",
             )
         )
+    if not dry_run and result.moved:
+        # #2963 - the group's appliance-hosted Kea members get their HA peer
+        # URL from the node address (empty URLs only; host-networked HA-mode
+        # groups). Only when a row actually moved in: re-saving the same roles
+        # is not a membership change and must not refill a cleared URL.
+        from app.services.dhcp.ha_peer_autofill import autofill_group_ha_peer_urls  # noqa: PLC0415
+
+        await db.flush()
+        await autofill_group_ha_peer_urls(db, dhcp_group.id, via="role_assignment")
     return result

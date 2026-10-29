@@ -50,6 +50,7 @@
     "jsqr": "^1.4.0",
     "postcss": "^8.5.31",
     "prettier": "^3.4.2",
+    "rollup-plugin-license": "^3.7.1",
     "tailwindcss": "^3.4.16",
     "tailwindcss-animate": "^1.0.7",
     "typescript": "^5.6.3",
