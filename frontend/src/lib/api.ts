@@ -7250,6 +7250,11 @@ export interface CloudDNSServerOption {
   has_credentials: boolean;
 }
 
+// The client defaults to application/json, which axios honours by turning a
+// FormData into JSON (a File becomes {}). The import previews read form
+// fields, so they must say multipart (#3038).
+const MULTIPART = { headers: { "Content-Type": "multipart/form-data" } };
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -7261,7 +7266,7 @@ export const dnsImportApi = {
     fd.append("target_group_id", target_group_id);
     if (target_view_id) fd.append("target_view_id", target_view_id);
     return api
-      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   bind9Commit: (body: {
@@ -7534,7 +7539,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   keaCommit: (body: DHCPImportCommitBody) =>
@@ -7549,7 +7554,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   iscCommit: (body: DHCPImportCommitBody) =>
