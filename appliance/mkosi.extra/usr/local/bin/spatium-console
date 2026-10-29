@@ -1904,7 +1904,8 @@ def refresh_durable_slot(saved_entry: str | None) -> None:
     """#3026 — fold a freshly-read grubenv ``saved_entry`` into the cached slot
     info. Only ``durable`` is replaced; ``current`` (the slot we booted from)
     is static. ``None`` (grubenv unreadable) keeps the last known value so a
-    transient probe failure cannot flip the verdict."""
+    transient probe failure cannot flip the verdict; ``""`` (readable, no
+    saved_entry) is stored as-is, matching ``detect_slot_info()``."""
     global _SLOT_INFO_CACHE
     cached = _SLOT_INFO_CACHE
     if cached is _UNPROBED or cached is None or saved_entry is None:
@@ -4226,7 +4227,7 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
 # ── Phase 2 KPI ribbon (§4) ────────────────────────────────────────────
 # A row of fixed-height (3 body + 2 border = 5) stat boxes placed in the
 # ``kpi`` Layout. Every box reads state.* ONLY (the few file-stats here —
-# slot_info() process-cached, reboot_pending()/upgrade_status() stat the
+# slot_info() a memory read, reboot_pending()/upgrade_status() stat the
 # release-state dir — already rode the PHASE-1 header render path, so this
 # is no regression). Each box is rendered through ``_kpi_safe`` so a single
 # malformed value degrades to a dim "n/a" box rather than blanking the frame.
@@ -4923,8 +4924,13 @@ class DashboardState:
             _grub = read_grubenv()
             self.slot_next_entry = ((_grub or {}).get("next_entry")) or None
             # #3026 — saved_entry moves when firstboot commits a trial boot,
-            # after this process started; keep the verdict in step.
-            refresh_durable_slot((_grub or {}).get("saved_entry") if _grub else None)
+            # after this process started; keep the verdict in step. A
+            # readable grubenv with no saved_entry is "no durable default"
+            # (what detect_slot_info() reports); only an UNREADABLE one
+            # (None) keeps the last value.
+            refresh_durable_slot(
+                _grub.get("saved_entry", "") if _grub is not None else None
+            )
             try:
                 self.env = read_env()
             except Exception:

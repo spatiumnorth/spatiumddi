@@ -158,18 +158,45 @@ def upgrade_direction(installed: str | None, target: str | None) -> str:
     return "backward" if includes else "forward"
 
 
-_NIGHTLY_TAG_RE = re.compile(r"^nightly-(\d{4})\.?(\d{2})\.?(\d{2})$")
+# A nightly's identity without its build: the release tag
+# (``nightly-YYYY.MM.DD``), the image tag (``nightly-YYYYMMDD``) or the slot
+# version with no ``+<sha>``. Each names a night, not a build.
+_NIGHTLY_DAY_RE = re.compile(
+    r"^(?:nightly-(\d{4})\.?(\d{2})\.?(\d{2})|0\.0\.0-nightly-(\d{4})(\d{2})(\d{2}))$"
+)
+
+
+def _nightly_day_target(target: str) -> date | None:
+    match = _NIGHTLY_DAY_RE.match(target)
+    if not match:
+        return None
+    groups = [g for g in match.groups() if g is not None]
+    try:
+        return date(*(int(g) for g in groups))
+    except ValueError:
+        return None
 
 
 def is_installed_target(installed: str | None, target: str | None) -> bool:
     """Whether a node reporting ``installed`` is already running ``target`` (#3026).
 
-    A release is installed under its own tag, so the two strings are equal.
-    A nightly is not: its release tag is ``nightly-YYYY.MM.DD`` (the bare
-    image tag ``nightly-YYYYMMDD`` is accepted too) while the slot reports
-    ``0.0.0-nightly-YYYYMMDD+<sha>``. A plain string compare never matched
-    them, so a completed nightly upgrade stayed "pending" and the supervisor
-    could fire it again over the rollback slot.
+    A release is installed under its own tag, so the two strings are equal,
+    and so is a target that spells out a nightly's full version including its
+    ``+<sha>``: that names one build, and only that build matches it.
+
+    A nightly's release tag does not: it is ``nightly-YYYY.MM.DD`` (the image
+    tag ``nightly-YYYYMMDD`` and a sha-less ``0.0.0-nightly-YYYYMMDD`` are
+    accepted too) while the slot reports ``0.0.0-nightly-YYYYMMDD+<sha>``. A
+    plain string compare never matched them, so a completed nightly upgrade
+    stayed "pending" and the supervisor could fire it again over the rollback
+    slot. Such a target names a NIGHT, so any build of that night matches:
+    the tag carries nothing finer, and nightly.yml publishes one build per
+    night (a forced same-night rebuild reuses the tag, and is the one case
+    this cannot tell apart).
+
+    ``spatium_supervisor.appliance_state.installed_is_target`` is a copy (a
+    separate package); ``tests/test_nightly_upgrade_cleared_3026.py`` runs
+    both over the same cases.
     """
     installed = (installed or "").strip()
     target = (target or "").strip()
@@ -178,7 +205,4 @@ def is_installed_target(installed: str | None, target: str | None) -> bool:
     if installed == target:
         return True
     night = nightly_build_date(installed)
-    match = _NIGHTLY_TAG_RE.match(target)
-    if night is None or match is None:
-        return False
-    return f"{night:%Y%m%d}" == "".join(match.groups())
+    return night is not None and night == _nightly_day_target(target)

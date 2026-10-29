@@ -1343,3 +1343,23 @@ def test_refresh_durable_slot_ignores_a_box_without_ab_slots(m, monkeypatch):
     monkeypatch.setattr(m, "_SLOT_INFO_CACHE", None)
     m.refresh_durable_slot("slot_a")
     assert m.slot_info() is None
+
+
+def test_readable_grubenv_without_saved_entry_reports_no_durable_default(m, monkeypatch):
+    """A grubenv that reads fine but carries no saved_entry is "no durable
+    default" — what detect_slot_info() reports — not "keep the old value"."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_a"))
+    monkeypatch.setattr(m, "read_grubenv", lambda: {"next_entry": ""})
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "")
+
+
+def test_unreadable_grubenv_on_the_data_tier_keeps_the_committed_slot(m, monkeypatch):
+    """A failed grub-editenv on one 5 s tick must not flip a committed box
+    back to a trial-boot verdict (#3026)."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_b"))
+    monkeypatch.setattr(m, "read_grubenv", lambda: None)
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_b")

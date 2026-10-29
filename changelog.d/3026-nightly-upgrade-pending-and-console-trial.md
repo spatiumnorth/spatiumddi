@@ -8,10 +8,15 @@
   after the upgrade landed. The Fleet card came back, and the supervisor
   would have fired the same slot write again over the inactive slot, the
   only rollback. The control plane (supervisor, DNS and DHCP agent
-  heartbeats, the rolling upgrade steps and the disk pre-flight) now
-  recognises a nightly tag as the build it names, and the supervisor never
-  fires a target the booted slot already is. Releases, where tag and
-  version are equal, behave as before. Separately, the tty1 console cached
+  heartbeats, the rolling upgrade steps, the disk pre-flight, the upgrade
+  image table's "installed on" column and the image reclaim sweep) now
+  recognises a nightly tag as the night it names, and the supervisor never
+  fires a target the booted slot already is, including on a trial boot of
+  it. A nightly rolling upgrade's shared-chart hold had the same compare,
+  so a node already on the target could write the shared role chart
+  mid-roll (#1710's outage); it now holds. Releases, where tag and version
+  are equal, behave as before, and a target spelled as a full nightly
+  version (`+<sha>` included) still matches only that build. Separately, the tty1 console cached
   grubenv's `saved_entry` for the life of the process, so it kept
   "DEGRADED - trial boot - reboot reverts" after firstboot committed the
   new slot, until the next reboot; it now re-reads it every 5 seconds.
