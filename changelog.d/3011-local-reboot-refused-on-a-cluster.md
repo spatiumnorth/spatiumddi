@@ -9,3 +9,6 @@
   `reboot_available` and `reboot_unavailable_reason`, and the Maintenance tab
   shows a link to Fleet instead of the button. Single-node and compose
   installs are unchanged.
+  On a multi-node control plane this also means a user with the Appliance
+  Operator role (`admin` on `appliance`, not superadmin) can no longer reboot
+  a node at all: Fleet's per-appliance reboot needs a superadmin (#2620).

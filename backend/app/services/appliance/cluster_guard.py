@@ -32,9 +32,11 @@ def clustered_refusal(action: str, nodes: int, alternative: str) -> str:
 
 async def reject_if_clustered(db: AsyncSession, action: str, alternative: str) -> None:
     """Refuse a node-local WRITE when this deployment has more than one
-    appliance node.
+    control-plane node.
 
-    ``schedule_apply``/``schedule_rollback`` write trigger files into
+    Callers: slot apply / rollback (``slot.py``) and the local reboot
+    (``system.py``, #3011). ``schedule_apply``/``schedule_rollback`` and
+    ``request_reboot`` write trigger files into
     ``/var/lib/spatiumddi-host/release-state``, which is a hostPath on the
     node the responding pod happens to occupy. That is correct on a
     single-node appliance — there is exactly one node, and it is this one.
