@@ -27,7 +27,7 @@ pattern), so an operator who deletes it keeps it deleted. The downgrade leaves
 it alone, since by then it may carry operator edits and its events.
 
 Revision ID: 833ee80c8c6b
-Revises: c4f81e2a9d37
+Revises: e3a9c71f40d2
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "833ee80c8c6b"
-down_revision: str | None = "c4f81e2a9d37"
+down_revision: str | None = "e3a9c71f40d2"
 branch_labels: str | None = None
 depends_on: str | None = None
 
