@@ -10,6 +10,7 @@ import {
 
 import { Link } from "react-router-dom";
 import { applianceSystemApi, formatApiError } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
@@ -39,9 +40,11 @@ export function MaintenanceTab() {
     // from request to the node going down; 15 s missed it entirely. The
     // endpoint is a few file stats, and only this open tab polls this fast.
     refetchInterval: (q) =>
-      q.state.data?.reboot_scheduled || q.state.data?.reboot_in_progress
-        ? 2_000
-        : 5_000,
+      isRefused(q.state.error)
+        ? false
+        : q.state.data?.reboot_scheduled || q.state.data?.reboot_in_progress
+          ? 2_000
+          : 5_000,
   });
 
   const toggleMaint = useMutation({

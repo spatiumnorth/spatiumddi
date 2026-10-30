@@ -19,6 +19,7 @@ import {
   type ContainerAction,
   formatApiError,
 } from "@/lib/api";
+import { listReadErrorMessage, pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import {
   useApplianceAdminGate,
@@ -49,7 +50,7 @@ export function ContainersTab() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "containers"],
     queryFn: applianceContainersApi.list,
-    refetchInterval: 5_000,
+    refetchInterval: pollUnlessRefused(5_000),
   });
 
   const action = useMutation({
@@ -89,7 +90,7 @@ export function ContainersTab() {
 
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          {formatApiError(error)}
+          {listReadErrorMessage(error, "the pods")}
         </div>
       )}
       {/* A refused Restart / Stop / Start used to say nothing (#1342). */}
@@ -103,7 +104,7 @@ export function ContainersTab() {
         <div className="py-12 text-center text-sm text-muted-foreground">
           Loading…
         </div>
-      ) : !data || data.length === 0 ? (
+      ) : error ? null : !data || data.length === 0 ? (
         <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
           No pods visible. The api's ServiceAccount may not be wired up — check
           the chart's ``api.serviceAccount.enabled`` value.
