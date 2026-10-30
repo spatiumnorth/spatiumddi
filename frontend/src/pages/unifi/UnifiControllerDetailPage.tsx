@@ -11,7 +11,7 @@ import {
   AlertTriangle,
 } from "lucide-react";
 
-import { unifiApi, type UnifiTestResult } from "@/lib/api";
+import { formatApiError, unifiApi, type UnifiTestResult } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ModalTabs } from "@/components/ui/modal";
 
@@ -555,11 +555,5 @@ function EmptyTab({ message }: { message: string }) {
 }
 
 function errMsg(e: unknown, fallback: string): string {
-  const ae = e as {
-    response?: { data?: { detail?: unknown } };
-    message?: string;
-  };
-  const d = ae?.response?.data?.detail;
-  if (typeof d === "string") return d;
-  return ae?.message || fallback;
+  return formatApiError(e, fallback);
 }

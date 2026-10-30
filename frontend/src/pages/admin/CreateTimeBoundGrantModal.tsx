@@ -1,7 +1,11 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import { timeBoundGrantsApi, type TimeBoundGrantCreate } from "@/lib/api";
+import {
+  formatApiError,
+  timeBoundGrantsApi,
+  type TimeBoundGrantCreate,
+} from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
@@ -95,10 +99,7 @@ export function CreateTimeBoundGrantModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Failed to create grant";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to create grant"));
     },
   });
 
