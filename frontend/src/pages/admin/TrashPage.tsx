@@ -7,7 +7,12 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { trashApi, type TrashEntry, type TrashEntryType } from "@/lib/api";
+import {
+  formatApiError,
+  trashApi,
+  type TrashEntry,
+  type TrashEntryType,
+} from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -252,9 +257,7 @@ function ConfirmPermanentDeleteModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Permanent delete failed");
+      setError(formatApiError(err, "Permanent delete failed"));
     },
   });
 

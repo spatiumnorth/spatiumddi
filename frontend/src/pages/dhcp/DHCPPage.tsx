@@ -2894,16 +2894,18 @@ function ServerDetailView({
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
     },
     onError: (e) => {
-      const err = e as {
-        response?: { status?: number; data?: { detail?: string } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (err?.response?.status === 409) {
+      const response = (e as { response?: { status?: number } })?.response;
+      if (response?.status === 409) {
+        // The response alone, so a 409 without a detail still names the
+        // conflict instead of axios's "Request failed with status code 409".
         setAdoptConflict(
-          detail ?? "A DHCP server already exists on the interface.",
+          formatApiError(
+            { response },
+            "A DHCP server already exists on the interface.",
+          ),
         );
       } else {
-        setSyncBanner(detail ?? "Force sync failed");
+        setSyncBanner(formatApiError(e, "Force sync failed"));
       }
     },
   });
@@ -2978,11 +2980,7 @@ function ServerDetailView({
         );
       setSyncBanner(parts.join(" · "));
     },
-    onError: (e) =>
-      setSyncBanner(
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Sync leases failed",
-      ),
+    onError: (e) => setSyncBanner(formatApiError(e, "Sync leases failed")),
   });
   const approveMut = useMutation({
     mutationFn: () => dhcpApi.approveServer(server.id),
@@ -3532,10 +3530,7 @@ export function DHCPPage() {
     },
   });
   const deleteGroupError =
-    deleteGroupMut.error &&
-    (((deleteGroupMut.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroupMut.error));
+    deleteGroupMut.error && formatApiError(deleteGroupMut.error);
   const deleteServerMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {

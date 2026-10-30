@@ -61,7 +61,12 @@ import structlog
 from sqlalchemy import select, text
 
 from app.config import settings
-from app.core.versions import canonical_version, includes_release, parse_release
+from app.core.versions import (
+    canonical_version,
+    includes_release,
+    is_installed_target,
+    parse_release,
+)
 from app.db import AsyncSessionLocal
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -497,9 +502,15 @@ async def check_node_disk_headroom(
     on_target: list[str] = []
     if target_version:
         on_target = sorted(
-            r.hostname or str(r.id) for r in rows if r.installed_appliance_version == target_version
+            r.hostname or str(r.id)
+            for r in rows
+            if is_installed_target(r.installed_appliance_version, target_version)
         )
-        rows = [r for r in rows if r.installed_appliance_version != target_version]
+        rows = [
+            r
+            for r in rows
+            if not is_installed_target(r.installed_appliance_version, target_version)
+        ]
     result = judge_node_disk_headroom(rows, need_bytes=need, now=datetime.now(UTC))
     detail = {**result.detail, "on_target": on_target} if target_version else result.detail
     if missing and result.level != "fail":

@@ -8,6 +8,7 @@ import {
   Wrench,
 } from "lucide-react";
 
+import { Link } from "react-router-dom";
 import { applianceSystemApi, formatApiError } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
@@ -146,17 +147,36 @@ export function MaintenanceTab() {
               the database primary, the primary moves to another node first (up
               to a few minutes).
             </p>
+            {data?.reboot_available === false && (
+              <p
+                className="mt-1 text-[11px] text-amber-700 dark:text-amber-400"
+                data-testid="reboot-unavailable"
+              >
+                {data.reboot_unavailable_reason ??
+                  "Reboot is unavailable on a multi-node control plane."}{" "}
+                Reboot each node from Fleet instead.
+              </p>
+            )}
           </div>
-          <button
-            type="button"
-            onClick={() => setConfirmReboot(true)}
-            disabled={data?.reboot_scheduled}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
-            {...applianceGate}
-          >
-            <Power className="h-3.5 w-3.5" />
-            {data?.reboot_scheduled ? "Already scheduled" : "Reboot now"}
-          </button>
+          {data?.reboot_available === false ? (
+            <Link
+              to="/appliance?tab=fleet"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+            >
+              Reboot from Fleet
+            </Link>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setConfirmReboot(true)}
+              disabled={data?.reboot_scheduled}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+              {...applianceGate}
+            >
+              <Power className="h-3.5 w-3.5" />
+              {data?.reboot_scheduled ? "Already scheduled" : "Reboot now"}
+            </button>
+          )}
         </div>
       </section>
 

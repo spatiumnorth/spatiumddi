@@ -31,6 +31,7 @@ import {
   type ResourceOptionsResponse,
   type RequestKind,
   type RequestKindId,
+  formatApiError,
 } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -128,10 +129,7 @@ function fmtTime(iso: string | null): string {
 }
 
 function errMessage(e: unknown, fallback: string): string {
-  const detail = (e as { response?: { data?: { detail?: unknown } } })?.response
-    ?.data?.detail;
-  if (typeof detail === "string") return detail;
-  return e instanceof Error ? e.message : fallback;
+  return formatApiError(e, fallback);
 }
 
 // ── New-request modal ──────────────────────────────────────────────────────

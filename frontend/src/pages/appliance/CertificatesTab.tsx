@@ -1798,11 +1798,7 @@ function ErrorBanner({ message }: { message: string }) {
 }
 
 function extractError(err: unknown): string {
-  const e = err as {
-    response?: { data?: { detail?: string } };
-    message?: string;
-  };
-  return e.response?.data?.detail ?? e.message ?? "request failed";
+  return formatApiError(err, "request failed");
 }
 
 function fmtDate(s: string): string {

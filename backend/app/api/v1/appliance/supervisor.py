@@ -98,7 +98,7 @@ from app.core.auth_throttle import (
 from app.core.db_transient import is_transient_db_error
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
-from app.core.versions import upgrade_direction
+from app.core.versions import is_installed_target, upgrade_direction
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -3049,7 +3049,7 @@ async def _supervisor_heartbeat(
     # legacy dns_server / dhcp_server auto-clear.
     if (
         row.desired_appliance_version is not None
-        and row.installed_appliance_version == row.desired_appliance_version
+        and is_installed_target(row.installed_appliance_version, row.desired_appliance_version)
         and row.last_upgrade_state in (None, "done", "ready")
     ):
         row.desired_appliance_version = None

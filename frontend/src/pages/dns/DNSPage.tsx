@@ -12149,10 +12149,7 @@ export function DNSPage() {
     },
   });
   const deleteGroupError =
-    deleteGroup.error &&
-    (((deleteGroup.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroup.error));
+    deleteGroup.error && formatApiError(deleteGroup.error);
 
   function toggleGroup(id: string) {
     setExpandedGroups((prev) => {
