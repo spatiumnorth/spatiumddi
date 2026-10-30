@@ -6042,7 +6042,7 @@ export function SubnetDetail({
                   ? "border-primary text-foreground"
                   : "border-transparent text-muted-foreground hover:text-foreground",
               )}
-              title="NAT mappings whose internal IP falls inside this subnet"
+              title="NAT mappings whose internal or external IP falls inside this subnet"
             >
               NAT
             </button>
@@ -10119,8 +10119,8 @@ function NatSubnetPanel({ subnetId }: { subnetId: string }) {
   return (
     <div className="space-y-2 p-2">
       <p className="px-3 pt-1 text-xs text-muted-foreground">
-        Every NAT mapping whose internal IP falls inside this subnet's CIDR, or
-        that's pinned to it as a hide-NAT source.
+        Every NAT mapping whose internal or external IP falls inside this
+        subnet's CIDR, or that's pinned to it as a hide-NAT source.
       </p>
       <NatRowsTable
         rows={data}
