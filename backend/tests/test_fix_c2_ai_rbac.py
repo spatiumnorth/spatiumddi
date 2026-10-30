@@ -127,7 +127,7 @@ def test_core_write_ops_declare_a_gate() -> None:
     inline-superadmin ops (create_alert_rule, grant_temporary_access)
     gate inside their own apply instead and are excluded here."""
     expected = {
-        "create_ip_address": ("write", "ip_address"),
+        "create_ip_address": ("write", "subnet"),
         "allocate_subnet": ("write", "subnet"),
         "run_nmap_scan": ("write", "manage_nmap_scans"),
         "create_dns_record": ("write", "dns_record"),
@@ -155,7 +155,7 @@ def test_core_write_ops_declare_a_gate() -> None:
 async def test_enforce_operation_permission_raises_for_viewer(db_session: AsyncSession) -> None:
     op = get_operation("create_ip_address")
     assert op is not None
-    # A bare user with no groups → no write on ip_address.
+    # A bare user with no groups → no write on subnet.
     viewer = await _user(db_session)
     with pytest.raises(OperationPermissionError):
         enforce_operation_permission(viewer, op)
@@ -192,13 +192,13 @@ async def test_apply_proposal_403_for_unprivileged_owner(db_session: AsyncSessio
 
 @pytest.mark.asyncio
 async def test_apply_proposal_succeeds_for_authorized_writer(db_session: AsyncSession) -> None:
-    """A user granted ('write','ip_address') — the same grant the REST
-    route requires — can apply the proposal and the row lands."""
+    """A user granted ('write','subnet') — the same grant the REST
+    address write requires (#3058) — can apply the proposal and the row lands."""
     subnet = await _subnet(db_session)
     writer = await _user(
         db_session,
         name="ipam-editor",
-        permissions=[{"action": "write", "resource_type": "ip_address"}],
+        permissions=[{"action": "write", "resource_type": "subnet"}],
     )
     proposal = await _make_proposal(
         db_session,

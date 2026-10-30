@@ -49,6 +49,7 @@ from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import rekey_raw_options
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 from app.services.import_savepoint import entity_savepoint
+from app.services.ipam.resize import _total_ips
 
 from .canonical import (
     ConflictAction,
@@ -336,7 +337,7 @@ async def _create_subnet(
         network=cidr,
         name="",
         kind="multicast" if is_multicast else "unicast",
-        total_ips=net.num_addresses,
+        total_ips=_total_ips(net),
         utilization_percent=0.0,
         allocated_ips=0,
     )

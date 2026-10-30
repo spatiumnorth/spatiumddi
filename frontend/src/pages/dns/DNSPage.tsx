@@ -636,7 +636,7 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
  *  never sends a delete it knows will be refused. The server's refusal stays
  *  the backstop and its reason shows in the dialog. What a delete still takes
  *  is the group's zones already in Trash, for good. */
-function DeleteDNSGroupModal({
+export function DeleteDNSGroupModal({
   group,
   onConfirm,
   onClose,
@@ -659,6 +659,36 @@ function DeleteDNSGroupModal({
     queryKey: ["dns-zones", group.id],
     queryFn: () => dnsApi.listZones(group.id),
   });
+  // What else a delete destroys (#3112): the group's views, ACLs and TSIG keys
+  // go with it by FK cascade and none of it goes to Trash. Counted from the
+  // lists the group's tabs already read; one that fails to load is named
+  // without a number.
+  const configQs = [
+    {
+      one: "view",
+      many: "views",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "views", group.id],
+        queryFn: () => dnsApi.listViews(group.id),
+      }),
+    },
+    {
+      one: "ACL",
+      many: "ACLs",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "acls", group.id],
+        queryFn: () => dnsApi.listAcls(group.id),
+      }),
+    },
+    {
+      one: "TSIG key",
+      many: "TSIG keys",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "tsig-keys", group.id],
+        queryFn: () => dnsApi.listTSIGKeys(group.id),
+      }),
+    },
+  ];
   const title = "Delete Server Group";
 
   if (serversQ.isPending || zonesQ.isPending) {
@@ -701,11 +731,33 @@ function DeleteDNSGroupModal({
       </Modal>
     );
   }
+  // Only the delete path needs the configuration counts.
+  if (configQs.some(({ q }) => q.isPending)) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" holds…
+        </p>
+      </Modal>
+    );
+  }
+  const held = configQs
+    .map(({ one, many, q }) => ({ one, many, count: q.data?.length ?? null }))
+    .filter((k) => k.count === null || k.count > 0)
+    .map((k) =>
+      k.count === null
+        ? `its ${k.many}`
+        : `${k.count} ${k.count === 1 ? k.one : k.many}`,
+    );
+  const config =
+    held.length > 0
+      ? ` The group's own configuration is deleted with it, none of it into Trash: ${held.join(", ")}.`
+      : "";
   return (
     <ConfirmDestroyModal
       title={title}
-      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records, and can no longer be restored.`}
-      checkLabel={`I understand the group "${group.name}" and its zones in Trash will be deleted for good.`}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records and pools, and can no longer be restored.${config} Its server options go too. None of this can be restored.`}
+      checkLabel={`I understand the group "${group.name}", its zones in Trash and its views, ACLs, TSIG keys and options will be deleted for good.`}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
@@ -1736,10 +1788,11 @@ export function ServerModal({
             <code className="rounded bg-emerald-500/20 px-1">
               ghcr.io/spatiumnorth/dns-technitium
             </code>{" "}
-            container alongside this server. v1 supports primary zones +
-            standard record types; DNSSEC, native DoT/DoH/DoQ listeners, and
-            secondary zones are on the roadmap. The agent provisions and rotates
-            its own API token automatically — leave the field below blank.
+            container alongside this server. Serves primary, secondary, stub and
+            forward zones, and native DoT, DoH and DoQ listeners (set from the
+            group&apos;s Options). DNSSEC signing is BIND9 and PowerDNS only.
+            The agent provisions and rotates its own API token automatically —
+            leave the field below blank.
           </div>
         )}
         {driver === "technitium_api" && (

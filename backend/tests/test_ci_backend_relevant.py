@@ -132,6 +132,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_ipam_bulk_allocate_template_vectors_2071.py": (
         "frontend/src/lib/bulk-allocate-template.vectors.json"
     ),
+    # #3119 — every resource type the server checks must be offered by New Role.
+    "test_grant_vocabulary_covers_routes_3119.py": ("frontend/src/lib/permissionVocabulary.ts"),
     "test_e911_held.py": (
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",

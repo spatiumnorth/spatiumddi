@@ -106,7 +106,7 @@ class ListSpacesArgs(BaseModel):
 @register_tool(
     name="list_ip_spaces",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "ip_space"),
     description=(
         "List IP spaces (top-level routing domains / VRFs). "
         "Returns each space's id, name, description, default flag, "
@@ -167,7 +167,7 @@ class ListBlocksArgs(BaseModel):
 @register_tool(
     name="list_ip_blocks",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "ip_block"),
     description=(
         "List IP blocks (aggregate / supernet ranges). Each block "
         "summary includes its CIDR, name, parent block, space, and "
@@ -250,7 +250,7 @@ class ListSubnetsArgs(BaseModel):
 @register_tool(
     name="list_subnets",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "subnet"),
     description=(
         "List subnets — the routable units that own IP addresses. "
         "Use this tool whenever the operator names a subnet by CIDR "
@@ -341,7 +341,7 @@ class FindSubnetsDecommissioningArgs(BaseModel):
 @register_tool(
     name="find_subnets_decommissioning",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "subnet"),
     description=(
         "List subnets with a planned decommission date (issue #46) "
         "falling within the next N days (default 30) — plus any that "
@@ -401,7 +401,7 @@ class SubnetSummaryArgs(BaseModel):
 @register_tool(
     name="get_subnet_summary",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "subnet"),
     description=(
         "Detailed summary for one subnet: status counts (allocated, "
         "free, reserved, dhcp, etc.), gateway, VLAN, recent allocation "
@@ -468,7 +468,7 @@ class SubnetReconciliationArgs(BaseModel):
 @register_tool(
     name="find_subnet_reconciliation",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "subnet"),
     description=(
         "IP-discovery reconciliation for one subnet (issue #23): which "
         "allocated IPs aren't answering on the wire, which live IPs were "
@@ -512,7 +512,7 @@ class SubnetUtilizationTrendArgs(BaseModel):
 @register_tool(
     name="get_subnet_utilization_trend",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "subnet"),
     description=(
         "Daily IP-utilization history for one subnet (issue #44): a "
         "time-ordered series of allocated / total / percent snapshots plus "
@@ -602,7 +602,7 @@ class FindStaleIPsArgs(BaseModel):
 @register_tool(
     name="find_stale_ips",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "ip_address"),
     description=(
         "Address-space hygiene report (issue #45): allocated IPs that "
         "nothing has seen on the wire in N days (default 90), drawn from "
@@ -661,7 +661,7 @@ class FindIPArgs(BaseModel):
 @register_tool(
     name="find_ip",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "ip_address"),
     description=(
         "Look up a single IP address by its dotted-decimal value "
         "(e.g. ``192.168.0.4``) and return its full row: hostname, "
@@ -755,7 +755,7 @@ class FindIPAddressesArgs(BaseModel):
 @register_tool(
     name="find_ip_addresses",
     honours_token_binding=True,
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "ip_address"),
     description=(
         "Search IP addresses ACROSS every subnet by substring (``q``), "
         "hostname, MAC or status — the cross-subnet companion to ``find_ip`` "
@@ -1014,12 +1014,12 @@ _TAG_KIND_DEFAULT = ["subnet", "ip_block", "ip_address", "ip_space"]
 # The read permission each tag kind needs — the gate on that kind's own REST
 # route. ``find_by_tag`` itself only requires an IPAM read, so the extended
 # kinds are checked one by one and a kind the caller can't read is skipped.
-_IPAM_TYPES = ("ip_space", "ip_block", "subnet", "ip_address")
 _TAG_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
-    "ip_space": ("read", _IPAM_TYPES),
-    "ip_block": ("read", _IPAM_TYPES),
-    "subnet": ("read", _IPAM_TYPES),
-    "ip_address": ("read", _IPAM_TYPES),
+    # Each IPAM kind takes its own type, as its REST route does (#3058).
+    "ip_space": ("read", ("ip_space",)),
+    "ip_block": ("read", ("ip_block",)),
+    "subnet": ("read", ("subnet",)),
+    "ip_address": ("read", ("ip_address",)),
     "asn": ("read", ("manage_asns",)),
     "vrf": ("read", ("vrf",)),
     "network_device": ("read", ("manage_network_devices",)),
@@ -1134,7 +1134,7 @@ class CountResourcesArgs(BaseModel):
         "addresses, plus a breakdown of IP addresses by status. "
         "Equivalent to the dashboard's KPI ribbon. Use this when the "
         "operator asks 'how big is my deployment?' or 'how many "
-        "subnets do I have?'."
+        "subnets do I have?'. A count is null for a type you cannot read."
     ),
     args_model=CountResourcesArgs,
     category="ipam",
@@ -1142,26 +1142,41 @@ class CountResourcesArgs(BaseModel):
 async def count_ipam_resources(
     db: AsyncSession, user: User, args: CountResourcesArgs
 ) -> dict[str, Any]:
-    space_count = await db.scalar(
-        select(func.count(IPSpace.id)).where(IPSpace.deleted_at.is_(None))
-    )
-    block_count = await db.scalar(
-        select(func.count(IPBlock.id)).where(IPBlock.deleted_at.is_(None))
-    )
-    subnet_count = await db.scalar(select(func.count(Subnet.id)).where(Subnet.deleted_at.is_(None)))
-    ip_count = await db.scalar(select(func.count(IPAddress.id)))
-    by_status_rows = (
-        await db.execute(
-            select(IPAddress.status, func.count(IPAddress.id)).group_by(IPAddress.status)
-        )
-    ).all()
-    return {
-        "ip_spaces": int(space_count or 0),
-        "ip_blocks": int(block_count or 0),
-        "subnets": int(subnet_count or 0),
-        "ip_addresses": int(ip_count or 0),
-        "ip_addresses_by_status": {row[0]: int(row[1]) for row in by_status_rows},
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    # A rollup over four types (#3058): each count only for a type the caller
+    # can read, as the type's own list route would allow.
+    def can(rtype: str) -> bool:
+        return user_has_permission(user, "read", rtype)
+
+    out: dict[str, Any] = {
+        "ip_spaces": None,
+        "ip_blocks": None,
+        "subnets": None,
+        "ip_addresses": None,
+        "ip_addresses_by_status": None,
     }
+    if can("ip_space"):
+        out["ip_spaces"] = int(
+            await db.scalar(select(func.count(IPSpace.id)).where(IPSpace.deleted_at.is_(None))) or 0
+        )
+    if can("ip_block"):
+        out["ip_blocks"] = int(
+            await db.scalar(select(func.count(IPBlock.id)).where(IPBlock.deleted_at.is_(None))) or 0
+        )
+    if can("subnet"):
+        out["subnets"] = int(
+            await db.scalar(select(func.count(Subnet.id)).where(Subnet.deleted_at.is_(None))) or 0
+        )
+    if can("ip_address"):
+        out["ip_addresses"] = int(await db.scalar(select(func.count(IPAddress.id))) or 0)
+        by_status_rows = (
+            await db.execute(
+                select(IPAddress.status, func.count(IPAddress.id)).group_by(IPAddress.status)
+            )
+        ).all()
+        out["ip_addresses_by_status"] = {row[0]: int(row[1]) for row in by_status_rows}
+    return out
 
 
 # ── address sets (#103) ───────────────────────────────────────────────
@@ -1287,7 +1302,7 @@ class FindIPHygieneFindingsArgs(BaseModel):
 
 @register_tool(
     name="find_ip_hygiene_findings",
-    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
+    permission=("read", "ip_address"),
     description=(
         "Fleet-wide IPAM hygiene findings (issue #369), in three buckets: "
         "'free_but_responding' (IPs marked available that answered on the "
