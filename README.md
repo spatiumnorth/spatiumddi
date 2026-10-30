@@ -961,7 +961,9 @@ Operators get a real Kubernetes node without managing one.
    Postgres replica / Redis. SSD strongly preferred for the
    etcd + Postgres write path. When you pick the **Control plane**
    role on a box below the recommended 40 GiB / 8 GiB, the installer
-   shows a sizing warning before proceeding.
+   shows a sizing warning before proceeding. Measured figures, the
+   minimums and the 48 GiB disk advice for a three-node control plane:
+   [Requirements, Memory / CPU](#memory--cpu).
 2. Boot. The installer wizard asks for:
    - **Role** — *Control plane* (the required first install:
      control plane on this box + the k3s etcd seed; DNS / DHCP
@@ -1391,6 +1393,29 @@ EOF
 - Kubernetes with Helm: CI tests the charts on Kubernetes 1.36 with Helm 4 (k3s 1.36 on the appliance); the umbrella chart declares `kubeVersion: >=1.31`, **or**
 - The SpatiumDDI OS appliance on bare metal or a VM (see [APPLIANCE.md](docs/deployment/APPLIANCE.md)); running directly on a host OS without Docker is planned, not implemented
 
+#### Memory / CPU
+
+Measured on running appliances (amd64 VMs, 1.0 pre-release builds): at rest,
+under light and realistic load, through upgrades and HA drills, and over a
+3-day soak. Docker Compose and Kubernetes were measured at rest and under
+light load (arm64). The numbers behind each row, the rule that turns them into a
+Minimum and a Recommended, what is not measured yet and how to measure your
+own install are in [docs/deployment/SIZING.md](docs/deployment/SIZING.md).
+
+| Deployment | Minimum | Recommended |
+|---|---|---|
+| **Appliance, one node** (control plane, with or without DNS / DHCP) | 4 vCPU, 6 GiB RAM, 40 GiB disk | 4 vCPU, 8 GiB RAM, 40 GiB SSD |
+| **Appliance, three-node control plane** | first node 4 vCPU / 8 GiB, the others 2 vCPU / 6 GiB, 40 GiB disks | every node 4 vCPU, 8 GiB RAM, 48 GiB SSD |
+| **Appliance role** (DNS / DHCP agent box) | 3 GiB RAM (its pods do not schedule below that) | 2 vCPU, 4 GiB RAM, 32 GiB SSD (not measured yet) |
+| **Docker Compose** (one host) | 2 vCPU, 4 GiB RAM (measured, arm64, Docker Desktop) | 4 vCPU, 8 GiB RAM (derived) |
+| **Kubernetes** (umbrella chart) | one node: 4 vCPU, 6 GiB RAM with the overrides in SIZING.md, 8 GiB on the chart's defaults (measured, arm64, Docker Desktop) | 4 vCPU, 8 GiB per node; api memory `512Mi` request and `1Gi` limit, worker `2Gi` |
+
+One node at rest used 3.3 GiB, and the busiest suites took it to 4.1 GiB:
+at this data size the memory is mostly the stack itself, not the load. For
+about 1M devices give every control-plane node 64 GiB of disk or more. On
+Kubernetes the chart's default api autoscaler runs 10 replicas at rest, since
+one api process is above its memory target; SIZING.md has the overrides.
+
 ---
 
 ## Deployment Options
@@ -1428,6 +1453,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
 | [Deployment Topologies](docs/deployment/TOPOLOGIES.md) | Six reference topologies — single VM through HA cloud + on-prem hybrid — with diagrams |
+| [Sizing](docs/deployment/SIZING.md) | Measured memory, CPU and disk per deployment shape, Minimum and Recommended, and how to measure your own install |
 | [Windows Server Setup](docs/deployment/WINDOWS.md) | WinRM, service accounts, firewall — Windows-side checklist |
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
 | [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + PowerDNS + Technitium (agent-managed *and* agentless) + Windows DNS + cloud (Route 53 / Azure DNS / Cloudflare / Google) driver internals |

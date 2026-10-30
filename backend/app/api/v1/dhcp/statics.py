@@ -17,7 +17,7 @@ from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_optional_hostname
 from app.core.permissions import require_resource_permission
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
 from app.services.dhcp.normalize import norm_duid, norm_ip, norm_mac
@@ -310,6 +310,7 @@ async def update_static(
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
         await _conflict_check(db, scope, new_ip, new_mac, exclude_id=st.id)
+    before = snapshot(st, changes)
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
@@ -328,7 +329,7 @@ async def update_static(
         resource_type="dhcp_static_assignment",
         resource_id=str(st.id),
         resource_display=f"{st.mac_address}->{st.ip_address}",
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()

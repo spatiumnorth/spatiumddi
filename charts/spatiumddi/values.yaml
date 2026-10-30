@@ -665,6 +665,8 @@ ingress:
   className: nginx
   annotations: {}
     # nginx.ingress.kubernetes.io/proxy-buffering: "off"      # SSE: AI chat, cluster health, logs (#1868)
+    # nginx.ingress.kubernetes.io/proxy-body-size: "4g"       # ingress-nginx's 1m default 413s imports + backup / slot-image uploads (#3036)
+    # nginx.ingress.kubernetes.io/proxy-request-buffering: "off"  # stream bodies to the frontend nginx, which applies the per-route limits
     # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # cert-manager.io/cluster-issuer: letsencrypt-prod
@@ -802,6 +804,30 @@ postgresql:
     # its own ``switchoverDelay``). Not part of the instance pods' spec,
     # so changing it rolls nothing.
     smartShutdownTimeout: 15
+    # #3021 — where the instance pods reach the Kubernetes API server. Off
+    # (the default): through the ``kubernetes`` Service, like every pod.
+    # On: through the API server on their own node, ``status.hostIP`` at
+    # ``port``, set as KUBERNETES_SERVICE_HOST / KUBERNETES_SERVICE_PORT.
+    #
+    # The primary's instance manager keeps one long-lived connection to the
+    # API server. Through the Service that connection goes to any node's
+    # API server, and when that node is lost the primary cannot reach the
+    # API: its liveness probe's isolation check then fails on the replica
+    # it can no longer reach either, and kubelet restarts the primary,
+    # taking the database away for 25 to 35 s although only a replica's
+    # node was lost. On its own node's API server the primary loses the API
+    # only when its own node does, and CloudNativePG's self-fencing of an
+    # isolated primary is unchanged.
+    #
+    # Only for a cluster where every node that can host an instance runs an
+    # API server at its own address: the appliance, where each
+    # control-plane node is a k3s server (port 6443), sets it on. A
+    # BYO-Kubernetes cluster usually does not run one on its nodes. A change
+    # is one rolling update of the instances (the primary last, by
+    # switchover).
+    nodeLocalApiServer:
+      enabled: false
+      port: 6443
     # #590 — instance spreading. CNPG defaults to anti-affinity ON but
     # ``preferred`` (best effort), which on a 1→3 promote let two of three
     # instances land on the seed: losing that node would have taken the

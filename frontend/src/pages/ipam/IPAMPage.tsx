@@ -2437,10 +2437,7 @@ function VlanPicker({
       setInlineTag("");
       setInlineName("");
     } catch (e: unknown) {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create VLAN";
-      setInlineError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setInlineError(formatApiError(e, "Failed to create VLAN"));
     } finally {
       setCreating(false);
     }
@@ -2878,10 +2875,7 @@ export function CreateSubnetModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create subnet";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to create subnet"));
     },
   });
 
@@ -7547,9 +7541,9 @@ export function DnsSyncModal({
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
-      // independently. The API re-syncs each address whole, so the rows
-      // left unticked ride along as ``skip_records`` (#2471) and are not
-      // written.
+      // independently. The rows left unticked ride along as ``skip_records``
+      // (#2471) and are not written; an existing record changes only when
+      // its Mismatched row is in ``update_record_ids`` (#3081).
       const ipIds = new Set<string>();
       for (const m of data.missing) {
         if (sel.missing.has(missingKey(m))) ipIds.add(m.ip_id);
@@ -8427,10 +8421,7 @@ export function EditSubnetModal({
       onClose(updated);
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to save"));
     },
   });
 
@@ -8457,15 +8448,7 @@ export function EditSubnetModal({
       onDeleted?.();
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setDeleteError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to delete subnet.",
-      );
+      setDeleteError(formatApiError(err, "Failed to delete subnet."));
     },
   });
 
@@ -9395,11 +9378,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
       qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: unknown } };
-      };
-      const d = err?.response?.data?.detail;
-      setError(typeof d === "string" ? d : "Failed to add alias");
+      setError(formatApiError(e, "Failed to add alias"));
     },
   });
   const delAliasMut = useMutation({
@@ -10895,10 +10874,7 @@ function BulkEditAddressesModal({
       }
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to apply bulk edit";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to apply bulk edit"));
     },
   });
 
@@ -11348,10 +11324,7 @@ function BulkDeleteAddressesModal({
       }
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to delete"));
     },
   });
 
@@ -12027,15 +12000,7 @@ function EditSpaceModalForm({
     // #516 — surface save failures (403/409/etc.) instead of leaving the
     // modal open with zero feedback.
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setSaveError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to save IP space.",
-      );
+      setSaveError(formatApiError(err, "Failed to save IP space."));
     },
   });
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -12058,15 +12023,7 @@ function EditSpaceModalForm({
       onDeleted();
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setDeleteError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to delete IP space.",
-      );
+      setDeleteError(formatApiError(err, "Failed to delete IP space."));
     },
   });
 
@@ -12546,10 +12503,7 @@ export function CreateBlockModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create block";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to create block"));
     },
   });
 
@@ -12879,10 +12833,7 @@ export function EditBlockModal({
       onClose(updated);
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(err, "Failed to save"));
     },
   });
 
@@ -12903,15 +12854,7 @@ export function EditBlockModal({
       onDeleted?.();
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setDeleteError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to delete block.",
-      );
+      setDeleteError(formatApiError(err, "Failed to delete block."));
     },
   });
 
@@ -13523,19 +13466,10 @@ export function BlockDetailView({
         ids.forEach((id, i) => {
           const r = results[i];
           if (r.status === "rejected") {
-            const reason = r.reason as
-              | { response?: { data?: { detail?: unknown } } }
-              | undefined;
-            const detail = reason?.response?.data?.detail;
             failures.push({
               id,
               kind,
-              message:
-                typeof detail === "string"
-                  ? detail
-                  : detail
-                    ? JSON.stringify(detail)
-                    : "Unknown error",
+              message: formatApiError(r.reason, "Unknown error"),
             });
           } else if (handleApprovalQueued(r.value)) {
             queued += 1;
@@ -14965,19 +14899,10 @@ export function SpaceTableView({
         ids.forEach((id, i) => {
           const r = results[i];
           if (r.status === "rejected") {
-            const reason = r.reason as
-              | { response?: { data?: { detail?: unknown } } }
-              | undefined;
-            const detail = reason?.response?.data?.detail;
             failures.push({
               id,
               kind,
-              message:
-                typeof detail === "string"
-                  ? detail
-                  : detail
-                    ? JSON.stringify(detail)
-                    : "Unknown error",
+              message: formatApiError(r.reason, "Unknown error"),
             });
           } else if (handleApprovalQueued(r.value)) {
             queued += 1;
@@ -16029,15 +15954,7 @@ export function SpaceSection({
       setSubnetDeleteError(null);
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setSubnetDeleteError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to delete subnet.",
-      );
+      setSubnetDeleteError(formatApiError(err, "Failed to delete subnet."));
     },
   });
 
@@ -16060,15 +15977,7 @@ export function SpaceSection({
       setBlockDeleteError(null);
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setBlockDeleteError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to delete block.",
-      );
+      setBlockDeleteError(formatApiError(err, "Failed to delete block."));
     },
   });
 
@@ -16080,9 +15989,7 @@ export function SpaceSection({
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
     },
     onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setDndError(typeof msg === "string" ? msg : "Move failed");
+      setDndError(formatApiError(err, "Move failed"));
     },
   });
 
@@ -16098,9 +16005,7 @@ export function SpaceSection({
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
     },
     onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setDndError(typeof msg === "string" ? msg : "Move failed");
+      setDndError(formatApiError(err, "Move failed"));
     },
   });
 

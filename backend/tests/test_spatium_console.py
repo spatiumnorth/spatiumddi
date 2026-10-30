@@ -1269,10 +1269,12 @@ def test_a_power_action_under_way_counts_as_a_pending_reboot(m, monkeypatch, tmp
     assert m.reboot_pending() is True
 
 
+@pytest.mark.parametrize("node_count", [1, 3])
 @pytest.mark.parametrize(("fn", "action"), [("do_reboot", "reboot"), ("do_shutdown", "poweroff")])
-def test_console_power_keys_start_the_unit_without_waiting(m, monkeypatch, fn, action):
+def test_console_power_keys_start_the_unit_without_waiting(m, monkeypatch, fn, action, node_count):
     """F5 / F6 hand the run to systemd and return at once, so the dashboard
-    keeps rendering through a handoff of up to a few minutes."""
+    keeps rendering through a handoff of up to a few minutes. Only a
+    multi-node control plane has a primary to hand off (#3008)."""
     calls = []
 
     class _Res:
@@ -1286,9 +1288,11 @@ def test_console_power_keys_start_the_unit_without_waiting(m, monkeypatch, fn, a
     monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: True)
     monkeypatch.setattr(m.subprocess, "run", _run)
     state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.nodes = [{"name": f"n{i}"} for i in range(node_count)]
     getattr(m, fn)(Console(file=io.StringIO()), state)
     assert calls == [["systemctl", "start", "--no-block", f"spatium-power-action@{action}.service"]]
-    assert "handing off the database primary" in state.status_message
+    assert "F9 cancels" in state.status_message
+    assert ("database primary" in state.status_message) == (node_count > 1)
 
 
 def test_console_power_key_failure_is_reported(m, monkeypatch):

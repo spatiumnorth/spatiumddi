@@ -22,6 +22,10 @@ import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
+// A refusal raised by the dialog's own checks before anything is sent; its
+// message is the reason shown to the operator (#3082).
+class ScopeFormError extends Error {}
+
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
 // for IPv6 or subnets too small to be useful.
@@ -391,7 +395,15 @@ function ScopeModalForm({
 
   const mut = useMutation({
     mutationFn: (adoptExisting: boolean) => {
-      const parsedLeaseTime = parseInt(leaseTime, 10) || 86400;
+      // #3082 — never send a lease time the field does not show. The API
+      // refuses 0 (a lease must last at least a second), so refuse it here with
+      // the reason instead of swapping in a default through a falsy `||`.
+      const parsedLeaseTime = parseInt(leaseTime, 10);
+      if (Number.isNaN(parsedLeaseTime) || parsedLeaseTime <= 0) {
+        throw new ScopeFormError(
+          "Lease time must be a whole number of seconds, at least 1.",
+        );
+      }
       const parsedMinLease = minLease ? parseInt(minLease, 10) : null;
       const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
       // #637 — blank means "inherit the group"; "0" means "caching off for this
@@ -411,16 +423,18 @@ function ScopeModalForm({
           parsedCacheThreshold < 0 ||
           parsedCacheThreshold > 1)
       ) {
-        throw new Error("Lease cache threshold must be between 0 and 1.");
+        throw new ScopeFormError(
+          "Lease cache threshold must be between 0 and 1.",
+        );
       }
 
       if (parsedMinLease !== null && parsedMinLease > parsedLeaseTime) {
-        throw new Error(
+        throw new ScopeFormError(
           "Minimum lease time must be less than or equal to lease time.",
         );
       }
       if (parsedMaxLease !== null && parsedLeaseTime > parsedMaxLease) {
-        throw new Error(
+        throw new ScopeFormError(
           "Lease time must be less than or equal to maximum lease time.",
         );
       }
@@ -429,7 +443,7 @@ function ScopeModalForm({
         parsedMaxLease !== null &&
         parsedMinLease > parsedMaxLease
       ) {
-        throw new Error(
+        throw new ScopeFormError(
           "Minimum lease time must be less than or equal to maximum lease time.",
         );
       }
@@ -546,7 +560,14 @@ function ScopeModalForm({
         setError("");
       } else {
         setAdoptConflict(null);
-        setError(errMsg(e, "Failed to save scope"));
+        // The dialog's own refusals (lease time, cache and lease-bound
+        // checks) carry their reason; any other error without an API detail
+        // keeps the generic message rather than surfacing a raw JS error.
+        setError(
+          e instanceof ScopeFormError
+            ? e.message
+            : errMsg(e, "Failed to save scope"),
+        );
       }
     },
   });
@@ -714,7 +735,7 @@ function ScopeModalForm({
           <Field label="Lease Time (sec)">
             <input
               type="number"
-              min="0"
+              min="1"
               step="1"
               className={inputCls}
               value={leaseTime}

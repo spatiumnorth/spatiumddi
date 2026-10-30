@@ -17,7 +17,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.class_refs import is_builtin_or_generated, known_class_names
@@ -470,6 +470,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
             address_family=(scope.address_family if scope else None) or "ipv4",
             previous=pool.options_override or {},
         )
+    before = snapshot(pool, changes)
     for k, v in changes.items():
         setattr(pool, k, v)
     await db.flush()
@@ -483,7 +484,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
         resource_type="dhcp_pool",
         resource_id=str(pool.id),
         resource_display=f"{pool.start_ip}-{pool.end_ip}",
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()
