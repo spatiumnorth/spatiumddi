@@ -2,8 +2,8 @@
  * @vitest-environment jsdom
  *
  * #2481 — Edit Pool shows a stored class restriction the group's class list
- * does not hold (Kea's KNOWN, generated classes) as itself, and an untouched
- * Save keeps it.
+ * does not hold (Kea's KNOWN, generated classes) as itself, and a Save keeps
+ * it (an edit sends only what changed, so the restriction is left alone).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -17,6 +17,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DHCPPool, DHCPScope } from "@/lib/api";
 
 const updatePool = vi.fn();
+const listPools = vi.fn();
 vi.mock("@/lib/api", () => ({
   dhcpApi: {
     listClientClasses: () => Promise.resolve([{ id: "c1", name: "voip" }]),
@@ -35,6 +36,7 @@ vi.mock("@/lib/api", () => ({
           enabled: false,
         },
       ]),
+    listPools: () => listPools(),
     updatePool: (...a: unknown[]) => updatePool(...a),
     createPool: vi.fn(),
   },
@@ -48,7 +50,7 @@ afterEach(() => {
 });
 
 describe("Edit Pool class restriction (#2481)", () => {
-  it("shows KNOWN as itself and keeps it on an untouched Save", async () => {
+  it("shows KNOWN as itself and keeps it when another field is saved", async () => {
     updatePool.mockResolvedValue({});
     const pool = {
       id: "p1",
@@ -58,6 +60,7 @@ describe("Edit Pool class restriction (#2481)", () => {
       pool_type: "dynamic",
       class_restriction: "KNOWN",
     } as unknown as DHCPPool;
+    listPools.mockResolvedValue([pool]);
     const scope = {
       id: "s1",
       group_id: "g1",
@@ -68,16 +71,23 @@ describe("Edit Pool class restriction (#2481)", () => {
         <CreatePoolModal pool={pool} scope={scope} onClose={() => {}} />
       </QueryClientProvider>,
     );
-    const sel = screen.getByText("Restrict to Client Class", {
-      selector: "label",
-    }).nextElementSibling as HTMLSelectElement;
+    const sel = (
+      await screen.findByText("Restrict to Client Class", {
+        selector: "label",
+      })
+    ).nextElementSibling as HTMLSelectElement;
     await waitFor(() =>
       expect(sel.selectedOptions[0].textContent).toMatch(/KNOWN/),
     );
     expect(sel.value).toBe("KNOWN");
+    fireEvent.change(screen.getByDisplayValue("p"), {
+      target: { value: "renamed" },
+    });
     fireEvent.submit(sel.form!);
     await waitFor(() => expect(updatePool).toHaveBeenCalled());
-    expect(updatePool.mock.calls[0][2].class_restriction).toBe("KNOWN");
+    // Only the rename goes out: the restriction is not in the body, so the
+    // server keeps KNOWN.
+    expect(updatePool.mock.calls[0][2]).toEqual({ name: "renamed" });
   });
 });
 

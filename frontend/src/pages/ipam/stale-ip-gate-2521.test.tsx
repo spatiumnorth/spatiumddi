@@ -115,22 +115,22 @@ describe("Stale IPs report (#2521)", () => {
     await open([["read", "*"]]);
     const all = deprecateAll();
     expect(all.disabled).toBe(true);
-    expect(all.title).toBe("Requires write permission on IPAM addresses");
+    expect(all.title).toBe("Requires write permission on subnets");
     tick();
     const sel = screen.getByRole("button", {
       name: /Deprecate selected/,
     }) as HTMLButtonElement;
     expect(sel.disabled).toBe(true);
-    expect(sel.title).toBe("Requires write permission on IPAM addresses");
+    expect(sel.title).toBe("Requires write permission on subnets");
   });
 
-  it("offers a superadmin and an address writer both", async () => {
+  it("offers a superadmin and a subnet writer both", async () => {
     await open("superadmin");
     expect(deprecateAll().disabled).toBe(false);
     cleanup();
     await open([
       ["read", "*"],
-      ["write", "ip_address"],
+      ["write", "subnet"],
     ]);
     expect(deprecateAll().disabled).toBe(false);
     tick();
@@ -141,6 +141,17 @@ describe("Stale IPs report (#2521)", () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(false);
+  });
+
+  it("offers an address-only or NAT writer neither (#3058)", async () => {
+    for (const other of ["ip_address", "nat_mapping"]) {
+      await open([
+        ["read", "*"],
+        ["write", other],
+      ]);
+      expect(deprecateAll().disabled).toBe(true);
+      cleanup();
+    }
   });
 
   it("says a refused deprecate was refused, in the dialog that stays open", async () => {

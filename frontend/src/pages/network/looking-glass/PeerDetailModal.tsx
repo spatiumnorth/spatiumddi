@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { BgpRouteMiniTable } from "@/components/network/bgp-route-table";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { errMsg, humanDuration, humanTime } from "../_shared";
 import { FALLBACK_STATE_COLOR, STATE_COLOR } from "./SessionsTab";
 
@@ -159,6 +160,17 @@ export function PeerDetailModal({
   onViewRoutes: (peerId: string) => void;
 }) {
   const qc = useQueryClient();
+  // #3104 — peers sit under the router's 'bgp_lg_peer' gate; a read-only
+  // user is offered no write on them.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "bgp_lg_peer"),
+    "Requires write permission on BGP peers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "bgp_lg_peer"),
+    "Requires delete permission on BGP peers",
+  );
 
   // Live-ticking clock — re-render every second while the session is
   // established so "Up for Xm Ys" counts up smoothly instead of jumping
@@ -524,10 +536,18 @@ export function PeerDetailModal({
         {/* Footer */}
         <div className="flex justify-end gap-2 border-t pt-3">
           <HeaderButton onClick={onClose}>Close</HeaderButton>
-          <HeaderButton variant="destructive" onClick={() => onDelete(peer)}>
+          <HeaderButton
+            variant="destructive"
+            onClick={() => onDelete(peer)}
+            {...deleteGate}
+          >
             Delete
           </HeaderButton>
-          <HeaderButton variant="primary" onClick={() => onEdit(peer)}>
+          <HeaderButton
+            variant="primary"
+            onClick={() => onEdit(peer)}
+            {...writeGate}
+          >
             Edit
           </HeaderButton>
         </div>
