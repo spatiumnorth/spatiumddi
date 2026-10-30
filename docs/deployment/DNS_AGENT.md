@@ -828,8 +828,17 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   agent also sends its process id on heartbeats: a refused process's
   heartbeats still count for liveness and op acks, but its daemon,
   config-apply and spool reports are kept off the server row, which shows
-  the owner's. To fix it, stop the extra agent, or clear its state
-  directory so it registers as a server of its own.
+  the owner's. Both processes also share the server's one token
+  ([#2219](https://github.com/spatiumnorth/spatiumddi/issues/2219)), so a
+  token issued to either would make the other's stale and the two would
+  take turns re-registering. The agent therefore sends its process id when
+  it registers too: the refused process is answered the same `409` at
+  registration, nothing is minted, it logs
+  `register_duplicate_agent_instance` and tries again every 30 s, and its
+  heartbeats never rotate the token. The owner keeps a working token, and
+  the pair settles. An agent older than this sends no id at registration
+  and registers as before. To fix it, stop the extra agent, or clear its
+  state directory so it registers as a server of its own.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when

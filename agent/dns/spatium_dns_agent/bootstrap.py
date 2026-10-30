@@ -26,6 +26,12 @@ import structlog
 from . import __version__, features
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
+from .instance import (
+    AGENT_INSTANCE,
+    AGENT_INSTANCE_HEADER,
+    DUPLICATE_INSTANCE_BACKOFF,
+    DUPLICATE_INSTANCE_HEADER,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -70,7 +76,13 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                 resp = c.post(
                     "/api/v1/dns/agents/register",
                     json=body,
-                    headers={"X-DNS-Agent-Key": bootstrap_key},
+                    headers={
+                        "X-DNS-Agent-Key": bootstrap_key,
+                        # #2219 — so the control plane can refuse the
+                        # duplicate half of a pair instead of minting it a
+                        # token that stales the owner's.
+                        AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+                    },
                 )
             if resp.status_code == 200:
                 data = resp.json()
@@ -81,6 +93,20 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                     pending_approval=data.get("pending_approval", False),
                 )
                 return agent_id, data["agent_token"], data
+            if resp.status_code == 409 and resp.headers.get(DUPLICATE_INSTANCE_HEADER):
+                # #2219 — another live process owns this server identity; no
+                # token was minted, so the owner's stays valid. Ask again at
+                # the poll's steady pace rather than the doubling one: the
+                # refusal ends the moment the owner stops, and each retry
+                # keeps the operator's "Duplicate agent" chip current.
+                log.error(
+                    "register_duplicate_agent_instance",
+                    instance=AGENT_INSTANCE,
+                    body=resp.text[:400],
+                    retry_in_seconds=DUPLICATE_INSTANCE_BACKOFF,
+                )
+                time.sleep(DUPLICATE_INSTANCE_BACKOFF + random.uniform(0, 2))
+                continue
             log.warning(
                 "register_failed", status=resp.status_code, body=resp.text[:400]
             )
