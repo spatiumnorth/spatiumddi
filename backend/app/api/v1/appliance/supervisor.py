@@ -98,7 +98,7 @@ from app.core.auth_throttle import (
 from app.core.db_transient import is_transient_db_error
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
-from app.core.versions import upgrade_direction
+from app.core.versions import is_installed_target, upgrade_direction
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -1660,6 +1660,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     # #1446 — this boot's kernel boot id. A reboot request is retired when a
     # heartbeat arrives from a different boot. None from an older supervisor.
     boot_id: str | None = Field(default=None, max_length=64)
+    # #3008 — set when the console's F9 cancelled a reboot in this boot: the
+    # boot id the cancel was made in. A Fleet request stamped for this boot is
+    # retired at once rather than at the give-up. None from an older supervisor.
+    reboot_cancelled_boot_id: str | None = Field(default=None, max_length=64)
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
     # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
@@ -3049,7 +3053,7 @@ async def _supervisor_heartbeat(
     # legacy dns_server / dhcp_server auto-clear.
     if (
         row.desired_appliance_version is not None
-        and row.installed_appliance_version == row.desired_appliance_version
+        and is_installed_target(row.installed_appliance_version, row.desired_appliance_version)
         and row.last_upgrade_state in (None, "done", "ready")
     ):
         row.desired_appliance_version = None
@@ -3084,6 +3088,23 @@ async def _supervisor_heartbeat(
     # command below: delivering it again from the new boot would reboot the
     # node a second time.
     deliver_reboot = False
+    if (
+        row.reboot_requested
+        and body.reboot_cancelled_boot_id
+        and body.reboot_cancelled_boot_id == body.boot_id
+        and row.reboot_requested_boot_id == body.boot_id
+    ):
+        # #3008 — cancelled from the console in this boot, after the request
+        # reached it (its boot id was recorded when it was first delivered).
+        # Nothing can fire again in this boot: retire it now, not at 900 s.
+        logger.info(
+            "appliance_reboot_cancelled_at_console",
+            appliance_id=str(row.id),
+            hostname=row.hostname,
+        )
+        row.reboot_requested = False
+        row.reboot_requested_at = None
+        row.reboot_requested_boot_id = None
     if row.reboot_requested:
         if body.boot_id:
             if row.reboot_requested_boot_id is None:

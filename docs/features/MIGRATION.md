@@ -25,7 +25,7 @@ preview → commit idiom, so it sits in the same table.
 | | DNS importer (#128) | DHCP importer (#129) | NetBox / IPAM importer (#36) | Windows cutover (#756) |
 |---|---|---|---|---|
 | Feature module | `dns.import` | `dhcp.import` | `ipam.import.netbox` | `migration.cutover` |
-| Admin surface | DNS Import (sidebar) | DHCP Import (sidebar) | Import → NetBox | Import → Windows cutover |
+| Admin surface | Import → DNS | Import → DHCP | Import → NetBox | Import → Windows cutover |
 | Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Technitium REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` | NetBox REST live-pull (v3.x–4.6+) | live Windows DNS + Windows DHCP over WinRM |
 | Target | DNS server group (+ optional view) | DHCP server group (+ IPAM linkage) | native IPAM rows (space / block / subnet / address + VRF / VLAN / Customer / Site) | zones + scopes that already exist here — it creates none |
 | Provenance columns | `dns_zone` / `dns_record` `import_source` + `imported_at` | `dhcp_scope` / `dhcp_pool` / `dhcp_static_assignment` / `dhcp_client_class` `import_source` + `imported_at` | IPAM / network rows `import_source` + `imported_at` + `netbox_id` (in `custom_fields` / `tags`) | `dhcp_static_assignment` `import_source="windows_cutover"` + `imported_at` (lease handover only) |

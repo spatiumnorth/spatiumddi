@@ -327,9 +327,7 @@ function EnrollModal({
     mutationFn: () => authApi.mfaEnrollVerify(code.trim()),
     onSuccess: () => onVerified(),
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Verification failed.");
+      setError(formatApiError(err, "Verification failed."));
       // #1354 — an expired enrolment is discarded server-side, so the
       // "previous enrolment" banner behind this modal is now stale.
       qc.invalidateQueries({ queryKey: ["mfa-status"] });
@@ -562,9 +560,7 @@ function DisableModal({
       authApi.mfaDisable(password, code),
     onSuccess: () => onDisabled(),
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Disable failed.");
+      setError(formatApiError(err, "Disable failed."));
     },
   });
   return (
@@ -600,9 +596,7 @@ function RegenerateRecoveryModal({
       onRegenerated();
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Regeneration failed.");
+      setError(formatApiError(err, "Regeneration failed."));
     },
   });
 

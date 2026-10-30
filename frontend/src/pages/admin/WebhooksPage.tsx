@@ -30,6 +30,7 @@ import {
   type WebhookSubscriptionWrite,
   type WebhookTestResult,
   webhooksApi,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -168,8 +169,7 @@ function SubscriptionEditor({
       }
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
