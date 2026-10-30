@@ -30,6 +30,7 @@ from app.api.v1.dhcp._failover_schemas import (
 from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
 from app.core.agent_wake import appliance_channel, collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.appliance import Appliance
 from app.models.dhcp import HA_MODES, DHCPServerGroup
 from app.services.ai.operations import get_operation
@@ -525,6 +526,7 @@ async def update_group(
         vip = await load_relay_vip(db)
         if vip and g.id in await group_ids_behind_relay_vip(db):
             raise HTTPException(status_code=422, detail=refusal_for_groups(vip, [g.name]))
+    before = snapshot(g, changes)
     for k, v in changes.items():
         setattr(g, k, v)
     # #2969 — the HA listener firewall rule (#1167) follows the mode too, and
@@ -548,7 +550,7 @@ async def update_group(
         resource_type="dhcp_server_group",
         resource_id=str(g.id),
         resource_display=g.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     await db.commit()

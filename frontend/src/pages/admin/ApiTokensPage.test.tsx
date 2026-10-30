@@ -36,7 +36,12 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function token(id: string, name: string, isActive: boolean) {
+function token(
+  id: string,
+  name: string,
+  isActive: boolean,
+  expiresAt: string | null = null,
+) {
   return {
     id,
     name,
@@ -46,7 +51,7 @@ function token(id: string, name: string, isActive: boolean) {
     scopes: [],
     resource_grants: [],
     user_id: "u1",
-    expires_at: null,
+    expires_at: expiresAt,
     last_used_at: null,
     is_active: isActive,
     created_at: "2026-10-01T00:00:00.000Z",
@@ -94,6 +99,26 @@ describe("API token Re-enable", () => {
       stepup_password: "pw",
       stepup_totp_code: null,
     });
+  });
+
+  it("does not offer Re-enable on an expired token", async () => {
+    myPermissions.mockResolvedValue({ is_superadmin: true, grants: [] });
+    list.mockResolvedValue([
+      token("t-exp", "expired-token", false, "2020-01-01T00:00:00.000Z"),
+    ]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("expired-token");
+    await act(async () => {});
+    expect(screen.queryByTitle("Re-enable")).toBeNull();
+    const btn = screen.getByTitle(/Expired/) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
   });
 
   it("revokes without a step-up", async () => {

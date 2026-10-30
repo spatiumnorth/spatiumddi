@@ -643,7 +643,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="security.certificates",
         label="Certificates (ACME / Let's Encrypt)",
         group="Security",
-        description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in: registering an ACME account, under Appliance → Fleet → Web UI Certificate → Issue via Let's Encrypt.",
+        description="Embedded RFC 8555 ACME client that issues CA-trusted TLS certs from Let's Encrypt — the Web UI cert on an appliance, and DoT / DoH certs on every install — solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in: registering an ACME account, under Appliance → Fleet → TLS certificates (Web UI Certificate on an appliance host) → Issue via Let's Encrypt.",
     ),
     # Default-OFF (#1069): armed, this reaches out and opens TLS connections
     # to endpoints on a schedule, and its discovery half can mint its own
