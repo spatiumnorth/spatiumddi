@@ -71,6 +71,10 @@ METALLB_CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-metallb.tgz
 K3S_MANIFESTS_DIR=/var/lib/rancher/k3s/server/manifests
 BOOTSTRAP_MANIFEST="$K3S_MANIFESTS_DIR/spatium-bootstrap.yaml"
 CONTROL_MANIFEST="$K3S_MANIFESTS_DIR/spatium-control.yaml"
+# #2865: where firstboot holds the control chart back during a cluster Rolling
+# Upgrade, and the runner that releases it (see control_hold_state).
+CONTROL_MANIFEST_HELD="${CONTROL_MANIFEST}.held"
+CONTROL_RELEASE_UNIT=spatiumddi-control-release.service
 # #1448 — the Secret that carries SECRET_KEY + the /metrics token, created by
 # ensure_app_key_secret and NOT owned by Helm, so no helm uninstall can delete
 # it. APP_KEY_STAMP records that it exists, for the one path that cannot ask
@@ -149,8 +153,9 @@ retire_inactive_swapfile() {
     return 0
 }
 
-# Sourced by the unit tests to reach the helpers above without running any of
-# the boot-time side effects below. Mirrors spatium-cluster-join's guard.
+# Sourced by the unit tests, and by spatium-control-release (#2865), to reach
+# the helpers above without running any of the boot-time side effects below.
+# Mirrors spatium-cluster-join's guard.
 if [ "${SPATIUM_FIRSTBOOT_LIB:-}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -1421,6 +1426,18 @@ ${POSTGRES_PARAMETERS_YAML}
         # labelled yet), so a single node loss would have taken the
         # primary and a replica together. Inert at instances: 1.
         podAntiAffinityType: required
+        # #3021 — the instance pods reach the API server on their own node
+        # (every control-plane node is a k3s server), not through the
+        # kubernetes Service: losing a replica's node no longer cuts the
+        # primary from the API and restarts it. The chart's default is off (a
+        # BYO-Kubernetes node may run no API server); the seed supervisor
+        # writes the same value into the spatium-control HelmChartConfig
+        # (apply_control_plane_overrides), which is what a grown or upgraded
+        # cluster renders. On one node it changes no outcome (its node is the
+        # only one), and stating it here leaves the first heartbeat nothing to
+        # add (#1005).
+        nodeLocalApiServer:
+          enabled: true
         # #2132 — copy the cluster CA's public certificate into a ConfigMap
         # the supervisor reads, so it verifies the TLS of CNPG's status
         # endpoint before trusting the primary's slot state, with no grant
@@ -1887,9 +1904,138 @@ pin_control_failure_policy() {
     return 0
 }
 
+# ── #2865: the control chart a cluster Rolling Upgrade holds back ───────────
+# A cluster Rolling Upgrade holds the shared image tags until every node runs
+# the target (#1710), and the control chart's applianceVersion with them
+# (#2176), so that the seed's boot onto its new slot does not roll the control
+# plane mid-run. That hold is a HelmChartConfig over VALUES (backend/app/
+# services/upgrades/shared_tags.py): it cannot hold the chart itself, and the
+# seed's firstboot renders the control chart from its NEW slot. A release whose
+# chart changed the api, worker or beat pod template therefore rolled them on
+# the held image as the seed booted, with the worker that drives the run, and
+# the run waited on its Lease (seen live on three nodes: the worker rolled 12
+# minutes before the run moved the tags).
+#
+# So while a run's hold is on, release_control_manifest keeps this boot's
+# control chart back as ${CONTROL_MANIFEST}.held (k3s applies *.yaml, *.yml
+# and *.json only, which the .deferred staging relies on too) and leaves the
+# release the cluster runs as it is, chart and values. spatium-control-release
+# (spatiumddi-control-release.service, which the gate starts) releases it
+# through the same gate once nothing pins the control chart to another
+# version: at the run's flip, whichever release drives the run (the first
+# upgrade into this release is driven, and flipped, by the release before it),
+# or, for a run that failed or was aborted, when its hold is released
+# (release_lingering_hold). A new run's Start pins the same values again, and
+# the chart stays held.
+
+# $1 = a rendered control manifest, $2 = park | release. Prints "held <tag>",
+# "free" or "unknown", from the two HelmChartConfigs the hold pins:
+#   park     a run's hold is on: spatium-bootstrap's global.imageTag and
+#            spatium-control's image.tag pinned to the SAME tag (only
+#            shared_tags.ensure_hold writes that pair; chart_bump writes
+#            image.tag alone, to the new tag), and that tag is not the one $1
+#            deploys. A node booted back into the held version releases its
+#            chart: that is the chart the control plane runs.
+#   release  spatium-control still pins image.tag or applianceVersion to a
+#            value $1 does not carry. The flip takes the bootstrap pin off
+#            first and the control pins in one later write, so waiting on the
+#            control pins makes the release ONE helm revision: the new chart,
+#            the new tag and the new version together.
+# "unknown" when the apiserver does not answer or a document does not parse.
+control_hold_state() {
+    local manifest="$1" mode="$2" configs
+    if ! configs=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get helmchartconfig spatium-bootstrap spatium-control --ignore-not-found \
+            -o json 2>/dev/null); then
+        echo unknown
+        return 0
+    fi
+    python3 -c '
+import json
+import sys
+
+import yaml
+
+
+def dig(doc, path):
+    for key in path:
+        if not isinstance(doc, dict) or key not in doc:
+            return None
+        doc = doc[key]
+    return None if doc is None else str(doc)
+
+
+try:
+    own = None
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for part in yaml.safe_load_all(fh):
+            if isinstance(part, dict) and part.get("kind") == "HelmChart":
+                own = yaml.safe_load(part["spec"]["valuesContent"])
+    raw = sys.argv[3].strip()
+    doc = json.loads(raw) if raw else {}
+    if doc.get("kind") == "List":
+        items = doc.get("items") or []
+    else:
+        items = [doc] if doc else []
+    pins = {}
+    for item in items:
+        name = (item.get("metadata") or {}).get("name")
+        pins[name] = yaml.safe_load((item.get("spec") or {}).get("valuesContent") or "")
+except Exception:
+    print("unknown")
+    sys.exit(0)
+tag = dig(own, ("image", "tag"))
+version = dig(own, ("applianceVersion",))
+bootstrap_tag = dig(pins.get("spatium-bootstrap"), ("global", "imageTag"))
+control_tag = dig(pins.get("spatium-control"), ("image", "tag"))
+control_version = dig(pins.get("spatium-control"), ("applianceVersion",))
+if not tag:
+    print("unknown")
+elif sys.argv[2] == "park":
+    held = bootstrap_tag is not None and bootstrap_tag == control_tag and control_tag != tag
+    print("held %s" % control_tag if held else "free")
+else:
+    tag_pinned = control_tag is not None and control_tag != tag
+    version_pinned = control_version is not None and control_version != version
+    print("held %s" % (control_tag or control_version) if tag_pinned or version_pinned else "free")
+' "$manifest" "$mode" "$configs" 2>/dev/null || echo unknown
+}
+
+# 0 while helm-controller runs spatium-control's install Job. Removing the
+# hold's pins changes the chart's values, which starts one, and a chart
+# released while it runs has helm-controller replace that Job mid-upgrade.
+# spatium-control-release takes this with the gate, and waits on it (a bounded
+# while) before it releases the chart it held back.
+control_helm_job_active() {
+    local active
+    active=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get job helm-install-spatium-control --ignore-not-found \
+            -o 'jsonpath={.status.active}' 2>/dev/null) || return 1
+    [ -n "$active" ] && [ "$active" != 0 ]
+}
+
 release_control_manifest() {
-    local deferred="${CONTROL_MANIFEST}.deferred"
+    local deferred="${1:-${CONTROL_MANIFEST}.deferred}" hold
     [ -f "$deferred" ] || return 0
+    # #2865: held back while a cluster Rolling Upgrade's hold is on (see
+    # control_hold_state). A hold that cannot be read is no hold, and a held
+    # chart whose runner cannot be started is released now: either way as
+    # before #2865, which at worst is the mid-run roll this prevents.
+    hold=$(control_hold_state "$deferred" park)
+    case "$hold" in
+        "held "*)
+            if [ "$deferred" != "$CONTROL_MANIFEST_HELD" ]; then
+                mv -f "$deferred" "$CONTROL_MANIFEST_HELD"
+                chmod 0600 "$CONTROL_MANIFEST_HELD"
+                deferred="$CONTROL_MANIFEST_HELD"
+            fi
+            if systemctl start --no-block "$CONTROL_RELEASE_UNIT" >/dev/null 2>&1; then
+                echo "A cluster Rolling Upgrade holds the control plane at ${hold#* }: this release's control chart is held back as $CONTROL_MANIFEST_HELD until the run's hold ends (#2865)."
+                return 0
+            fi
+            echo "WARN: could not start $CONTROL_RELEASE_UNIT; releasing the held control chart now (#2865)." >&2
+            ;;
+    esac
     if ! /usr/local/bin/k3s kubectl get priorityclass spatium-control-plane \
             >/dev/null 2>&1; then
         echo "WARN: PriorityClass spatium-control-plane is absent, or the apiserver could not be reached." >&2
@@ -1906,6 +2052,8 @@ release_control_manifest() {
     sizing_patch=$(control_sizing_patch "$deferred")
     mv -f "$deferred" "$CONTROL_MANIFEST"
     chmod 0600 "$CONTROL_MANIFEST"
+    # #2865: a chart an earlier boot held back is superseded by this one.
+    rm -f "$CONTROL_MANIFEST_HELD"
     apply_control_sizing_patch "$CONTROL_MANIFEST" "$sizing_patch"
 }
 

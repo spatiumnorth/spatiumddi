@@ -1,12 +1,13 @@
 """Bulk IPAM handlers hold every row to the caller's write grants.
 
-The IPAM router's coarse gate admits a caller holding any write grant on an
-IPAM type, including an instance-scoped address-set grant (#103) or a grant on
-a peripheral type such as ``custom_field``. Handlers that change many rows in
-one request must then check each row against the caller's per-row grants
-(subnet-wide write, or an address set covering the address). These tests pin
-that for the stale-IP deprecate action: rows the caller may not write come
-back in ``skipped`` and are left unchanged.
+The IPAM router's gate admits a caller holding type-level write on the
+route's own type (``subnet`` here, #3058) or an instance-scoped address-set
+grant (#103). Handlers that change many rows in one request must then check
+each row against the caller's per-row grants (subnet-wide write, or an address
+set covering the address). These tests pin that for the stale-IP deprecate
+action: rows the caller may not write come back in ``skipped`` and are left
+unchanged. A grant on a peripheral type such as ``custom_field`` no longer
+clears the gate at all.
 """
 
 from __future__ import annotations
@@ -205,19 +206,18 @@ async def test_peripheral_type_writer_changes_nothing(
     )
     await db_session.commit()
 
+    # The gate wants write on ``subnet`` (#3058): a peripheral grant is refused
+    # before the handler runs.
     ids = [w.in_set.id, w.a_outside.id, w.b_rows[0].id]
     r = await client.post(URL, headers=_h(token), json={"ip_ids": [str(i) for i in ids]})
-    assert r.status_code == 200, r.text
-    assert r.json()["deprecated_count"] == 0
-    assert set(r.json()["skipped"]) == {str(i) for i in ids}
+    assert r.status_code == 403, r.text
 
     r = await client.post(
         URL,
         headers=_h(token),
         json={"all_matching": True, "stale_days": 90, "space_id": str(w.space.id)},
     )
-    # Nothing the caller may write matches the filter.
-    assert r.status_code == 422, r.text
+    assert r.status_code == 403, r.text
     for row in (w.in_set, w.a_outside, w.b_rows[0]):
         assert await _status(db_session, row) == "allocated"
 
@@ -233,7 +233,9 @@ async def test_single_subnet_writer_changes_only_that_subnet(
     token = await _user(
         db_session,
         permissions=[
-            {"action": "write", "resource_type": "custom_field"},
+            # The address-set grant clears the gate (#103); the subnet grant
+            # is what the handler then holds each row to.
+            {"action": "write", "resource_type": "address_set", "resource_id": str(w.aset.id)},
             {"action": "write", "resource_type": "subnet", "resource_id": str(w.subnet_a.id)},
         ],
     )
@@ -255,7 +257,9 @@ async def test_single_subnet_writer_all_matching_stays_in_subnet(
     token = await _user(
         db_session,
         permissions=[
-            {"action": "write", "resource_type": "custom_field"},
+            # The address-set grant clears the gate (#103); the subnet grant
+            # is what the handler then holds each row to.
+            {"action": "write", "resource_type": "address_set", "resource_id": str(w.aset.id)},
             {"action": "write", "resource_type": "subnet", "resource_id": str(w.subnet_a.id)},
         ],
     )

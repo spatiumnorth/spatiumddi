@@ -245,6 +245,8 @@ def _parse_ranges(body: list[_Stmt]) -> tuple[list[ImportedPool], list[str]]:
             pool = _range_to_pool(st)
             if pool is not None:
                 pools.append(pool)
+            else:
+                warnings.append(_no_address_warning(st))
         elif kw == "pool" and st.children is not None:
             class_restriction = None
             for sub in st.children:
@@ -263,7 +265,16 @@ def _parse_ranges(body: list[_Stmt]) -> tuple[list[ImportedPool], list[str]]:
                     pool = _range_to_pool(sub, class_restriction=class_restriction)
                     if pool is not None:
                         pools.append(pool)
+                    else:
+                        warnings.append(_no_address_warning(sub))
     return pools, warnings
+
+
+def _no_address_warning(st: _Stmt) -> str:
+    # A range with no address in it is dropped; say so rather than leave
+    # the operator to find the missing pool after the commit (#3097).
+    text = " ".join(t.value for t in st.parts)
+    return f"Range {text!r} not imported: no address in it."
 
 
 def _range_to_pool(st: _Stmt, *, class_restriction: str | None = None) -> ImportedPool | None:

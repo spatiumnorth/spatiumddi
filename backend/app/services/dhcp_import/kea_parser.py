@@ -236,6 +236,11 @@ def _parse_subnet(
                 parse_warnings.append(f"Pool {p.get('pool')!r} not imported: {problem}.")
             elif pool is not None:
                 pools.append(pool)
+        else:
+            # Kea wants each pool as an object with a "pool" key; a bare
+            # string or number is not one, and dropping it silently would
+            # leave the operator no notice of the missing range (#3097).
+            parse_warnings.append(f"Pool {p!r} not imported: not a pool object.")
 
     reservations: list[ImportedReservation] = []
     skipped_duid = 0

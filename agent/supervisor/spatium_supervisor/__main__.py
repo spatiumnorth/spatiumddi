@@ -36,6 +36,7 @@ from .config import SupervisorConfig
 from .heartbeat import (
     ROLE_ENV_FILENAME,
     _effective_control_plane_url,
+    drain_housekeeping,
     heartbeat_once,
     next_heartbeat_delay,
     read_lifecycle_state,
@@ -572,7 +573,8 @@ def main() -> int:
         effective_url = _effective_control_plane_url(cfg)
         # #358 Phase 1b — True when the control plane long-poll-held this
         # heartbeat (and thus already paced us ~heartbeat_interval); None when
-        # it never reached the control plane (#1805).
+        # it did not land: it never reached the control plane (#1805), or the
+        # control plane answered 5xx (#3020).
         held: bool | None = False
         if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
@@ -616,7 +618,8 @@ def main() -> int:
         # #1805 — a heartbeat that never reached the control plane (None) is
         # re-sent after 5 s, doubling while they keep failing, up to the
         # interval: a node loss's few seconds of unreachable api no longer cost
-        # a whole interval each.
+        # a whole interval each. #3020 — one answered 5xx (a database outage
+        # behind the api) is None too, and is re-sent the same way.
         failures = failures + 1 if held is None else 0
         sleep_budget = next_heartbeat_delay(
             held,
@@ -631,6 +634,10 @@ def main() -> int:
             time.sleep(1)
             waited += 1.0
 
+    # #3020 — housekeeping still running on its worker (a heartbeat stopped
+    # waiting for it) gets a bounded chance to finish before the process ends.
+    if not drain_housekeeping(20.0):
+        log.warning("supervisor.stop.housekeeping_unfinished")
     log.info("supervisor.stop")
     return 0
 

@@ -528,28 +528,45 @@ async def test_top_modified_requires_audit_read(
 
 
 @pytest.mark.asyncio
-async def test_top_dns_clients_requires_server_or_dns_group(
+async def test_top_dns_clients_requires_server_read(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    # Lacking both server + dns_group → 403.
+    """The report reads the query log of every server, so it needs the same
+    ``read:server`` as ``/logs/dns-queries`` — a ``read:dns_group`` grant (one
+    group's zones) is not enough (#3130)."""
     _, h_deny = await _user_with_perms(
         db_session, [{"action": "read", "resource_type": "subnet"}], name="nodns"
     )
     r = await client.get(f"{REPORTS}/top-dns-clients", headers=h_deny)
     assert r.status_code == 403
 
-    # Either grant alone passes.
+    _, h_grp = await _user_with_perms(
+        db_session, [{"action": "read", "resource_type": "dns_group"}], name="grponly"
+    )
+    r = await client.get(f"{REPORTS}/top-dns-clients", headers=h_grp)
+    assert r.status_code == 403
+
     _, h_srv = await _user_with_perms(
         db_session, [{"action": "read", "resource_type": "server"}], name="srvok"
     )
     r = await client.get(f"{REPORTS}/top-dns-clients", headers=h_srv)
     assert r.status_code == 200
 
-    _, h_grp = await _user_with_perms(
-        db_session, [{"action": "read", "resource_type": "dns_group"}], name="grpok"
+
+@pytest.mark.asyncio
+async def test_find_top_dns_clients_tool_needs_server_read(db_session: AsyncSession) -> None:
+    from app.services.ai.tools import REGISTRY
+    from app.services.ai.tools.base import tool_permission_allows
+
+    perm = REGISTRY.get("find_top_dns_clients").permission
+    grp, _ = await _user_with_perms(
+        db_session, [{"action": "read", "resource_type": "dns_group"}], name="tool-grp"
     )
-    r = await client.get(f"{REPORTS}/top-dns-clients", headers=h_grp)
-    assert r.status_code == 200
+    srv, _ = await _user_with_perms(
+        db_session, [{"action": "read", "resource_type": "server"}], name="tool-srv"
+    )
+    assert tool_permission_allows(grp, perm) is False
+    assert tool_permission_allows(srv, perm) is True
 
 
 # ── Feature-module gate ──────────────────────────────────────────────

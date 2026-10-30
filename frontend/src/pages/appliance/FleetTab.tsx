@@ -1144,17 +1144,16 @@ export function FleetTab({
           summary: "GitHub import or air-gap .raw.xz upload.",
         },
         // #404 — Web UI Certificate moved here from a top-level tab.
-        // Appliance-host only (a docker/k8s control plane has no local cert
-        // to manage).
-        ...(isApplianceHost
-          ? [
-              {
-                key: "web-ui-certificate" as const,
-                label: "Web UI Certificate",
-                summary: "TLS upload / CSR / Let's Encrypt.",
-              },
-            ]
-          : []),
+        // #3061 — the certificate store is on every install type (DoT / DoH
+        // pick from it); only the Web UI activation is appliance-specific, so
+        // off-appliance the entry is the store-only view.
+        {
+          key: "web-ui-certificate" as const,
+          label: isApplianceHost ? "Web UI Certificate" : "TLS certificates",
+          summary: isApplianceHost
+            ? "TLS upload / CSR / Let's Encrypt."
+            : "Certificate store: upload / CSR / Let's Encrypt.",
+        },
       ],
     },
     {
@@ -1305,8 +1304,8 @@ export function FleetTab({
           )}
 
           {/* #404 — Web UI Certificate, moved from a top-level tab. */}
-          {view === "web-ui-certificate" && isApplianceHost && (
-            <CertificatesTab />
+          {view === "web-ui-certificate" && (
+            <CertificatesTab isApplianceHost={isApplianceHost} />
           )}
 
           {view === "lldp" && (

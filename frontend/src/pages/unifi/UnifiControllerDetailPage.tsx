@@ -14,6 +14,11 @@ import {
 import { formatApiError, unifiApi, type UnifiTestResult } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ModalTabs } from "@/components/ui/modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // Per-controller "what does the gateway see right now" page. Reads
 // the single-shot dashboard endpoint that joins subnets + vlans +
@@ -25,8 +30,14 @@ type Tab = "overview" | "subnets" | "vlans" | "clients" | "discovery";
 export function UnifiControllerDetailPage() {
   const { id } = useParams<{ id: string }>();
   const qc = useQueryClient();
+  // #3104 — test and sync take a superadmin (the list page gates both).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const [tab, setTab] = useState<Tab>("overview");
   const [testResult, setTestResult] = useState<UnifiTestResult | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const { data, isFetching, isError, error } = useQuery({
     queryKey: ["unifi-dashboard", id],
@@ -37,6 +48,8 @@ export function UnifiControllerDetailPage() {
 
   const syncMut = useMutation({
     mutationFn: () => unifiApi.syncNow(id!),
+    onMutate: () => setSyncError(null),
+    onError: (e) => setSyncError(formatApiError(e, "Sync failed")),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["unifi-dashboard", id] });
       setTimeout(
@@ -159,6 +172,7 @@ export function UnifiControllerDetailPage() {
               icon={TestTube2}
               onClick={() => testMut.mutate()}
               disabled={testMut.isPending}
+              {...superadminGate}
             >
               {testMut.isPending ? "Testing…" : "Test"}
             </HeaderButton>
@@ -168,6 +182,7 @@ export function UnifiControllerDetailPage() {
               iconClassName={syncMut.isPending ? "animate-spin" : ""}
               onClick={() => syncMut.mutate()}
               disabled={syncMut.isPending}
+              {...superadminGate}
             >
               Sync Now
             </HeaderButton>
@@ -190,6 +205,9 @@ export function UnifiControllerDetailPage() {
           >
             {testResult.ok ? "✓" : "✗"} {testResult.message}
           </p>
+        )}
+        {syncError && (
+          <p className="mt-2 text-xs text-destructive">✗ {syncError}</p>
         )}
       </div>
 

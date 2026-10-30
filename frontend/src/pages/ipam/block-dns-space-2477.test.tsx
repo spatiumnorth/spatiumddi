@@ -90,7 +90,7 @@ const block = {
   total_ips: 65536,
 } as unknown as IPBlock;
 
-function openDnsTab(b: IPBlock) {
+async function openDnsTab(b: IPBlock) {
   answer("dnsApi", "listGroups", () =>
     Promise.resolve([{ id: "grp-1", name: "corp-dns" }]),
   );
@@ -111,13 +111,14 @@ function openDnsTab(b: IPBlock) {
       inherited_from_block_id: "b-0",
     }),
   );
+  answer("ipamApi", "getBlock", () => Promise.resolve(b));
   open(<EditBlockModal block={b} onClose={() => {}} />);
-  fireEvent.click(screen.getByRole("button", { name: "DNS" }));
+  fireEvent.click(await screen.findByRole("button", { name: "DNS" }));
 }
 
 describe("Edit IP Block's DNS tab (#2477)", () => {
   it("a top-level block shows the DNS server group its space gives it", async () => {
-    openDnsTab(block);
+    await openDnsTab(block);
     await waitFor(() => {
       const select = screen.getByText("DNS Server Group")
         .nextElementSibling as HTMLSelectElement;
@@ -130,7 +131,7 @@ describe("Edit IP Block's DNS tab (#2477)", () => {
   });
 
   it("a nested block still reads its parent chain", async () => {
-    openDnsTab({ ...block, parent_block_id: "b-0" } as IPBlock);
+    await openDnsTab({ ...block, parent_block_id: "b-0" } as IPBlock);
     await waitFor(() => {
       const select = screen.getByText("DNS Server Group")
         .nextElementSibling as HTMLSelectElement;

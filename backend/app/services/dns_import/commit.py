@@ -31,6 +31,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone, servable_ttl
 from app.services.dns.named_conf_validation import split_zone_forwarders
+from app.services.dns.new_object_defaults import load_dns_defaults
 from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
     record_op_payload,
@@ -251,6 +252,7 @@ def _zone_kwargs_from_parsed(
     target_view_id: uuid.UUID | None,
     source: ImportSource,
     now: datetime,
+    default_ttl: int = 3600,
 ) -> dict[str, Any]:
     """Translate one parsed zone into kwargs for ``DNSZone(...)``.
 
@@ -277,7 +279,7 @@ def _zone_kwargs_from_parsed(
         # #2073 — a value outside 0..2^31-1 (negative, or past int4 in an
         # uploaded export) falls back to the default rather than being
         # stored for BIND to refuse the zone over, or 500ing the commit.
-        ttl=_timer(soa.ttl if soa else None, 3600),
+        ttl=_timer(soa.ttl if soa else None, default_ttl),
         refresh=_timer(soa.refresh if soa else None, 86400),
         retry=_timer(soa.retry if soa else None, 7200),
         expire=_timer(soa.expire if soa else None, 3600000),
@@ -324,6 +326,9 @@ async def _create_zone_at(
         target_view_id=target_view_id,
         source=source,
         now=now,
+        # #3087 — the source's own TTL wins; the stored default fills in
+        # only where it carried none (a forward / stub zone, no SOA).
+        default_ttl=(await load_dns_defaults(db)).ttl,
     )
     # #2275 — the slot being empty is not enough: a zone with no view renders
     # into every view, so it must not land beside a same-name pinned zone (and

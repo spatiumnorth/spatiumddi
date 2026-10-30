@@ -25,6 +25,11 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
+    // The shortcuts overlay reads the caller's grants (#3103).
+    authApi: {
+      ...actual.authApi,
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    },
     searchApi: {
       search: () =>
         Promise.resolve({
