@@ -367,7 +367,15 @@ export function CreateScopeModal({
 
   const mut = useMutation({
     mutationFn: (adoptExisting: boolean) => {
-      const parsedLeaseTime = parseInt(leaseTime, 10) || 86400;
+      // #3082 — never send a lease time the field does not show. The API
+      // refuses 0 (a lease must last at least a second), so refuse it here with
+      // the reason instead of swapping in a default through a falsy `||`.
+      const parsedLeaseTime = parseInt(leaseTime, 10);
+      if (Number.isNaN(parsedLeaseTime) || parsedLeaseTime <= 0) {
+        throw new Error(
+          "Lease time must be a whole number of seconds, at least 1.",
+        );
+      }
       const parsedMinLease = minLease ? parseInt(minLease, 10) : null;
       const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
       // #637 — blank means "inherit the group"; "0" means "caching off for this
@@ -522,7 +530,10 @@ export function CreateScopeModal({
         setError("");
       } else {
         setAdoptConflict(null);
-        setError(errMsg(e, "Failed to save scope"));
+        // A refusal thrown by the mutation itself (lease time, cache and
+        // lease-bound checks) has no response; its message is the reason.
+        const local = e instanceof Error && !("response" in e);
+        setError(errMsg(e, local ? e.message : "Failed to save scope"));
       }
     },
   });
@@ -690,7 +701,7 @@ export function CreateScopeModal({
           <Field label="Lease Time (sec)">
             <input
               type="number"
-              min="0"
+              min="1"
               step="1"
               className={inputCls}
               value={leaseTime}

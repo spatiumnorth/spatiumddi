@@ -24,6 +24,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
@@ -1003,6 +1004,7 @@ async def update_scope(
             )
     placement_in = body.windows_placement
     changes.pop("windows_placement", None)
+    before = snapshot(scope, changes)
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()
@@ -1020,7 +1022,7 @@ async def update_scope(
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
         resource_display=str(scope.id),
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes, unordered={"relay_addresses"}),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     await db.commit()
