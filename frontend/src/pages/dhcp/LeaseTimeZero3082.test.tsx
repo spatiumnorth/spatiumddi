@@ -17,15 +17,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DHCPScope } from "@/lib/api";
 
 const updateScope = vi.fn(() => Promise.resolve({}));
-vi.mock("@/lib/api", () => ({
+// The row the dialog's fresh read (#3077) answers with.
+let freshScope: unknown;
+vi.mock("@/lib/api", async (importOriginal) => ({
+  // Real helpers (formatApiError, …); only the API clients are stubbed.
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   dhcpApi: {
     listGroups: () =>
       Promise.resolve([{ id: "g-a", name: "group-a", mode: "standalone" }]),
     listOptionCodes: () => Promise.resolve([]),
     listOptionTemplates: () => Promise.resolve([]),
     listPxeProfiles: () => Promise.resolve([]),
-    // #3077 reads the scope fresh on open; undefined keeps the row passed in.
-    getScope: () => Promise.resolve(undefined),
+    // #3077 reads the scope fresh on open, and renders nothing until it has.
+    getScope: () => Promise.resolve(freshScope),
     updateScope: (...a: unknown[]) => (updateScope as any)(...a),
   },
   ipamApi: {
@@ -56,6 +60,7 @@ async function open() {
     lease_time: 3600,
     options: [],
   } as unknown as DHCPScope;
+  freshScope = scope;
   render(
     <QueryClientProvider client={new QueryClient()}>
       <CreateScopeModal scope={scope} onClose={() => {}} />
