@@ -104,11 +104,14 @@ export function ContainersTab() {
         <div className="py-12 text-center text-sm text-muted-foreground">
           Loading…
         </div>
-      ) : error ? null : !data || data.length === 0 ? (
-        <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
-          No pods visible. The api's ServiceAccount may not be wired up — check
-          the chart's ``api.serviceAccount.enabled`` value.
-        </div>
+      ) : !data || data.length === 0 ? (
+        // #3107 — a failed or refused read is said above, not as "no pods".
+        error ? null : (
+          <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
+            No pods visible. The api's ServiceAccount may not be wired up —
+            check the chart's ``api.serviceAccount.enabled`` value.
+          </div>
+        )
       ) : (
         <div className="space-y-2">
           {data.map((c) => (

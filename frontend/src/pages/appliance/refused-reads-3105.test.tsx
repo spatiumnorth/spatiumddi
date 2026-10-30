@@ -195,6 +195,19 @@ describe("#3107 a refusal is not an empty state", () => {
     expect(screen.queryByText("No online appliances")).toBeNull();
   });
 
+  it("says a failed appliance list could not be loaded, not refused", async () => {
+    listAppliances.mockRejectedValue(
+      Object.assign(new Error("Request failed with status code 500"), {
+        status: 500,
+        response: { status: 500, data: { detail: "boom" } },
+      }),
+    );
+    wrap(<FirewallLogsSection />);
+    expect(await screen.findByText("Couldn't load appliances")).toBeTruthy();
+    expect(screen.queryByText(/permission/)).toBeNull();
+    expect(screen.queryByText("Appliance list not permitted")).toBeNull();
+  });
+
   it("keeps 'No online appliances' for a list that is really empty", async () => {
     listAppliances.mockResolvedValue([]);
     wrap(<FirewallLogsSection />);
