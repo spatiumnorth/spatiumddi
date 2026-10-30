@@ -86,7 +86,7 @@ from app.services.backup.rewrap import (
     rewrap_secrets,
 )
 from app.services.backup.targets.base import PRE_RESTORE_KEEP_LAST_N, PRE_RESTORE_PREFIX
-from app.services.logs.partitions import LOG_TABLES, partition_name_pattern
+from app.services.logs.partitions import LOG_TABLES, maintain_all, partition_name_pattern
 
 logger = structlog.get_logger(__name__)
 
@@ -641,7 +641,7 @@ JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE k.contype = 'f'
   -- A partition's copy of its parent's key goes with the parent's, and
-  -- dropping one directly is an ERROR. The product has no partitions.
+  -- dropping one directly is an ERROR (the log tables are partitioned, #2185).
   AND k.conparentid = 0
   AND n.nspname = 'public'
   AND c.relname = ANY ({tables});
@@ -899,6 +899,23 @@ def _selective_postlude(tables: list[str], partitioned: list[str] | None = None)
         + _PUT_BACK_FOREIGN_KEYS_SQL
         + _PUT_SEQUENCES_PAST_THEIR_ROWS_SQL.format(tables=_sql_text_array(tables))
     )
+
+
+async def _maintain_log_partitions(db_url: str) -> None:
+    """Run the log tables' partition maintenance once against ``db_url``. Never raises."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: PLC0415
+    from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+    from app.db import task_connect_args  # noqa: PLC0415
+
+    engine = create_async_engine(db_url, poolclass=NullPool, connect_args=task_connect_args())
+    try:
+        result = await maintain_all(async_sessionmaker(engine, expire_on_commit=False))
+        logger.info("backup_restore_log_partitions", **result)
+    except Exception as exc:  # noqa: BLE001 — the beat task covers it within 15 minutes
+        logger.warning("backup_restore_log_partitions_failed", error=repr(exc))
+    finally:
+        await engine.dispose()
 
 
 async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]) -> None:
@@ -1531,6 +1548,13 @@ async def _apply_backup_restore_inner(
             f"their encrypted columns ({exc}). They are not read by the "
             "application; re-run the restore once the cause is fixed."
         )
+
+    # Phase 6c (#2185): the time-partitioned log tables. A full restore of an
+    # archive taken a while ago brings back the partitions that existed then,
+    # and ingest drops every current line until a partition covers it, so the
+    # next ones are made here rather than at the next 15-minute tick. Non-fatal:
+    # that tick still runs.
+    await _maintain_log_partitions(db_url)
 
     # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and

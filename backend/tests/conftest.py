@@ -143,15 +143,18 @@ async def _ensure_worker_database() -> None:
 
 #: The agent-shipped log tables are partitioned by time (#2185) and a row needs a
 #: partition to land in. ``create_all`` makes the parents only, so the suite
-#: gets daily partitions around "now", wide enough for every age the tests use
-#: (RPZ hits are kept 30 days). Named as ``maintain_log_partitions`` names them,
-#: so a test of the lifecycle finds them where it expects.
+#: gets partitions around "now": daily ones from four days back to two days
+#: ahead, named as ``maintain_log_partitions`` names them, and one partition for
+#: everything older back to 60 days (RPZ hits are kept 30). Few on purpose:
+#: every test ends with a TRUNCATE of every table, partitions included.
 _LOG_TABLES = ("dns_query_log_entry", "dhcp_log_entry", "dns_rpz_hit")
-_LOG_PARTITION_DAYS_BACK = 45
+_LOG_PARTITION_DAYS_BACK = 60
+_LOG_PARTITION_DAILY_BACK = 4
 _LOG_PARTITION_DAYS_AHEAD = 2
 
 
 async def create_test_log_partitions(conn: AsyncConnection) -> None:
+    """Create the suite's log partitions; the ones that already exist are kept."""
     for table in _LOG_TABLES:
         await conn.execute(text(f"""
 DO $$
@@ -159,7 +162,13 @@ DECLARE
   today date := (now() AT TIME ZONE 'UTC')::date;
   d date;
 BEGIN
-  FOR i IN -{_LOG_PARTITION_DAYS_BACK}..{_LOG_PARTITION_DAYS_AHEAD} LOOP
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS %I PARTITION OF {table} FOR VALUES FROM (%L) TO (%L)',
+    '{table}_p' || to_char(today - {_LOG_PARTITION_DAYS_BACK}, 'YYYYMMDD'),
+    ((today - {_LOG_PARTITION_DAYS_BACK})::timestamp AT TIME ZONE 'UTC'),
+    ((today - {_LOG_PARTITION_DAILY_BACK})::timestamp AT TIME ZONE 'UTC')
+  );
+  FOR i IN -{_LOG_PARTITION_DAILY_BACK}..{_LOG_PARTITION_DAYS_AHEAD} LOOP
     d := today + i;
     EXECUTE format(
       'CREATE TABLE IF NOT EXISTS %I PARTITION OF {table} FOR VALUES FROM (%L) TO (%L)',

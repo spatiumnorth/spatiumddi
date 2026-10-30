@@ -20,9 +20,9 @@ from app.models.dns import DNSServer, DNSServerGroup
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS
-from app.services.logs.partitions import RPZ_HIT_RETENTION_DAYS
+from app.services.logs.partitions import DEFAULT_RETENTION_HOURS, RPZ_HIT_RETENTION_DAYS
 from app.tasks import prune_logs
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS, FAILED, _sweep_with_session
+from app.tasks.prune_logs import FAILED, _sweep_with_session
 
 
 async def _make_dns_server(db: AsyncSession) -> DNSServer:

@@ -24,11 +24,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.models.base import Base
+from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer, DNSServerGroup
 from app.models.dns_rpz_hit import DNSRPZHit
-from app.models.logs import DNSQueryLogEntry
+from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.services.backup import restore
-from tests.conftest import create_test_log_partitions
+from app.services.logs.partitions import list_partitions
+from tests.conftest import _LOG_PARTITION_DAYS_BACK, create_test_log_partitions
 from tests.test_selective_restore_app_role_1693 import (
     _admin,
     _archive,
@@ -45,15 +47,17 @@ pytestmark = pytest.mark.skipif(
 
 _HEAD = "r2185_archive_head"
 NOW = datetime.now(UTC).replace(microsecond=0)
+#: Where the suite's oldest log partition starts, and what it is named after.
+_OLDEST = NOW.date() - timedelta(days=_LOG_PARTITION_DAYS_BACK)
 
 
 @pytest.fixture
 async def appliance_db() -> AsyncIterator[tuple[str, bytes, uuid.UUID]]:
     """(the app role's URL, an archive of its database, the server's id).
 
-    The database holds two RPZ hits and a DNS query line, in the daily
-    partitions the suite creates, and one RPZ hit 20 days old whose partition
-    is dropped again after the archive is taken.
+    The database holds two RPZ hits and a DNS query line, in the partitions the
+    suite creates, and one RPZ hit 20 days old whose partition is dropped again
+    after the archive is taken.
     """
     suffix = uuid.uuid4().hex[:10]
     role, password, dbname = (
@@ -109,12 +113,10 @@ async def appliance_db() -> AsyncIterator[tuple[str, bytes, uuid.UUID]]:
             )
             await db.commit()
             server_id = server.id
-        # The partition for 20 days ago exists for as long as it takes to put a
+        # A partition for 20 days ago exists for as long as it takes to put a
         # row in it, and is gone by the time of the restore.
         async with engine.begin() as conn:
-            await conn.exec_driver_sql(
-                "DROP TABLE dns_rpz_hit_p" + (NOW - timedelta(days=20)).strftime("%Y%m%d")
-            )
+            await conn.exec_driver_sql(f"DROP TABLE dns_rpz_hit_p{_OLDEST:%Y%m%d}")
             await conn.exec_driver_sql(
                 "CREATE TABLE dns_rpz_hit_old PARTITION OF dns_rpz_hit FOR VALUES FROM "
                 f"('{(NOW - timedelta(days=20)).strftime('%Y-%m-%d')} 00:00+00') TO "
@@ -275,6 +277,125 @@ async def test_an_archive_from_before_the_tables_were_partitioned_still_restores
     await _restore(url, old_archive, monkeypatch, sections=("dns_threat",))
 
     assert await _qnames(url, "dns_rpz_hit") == ["recent.example"]
+
+
+async def _upper(url: str, table: str) -> datetime:
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            return max(p.upper for p in await list_partitions(conn, table) if p.upper)
+    finally:
+        await engine.dispose()
+
+
+async def test_a_full_restore_makes_the_partitions_the_archive_is_missing(
+    appliance_db: tuple[str, bytes, uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive brings back the partitions that existed when it was taken.
+    Ingest would drop every current line until a partition covers it, so the
+    restore makes the missing ones itself instead of leaving them to the next
+    15-minute tick."""
+    url, _archive_now, _server_id = appliance_db
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        # Taken yesterday, as far as its partitions are concerned.
+        for table in ("dns_query_log_entry", "dhcp_log_entry", "dns_rpz_hit"):
+            for day in range(0, 3):
+                await conn.execute(
+                    f"DROP TABLE IF EXISTS {table}_p{NOW.date() + timedelta(days=day):%Y%m%d}"
+                )
+    finally:
+        await conn.close()
+    stale = _archive(await _pg_dump(url))
+    assert await _upper(url, "dns_query_log_entry") <= NOW
+
+    await _restore(url, stale, monkeypatch, sections=())
+
+    assert await _upper(url, "dns_query_log_entry") > NOW + timedelta(hours=20)
+    assert await _upper(url, "dhcp_log_entry") > NOW + timedelta(days=2)
+    assert await _upper(url, "dns_rpz_hit") > NOW + timedelta(days=2)
+
+
+@pytest.fixture
+async def migrated_db() -> AsyncIterator[tuple[str, bytes]]:
+    """(the app role's URL, an archive) for a database whose log tables were
+    made by the previous release and converted by the migration, the shape an
+    upgraded install has, with a DNS query line and a DHCP activity line."""
+    from tests.test_migration_e5a93c1b7d24_partition_log_tables import make_legacy_tables, run
+
+    suffix = uuid.uuid4().hex[:10]
+    role, password, dbname = (
+        f"r2185m_{suffix}",
+        f"pw-{suffix}",
+        f"spatiumddi_test_r2185m_{suffix}",
+    )
+    admin = await _admin()
+    try:
+        await admin.execute(
+            f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' "
+            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        await admin.execute(f'CREATE DATABASE "{dbname}" OWNER "{role}"')
+    finally:
+        await admin.close()
+    url = _url_for(dbname, role, password)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await make_legacy_tables(conn)
+            await conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num varchar(32) NOT NULL, "
+                "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+            )
+            await conn.exec_driver_sql(f"INSERT INTO alembic_version VALUES ('{_HEAD}')")
+        async with engine.begin() as conn:
+            await conn.run_sync(run, "upgrade")
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            group = DNSServerGroup(name=f"g2185m-{suffix}")
+            db.add(group)
+            await db.flush()
+            dns = DNSServer(group_id=group.id, name="ns", host="10.0.0.53", driver="bind9")
+            dhcp = DHCPServer(name="kea", host="127.0.0.1", driver="kea")
+            db.add_all([dns, dhcp])
+            await db.flush()
+            db.add(DNSQueryLogEntry(server_id=dns.id, ts=NOW, qname="q.example"))
+            db.add(DHCPLogEntry(server_id=dhcp.id, ts=NOW, raw="lease"))
+            await db.commit()
+        yield url, _archive(await _pg_dump(url))
+    finally:
+        await engine.dispose()
+        admin = await _admin()
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+            await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        finally:
+            await admin.close()
+
+
+async def test_dns_and_dhcp_restore_on_an_upgraded_install(
+    migrated_db: tuple[str, bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DNS and DHCP sections reach the log tables through the server tables'
+    foreign keys. After the upgrade nothing else may hold one: a leftover table
+    with such a key makes the restore refuse to run."""
+    url, archive = migrated_db
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        await conn.execute("TRUNCATE dns_query_log_entry, dhcp_log_entry")
+    finally:
+        await conn.close()
+
+    for section in ("dns", "dhcp"):
+        outcome: Any = await _restore(url, archive, monkeypatch, sections=(section,))
+        assert section in outcome.restored_sections
+
+    assert await _qnames(url, "dns_query_log_entry") == ["q.example"]
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        assert await conn.fetchval("SELECT count(*) FROM dhcp_log_entry") == 1
+    finally:
+        await conn.close()
 
 
 async def _chunks(*parts: bytes) -> AsyncIterator[bytes]:

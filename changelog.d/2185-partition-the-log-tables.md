@@ -15,9 +15,16 @@
     A per-table advisory lock keeps two workers from racing.
   - Retention is applied at the grain of the partitions: a row can
     outlive `log_retention_hours` by up to an hour, or a day.
-  - There is no default partition. The agent ingest endpoints count a
-    line dated beyond what the partitions cover as `expired`, with the
-    lines that are already older than the window.
+  - Because of the foreign key, attaching and detaching a partition also
+    locks `dns_server` / `dhcp_server` for a few milliseconds. Every step
+    waits at most 500 ms for a lock and is otherwise retried next tick.
+  - There is no default partition. The agent ingest endpoints count a line
+    inside the window that no partition covers as `no_partition`, apart
+    from `expired`, and log `log_lines_without_partition`. The
+    `log-partitions` component of `/health/platform` warns when the
+    partitions ahead of now run short and errors when none covers the
+    present. The task is also queued when beat or a worker starts, and a
+    backup restore runs it before it returns.
   - `prune_log_entries` now only retires agent ingest receipts.
   - The setting's cap of 168 hours is unchanged.
   - A selective restore of the `logs` or `dns_threat` section loads
@@ -25,17 +32,18 @@
     rows under the partitions, so `pg_restore --table <parent>` would
     have emptied the table and loaded nothing. Rows dated outside every
     partition the install has now are dropped, not failed on.
-  - DNS query log, DHCP activity and RPZ hit history start fresh after
-    the upgrade. The previous rows are kept in `<table>_legacy` for one
-    release.
+  - The upgrade copies the RPZ hits of the last 30 days. The DNS query log
+    and DHCP activity history start fresh.
 
 ### Migrations
 
-- `e5a93c1b7d24` — #2185, renames each of the three tables to
-  `<table>_legacy` and creates the partitioned table under the old name
-  (same columns, foreign key and indexes; primary key `(id, ts)`), moves
-  the `id` sequence to it, and creates daily partitions covering the
-  retention window. The previous release's pods keep reading and writing
-  the same table name during the rolling upgrade. The `_legacy` tables
-  are dropped in the next release. Downgrade parks the partitioned
-  tables as `<table>_partitioned` and restores the old ones.
+- `e5a93c1b7d24` — #2185, swaps each of the three tables for a
+  partitioned one under the same name (same columns, foreign key and
+  indexes; primary key `(id, ts)`), moves the `id` sequence to it, creates
+  daily partitions covering the retention window, copies the RPZ hits
+  inside it and drops the old tables. All locks are taken first under a
+  3 s `lock_timeout` and the swap is retried, so a long reader makes the
+  migration wait rather than queue the previous release's inserts behind
+  it. The previous release's pods keep reading and writing the same table
+  names during the rolling upgrade. Downgrade swaps back to plain tables,
+  copying the RPZ hits.
