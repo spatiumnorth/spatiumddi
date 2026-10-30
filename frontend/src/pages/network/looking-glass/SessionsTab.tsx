@@ -23,6 +23,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Field, errMsg, humanDuration, humanTime, inputCls } from "../_shared";
 import { PeerDetailModal } from "./PeerDetailModal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // Established = green, the transitional FSM states = amber, Idle = rose.
 // Exported so PeerDetailModal's header chip reuses the exact same
@@ -64,6 +65,17 @@ export function SessionsTab({
   onViewRoutes: (peerId: string) => void;
 }) {
   const qc = useQueryClient();
+  // #3104 — peers sit under the router's 'bgp_lg_peer' gate; a read-only
+  // user is offered no write on them.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "bgp_lg_peer"),
+    "Requires write permission on BGP peers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "bgp_lg_peer"),
+    "Requires delete permission on BGP peers",
+  );
   const [deleteTarget, setDeleteTarget] = useState<BGPLGPeer | null>(null);
   const [viewingPeerId, setViewingPeerId] = useState<string | null>(null);
 
@@ -227,6 +239,7 @@ export function SessionsTab({
                           title="Edit peer"
                           className="rounded p-1 hover:bg-muted"
                           onClick={() => onEdit(peer)}
+                          {...writeGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -235,6 +248,7 @@ export function SessionsTab({
                           title="Delete peer"
                           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                           onClick={() => setDeleteTarget(peer)}
+                          {...deleteGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
