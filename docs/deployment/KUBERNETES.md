@@ -316,7 +316,7 @@ on `api.autoscaling.enabled` (**default `true`**):
 
 ```yaml
 api:
-  replicas: 2
+  replicas: 2                            # only with autoscaling.enabled: false
   autoscaling:
     enabled: true
     minReplicas: 2
@@ -325,10 +325,14 @@ api:
     targetMemoryUtilizationPercentage: 80
 ```
 
-The HPA scales on both CPU and memory utilisation. It requires a running
-metrics-server in the cluster (most managed Kubernetes offerings ship one); if
-yours doesn't, install
-[metrics-server](https://github.com/kubernetes-sigs/metrics-server) or set
+The HPA scales on both CPU and memory utilisation.
+
+While the HPA is on, the chart renders no `replicas` on the api Deployment, so
+the HPA alone sets the count and `helm upgrade` keeps it (#3111); `api.replicas`
+applies only with `api.autoscaling.enabled: false`. The HPA needs a running
+metrics-server in the cluster (most managed Kubernetes offerings ship one), and
+without one it holds the api at `minReplicas`. Install
+[metrics-server](https://github.com/kubernetes-sigs/metrics-server), or set
 `api.autoscaling.enabled: false` and manage `api.replicas` directly. No other
 workload defines an HPA — `frontend` / `worker` are fixed-replica Deployments
 (scale by editing `*.replicas`) and `beat` is a hard singleton.
@@ -660,6 +664,10 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <NEW_CHART_VERSION> \
   --namespace spatiumddi --reuse-values
 ```
+
+At the first upgrade to a chart with #3111 the api's replica count changes
+hands; the [chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#the-apis-replica-count-under-the-autoscaler-3111)
+says what each kind of release sees.
 
 Each upgrade renders a fresh per-revision migrate Job; the api / worker / beat
 pods' `wait-for-migrate` init containers hold their rollout until the new

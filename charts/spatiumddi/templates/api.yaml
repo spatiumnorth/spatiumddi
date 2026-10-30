@@ -8,7 +8,15 @@ metadata:
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
+  {{- /* #3111: while the autoscaler is on (the default) it alone sets the count.
+         Helm 4 applies server-side, and a rendered count made helm an owner of
+         the field the autoscaler writes through the scale subresource: once it
+         had scaled, every helm upgrade failed on .spec.replicas (and under Helm
+         3 each upgrade reset the count to api.replicas). With the autoscaler off
+         (the appliance) helm sets it from api.replicas, as before. */}}
+  {{- if not .Values.api.autoscaling.enabled }}
   replicas: {{ .Values.api.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}

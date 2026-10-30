@@ -60,6 +60,14 @@
 #                      dedicated pass asserting the appliance's api / worker /
 #                      frontend retire first at one replica too, where the
 #                      blocking term rides on the OUTGOING pods (#1541).
+#   hpa-replicas     — every render, plus --require passes, a control and
+#                      negative controls: a workload an autoscaler scales
+#                      renders no ``spec.replicas`` (#3111), while the
+#                      appliance's api (autoscaler off) keeps its count. Helm
+#                      4 applies server-side, so a rendered count made helm an
+#                      owner of the field the autoscaler writes, and every
+#                      ``helm upgrade`` failed on it once the autoscaler had
+#                      scaled.
 #   template-stable  — dedicated pass over the appliance renders at one replica
 #                      and at three: the frontend's pod template must be the
 #                      same in both (#2450). The first promotion only raises
@@ -208,6 +216,10 @@ render() { # name chart [helm --set args...]
     # wedges once replicas == nodes.
     python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" "$file" \
         || failures=$((failures + 1))
+    # #3111 — an autoscaled workload must leave spec.replicas to the
+    # autoscaler, or helm upgrade fails on it under server-side apply.
+    python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -314,12 +326,15 @@ render umbrella-appliance-mirror "$UMBRELLA" \
 # demote replaces still carry the 3-node required term, which keeps a
 # surged pod off the only node for good — so api and worker must retire
 # first at one replica as well as at three.
+# #3111 — and the api autoscaler off, as firstboot renders it: the appliance's
+# api count is its control-plane size (``api.replicas``), which helm sets.
 APPLIANCE_CP_HARD=(
     --set api.podAntiAffinity=hard
     --set worker.podAntiAffinity=hard
     --set frontend.podAntiAffinity=hard
     --set frontend.hostNetwork=true
     --set api.service.trafficDistribution=PreferSameNode
+    --set api.autoscaling.enabled=false
 )
 for n in 1 3; do
     render "umbrella-appliance-cp-$n" "$UMBRELLA" "${APPLIANCE_CP_HARD[@]}" \
@@ -369,6 +384,57 @@ neg1805() { # label manifest [chart-api-node-local.py flags...]
 neg1805 "the default render read as the appliance's" "$OUT/umbrella-defaults.yaml" --require
 neg1805 "an appliance render read as the default" "$OUT/umbrella-appliance-cp-3.yaml" \
     --require --absent
+
+# #3111 — the autoscaler alone sets the api's replica count. The default render
+# (a BYO-Kubernetes install, autoscaler on) and the all-on render must leave
+# ``spec.replicas`` off the api Deployment; the appliance's values turn the
+# autoscaler off, and there helm keeps rendering ``api.replicas``, at one
+# replica and at three. --require so no pass can succeed by rendering no
+# autoscaler at all.
+echo "── api replicas: the autoscaler's while it is on, api.replicas while it is off (umbrella, #3111)"
+python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" --require \
+    "$OUT/umbrella-defaults.yaml" "$OUT/umbrella-all-on.yaml" || failures=$((failures + 1))
+for n in 1 3; do
+    python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" --replicas "api=$n" \
+        "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
+done
+# Negative controls: the default render as it was before #3111 (``replicas: 2``
+# beside the autoscaler) and an appliance api that lost its count must each be
+# refused, naming #3111, or the passes above could be reading renders they
+# cannot parse.
+echo "── negative controls: the #3111 guard must refuse each wrong render"
+api_replicas() { # source-render out-file set|drop
+    python3 - "$@" <<'PYEOF'
+import sys, yaml
+src, dst, how = sys.argv[1:4]
+docs = [d for d in yaml.safe_load_all(open(src)) if d]
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["labels"].get("app.kubernetes.io/component") == "api":
+        if how == "set":
+            d["spec"]["replicas"] = 2
+        else:
+            d["spec"].pop("replicas", None)
+with open(dst, "w") as fh:
+    yaml.safe_dump_all(docs, fh)
+PYEOF
+}
+neg3111() { # label manifest [chart-hpa-replicas.py flags...]
+    local label="$1" file="$2"; shift 2
+    local out rc
+    out="$(python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" "$@" "$file" 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#3111"; then
+        echo "   ok: $label refused by the #3111 guard"
+    else
+        echo "   FAIL: expected the #3111 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+api_replicas "$OUT/umbrella-defaults.yaml" "$OUT/neg-hpa-replicas-set.yaml" set
+api_replicas "$OUT/umbrella-appliance-cp-3.yaml" "$OUT/neg-hpa-replicas-dropped.yaml" drop
+neg3111 "an autoscaled api rendering replicas: 2" "$OUT/neg-hpa-replicas-set.yaml" --require
+neg3111 "an appliance api without its count" "$OUT/neg-hpa-replicas-dropped.yaml" --replicas api=3
 
 # #3021 — the CNPG instance pods reach the API server on their own node, which
 # the appliance sets (firstboot's HelmChart and the supervisor's
