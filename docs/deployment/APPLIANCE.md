@@ -3842,7 +3842,7 @@ the operator installing a CA anywhere:
    is sent to a server that does not hold the pinned key. The hostname does
    not have to match, so an IP works. The supervisor logs the fingerprint as
    `supervisor.tls.pinned_on_first_contact`; it should match the one shown
-   under **Appliance → TLS** on the control plane. If it does not, something
+   under **Appliance → Fleet → Web UI Certificate** on the control plane. If it does not, something
    intercepted the connection.
 2. **Rotation goes through the appliance CA.** The Web UI certificate changes
    in normal operation: a self-signed one is re-minted when a member joins or
@@ -3872,7 +3872,8 @@ unconditionally, and nothing was pinned in its place).
 **Limit, stated plainly.** Trust on first use is as good as the first
 contact. An attacker on the path at pairing time who also substitutes the CA
 certificate the supervisor receives at approval is not caught automatically;
-comparing the logged fingerprint with **Appliance → TLS** is the check.
+comparing the logged fingerprint with **Appliance → Fleet → Web UI
+Certificate** is the check.
 
 **The role pods use the same pin (#1281).** On an off-cluster appliance the
 DNS, DHCP and looking-glass pods reach the control plane at the same external
