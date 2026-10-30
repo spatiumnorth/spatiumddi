@@ -81,6 +81,7 @@ import {
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -3219,14 +3220,32 @@ type RecordModalProps = {
 };
 
 // Edit reads the record fresh on open (#3077): the row the page holds comes
-// from a cached records page that may predate a Save made a moment ago.
+// from a cached records page that may predate a Save made a moment ago. It is
+// opened from the zone's records page or the group-wide records list, so both
+// are refetched and the row is taken from whichever holds it.
 export function RecordModal(props: RecordModalProps) {
   const qc = useQueryClient();
-  const { row, ready } = useFreshRow(props.record, () =>
-    refetchRow<DNSRecord>(qc, ["dns-records", props.zoneId], props.record!.id),
+  const fresh = useFreshRow(props.record, () =>
+    refetchRow<DNSRecord>(
+      qc,
+      [
+        ["dns-records", props.zoneId],
+        ["dns-group-records", props.groupId],
+      ],
+      props.record!.id,
+    ),
   );
-  if (!ready) return null;
-  return <RecordModalForm {...props} record={row} />;
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Record"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <RecordModalForm {...props} record={fresh.row} />;
 }
 
 function RecordModalForm({

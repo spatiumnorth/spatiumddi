@@ -24,6 +24,7 @@ import type {
   DHCPScope,
   DHCPStaticAssignment,
   DNSRecord,
+  IPAddress,
   IPSpace,
 } from "@/lib/api";
 
@@ -57,7 +58,8 @@ vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({ ready: true, enabled: () => true }),
 }));
 
-const { EditSpaceModal } = await import("@/pages/ipam/IPAMPage");
+const { EditSpaceModal, EditAddressModal } =
+  await import("@/pages/ipam/IPAMPage");
 const { CreateStaticAssignmentModal } =
   await import("@/pages/dhcp/CreateStaticAssignmentModal");
 const { CreateScopeModal } = await import("@/pages/dhcp/CreateScopeModal");
@@ -110,6 +112,40 @@ describe("Edit IP Space (#3075)", () => {
     save();
     await waitFor(() => expect(updateSpace).toHaveBeenCalled());
     expect(updateSpace).toHaveBeenCalledWith("sp-1", { description: "xp d3" });
+  });
+
+  it("sends a cleared description as an empty string", async () => {
+    const updateSpace = vi.fn(() => Promise.resolve(fresh));
+    answers.ipamApi = { getSpace: () => Promise.resolve(fresh), updateSpace };
+    open(
+      <EditSpaceModal space={stale} onClose={() => {}} onDeleted={() => {}} />,
+    );
+    const box = await screen.findByDisplayValue("xp d2");
+    fireEvent.change(box, { target: { value: "" } });
+    save();
+    await waitFor(() => expect(updateSpace).toHaveBeenCalled());
+    expect(updateSpace).toHaveBeenCalledWith("sp-1", { description: "" });
+  });
+
+  it("a failed read offers a retry and never shows the cached row", async () => {
+    let fail = true;
+    answers.ipamApi = {
+      getSpace: () =>
+        fail
+          ? Promise.reject({ response: { data: { detail: "upstream down" } } })
+          : Promise.resolve(fresh),
+    };
+    open(
+      <EditSpaceModal space={stale} onClose={() => {}} onDeleted={() => {}} />,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("upstream down");
+    expect(screen.queryByDisplayValue("xp d1")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Save/ })).toBeNull();
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByDisplayValue("xp d2");
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });
 
@@ -177,6 +213,39 @@ describe("Edit Static Assignment (#3076)", () => {
     expect(updateStatic).toHaveBeenCalledWith("sc-1", "st-1", {
       hostname: "xp-st-c",
     });
+  });
+});
+
+describe("Edit Static Assignment, failed read (#3076)", () => {
+  it("does not seed the form from the cache when the refetch fails", async () => {
+    const scope = { id: "sc-1", subnet_id: "sn-1" } as DHCPScope;
+    const row = {
+      id: "st-1",
+      scope_id: "sc-1",
+      mac_address: "02:98:14:00:00:20",
+      ip_address: "10.98.140.20",
+      hostname: "xp-st-a",
+      description: "",
+      client_id: null,
+    } as unknown as DHCPStaticAssignment;
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    qc.setQueryDefaults(["dhcp-statics"], {
+      queryFn: () => Promise.reject(new Error("network down")),
+    });
+    qc.setQueryData(["dhcp-statics", "sc-1"], [row]);
+    open(
+      <CreateStaticAssignmentModal
+        scope={scope}
+        staticAssignment={row}
+        onClose={() => {}}
+      />,
+      qc,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("network down");
+    expect(screen.queryByDisplayValue("xp-st-a")).toBeNull();
   });
 });
 
@@ -249,5 +318,72 @@ describe("Edit Record (#3077)", () => {
     save();
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(updateRecord).not.toHaveBeenCalled();
+  });
+});
+
+describe("Edit Record from the group-wide list (#3077)", () => {
+  it("reads the row fresh from the group records list", async () => {
+    const rec = (value: string) =>
+      ({
+        id: "r-1",
+        zone_id: "z-1",
+        view_id: null,
+        name: "www",
+        record_type: "A",
+        value,
+        ttl: 300,
+        priority: null,
+        weight: null,
+        port: null,
+      }) as unknown as DNSRecord;
+    answers.dnsApi = {
+      listGroupRecords: () =>
+        Promise.resolve({ items: [rec("10.98.200.11")], total: 1 }),
+      listViews: () => Promise.resolve([]),
+    };
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    qc.setQueryDefaults(["dns-group-records"], {
+      queryFn: () => answers.dnsApi.listGroupRecords(),
+    });
+    qc.setQueryData(["dns-group-records", "g-1", {}], {
+      items: [rec("10.98.200.10")],
+      total: 1,
+    });
+    const { RecordModal } = await import("@/pages/dns/DNSPage");
+    open(
+      <RecordModal
+        groupId="g-1"
+        zoneId="z-1"
+        zoneName="example.com."
+        record={rec("10.98.200.10")}
+        onClose={() => {}}
+      />,
+      qc,
+    );
+    await screen.findByDisplayValue("10.98.200.11");
+    expect(screen.queryByDisplayValue("10.98.200.10")).toBeNull();
+  });
+});
+
+describe("IPAM Edit address (#3077)", () => {
+  it("shows the stored hostname, not the cached one", async () => {
+    const addr = (hostname: string) =>
+      ({
+        id: "a-1",
+        subnet_id: "sn-1",
+        address: "10.0.0.5",
+        hostname,
+        description: "",
+        mac_address: null,
+        status: "allocated",
+        custom_fields: {},
+        tags: {},
+      }) as unknown as IPAddress;
+    answers.ipamApi = { getAddress: () => Promise.resolve(addr("host-b")) };
+    open(<EditAddressModal address={addr("host-a")} onClose={() => {}} />);
+    await screen.findByDisplayValue("host-b");
+    expect(screen.queryByDisplayValue("host-a")).toBeNull();
   });
 });

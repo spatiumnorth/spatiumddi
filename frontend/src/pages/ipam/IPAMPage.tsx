@@ -132,6 +132,7 @@ import { useSessionState } from "@/lib/useSessionState";
 import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -9283,13 +9284,32 @@ function withStoredValue(
   return value && !options.includes(value) ? [value, ...options] : options;
 }
 
-export function EditAddressModal({
-  address,
-  onClose,
-}: {
+type EditAddressModalProps = {
   address: IPAddress;
   onClose: () => void;
-}) {
+};
+
+// Reads the address fresh on open (#3077): the row comes from the cached
+// addresses list, which an inline edit, a static assignment's Save or this
+// dialog's own last Save may have outdated, and the form is seeded once.
+export function EditAddressModal(props: EditAddressModalProps) {
+  const fresh = useFreshRow<IPAddress>(props.address, () =>
+    ipamApi.getAddress(props.address.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Edit ${props.address.address}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditAddressModalForm {...props} address={fresh.row} />;
+}
+
+function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const qc = useQueryClient();
   const [hostname, setHostname] = useState(address.hostname ?? "");
   const [description, setDescription] = useState(address.description ?? "");
@@ -11888,11 +11908,20 @@ type EditSpaceModalProps = {
 // Reads the space fresh on open (#3075): the panel holds the space as it was
 // when clicked, and the form is seeded once from it.
 export function EditSpaceModal(props: EditSpaceModalProps) {
-  const { row, ready } = useFreshRow<IPSpace>(props.space, () =>
+  const fresh = useFreshRow<IPSpace>(props.space, () =>
     ipamApi.getSpace(props.space.id),
   );
-  if (!ready || !row) return null;
-  return <EditSpaceModalForm {...props} space={row} />;
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit IP Space"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditSpaceModalForm {...props} space={fresh.row} />;
 }
 
 function EditSpaceModalForm({

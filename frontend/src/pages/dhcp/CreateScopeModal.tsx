@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
@@ -62,11 +63,20 @@ type CreateScopeModalProps = {
 // a cached list whose refetch may not have answered since the last Save, and
 // the form is seeded once.
 export function CreateScopeModal(props: CreateScopeModalProps) {
-  const { row, ready } = useFreshRow(props.scope, () =>
+  const fresh = useFreshRow(props.scope, () =>
     dhcpApi.getScope(props.scope!.id),
   );
-  if (!ready) return null;
-  return <ScopeModalForm {...props} scope={row} />;
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit DHCP Scope"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ScopeModalForm {...props} scope={fresh.row} />;
 }
 
 function ScopeModalForm({

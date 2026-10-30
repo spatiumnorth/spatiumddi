@@ -7,6 +7,7 @@ import {
   type DHCPScope,
 } from "@/lib/api";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { hostnameError } from "@/lib/dnsNames";
 import { staticDuidField } from "@/lib/formPayloads";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
@@ -22,15 +23,24 @@ type StaticModalProps = {
 // would put it back on both the static and its IPAM row.
 export function CreateStaticAssignmentModal(props: StaticModalProps) {
   const qc = useQueryClient();
-  const { row, ready } = useFreshRow(props.staticAssignment, () =>
+  const fresh = useFreshRow(props.staticAssignment, () =>
     refetchRow<DHCPStaticAssignment>(
       qc,
-      ["dhcp-statics", props.scope.id],
+      [["dhcp-statics", props.scope.id]],
       props.staticAssignment!.id,
     ),
   );
-  if (!ready) return null;
-  return <StaticModalForm {...props} staticAssignment={row} />;
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Static Assignment"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <StaticModalForm {...props} staticAssignment={fresh.row} />;
 }
 
 function StaticModalForm({

@@ -1895,6 +1895,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
