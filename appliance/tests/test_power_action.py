@@ -484,3 +484,25 @@ def test_the_console_cancel_leaves_a_marker_for_the_supervisor(tmp_path: Path) -
     # unprivileged supervisor empty it once acknowledged, never unlink it.
     assert stat.S_IMODE(marker.stat().st_mode) == 0o660
     assert marker.stat().st_gid == state.stat().st_gid
+
+
+class _FlashRecorder:
+    def __init__(self) -> None:
+        self.flashes: list[str] = []
+
+    def flash(self, msg: str, ttl: float = 3.0) -> None:
+        self.flashes.append(msg)
+
+
+def test_a_console_cancel_replaces_the_reboot_flash(tmp_path: Path) -> None:
+    # The F5 / F6 flash ("Rebooting · F9 cancels") runs 20 s; the cancel must
+    # replace it, or the footer goes on announcing a reboot that will not come.
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    (state / "reboot-pending").write_text("x")
+    con = _console(state, boot, lambda argv: None)
+    dash = _FlashRecorder()
+    con["do_cancel_reboot"](_FakeConsole(), dash)
+    assert dash.flashes and dash.flashes[-1] == "Reboot cancelled"

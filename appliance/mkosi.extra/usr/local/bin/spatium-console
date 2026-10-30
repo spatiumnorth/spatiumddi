@@ -5223,7 +5223,7 @@ def _record_reboot_cancel() -> None:
             pass
 
 
-def do_cancel_reboot(console: Console) -> None:
+def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) -> None:
     """#556 — abort a queued reboot from the physical console.
 
     A queued reboot runs a systemd service that *sleeps* for a grace
@@ -5285,6 +5285,10 @@ def do_cancel_reboot(console: Console) -> None:
             console.print(f"[dim](left {name}: {exc})[/dim]")
     _record_reboot_cancel()
     console.print("[green]Reboot cancelled.[/green]\n")
+    if state is not None:
+        # F5 / F6 set a 20 s "Rebooting · F9 cancels" flash; without this it
+        # outlived the cancel and the footer went on announcing the reboot.
+        state.flash("Reboot cancelled", ttl=5)
     time.sleep(1.5)
 
 
@@ -6448,7 +6452,7 @@ def main() -> int:
                                 elif action == "shutdown":
                                     do_shutdown(console, state)
                                 elif action == "cancel_reboot":
-                                    do_cancel_reboot(console)
+                                    do_cancel_reboot(console, state)
                                 elif action == "monitor":
                                     do_monitor(console, args.tty)
                                 elif action == "containers":
