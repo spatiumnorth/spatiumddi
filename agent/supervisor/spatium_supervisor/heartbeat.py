@@ -34,9 +34,10 @@ the supervisor.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -331,6 +332,11 @@ _evicted_pending: set[str] = set()
 # ``evict_pending`` so the row shows it.
 _nodes_deleted: set[str] = set()
 _evict_reasons: dict[str, str] = {}
+# #3020 — the seed's housekeeping writes the two reports above on its worker
+# (``_Housekeeper``) and the next heartbeat's body reads them, possibly while
+# that work is still running. Held only around those reads and writes, never
+# across a kube API call.
+_evict_lock = threading.Lock()
 _etcd_evictions = etcd_evict.EtcdEvictions()
 
 # #1058 — hostnames whose stranded CNPG claims the reclaim still owes (a
@@ -1089,6 +1095,113 @@ def next_heartbeat_delay(
     return rearm_floor_s if held else float(interval_s)
 
 
+#: #3020 — how long a heartbeat waits for its kube API housekeeping (the seed's
+#: control-plane block, and the role lifecycle on every node) before the loop
+#: sends the next heartbeat without it. A healthy tick's work takes about 1.5 s,
+#: so in steady state the wait never expires and nothing changes. Through a node
+#: loss it did not: every kube API call opens a new connection to the
+#: kubernetes Service, one that went to the lost node's apiserver waited out its
+#: 10 s timeout, and the #2132 reclone check's read of the lost node's pod log
+#: did on every tick. The work took 20 to 30 s, the next heartbeat waited for all
+#: of it, and the seed's heartbeat landed 92 s apart.
+HOUSEKEEPING_WAIT_S = 5.0
+
+
+class _Housekeeper:
+    """#3020 — runs a heartbeat's kube API housekeeping on one worker thread.
+
+    ``run`` hands the work over and waits for it at most ``wait_s``. Work that
+    finishes inside the wait is today's inline call: it is done, in the same
+    order, before the heartbeat returns. Work that does not keeps running on the
+    worker while the loop sends the next heartbeat. A heartbeat answered
+    meanwhile queues its own work behind it, and only the newest waits: every
+    input is desired state the control plane sends again on each heartbeat. One
+    job runs at a time, so the housekeeping never overlaps itself."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: tuple[Callable[[], None], float, Any] | None = None
+        self._pending_seq = 0
+        self._done_seq = 0
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def busy(self) -> bool:
+        """True while work runs or waits to run."""
+        with self._cond:
+            return self._running or self._pending is not None
+
+    def run(self, job: Callable[[], None], wait_s: float, log: Any) -> bool:
+        """Queue ``job`` and wait for it at most ``wait_s``. True when it (or
+        newer work queued over it) finished inside the wait."""
+        started = time.monotonic()
+        with self._cond:
+            behind = self._running
+            if self._pending is not None:
+                log.info("supervisor.heartbeat.housekeeping_superseded")
+            self._pending_seq += 1
+            seq = self._pending_seq
+            self._pending = (job, wait_s, log)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._work, name="spatium-housekeeping", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+            while self._done_seq < seq:
+                left = started + wait_s - time.monotonic()
+                if left <= 0:
+                    log.info(
+                        "supervisor.heartbeat.housekeeping_deferred",
+                        waited_s=round(time.monotonic() - started, 1),
+                        behind_running_work=behind,
+                    )
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def drain(self, timeout_s: float) -> bool:
+        """Wait at most ``timeout_s`` for queued and running work (shutdown)."""
+        deadline = time.monotonic() + timeout_s
+        with self._cond:
+            while self._running or self._pending is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def _work(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None:
+                    self._cond.wait()
+                (job, wait_s, log), seq = self._pending, self._pending_seq
+                self._pending = None
+                self._running = True
+            started = time.monotonic()
+            try:
+                job()
+            except Exception as exc:  # noqa: BLE001 — the worker outlives any one job
+                log.warning("supervisor.heartbeat.housekeeping_crashed", error=str(exc))
+            finally:
+                took = time.monotonic() - started
+                with self._cond:
+                    self._running = False
+                    self._done_seq = seq
+                    self._cond.notify_all()
+            if took > wait_s:
+                log.info("supervisor.heartbeat.housekeeping_done", elapsed_s=round(took, 1))
+
+
+_housekeeper = _Housekeeper()
+
+
+def drain_housekeeping(timeout_s: float) -> bool:
+    """#3020 — at shutdown, let housekeeping still running finish (bounded)."""
+    return _housekeeper.drain(timeout_s)
+
+
 
 # #2798 — how the control plane says "this appliance is revoked" on a
 # heartbeat: a 403 carrying this header (``revoked`` for a revoked row,
@@ -1148,9 +1261,14 @@ def heartbeat_once(
     journalctl without taking down the supervisor process.
 
     Returns True when the control plane long-poll-held the heartbeat, False
-    when it answered without holding, and None when it never answered (a
-    transport error: DNS, connect, timeout). The loop re-sends a None sooner
-    than the interval (``next_heartbeat_delay``, #1805).
+    when it answered without holding, and None when the heartbeat did not land:
+    it never answered (a transport error: DNS, connect, timeout, #1805) or it
+    answered 5xx (#3020). The loop re-sends a None sooner than the interval
+    (``next_heartbeat_delay``).
+
+    #3020 — the kube API housekeeping after an accepted heartbeat runs on the
+    housekeeping worker, and this waits for it at most ``HOUSEKEEPING_WAIT_S``
+    (``_Housekeeper``).
     """
     state = appliance_state.collect()
     # #358 Phase 1b — ask the control plane to long-poll-hold this
@@ -1158,6 +1276,10 @@ def heartbeat_once(
     # in ~0 s. Old control planes ignore it + return at once; the widened
     # client timeout below covers the hold.
     hold_s = max(0, int(cfg.heartbeat_interval_seconds))
+    # #3020 — the previous tick's housekeeping may still be writing these.
+    with _evict_lock:
+        evicted_report = sorted(_evicted_pending)
+        evict_pending_report = dict(_evict_reasons)
     body: dict[str, Any] = {
         "appliance_id": str(appliance_id),
         "wait_seconds": hold_s,
@@ -1182,8 +1304,8 @@ def heartbeat_once(
         # to ``left``. Empty on non-seed / nothing-evicted. #1284 — only once
         # etcd no longer lists the node; ``evict_pending`` says why the rest
         # are still waiting.
-        "evicted_node_names": sorted(_evicted_pending),
-        "evict_pending": dict(_evict_reasons),
+        "evicted_node_names": evicted_report,
+        "evict_pending": evict_pending_report,
     }
     # #170 Wave D follow-up — surface the outcome of the previous
     # heartbeat's compose-lifecycle apply. Empty / None on the first
@@ -1203,7 +1325,10 @@ def heartbeat_once(
     # lifecycle path, so the watchdog has nothing to watch.
     global _last_watchdog_at, _cached_role_health
     if appliance_state.detect_deployment_kind() == "appliance":
-        if _watchdog_check_due():
+        # #3020 — not while the previous tick's housekeeping is still running:
+        # a heal must never race the role lifecycle's apply. It stays due and
+        # runs on the next heartbeat.
+        if _watchdog_check_due() and not _housekeeper.busy():
             try:
                 env_file = cfg.state_dir / _ROLE_ENV_FILENAME
                 # #2808 — no heal while the node is not approved: the revoked
@@ -1385,11 +1510,19 @@ def heartbeat_once(
     if resp.status_code >= 500:
         # 5xx is the control plane crashing mid-flight, not a
         # deliberate rejection — don't count toward revocation.
+        #
+        # #3020 — and it did not land, so it is re-sent as soon as one that
+        # never reached the control plane (None: #1805's 5 s, doubling). The
+        # heartbeat handler answers a database outage (a failover, a restarted
+        # primary) with 503 and Retry-After: 1, and the maintenance middleware's
+        # own database read with a bare 500; returning False waited the whole
+        # interval after either, which after a held heartbeat made a gap of
+        # about 60 s, and with the housekeeping stall before it 92 s.
         log.warning(
             "supervisor.heartbeat.server_error",
             status_code=resp.status_code,
         )
-        return False
+        return None
     if resp.status_code != 200:
         log.warning(
             "supervisor.heartbeat.unexpected_status",
@@ -1443,6 +1576,14 @@ def heartbeat_once(
     desired_next_boot_slot = body_out.get("desired_next_boot_slot")
     desired_default_slot = body_out.get("desired_default_slot")
     reboot_requested = bool(body_out.get("reboot_requested"))
+    # #3008 — the cancel this heartbeat reported is done with only when the
+    # response proves the request retired (``reboot_requested`` false); an
+    # older api ignores the report and still sends ``true``.
+    reboot_in_response = body_out.get("reboot_requested")
+    appliance_state.ack_reboot_cancel(
+        state.get("reboot_cancelled_boot_id"),  # type: ignore[arg-type]
+        reboot_in_response if isinstance(reboot_in_response, bool) else None,
+    )
     clear_upgrade_requested = bool(body_out.get("clear_upgrade_requested"))
 
     # #786 — an explicit "Clear failed upgrade" outranks everything below.
@@ -1606,11 +1747,19 @@ def heartbeat_once(
     # only when the rendered cp-size differs, so it converges one tick
     # after a promote/demote settles and stays quiet otherwise.
     cp_size = body_out.get("control_plane_size")
-    if (
+    run_seed_housekeeping = (
         isinstance(cp_size, int)
         and cp_size >= 1
         and appliance_state.detect_appliance_variant() == "control-plane"
-    ):
+    )
+
+    def _seed_housekeeping() -> None:
+        # #3020 — the seed's kube API work, run on the housekeeping worker with
+        # the role lifecycle at the end of this function (``_Housekeeper``), not
+        # inline here: through a node loss its calls that reach the lost node
+        # time out at 10 s each, and the next heartbeat waited for every one.
+        # It reads only this heartbeat's answer, so the firewall dispatch and the
+        # role env render below no longer wait for it either.
         from . import k8s_api  # noqa: PLC0415
 
         # #272 — write the supervisor-owned overrides to HelmChartConfigs
@@ -1849,15 +1998,16 @@ def heartbeat_once(
             # etcd member is not a late arrival of the evicted one.
             wanted=[str(n) for n in (body_out.get("join_node_names") or [])],
         )
-        for name in confirmed:
-            _evicted_pending.add(name)
-            log.info("supervisor.heartbeat.node_evicted", node=name)
-        for name, reason in reasons.items():
-            if _evict_reasons.get(name) != reason:
-                log.info("supervisor.heartbeat.node_evict_pending", node=name, reason=reason)
-        _evict_reasons.clear()
-        _evict_reasons.update(reasons)
-        _evicted_pending.intersection_update(set(evict_names))
+        with _evict_lock:  # #3020: the next heartbeat's body reads these two
+            for name in confirmed:
+                _evicted_pending.add(name)
+                log.info("supervisor.heartbeat.node_evicted", node=name)
+            for name, reason in reasons.items():
+                if _evict_reasons.get(name) != reason:
+                    log.info("supervisor.heartbeat.node_evict_pending", node=name, reason=reason)
+            _evict_reasons.clear()
+            _evict_reasons.update(reasons)
+            _evicted_pending.intersection_update(set(evict_names))
         _nodes_deleted.intersection_update(set(evict_names))
 
         # #590: the deleted Node strands any local-path Redis claim on it
@@ -2097,25 +2247,40 @@ def heartbeat_once(
     # toward a state the control plane no longer expects. The console
     # dashboard surfaces the red ``Approval revoked`` chip so the
     # operator knows the recovery is "re-pair from /appliance/pairing".
-    if approval_state.role_services_hold(cfg.state_dir) is not None:
-        log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
-        _ = identity
-        return False
+    lifecycle_held = approval_state.role_services_hold(cfg.state_dir) is not None
+    run_lifecycle = (
+        not lifecycle_held
+        and not env_write_failed
+        and appliance_state.detect_deployment_kind() == "appliance"
+    )
 
-    if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        _run_role_lifecycle(
-            cfg.state_dir,
-            target.profiles,
-            rendered,
-            env_path,
-            force=held_until_now is not None,
-        )
+    def _housekeeping() -> None:
+        if run_seed_housekeeping:
+            _seed_housekeeping()
+        if run_lifecycle:
+            _run_role_lifecycle(
+                cfg.state_dir,
+                target.profiles,
+                rendered,
+                env_path,
+                force=held_until_now is not None,
+            )
+
+    # #3020 — the kube API work of this heartbeat (the seed's block above, the
+    # role lifecycle) runs on the housekeeping worker; the loop waits for it at
+    # most HOUSEKEEPING_WAIT_S, so a node loss's 10 s timeouts no longer hold
+    # the next heartbeat back.
+    if run_seed_housekeeping or run_lifecycle:
+        _housekeeper.run(_housekeeping, HOUSEKEEPING_WAIT_S, log)
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
     # the linter without adding a runtime cost.
     _ = identity
 
+    if lifecycle_held:
+        log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
+        return False
     return held
 
 

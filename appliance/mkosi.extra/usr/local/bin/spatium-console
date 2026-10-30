@@ -3493,12 +3493,42 @@ def reboot_pending() -> bool:
     Surfacing either warns the on-console operator that the box is about
     to go offline — and that pressing F5 lets them ack it gracefully
     rather than have the machine vanish mid-keystroke. Plain
-    ``exists()`` checks (no subprocess)."""
+    ``exists()`` checks (no subprocess).
+
+    #3008 — the fleet runner renames its trigger BEFORE its 5 s grace, and
+    the wrapper's marker only exists once the grace is over, so the grace
+    itself is the runner's own marker (``fleet_reboot_in_grace``); without
+    it F9 answered "No reboot is currently pending" and the node rebooted."""
     return (
         (_RELEASE_STATE_DIR / "reboot-pending-fleet").exists()
         or (_RELEASE_STATE_DIR / "reboot-pending").exists()
+        or fleet_reboot_in_grace()
         or power_action_in_progress() is not None
     )
+
+
+#: #3008 — spatiumddi-reboot-agent writes "<pid> <boot_id>" here from taking
+#: the fleet trigger until it exits (its grace, then the wrapper's run).
+FLEET_GRACE_MARKER = _RELEASE_STATE_DIR / "reboot-fleet-grace"
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+
+
+def fleet_reboot_in_grace() -> bool:
+    """#3008 — True while the fleet reboot runner holds its grace marker. A
+    marker whose process is gone (a runner killed outright) or that was
+    written in another boot counts for nothing. Two small reads, no
+    subprocess."""
+    try:
+        pid, boot = FLEET_GRACE_MARKER.read_text().split()[:2]
+    except (OSError, ValueError):
+        return False
+    try:
+        current = BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        current = ""
+    if current and boot != current:
+        return False
+    return pid.isdigit() and os.path.exists(f"/proc/{pid}")
 
 
 #: #2974 — spatium-power-action writes "<pid> <action>" here while it runs
@@ -4468,9 +4498,12 @@ def render_kpi_slot(state: "DashboardState") -> Panel:
         border = "yellow"
     elif (power := power_action_in_progress()) is not None:
         # #2974 — the handoff of the PostgreSQL primary runs first (up to a
-        # few minutes on the primary's node); F9 still cancels it.
+        # few minutes on the primary's node); F9 still cancels it. #3008 — a
+        # one-node install has no primary to hand off, so it is named only on
+        # a multi-node cluster.
         what = "REBOOT" if power == "reboot" else "POWER-OFF"
-        rows.append(Text(f"{what} under way — handing off DB primary · F9 cancel",
+        handoff = " — handing off DB primary" if len(state.nodes) > 1 else ""
+        rows.append(Text(f"{what} under way{handoff} · F9 cancel",
                          style="bold bright_yellow"))
         border = "yellow"
     elif reboot_pending():
@@ -5126,8 +5159,14 @@ def _start_power_action(console: Console, state: "DashboardState | None", action
     except (OSError, subprocess.TimeoutExpired) as exc:
         ok, why = False, str(exc)
     if ok:
-        msg = (f"{label}: handing off the database primary first "
-               "(up to a few minutes) · F9 cancels")
+        # #3008 — the handoff runs only on a multi-node control plane (and
+        # there only on the node holding the primary); a one-node install
+        # has no primary to hand off.
+        if state is not None and len(state.nodes) > 1:
+            msg = (f"{label}: the database primary is handed off first if this "
+                   "node holds it (up to a few minutes) · F9 cancels")
+        else:
+            msg = f"{label} · F9 cancels"
     else:
         msg = f"{label} could not be started: {why.splitlines()[-1] if why else 'no output'}"
     if state is not None:
@@ -5146,6 +5185,44 @@ def do_shutdown(console: Console, state: "DashboardState | None" = None) -> None
         _start_power_action(console, state, "poweroff", "Powering off")
 
 
+#: #3008 — "<boot_id>" of the boot a reboot was cancelled in. The supervisor
+#: reports it on its next heartbeat, so the control plane retires the Fleet
+#: request (``reboot_requested``) at once instead of at its 900 s give-up, and
+#: then empties it. Written under a fresh name and renamed into place: the api
+#: and the supervisor can create names in this directory and this runs as root.
+#: Published 0660 to the directory's shared gid: the directory is sticky, so the
+#: unprivileged supervisor can never unlink a root-owned file in it, only
+#: truncate one it may write — without that the marker outlived its ack and was
+#: reported on every heartbeat for the rest of the boot.
+REBOOT_CANCEL_MARKER = _RELEASE_STATE_DIR / "reboot-cancelled"
+
+
+def _record_reboot_cancel() -> None:
+    try:
+        boot = BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        return
+    if not boot:
+        return
+    tmp = REBOOT_CANCEL_MARKER.with_name(f".reboot-cancelled.{os.getpid()}")
+    try:
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            os.fchown(fh.fileno(), -1, _RELEASE_STATE_DIR.stat().st_gid)
+            os.fchmod(fh.fileno(), 0o660)
+            fh.write(boot + "\n")
+        os.replace(tmp, REBOOT_CANCEL_MARKER)
+    except OSError:
+        # Best effort: without it the control plane retires the request on
+        # its own give-up, as before.
+        try:
+            tmp.unlink()
+        except OSError:
+            # The temp file may never have been created; nothing to clean up.
+            pass
+
+
 def do_cancel_reboot(console: Console) -> None:
     """#556 — abort a queued reboot from the physical console.
 
@@ -5153,15 +5230,17 @@ def do_cancel_reboot(console: Console) -> None:
     window before ``systemctl reboot`` — 10 s for the web-UI path
     (``spatiumddi-reboot.service``, which sleeps then renames the
     trigger, so ``reboot-pending`` stays visible for the whole window)
-    and 5 s for the fleet path (``spatiumddi-reboot-agent.service``).
+    and 5 s for the fleet path (``spatiumddi-reboot-agent.service``, which
+    renames its trigger first and holds ``reboot-fleet-grace`` instead, #3008).
     Cancelling = ``systemctl stop`` that service mid-grace (kills the
     sleep before the reboot ExecStart) + remove the trigger so the edge-
     triggered ``.path`` unit has nothing to re-fire on.
 
-    #2974 — the web-UI unit and the console's F5 / F6 unit then hand the
-    PostgreSQL primary off before ``systemctl reboot`` (up to a few
-    minutes); stopping them during that makes ``spatium-power-action``
-    undo the handoff's cordon, and nothing reboots.
+    #2974 — the web-UI unit, the fleet unit (#3008) and the console's
+    F5 / F6 unit then hand the PostgreSQL primary off before
+    ``systemctl reboot`` (up to a few minutes); stopping them during that
+    makes ``spatium-power-action`` undo the handoff's cordon, and nothing
+    reboots.
 
     Best-effort: if ``systemctl reboot`` has already been issued there's
     nothing to stop and the box reboots anyway — same as before this key
@@ -5189,7 +5268,11 @@ def do_cancel_reboot(console: Console) -> None:
     # (edge-triggered on PathChanged, not level-triggered) have nothing to
     # re-fire on. The services rename the trigger to .done as part of their
     # run; unlink the live form if the service was stopped before it did.
-    for name in ("reboot-pending", "reboot-pending-fleet"):
+    # #3008 — and the fleet runner's grace marker, which the runner removes
+    # itself when stopped; this covers one that was killed outright. The
+    # supervisor writes a fleet trigger at most once per boot (#1446), so a
+    # cancelled Fleet reboot is not fired again before the next boot.
+    for name in ("reboot-pending", "reboot-pending-fleet", "reboot-fleet-grace"):
         try:
             (_RELEASE_STATE_DIR / name).unlink()
         except FileNotFoundError:
@@ -5200,6 +5283,7 @@ def do_cancel_reboot(console: Console) -> None:
             # Non-fatal — the service is already stopped, so the reboot is
             # cancelled regardless of whether the trigger file lingers.
             console.print(f"[dim](left {name}: {exc})[/dim]")
+    _record_reboot_cancel()
     console.print("[green]Reboot cancelled.[/green]\n")
     time.sleep(1.5)
 

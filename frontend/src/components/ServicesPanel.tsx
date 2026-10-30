@@ -28,6 +28,7 @@ import {
   serviceControlApi,
   type ServiceAction,
   type ServiceRow,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
@@ -67,11 +68,7 @@ function stateTone(state: string): string {
 }
 
 function errorDetail(e: unknown, fallback: string): string {
-  if (e && typeof e === "object" && "response" in e) {
-    const resp = (e as { response?: { data?: { detail?: unknown } } }).response;
-    if (resp?.data?.detail) return String(resp.data.detail);
-  }
-  return fallback;
+  return formatApiError(e, fallback);
 }
 
 export function ServicesPanel() {

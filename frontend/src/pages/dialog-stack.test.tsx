@@ -25,6 +25,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
 vi.mock("@/lib/api", () => ({
+  // The shortcuts overlay reads the caller's grants (#3103).
+  authApi: {
+    myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+  },
   ipamApi: { listSpaces: () => Promise.resolve([]) },
   networkApi: {},
   searchApi: {

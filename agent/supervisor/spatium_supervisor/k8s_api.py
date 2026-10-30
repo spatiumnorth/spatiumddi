@@ -2884,8 +2884,17 @@ def apply_control_plane_overrides(
             # with the instance count (both live under ``postgresql``; the merge
             # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
             # count is the Cluster's own, as the supervisor's patch left it.
+            # #3021 — and the instance pods reach the API server on their own
+            # node (every control-plane node is a k3s server): through the
+            # kubernetes Service, the loss of the node whose API server held
+            # the primary's connection restarted the primary.
             "postgresql": _deep_merge(
-                {"cnpg": {"instances": cnpg_instances if cnpg_instances else cp_size}},
+                {
+                    "cnpg": {
+                        "instances": cnpg_instances if cnpg_instances else cp_size,
+                        "nodeLocalApiServer": {"enabled": True},
+                    }
+                },
                 sized.get("postgresql", {}),
             ),
             # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only

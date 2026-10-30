@@ -56,6 +56,8 @@ from typing import Any
 
 import structlog
 
+from app.core.shutdown import get_or_shutdown
+
 logger = structlog.get_logger(__name__)
 
 
@@ -278,9 +280,9 @@ async def pop_command(
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             return None
-        try:
-            command = await asyncio.wait_for(queue.get(), timeout=remaining)
-        except TimeoutError:
+        # #3015 — also ended by api shutdown, answering "no command" at once.
+        command, _ended = await get_or_shutdown(queue, remaining)
+        if command is None:
             return None
         if command.cancelled:
             logger.info(

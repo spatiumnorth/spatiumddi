@@ -88,6 +88,13 @@
 #                      included (#2878), and the supervisor's namespace Role
 #                      grants what its re-clone of a stuck instance needs,
 #                      pods/log get + pods patch (#2132).
+#   cnpg-node-local  — dedicated umbrella render with the appliance's CNPG
+#                      values, a --require pass over it and over the HA render,
+#                      and negative controls: the appliance's instance pods take
+#                      the API server from their own node (``status.hostIP``,
+#                      port 6443) and the umbrella default sets neither
+#                      variable (#3021). A primary whose API connection landed
+#                      on a lost node was restarted by its own liveness probe.
 #   bind9 memory     — the appliance dns-bind9 container takes its memory from
 #                      ``dnsBind9.memory`` (sized from node RAM by the
 #                      supervisor, #2223) and an explicit memory in
@@ -362,6 +369,41 @@ neg1805() { # label manifest [chart-api-node-local.py flags...]
 neg1805 "the default render read as the appliance's" "$OUT/umbrella-defaults.yaml" --require
 neg1805 "an appliance render read as the default" "$OUT/umbrella-appliance-cp-3.yaml" \
     --require --absent
+
+# #3021 — the CNPG instance pods reach the API server on their own node, which
+# the appliance sets (firstboot's HelmChart and the supervisor's
+# HelmChartConfig, ``postgresql.cnpg.nodeLocalApiServer.enabled``). The
+# umbrella default (a BYO-Kubernetes install, whose nodes need not serve the
+# API on their own address) keeps the kubernetes Service, as before #3021: the
+# HA render above must set neither variable, the appliance's values both.
+# --require on each, so neither can pass by rendering no Cluster at all.
+UMBRELLA_APPLIANCE_CNPG=(
+    "${UMBRELLA_HA[@]}"
+    --set postgresql.cnpg.nodeLocalApiServer.enabled=true
+)
+render umbrella-appliance-cnpg "$UMBRELLA" "${UMBRELLA_APPLIANCE_CNPG[@]}"
+echo "── CNPG instances: the kubernetes Service by default, the node's own API server on the appliance (umbrella, #3021)"
+python3 "$ROOT/.github/scripts/chart-cnpg-node-local-api.py" --require --absent \
+    "$OUT/umbrella-ha.yaml" || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-cnpg-node-local-api.py" --require \
+    "$OUT/umbrella-appliance-cnpg.yaml" || failures=$((failures + 1))
+echo "── negative controls: the #3021 guard must refuse each wrong render"
+neg3021() { # label manifest [chart-cnpg-node-local-api.py flags...]
+    local label="$1" file="$2"; shift 2
+    local out rc
+    out="$(python3 "$ROOT/.github/scripts/chart-cnpg-node-local-api.py" "$@" "$file" 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#3021"; then
+        echo "   ok: $label refused by the #3021 guard"
+    else
+        echo "   FAIL: expected the #3021 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg3021 "the default render read as the appliance's" "$OUT/umbrella-ha.yaml" --require
+neg3021 "an appliance render read as the default" "$OUT/umbrella-appliance-cnpg.yaml" \
+    --require --absent
 # #2450 — the first promotion takes the appliance's frontend from one replica
 # to the node count, and the supervisor's overrides change nothing else in its
 # values. Its pods bind hostPorts 80 and 443 and the old pod retires first, so
@@ -560,7 +602,8 @@ else
     failures=$((failures + 1))
 fi
 POSTURE_ARGS=""
-coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
+coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}" \
+    "${UMBRELLA_APPLIANCE_CNPG[@]}"
 
 # #1553 — the dns-agent template must REFUSE encrypted-transport ports a
 # flavor cannot serve (DoQ on anything but Technitium; DoT/DoH on

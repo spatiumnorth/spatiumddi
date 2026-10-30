@@ -39,6 +39,7 @@ import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { SpoolChip } from "@/components/SpoolChip";
+import { syncCard } from "@/lib/dhcp-sync-label";
 import { haPillTitle } from "@/lib/dhcpHa";
 import {
   dhcpApi,
@@ -272,6 +273,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
   // Kea agents send heartbeats; their ``agent_last_seen`` is the right
   // liveness signal. Windows DHCP is polled, so ``last_sync_at`` is
   // meaningful. Fall back to whichever exists.
+  const sync = syncCard(server);
   const seenAt =
     server.driver === "kea"
       ? (server.agent_last_seen ?? server.last_sync_at)
@@ -294,7 +296,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
           </span>
         </InfoCard>
         <InfoCard label="Last heartbeat" value={fmtRelative(seenAt)} />
-        <InfoCard label="Last sync" value={fmtRelative(server.last_sync_at)} />
+        <InfoCard label={sync.label} value={fmtRelative(sync.at)} />
         <InfoCard
           label="Last seen IP"
           value={server.last_seen_ip ?? "—"}
