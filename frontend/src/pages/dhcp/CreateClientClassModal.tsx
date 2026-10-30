@@ -1,19 +1,45 @@
 import { useState } from "react";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPClientClass, type DHCPOption } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { optionsFromMap, optionsToMap } from "./dhcpOptionKeys";
 
-export function CreateClientClassModal({
-  klass,
-  groupId,
-  onClose,
-}: {
+type CreateClientClassModalProps = {
   klass?: DHCPClientClass;
   groupId: string;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the class fresh on open (#3091): the row the page holds comes
+// from a cached list, and the form is seeded once. A class has no read of its
+// own, so it is looked up in its group's list.
+export function CreateClientClassModal(props: CreateClientClassModalProps) {
+  const fresh = useFreshRow(props.klass, async () =>
+    (await dhcpApi.listClientClasses(props.groupId)).find(
+      (c) => c.id === props.klass!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Client Class"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ClientClassModalForm {...props} klass={fresh.row} />;
+}
+
+function ClientClassModalForm({
+  klass,
+  groupId,
+  onClose,
+}: CreateClientClassModalProps) {
   const qc = useQueryClient();
   const editing = !!klass;
   const [name, setName] = useState(klass?.name ?? "");
@@ -27,7 +53,7 @@ export function CreateClientClassModal({
   const [error, setError] = useState("");
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const optionsDict = optionsToMap(options);
       const data: Partial<DHCPClientClass> = {
         name,
@@ -36,9 +62,22 @@ export function CreateClientClassModal({
         address_family: family,
         options: optionsDict,
       };
-      return editing
-        ? dhcpApi.updateClientClass(groupId, klass!.id, data)
-        : dhcpApi.createClientClass(groupId, data);
+      if (!editing) return dhcpApi.createClientClass(groupId, data);
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the class as it is. The options baseline goes through the editor's own
+      // round trip, so an untouched map compares equal to what it shows.
+      const diff = changedFields(
+        {
+          name: klass!.name,
+          description: klass!.description ?? "",
+          match_expression: klass!.match_expression ?? "",
+          address_family: klass!.address_family,
+          options: optionsToMap(optionsFromMap(klass!.options)),
+        },
+        data,
+      );
+      if (Object.keys(diff).length === 0) return klass!;
+      return dhcpApi.updateClientClass(groupId, klass!.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-client-classes", groupId] });

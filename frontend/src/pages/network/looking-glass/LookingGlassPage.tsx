@@ -6,6 +6,7 @@ import { Binoculars, Plus, RefreshCw } from "lucide-react";
 import { lookingGlassApi, type BGPLGPeer } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 
@@ -95,6 +96,12 @@ export function LookingGlassPage() {
     );
   }
 
+  // #3104 — Add peer is a write on 'bgp_lg_peer'.
+  const writeGate = permissionGate(
+    usePermissions().can("write", "bgp_lg_peer"),
+    "Requires write permission on BGP peers",
+  );
+
   function openAddPeer() {
     setEditingPeer(null);
     setShowPeerModal(true);
@@ -159,6 +166,7 @@ export function LookingGlassPage() {
                   ? "No collector has registered yet — install a Looking Glass agent first."
                   : undefined
               }
+              {...writeGate}
             >
               Add Peer
             </HeaderButton>

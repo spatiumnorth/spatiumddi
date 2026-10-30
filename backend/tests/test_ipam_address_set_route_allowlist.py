@@ -244,9 +244,10 @@ async def test_delegate_is_refused_at_the_gate_on_every_unlisted_route(
         method = key.split(" ", 1)[0]
         r = await client.request(method, _concrete(path), headers=_h(token), json={})
         detail = r.json().get("detail") if r.status_code == 403 else None
-        # The coarse gate's own refusal names the types it accepts; a 403 from
-        # inside a handler means the gate let the delegate through.
-        if not (isinstance(detail, str) and "on one of" in detail):
+        # The gate's own refusal names the types the route needs ("on each of",
+        # #3058); a 403 from inside a handler means the gate let the delegate
+        # through.
+        if not (isinstance(detail, str) and "on each of" in detail):
             admitted.append((key, r.status_code))
     assert not admitted, f"routes that admit an address-set delegate: {admitted}"
 

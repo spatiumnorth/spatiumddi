@@ -87,6 +87,73 @@ async def _state(db: AsyncSession, token_id: uuid.UUID) -> APIToken:
 
 
 @pytest.mark.asyncio
+async def test_expired_token_cannot_be_reenabled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    owner, _ = await _user(db_session, superadmin=False)
+    _admin, headers = await _user(db_session, superadmin=True)
+    tok = await _token(db_session, owner, active=False)
+    tok.expires_at = datetime.now(UTC) - timedelta(days=1)
+    await db_session.commit()
+    r = await client.patch(
+        f"/api/v1/api-tokens/{tok.id}",
+        headers=headers,
+        json={"is_active": True, "stepup_password": _PW},
+    )
+    assert r.status_code == 422, r.text
+    assert "expired" in r.json()["detail"]
+    assert (await _state(db_session, tok.id)).is_active is False
+
+
+@pytest.mark.asyncio
+async def test_expired_token_can_still_be_renamed_and_revoked(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The #3120 refusal is for re-enabling only: a no-op is_active, a rename
+    and a revoke of an expired token go through as before."""
+    from datetime import UTC, datetime, timedelta
+
+    owner, _ = await _user(db_session, superadmin=False)
+    _admin, headers = await _user(db_session, superadmin=True)
+    tok = await _token(db_session, owner, active=True)
+    tok.expires_at = datetime.now(UTC) - timedelta(days=1)
+    await db_session.commit()
+    r = await client.patch(
+        f"/api/v1/api-tokens/{tok.id}",
+        headers=headers,
+        json={"is_active": True, "name": "renamed"},
+    )
+    assert r.status_code == 200, r.text
+    r = await client.patch(
+        f"/api/v1/api-tokens/{tok.id}", headers=headers, json={"is_active": False}
+    )
+    assert r.status_code == 200, r.text
+    assert (await _state(db_session, tok.id)).is_active is False
+
+
+@pytest.mark.asyncio
+async def test_owner_reenabling_an_expired_token_is_refused_as_non_superadmin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The superadmin gate still answers first, so the expiry check tells an
+    owner nothing the 403 would not."""
+    from datetime import UTC, datetime, timedelta
+
+    owner, headers = await _user(db_session, superadmin=False)
+    tok = await _token(db_session, owner, active=False)
+    tok.expires_at = datetime.now(UTC) - timedelta(days=1)
+    await db_session.commit()
+    r = await client.patch(
+        f"/api/v1/api-tokens/{tok.id}",
+        headers=headers,
+        json={"is_active": True, "stepup_password": _PW},
+    )
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
 async def test_owner_cannot_reenable_an_inactive_token(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
