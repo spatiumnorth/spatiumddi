@@ -31,7 +31,7 @@ from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
-from app.core.permissions import require_any_permission, require_permission
+from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.logs import DNSQueryLogEntry
@@ -329,7 +329,7 @@ async def top_modified_resources(db: DB) -> TopModifiedResourcesReport:
 @router.get(
     "/top-dns-clients",
     response_model=TopDNSClientsReport,
-    dependencies=[Depends(require_any_permission(("read", "server"), ("read", "dns_group")))],
+    dependencies=[Depends(require_permission("read", "server"))],
 )
 async def top_dns_clients(db: DB) -> TopDNSClientsReport:
     """Top 10 noisiest DNS query-log clients (24 h retention window)."""

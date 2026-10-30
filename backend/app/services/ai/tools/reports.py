@@ -158,7 +158,7 @@ class FindTopDNSClientsArgs(BaseModel):
 
 @register_tool(
     name="find_top_dns_clients",
-    permission=("read", ("server", "dns_group")),
+    permission=("read", "server"),
     module=_MODULE,
     description=(
         "Return the noisiest DNS clients by query volume over the DNS "
