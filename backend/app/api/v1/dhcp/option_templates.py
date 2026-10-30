@@ -22,6 +22,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_permission, require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import (
     DHCPOptionTemplate,
     DHCPScope,
@@ -204,6 +205,7 @@ async def update_template(
         )
         if "options" in payload:
             payload["options"] = options
+    before = snapshot(tpl, payload)
     for k, v in payload.items():
         setattr(tpl, k, v)
     write_audit(
@@ -213,7 +215,7 @@ async def update_template(
         resource_type="dhcp_option_template",
         resource_id=str(tpl.id),
         resource_display=tpl.name,
-        changed_fields=list(payload.keys()),
+        changed_fields=changed_keys(before, payload),
         new_value=payload,
     )
     await db.commit()

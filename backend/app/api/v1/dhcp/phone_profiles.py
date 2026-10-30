@@ -28,7 +28,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import (
     DHCPPhoneProfile,
     DHCPPhoneProfileScope,
@@ -328,6 +328,7 @@ async def update_profile(
     if "tags" in payload:
         payload["tags"] = dict(payload["tags"] or {})
 
+    before = snapshot(prof, payload)
     for k, v in payload.items():
         setattr(prof, k, v)
 
@@ -338,7 +339,7 @@ async def update_profile(
         resource_type="dhcp_phone_profile",
         resource_id=str(prof.id),
         resource_display=prof.name,
-        changed_fields=list(payload.keys()),
+        changed_fields=changed_keys(before, payload),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     collect_wake(dhcp_group_channel(prof.group_id))
