@@ -25,16 +25,26 @@ const createGroup = vi.fn((data: Record<string, unknown>) =>
 );
 const pending = () => new Promise<never>(() => {});
 let stored: Record<string, unknown> = {};
+// A role that may not read Settings, or a failed load: the dialogs must
+// fall back to the built-in values rather than wait on it.
+let settingsFails = false;
+let groups: Array<Record<string, unknown>> = [];
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
-    settingsApi: { ...actual.settingsApi, get: () => Promise.resolve(stored) },
+    settingsApi: {
+      ...actual.settingsApi,
+      get: () =>
+        settingsFails
+          ? Promise.reject(new Error("Request failed with status code 403"))
+          : Promise.resolve(stored),
+    },
     dnsApi: {
       ...actual.dnsApi,
       classifyZoneName: pending,
-      listGroups: () => Promise.resolve([]),
+      listGroups: () => Promise.resolve(groups),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (g: string, d: Record<string, unknown>) => createZone(g, d),
@@ -61,6 +71,8 @@ function control(label: string): HTMLInputElement | HTMLSelectElement {
 afterEach(() => {
   cleanup();
   stored = {};
+  settingsFails = false;
+  groups = [];
   createZone.mockClear();
   createGroup.mockClear();
 });
@@ -83,6 +95,42 @@ describe("Add Zone", () => {
     });
     expect(control("Type").value).toBe("primary");
     expect(control("Default TTL (seconds)").value).toBe("60");
+  });
+
+  it("keeps the built-in values when Settings cannot be read", async () => {
+    settingsFails = true;
+    wrap(<ZoneModal groupId="g1" views={[]} onClose={() => {}} />);
+    // Let the rejected query settle, then the form must still be usable.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(control("Type").value).toBe("primary");
+    expect(control("Default TTL (seconds)").value).toBe("3600");
+    fireEvent.change(control("Zone Name (FQDN)"), {
+      target: { value: "f.example.com" },
+    });
+    fireEvent.submit(control("Zone Name (FQDN)").form!);
+    await waitFor(() => expect(createZone).toHaveBeenCalledTimes(1));
+    expect(createZone.mock.calls[0][1]).toMatchObject({
+      zone_type: "primary",
+      ttl: 3600,
+    });
+  });
+
+  it("offers Primary / 3600 on a technitium_api group whatever Settings holds", async () => {
+    stored = { dns_default_zone_type: "forward", dns_default_ttl: 5400 };
+    groups = [{ id: "g1", name: "t", server_drivers: ["technitium_api"] }];
+    wrap(<ZoneModal groupId="g1" views={[]} onClose={() => {}} />);
+    // The SOA / TTL inputs are hidden there; what matters is what is sent.
+    await new Promise((r) => setTimeout(r, 0));
+    await waitFor(() => expect(control("Type").value).toBe("primary"));
+    fireEvent.change(control("Zone Name (FQDN)"), {
+      target: { value: "t.example.com" },
+    });
+    fireEvent.submit(control("Zone Name (FQDN)").form!);
+    await waitFor(() => expect(createZone).toHaveBeenCalledTimes(1));
+    expect(createZone.mock.calls[0][1]).toMatchObject({
+      zone_type: "primary",
+      ttl: 3600,
+    });
   });
 
   it("shows an existing zone's own values, not the defaults", async () => {

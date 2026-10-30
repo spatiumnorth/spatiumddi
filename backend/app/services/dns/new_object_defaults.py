@@ -13,12 +13,24 @@ exactly as before.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import ZONE_DEFAULT_TTL, DNSServerGroup, DNSServerOptions
+from app.models.dns import DNS_TTL_MAX, ZONE_DEFAULT_TTL, DNSServerGroup, DNSServerOptions
 from app.models.settings import PlatformSettings
+from app.services.dns import technitium_api_scope
+
+logger = structlog.get_logger(__name__)
+
+# The values each setting may hold.  The DNS router's create / options
+# validators read these too, so Settings cannot store a value the object it
+# seeds would refuse.  ``dnssec_validation`` is interpolated into
+# ``named.conf``: a value BIND rejects stops the whole group converging.
+ZONE_TYPES = frozenset({"primary", "secondary", "stub", "forward"})
+DNSSEC_VALIDATION_MODES = frozenset({"auto", "yes", "no"})
 
 
 @dataclass(frozen=True)
@@ -34,12 +46,40 @@ async def load_dns_defaults(db: AsyncSession) -> DNSNewObjectDefaults:
     ps = await db.get(PlatformSettings, 1)
     if ps is None:
         return DNSNewObjectDefaults()
+    builtin = DNSNewObjectDefaults()
+    ttl = ps.dns_default_ttl
+    zone_type = ps.dns_default_zone_type
+    dnssec = ps.dns_default_dnssec_validation
+    # Settings accepted any value while these were inert; a row stored then
+    # must not reach a zone or named.conf.  Each bad value falls back alone.
+    if not 0 <= ttl <= DNS_TTL_MAX:
+        logger.warning("dns_default_invalid", field="dns_default_ttl", value=ttl)
+        ttl = builtin.ttl
+    if zone_type not in ZONE_TYPES:
+        logger.warning("dns_default_invalid", field="dns_default_zone_type", value=zone_type)
+        zone_type = builtin.zone_type
+    if dnssec not in DNSSEC_VALIDATION_MODES:
+        logger.warning("dns_default_invalid", field="dns_default_dnssec_validation", value=dnssec)
+        dnssec = builtin.dnssec_validation
     return DNSNewObjectDefaults(
-        ttl=ps.dns_default_ttl,
-        zone_type=ps.dns_default_zone_type,
-        dnssec_validation=ps.dns_default_dnssec_validation,
+        ttl=ttl,
+        zone_type=zone_type,
+        dnssec_validation=dnssec,
         recursive=ps.dns_recursive_by_default,
     )
+
+
+async def default_zone_ttl(db: AsyncSession, group_id: uuid.UUID) -> int:
+    """The TTL a new zone in ``group_id`` takes when none was given.
+
+    Settings' default, except in an experimental ``technitium_api`` group:
+    that driver never writes a zone TTL and its scope gate refuses anything
+    but the stock value (#1784), so the default would turn a create that
+    omits the TTL into a 422 (or store a value nothing serves).
+    """
+    if await technitium_api_scope.group_is_technitium_api(db, group_id):
+        return ZONE_DEFAULT_TTL
+    return (await load_dns_defaults(db)).ttl
 
 
 async def add_group_with_defaults(db: AsyncSession, group: DNSServerGroup) -> None:

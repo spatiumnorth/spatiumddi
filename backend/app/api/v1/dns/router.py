@@ -167,7 +167,12 @@ from app.services.dns.named_conf_validation import (
     validate_view_name,
     validate_zone_forwarders,
 )
-from app.services.dns.new_object_defaults import load_dns_defaults
+from app.services.dns.new_object_defaults import (
+    DNSSEC_VALIDATION_MODES,
+    ZONE_TYPES,
+    default_zone_ttl,
+    load_dns_defaults,
+)
 from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
@@ -294,7 +299,7 @@ _DNS_RECORDS_READ = require_any_permission(
 # don't also need a schema edit to be accepted on create/update.
 VALID_DRIVERS = frozenset(_DNS_DRIVERS.keys())
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
-VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
+VALID_ZONE_TYPES = set(ZONE_TYPES)
 VALID_RECORD_TYPES = {
     "A",
     "AAAA",
@@ -363,7 +368,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
     "dnssec_rollover": frozenset({"bind9"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
-VALID_DNSSEC = {"auto", "yes", "no"}
+VALID_DNSSEC = set(DNSSEC_VALIDATION_MODES)
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only", "primary-only"}
 VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # Upstream forwarding transport (issue #50). No "https" member: BIND has no
@@ -3203,7 +3208,7 @@ async def _sync_single_server(
     zones_skipped_system: list[str] = []
     if import_new_zones and new_zones:
         # The server reports no zone TTL; the stored default fills the gap (#3087).
-        pull_defaults = await load_dns_defaults(db)
+        pull_ttl = await default_zone_ttl(db, group_id)
         for name in new_zones:
             if _is_system_zone_name(name):
                 zones_skipped_system.append(name)
@@ -3225,7 +3230,7 @@ async def _sync_single_server(
                 name=name if name.endswith(".") else name + ".",
                 zone_type="primary",
                 kind=kind,
-                ttl=pull_defaults.ttl,
+                ttl=pull_ttl,
                 refresh=ZONE_DEFAULT_REFRESH,
                 retry=ZONE_DEFAULT_RETRY,
                 expire=ZONE_DEFAULT_EXPIRE,
@@ -5664,7 +5669,7 @@ async def create_zone(
     # before the gates so they judge the value the zone will actually carry.
     zone_fields = body.model_dump()
     if zone_fields["ttl"] is None:
-        zone_fields["ttl"] = (await load_dns_defaults(db)).ttl
+        zone_fields["ttl"] = await default_zone_ttl(db, group_id)
     _refuse_superadmin_zone_fields(current_user, zone_fields, None)
     await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
     await _assert_forward_zone_serviceable(
@@ -7920,7 +7925,7 @@ async def create_zone_from_template(
         name=body.zone_name,
         zone_type=body.zone_type,
         kind=body.kind,
-        ttl=(await load_dns_defaults(db)).ttl,  # #3087
+        ttl=await default_zone_ttl(db, group_id),  # #3087
     )
     db.add(zone)
     await guard.check(db, f"create zone {body.zone_name!r}")  # #2275

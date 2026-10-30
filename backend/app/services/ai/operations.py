@@ -50,7 +50,7 @@ from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
-from app.services.dns.new_object_defaults import load_dns_defaults
+from app.services.dns.new_object_defaults import default_zone_ttl
 from app.services.ipam.address_create_rules import holds_address, take_address_row
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
@@ -2667,11 +2667,12 @@ class CreateDNSZoneArgs(BaseModel):
     )
 
 
-async def _effective_zone_ttl(db: AsyncSession, args: CreateDNSZoneArgs) -> int:
-    """The TTL the zone will carry: the caller's, else Settings' default (#3087)."""
+async def _effective_zone_ttl(db: AsyncSession, args: CreateDNSZoneArgs, group_id: UUID) -> int:
+    """The TTL the zone will carry: the caller's, else the group's default
+    (Settings' Default Zone TTL; the stock value on ``technitium_api``) (#3087)."""
     if args.ttl is not None:
         return args.ttl
-    return (await load_dns_defaults(db)).ttl
+    return await default_zone_ttl(db, group_id)
 
 
 def _technitium_api_zone_arg_conflict(
@@ -2820,7 +2821,9 @@ async def _preview_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
-    conflict = _technitium_api_zone_arg_conflict(args, drivers, await _effective_zone_ttl(db, args))
+    conflict = _technitium_api_zone_arg_conflict(
+        args, drivers, await _effective_zone_ttl(db, args, grp.id)
+    )
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
     if args.dnssec_enabled:
@@ -2891,7 +2894,9 @@ async def _apply_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         raise ValueError(conflict)
-    conflict = _technitium_api_zone_arg_conflict(args, drivers, await _effective_zone_ttl(db, args))
+    conflict = _technitium_api_zone_arg_conflict(
+        args, drivers, await _effective_zone_ttl(db, args, grp.id)
+    )
     if conflict is not None:
         raise ValueError(conflict)
     # #1762 — the single-signer rule the REST create applies, re-checked at
@@ -2923,7 +2928,7 @@ async def _apply_create_dns_zone(
         name=name,
         zone_type=args.zone_type,
         kind=kind,
-        ttl=await _effective_zone_ttl(db, args),
+        ttl=await _effective_zone_ttl(db, args, grp.id),
         primary_ns=args.primary_ns,
         admin_email=args.admin_email,
         dnssec_enabled=args.dnssec_enabled,

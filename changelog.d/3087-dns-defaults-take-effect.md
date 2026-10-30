@@ -15,3 +15,8 @@
   needs forwarders or masters a bare create never sends. A default that
   was changed while it did nothing now takes effect on the next new zone
   or group; stock values are unchanged.
+  Settings now refuses a value the new zone or group could not use (a TTL
+  outside 0 to 2147483647, an unknown zone type or DNSSEC mode), and a bad
+  value saved earlier falls back to the built-in default rather than
+  reaching `named.conf`. A zone created on an experimental `technitium_api`
+  group keeps a TTL of 3600, the only one that driver accepts.
