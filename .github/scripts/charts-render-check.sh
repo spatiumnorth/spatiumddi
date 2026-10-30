@@ -68,6 +68,14 @@
 #                      owner of the field the autoscaler writes, and every
 #                      ``helm upgrade`` failed on it once the autoscaler had
 #                      scaled.
+#   footprint        — dedicated pass over the default render, an opt-in
+#                      render and negative controls: the api autoscaler aims at
+#                      least at one api pod's measured use and scales on CPU
+#                      alone unless memory is asked for, and the api's request
+#                      and limit hold what they were
+#                      measured to use (#3110). At 80 % of the old 256Mi
+#                      request one idle api process sat above the memory
+#                      target, and every default install ran 10 replicas.
 #   template-stable  — dedicated pass over the appliance renders at one replica
 #                      and at three: the frontend's pod template must be the
 #                      same in both (#2450). The first promotion only raises
@@ -435,6 +443,51 @@ api_replicas "$OUT/umbrella-defaults.yaml" "$OUT/neg-hpa-replicas-set.yaml" set
 api_replicas "$OUT/umbrella-appliance-cp-3.yaml" "$OUT/neg-hpa-replicas-dropped.yaml" drop
 neg3111 "an autoscaled api rendering replicas: 2" "$OUT/neg-hpa-replicas-set.yaml" --require
 neg3111 "an appliance api without its count" "$OUT/neg-hpa-replicas-dropped.yaml" --replicas api=3
+
+# #3110 — the chart's default sizing holds what the api was measured
+# to use (docs/deployment/SIZING.md, Kubernetes): the api autoscaler
+# aims at least at one api pod's use at rest and under light load, and by
+# default scales on CPU alone (memory is opt-in); the api's memory request
+# holds its working set; the api's limit leaves the sizing guide's headroom.
+# On the default render only: the appliance sizes the limits from
+# the node's RAM. --require so the pass cannot succeed on a render with no api.
+echo "── api sizing holds its measured use (umbrella, #3110)"
+python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require \
+    --expect-metrics cpu "$OUT/umbrella-defaults.yaml" || failures=$((failures + 1))
+# The opt-in memory metric renders, and at the 512Mi request 80 % aims above
+# that use.
+helm template hpa-memory "$UMBRELLA" --kube-version "$K8S_VERSION" \
+    --set api.autoscaling.targetMemoryUtilizationPercentage=80 \
+    | python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require \
+        --expect-metrics cpu,memory - || failures=$((failures + 1))
+# Negative controls: each value as the chart shipped it before #3110 must be
+# refused by its own rule, or the passes above could be reading renders they
+# cannot parse. Decided on the guard's message, not its exit status alone.
+echo "── negative controls: the #3110 guard must refuse the pre-#3110 sizing"
+neg3110() { # label expected-message [helm --set args...]
+    local label="$1" expect="$2"; shift 2
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "$@" \
+        | python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require - 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$expect"; then
+        echo "   ok: $label refused by the #3110 guard"
+    else
+        echo "   FAIL: expected the #3110 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg3110 "a memory target at 80 % of a 256Mi request" \
+    "aims memory at 80 % of 256Mi = 205 MiB" \
+    --set api.resources.requests.memory=256Mi \
+    --set api.autoscaling.targetMemoryUtilizationPercentage=80
+neg3110 "a 256Mi api memory request" "the api's memory request is 256Mi" \
+    --set api.resources.requests.memory=256Mi
+neg3110 "a CPU target at 70 % of 100m" "aims CPU at 70 % of 100m = 70m" \
+    --set api.resources.requests.cpu=100m
+neg3110 "a 512Mi api memory limit" "the api's memory limit is 512Mi" \
+    --set api.resources.limits.memory=512Mi
 
 # #3021 — the CNPG instance pods reach the API server on their own node, which
 # the appliance sets (firstboot's HelmChart and the supervisor's

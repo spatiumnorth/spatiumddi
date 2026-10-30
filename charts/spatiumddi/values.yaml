@@ -132,11 +132,32 @@ api:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
+    # #3110 — the autoscaler scales on CPU, which falls as replicas share the
+    # load: 70 % of the 200m request below is 140m per pod, and each of two api
+    # pods used about 100m under light load (amd64), so light use stays at
+    # minReplicas and a heavier load scales out.
     targetCPUUtilizationPercentage: 70
-    targetMemoryUtilizationPercentage: 80
+    # #3110 — memory is opt-in: empty (the default) renders no memory metric.
+    # One api process's memory is its own baseline, about 305 MiB from the
+    # moment it starts, so adding replicas does not lower the average: once a
+    # memory target is passed the autoscaler goes to maxReplicas and stays
+    # there. At 80 % of the old 256Mi request that happened at rest, and every
+    # default install with a metrics-server ran 10 idle replicas. If you set
+    # one, aim it above what a busy api pod holds (80 % of the 512Mi request
+    # is about 410 MiB) and expect it to scale up only.
+    targetMemoryUtilizationPercentage:
+  # #3110 — sized from the measured footprint (docs/deployment/SIZING.md,
+  # Kubernetes). One api pod held about 305 MiB at rest and at most 373 MiB
+  # under light load, so the memory request holds it: a pod above its memory
+  # request is the kubelet's first eviction candidate (#1828). One process
+  # taking all of the light load peaked at 469 MiB, and on the appliance 0.4
+  # to 0.85 GiB under the API suite: hence the 1Gi limit, the appliance's own
+  # floor. The appliance sizes these limits from the node's RAM and CPUs
+  # (firstboot, k8s_api.control_plane_resources) and keeps these requests;
+  # the slot-image mirror takes all four (#1174).
   resources:
-    requests: { cpu: 100m, memory: 256Mi }
-    limits:   { cpu: 1000m, memory: 512Mi }
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
   # #1051 — probe budgets sized for a BUSY event loop, not an idle one.
   #
   # The api is one uvicorn worker, so the kubelet's probes are answered by

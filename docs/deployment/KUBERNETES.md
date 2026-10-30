@@ -321,11 +321,17 @@ api:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
-    targetCPUUtilizationPercentage: 70
-    targetMemoryUtilizationPercentage: 80
+    targetCPUUtilizationPercentage: 70   # of the 200m request
+    targetMemoryUtilizationPercentage:   # unset: memory is opt-in
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
 ```
 
-The HPA scales on both CPU and memory utilisation.
+The HPA scales on CPU. Memory is opt-in (#3110): an api process holds about
+300 MiB from the moment it starts, and that does not fall as replicas are
+added, so a memory target below it holds the HPA at `maxReplicas` for good. If
+you set one, use 73 or more with the 512Mi request.
 
 While the HPA is on, the chart renders no `replicas` on the api Deployment, so
 the HPA alone sets the count and `helm upgrade` keeps it (#3111); `api.replicas`
@@ -665,6 +671,10 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --namespace spatiumddi --reuse-values
 ```
 
+`--reuse-values` keeps the defaults of the chart the release was installed
+from, so upgrade once with `--reset-then-reuse-values` to take a new chart's
+defaults, such as the #3110 api sizing
+([chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#taking-a-new-charts-defaults-3110)).
 At the first upgrade to a chart with #3111 the api's replica count changes
 hands; the [chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#the-apis-replica-count-under-the-autoscaler-3111)
 says what each kind of release sees.

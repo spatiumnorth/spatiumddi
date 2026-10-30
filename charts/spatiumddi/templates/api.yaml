@@ -379,10 +379,15 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+    {{- /* #3110: memory only when asked for. A process's memory does not fall as
+           replicas are added, so a passed memory target holds the autoscaler at
+           maxReplicas (see api.autoscaling in values.yaml). */}}
+    {{- with .Values.api.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: {{ .Values.api.autoscaling.targetMemoryUtilizationPercentage }}
+          averageUtilization: {{ . }}
+    {{- end }}
 {{- end }}

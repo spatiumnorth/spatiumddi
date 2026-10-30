@@ -283,8 +283,11 @@ them:
 | `api.service.type` | `ClusterIP` |  |
 | `api.service.port` | `8000` |  |
 | `api.service.trafficDistribution` | `""` | #1805 — `""` renders no field (kube-proxy spreads every caller over every api pod). `PreferSameNode` keeps each node's in-cluster callers (the supervisor, the DNS/DHCP agents, the frontend's `/api` proxy) on the api pod on their own node while it is ready, so a lost node's api pod cannot hold their requests. The appliance sets it (firstboot's `spatium-control` values and the supervisor's HelmChartConfig), where every control-plane node runs one api pod. Elsewhere it pins a node's callers to the one api pod on that node, which can leave the others idle and the HPA reacting late. Rendered on Kubernetes 1.34+ |
-| `api.autoscaling.enabled` | `true` | HPA on CPU + memory. It needs a metrics-server; without one it holds the api at `minReplicas` |
+| `api.autoscaling.enabled` | `true` | HPA on CPU (memory is opt-in). It needs a metrics-server; without one it holds the api at `minReplicas` |
 | `api.autoscaling.minReplicas` / `maxReplicas` | `2` / `10` |  |
+| `api.autoscaling.targetCPUUtilizationPercentage` | `70` | #3110 — of the api's CPU request (200m), so 140m a pod. Each of two api pods used about 100m under light load |
+| `api.autoscaling.targetMemoryUtilizationPercentage` | unset | #3110 — memory is opt-in. An api process holds about 300 MiB from the moment it starts, and that does not fall as replicas are added, so a target below it holds the HPA at `maxReplicas`. If you set one, use 73 or more with the default 512Mi request |
+| `api.resources` | requests `200m` / `512Mi`, limits `1000m` / `1Gi` | #3110 — the api's measured use, see `values.yaml`. The appliance sets its own limits from the node's RAM |
 | `api.probes.liveness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `10` / `30` / `30` / `4` | #1051 — `/health/live` budgets, sized for a busy single-worker loop: four 30 s misses restart a process that has said nothing for two minutes |
 | `api.probes.readiness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `5` / `10` / `15` / `3` | #1051 — `/health/ready` budgets; the timeout exceeds the handler's own bounded worst case (4 s db + 4 s schema + 2 s redis) so the kubelet sees the 503 naming the failing check instead of a bare deadline |
 | `api.serviceControl.enabled` | `false` | Sets `SERVICE_CONTROL_ENABLED` on the api — what the Services screen's capability probe reports |
@@ -350,6 +353,20 @@ upgrade creates a new one, and the api, worker and beat pods wait for the
 schema in their `wait-for-migrate` init containers, so Alembic applies
 before the new pods start serving. Under `helm template` (GitOps), see
 [GitOps with `helm template`](#gitops-with-helm-template-argo-cd).
+
+### Taking a new chart's defaults (#3110)
+
+`--reuse-values` keeps every value of the release it upgrades, including
+the defaults of the chart it was installed from. To take this chart's api
+sizing and autoscaler defaults (#3110), upgrade once with
+`--reset-then-reuse-values` (Helm 3.14 or later). It starts from this
+chart's defaults and keeps the values you set:
+
+```bash
+helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+  --version <NEW_CHART_VERSION> \
+  --namespace spatiumddi --reset-then-reuse-values
+```
 
 ### The api's replica count under the autoscaler (#3111)
 
