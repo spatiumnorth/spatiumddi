@@ -44,7 +44,7 @@ from typing import Any
 
 import httpx
 
-from app.services.backup.targets.base import describe_exc
+from app.core.exc_text import describe_exc
 from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES as _DNSSEC_RECORDS,
 )

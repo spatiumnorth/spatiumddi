@@ -38,7 +38,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import structlog
 
-from app.services.backup.targets.base import describe_exc
+from app.core.exc_text import describe_exc
 
 logger = structlog.get_logger(__name__)
 

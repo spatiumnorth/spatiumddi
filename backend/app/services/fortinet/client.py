@@ -24,6 +24,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
+
 logger = structlog.get_logger(__name__)
 
 
@@ -255,7 +257,7 @@ class FortinetClient:
         try:
             resp = await self._client.get(path, params={"vdom": self._vdom})
         except httpx.HTTPError as exc:
-            raise FortinetClientError(f"{path}: {exc}") from exc
+            raise FortinetClientError(f"{path}: {describe_exc(exc)}") from exc
         if resp.status_code == 401:
             raise FortinetClientError(f"{path}: HTTP 401 — API token invalid", status_code=401)
         if resp.status_code == 403:

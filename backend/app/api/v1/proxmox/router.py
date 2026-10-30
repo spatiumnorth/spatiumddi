@@ -21,6 +21,7 @@ from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
@@ -28,7 +29,6 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.proxmox import ProxmoxNode
-from app.services.backup.targets.base import describe_exc
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -303,7 +303,7 @@ async def _probe(
             )
     except httpx.HTTPStatusError as exc:
         return TestConnectionResponse(ok=False, message=f"HTTP {exc.response.status_code} from PVE")
-    except httpx.ConnectError as exc:
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
         return TestConnectionResponse(ok=False, message=f"Could not reach PVE: {describe_exc(exc)}")
     except ssl.SSLError as exc:
         return TestConnectionResponse(
@@ -314,7 +314,7 @@ async def _probe(
             ),
         )
     except Exception as exc:  # noqa: BLE001
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
 
 
 async def _validate_bindings(

@@ -30,6 +30,7 @@ from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
@@ -38,7 +39,6 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
-from app.services.backup.targets.base import describe_exc
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -455,7 +455,7 @@ async def _probe(
                 controller_version=controller_version,
                 site_count=site_count,
             )
-    except httpx.ConnectError as exc:
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
         return TestConnectionResponse(
             ok=False, message=f"Could not reach controller: {describe_exc(exc)}"
         )
@@ -468,9 +468,9 @@ async def _probe(
             ),
         )
     except httpx.HTTPError as exc:
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
     except Exception as exc:  # noqa: BLE001
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
 
 
 # ── Endpoints ────────────────────────────────────────────────────────
