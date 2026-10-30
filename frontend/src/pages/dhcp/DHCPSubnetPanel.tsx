@@ -8,7 +8,12 @@ import {
   Server,
   Trash2,
 } from "lucide-react";
-import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
+import {
+  dhcpApi,
+  formatApiError,
+  type DHCPPool,
+  type DHCPScope,
+} from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
@@ -87,8 +92,14 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
           title="Delete Pool"
           description={`Delete pool ${pool.start_ip} – ${pool.end_ip}?`}
           onConfirm={() => mut.mutate()}
-          onClose={() => setDel(false)}
+          onClose={() => {
+            mut.reset();
+            setDel(false);
+          }}
           isPending={mut.isPending}
+          error={
+            mut.isError ? formatApiError(mut.error, "Delete failed") : null
+          }
         />
       )}
     </tr>
@@ -271,6 +282,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             delMut.reset();
           }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
           notice={deleteNotice}
         />
       )}

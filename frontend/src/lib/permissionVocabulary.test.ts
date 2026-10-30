@@ -30,6 +30,10 @@ const BUILTIN_ROLE_TYPES = [
   "use_network_tools",
 ];
 
+// Every type the server checks — routes, copilot tools, search — is held to
+// this list by backend/tests/test_grant_vocabulary_covers_routes_3119.py,
+// which reads the types from the running app rather than scanning source
+// (#3119).
 describe("GRANT_RESOURCE_TYPES", () => {
   const offered = new Set<string>(GRANT_RESOURCE_TYPES);
 

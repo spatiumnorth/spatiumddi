@@ -21,7 +21,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | --------------- | -------- | ---------------------------------------------------------------------- |
 | `action`        | yes      | What the user may do. See **Actions** below.                           |
 | `resource_type` | yes      | Which resource kind. See **Resource types** below.                     |
-| `resource_id`   | no       | Scope to a specific UUID. Omit / `null` for "any instance of the type". |
+| `resource_id`   | no       | Scope to a specific UUID. Omit / `null` for "any instance of the type". A role grant scoped this way opens that one item only for `subnet`, `ip_space`, `ip_block`, `customer`, `site`, `provider` and `address_set` (rule 4); a `dns_zone`-scoped grant only lets a subnet-scoped holder name that zone. API tokens bind to a `subnet` or `dns_zone` |
 
 ### Actions
 
@@ -41,7 +41,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `ip_space`        | IPAM spaces                                           |
 | `ip_block`        | Top-level CIDR blocks                                 |
 | `subnet`          | Subnets under a block                                 |
-| `ip_address`      | Individual IPs, aliases, bulk address ops             |
+| `ip_address`      | Reading individual IPs outside a subnet's own routes: by id, search, reports. Writing an IP takes `write` on its `subnet` (or an `address_set`) |
 | `vlan`            | VLANs and routers                                     |
 | `vrf`             | VRFs (Virtual Routing and Forwarding) — `manage_vrfs` |
 | `manage_asns`     | Autonomous Systems + RPKI ROAs + BGP peering / communities |
@@ -78,6 +78,18 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `looking_glass_collector` | BGP Looking Glass receive-only GoBGP collectors — register / CRUD + learned-route reads (#566) |
 | `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
+| `proxmox_node` | Proxmox VE integration targets (`/proxmox`) |
+| `unifi_controller` | UniFi Network controllers (`/unifi`) |
+| `kubernetes_cluster` | Kubernetes cluster integrations (`/kubernetes`) |
+| `docker_host` | Docker host integrations (`/docker`) |
+| `tailscale_tenant` | Tailscale tenant integrations (`/tailscale`) |
+| `cloud_endpoint` | Cloud connector endpoints — AWS / Azure / GCP (`/cloud`) |
+| `meraki_org` | Cisco Meraki organisations (`/meraki`) |
+| `panos_firewall` | Palo Alto PAN-OS / Panorama firewalls (`/paloalto`) |
+| `opnsense_router` | OPNsense routers (`/opnsense`) |
+| `fortinet_firewall` | Fortinet FortiGate firewalls (`/fortinet`) |
+| `netbird_instance` | NetBird management instances (`/netbird`) |
+| `firewall_feed` | Firewall block-list feeds (`/firewall-feeds`) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
 | `manage_block_sync` | Active block sync / write-back enforcement (#601) — create/lift SpatiumDDI-owned IP/MAC blocks, arm per-target OPNsense/UniFi enforcement + write-scoped creds, reveal + reconcile. High blast-radius (pushes a real firewall/gateway block that can lock devices out); granted to `Network Editor`, not `Viewer`. Every push is audited and eligible for two-person approval (`admin:manage_block_sync`). |
@@ -163,6 +175,21 @@ on inactive.
    resize / split / merge / next-IP / bulk / DNS-sync, and editing or
    deleting an existing address stay refused unless a type-level grant
    covers them.
+   **IPAM spaces and blocks, customers, sites and providers (#3039).** A
+   `read` / `write` grant scoped to one IP space, one IP block, one customer,
+   one site or one provider reaches that item's detail (`GET`), its edit
+   (`PUT`) and the collection, which is narrowed to the granted items, and
+   nothing else. The grant names the item itself: it does **not** inherit down
+   a tree (a block grant does not reach child blocks or the subnets inside it,
+   a space grant does not reach its blocks), and delete, create and every
+   other route of the type stay refused unless a type-level grant covers them
+   (a customer's `/summary` too). Through the scoped grant the holder may not
+   point the item at another resource (DNS / DHCP server groups, zones, DDNS
+   domain, VRF, ASN, customer, site, parent block / site, a provider's default
+   ASN), nor change a setting the subnets underneath inherit from a space or
+   block (DDNS on / policy / TTL / inherit, the DNS and DHCP inherit switches,
+   split-horizon, do-not-probe), since those subnets are outside the grant;
+   re-sending the current value passes.
    **IPAM address sets (#103).** A `write` / `admin` grant on an address set
    (the Address Set Editor role, scoped to one set) reaches an allow-list of
    address routes and nothing else in IPAM: create, next-IP, bulk-allocate
@@ -211,6 +238,57 @@ on inactive.
    grant is never refused by this rule. The check and the change it guards run
    under one advisory lock, so two concurrent changes cannot each remove one of
    the last two superadmins.
+
+### IPAM: each route needs its own type (#3058)
+
+Every route under `/api/v1/ipam` needs the HTTP method's action on the type it
+serves, listed per route in `_IPAM_ROUTE_TYPES`
+(`backend/app/api/v1/ipam/router.py`). Until #3058 the IPAM gate admitted a
+type-level grant on *any* IPAM type, so a role holding only `read` on
+`nat_mapping` or `custom_field` read every space, block, subnet and address.
+A route missing from the map admits no type-level grant at all, and
+`backend/tests/test_ipam_route_types.py` fails until it is classified.
+
+| Routes | Needs |
+|---|---|
+| `/spaces…` | `ip_space` |
+| `/blocks…`, the aggregation snoozes, `/plans…` | `ip_block` |
+| `/subnets…`, including the subnet's own addresses, aliases, network context and reconciliation | `subnet` |
+| `/addresses/{id}` reads, address search, stale-IP / hygiene / vendor reports | `ip_address` |
+| Address writes: create, next-IP, bulk-allocate, edit, delete, aliases, bulk edit / delete, profile, wake, stale-IP deprecate, address import | `subnet` (the action of the method; the handler also checks the row's subnet, or an address set covering the address, #103) |
+| `/nat-mappings…` | `nat_mapping` |
+| `/templates…` | `manage_ipam_templates`; applying one (`/apply`, `/reapply-all`) also needs `write` on the block or subnet it is stamped onto, and on `subnet` when it carves child subnets |
+
+A route whose answer carries several types needs each of them:
+
+| Route | Needs |
+|---|---|
+| Block free space, available subnets, aggregation suggestions, plan allocation, space find-free | `ip_block` and `subnet` (free space is the subnets' occupancy inverted) |
+| Subnet / block / space DNS-sync summary and preview | the container's type and `ip_address` |
+| Whole-space import (preview and commit) | `ip_block` and `subnet` (the commit already checked both) |
+| `GET /export`, `GET /export.pdf` | `ip_space`, `ip_block`, `subnet` and `ip_address` |
+
+`effective-*` routes need the type of the item they are asked about: the
+values a subnet inherits from its block and space are part of how the subnet
+behaves. A `read` on `subnet` reaches that subnet's addresses through its own
+routes, as a grant scoped to one subnet does (#2438); the address routes that
+are not under a subnet (by id, search, reports) need `ip_address`.
+
+An API token bound to subnets (#374) is checked against its owner's grants
+this way, and is narrowed to its subnets (and their blocks and spaces) as
+before: its `subnet` grant lets it through on `ip_space`, `ip_block` and
+`ip_address` too, and the route then answers for its subnets only.
+
+The Copilot / MCP IPAM tools follow the same rule: `list_ip_spaces` needs
+`ip_space`, `list_ip_blocks` `ip_block`, the subnet tools `subnet` and the
+address tools `ip_address`. `count_ipam_resources` and `find_by_tag` answer
+for the types the caller can read and leave the rest out.
+
+**Upgrading.** A custom role that relied on one IPAM grant to read the rest of
+IPAM loses those reads. Add `read` on each type the role should see —
+typically `ip_space`, `ip_block`, `subnet` and `ip_address` together. The
+built-in roles keep what they had (`Auditor` and `Compliance Editor` gain
+`read` on `ip_space` and `ip_block`, which their subnet read used to open).
 
 ### Bulk deletes need `delete`
 
@@ -293,8 +371,8 @@ starts at the server groups). The built-in roles keep what they had
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `certificate_store`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists; manage the TLS certificate store DoT / DoH / DoQ serve from (#3067), short of making a certificate the Web UI certificate. Infrastructure stays superadmin-only (see below), including the server-group options that turn a DoT / DoH / DoQ listener on |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
 | `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`; `read` on `alert` |
-| `Auditor`        | `read` on `conformity`, `audit_log`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
-| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
+| `Auditor`        | `read` on `conformity`, `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
+| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103); `read` on `alert` — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62); `read` on `alert` — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
 | `Requester`        | `write` + `read` on `provisioning_request` (#696); `read` on `alert` — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. |

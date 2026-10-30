@@ -828,7 +828,12 @@ def action_for_request(request: Request) -> str:
     return _METHOD_TO_ACTION.get(method, "write")
 
 
-def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[User]]:
+def require_resource_permission(
+    resource_type: str,
+    instance_routes: tuple[str, str, frozenset[str], frozenset[str]] | None = None,
+    instance_param: str | None = None,
+    prefix: str | None = None,
+) -> Callable[..., Awaitable[User]]:
     """Router-level dependency that enforces permissions by HTTP method.
 
     The mapping is: GET/HEAD/OPTIONS → ``read``, POST/PUT/PATCH → ``write``,
@@ -839,6 +844,12 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
 
     Per-row checks should still be performed inside handlers that know the
     resource UUID, using :func:`user_has_permission`.
+
+    ``instance_routes`` / ``instance_param`` / ``prefix`` (#3039) additionally
+    admit a grant scoped to ONE ``resource_type`` instance on an allow-list of
+    routes naming it in their path, and on the collection route, whose handler
+    must narrow its rows (see :func:`_instance_scoped_admit`). ``prefix`` is the
+    router's mount point (``/customers``) the route templates are relative to.
     """
 
     async def _dep(
@@ -848,6 +859,18 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
     ) -> User:
         action = action_for_request(request)
         if user_has_permission(current_user, action, resource_type):
+            return current_user
+        if (
+            instance_routes
+            and instance_param
+            and _instance_scoped_admit(
+                request,
+                current_user,
+                action,
+                {instance_param: instance_routes},
+                prefix or "/ipam",
+            )
+        ):
             return current_user
         await _record_denial(db, current_user, request, action, resource_type, None)
         raise HTTPException(
@@ -923,7 +946,7 @@ def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
     return False
 
 
-def request_route_key(request: Request) -> str:
+def request_route_key(request: Request, prefix: str = "/ipam") -> str:
     """``"METHOD /path-template"`` of the matched route, relative to the IPAM
     router's ``/ipam`` prefix (``"PUT /addresses/{address_id}"``).
 
@@ -933,8 +956,14 @@ def request_route_key(request: Request) -> str:
     which entry matches.
     """
     route = request.scope.get("route")
-    template = getattr(route, "path", "") or ""
-    return f"{request.method.upper()} {template.split('/ipam', 1)[-1]}"
+    return route_key(request.method, getattr(route, "path", "") or "", prefix)
+
+
+def route_key(method: str, path: str, prefix: str = "/ipam") -> str:
+    """``"METHOD /path-template"`` for a route path, relative to ``prefix``
+    (path converters such as ``{x:path}`` folded to ``{x}``)."""
+    template = re.sub(r"\{(\w+):\w+\}", r"{\1}", path)
+    return f"{method.upper()} {template.split(prefix, 1)[-1] or '/'}"
 
 
 def mount_route_key(method: str, path: str, prefix: str) -> str:
@@ -960,13 +989,15 @@ def _instance_scoped_admit(
     user: User,
     action: str,
     instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]],
+    prefix: str = "/ipam",
 ) -> bool:
     """True when ``user`` holds ``action`` on the ONE resource the route's path
     names, via a grant scoped to that resource (or an unscoped one).
 
     ``instance_routes`` maps a path parameter (``subnet_id``) to
     ``(resource_type, list_route, read_routes, write_routes)``. Every route is
-    a ``"METHOD /path"`` template relative to the router's ``/ipam`` prefix,
+    a ``"METHOD /path"`` template relative to the router's ``prefix`` (``/ipam``
+    by default; the collection route is ``"GET /"`` for a router mounted at it),
     and the lists are allow-lists: a route added later is NOT reachable by a
     scoped grant until someone decides it should be (#2438).
 
@@ -976,7 +1007,7 @@ def _instance_scoped_admit(
       caller holds any read grant on the type; its handler must narrow the
       rows to the granted ones.
     """
-    key = request_route_key(request)
+    key = request_route_key(request, prefix)
     for pname, (rtype, list_route, read_routes, write_routes) in instance_routes.items():
         raw = request.path_params.get(pname)
         if raw is None:
@@ -1007,12 +1038,19 @@ def require_any_resource_or_scoped(
     unscoped_types: tuple[str, ...],
     scoped_routes: dict[str, frozenset[str]],
     instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] | None = None,
+    route_types: dict[str, tuple[str, ...]] | None = None,
 ) -> Callable[..., Awaitable[User]]:
-    """Coarse router gate that also admits instance-scoped delegates.
+    """Router gate that also admits instance-scoped delegates.
 
-    Passes if the user has the method-derived action (unscoped) on ANY
-    ``unscoped_types`` — the normal :func:`require_any_resource_permission`
-    behaviour — OR, for **mutating** methods only (write / delete, never read),
+    Passes if the user has the method-derived action (unscoped) on what the
+    route needs. With ``route_types`` (#3058) that is EVERY type the matched
+    route's ``"METHOD /path"`` key (see :func:`request_route_key`) maps to — the
+    type the route serves, or each type an aggregate route returns. A route
+    missing from ``route_types`` admits no unscoped grant at all, so a route
+    added later is closed until someone classifies it. Without ``route_types``
+    a grant on ANY ``unscoped_types`` passes (the
+    :func:`require_any_resource_permission` behaviour). It also passes when,
+    for **mutating** methods only (write / delete, never read), the caller
     holds ANY grant (scoped or unscoped) on a ``scoped_routes`` type via
     :func:`has_any_grant_for` AND the request's route is on that type's
     allow-list.
@@ -1039,11 +1077,17 @@ def require_any_resource_or_scoped(
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
         action = action_for_request(request)
-        for rt in unscoped_types:
-            if user_has_permission(current_user, action, rt):
+        key = request_route_key(request)
+        if route_types is not None:
+            needed = route_types.get(key, ())
+            if needed and all(type_level_allows(current_user, action, rt) for rt in needed):
                 return current_user
+        else:
+            needed = unscoped_types
+            for rt in unscoped_types:
+                if user_has_permission(current_user, action, rt):
+                    return current_user
         if action != "read" and scoped_routes:
-            key = request_route_key(request)
             for rt, routes in scoped_routes.items():
                 if key in routes and has_any_grant_for(current_user, action, rt):
                     return current_user
@@ -1051,6 +1095,17 @@ def require_any_resource_or_scoped(
             request, current_user, action, instance_routes
         ):
             return current_user
+        if route_types is not None:
+            first = needed[0] if needed else "*"
+            await _record_denial(db, current_user, request, action, first, None)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Permission denied: need '{action}' on each of {list(needed)}"
+                    if needed
+                    else "Permission denied: route has no permission mapping"
+                ),
+            )
         all_types = list(unscoped_types) + list(scoped_routes)
         first = all_types[0] if all_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
@@ -1060,6 +1115,15 @@ def require_any_resource_or_scoped(
         )
 
     _dep.spatium_requires = ("method", list(unscoped_types))  # type: ignore[attr-defined]
+    if route_types is not None:
+        # Per-route requirement for the route-table walkers in the tests:
+        # ``(method, full_path) -> [types]``, every one required with the
+        # method's action, or ``None`` for a route the map does not classify.
+        def _requires_for(method: str, path: str) -> list[str] | None:
+            found = route_types.get(route_key(method, path))
+            return list(found) if found is not None else None
+
+        _dep.spatium_route_requires = _requires_for  # type: ignore[attr-defined]
     return _dep
 
 
@@ -1150,6 +1214,7 @@ __all__ = [
     "require_permission_or_scoped",
     "mount_route_key",
     "request_route_key",
+    "route_key",
     "require_resource_permission",
     "require_route_types",
     "token_scope_allows",

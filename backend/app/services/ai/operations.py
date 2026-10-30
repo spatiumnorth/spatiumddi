@@ -1871,7 +1871,9 @@ register(
         apply=_apply_create_ip_address,
         validate_submit=_validate_submit_create_ip_address,
         category="ipam",
-        required_permission=("write", "ip_address"),
+        # The REST address write needs ``write`` on the subnet that owns the
+        # address (#3058); the apply path delegates to that handler.
+        required_permission=("write", "subnet"),
     )
 )
 
@@ -2644,7 +2646,11 @@ class CreateDNSZoneArgs(BaseModel):
 
     admin_email: str = Field(
         default="",
-        description="Zone admin email rendered into SOA RNAME (e.g. ``hostmaster@example.com``).",
+        description=(
+            "Zone admin mailbox, the SOA RNAME, in domain-name form: "
+            "``hostmaster.example.com.`` for hostmaster@example.com. An "
+            "address with ``@`` is refused."
+        ),
     )
     dnssec_enabled: bool = Field(
         default=False,
