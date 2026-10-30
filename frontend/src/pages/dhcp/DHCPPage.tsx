@@ -497,6 +497,22 @@ function GroupDetailView({
                 {group.description}
               </p>
             )}
+            {(group.ha_peer_urls_missing?.length ?? 0) > 0 && (
+              <p
+                className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+                data-testid="ha-peer-urls-missing"
+              >
+                HA is not running: no HA Peer URL on{" "}
+                {group.ha_peer_urls_missing!.join(", ")}. Set it on each server
+                (Edit server → HA Peer URL), e.g.{" "}
+                <span className="font-mono">http://&lt;host&gt;:8000/</span>.
+                {group.ha_autofill_skipped_reason ===
+                  "more_than_two_kea_members" &&
+                  " Not filled automatically: a third Kea member joins as an HA backup, and roles follow server order, so it could take the primary role from the existing pair."}
+                {group.ha_autofill_skipped_reason === "bridged_network_mode" &&
+                  " Not filled automatically: in bridged mode the node address is not where Kea listens."}
+              </p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <AskAIButton
@@ -2878,16 +2894,18 @@ function ServerDetailView({
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
     },
     onError: (e) => {
-      const err = e as {
-        response?: { status?: number; data?: { detail?: string } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (err?.response?.status === 409) {
+      const response = (e as { response?: { status?: number } })?.response;
+      if (response?.status === 409) {
+        // The response alone, so a 409 without a detail still names the
+        // conflict instead of axios's "Request failed with status code 409".
         setAdoptConflict(
-          detail ?? "A DHCP server already exists on the interface.",
+          formatApiError(
+            { response },
+            "A DHCP server already exists on the interface.",
+          ),
         );
       } else {
-        setSyncBanner(detail ?? "Force sync failed");
+        setSyncBanner(formatApiError(e, "Force sync failed"));
       }
     },
   });
@@ -2962,11 +2980,7 @@ function ServerDetailView({
         );
       setSyncBanner(parts.join(" · "));
     },
-    onError: (e) =>
-      setSyncBanner(
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Sync leases failed",
-      ),
+    onError: (e) => setSyncBanner(formatApiError(e, "Sync leases failed")),
   });
   const approveMut = useMutation({
     mutationFn: () => dhcpApi.approveServer(server.id),
@@ -3516,10 +3530,7 @@ export function DHCPPage() {
     },
   });
   const deleteGroupError =
-    deleteGroupMut.error &&
-    (((deleteGroupMut.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroupMut.error));
+    deleteGroupMut.error && formatApiError(deleteGroupMut.error);
   const deleteServerMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {

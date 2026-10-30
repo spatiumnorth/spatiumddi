@@ -86,6 +86,7 @@ from app.drivers.dns import (
     get_driver,
     is_agentless,
     supports_topology_pull,
+    ttl_refusal,
 )
 from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
@@ -100,7 +101,6 @@ from app.models.dns import (
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
-    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSBlockList,
@@ -119,6 +119,7 @@ from app.models.dns import (
     dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
+from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
@@ -166,6 +167,12 @@ from app.services.dns.named_conf_validation import (
     validate_update_acl_entry,
     validate_view_name,
     validate_zone_forwarders,
+)
+from app.services.dns.new_object_defaults import (
+    DNSSEC_VALIDATION_MODES,
+    ZONE_TYPES,
+    default_zone_ttl,
+    load_dns_defaults,
 )
 from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_identity import describe_identical, find_identical_record
@@ -256,6 +263,7 @@ from app.services.dns_io import (
     write_zone_file,
 )
 from app.services.dns_io import spreadsheet as sheet_io
+from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     SoftDeleteBatch,
@@ -292,7 +300,7 @@ _DNS_RECORDS_READ = require_any_permission(
 # don't also need a schema edit to be accepted on create/update.
 VALID_DRIVERS = frozenset(_DNS_DRIVERS.keys())
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
-VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
+VALID_ZONE_TYPES = set(ZONE_TYPES)
 VALID_RECORD_TYPES = {
     "A",
     "AAAA",
@@ -361,7 +369,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
     "dnssec_rollover": frozenset({"bind9"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
-VALID_DNSSEC = {"auto", "yes", "no"}
+VALID_DNSSEC = set(DNSSEC_VALIDATION_MODES)
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only", "primary-only"}
 VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # Upstream forwarding transport (issue #50). No "https" member: BIND has no
@@ -398,7 +406,9 @@ class ServerGroupCreate(BaseModel):
     description: str = ""
     group_type: str = "internal"
     default_view: str | None = None
-    is_recursive: bool = True
+    # #3087 — omitted ⇒ Settings → DNS "Recursive by Default" (resolved in
+    # the create handler; an explicit value always wins).
+    is_recursive: bool | None = None
     # BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
     # ≥2-server BIND9 groups.
     catalog_zones_enabled: bool = False
@@ -716,6 +726,13 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2962 — who the current not-``ok`` daemon state came from: ``agent``
+    # (its own heartbeat) or ``supervisor`` (the appliance's supervisor, from
+    # the kubelet's container state, when the agent died with its container
+    # or has gone silent). ``null`` on ``ok`` or never reported. Derived
+    # (``container_oom.daemon_reported_by``), the same reading the alert's
+    # wording uses.
+    daemon_reported_by: Literal["agent", "supervisor"] | None = None
     # #2044 — a second live agent process is polling as this server (a cloned
     # VM or a copied state dir keeps the agent_id) and is being refused: only
     # the most recent process is served record ops. Derived
@@ -795,6 +812,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
             **_duplicate_agent_fields(s),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
@@ -1264,7 +1282,7 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
             raise ValueError(
                 f"master {entry!r} must be a bare IPv4/IPv6 address (optionally 'ip@port')"
             ) from exc
-        if sep and (not port.isdigit() or not (1 <= int(port) <= 65535)):
+        if sep and (not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535)):
             raise ValueError(f"master {entry!r}: port must be an integer in 1..65535")
         cleaned.append(entry)
     return cleaned
@@ -1301,11 +1319,17 @@ def _validate_zone_forward_tls_hostname(v: str | None) -> str | None:
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
+    # Stays "primary" when omitted (#3087): Settings' Default Zone Type is a
+    # pre-selection for the Add Zone form only.  A forward / secondary / stub
+    # zone needs fields (forwarders, masters) a bare create never carries, so
+    # defaulting the API's type to it would turn an omitted type into a 422.
     zone_type: str = "primary"
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
+    # #3087 — omitted ⇒ Settings → DNS "Default Zone TTL" (resolved in the
+    # create handler; an explicit value, including 0, always wins).
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1933,12 +1957,16 @@ async def create_group(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A server group with that name already exists")
 
-    group = DNSServerGroup(**body.model_dump())
+    defaults = await load_dns_defaults(db)
+    group_fields = body.model_dump()
+    if body.is_recursive is None:
+        group_fields["is_recursive"] = defaults.recursive
+    group = DNSServerGroup(**group_fields)
     db.add(group)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
-    # Auto-create default options
-    options = DNSServerOptions(group=group)
+    # Auto-create default options (#3087: DNSSEC validation from Settings)
+    options = DNSServerOptions(group=group, dnssec_validation=defaults.dnssec_validation)
     db.add(options)
 
     db.add(
@@ -3180,6 +3208,8 @@ async def _sync_single_server(
     zones_imported: list[str] = []
     zones_skipped_system: list[str] = []
     if import_new_zones and new_zones:
+        # The server reports no zone TTL; the stored default fills the gap (#3087).
+        pull_ttl = await default_zone_ttl(db, group_id)
         for name in new_zones:
             if _is_system_zone_name(name):
                 zones_skipped_system.append(name)
@@ -3201,7 +3231,7 @@ async def _sync_single_server(
                 name=name if name.endswith(".") else name + ".",
                 zone_type="primary",
                 kind=kind,
-                ttl=3600,
+                ttl=pull_ttl,
                 refresh=ZONE_DEFAULT_REFRESH,
                 retry=ZONE_DEFAULT_RETRY,
                 expire=ZONE_DEFAULT_EXPIRE,
@@ -4099,7 +4129,7 @@ def _plain_port_forwarders(entries: list[str] | None) -> list[str]:
     out = []
     for entry in entries or []:
         port = str(entry).partition("@")[2].strip()
-        if port.isdigit() and int(port) == 53:
+        if port.isascii() and port.isdigit() and int(port) == 53:
             out.append(entry)
     return out
 
@@ -5637,12 +5667,17 @@ async def create_zone(
 ) -> ZoneResponse:
     await _require_group(group_id, db)
     await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
-    _refuse_superadmin_zone_fields(current_user, body.model_dump(), None)
-    await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
+    # #3087 — an omitted TTL takes Settings → DNS "Default Zone TTL". Resolved
+    # before the gates so they judge the value the zone will actually carry.
+    zone_fields = body.model_dump()
+    if zone_fields["ttl"] is None:
+        zone_fields["ttl"] = await default_zone_ttl(db, group_id)
+    _refuse_superadmin_zone_fields(current_user, zone_fields, None)
+    await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
-    await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
+    await _check_zone_forward_transport(group_id, zone_fields, None, db)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -5656,7 +5691,7 @@ async def create_zone(
     if body.dnssec_enabled:
         await _check_driver_gated_operation("dnssec_sign", group_id, db)
 
-    payload = body.model_dump()
+    payload = zone_fields
     payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
     guard = await RenderGuard.capture(db, group_id, [body.name])
     zone = DNSZone(group_id=group_id, **payload)
@@ -7947,6 +7982,16 @@ async def create_zone_from_template(
             detail="A zone with that name already exists in this group/view",
         )
 
+    # Every provider-refusal gate runs on the whole record set BEFORE the zone
+    # exists or is pushed anywhere, so a refusal is atomic (#3007).
+    record_payloads = materialize(template, body.zone_name, body.params)
+    for r in record_payloads:
+        if r["record_type"] in VALID_RECORD_TYPES:
+            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    await _check_driver_refusals(
+        [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
+    )
+
     guard = await RenderGuard.capture(db, group_id, [body.zone_name])
     zone = DNSZone(
         group_id=group_id,
@@ -7954,6 +7999,7 @@ async def create_zone_from_template(
         name=body.zone_name,
         zone_type=body.zone_type,
         kind=body.kind,
+        ttl=await default_zone_ttl(db, group_id),  # #3087
     )
     db.add(zone)
     await guard.check(db, f"create zone {body.zone_name!r}")  # #2275
@@ -8690,6 +8736,7 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
     await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
@@ -8820,6 +8867,12 @@ async def update_record(
         return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
+    if "value" in changes or "ttl" in changes:
+        # #2959 / #2942 — before the row is touched, so a refusal leaves it as
+        # it was. Only what the request changes is checked.
+        await _check_driver_refusals(
+            [(record.record_type, changes.get("value"), changes.get("ttl"))], group_id, db
+        )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -9386,6 +9439,9 @@ async def bulk_create_records(
     # Driver gating is per record-type — check each distinct type once.
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_refusals(
+        [(r.record_type, r.value, r.ttl) for r in body.records], group_id, db
+    )
 
     # Normalise first: MX defaults its priority to 10, so an MX with and one
     # without an explicit 10 are the same record and must compare equal.
@@ -9670,8 +9726,103 @@ async def _diff_zone_file(
         replace=replace,
         zone_name=zone.name,
     )
+    # #2913 — a TTL past what a server can serve is refused like the
+    # spreadsheet import refuses it, not stored as "no TTL" (which a merge then
+    # wrote over an explicit one). The row still goes through the diff, so a
+    # ``replace`` reads the record it names as present in the file and leaves
+    # it alone rather than deleting it; only its create / update is withheld.
+    unservable = _withhold_unservable_ttls(diff, parsed)
+    # #2912 — a new row meets the record API's own rules (the ones the
+    # spreadsheet import runs), or it is left out with the reason.
+    await _apply_record_rules_to_import(db, zone, diff)
     apply_cname_rule(diff, existing, replace=replace)
+    diff.skipped = unservable + diff.skipped
     return diff
+
+
+def _withhold_unservable_ttls(diff: ZoneDiff, parsed: list[ParsedRecord]) -> list[str]:
+    """Take every create / update / unchanged entry whose file row carries a
+    TTL past ``DNS_TTL_MAX`` out of ``diff`` (#2913), and return one skipped
+    line per such row."""
+    bad = {(p.name, p.record_type, p.value): p.bad_ttl for p in parsed if p.bad_ttl is not None}
+    if not bad:
+        return []
+
+    def keep(c: RecordChange) -> bool:
+        return (c.name, c.record_type, c.value) not in bad
+
+    diff.to_create = [c for c in diff.to_create if keep(c)]
+    diff.to_update = [c for c in diff.to_update if keep(c)]
+    diff.unchanged = [c for c in diff.unchanged if keep(c)]
+    return [
+        f"{name} {rtype} {value}: skipped - TTL {ttl} is above the maximum of {DNS_TTL_MAX}"
+        for (name, rtype, value), ttl in bad.items()
+    ]
+
+
+# The longest ``skipped`` list a zone-file import returns (and audits). A file
+# of nothing but refused rows is bounded only by the request body cap, and
+# the list is echoed in the response AND stored in the audit row.
+_IMPORT_SKIPPED_MAX = 500
+
+
+def _cap_skipped(skipped: list[str]) -> list[str]:
+    if len(skipped) <= _IMPORT_SKIPPED_MAX:
+        return skipped
+    more = len(skipped) - _IMPORT_SKIPPED_MAX
+    return [*skipped[:_IMPORT_SKIPPED_MAX], f"... and {more} more row(s) left alone"]
+
+
+async def _apply_record_rules_to_import(db: DB, zone: DNSZone, diff: ZoneDiff) -> None:
+    """Move every ``to_create`` row the record API would refuse into
+    ``diff.skipped`` (#2912).
+
+    Uses ``_sheet_row_validator`` — the record API's own checks (owner rule,
+    TTL bounds, value rules, BIND's check-names) as a per-row verdict — rather
+    than a second copy. BIND refuses a zone holding one bad owner whole and
+    keeps serving the last good copy, so storing such a row also held back
+    every good row imported beside it. An update names a record that already
+    exists, so its name, type and value are unchanged and are not re-judged
+    (the record API's update re-judges only what changes); an update writes
+    only the TTL and priority / weight / port, which the parser bounds
+    (``bad_ttl``; the wire format caps the others at 16 bits).
+    """
+    if not diff.to_create:
+        return
+    needs_absolute = any(
+        dotless_target(c.record_type, c.value) is not None for c in diff.to_create
+    ) and await group_needs_absolute_targets(db, zone.group_id)
+    check = _sheet_row_validator(zone, {}, needs_absolute)
+    keep: list[RecordChange] = []
+    for i, c in enumerate(diff.to_create, start=1):
+        verdict = check(
+            sheet_io.SheetRow(
+                row=i,
+                name=c.name,
+                type=c.record_type,
+                value=c.value,
+                ttl=c.ttl,
+                priority=c.priority,
+                weight=c.weight,
+                port=c.port,
+            ),
+            c.view_id,
+            None,
+        )
+        if isinstance(verdict, str):
+            diff.skipped.append(f"{c.name} {c.record_type} {c.value}: skipped - {verdict}")
+        else:
+            keep.append(c)
+    diff.to_create = keep
+
+
+def _skipped_type_notes(parsed: ParsedZone) -> list[str]:
+    """One line per record type the file carries that SpatiumDDI does not
+    store (#2914), so the preview and the result name what is not imported."""
+    return [
+        f"{rtype}: {n} record(s) skipped - SpatiumDDI does not store {rtype} records"
+        for rtype, n in sorted(parsed.skipped_types.items())
+    ]
 
 
 def _change_to_response(c: RecordChange) -> RecordChangeResponse:
@@ -9750,6 +9901,7 @@ async def import_zone_preview(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
+    diff.skipped = _cap_skipped(_skipped_type_notes(parsed) + diff.skipped)
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -9811,6 +9963,7 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
+    diff.skipped = _cap_skipped(_skipped_type_notes(parsed) + diff.skipped)
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
@@ -9829,6 +9982,12 @@ async def import_zone_commit(
     _reject_if_synthesised_zone(zone, "import")
     for rtype in sorted({c.record_type for c in diff.to_create}):
         await _check_driver_gated_record_type(rtype, group_id, db)
+    await _check_driver_refusals(
+        [(c.record_type, c.value, c.ttl) for c in diff.to_create]
+        + [(c.record_type, None, c.ttl) for c in diff.to_update],
+        group_id,
+        db,
+    )
 
     # #2275 — a view-scoped import creates or deletes records in that view,
     # which moves where the zone renders.
@@ -10539,6 +10698,20 @@ async def import_zone_spreadsheet_commit(
             detail="Permission denied: need 'delete' on 'dns_record'",
         )
 
+    await _check_driver_refusals(
+        [(c.record_type, c.value, c.ttl) for c in plan.creates]
+        + [
+            (
+                u.candidate.record_type,
+                u.candidate.value if "value" in u.changed else None,
+                u.candidate.ttl,
+            )
+            for u in plan.updates
+        ],
+        group_id,
+        db,
+    )
+
     # #2275 — rows carry a view, and a record's view places its zone there.
     render_guard = await RenderGuard.capture(db, group_id, [zone.name])
     batch_id = uuid.uuid4()
@@ -10904,6 +11077,51 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                     "public resolvers."
                 ),
             )
+
+
+async def _check_driver_refusals(
+    records: Iterable[tuple[str, str | None, int | None]], group_id: uuid.UUID, db: DB
+) -> None:
+    """422 a record a driver in the zone's group would refuse (#2942, #2959).
+
+    ``records`` is ``(record_type, value, ttl)``; a ``None`` value or TTL is
+    not checked (an update that leaves it alone, or a TTL that inherits). One
+    gate, one query, for both things a driver can refuse about a record:
+
+    * its **value** — through the driver's optional
+      ``record_value_refusal(record_type, value) -> str | None`` (Linode
+      cannot carry non-zero CAA flags, for example; #2959). Without it the
+      record would be stored and then fail on every push.
+    * its **TTL** — :func:`app.drivers.dns.ttl_refusal` against
+      ``PROVIDER_TTL_RANGES`` (#2942). Without it a TTL of 0 reaches
+      Cloudflare (refused, so the stored record never publishes) or Vultr /
+      Linode (read as "automatic", so a different TTL publishes).
+
+    Values are checked before TTLs, and the first refusal is the 422, in the
+    provider's own words. Same fail-soft semantics as
+    ``_check_driver_gated_record_type``: an empty group passes, and the
+    driver re-checks at apply time.
+    """
+    rows = list(records)
+    values = [(rtype, value) for rtype, value, _ in rows if value is not None]
+    ttls = sorted({ttl for _, _, ttl in rows if ttl is not None})
+    if not values and not ttls:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    drivers = sorted({d for d in res.scalars().all() if d})
+    for driver in drivers:
+        check = getattr(_DNS_DRIVERS.get(driver), "record_value_refusal", None)
+        if check is None:
+            continue
+        for record_type, value in values:
+            refusal = check(record_type, value)
+            if refusal:
+                raise HTTPException(status_code=422, detail=refusal)
+    for driver in drivers:
+        for ttl in ttls:
+            reason = ttl_refusal(driver, ttl)
+            if reason is not None:
+                raise HTTPException(status_code=422, detail=reason)
 
 
 async def _require_record(

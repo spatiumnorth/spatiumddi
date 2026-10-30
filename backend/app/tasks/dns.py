@@ -21,6 +21,7 @@ from app.core.agent_wake import dns_group_channel, publish_wake
 from app.core.safe_fetch import FetchRefusedError, describe_fetch_error, safe_get_text
 from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException, DNSServer
+from app.services.agents.daemon_state import forget_stale_ok
 from app.services.dns_blocklist import parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
 from app.services.forward_secrets import redact, secret_url_in_flight, url_display
@@ -423,6 +424,22 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
                 .returning(DNSServer.id)
             )
             changed = len(res.all())
+            # #2961 — an agent that has stopped heartbeating can no longer
+            # vouch for ``ok``: NULL (unknown) instead of a stale green. Only
+            # ``ok`` goes; a ``degraded`` (including the supervisor's own
+            # verdicts) is a failure still standing. Covers every server read
+            # unreachable, not just the ones flipped this tick.
+            await db.execute(
+                update(DNSServer)
+                .where(
+                    DNSServer.status == "unreachable",
+                    DNSServer.last_seen_at.isnot(None),
+                    DNSServer.last_seen_at < cutoff,
+                    DNSServer.maintenance_mode.is_(False),
+                    DNSServer.daemon_status == "ok",
+                )
+                .values(daemon_status=None, daemon_reason=None, daemon_status_since=None)
+            )
             # #2276 — self-heal a group left with servers and no primary (its
             # primary deleted on a build that did not re-elect). Idempotent;
             # rides this 60 s sweep rather than a beat entry of its own.
@@ -609,6 +626,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
                     new_status = "active"
                 else:
                     new_status = "unreachable"
+                    forget_stale_ok(server)  # #2961
 
             server.status = new_status
             server.last_health_check_at = now

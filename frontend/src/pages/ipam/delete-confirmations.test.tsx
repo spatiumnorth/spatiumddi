@@ -102,13 +102,13 @@ const confirmButton = (dialog: HTMLElement) =>
 describe("IPAM delete confirmations", () => {
   it("Edit Space → Danger zone: says the space goes to Trash, and sends the Trash delete", async () => {
     const deleteSpace = vi.fn(() => Promise.resolve({}));
-    answers.ipamApi = { deleteSpace };
     const space = { id: "sp-1", name: "retiring-space" } as IPSpace;
+    answers.ipamApi = { deleteSpace, getSpace: () => Promise.resolve(space) };
     open(
       <EditSpaceModal space={space} onClose={() => {}} onDeleted={() => {}} />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
     const danger = words(topDialog());
     fireEvent.click(
       screen.getByRole("button", { name: /^Delete this IP space/ }),

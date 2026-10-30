@@ -52,11 +52,25 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
+from ._caa import caa_presentation
 from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, SERIAL_UNREAD, DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
+# #2935 — ``version`` / ``hostname`` in ``options`` below set what named
+# says about itself over CHAOS-class queries. Version and
+# stack details are for signed-in users only, and ``version.bind CH TXT`` is
+# the first question a DNS fingerprinting scan asks. ``version "none"``
+# keeps the query ANSWERED (with the string ``none``) rather than refused,
+# so a liveness check that digs it still gets a reply. ``hostname none``
+# stops ``hostname.bind`` naming the container (a container id on Compose,
+# the node on the appliance's host network). ``server-id`` (``id.server`` +
+# NSID) already defaults to none. A static part of the rendered config, not
+# a bundle field: no option turns it back on, and the first render after an
+# agent upgrade picks it up like any other template change. Mirrored by the
+# control plane's ``named.conf.j2``. The heartbeat's ``daemon_version`` is
+# unaffected — it reads ``named -v``, not the CHAOS answer.
 NAMED_CONF_SKELETON = """\
 {acl_statements}{tls_statements}options {{
     directory "/var/cache/bind";
@@ -68,6 +82,8 @@ NAMED_CONF_SKELETON = """\
 {blackhole}    dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
+    version "none";
+    hostname none;
 {max_cache_size}{query_log}{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
 }};
 statistics-channels {{
@@ -1038,6 +1054,10 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
         # truncates SPF/DMARC at a comment and spaces split the value
         # into separate character-strings resolvers concatenate wrong.
         return _quote_txt(value)
+    if rtype_u == "CAA":
+        # Quoted and escaped (#2943): a bare ``ca.org; account=1`` would lose
+        # everything after the ``;`` as a zone-file comment.
+        return caa_presentation(value)
     if rtype_u == "MX":
         pri = fields.get("priority")
         if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
@@ -1070,6 +1090,17 @@ _PLACEHOLDER_NS_ADDRESS = "127.0.0.1"
 # Sidecar in the rendered tree naming the zones given the placeholder glue.
 PLACEHOLDER_GLUE_FILE = "placeholder-glue.json"
 _PLACEHOLDER_RNAME_LABEL = "admin"
+# The placeholder of a zone whose own name holds a label that is not a host name,
+# such as Active Directory's ``_msdcs.<forest root>`` (#3003). Every name inside
+# that zone carries the label, and BIND's default check-names for a primary zone
+# refuses an SOA MNAME, an NS target or an A owner that is not a host name, and an
+# SOA RNAME whose domain part is not: ``ns1.<zone>``, its glue and ``admin.<zone>``
+# made named refuse the zone, so it was never served. Such a zone's placeholder
+# lives outside it: ``invalid.``, the name RFC 6761 reserves never to resolve, as
+# the catalog zone's apex already uses it (``_write_catalog_zone_file``). A name
+# server outside the zone needs no glue.
+_PLACEHOLDER_OUTSIDE = "invalid."
+_PLACEHOLDER_OUTSIDE_RNAME = "invalid."
 
 # Characters a master-file name cannot carry unescaped. The same set as the
 # control plane's ``contains_zonefile_unsafe`` (backend app/core/dns_names.py),
@@ -1158,6 +1189,16 @@ def _inside(name: str, origin: str) -> bool:
     return n == o or n.endswith("." + o)
 
 
+def _labels_are_host_names(origin: str) -> bool:
+    """Whether every label of absolute ``origin`` is a host-name label, so that
+    a name the agent invents inside the zone is one check-names accepts (#3003).
+    The zone API allows an underscore in a zone's name (``_msdcs``,
+    ``_domainkey``); a host-name label does not. Not ``_is_host_name``: a
+    one-label zone (``lan.``) qualifies, since ``ns1.lan.`` is a host name."""
+    body = origin.removesuffix(".")
+    return not body or all(_HOST_LABEL_RE.match(label) for label in body.split("."))
+
+
 class ZoneApex(NamedTuple):
     """What a zone file opens with — see ``_zone_apex``."""
 
@@ -1186,10 +1227,13 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     3. Otherwise the placeholder ``ns1.<zone>``, glued to 127.0.0.1 unless the
        zone holds an address for ``ns1`` itself. That glue sends every
        resolver that follows the zone's own NS set to loopback, so it is noted
-       for a warning.
+       for a warning. A zone whose own name is not a host name (``_msdcs.…``)
+       gets ``invalid.`` instead, outside it and with no glue, also noted: no
+       name inside it is one BIND's check-names accepts (#3003).
 
     The SOA MNAME is ``primary_ns``, else the first declared NS, else the
-    placeholder; the RNAME is ``admin_email``, else ``admin.<zone>``. Before
+    placeholder; the RNAME is ``admin_email``, else ``admin.<zone>``, or
+    ``invalid.`` for a zone whose own name is not a host name. Before
     this, every zone got the placeholder SOA, NS and glue whatever it held:
     ``primary_ns`` and ``admin_email`` never reached the agent, and a zone's own
     NS records were served beside ``ns1.<zone>``.
@@ -1218,7 +1262,12 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
         if parsed is None and str(zone.get(field) or "").strip():
             notes.append(("unusable_field", f"{field}={zone.get(field)!r}"))
 
-    placeholder = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
+    if _labels_are_host_names(origin):
+        placeholder = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
+        rname_fallback = f"{_PLACEHOLDER_RNAME_LABEL}.{origin}"
+    else:
+        placeholder = _PLACEHOLDER_OUTSIDE
+        rname_fallback = _PLACEHOLDER_OUTSIDE_RNAME
     apex_ns: tuple[str, ...]
     if declared_ns:
         apex_ns = ()
@@ -1233,10 +1282,14 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
             notes.append(("unaddressed_primary_ns", primary_ns))
         apex_ns = (placeholder,)
         ns_set = [placeholder]
+        if not _inside(placeholder, origin):
+            notes.append(("placeholder_outside", placeholder))
 
     ns_lower = {n.lower() for n in ns_set}
     placeholder_glue = (
-        placeholder.lower() in ns_lower and placeholder.lower() not in addressed
+        _inside(placeholder, origin)
+        and placeholder.lower() in ns_lower
+        and placeholder.lower() not in addressed
     )
     if placeholder_glue:
         notes.append(("placeholder", placeholder))
@@ -1246,7 +1299,7 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
             notes.append(("unaddressed_ns", n))
 
     mname = primary_ns or (declared_ns[0] if declared_ns else placeholder)
-    rname = admin or f"{_PLACEHOLDER_RNAME_LABEL}.{origin}"
+    rname = admin or rname_fallback
     return ZoneApex(mname, rname, apex_ns, placeholder_glue, tuple(notes))
 
 
@@ -1296,6 +1349,19 @@ _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
             "zone), or add NS records at the apex."
         ),
     ),
+    "placeholder_outside": (
+        "bind9_zone_apex_ns_never_resolves",
+        (
+            "These zones name no name server of their own (no Primary NS, no "
+            "NS record at the apex), and their own names hold a label that is "
+            "not a host name (an underscore, as in _msdcs), so no name inside "
+            "them is one BIND accepts as a name server (check-names). They are "
+            "served with the SOA primary name and NS invalid., a name that "
+            "never resolves (RFC 6761), so a resolver that follows a zone's own "
+            "NS set finds no server. Set the zone's Primary NS to a host name "
+            "outside the zone, or add NS records at the apex naming one."
+        ),
+    ),
     "unaddressed_primary_ns": (
         "bind9_zone_primary_ns_has_no_address",
         (
@@ -1342,7 +1408,8 @@ def _log_apex_notes(notes: list[tuple[str, str, str]]) -> None:
     """
     by_kind: dict[str, set[str]] = {}
     for zname, kind, detail in notes:
-        entry = zname if kind == "placeholder" else f"{zname} ({detail})"
+        placeholder = kind in ("placeholder", "placeholder_outside")
+        entry = zname if placeholder else f"{zname} ({detail})"
         by_kind.setdefault(kind, set()).add(entry)
     for kind, entries in by_kind.items():
         event, text = _APEX_NOTE_LOG[kind]
@@ -3282,6 +3349,8 @@ class Bind9Driver(DriverBase):
             if rtype == "TXT":
                 # Quote TXT (issue #1514) — see _wire_value.
                 value = _quote_txt(value)
+            elif rtype == "CAA":
+                value = caa_presentation(value)
             elif rtype == "MX" and rec.get("priority") is not None:
                 if not value.lstrip().split(" ", 1)[0].isdigit():
                     value = f"{rec['priority']} {value}"
@@ -5431,7 +5500,8 @@ class Bind9Driver(DriverBase):
         overlay[key] = new
         before = _zone_apex(_apex_zone(state))
         after = _zone_apex(_apex_zone(new))
-        ttl = int(state.get("ttl") or 3600)
+        _state_ttl = state.get("ttl")
+        ttl = int(_state_ttl) if _state_ttl is not None else 3600
         glue = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
         if after.placeholder_glue and not before.placeholder_glue:
             upd.add(glue, ttl, "A", _PLACEHOLDER_NS_ADDRESS)

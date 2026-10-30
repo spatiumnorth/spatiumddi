@@ -33,12 +33,53 @@ SpatiumDDI's auth stack has three layers:
 ## Local auth
 
 - `POST /auth/login` accepts JSON `{username, password}`. Returns
-  `{access_token, refresh_token, force_password_change}`.
+  `{access_token, token_type, force_password_change}`; the refresh token is
+  set only as the HttpOnly `spatium_refresh` cookie and is never in the body.
 - Passwords are `bcrypt` hashed. New users default `force_password_change=True`
   so the UI redirects them to `/change-password` before they can do anything
   else.
 - Access token expires in 15 min. Refresh token expires in 7 days
   (`refresh_token_expire_days` default) and rotates on every use.
+- **Rotation grace window (#2941).** The tabs of one browser share the
+  refresh cookie, so two tabs can refresh at the same moment with the same
+  cookie. For 10 seconds after a rotation (`ROTATION_GRACE` in
+  `backend/app/core/session_rotation.py`) the rotated-away session stands
+  for its successor: a refresh presenting the rotated cookie gets a new
+  access token for the SAME successor session (no third session and no new
+  cookie, since the browser already holds the successor's), and an access
+  token minted for the rotated session is still accepted. Concurrent
+  refreshes serialize on a row lock, so they land on one successor. After
+  the window a rotated cookie is a `401` and its access tokens are refused.
+  The grace applies only to a revocation by rotation, recorded in
+  `user_session.rotated_at` + `rotated_to_id`; a logout, a force-logout
+  from the session viewer, a password change or disabling the account
+  revokes the live session, which ends the old cookie and the old access
+  token at once, with no grace.
+  The API docs' spec route (`GET /api/v1/auth/openapi.json`, #2935), which
+  reads the refresh cookie without rotating it, applies the same rule: a
+  docs tab holding a cookie another tab rotated within the window still
+  loads the schema, and one revoked any other way does not.
+  - **The window is anchored to the rotation.** A refresh inside the window
+    does not rotate again, so it never moves `rotated_at`; replaying the old
+    cookie over and over cannot stretch the 10 seconds. The successor's own
+    absolute expiry and idle timeout are checked on every grace answer, and
+    a grace refresh does not count as activity.
+  - **What a captured cookie is worth.** A refresh cookie captured from a
+    rotated session and replayed inside those 10 seconds is answered like
+    the browser it came from: with an ordinary 15-minute access token for
+    the successor session. That is the trade the window makes, and why it
+    is 10 seconds rather than the minute some identity providers allow:
+    long enough for a concurrent refresh, and requests already in flight
+    with the old access token, to land; short enough that a cookie copied
+    out of a rotated session is useless almost at once. Revoking the
+    successor (logout, force-logout, a password change) ends that access
+    token too, since it names the successor.
+  - **Revocation cannot be raced by a rotation.** The bulk revocations lock
+    the account's live sessions before revoking them, so a refresh rotating
+    one at the same moment either finishes first (and its successor is
+    revoked with the rest) or waits and is refused. A force-logout from the
+    session viewer follows a row that was rotated after the list was
+    fetched to its live successor, and revokes that.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
@@ -169,7 +210,7 @@ session alone doesn't prove and an SSO account has no local password.
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and
   exchanges the pre-token via `POST /auth/login/mfa` for the
-  real `{access_token, refresh_token}` pair. Backup codes are
+  real `{access_token, ...}` body, with the refresh token set as the `spatium_refresh` cookie. Backup codes are
   invalidated on use.
 - **MFA attempt limits**: `POST /auth/login/mfa` checks three bounds
   before it looks at the code, and a TOTP code and a backup code are
@@ -638,8 +679,8 @@ Prefixes match on a whole path segment, so `/api/v1/dns` covers
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still
 inherits the owning user's RBAC, which is the only gate) — equivalent
-to the pre-#74 behaviour. New tokens pick scopes via a chip selector in
-the create modal.
+to the pre-#74 behaviour. New tokens pick scopes by ticking checkboxes in
+the create dialog.
 
 Scope enforcement runs **before** RBAC: a non-empty scope set narrows the
 token, and the owning user's RBAC still applies on top, so a `read`-scoped
@@ -779,13 +820,12 @@ up by hash, enforces `is_active` and `expires_at`, then loads the
 owning user and records the use in `last_used_at`. The write is at most
 once a minute per token and commits on its own, so a token used only for
 reads shows its use too (#1158). JWTs take the original path. A
-missing / wrong / revoked token returns the same generic 401 as an
-invalid JWT to avoid confirming token existence to an attacker.
+missing / wrong / revoked token returns 401 (`Invalid or revoked API token`; an expired one, `API token has expired`), a different detail from an invalid JWT.
 
 **Lifecycle.**
 - Create via the Admin → API Tokens UI or `POST /api/v1/api-tokens`
-  (JSON: `{name, description?, expires_in_days?, stepup_password?,
-  stepup_totp_code?}` — the owner's step-up is required, #1355). The create
+  (JSON: `{name, description?, expires_at?, expires_in_days?, scopes?,
+  resource_grants?, stepup_password?, stepup_totp_code?}` — the owner's step-up is required, #1355). The create
   response contains the raw `token` field **once** — the UI forces a
   "copy now" dialog before it disappears.
 - List via `GET /api/v1/api-tokens` (your tokens only; superadmins
@@ -873,8 +913,9 @@ rather than swallowing the failure. Permission-related rejections
   until an administrator links it; the denied audit row names the account.
   `backend/app/core/auth/user_sync.py`.
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
-  when the token is not in the sessions table, has been revoked, or
-  has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
+  when the token is not in the sessions table, has been revoked (other
+  than by a rotation inside the grace window above), or has passed
+  `expires_at`. `backend/app/api/v1/auth/router.py`.
 - **Disabling an account ends its sessions (#1383).** `PUT
   /api/v1/users/{id}` that changes `is_active` revokes every session
   the account holds, as an admin password reset does, and its audit row

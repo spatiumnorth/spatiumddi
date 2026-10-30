@@ -34,6 +34,8 @@ from typing import Any
 
 import structlog
 
+from app.core.shutdown import get_or_shutdown
+
 logger = structlog.get_logger(__name__)
 
 
@@ -153,9 +155,9 @@ async def pop_request(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> K8sP
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             return None
-        try:
-            request = await asyncio.wait_for(queue.get(), timeout=remaining)
-        except TimeoutError:
+        # #3015 — also ended by api shutdown, answering "no request" at once.
+        request, _ended = await get_or_shutdown(queue, remaining)
+        if request is None:
             return None
         if request.cancelled:
             # Skip stale entries and keep waiting on the same queue.

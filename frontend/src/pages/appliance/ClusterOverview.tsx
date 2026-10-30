@@ -46,6 +46,7 @@ import {
   type NodeStorage,
   type SelfApplianceInfo,
 } from "@/lib/api";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   formatEta,
   mdChipLabel,
@@ -1096,8 +1097,17 @@ export function WorkloadHealth({
               <div className="flex shrink-0 items-center gap-3 text-muted-foreground">
                 {w.restarts > 0 && (
                   <span
-                    className="flex items-center gap-0.5 text-amber-600 dark:text-amber-400"
-                    title={`${w.restarts} restarts`}
+                    data-testid="restart-chip"
+                    className={
+                      (w.recent_restarts ?? 0) > 0
+                        ? "flex items-center gap-0.5 text-amber-600 dark:text-amber-400"
+                        : "flex items-center gap-0.5 text-muted-foreground/60"
+                    }
+                    title={
+                      (w.recent_restarts ?? 0) > 0
+                        ? `${w.recent_restarts} restarted in the last 15 min (${w.restarts} lifetime)`
+                        : `${w.restarts} lifetime restarts, none in the last 15 min`
+                    }
                   >
                     <RotateCcw className="h-3 w-3" />
                     {w.restarts}
@@ -1304,7 +1314,7 @@ export function ClusterOverview({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
     staleTime: 20_000,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: version } = useQuery({
     queryKey: ["version"],

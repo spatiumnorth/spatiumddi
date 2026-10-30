@@ -293,13 +293,9 @@ Default ruleset (enforced, cannot be deleted):
 ### 2.4 Users and Groups (Platform-Level)
 
 Separate from IP-range-scoped permissions — this section manages:
-- Local user accounts (create, edit, enable/disable, reset password, force MFA)
+- Local user accounts (create, edit, enable/disable, reset password). Users enrol their own MFA from the Account page; there is no per-user "require MFA" switch
 - Local groups (create, manage membership)
-- LDAP / OIDC sync configuration:
-  - Which LDAP OUs to sync groups from
-  - Group attribute mapping
-  - Sync interval
-  - Manual "Sync Now" trigger
+- External auth provider group mapping (LDAP, OIDC, SAML, RADIUS, TACACS+): each provider carries group mappings (external group → SpatiumDDI group). There is no directory sync job, interval or "Sync Now": a user's groups are replaced from the mappings at each sign-in (see [AUTH.md](AUTH.md))
 - Last login per user
 - Active sessions (with revoke capability)
 
@@ -308,20 +304,22 @@ Separate from IP-range-scoped permissions — this section manages:
 ```
 APIToken
   id, name, description
-  token_hash: str        -- only hash stored; token shown once on creation
-  scope: enum(global, user)
-  user_id (FK, nullable) -- if user-scoped
-  permissions: JSONB     -- optional restriction (e.g., read-only, specific resource types)
+  token_hash: str        -- only the sha256 hash is stored; token shown once on creation
+  prefix: str            -- short identifier shown in the UI
+  scope: str            -- always "user" today (see below)
+  user_id (FK)           -- the owning user; the token acts as that user
+  scopes: list[str]      -- coarse scopes (below); empty = no scope restriction
+  resource_grants: list  -- optional binding to specific subnets / DNS zones
+  allowed_paths, permissions: JSONB -- reserved columns, not set or read today
   expires_at: timestamp (nullable)
   last_used_at: timestamp
   created_by_user_id, created_at
   is_active: bool
 ```
 
-- **Global tokens**: used for automation, CI/CD, Terraform providers — permissions are explicit
-- **User tokens**: scoped to the creating user's permission set — cannot exceed user's own rights
-- Tokens are displayed once on creation (PBKDF2 hash stored)
-- Tokens can be scoped to specific API paths (e.g., `/api/v1/ipam/*` only)
+- **User tokens** are the only kind the build issues: a token acts as its owning user and cannot exceed that user's rights. A token with no owner (a "global" token) is refused with 401 "Global-scope API tokens are not yet supported"; use a dedicated service user for automation, CI/CD and Terraform instead
+- Tokens are displayed once on creation (sha256 hash stored)
+- Instead of typing API paths, the create dialog offers five fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write`, `dhcp:write` and `agent`. A token may also be bound to specific subnets or DNS zones (`resource_grants`; the create dialog binds one)
 
 ### 2.6 Syslog / Log Forwarding
 
@@ -342,12 +340,9 @@ Multiple syslog targets can be configured simultaneously (e.g., local Loki + rem
 
 ### 2.7 Audit Log and Data Retention
 
-- Retention period (default: 365 days)
-- Export audit log: date range → CSV or JSON download
-- Archive to S3-compatible storage (optional)
 - Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
 - Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
-- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which runs at least once every 7 days, and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to a week between an edit to an old row and its alert. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
+- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which starts on the first nightly run after the last full pass is more than 7 days old (so roughly every eighth night, and later if nightly runs fail), and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to about eight days between an edit to an old row and its alert, plus however long the full pass takes. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
 **Audit log.** The audit log is append-only: nothing deletes from it,
 not even a superadmin, and no task prunes it, so it has no retention
 setting. Every mutation records the user, timestamp, source IP, action,
@@ -941,6 +936,53 @@ SMTPConfig
   reply_to: str (nullable)
 ```
 
+### About page: licence, NOTICE and third-party lists
+
+`/about` (sidebar footer —
+[#2895](https://github.com/spatiumnorth/spatiumddi/issues/2895)) shows the
+product name and version, the Apache-2.0 licence and its text, Spatium North,
+links to the source, docs and [privacy statement](../PRIVACY.md), the full
+`NOTICE` text, a section on the GPL / LGPL components of the OS appliance
+image, and the two generated third-party lists.
+
+**It is for signed-in users only**, and so is every file it shows. Someone
+probing the server from outside must not learn which version, libraries or
+third-party tools it runs, so the page is routed inside the authenticated
+console, the sign-in page does not link to it, and each data source refuses a
+caller without a session (401, or 403 for a disabled account or a pending
+password change). Any signed-in user may read it; no role is needed.
+
+| Source | Generated by | Served from |
+|---|---|---|
+| `NOTICE`, `LICENSE` | copied from the repo root by the Vite build | `/legal/NOTICE.txt`, `/legal/LICENSE.txt` (frontend image) |
+| Web UI libraries (npm) | `rollup-plugin-license` during `vite build`, so it covers exactly what is in the bundle | `/legal/third-party-npm.txt` (frontend image) |
+| Backend libraries (Python) | `pip-licenses` in the backend image's builder stage, over the packages the runtime stage receives; the tool itself never reaches the runtime image | `GET /api/v1/about/third-party/python` (plain text) |
+
+How the `/legal/` files are protected: the Vite build writes them to
+`dist-legal/`, a sibling of the public `dist/`, and the frontend image copies
+them to `/usr/share/spatiumddi/legal`, outside the nginx web root, so neither
+the SPA fallback nor the static-asset location can serve them. nginx serves
+`/legal/` only after an `auth_request` to `GET /api/v1/about/session`, which
+answers 204 for a signed-in caller and 401 / 403 otherwise; an api that cannot
+answer is a 503, never the file. Both nginx configs carry this: the image's own
+`default.conf.template` (Docker Compose, and the Helm chart without TLS) and
+the chart's `frontend-tls-config.yaml` (the Helm chart with TLS, and the
+appliance). The SPA's session is a Bearer token held in memory, which a plain
+link would not send, so the page fetches each file through its API client and
+shows it inline rather than linking it for a new tab. Nothing is inlined into
+the JS bundle.
+
+That is about the **content**. The version number is a separate decision,
+made on its own route: `GET /api/v1/version`, which the installer probe and
+the mobile client use, answers everyone, but since #2935 an anonymous caller
+gets `version: "restricted"` and only a signed-in caller sees the release (see
+[API.md](../API.md) §7.2).
+
+A `make dev` or `npm run dev` session has none of these files, and the page
+says "not available in this build" rather than show an empty list. Agent images
+and the appliance's OS packages are not in the generated lists yet; `NOTICE`
+covers them.
+
 ---
 
 ## 4. Multi-Role Servers
@@ -1223,7 +1265,7 @@ Other notable areas on the model (each a small cluster of columns): a derived co
 
 ### Current Version Display
 
-The current application version is displayed in the UI header bar and on the System Admin → About page. Releases up to the bridge are **CalVer**, `YYYY.MM.DD-N`, where N is the release number for that date (starting at 1). From 1.0.0 they are **SemVer**, `MAJOR.MINOR.PATCH`, with release candidates tagged `1.0.0-rc.N` (#1182).
+The current application version is displayed in the sidebar footer and on the [About page](#about-page-licence-notice-and-third-party-lists). Releases up to the bridge are **CalVer**, `YYYY.MM.DD-N`, where N is the release number for that date (starting at 1). From 1.0.0 they are **SemVer**, `MAJOR.MINOR.PATCH`, with release candidates tagged `1.0.0-rc.N` (#1182).
 
 Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day), `1.0.0-rc.1`, `1.0.0`, `1.0.1`
 
@@ -1233,7 +1275,17 @@ Every SemVer release is newer than every CalVer one, and versions are never comp
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
-- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }`
+- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }` to a signed-in caller
+
+**What an anonymous caller sees (#2935).** Version and stack details are for signed-in users only, because the exact release tells a scanner which advisories apply. Without a session or API token:
+
+- `GET /api/v1/version` returns only `product`, `api_level` and `restricted: true`; the version and release-check fields are null / false.
+- `GET /health/platform` returns the rollup `status` only, with no component list (which named every Celery worker by container id or pod name).
+- `/api/openapi.json` answers 401. `/api/docs` and `/api/redoc` load, then ask the reader to sign in.
+- The web tier sends `Server: nginx` with no version (`server_tokens off`), on the console and on the appliance's agent landing page.
+- DNS servers answer `version.bind CH TXT` with `"none"`. BIND9 also stops answering `hostname.bind`, and PowerDNS answers `id.server` (and NSID) with `"none"` instead of the container hostname. Technitium already refuses CHAOS queries.
+
+The public JavaScript bundle still carries the libraries it is built from; that cannot be hidden while the console loads before sign-in.
 
 ### GitHub Release Check
 

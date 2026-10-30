@@ -42,6 +42,7 @@ from sqlalchemy import func, or_, select, text, update
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -525,6 +526,13 @@ RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 # So a rule that counted it would fire permanently, and never auto-resolve,
 # on two ordinary correctly-working configurations. Deliberate policy drops
 # are not loss.
+#
+# #2889 — it also fires on ``queue_evicted``: DHCPv4 requests Kea read and
+# then evicted from its full multi-threading packet queue during a burst.
+# That is the same failure one stage later (a worker that cannot keep up
+# instead of a receive thread), it is never deliberate either, and no other
+# counter records it — ``socket_drop`` is before Kea reads, and
+# ``receive_drop`` is counted by the worker, after the queue.
 RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 
 # Issue #1110 — a DHCP scope served by two or more servers that do not
@@ -538,6 +546,15 @@ RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 # observations through the same report the group's Windows failover panel
 # shows, so the alarm and the panel cannot disagree.
 RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
+
+# Issue #2899 — a DHCP server group in ``direct`` socket mode (Kea raw
+# sockets) behind the MetalLB DHCP relay VIP. kube-proxy keeps about one relay
+# flow in N on the node announcing the VIP, whose raw socket drops the frame
+# still addressed to the VIP while raw mode discards the DNATed copy, so those
+# relays' clients get no address — and no counter records it (the #2889
+# arrival counter excludes VIP-addressed frames on purpose). Subject = the
+# group. Resolves when the group is set to ``relay`` or the VIP is cleared.
+RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET = "dhcp_relay_vip_direct_socket"
 
 # Issue #2313 — a blocklist feed whose refresh has not SUCCEEDED within three
 # of its own update intervals. A family filter that stopped refreshing keeps
@@ -758,6 +775,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+        RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
         RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
         RULE_TYPE_DNS_POOL_HEALTH_STALE,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
@@ -2220,11 +2238,16 @@ async def _matching_dhcp_packets_dropped_subjects(
     db: AsyncSession,
     rule: AlertRule,
 ) -> list[tuple[str, str, str]]:
-    """DHCP servers the kernel dropped packets for over the window (#980).
+    """DHCP servers that lost packets over the window (#980, #2889).
 
-    Fires on ``socket_drop`` alone: packets discarded because Kea's receive
-    buffer was full, so Kea never read them. That is unambiguous loss nobody
-    asked for, which is why a floor of one packet is reasonable.
+    Fires on ``socket_drop`` + ``queue_evicted``: packets discarded because
+    Kea's receive buffer was full, so Kea never read them, and requests Kea
+    read and then evicted from its full packet queue before its worker got
+    to them. Both are loss nobody asked for, which is why a floor of one
+    packet is reasonable. ``queue_evicted`` is derived by the agent from
+    three counters (see ``spatium_dhcp_agent.intake``), reporting only an
+    eviction a second sample has confirmed, so a backlog merely in flight
+    at one read does not fire it.
 
     **``receive_drop`` is deliberately not part of the test**, though the
     message reports it when present. Kea's ``pkt4-receive-drop`` counts
@@ -2239,6 +2262,9 @@ async def _matching_dhcp_packets_dropped_subjects(
     NULL is not zero. A server whose agent predates #980, or cannot read
     ``/proc/net/udp``, reports no ``socket_drop`` at all; ``SUM`` over its
     rows is NULL and the server is skipped rather than treated as loss-free.
+    The same holds for ``queue_evicted`` on its own: unmeasured (no raw
+    socket, a v6-only server, an older agent) contributes nothing, and a
+    server with neither measured is skipped.
     Note this is tested on ``socket_drop`` specifically and not on the pair:
     ``receive_drop`` always arrives from a #980 agent, so a combined test
     would read an unmeasurable server as measured-and-clean.
@@ -2256,6 +2282,7 @@ async def _matching_dhcp_packets_dropped_subjects(
             select(
                 DHCPMetricSample.server_id,
                 func.sum(DHCPMetricSample.socket_drop).label("sock"),
+                func.sum(DHCPMetricSample.queue_evicted).label("evicted"),
                 func.sum(DHCPMetricSample.receive_drop).label("recv"),
                 func.sum(DHCPMetricSample.discover).label("disc"),
             )
@@ -2266,14 +2293,21 @@ async def _matching_dhcp_packets_dropped_subjects(
     if not rows:
         return []
 
-    hits: dict[uuid.UUID, tuple[int, int | None, int]] = {}
+    hits: dict[uuid.UUID, tuple[int, int, int | None, int]] = {}
     for r in rows:
-        if r.sock is None:
+        if r.sock is None and r.evicted is None:
             continue  # unmeasured — skipped, not vouched for
-        sock = int(r.sock)
-        if sock < floor or sock <= 0:
+        sock = int(r.sock or 0)
+        evicted = int(r.evicted or 0)
+        lost = sock + evicted
+        if lost < floor or lost <= 0:
             continue
-        hits[r.server_id] = (sock, None if r.recv is None else int(r.recv), int(r.disc or 0))
+        hits[r.server_id] = (
+            sock,
+            evicted,
+            None if r.recv is None else int(r.recv),
+            int(r.disc or 0),
+        )
     if not hits:
         return []
 
@@ -2286,16 +2320,39 @@ async def _matching_dhcp_packets_dropped_subjects(
 
     win_min = int(_DHCP_PACKET_LOSS_WINDOW.total_seconds() // 60)
     matches: list[tuple[str, str, str]] = []
-    for sid, (sock, recv, disc) in hits.items():
+    for sid, (sock, evicted, recv, disc) in hits.items():
         name = names.get(sid) or str(sid)
-        message = (
-            f"DHCP server {name} lost {sock} packet(s) in the last {win_min} min: "
-            "the kernel discarded them because the server's receive buffer was "
-            "full, so it never read them. Usually means the node is short of "
-            f"CPU. It answered {disc} DISCOVER(s) over the same window, so every "
-            "server-side counter reads healthy — the loss is upstream of them and "
-            "costs each affected client a full retransmit round."
-        )
+        if not evicted:
+            # Kernel drops only — the #980 message, byte for byte, so a server
+            # whose evictions are unmeasured (NULL) or measured at zero reads
+            # exactly as it did before #2889.
+            message = (
+                f"DHCP server {name} lost {sock} packet(s) in the last {win_min} min: "
+                "the kernel discarded them because the server's receive buffer was "
+                "full, so it never read them. Usually means the node is short of "
+                f"CPU. It answered {disc} DISCOVER(s) over the same window, so every "
+                "server-side counter reads healthy — the loss is upstream of them and "
+                "costs each affected client a full retransmit round."
+            )
+        else:
+            parts = []
+            if sock:
+                parts.append(
+                    f"{sock} discarded by the kernel because the server's receive "
+                    "buffer was full, so it never read them"
+                )
+            parts.append(
+                f"{evicted} read and then evicted from the server's full packet "
+                "queue during a burst, before its worker reached them"
+            )
+            message = (
+                f"DHCP server {name} lost {sock + evicted} packet(s) in the last "
+                f"{win_min} min: {'; '.join(parts)}. Usually means the node is short "
+                f"of CPU for the load's bursts. It answered {disc} DISCOVER(s) over "
+                "the same window, so every server-side counter reads healthy — the "
+                "loss is upstream of them and costs each affected client a full "
+                "retransmit round."
+            )
         if recv:
             # Reported, never alerted on: this number legitimately includes
             # MAC-blocklist and HA out-of-scope drops.
@@ -4211,7 +4268,95 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
                     "critical",
                 )
             )
+    matches.extend(await _standalone_kea_group_matches(db))
     return matches
+
+
+async def _standalone_kea_group_matches(
+    db: AsyncSession,
+) -> list[tuple[str, str, str, str | None]]:
+    """#2969 — a ``standalone`` group with 2+ Kea members and at least one
+    active scope. Scopes belong to the group, so every member renders and
+    serves its active ones with no HA hook to coordinate (``standalone`` never
+    renders HA). Fixed by setting the group's mode to hot-standby /
+    load-balancing, or by leaving one Kea member in the group.
+
+    Kea members only. A group that also has a Windows member is skipped: the
+    failover report above already reports each of its scopes uncoordinated
+    (a mixed group is, #1110), and a second, group-level event for the same
+    fault would page twice. An inactive scope is not rendered into any
+    bundle, so it is not served and does not count."""
+    from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup  # noqa: PLC0415
+
+    kea_count = func.count(DHCPServer.id)
+    # Aliased, or the subquery would auto-correlate to the outer DHCPServer
+    # join (a Kea row) and never find a Windows member.
+    win = aliased(DHCPServer)
+    has_windows = (
+        select(win.id)
+        .where(win.server_group_id == DHCPServerGroup.id, win.driver == "windows_dhcp")
+        .exists()
+    )
+    rows = (
+        await db.execute(
+            select(DHCPServerGroup.id, DHCPServerGroup.name, kea_count)
+            .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+            .where(
+                DHCPServerGroup.mode == "standalone",
+                DHCPServer.driver == "kea",
+                ~has_windows,
+            )
+            .group_by(DHCPServerGroup.id, DHCPServerGroup.name)
+            .having(kea_count >= 2)
+        )
+    ).all()
+    out: list[tuple[str, str, str, str | None]] = []
+    for gid, name, n in rows:
+        has_scope = await db.scalar(
+            select(DHCPScope.id)
+            .where(DHCPScope.group_id == gid, DHCPScope.is_active.is_(True))
+            .limit(1)
+        )
+        if has_scope is None:
+            continue
+        out.append(
+            (
+                f"{gid}:standalone",
+                f"{name} (standalone)",
+                f"DHCP server group '{name}' is standalone but has {n} Kea servers "
+                "serving the same scopes with no coordination: each can hand the "
+                "same address to a different client. Set the group mode to "
+                "hot-standby or load-balancing, or keep one Kea server in it.",
+                "critical",
+            )
+        )
+    return out
+
+
+async def _matching_dhcp_relay_vip_direct_socket_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dhcp_relay_vip_direct_socket`` — every DHCP server group in ``direct``
+    socket mode behind the MetalLB relay VIP (#2899).
+
+    Read from the same helper the MetalLB card and the configuration refusals
+    use, so the alarm, the card and the 422 cannot disagree. Silent on every
+    install without a relay VIP, which is every Compose / plain-k8s install.
+    """
+    from app.services.dhcp.relay_vip import (  # noqa: PLC0415
+        alert_message,
+        direct_groups_behind_relay_vip,
+        load_relay_vip,
+    )
+
+    vip = await load_relay_vip(db)
+    if not vip:
+        return []
+    return [
+        (str(g.id), g.name, alert_message(g.name, vip), rule.severity)
+        for g in await direct_groups_behind_relay_vip(db, vip)
+    ]
 
 
 async def _matching_dns_blocklist_feed_stale_subjects(
@@ -4329,6 +4474,36 @@ async def _matching_dns_pool_health_stale_subjects(
     return matches
 
 
+def _daemon_degraded_source_text(reason: str) -> str:
+    """The closing sentences of an ``agent_daemon_degraded`` message, worded by
+    who actually reported (#2962). The agent's own report is the only case in
+    which "the agent is heartbeating" is true: a kubelet-sourced verdict (an
+    OOM kill, a crash loop) comes from the appliance's supervisor because the
+    agent died with its container, and a silent agent is the opposite of
+    heartbeating."""
+    from app.services.agents.container_oom import (  # noqa: PLC0415
+        is_silent_agent_reason,
+        reason_source,
+    )
+
+    if reason_source(reason) == "supervisor":
+        if is_silent_agent_reason(reason):
+            lead = (
+                "The agent is not heartbeating, so the server reads unreachable, while "
+                "its appliance's supervisor still is."
+            )
+        else:
+            lead = (
+                "The agent died with its container and cannot report this itself; the "
+                "appliance's supervisor reports it from the kubelet's container state."
+            )
+        return f"{lead} Supervisor reported: {reason}"
+    return (
+        "The agent is heartbeating, so the server reads reachable and healthy on every "
+        "other signal while it is not serving." + (f" Agent reported: {reason}" if reason else "")
+    )
+
+
 async def _matching_agent_daemon_degraded_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4357,6 +4532,7 @@ async def _matching_agent_daemon_degraded_subjects(
     """
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.container_oom import reason_source  # noqa: PLC0415
     from app.services.agents.daemon_state import (  # noqa: PLC0415
         STATUS_OK,
         is_not_serving,
@@ -4385,12 +4561,17 @@ async def _matching_agent_daemon_degraded_subjects(
                 continue
             reason = (row.daemon_reason or "").strip()
             minutes = int((now - since).total_seconds() // 60)
+            # #2962 — "reports" only when the agent said it.
+            verb = (
+                "reads its daemon as"
+                if reason_source(reason) == "supervisor"
+                else ("reports its daemon is")
+            )
             message = (
-                f"{kind} server '{row.name}' reports its daemon is "
+                f"{kind} server '{row.name}' {verb} "
                 f"{str(row.daemon_status).replace('_', ' ')} and has for {minutes} min "
-                f"(since {since.isoformat(timespec='seconds')}). The agent is heartbeating, "
-                "so the server reads reachable and healthy on every other signal while it "
-                "is not serving." + (f" Agent reported: {reason}" if reason else "")
+                f"(since {since.isoformat(timespec='seconds')}). "
+                + _daemon_degraded_source_text(reason)
             )
             subject_id = f"{model.__tablename__}:{row.id}"
             matches.append((subject_id, f"{row.name} ({kind})", message, rule.severity))
@@ -6246,6 +6427,48 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
         await session.commit()
 
 
+_DHCP_RELAY_VIP_DIRECT_SOCKET_RULE_NAME = "DHCP group in direct mode behind the relay VIP"
+
+
+async def seed_dhcp_relay_vip_direct_socket_alert_rule() -> None:
+    """Seed the #2899 rule, ENABLED by default.
+
+    Silent unless a MetalLB DHCP relay VIP is set AND a group it fronts reads
+    raw sockets — a state in which about one relay in N already gets no
+    answer, and no counter or other alarm says so. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DHCP_RELAY_VIP_DIRECT_SOCKET_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DHCP_RELAY_VIP_DIRECT_SOCKET_RULE_NAME,
+                description=(
+                    "Fires for each DHCP server group served through the MetalLB DHCP "
+                    "relay VIP while its client reachability is direct (Kea raw "
+                    "sockets). Relays whose flows land on the node announcing the VIP "
+                    "get no answer, about one relay in N for N nodes, and no packet "
+                    "counter shows it. Resolves when the group is set to relay, or the "
+                    "relay VIP is cleared."
+                ),
+                rule_type=RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNS_BLOCKLIST_FEED_STALE_RULE_NAME = "DNS blocklist feed stale"
 
 
@@ -6482,8 +6705,15 @@ async def seed_dhcp_packets_dropped_alert_rule() -> None:
     non-zero ``socket_drop`` is not an inference from a threshold, it is the
     kernel saying it threw a packet away.
 
-    "Cannot false-fire" is only true because the evaluator reads
-    ``socket_drop`` alone. Counting ``receive_drop`` as well would make a
+    #2889 added ``queue_evicted``, which IS an inference: arrivals less
+    the two counters that account for them. It joins the test anyway because
+    it is the same loss one stage later and nothing else reports it, and the
+    agent reports only an eviction a second sample has confirmed, so a backlog
+    in flight at one read does not reach this rule. Its residual false
+    positives are documented in ``docs/features/DHCP.md``.
+
+    "Cannot false-fire" is only true because the evaluator never reads
+    ``receive_drop``. Counting ``receive_drop`` as well would make a
     default-on rule fire permanently on any install using the DHCP MAC
     blocklist, since Kea counts a ``DROP``-class match there — the kind of
     alarm that trains operators to ignore the feed.
@@ -6518,7 +6748,9 @@ async def seed_dhcp_packets_dropped_alert_rule() -> None:
                 description=(
                     "Fires when the kernel discarded DHCP packets before the server "
                     "could read them — its receive buffer filled, usually because the "
-                    "node is short of CPU. Invisible to every other signal: the server "
+                    "node is short of CPU — or when the server read DHCPv4 requests and "
+                    "then evicted them from its full packet queue during a burst. "
+                    "Invisible to every other signal: the server "
                     "stays reachable and healthy and answers 100% of what reaches it, "
                     "while clients wait out retransmit rounds. Does NOT fire on packets "
                     "Kea read and discarded, because that figure also counts deliberate "
@@ -7811,6 +8043,7 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
+    RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET: "core.dhcp",
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
     RULE_TYPE_DNS_BLOCKLIST_FEED_STALE: "core.dns",
     RULE_TYPE_DNS_POOL_HEALTH_STALE: "core.dns",
@@ -8105,6 +8338,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # A scope held on Windows need not have a SpatiumDDI row, so the
                 # subject is "<group id>:<cidr>", not a dhcp_scope id.
                 subject_type = "dhcp_scope"
+            elif rule.rule_type == RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET:
+                relay_vip_direct = await _matching_dhcp_relay_vip_direct_socket_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in relay_vip_direct]
+                subject_type = "dhcp_server_group"
             elif rule.rule_type == RULE_TYPE_DNS_BLOCKLIST_FEED_STALE:
                 stale_feeds = await _matching_dns_blocklist_feed_stale_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_feeds]

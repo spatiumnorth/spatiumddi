@@ -227,7 +227,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
         rr = change.record
         rtype = rr.record_type.upper()
         absolute = self._absolutize(rr.name, apex)
-        default_ttl = int(rr.ttl) if rr.ttl else 300
+        default_ttl = int(rr.ttl) if rr.ttl is not None else 300
 
         # SpatiumDDI stores one DB row per record value and emits one
         # RecordChange per row, but Route 53 groups every value sharing the
@@ -257,7 +257,9 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 else [{"Value": compose_structured_rdata(rr)}]
             )
             ttl = int(
-                (change.rrset.ttl if change.rrset else None) or (rr.ttl if rr.ttl else 0) or 300
+                change.rrset.ttl
+                if change.rrset is not None and change.rrset.ttl is not None
+                else default_ttl
             )
             rrset: dict[str, Any] = {
                 "Name": absolute,
@@ -331,7 +333,8 @@ class Route53DNSDriver(CloudDNSDriverBase):
         if remaining:
             # Other values survive — UPSERT the reduced set, keeping the
             # rrset's live TTL.
-            ttl = int(existing.get("TTL", default_ttl) or default_ttl)
+            live_ttl = existing.get("TTL")
+            ttl = int(live_ttl) if live_ttl is not None else default_ttl
             rrset = {
                 "Name": absolute,
                 "Type": rtype,
@@ -392,7 +395,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
     ) -> int:
         """TTL for a merged rrset: the change's ttl, else the live rrset's,
         else the default."""
-        if change_ttl:
+        if change_ttl is not None:
             return int(change_ttl)
         if existing and existing.get("TTL") is not None:
             return int(existing["TTL"])

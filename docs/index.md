@@ -208,6 +208,10 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
       <span class="idx-card-title">Kubernetes</span>
       <span class="idx-card-desc">Umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA</span>
     </a>
+    <a class="idx-card" href="deployment/SIZING.html">
+      <span class="idx-card-title">Sizing</span>
+      <span class="idx-card-desc">Measured memory, CPU and disk per deployment shape, the minimums, and how to measure your own install</span>
+    </a>
     <a class="idx-card" href="deployment/REVERSE_PROXY.html">
       <span class="idx-card-title">Behind a Reverse Proxy</span>
       <span class="idx-card-desc">nginx, Caddy, Traefik, HAProxy, Nginx Proxy Manager, K8s Ingress: headers, trusted proxies, streaming, troubleshooting</span>

@@ -59,6 +59,7 @@ from app.drivers.dns.base import (
     ServerOptions,
     TsigKey,
     ZoneData,
+    first_ttl,
 )
 
 logger = structlog.get_logger(__name__)
@@ -292,7 +293,11 @@ class WindowsDNSDriver(DNSDriver):
             # named a single value while the wire operation addressed the
             # whole RRset, so the siblings the op never mentioned were lost.
             members = change.rrset.members
-            ttl = change.rrset.ttl or rr.ttl or 3600
+            # #2942 — a stored 0 is sent as 0 here and over WinRM. Whether
+            # Windows then serves 0 or substitutes the zone's minimum TTL has
+            # not been verified against a live server; drift cannot flag it
+            # either way, since it never compares TTLs.
+            ttl = first_ttl(change.rrset.ttl, rr.ttl, default=3600)
             if not members:
                 update.delete(rel_name, rdtype)
             else:
@@ -314,7 +319,7 @@ class WindowsDNSDriver(DNSDriver):
         else:  # create | update
             if change.op == "update":
                 update.delete(rel_name, rdtype)
-            update.add(rel_name, rr.ttl or 3600, rtype, _format_rdata(rr))
+            update.add(rel_name, first_ttl(rr.ttl, default=3600), rtype, _format_rdata(rr))
 
         logger.info(
             "windows_dns.apply_record_change",
@@ -1153,7 +1158,7 @@ def _ps_apply_record(change: RecordChange) -> str:
     rel_name = change.record.name if change.record.name not in ("", "@") else "@"
     name = _ps_escape_single_quoted(rel_name)
     members = _rrset_members_or_self(change)
-    ttl = int((change.rrset.ttl if change.rrset else None) or change.record.ttl or 3600)
+    ttl = first_ttl(change.rrset.ttl if change.rrset else None, change.record.ttl, default=3600)
     create = (
         "\n".join(_ps_add_record(zone, name, m, ttl) for m in members)
         if members
@@ -1300,8 +1305,8 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
                 "t": rtype,
                 "m": [_member(r) for r in to_add],
                 "rm": 1 if remove_first else 0,
-                "ttl": int(
-                    (change.rrset.ttl if change.rrset else None) or change.record.ttl or 3600
+                "ttl": first_ttl(
+                    change.rrset.ttl if change.rrset else None, change.record.ttl, default=3600
                 ),
             }
         )

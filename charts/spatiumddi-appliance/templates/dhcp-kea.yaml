@@ -173,8 +173,11 @@ spec:
 # #272 Phase 5 — DHCP relay-VIP. An ADDITIONAL LoadBalancer Service so a
 # DHCP relay's ``forward-to`` target is a stable floating IP that
 # outlives any single Kea node. Kea still runs hostNetwork:67 (the
-# DaemonSet above) for direct-attached VLAN broadcast reach — this VIP
-# only fronts the relay→server unicast forward, NOT client-facing :67.
+# DaemonSet above) — this VIP only fronts the relay→server unicast
+# forward, NOT client-facing :67. Every DHCP group behind it must read UDP
+# sockets (dhcp_socket_mode=relay): in raw mode the announcing node's Kea
+# drops the flows kube-proxy keeps on it (#2899). The control plane refuses
+# that combination and alerts on it.
 apiVersion: v1
 kind: Service
 metadata:

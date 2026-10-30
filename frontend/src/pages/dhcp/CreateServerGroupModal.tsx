@@ -1,15 +1,35 @@
 import { useState } from "react";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPServerGroup } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
-export function CreateServerGroupModal({
-  group,
-  onClose,
-}: {
+type CreateServerGroupModalProps = {
   group?: DHCPServerGroup;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the group fresh on open (#3091): the row the page holds comes
+// from a cached list, and the form is seeded once.
+export function CreateServerGroupModal(props: CreateServerGroupModalProps) {
+  const fresh = useFreshRow(props.group, () =>
+    dhcpApi.getGroup(props.group!.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Server Group"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ServerGroupModalForm {...props} group={fresh.row} />;
+}
+
+function ServerGroupModalForm({ group, onClose }: CreateServerGroupModalProps) {
   const qc = useQueryClient();
   const editing = !!group;
   const [name, setName] = useState(group?.name ?? "");
@@ -56,7 +76,7 @@ export function CreateServerGroupModal({
   const isHA = mode === "hot-standby" || mode === "load-balancing";
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       // #637 — validate client-side so an out-of-range threshold surfaces as an
       // inline message instead of a raw 422, matching CreateScopeModal's handling
       // of the same field. Blank threshold falls back to 0 (caching disabled);
@@ -109,9 +129,30 @@ export function CreateServerGroupModal({
         kea_thread_pool_size: parsedPool,
         kea_packet_logging: packetLogging,
       };
-      return editing
-        ? dhcpApi.updateGroup(group!.id, data)
-        : dhcpApi.createGroup(data);
+      if (!editing) return dhcpApi.createGroup(data);
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the group as it is. The baseline repeats the form's own defaults for
+      // a column the row does not carry.
+      const diff = changedFields(
+        {
+          name: group!.name,
+          description: group!.description ?? "",
+          mode: group!.mode ?? "standalone",
+          dhcp_socket_mode: group!.dhcp_socket_mode ?? "direct",
+          heartbeat_delay_ms: group!.heartbeat_delay_ms ?? 10000,
+          max_response_delay_ms: group!.max_response_delay_ms ?? 60000,
+          max_ack_delay_ms: group!.max_ack_delay_ms ?? 10000,
+          max_unacked_clients: group!.max_unacked_clients ?? 5,
+          auto_failover: group!.auto_failover ?? true,
+          lease_cache_threshold: group!.lease_cache_threshold ?? 0,
+          lease_cache_max_age: group!.lease_cache_max_age ?? null,
+          kea_thread_pool_size: group!.kea_thread_pool_size ?? 1,
+          kea_packet_logging: group!.kea_packet_logging ?? true,
+        },
+        data,
+      );
+      if (Object.keys(diff).length === 0) return group!;
+      return dhcpApi.updateGroup(group!.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });

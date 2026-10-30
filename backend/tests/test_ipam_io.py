@@ -301,6 +301,31 @@ async def test_csv_roundtrip(db_session: AsyncSession) -> None:
     assert parsed_nets == sorted(nets)
 
 
+@pytest.mark.asyncio
+async def test_json_export_block_counters_are_ignored_on_import(
+    db_session: AsyncSession,
+) -> None:
+    """The JSON export's block rows carry the cached ``allocated_ips``
+    (#2982); re-importing that file must not choke on it or treat it as
+    data — block counters are always recomputed, never imported."""
+    space = await _seed_space(db_session, "RoundTripJSON")
+    block = IPBlock(space_id=space.id, network="10.0.0.0/8", name="b", allocated_ips=7)
+    db_session.add(block)
+    await db_session.flush()
+    db_session.add(
+        Subnet(space_id=space.id, block_id=block.id, network="10.0.3.0/24", total_ips=254)
+    )
+    await db_session.flush()
+
+    data, _, _ = await export_subtree(db_session, space_id=space.id, format="json")
+    assert json.loads(data)["blocks"][0]["allocated_ips"] == 7
+    parsed = parse_payload(data, "rt.json", "application/json")
+    assert [str(s["network"]) for s in parsed.subnets] == ["10.0.3.0/24"]
+    preview = await preview_import(db_session, parsed, space_id=space.id, strategy="skip")
+    assert preview.errors == []
+    assert [r.network for r in preview.conflicts] == ["10.0.3.0/24"]
+
+
 # ── Formula-injection hardening (#523) ─────────────────────────────────────────
 
 

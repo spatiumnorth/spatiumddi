@@ -289,7 +289,9 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     # Computed / cached. ``allocated_ips`` is the recursive sum of descendant
-    # subnets' allocated_ips; ``total_ips`` is the block's CIDR size clamped to
+    # subnets' allocated_ips plus each subnet's network/broadcast addresses
+    # (a block's utilization is the share of its CIDR in use, #2982), clamped
+    # to the CIDR size; ``total_ips`` is the block's CIDR size clamped to
     # BIGINT (a huge IPv6 block reads as "uncountable" in the UI, like a /64
     # subnet). Both are populated by ``_update_block_utilization`` alongside
     # ``utilization_percent`` so block rows can show Used IPs, not just a bar.

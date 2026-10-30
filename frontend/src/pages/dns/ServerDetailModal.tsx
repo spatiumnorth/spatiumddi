@@ -42,6 +42,7 @@ import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
+import { syncCard } from "@/lib/dhcp-sync-label";
 import {
   dnsApi,
   formatApiError,
@@ -315,6 +316,7 @@ function OverviewTab({
 }
 
 function OverviewInfo({ server }: { server: DNSServer }) {
+  const sync = syncCard(server);
   return (
     <>
       <InfoCard label="Status" value={server.status}>
@@ -350,7 +352,18 @@ function OverviewInfo({ server }: { server: DNSServer }) {
         label="Last health check"
         value={fmtRelative(server.last_health_check_at)}
       />
-      <InfoCard label="Last sync" value={fmtRelative(server.last_sync_at)} />
+      {/* #3046 — nothing records a sync for an agentless DNS server
+          (Windows, cloud, technitium_api): no code writes its last_sync_at
+          and it has no agent apply report. Say so, rather than show the
+          placeholder that reads as "never synced". */}
+      <InfoCard
+        label={sync.label}
+        value={
+          !sync.at && server.is_agentless
+            ? "Not recorded for agentless servers"
+            : fmtRelative(sync.at)
+        }
+      />
       <InfoCard
         label="Config ETag (last acked)"
         value={server.last_config_etag ?? "—"}
@@ -358,7 +371,7 @@ function OverviewInfo({ server }: { server: DNSServer }) {
       />
       <InfoCard
         label="Enabled"
-        value={server.is_enabled ? "yes" : "no (paused)"}
+        value={server.is_enabled ? "yes" : "no (disabled)"}
         accent={server.is_enabled ? undefined : "warning"}
       />
       <InfoCard label="Primary" value={server.is_primary ? "yes" : "no"} />

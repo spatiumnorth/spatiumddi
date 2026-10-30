@@ -21,19 +21,22 @@ from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, PendingRollbackError
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     collect_wake,
     dhcp_wake_channels,
     wake_subscription,
 )
 from app.core.celery_dispatch import dispatch
+from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -469,6 +472,21 @@ async def _auth_agent(
     return server, payload
 
 
+def _reraise_if_database_gone(exc: Exception) -> None:
+    """The lease pass logs and skips a failed DDNS / profiling / sighting
+    step, but not one that failed because the database went away (#3017):
+    the session is unusable from then on, and swallowing it only moved the
+    failure to the next statement as a ``PendingRollbackError`` 500. Raised,
+    it is the dependency-down 503, and the agent resends the batch.
+
+    Deliberately the DATABASE classifier, not ``is_dependency_down``: that
+    one also counts any ``ConnectionError`` / ``TimeoutError``, and a DNS
+    server that refuses the DDNS update must stay a logged skip, not a 503
+    that has the agent resend the whole batch into the same refusal."""
+    if isinstance(exc, PendingRollbackError) or is_transient_db_error(exc):
+        raise exc
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
@@ -530,6 +548,7 @@ async def agent_register(
 
     require_approval = os.environ.get("DHCP_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
     pending_approval = False
+    created = server is None
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
         server = DHCPServer(
@@ -585,6 +604,17 @@ async def agent_register(
         resource_display=body.hostname,
         new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
     )
+    # #2963 - an appliance-hosted Kea member joining an HA group gets its peer
+    # URL from the node address instead of by hand (empty URLs only). Only
+    # when this registration CREATED the row: an agent re-registers on every
+    # restart, and refilling then would undo an operator who cleared a URL to
+    # keep the pair from forming.
+    if created:
+        from app.services.dhcp.ha_peer_autofill import (  # noqa: PLC0415
+            autofill_group_ha_peer_urls,
+        )
+
+        await autofill_group_ha_peer_urls(db, server.server_group_id, via="agent_register")
     await db.commit()
     await db.refresh(server)
 
@@ -1053,7 +1083,11 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)
@@ -1106,7 +1140,9 @@ async def agent_heartbeat(
     if (
         server.desired_appliance_version is not None
         and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
+        and is_installed_target(
+            server.installed_appliance_version, server.desired_appliance_version
+        )
         and (server.last_upgrade_state in ("done", None))
     ):
         server.desired_appliance_version = None
@@ -1529,6 +1565,7 @@ async def agent_lease_events(
                         client_hostname=ev.hostname,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_ddns_failed",
                         server=str(server.id),
@@ -1549,6 +1586,7 @@ async def agent_lease_events(
 
                     await maybe_enqueue_for_lease(db, subnet=subnet, ipam_row=ipam_row)
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_auto_profile_failed",
                         server=str(server.id),
@@ -1582,6 +1620,7 @@ async def agent_lease_events(
 
                     await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=ipam_row)
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_ddns_revoke_failed",
                         server=str(server.id),
@@ -1620,6 +1659,7 @@ async def agent_lease_events(
                 async with db.begin_nested():
                     result = await record_mac_observation(db, ipam_row.id, mac, source="dhcp_lease")
             except Exception as exc:  # noqa: BLE001
+                _reraise_if_database_gone(exc)
                 logger.warning(
                     "dhcp_agent_lease_mac_observation_failed",
                     server=str(server.id),
@@ -1846,6 +1886,8 @@ class DHCPMetricReport(BaseModel):
     # un-upgraded fleet reads as a fleet that has never dropped a packet.
     receive_drop: int | None = None
     socket_drop: int | None = None
+    # #2889 — requests evicted from Kea's packet queue. Same NULL rule.
+    queue_evicted: int | None = None
     batch_id: BatchId = None
 
 
@@ -1895,6 +1937,7 @@ async def agent_metrics(
     nullable_values = {
         "receive_drop": None if body.receive_drop is None else max(0, body.receive_drop),
         "socket_drop": None if body.socket_drop is None else max(0, body.socket_drop),
+        "queue_evicted": None if body.queue_evicted is None else max(0, body.queue_evicted),
     }
     existing = await db.get(DHCPMetricSample, (server.id, body.bucket_at))
     if existing is None:

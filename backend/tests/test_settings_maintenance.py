@@ -191,7 +191,8 @@ async def test_health_platform_exposes_fields(
         headers=headers,
         json={"maintenance_mode_enabled": True, "maintenance_message": "hi"},
     )
-    resp = await client.get("/health/platform", headers={"baseURL": "/"})
+    # The banner fields are for a signed-in caller (#2935).
+    resp = await client.get("/health/platform", headers=headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["maintenance_mode"] is True
