@@ -16,4 +16,6 @@
   addresses, subnets, DNS records and DHCP reservations answer a
   target the caller can neither read nor act on the same way, and a
   DNS record apply refuses an API token bound to another zone, as the
-  REST create does.
+  REST create does. An approver who cannot reach a request's target
+  gets 403 and the request stays pending for another approver; only a
+  target that no longer exists fails the request.

@@ -220,6 +220,152 @@ async def test_portal_approve_refuses_without_subnet_write(
     assert await _addresses(db_session, env.subnet_id) == []
 
 
+async def _submit_ip_request(
+    client: AsyncClient, db: AsyncSession, subnet_id: uuid.UUID, address: str
+) -> str:
+    _, req_token = await _user(
+        db,
+        name="req",
+        permissions=[*BARE_REQUESTER_PERMS, {"action": "read", "resource_type": "subnet"}],
+    )
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=_auth(req_token),
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": str(subnet_id), "address": address},
+            "justification": "need one",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def _cr_state(db: AsyncSession, rid: str) -> ChangeRequest:
+    cr = await db.get(ChangeRequest, uuid.UUID(rid))
+    assert cr is not None
+    await db.refresh(cr)
+    return cr
+
+
+@pytest.mark.asyncio
+async def test_approver_who_cannot_read_the_subnet_is_refused_and_request_stays_pending(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The approve re-preview hides a subnet the approver can neither read nor
+    write. That is about the approver, not the subnet: 403 with the REST
+    create's permission detail, and the request stays pending for an approver
+    who can reach it — not ``failed`` with "Subnet not found" (#2934)."""
+    await _enable_module(db_session, MODULE)
+    env = await _estate(db_session)
+    rid = await _submit_ip_request(client, db_session, env.subnet_id, "10.77.5.16")
+    # Write on some other subnet only: no read on this one.
+    _, blind_token = await _user(
+        db_session,
+        name="blind",
+        permissions=[
+            *APPROVE,
+            {"action": "write", "resource_type": "subnet", "resource_id": str(uuid.uuid4())},
+        ],
+    )
+    await db_session.commit()  # a wrongly-failed request rolls back first
+    resp = await client.post(
+        f"/api/v1/requests/{rid}/approve", headers=_auth(blind_token), json={}
+    )
+    assert resp.status_code == 403, resp.text
+    assert "No write permission on subnet" in resp.json()["detail"]
+    assert "not found" not in resp.json()["detail"]
+    cr = await _cr_state(db_session, rid)
+    assert cr.state == "pending" and cr.error is None
+    assert await _addresses(db_session, env.subnet_id) == []
+
+    # Another approver who can reach the subnet still takes it.
+    _, ok_token = await _user(
+        db_session,
+        name="able",
+        permissions=[
+            *APPROVE,
+            {"action": "write", "resource_type": "subnet", "resource_id": str(env.subnet_id)},
+        ],
+    )
+    resp = await client.post(f"/api/v1/requests/{rid}/approve", headers=_auth(ok_token), json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "executed", resp.text
+    assert await _addresses(db_session, env.subnet_id) == ["10.77.5.16"]
+
+
+@pytest.mark.asyncio
+async def test_address_set_approver_outside_the_set_without_read_stays_pending(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _enable_module(db_session, MODULE)
+    env = await _estate(db_session)
+    aset = AddressSet(
+        name="desk",
+        subnet_id=env.subnet.id,
+        range_kind="contiguous",
+        start_address="10.77.5.100",
+        end_address="10.77.5.110",
+    )
+    db_session.add(aset)
+    await db_session.flush()
+    rid = await _submit_ip_request(client, db_session, env.subnet_id, "10.77.5.60")
+    _, set_token = await _user(
+        db_session,
+        name="setw",
+        permissions=[
+            *APPROVE,
+            {"action": "write", "resource_type": "address_set", "resource_id": str(aset.id)},
+        ],
+    )
+    await db_session.commit()  # a wrongly-failed request rolls back first
+    resp = await client.post(f"/api/v1/requests/{rid}/approve", headers=_auth(set_token), json={})
+    assert resp.status_code == 403, resp.text
+    assert "No write permission on subnet" in resp.json()["detail"]
+    cr = await _cr_state(db_session, rid)
+    assert cr.state == "pending" and cr.error is None
+    assert await _addresses(db_session, env.subnet_id) == []
+
+
+@pytest.mark.asyncio
+async def test_deleted_subnet_still_fails_the_request(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A subnet that is genuinely gone is a stale request, whoever approves."""
+    await _enable_module(db_session, MODULE)
+    env = await _estate(db_session)
+    gone = Subnet(
+        space_id=env.subnet.space_id, block_id=env.block.id, network="10.77.9.0/24", name="gone"
+    )
+    db_session.add(gone)
+    await db_session.flush()
+    gone_id = gone.id
+    rid = await _submit_ip_request(client, db_session, gone_id, "10.77.9.5")
+    await db_session.delete(gone)
+    await db_session.flush()
+
+    # An approver with no read on it: still a failed request, not a 403.
+    _, blind_token = await _user(
+        db_session,
+        name="blind",
+        permissions=[
+            *APPROVE,
+            {"action": "write", "resource_type": "subnet", "resource_id": str(uuid.uuid4())},
+        ],
+    )
+    # The failed path rolls back before stamping; keep the delete and the
+    # approver row through that rollback.
+    await db_session.commit()
+    resp = await client.post(
+        f"/api/v1/requests/{rid}/approve", headers=_auth(blind_token), json={}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "failed"
+    cr = await _cr_state(db_session, rid)
+    assert cr.state == "failed"
+    assert cr.error == TARGET_NOT_FOUND["subnet"].format(id=gone_id)
+
+
 @pytest.mark.asyncio
 async def test_apply_function_itself_refuses_without_subnet_write(db_session: AsyncSession) -> None:
     """The gate lives in the operation's own apply, so it holds for any caller."""
@@ -466,8 +612,23 @@ async def test_previews_answer_an_unreadable_target_like_an_unknown_one(
         res = await op.preview(db_session, user, args)
         assert res.ok is False, name
         assert res.detail == TARGET_NOT_FOUND[rtype].format(id=rid), (name, res.detail)
+        # The approve spine reads this as "refuse the caller", not "gone".
+        assert res.forbidden_detail is not None, name
+        assert "Permission denied" in res.forbidden_detail or "No write" in res.forbidden_detail
         for secret in _SECRETS:
             assert secret not in res.detail and secret not in res.preview_text, (name, secret)
+            assert secret not in res.forbidden_detail, (name, secret)
+        # An id that does not exist is plain not-found: nothing to refuse.
+        missing = args.model_copy(update={_id_field(args): str(uuid.uuid4())})
+        gone = await op.preview(db_session, user, missing)
+        assert gone.ok is False and gone.forbidden_detail is None, name
+
+
+def _id_field(args: object) -> str:
+    for f in ("subnet_id", "block_id", "zone_id", "scope_id"):
+        if hasattr(args, f):
+            return f
+    raise AssertionError(args)
 
 
 @pytest.mark.asyncio

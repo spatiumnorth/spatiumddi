@@ -455,7 +455,10 @@ async def mark_expired(db: AsyncSession, cr: ChangeRequest) -> ChangeRequest:
 #   4. Approver holds the underlying op's ``required_permission``
 #      (``DecisionForbidden``) — can't rubber-stamp a delete you couldn't do.
 #   5. ``preview()`` re-runs (stale-state guard); if it refuses, the op does
-#      NOT execute and the row ends ``failed`` with the reason (#2911). A
+#      NOT execute and the row ends ``failed`` with the reason (#2911) —
+#      unless the refusal is about the approver (``forbidden_detail``: a
+#      target they cannot reach), which is ``DecisionForbidden`` and leaves
+#      the row ``pending`` like step 4 (#2934). A
 #      gate row whose preview still succeeds but describes a different scope
 #      (5b) is ``DecisionConflict`` and stays ``pending``.
 #   6. ``apply()`` dispatches under the **approver's** identity; the audit
@@ -788,6 +791,13 @@ async def approve_change_request(
         return await _stamp_apply_failed(
             db, cr_id, approver=approver, request=request, note=note, error=str(exc)
         )
+    if not preview.ok and preview.forbidden_detail is not None:
+        # The target exists, but THIS approver can neither read nor act on
+        # it (the preview answers it like an unknown id). Refuse the approver,
+        # as step 4 does, and leave the request pending for one who can — not
+        # ``failed`` as if the target were gone (#2934).
+        await _safe_rollback(db)
+        raise DecisionForbidden(preview.forbidden_detail)
     if not preview.ok:
         logger.info(
             "change_request.stale",
