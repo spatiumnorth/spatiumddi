@@ -6,19 +6,38 @@ import {
   type DHCPStaticAssignmentWrite,
   type DHCPScope,
 } from "@/lib/api";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { hostnameError } from "@/lib/dnsNames";
 import { staticDuidField } from "@/lib/formPayloads";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
-export function CreateStaticAssignmentModal({
-  staticAssignment,
-  scope,
-  onClose,
-}: {
+type StaticModalProps = {
   staticAssignment?: DHCPStaticAssignment;
   scope: DHCPScope;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the reservation fresh on open (#3076): the list row can predate
+// an inline IPAM edit of the same address, and a Save of the old hostname
+// would put it back on both the static and its IPAM row.
+export function CreateStaticAssignmentModal(props: StaticModalProps) {
+  const qc = useQueryClient();
+  const { row, ready } = useFreshRow(props.staticAssignment, () =>
+    refetchRow<DHCPStaticAssignment>(
+      qc,
+      ["dhcp-statics", props.scope.id],
+      props.staticAssignment!.id,
+    ),
+  );
+  if (!ready) return null;
+  return <StaticModalForm {...props} staticAssignment={row} />;
+}
+
+function StaticModalForm({
+  staticAssignment,
+  scope,
+  onClose,
+}: StaticModalProps) {
   const qc = useQueryClient();
   const editing = !!staticAssignment;
   const [mac, setMac] = useState(staticAssignment?.mac_address ?? "");
@@ -56,9 +75,24 @@ export function CreateStaticAssignmentModal({
         client_id: clientId || null,
         ...staticDuidField({ isV6, duid }, editing),
       };
-      return editing
-        ? dhcpApi.updateStatic(scope.id, staticAssignment!.id, data)
-        : dhcpApi.createStatic(scope.id, data);
+      if (!editing) return dhcpApi.createStatic(scope.id, data);
+      // Send only what changed (#3076): an untouched Save writes nothing to
+      // the reservation, its IPAM address or DNS.
+      const st = staticAssignment!;
+      const was = {
+        mac_address: st.mac_address,
+        ip_address: st.ip_address,
+        hostname: st.hostname ?? "",
+        description: st.description ?? "",
+        client_id: st.client_id || null,
+        duid: isV6 ? st.duid || null : undefined,
+      };
+      const diff = changedFields(was, {
+        ...data,
+        duid: isV6 ? data.duid : undefined,
+      });
+      if (Object.keys(diff).length === 0) return Promise.resolve(st);
+      return dhcpApi.updateStatic(scope.id, st.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-statics", scope.id] });

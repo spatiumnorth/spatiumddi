@@ -160,6 +160,15 @@ class StaticResponse(BaseModel):
         return str(v) if v is not None else v
 
 
+def _same_value(current: Any, sent: Any) -> bool:
+    """True when ``sent`` equals the stored ``current`` (INET / MACADDR compare as text)."""
+    if current is None or sent is None:
+        return current is sent
+    if isinstance(sent, (dict, list)):
+        return bool(current == sent)
+    return str(current) == str(sent)
+
+
 @router.get("/scopes/{scope_id}/statics", response_model=list[StaticResponse])
 async def list_statics(
     scope_id: uuid.UUID,
@@ -270,6 +279,11 @@ async def update_static(
             address_family=scope.address_family or "ipv4",
             previous=st.options_override or {},
         )
+    # #3076 — a field sent back at the value the row already holds is not a
+    # change. A dialog opened on a stale row resends every field, and writing
+    # them through would revert whatever another surface (an IPAM inline
+    # edit) stored since.
+    changes = {k: v for k, v in changes.items() if not _same_value(getattr(st, k), v)}
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
@@ -277,6 +291,10 @@ async def update_static(
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
+    if not changes:
+        # Nothing differs from what is stored: no push, no IPAM / DNS write.
+        await db.refresh(st)
+        return st
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st, action="update")

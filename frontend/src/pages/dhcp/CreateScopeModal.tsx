@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useFreshRow } from "@/hooks/useFreshRow";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
@@ -47,12 +48,7 @@ function suggestRange(
   return { start: fmt(startInt), end: fmt(endInt) };
 }
 
-export function CreateScopeModal({
-  scope,
-  subnetId: fixedSubnetId,
-  defaultGroupId,
-  onClose,
-}: {
+type CreateScopeModalProps = {
   scope?: DHCPScope;
   /** When creating from a subnet, pin the subnet; otherwise show a picker. */
   subnetId?: string;
@@ -60,7 +56,25 @@ export function CreateScopeModal({
    * the user isn't re-picking it from the list. */
   defaultGroupId?: string;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the scope fresh on open (#3077): the row the page holds comes from
+// a cached list whose refetch may not have answered since the last Save, and
+// the form is seeded once.
+export function CreateScopeModal(props: CreateScopeModalProps) {
+  const { row, ready } = useFreshRow(props.scope, () =>
+    dhcpApi.getScope(props.scope!.id),
+  );
+  if (!ready) return null;
+  return <ScopeModalForm {...props} scope={row} />;
+}
+
+function ScopeModalForm({
+  scope,
+  subnetId: fixedSubnetId,
+  defaultGroupId,
+  onClose,
+}: CreateScopeModalProps) {
   const qc = useQueryClient();
   const editing = !!scope;
   const [subnetId, setSubnetId] = useState<string>(

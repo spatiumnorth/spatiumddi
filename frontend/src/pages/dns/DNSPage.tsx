@@ -80,6 +80,7 @@ import {
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -3209,19 +3210,32 @@ const RECORD_VALUE_PLACEHOLDER: Record<string, string> = {
   DNAME: "target.example.net.",
 };
 
-function RecordModal({
-  groupId,
-  zoneId,
-  zoneName,
-  record,
-  onClose,
-}: {
+type RecordModalProps = {
   groupId: string;
   zoneId: string;
   zoneName?: string;
   record?: DNSRecord;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the record fresh on open (#3077): the row the page holds comes
+// from a cached records page that may predate a Save made a moment ago.
+export function RecordModal(props: RecordModalProps) {
+  const qc = useQueryClient();
+  const { row, ready } = useFreshRow(props.record, () =>
+    refetchRow<DNSRecord>(qc, ["dns-records", props.zoneId], props.record!.id),
+  );
+  if (!ready) return null;
+  return <RecordModalForm {...props} record={row} />;
+}
+
+function RecordModalForm({
+  groupId,
+  zoneId,
+  zoneName,
+  record,
+  onClose,
+}: RecordModalProps) {
   const qc = useQueryClient();
   const isReverseZone =
     !!zoneName && /\.(in-addr|ip6)\.arpa\.?$/i.test(zoneName);
@@ -3276,7 +3290,7 @@ function RecordModal({
       setError(`TTL ${recordTtl}.`);
       return;
     }
-    mut.mutate({
+    const body = {
       name,
       record_type: type,
       value,
@@ -3287,7 +3301,30 @@ function RecordModal({
       weight: isSrv && weight !== "" ? parseInt(weight, 10) : null,
       port: isSrv && port !== "" ? parseInt(port, 10) : null,
       view_id: viewId || null,
-    });
+    };
+    if (!record) {
+      mut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3077), so a dialog opened
+    // on an out-of-date row cannot write the old values back. The type is not
+    // editable, so it never rides an update.
+    const { record_type: _type, ...fields } = body;
+    const was = {
+      name: record.name,
+      value: record.value,
+      ttl: record.ttl ?? null,
+      priority: record.priority ?? null,
+      weight: record.weight ?? null,
+      port: record.port ?? null,
+      view_id: record.view_id ?? null,
+    };
+    const diff = changedFields(was, fields);
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   }
 
   return (
