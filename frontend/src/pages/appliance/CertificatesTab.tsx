@@ -1187,13 +1187,13 @@ const ACME_CHALLENGE_OPTIONS: {
   {
     value: "http-01",
     label: "HTTP-01 (CA fetches a token over port 80/443)",
-    hint: "No DNS needed — the appliance must be reachable on port 80/443 at each requested name.",
+    hint: "No DNS needed — SpatiumDDI must be reachable on port 80/443 at each requested name.",
   },
   {
     value: "tls-alpn-01",
     label: "TLS-ALPN-01",
     disabled: true,
-    disabledReason: "Not supported on this appliance (nginx terminates TLS).",
+    disabledReason: "Not supported (nginx terminates TLS).",
   },
 ];
 
@@ -1383,8 +1383,8 @@ function AcmeIssueModal({
           cloud-hosted zones, with a manual-TXT fallback) or HTTP-01. When the
           order completes the issued cert is stored{" "}
           {isApplianceHost
-            ? "and activated automatically, and active certs auto-renew ~30 days before they expire."
-            : "in the certificate store, ready to pick for DoT / DoH."}
+            ? "and activated automatically. The active cert, and any a DNS group serves for DoT / DoH, auto-renew ~30 days before they expire."
+            : "in the certificate store, ready to pick for DoT / DoH. A cert a DNS group serves auto-renews ~30 days before it expires."}
         </p>
 
         <ModalTabs
@@ -1559,7 +1559,9 @@ function AcmeIssueModal({
                 <span className="font-mono">
                   http(s)://&lt;domain&gt;/.well-known/acme-challenge/…
                 </span>{" "}
-                — the appliance must be reachable on port 80/443 at that name.
+                {isApplianceHost
+                  ? "— the appliance must be reachable on port 80/443 at that name."
+                  : "— that name must reach this install's frontend on port 80/443. Behind your own reverse proxy or ingress, forward /.well-known/acme-challenge/ to it as well."}
               </p>
             )}
 

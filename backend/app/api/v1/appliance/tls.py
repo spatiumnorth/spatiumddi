@@ -563,7 +563,7 @@ async def delete_certificate(
         names = ", ".join(serving)
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"this certificate serves DoT/DoH for DNS server group(s): {names}. "
+            f"this certificate serves DoT/DoH/DoQ for DNS server group(s): {names}. "
             "Disable those listeners (or point them at another certificate) "
             "under DNS → Server Groups → Options → Encrypted transports first.",
         )
@@ -597,7 +597,7 @@ async def delete_certificate(
 
 
 async def _dns_groups_serving_cert(db: DB, cert_id: uuid.UUID) -> list[str]:
-    """Names of DNS server groups with a LIVE DoT/DoH listener on this cert.
+    """Names of DNS server groups with a LIVE DoT/DoH/DoQ listener on this cert.
 
     Only groups with a listener actually enabled count — a group that merely
     points at the cert with both listeners off isn't serving anything, so
@@ -615,6 +615,8 @@ async def _dns_groups_serving_cert(db: DB, cert_id: uuid.UUID) -> list[str]:
                     or_(
                         DNSServerOptions.dot_enabled.is_(True),
                         DNSServerOptions.doh_enabled.is_(True),
+                        # #3061 — DoQ serves the same cert (Technitium, #741)
+                        DNSServerOptions.doq_enabled.is_(True),
                     ),
                 )
                 .order_by(DNSServerGroup.name)
