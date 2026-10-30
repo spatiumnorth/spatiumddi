@@ -99,6 +99,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # those, and the zone would read in sync at a serial no longer served.
 SERVED_REPORT_SECONDS = 120.0
 
+# #2309 — how often the key directory is re-checked between structural
+# applies, so a zone's key files go when its grace period ends.
+DNSSEC_KEY_PRUNE_SECONDS = 3600.0
+
 # #1934 — the re-read interval while a signed zone's key set is still
 # settling: right after a structural reload or pod start (BIND generates the
 # keys a few seconds AFTER it loads the zone, and a re-keyed zone — #1855 —
@@ -276,6 +280,10 @@ class SyncLoop:
         # #1934 — consecutive reads that ended unsettled (a report, a refused
         # report, an unreadable zone); drives the settling backoff.
         self._dnssec_settle_streak = 0
+        # #2309 — the signed zones of the last bundle that applied and was
+        # committed; ``None`` until one has, and again after a failed apply.
+        self._key_prune_bundle: dict[str, Any] | None = None
+        self._key_prune_at = 0.0
         # #1725 — the supervisor's; ``None`` in tests that build a loop
         # directly. Only read on a failed apply, to name an OOM kill.
         self.oom_watch = oom_watch
@@ -1330,13 +1338,33 @@ class SyncLoop:
         self._report_applied(etag)
         return True
 
-    def _prune_dnssec_keys(self, bundle: dict[str, Any]) -> None:
-        """#2309 — drop key files of zones no longer signed, after a good apply."""
+    def _prune_dnssec_keys(self, bundle: dict[str, Any] | None = None) -> None:
+        """#2309 — age out key files of zones no longer signed.
+
+        Called with the bundle just applied and committed, which becomes the
+        zone set the periodic call from ``run`` prunes against; called with
+        none, it re-runs against that set so a zone's files go once its grace
+        period ends even if no structural change follows. A failed apply
+        clears the set (``_handle_apply_failure``) so nothing is pruned while
+        the daemon is not on a bundle that applied.
+        """
         prune = getattr(self.driver, "prune_dnssec_keys", None)
         if prune is None:
             return
+        if bundle is not None:
+            # Only what the driver reads: the names of the signed zones.
+            self._key_prune_bundle = {
+                "zones": [
+                    {"name": z.get("name"), "dnssec_enabled": True}
+                    for z in bundle.get("zones") or []
+                    if z.get("dnssec_enabled")
+                ]
+            }
+        self._key_prune_at = time.monotonic() + DNSSEC_KEY_PRUNE_SECONDS
+        if self._key_prune_bundle is None:
+            return
         try:
-            prune(bundle)
+            prune(self._key_prune_bundle)
         except Exception as e:  # noqa: BLE001 — housekeeping must not fail an apply
             log.warning("dnssec_key_prune_failed", error=str(e))
 
@@ -1451,6 +1479,9 @@ class SyncLoop:
         cause: BaseException,
         daemon_disturbed: bool,
     ) -> None:
+        # #2309 — what is live now is not a bundle that applied; stop ageing
+        # key files out until one does.
+        self._key_prune_bundle = None
         if self.oom_watch is not None and self.oom_watch.fired(consume=True):
             # #1725 — the error the daemon left (an rndc refusal, a dead
             # control channel) does not say why it died. Say it.
@@ -1788,5 +1819,7 @@ class SyncLoop:
             self._poll_once()
             if time.monotonic() >= self._dnssec_refresh_at:
                 self._refresh_dnssec_state()
+            if time.monotonic() >= self._key_prune_at:
+                self._prune_dnssec_keys()
             if time.monotonic() >= self._served_report_at:
                 self._report_served_serials()

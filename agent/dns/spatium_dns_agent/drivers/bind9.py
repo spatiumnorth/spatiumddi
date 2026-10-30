@@ -1416,13 +1416,41 @@ _KEYFILE_RE = re.compile(
     r"^K(?P<zone>.+?)\.?\+\d{3}\+\d{5}\.(?:key|private|state)(?:\.backup)?$"
 )
 
+# How long a zone's key files outlive its signing (#2309). Unsigning, deleting
+# or moving a zone is not undone by re-signing it once its keys are gone: BIND
+# generates a new KSK whose DS the parent does not have, so the zone goes bogus
+# until the registrar is updated. The grace period turns a mistake, or a
+# control plane briefly shipping the wrong zone set, into a no-op instead of a
+# broken chain of trust. ``0`` deletes on the first successful apply.
+DNSSEC_KEY_PRUNE_GRACE_SECONDS = float(
+    os.environ.get("DNSSEC_KEY_PRUNE_GRACE_SECONDS", str(7 * 24 * 3600))
+)
+
+# Under ``state_dir``: when each zone with key files was first seen not signed.
+DNSSEC_KEY_PRUNE_STATE = "dnssec-key-prune.json"
+
+_PCT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+
 
 def _key_zone(filename: str) -> str | None:
-    """Lower-cased, dot-less zone a BIND key file belongs to, or None."""
+    """Lower-cased, dot-less zone a BIND key file belongs to, or None.
+
+    BIND writes the zone with ``dns_name_tofilenametext``: lower-cased, and
+    any byte outside ``[a-z0-9._-]`` as ``%XX`` — an RFC 2317 zone
+    ``0/26.2.0.192.in-addr.arpa`` gets ``K0%2F26.2.0.192.in-addr.arpa.+…``
+    (checked against named 9.20). Undone here so the name compares equal to
+    the bundle's.
+    """
     m = _KEYFILE_RE.match(filename)
     if not m:
         return None
-    return m.group("zone").rstrip(".").lower()
+    zone = _PCT_ESCAPE_RE.sub(lambda e: chr(int(e.group(1), 16)), m.group("zone"))
+    return zone.rstrip(".").lower()
+
+
+def _zone_key_name(name: str | None) -> str:
+    """A bundle zone name in the form ``_key_zone`` returns."""
+    return (name or "").rstrip(".").lower()
 
 
 def _parse_dnssec_status(text: str) -> list[dict[str, Any]]:
@@ -1541,7 +1569,7 @@ def _ds_from_key_dir(zone: str, key_dir: str) -> list[str]:
     origin = dns.name.from_text(zone)
     held: list[str] = []
     for fn in sorted(os.listdir(key_dir)):
-        if not fn.endswith(".key") or not fn.startswith(f"K{zone}.+"):
+        if not fn.endswith(".key") or _key_zone(fn) != _zone_key_name(zone):
             continue
         path = os.path.join(key_dir, fn)
         try:
@@ -5696,45 +5724,96 @@ class Bind9Driver(DriverBase):
             cmd += ["-c", str(agent_conf)]
         return cmd
 
-    def prune_dnssec_keys(self, bundle: dict[str, Any]) -> list[str]:
-        """Delete key files of zones this server no longer serves signed (#2309).
+    def prune_dnssec_keys(
+        self, bundle: dict[str, Any], now: float | None = None
+    ) -> list[str]:
+        """Delete key files of zones not signed here for the grace period (#2309).
 
         The key directory is persistent and BIND never removes a zone's keys
         itself, so a deleted / unsigned / moved zone left its private keys on
         disk forever, and a same-name zone created later inherited them (and
         the DS the operator would publish). ``key-directory`` is one global
-        directory shared by every view, so a zone is kept while ANY zone entry
-        in the bundle (any view) is still ``dnssec_enabled``.
+        directory shared by every view, so a zone counts as signed while ANY
+        zone entry in the bundle (any view) is ``dnssec_enabled``.
 
-        Only call this after the bundle has been applied successfully: a
-        failed apply must never cost a still-signed zone its keys. Returns the
-        removed file names.
+        Removal is deferred: a zone with key files that is not signed is
+        recorded with the time it was first seen so, and its files go only
+        once it has stayed that way for ``DNSSEC_KEY_PRUNE_GRACE_SECONDS``.
+        Signed again inside the window, it is forgotten and BIND carries on
+        with the keys whose DS the parent already has. Every failure to read
+        or write that record restarts the clock rather than deleting early.
+
+        Only call this with a bundle that has been applied successfully: a
+        failed apply must never advance a still-signed zone towards removal.
+        Returns the removed file names.
         """
+        if now is None:
+            now = time.time()
         signed = {
-            (z.get("name") or "").rstrip(".").lower()
-            for z in bundle.get("zones", [])
+            _zone_key_name(z.get("name"))
+            for z in bundle.get("zones") or []
             if z.get("dnssec_enabled")
         }
-        removed: list[str] = []
         key_dir = DNSSEC_KEY_DIR
         try:
             names = sorted(os.listdir(key_dir))
         except OSError:
-            return removed
+            return []
+        by_zone: dict[str, list[str]] = {}
         for fn in names:
             zone = _key_zone(fn)
             if zone is None or zone in signed:
                 continue
             path = os.path.join(key_dir, fn)
-            try:
-                if os.path.islink(path) or not os.path.isfile(path):
-                    continue
-                os.unlink(path)
-            except OSError as e:
-                log.warning("dnssec_key_remove_failed", file=fn, error=str(e))
+            if os.path.islink(path) or not os.path.isfile(path):
                 continue
-            removed.append(fn)
-            log.info("dnssec_key_removed", file=fn, zone=zone, reason="zone_not_signed")
+            by_zone.setdefault(zone, []).append(fn)
+
+        state_path = self.state_dir / DNSSEC_KEY_PRUNE_STATE
+        try:
+            loaded = json.loads(state_path.read_text())
+            pending = {
+                str(k): float(v)
+                for k, v in (loaded if isinstance(loaded, dict) else {}).items()
+            }
+        except (OSError, ValueError, TypeError):
+            pending = {}
+
+        grace = DNSSEC_KEY_PRUNE_GRACE_SECONDS
+        keep: dict[str, float] = {}
+        removed: list[str] = []
+        for zone, files in by_zone.items():
+            since = pending.get(zone)
+            # A clock that went backwards restarts the window, never shortens it.
+            if since is None or since > now:
+                since = now
+                if grace > 0:
+                    log.info(
+                        "dnssec_key_prune_scheduled",
+                        zone=zone,
+                        files=len(files),
+                        grace_seconds=grace,
+                    )
+            if now - since < grace:
+                keep[zone] = since
+                continue
+            for fn in files:
+                try:
+                    os.unlink(os.path.join(key_dir, fn))
+                except OSError as e:
+                    log.warning("dnssec_key_remove_failed", file=fn, error=str(e))
+                    keep[zone] = since
+                    continue
+                removed.append(fn)
+                log.info("dnssec_key_removed", file=fn, zone=zone, reason="zone_not_signed")
+
+        if keep != pending:
+            try:
+                tmp = state_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(keep, sort_keys=True))
+                os.replace(tmp, state_path)
+            except OSError as e:
+                log.warning("dnssec_key_prune_state_write_failed", error=str(e))
         return removed
 
     def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
