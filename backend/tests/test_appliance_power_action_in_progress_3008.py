@@ -27,9 +27,13 @@ def test_true_while_another_process_holds_it_and_clears_when_it_dies(tmp_path, m
         [
             sys.executable,
             "-c",
-            "import fcntl,os,sys,time\n"
-            "fd=os.open(sys.argv[1],os.O_RDONLY); fcntl.flock(fd, fcntl.LOCK_EX)\n"
-            "print('held', flush=True); time.sleep(60)",
+            "\n".join(
+                [
+                    "import fcntl,os,sys,time",
+                    "fd=os.open(sys.argv[1],os.O_RDONLY); fcntl.flock(fd, fcntl.LOCK_EX)",
+                    "print('held', flush=True); time.sleep(60)",
+                ]
+            ),
             str(tmp_path),
         ],
         stdout=subprocess.PIPE,

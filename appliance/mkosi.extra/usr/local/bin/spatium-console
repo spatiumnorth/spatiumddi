@@ -5219,6 +5219,7 @@ def _record_reboot_cancel() -> None:
         try:
             tmp.unlink()
         except OSError:
+            # The temp file may never have been created; nothing to clean up.
             pass
 
 
