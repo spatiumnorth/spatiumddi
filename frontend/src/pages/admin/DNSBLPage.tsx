@@ -16,6 +16,7 @@ import {
   type DNSBLList,
   type DNSBLPinnedIP,
   type DNSBLSettings,
+  formatApiError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
@@ -88,9 +89,7 @@ export function DNSBLPage() {
       setPinError(null);
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setPinError(typeof detail === "string" ? detail : "Failed to pin IP");
+      setPinError(formatApiError(err, "Failed to pin IP"));
     },
   });
   const deletePinned = useMutation({

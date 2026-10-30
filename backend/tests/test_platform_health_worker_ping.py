@@ -24,8 +24,11 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health as health_module
+
+from ._signed_in import signed_in_headers
 
 
 class _FakeRedis:
@@ -79,36 +82,43 @@ def _workers(body: dict) -> dict:
 async def test_concurrent_requests_share_one_ping(
     client: AsyncClient, control: _CountingControl
 ) -> None:
+    # Anonymous, which is the surface the advisory is about (and which still
+    # pings: the rollup status depends on it). An anonymous caller sees the
+    # rollup only since #2935, so the worker detail is read signed in below.
     responses = await asyncio.gather(*(client.get("/health/platform") for _ in range(20)))
 
     assert control.calls == 1, f"{control.calls} broadcasts for 20 concurrent requests"
     for r in responses:
         assert r.status_code == 200
-        assert _workers(r.json())["status"] == "ok"
-        assert _workers(r.json())["workers"] == ["celery@w1"]
+        assert set(r.json()) == {"status"}
 
 
 @pytest.mark.asyncio
 async def test_result_is_cached_then_refreshed(
-    client: AsyncClient, control: _CountingControl, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient,
+    db_session: AsyncSession,
+    control: _CountingControl,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    headers = await signed_in_headers(db_session)
     now = [1000.0]
     monkeypatch.setattr(health_module, "monotonic", lambda: now[0], raising=True)
 
-    await client.get("/health/platform")
+    await client.get("/health/platform", headers=headers)
     now[0] += 1.0
-    await client.get("/health/platform")
+    await client.get("/health/platform", headers=headers)
     assert control.calls == 1, "a ping inside the cache window was not reused"
 
     now[0] += 60.0
-    body = (await client.get("/health/platform")).json()
+    body = (await client.get("/health/platform", headers=headers)).json()
     assert control.calls == 2, "an expired cached ping was not refreshed"
     assert _workers(body)["status"] == "ok"
+    assert _workers(body)["workers"] == ["celery@w1"]
 
 
 @pytest.mark.asyncio
 async def test_hung_ping_is_joined_not_duplicated(
-    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ping still running past the request timeout must not be re-issued.
 
@@ -117,6 +127,7 @@ async def test_hung_ping_is_joined_not_duplicated(
     """
     from app.celery_app import celery_app
 
+    headers = await signed_in_headers(db_session)
     gate = threading.Event()
     ctl = _CountingControl(gate=gate)
     monkeypatch.setattr(celery_app, "control", ctl)
@@ -124,7 +135,7 @@ async def test_hung_ping_is_joined_not_duplicated(
     monkeypatch.setattr(health_module, "WORKER_PING_TIMEOUT_S", 0.2, raising=False)
     try:
         for _ in range(3):
-            body = (await client.get("/health/platform")).json()
+            body = (await client.get("/health/platform", headers=headers)).json()
             assert _workers(body)["status"] == "error"
             assert _workers(body)["detail"] == "inspect timed out"
         assert ctl.calls == 1, f"{ctl.calls} pings in flight for one hung broker"

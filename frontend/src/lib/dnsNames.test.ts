@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { nameInZoneError, parseTtlInput, summarizeZoneNames } from "./dnsNames";
+import {
+  nameInZoneError,
+  parseTtlInput,
+  summarizeZoneNames,
+  zoneKindForName,
+} from "./dnsNames";
 
 describe("summarizeZoneNames (#1840)", () => {
   it("joins a short list whole", () => {
@@ -73,4 +78,16 @@ describe("parseTtlInput (#2073 / #2074)", () => {
       expect(typeof parseTtlInput(text)).toBe("string");
     },
   );
+});
+
+describe("zoneKindForName: a name that merely contains arpa is forward (#3079)", () => {
+  it.each([
+    ["arpa-corp.example.", "forward"],
+    ["myarpa.lan.", "forward"],
+    ["harpa.example.", "forward"],
+    ["1.168.192.in-addr.arpa.", "reverse"],
+    ["8.b.d.0.1.0.0.2.ip6.arpa.", "reverse"],
+  ])("%s is %s", (name, kind) => {
+    expect(zoneKindForName(name)).toBe(kind);
+  });
 });

@@ -569,3 +569,32 @@ def test_sock_diag_reads_a_real_raw_sockets_drops():
     assert (sock.sock_type, sock.protocol, sock.uid) == (3, 0x0003, os.geteuid())
     assert sock.drops > 0
     assert sock.drops == tp_drops
+
+
+def test_last_v4_is_the_dhcp4_share_of_the_total(tmp_path):
+    """#2889 — ``queue_evicted`` subtracts kernel drops from DHCPv4 arrivals,
+    so it needs the port-67 share without the port-547 one."""
+    path = tmp_path / "udp"
+
+    def rows(d67: int, d547: int) -> str:
+        head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+        r67 = f"   1: 00000000:0043 00000000:0000 07 00000000:00000000 00:00000000 00000000   0        0 111 2 0000000000000000 {d67}\n"
+        r547 = f"   2: 00000000:0223 00000000:0000 07 00000000:00000000 00:00000000 00000000   0        0 222 2 0000000000000000 {d547}\n"
+        return head + r67 + r547
+
+    c = SocketDropCounter(socket_type=lambda: "udp")
+    path.write_text(rows(10, 100))
+    assert c.sample_from((str(path),)) is None
+    assert c.last_v4 is None
+    path.write_text(rows(14, 107))
+    assert c.sample_from((str(path),)) == 11
+    assert c.last_v4 == 4
+    # Raw mode: the AF_PACKET sockets are the DHCPv4 share, the :67 UDP
+    # fallbacks are not counted at all.
+    packets = iter([{"packet:9": 50}, {"packet:9": 58}])
+    r = SocketDropCounter(packet_drops=lambda: next(packets), socket_type=lambda: "raw")
+    path.write_text(rows(0, 0))
+    r.sample_from((str(path),))
+    path.write_text(rows(500, 2))
+    assert r.sample_from((str(path),)) == 10
+    assert r.last_v4 == 8

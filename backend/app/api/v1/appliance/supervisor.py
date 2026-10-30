@@ -98,7 +98,7 @@ from app.core.auth_throttle import (
 from app.core.db_transient import is_transient_db_error
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
-from app.core.versions import upgrade_direction
+from app.core.versions import is_installed_target, upgrade_direction
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -124,8 +124,8 @@ from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
 from app.services.agents.container_oom import (
     apply_container_oom,
-    container_oom_report,
-    is_oom_reason,
+    carry_restart_history,
+    verdict_needs_write,
 )
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
@@ -1660,6 +1660,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     # #1446 — this boot's kernel boot id. A reboot request is retired when a
     # heartbeat arrives from a different boot. None from an older supervisor.
     boot_id: str | None = Field(default=None, max_length=64)
+    # #3008 — set when the console's F9 cancelled a reboot in this boot: the
+    # boot id the cancel was made in. A Fleet request stamped for this boot is
+    # retired at once rather than at the give-up. None from an older supervisor.
+    reboot_cancelled_boot_id: str | None = Field(default=None, max_length=64)
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
     # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
@@ -2239,8 +2243,10 @@ _HEARTBEAT_HOLD_CAP_S = 28.0
 
 
 async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
-    """Stamp a current ``OOMKilled`` from ``appliance.role_health`` onto the
-    DNS and DHCP server rows this appliance's containers serve (#2018, #2023).
+    """Stamp the supervisor's verdict from ``appliance.role_health`` onto the
+    DNS and DHCP server rows this appliance's containers serve: a current
+    ``OOMKilled`` (#2018, #2023), a crash loop whatever the kubelet calls the
+    cause, or an agent that has gone silent under a live supervisor (#2961).
     See ``app.services.agents.container_oom``.
 
     One row per engine: the most recently seen of the rows this appliance
@@ -2286,12 +2292,7 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
                 getattr(best, seen_attr) or floor
             ):
                 live[server.driver] = server
-        ids = [
-            s.id
-            for s in live.values()
-            if container_oom_report(health, s.driver, now) is not None
-            and not is_oom_reason(s.daemon_reason)
-        ]
+        ids = [s.id for s in live.values() if verdict_needs_write(s, health, now)]
         if not ids:
             continue
         locked = (
@@ -2465,6 +2466,9 @@ async def _supervisor_heartbeat(
     if refusal is not None:
         raise refusal
 
+    # #2961 — the previous heartbeat, so the role_health carry can tell an
+    # unbroken run of supervisor heartbeats from one resuming after a gap.
+    supervisor_prev_seen = row.last_seen_at
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
     if body.capabilities is not None:
@@ -2634,7 +2638,19 @@ async def _supervisor_heartbeat(
         # entries when the operator removes a role, and the
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
-        row.role_health = dict(body.role_health)
+        # #2961 — the kubelet's restartCount is lifetime, so the restarts
+        # inside the crash-loop window are measured across heartbeats: each
+        # container's observed counts are carried forward from the stored
+        # row (a backend-owned key; one the supervisor sends is dropped).
+        # It also stamps when the supervisor's current unbroken run of
+        # heartbeats began, which bounds how long a silent agent can be said
+        # to have been silent.
+        row.role_health = carry_restart_history(
+            row.role_health,
+            dict(body.role_health),
+            datetime.now(UTC),
+            supervisor_last_seen=supervisor_prev_seen,
+        )
         # #2018 — the kubelet's OOMKilled for a DNS role container, onto the
         # server row. The agent died in the same group kill and cannot say
         # it; while the container crash-loops this is the only report.
@@ -3037,7 +3053,7 @@ async def _supervisor_heartbeat(
     # legacy dns_server / dhcp_server auto-clear.
     if (
         row.desired_appliance_version is not None
-        and row.installed_appliance_version == row.desired_appliance_version
+        and is_installed_target(row.installed_appliance_version, row.desired_appliance_version)
         and row.last_upgrade_state in (None, "done", "ready")
     ):
         row.desired_appliance_version = None
@@ -3072,6 +3088,23 @@ async def _supervisor_heartbeat(
     # command below: delivering it again from the new boot would reboot the
     # node a second time.
     deliver_reboot = False
+    if (
+        row.reboot_requested
+        and body.reboot_cancelled_boot_id
+        and body.reboot_cancelled_boot_id == body.boot_id
+        and row.reboot_requested_boot_id == body.boot_id
+    ):
+        # #3008 — cancelled from the console in this boot, after the request
+        # reached it (its boot id was recorded when it was first delivered).
+        # Nothing can fire again in this boot: retire it now, not at 900 s.
+        logger.info(
+            "appliance_reboot_cancelled_at_console",
+            appliance_id=str(row.id),
+            hostname=row.hostname,
+        )
+        row.reboot_requested = False
+        row.reboot_requested_at = None
+        row.reboot_requested_boot_id = None
     if row.reboot_requested:
         if body.boot_id:
             if row.reboot_requested_boot_id is None:
@@ -3203,7 +3236,10 @@ async def _supervisor_heartbeat(
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         break
-                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.WAKE:
+                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) in (
+                        WakeResult.WAKE,
+                        WakeResult.SHUTDOWN,  # #3015 — api stopping: answer now
+                    ):
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
@@ -5067,7 +5103,9 @@ async def update_appliance_roles(
             # Copilot's assign_appliance_role, #1902).
             from app.services.appliance.dhcp_group_move import move_appliance_dhcp_servers
 
-            dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, current_user)
+            dhcp_move = await move_appliance_dhcp_servers(
+                db, row, dhcp_group, current_user, prev_roles=prev_dns_roles
+            )
             moved_servers.extend(dhcp_move.moved)
             row.assigned_dhcp_group_id = dhcp_group.id
 
@@ -5508,6 +5546,14 @@ async def promote_control_plane(
     dns_refusal = await promote_dns_group_refusal(db, members, targets)
     if dns_refusal is not None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, dns_refusal)
+    # #2899 — a joiner's Kea pod joins the relay VIP Service the moment it is
+    # a node, so a joiner serving a ``direct`` DHCP group cannot be promoted
+    # while a relay VIP is set.
+    from app.services.dhcp.relay_vip import promote_refusal as dhcp_vip_refusal  # noqa: PLC0415
+
+    vip_refusal = await dhcp_vip_refusal(db, targets)
+    if vip_refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, vip_refusal)
 
     new_total = current_count + len(targets)
     if new_total % 2 == 0:
@@ -6658,6 +6704,11 @@ class MetalLBConfigResponse(BaseModel):
     # :53; ``dhcp_relay_vip`` fronts the Kea relay→server :67 forward.
     dns_vip: str = ""
     dhcp_relay_vip: str = ""
+    # #2899 — DHCP server groups behind the relay VIP that are still in
+    # ``direct`` (raw socket) mode, by name. Relays whose flows land on the
+    # node announcing the VIP get no answer from such a group, and no counter
+    # shows it. Empty when no relay VIP is set or every group is ``relay``.
+    dhcp_relay_vip_direct_groups: list[str] = Field(default_factory=list)
     # issue #566 decision D1 — BGP mode (export path: advertise the VIP
     # to upstream routers). Layered on top of the same MetalLB install;
     # requires ``enabled=True``.
@@ -6713,14 +6764,18 @@ def _metallb_pod_status() -> tuple[bool, int, int]:
     return (controller_ready, speakers_ready, speakers_total)
 
 
-def _metallb_response(row: PlatformSettings) -> MetalLBConfigResponse:
+async def _metallb_response(db: DB, row: PlatformSettings) -> MetalLBConfigResponse:
+    from app.services.dhcp.relay_vip import direct_groups_behind_relay_vip  # noqa: PLC0415
+
     controller_ready, speakers_ready, speakers_total = _metallb_pod_status()
+    direct_groups = await direct_groups_behind_relay_vip(db)
     return MetalLBConfigResponse(
         enabled=row.metallb_enabled,
         pool_addresses=list(row.metallb_pool_addresses or []),
         control_plane_vip=row.control_plane_vip or "",
         dns_vip=row.dns_vip or "",
         dhcp_relay_vip=row.dhcp_relay_vip or "",
+        dhcp_relay_vip_direct_groups=[g.name for g in direct_groups],
         bgp_enabled=row.metallb_bgp_enabled,
         bgp_peers=row.metallb_bgp_peers or [],
         bgp_advertisements=row.metallb_bgp_advertisements or [],
@@ -6864,7 +6919,7 @@ async def get_metallb_config(
     db: DB,
 ) -> MetalLBConfigResponse:
     row = await _get_or_create_settings(db)
-    return _metallb_response(row)
+    return await _metallb_response(db, row)
 
 
 @router.put(
@@ -6898,6 +6953,27 @@ async def put_metallb_config(
         "bgp_peers": list(row.metallb_bgp_peers or []),
         "bgp_advertisements": list(row.metallb_bgp_advertisements or []),
     }
+    # #2899 — refuse to START fronting DHCP groups with the relay VIP while
+    # any of them reads raw sockets: kube-proxy keeps about one relay in N on
+    # the announcing node's own Kea, whose raw socket drops the VIP-addressed
+    # frame, so those relays get no answer and nothing counts the loss.
+    # Only when the VIP is being turned on: a later edit to an unrelated field
+    # (a BGP peer, the pool) is not blocked on a state the operator already
+    # has, which the ``dhcp_relay_vip_direct_socket`` alert reports instead.
+    from app.services.dhcp.relay_vip import (  # noqa: PLC0415
+        direct_groups_behind_relay_vip,
+        effective_relay_vip,
+        refusal_for_groups,
+    )
+
+    new_relay_vip = body.dhcp_relay_vip if body.enabled else ""
+    if new_relay_vip and not effective_relay_vip(row):
+        direct = await direct_groups_behind_relay_vip(db, new_relay_vip)
+        if direct:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                refusal_for_groups(new_relay_vip, [g.name for g in direct]),
+            )
     row.metallb_enabled = body.enabled
     row.metallb_pool_addresses = body.pool_addresses
     row.control_plane_vip = body.control_plane_vip
@@ -6938,7 +7014,7 @@ async def put_metallb_config(
         vip=body.control_plane_vip,
         user=current_user.username,
     )
-    return _metallb_response(row)
+    return await _metallb_response(db, row)
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────
@@ -8431,6 +8507,7 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
     empty shape after ~30 s so the supervisor re-polls."""
     import asyncio as _asyncio  # noqa: PLC0415
 
+    from app.core.shutdown import sleep_or_shutdown  # noqa: PLC0415
     from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
@@ -8441,7 +8518,11 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
             return PcapPollResponse(**cmd)
         if _asyncio.get_running_loop().time() >= deadline:
             return PcapPollResponse()
-        await _asyncio.sleep(2.0)
+        if await sleep_or_shutdown(2.0):
+            # #3015 — this api process is stopping: the next pass makes one
+            # last claim check and answers the empty shape, so the supervisor
+            # re-polls another pod instead of being cancelled into a 500.
+            deadline = _asyncio.get_running_loop().time()
 
 
 @router.post(
@@ -8507,7 +8588,9 @@ async def pcap_upload(
         return {"status": "failed"}
 
     packets_q = request.query_params.get("packets")
-    packet_count = int(packets_q) if packets_q and packets_q.isdigit() else None
+    packet_count = (
+        int(packets_q) if packets_q and packets_q.isascii() and packets_q.isdigit() else None
+    )
     # Generous transfer ceiling: the configured byte cap + 16 MiB headroom
     # (pcap framing), never above the hard ceiling + headroom.
     cap = min((row.max_bytes or HARD_MAX_BYTES), HARD_MAX_BYTES) + 16 * 1024 * 1024

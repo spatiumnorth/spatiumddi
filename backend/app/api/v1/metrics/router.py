@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import require_any_resource_permission, require_resource_permission
+from app.core.permissions import require_resource_permission
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.services.feature_modules import require_module
 
@@ -119,6 +119,9 @@ class DHCPTimePoint(BaseModel):
     #: rendered as unknown, not as zero.
     receive_drop: int | None = None
     socket_drop: int | None = None
+    #: #2889 — DHCPv4 requests Kea read and then evicted from its packet
+    #: queue under a burst; no Kea counter sees them. Same ``None`` rule.
+    queue_evicted: int | None = None
 
 
 class DHCPTimeseries(BaseModel):
@@ -136,14 +139,14 @@ def _validate_window(window: str) -> None:
 
 
 # Each series reads the same grants as the server it describes: DNS server
-# traffic needs what the ``/dns`` router needs, DHCP traffic what the DHCP
-# server routes need.
+# traffic needs what the ``/dns`` server routes need (``dns_group``, #3073),
+# DHCP traffic what the DHCP server routes need.
 @router.get(
     "/dns/timeseries",
     response_model=DNSTimeseries,
     dependencies=[
         Depends(require_module("core.dns")),
-        Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record")),
+        Depends(require_resource_permission("dns_group")),
     ],
 )
 async def dns_timeseries(
@@ -244,6 +247,7 @@ async def dhcp_timeseries(
         # coalesced like the counters above.
         func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
         func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+        func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
     ).where(DHCPMetricSample.bucket_at >= since)
     if server_id is not None:
         stmt = stmt.where(DHCPMetricSample.server_id == server_id)
@@ -266,6 +270,7 @@ async def dhcp_timeseries(
             # opposite of unmeasured.
             receive_drop=None if row.receive_drop is None else int(row.receive_drop),
             socket_drop=None if row.socket_drop is None else int(row.socket_drop),
+            queue_evicted=None if row.queue_evicted is None else int(row.queue_evicted),
         )
         for row in rows
     ]

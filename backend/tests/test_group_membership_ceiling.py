@@ -554,8 +554,10 @@ async def test_a_time_bound_permission_is_not_a_ceiling_to_grant_from(
         users=[delegate],
     )
     await _grant(db_session, own, "admin", "dns_zone")
-    # The grant is live: the delegate does hold the permission right now.
-    r = await client.get("/api/v1/dns/groups", headers=_headers(delegate))
+    # The grant is live: the delegate does hold the permission right now
+    # (a route that needs dns_zone; listing server groups needs dns_group,
+    # #3073).
+    r = await client.get("/api/v1/dns/zone-templates", headers=_headers(delegate))
     assert r.status_code == 200, r.text
 
     target = await _group(db_session, roles=[await _role(db_session, zone_admin)], users=[])

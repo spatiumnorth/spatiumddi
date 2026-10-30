@@ -201,19 +201,37 @@ async def test_read_and_write_previews_the_zone_file(
     ]
 
 
-async def test_read_on_the_zone_type_is_enough_as_for_the_export(
+async def test_read_on_the_record_type_is_needed_not_any_dns_type(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    # The export passes on read of any of the three DNS types; so does the preview.
-    h = await _headers(
+    # #3073: the preview answers with the zone's records, so it needs read on
+    # ``dns_record`` (as the record list does); read on ``dns_zone`` no longer
+    # stands in for it, and the export needs both.
+    zone_reader = await _headers(
         db_session,
         [
             {"action": "write", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dns_zone"},
         ],
     )
+    h = await _headers(
+        db_session,
+        [
+            {"action": "write", "resource_type": "dns_record"},
+            {"action": "read", "resource_type": "dns_record"},
+            {"action": "read", "resource_type": "dns_zone"},
+        ],
+    )
     zone = await _zone(db_session)
     await db_session.commit()
+
+    r = await client.post(
+        f"{_base(zone)}/import/spreadsheet/preview",
+        headers=zone_reader,
+        data={"mode": "replace"},
+        **_sheet(),
+    )
+    assert r.status_code == 403, r.text
 
     assert (await client.get(f"{_base(zone)}/export", headers=h)).status_code == 200
     r = await client.post(

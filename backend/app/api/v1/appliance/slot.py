@@ -15,13 +15,12 @@ from typing import Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
 from app.core.permissions import require_permission
-from app.models.appliance import CLUSTER_ROLES, Appliance
 from app.models.audit import AuditLog
+from app.services.appliance.cluster_guard import reject_if_clustered
 from app.services.appliance.slot import (
     SlotStatus,
     can_rollback,
@@ -87,52 +86,17 @@ class ApplyResponse(BaseModel):
 
 
 async def _reject_if_clustered(db: DB, action: str) -> None:
-    """Refuse a node-local WRITE when this deployment has more than one
-    appliance node.
+    """Refuse a node-local slot write on a multi-node control plane.
 
-    ``schedule_apply``/``schedule_rollback`` write trigger files into
-    ``/var/lib/spatiumddi-host/release-state``, which is a hostPath on the
-    node the responding pod happens to occupy. That is correct on a
-    single-node appliance — there is exactly one node, and it is this one.
-    On a cluster it is not: the api Deployment runs one replica per
-    control-plane node behind a Service with no session affinity, so the
-    node that receives this POST is chosen by the load balancer. The
-    operator asks to upgrade an appliance and an arbitrary machine writes
-    its inactive slot; addressing a node's own IP does not change that,
-    because the IP selects an ingress, not a pod.
-
-    A wrong-node upgrade is silent — 202 Accepted, a real upgrade, on a
-    host nobody named — so this refuses rather than guesses. The
-    per-appliance endpoints
-    (``POST /appliance/appliances/{id}/upgrade``, ``/set-next-boot``,
-    ``/set-default-slot``) are the node-addressed path: they stamp desired
-    state on that appliance's row and the target node's own supervisor
-    writes the trigger on its own disk.
-
-    Counts CONTROL-PLANE nodes, not approved appliances: ``cluster_role`` is
-    NULL for a data-plane appliance and for a single node that has not been
-    promoted, and becomes primary/member only on promotion. That is the same
-    quantity the api Deployment's replica count tracks, so it is exactly the
-    condition that makes "which node answered?" ambiguous — a single-node
-    control plane with paired data-plane appliances stays unambiguous and
-    keeps working.
+    The rationale lives on ``reject_if_clustered`` (shared with the local
+    reboot endpoint, #3011).
     """
-    nodes = (
-        await db.execute(
-            select(func.count())
-            .select_from(Appliance)
-            .where(Appliance.cluster_role.in_(CLUSTER_ROLES))
-        )
-    ).scalar_one()
-    if nodes > 1:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"{action} is unavailable on a clustered deployment: this endpoint "
-            f"acts on whichever node serves the request ({settings.node_name or 'unknown'}), "
-            f"not on one you can choose, and this cluster has {nodes} control-plane nodes. "
-            "Use POST /api/v1/appliance/appliances/{appliance_id}/upgrade, which "
-            "targets a node by id and lets that node's own supervisor apply it.",
-        )
+    await reject_if_clustered(
+        db,
+        action,
+        "Use POST /api/v1/appliance/appliances/{appliance_id}/upgrade, which "
+        "targets a node by id and lets that node's own supervisor apply it.",
+    )
 
 
 def _serialise(s: SlotStatus) -> SlotStatusResponse:

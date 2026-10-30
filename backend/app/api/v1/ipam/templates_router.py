@@ -22,7 +22,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.dns import DNS_TTL_MAX
 from app.models.ipam import IPAMTemplate, IPBlock, Subnet
 from app.services.ipam.templates import (
@@ -33,6 +33,7 @@ from app.services.ipam.templates import (
     find_block_instances,
     find_subnet_instances,
 )
+from app.services.ipam.zone_binding import check_zone_uuid, check_zone_uuid_list
 
 router = APIRouter(
     prefix="/templates",
@@ -109,6 +110,18 @@ class IPAMTemplateBase(BaseModel):
     ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     child_layout: dict[str, Any] | None = None
 
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _v_dns_zone_id(cls, v: str | None) -> str | None:
+        # The template stamps this onto a block / subnet: refuse a value that
+        # names no zone rather than store it there (#2923).
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _v_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
+
     @field_validator("applies_to")
     @classmethod
     def _v_applies_to(cls, v: str) -> str:
@@ -167,6 +180,18 @@ class IPAMTemplateUpdate(BaseModel):
     clear_child_layout: bool = False
     clear_ddns_domain_override: bool = False
     clear_ddns_ttl: bool = False
+
+    @field_validator("dns_zone_id")
+    @classmethod
+    def _v_dns_zone_id(cls, v: str | None) -> str | None:
+        # The template stamps this onto a block / subnet: refuse a value that
+        # names no zone rather than store it there (#2923).
+        return check_zone_uuid(v, blank=None)
+
+    @field_validator("dns_additional_zone_ids")
+    @classmethod
+    def _v_dns_additional_zone_ids(cls, v: list[str] | None) -> list[str] | None:
+        return check_zone_uuid_list(v, field="dns_additional_zone_ids")
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -417,6 +442,20 @@ async def delete_template(template_id: uuid.UUID, current_user: CurrentUser, db:
     return None
 
 
+def _require_target_write(
+    user: Any, resource_type: str, resource_id: uuid.UUID | None = None
+) -> None:
+    """403 unless ``user`` may write the block or subnet a template is stamped
+    onto (#3058). The router gate asks only ``manage_ipam_templates``, which
+    is the right to author templates, not to change the blocks and subnets
+    they are applied to (nor to carve new subnets into a block)."""
+    if not user_has_permission(user, "write", resource_type, resource_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: need 'write' on '{resource_type}'",
+        )
+
+
 @router.post("/{template_id}/apply", response_model=TemplateApplyResponse)
 async def apply_template(
     template_id: uuid.UUID,
@@ -437,6 +476,9 @@ async def apply_template(
         block = await db.get(IPBlock, body.block_id)
         if block is None or block.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+        _require_target_write(current_user, "ip_block", block.id)
+        if body.carve_children and template.child_layout is not None:
+            _require_target_write(current_user, "subnet")
         try:
             written = apply_template_to_block(template, block, force=body.force)
         except TemplateError as exc:
@@ -482,6 +524,7 @@ async def apply_template(
     subnet = await db.get(Subnet, body.subnet_id)
     if subnet is None or subnet.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _require_target_write(current_user, "subnet", subnet.id)
     try:
         written = apply_template_to_subnet(template, subnet, force=body.force)
     except TemplateError as exc:
@@ -521,6 +564,15 @@ async def reapply_all(
     template = await db.get(IPAMTemplate, template_id)
     if template is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
+
+    # Every recorded instance is rewritten, so type-level write on the
+    # instances' type (and on subnets, where the layout carves children).
+    if template.applies_to == "block":
+        _require_target_write(current_user, "ip_block")
+        if template.child_layout is not None:
+            _require_target_write(current_user, "subnet")
+    else:
+        _require_target_write(current_user, "subnet")
 
     processed = 0
     skipped = 0

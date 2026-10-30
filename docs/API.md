@@ -44,7 +44,7 @@ infrastructure rather than application surface:
 | `/health/live` | Liveness probe — 200 if the process is up | none |
 | `/health/ready` | Readiness probe — DB connectivity + **schema-at-head** + Redis; a pod already ready stays ready on a schema a newer release migrated while every table and column it uses is present (#2777) | none |
 | `/health/startup` | Same logic as `/health/ready`, for slow-start k8s containers | none |
-| `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard | none |
+| `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard. Anonymous callers get the rollup `status` only; the component list needs a signed-in caller (#2935) | optional |
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |
 | `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
 
@@ -67,7 +67,7 @@ and [`backend/app/api/docs.py`](https://github.com/spatiumnorth/spatiumddi/blob/
 |---|---|
 | `/api/docs` | Swagger UI |
 | `/api/redoc` | ReDoc |
-| `/api/openapi.json` | The OpenAPI 3.x schema document |
+| `/api/openapi.json` | The OpenAPI 3.x schema document — **signed in only** |
 
 Note the `/api/` prefix on the docs routes — they are **not** under
 `/api/v1`. The api serves the Swagger UI and ReDoc bundles itself, from
@@ -78,6 +78,25 @@ response models on every route, so it always reflects the running
 build. Each router carries a `tags=[...]` label (alphabetised in
 `router.py`) so the Swagger / ReDoc sidebar groups endpoints by
 feature area.
+
+**Signed in only (#2935).** The schema names every route and carries the
+exact running version in `info.version`, so `/api/openapi.json` needs a
+session or an API token (`Authorization: Bearer …`) and answers 401
+otherwise. The two HTML pages still load for anyone, but they carry only
+the page title. Each fetches the schema from `/api/v1/auth/openapi.json`,
+which accepts the browser's sign-in cookie and reads it **without rotating
+it**: a refresh (`POST /api/v1/auth/refresh`) would revoke the session the
+console tab's token belongs to, and a console refresh racing the docs
+page's would log the operator out. Signed in, the docs render as before;
+"Try it out" carries no token until you use **Authorize**, as before.
+Signed out, the page says so and links to the sign-in page. From a script,
+fetch the schema with an API token:
+
+```bash
+curl -H "Authorization: Bearer $SPATIUM_TOKEN" https://ddi.example.com/api/openapi.json
+```
+
+The release asset below is unaffected and needs no credential.
 
 ### 2.1 The versioned contract (`openapi.json` release asset)
 
@@ -119,8 +138,8 @@ guarantees and a hand-rolled dump would not:
   public API.
 
 **Version handshake.** A client knows which spec it was built against, and
-`GET /api/v1/version` (unauthenticated — see §7.2) reports what the server
-is running. Gating a feature is then a version comparison rather than
+`GET /api/v1/version` (see §7.2) reports what the server is running, to a
+signed-in caller. Gating a feature is then a version comparison rather than
 probing for an endpoint and interpreting the 404.
 
 The document declares no `servers` block. That is deliberate: there is no
@@ -318,12 +337,14 @@ returns `403`.
 { "username": "admin", "password": "admin" }
 ```
 
-On success (and no MFA) the response is:
+The refresh token is never in a response body. On success the server sets it
+as the HttpOnly `spatium_refresh` cookie (`Set-Cookie`), and the same holds for
+the response of `POST /api/v1/auth/login/mfa`. On success (and no MFA) the
+body is:
 
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "9c2f...e1",
   "token_type": "bearer",
   "force_password_change": true,
   "mfa_required": false,
@@ -338,7 +359,6 @@ factor at `POST /api/v1/auth/login/mfa`:
 ```json
 {
   "access_token": null,
-  "refresh_token": null,
   "token_type": "bearer",
   "force_password_change": false,
   "mfa_required": true,
@@ -358,12 +378,11 @@ password-recovery allowlist (`/auth/change-password`, `/auth/logout`,
 
 `POST /api/v1/auth/refresh`
 
-```json
-{ "refresh_token": "9c2f...e1" }
-```
-
-returns a fresh `{ access_token, refresh_token, token_type,
-force_password_change }`. Refresh is **rotating**: the presented
+takes no body: the refresh token is read from the `spatium_refresh` cookie
+the login set. Without the cookie the answer is 401 "Missing refresh token".
+It returns a fresh `{ access_token, token_type, force_password_change }`
+and sets the rotated
+refresh token as the cookie again. Refresh is **rotating**: the presented
 refresh token's session is revoked and a new session (and new refresh
 token) is issued. Each access token carries the issuing session's UUID
 as its `jti` claim, so revoking the session (`POST /api/v1/auth/logout`
@@ -463,8 +482,8 @@ entry and nowhere else — a `feature_module` row means an operator
 changed it. A module ships **enabled** only if it is core IPAM / DNS /
 DHCP workflow, a zero-footprint UI convenience, or a hand-invoked
 read-only diagnostic; everything else ships **disabled**
-([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 14 of
-53 are on out of the box. Settings → Features lists every module with
+([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 16 of
+57 are on out of the box. Settings → Features lists every module with
 its description either way, so a disabled one is still discoverable.
 Examples of gated prefixes (from `router.py`):
 
@@ -485,10 +504,15 @@ Operators toggle modules via the admin feature-modules surface under
 
 ## 6. Pagination
 
-There are two list shapes in the codebase. New routers should use the
-envelope; the legacy core routers return bare arrays.
+There are three list shapes in the codebase: the `{items, total, limit,
+offset}` envelope (6.1), bare arrays (6.2), and `Page[T]`
+(`{items, total, page, page_size}`, `backend/app/api/pagination.py`), which
+DNS records and DHCP leases answer and which that module names as the shape
+for new endpoints that can grow unbounded. The audit list answers
+`{total, items}`. Check the route's schema in `/api/docs` rather than
+assuming one shape.
 
-### 6.1 `{items, total, limit, offset}` envelope (preferred)
+### 6.1 `{items, total, limit, offset}` envelope
 
 The network-modeling and newer routers (circuits, services, ASNs,
 VRFs, overlays, multicast, TLS certs, …) accept `limit` + `offset`
@@ -601,14 +625,48 @@ key is replaced whole. A boolean or integer under a credential-shaped
 key is kept, so a writer's `smtp_password_set: true` still says whether
 the secret was set. Both endpoints need `read` on `audit_log`.
 
-### 7.2 Read the running version (public)
+### 7.2 Read the running version (public, details signed in)
 
-`GET /api/v1/version` is unauthenticated (the login page calls it for
-the release-check banner); the host-identity fields are only populated
-for authenticated callers:
+`GET /api/v1/version` answers everyone, but version and stack details are
+for signed-in users only (#2935). An anonymous caller gets a coarse
+handshake: enough to know it reached a SpatiumDDI control plane, and
+nothing about which release. `restricted: true` says the other fields
+were withheld rather than empty. `version` carries the placeholder
+`"restricted"` rather than null, so an installer ISO built before this
+change, which checks only for a non-empty `version` string, still reports
+the control plane as reachable; it is not a release, and SpatiumDDI's own
+version parsers read it as an unknown version:
 
 ```json
 {
+  "product": "SpatiumDDI",
+  "api_level": 1,
+  "restricted": true,
+  "version": "restricted",
+  "latest_version": null,
+  "update_available": false,
+  "latest_release_url": null,
+  "latest_checked_at": null,
+  "release_check_enabled": false,
+  "latest_check_error": null,
+  "appliance_mode": false,
+  "appliance_version": null,
+  "appliance_hostname": null
+}
+```
+
+`api_level` is the major version of the REST surface (the `/api/v1`
+prefix), and changes only when a v1 client can no longer talk to the
+server. The appliance installer uses `product` to check that the URL it was
+given is a control plane before it wipes a disk.
+
+A signed-in caller (a session or an API token) gets the full answer:
+
+```json
+{
+  "product": "SpatiumDDI",
+  "api_level": 1,
+  "restricted": false,
   "version": "2026.06.25-1",
   "latest_version": null,
   "update_available": false,
@@ -649,7 +707,7 @@ Common status codes across the surface:
 | `409 Conflict` | Uniqueness / overlap / collision conflict, or a delete refused because rows still reference the target |
 | `413 Content Too Large` | The request body is over the API's body cap (see below) |
 | `422 Unprocessable Entity` | Pydantic request-body / query-param validation failure, or a request-supplied reference to a row that does not exist |
-| `429 Too Many Requests` | Per-IP login rate limit tripped |
+| `429 Too Many Requests` | A rate limit or attempt budget tripped: the per-IP, per-username or install-wide sign-in ceilings, the MFA wrong-code and step-up budgets, appliance registration, and a few others (some carry `Retry-After`) |
 | `503 Service Unavailable` | Maintenance mode, transient DB-connection-closed (carries `Retry-After`), or a failing readiness check |
 
 ### Request body limits
@@ -660,8 +718,15 @@ over it is refused before any of the body is read; a body sent without one
 is counted as it arrives and refused once it passes the cap. The cap is
 `MAX_REQUEST_BODY_BYTES` (default **8 MiB**, minimum 64 KiB), set in the
 api's environment: `.env` on Docker Compose, `api.env` in the Helm chart.
-It applies to the api port itself; traffic through the bundled nginx is
-already limited to 1 MiB on `/api/`.
+It applies to the api port itself. The bundled nginx admits 1 MiB on
+`/api/`, except on the routes below, which each have an nginx location
+that passes the body through to the api unbuffered. For the importers,
+the zone spreadsheet, the pcap upload and the agents' ingested-records
+push, that location's limit is exactly the route's own limit in the table
+below, and nginx answers a body over it with the same JSON 413 the api
+sends, before any of it is proxied
+([#3036](https://github.com/spatiumnorth/spatiumddi/issues/3036)). Backups
+(2 GiB) and upgrade images (4 GiB) pass through at those sizes.
 
 Routes that take larger bodies keep their own limits, which the cap never
 lowers:
@@ -752,7 +817,9 @@ server-side log lines for that request (non-negotiable #7).
 - **CORS** — origins come from the `CORS_ORIGINS` env var (comma-
   separated; default `*`). With a wildcard, credentialed CORS is
   disabled by construction (the API authenticates via the
-  `Authorization` header, not cookies). Pin explicit origins to enable
+  `Authorization` header; the HttpOnly `spatium_refresh` cookie and the
+  short-lived OIDC / SAML sign-in flow cookies are scoped to
+  `/api/v1/auth`). Pin explicit origins to enable
   `allow_credentials`.
 - **Trusted hosts** — `TRUSTED_HOSTS` (default `*`) gates the inbound
   `Host` header; set it to your real hostnames to harden against

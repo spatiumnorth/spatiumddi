@@ -8,7 +8,9 @@ import {
   Wrench,
 } from "lucide-react";
 
+import { Link } from "react-router-dom";
 import { applianceSystemApi, formatApiError } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
@@ -19,7 +21,8 @@ import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
  *  1. Toggle maintenance-mode flag (file-backed; recorded and shown,
  *     nothing reads it yet — #2618).
  *  2. Schedule a host reboot (writes a trigger file; host-side
- *     systemd Path unit waits 10 s + runs ``systemctl reboot``).
+ *     systemd Path unit waits 10 s, hands the PostgreSQL primary off
+ *     when this node holds it (#2974), then runs ``systemctl reboot``).
  *
  * Plus the reboot-pending banner mirrored from the Network tab so
  * operators don't have to flip back and forth.
@@ -33,7 +36,15 @@ export function MaintenanceTab() {
   const info = useQuery({
     queryKey: ["appliance", "system", "info"],
     queryFn: applianceSystemApi.info,
-    refetchInterval: 15_000,
+    // #3008 — a reboot started from Fleet or the console can be seconds
+    // from request to the node going down; 15 s missed it entirely. The
+    // endpoint is a few file stats, and only this open tab polls this fast.
+    refetchInterval: (q) =>
+      isRefused(q.state.error)
+        ? false
+        : q.state.data?.reboot_scheduled || q.state.data?.reboot_in_progress
+          ? 2_000
+          : 5_000,
   });
 
   const toggleMaint = useMutation({
@@ -52,6 +63,10 @@ export function MaintenanceTab() {
   });
 
   const data = info.data;
+  // #3008 — the trigger file is renamed before the primary handoff, so
+  // reboot_scheduled reads false while the handoff runs; reboot_in_progress
+  // (the host wrapper's lock) covers that until the node goes down.
+  const rebootUnderway = !!(data?.reboot_scheduled || data?.reboot_in_progress);
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
@@ -77,13 +92,18 @@ export function MaintenanceTab() {
         </div>
       )}
 
-      {data?.reboot_scheduled && (
+      {rebootUnderway && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
           <Activity className="mt-0.5 h-4 w-4 shrink-0 animate-pulse text-amber-600 dark:text-amber-400" />
           <div className="text-amber-700 dark:text-amber-400">
-            <strong>Reboot in flight.</strong> The host's systemd Path unit has
-            the trigger; it'll call <code>systemctl reboot</code> after a
-            10-second grace. The browser will lose connection shortly.
+            <strong>
+              Reboot in flight{data?.node ? ` on ${data.node}` : ""}.
+            </strong>{" "}
+            The host calls <code>systemctl reboot</code> after a short grace (10
+            s from this page), and on the node holding the database primary only
+            once the primary has moved to another node (up to a few minutes). A
+            reboot started from Fleet or the console shows here too. The browser
+            may lose connection shortly.
           </div>
         </div>
       )}
@@ -139,19 +159,40 @@ export function MaintenanceTab() {
             <p className="mt-0.5 text-[11px] text-muted-foreground">
               Reboots the OS (not just the container stack). Useful after an
               unattended-upgrade kernel install. 10-second grace before the host
-              actually issues <code>systemctl reboot</code>.
+              actually issues <code>systemctl reboot</code>; on the node holding
+              the database primary, the primary moves to another node first (up
+              to a few minutes).
             </p>
+            {data?.reboot_available === false && (
+              <p
+                className="mt-1 text-[11px] text-amber-700 dark:text-amber-400"
+                data-testid="reboot-unavailable"
+              >
+                {data.reboot_unavailable_reason ??
+                  "Reboot is unavailable on a multi-node control plane."}{" "}
+                Reboot each node from Fleet instead.
+              </p>
+            )}
           </div>
-          <button
-            type="button"
-            onClick={() => setConfirmReboot(true)}
-            disabled={data?.reboot_scheduled}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
-            {...applianceGate}
-          >
-            <Power className="h-3.5 w-3.5" />
-            {data?.reboot_scheduled ? "Already scheduled" : "Reboot now"}
-          </button>
+          {data?.reboot_available === false ? (
+            <Link
+              to="/appliance?tab=fleet"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+            >
+              Reboot from Fleet
+            </Link>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setConfirmReboot(true)}
+              disabled={rebootUnderway}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+              {...applianceGate}
+            >
+              <Power className="h-3.5 w-3.5" />
+              {rebootUnderway ? "Already scheduled" : "Reboot now"}
+            </button>
+          )}
         </div>
       </section>
 
@@ -160,9 +201,11 @@ export function MaintenanceTab() {
         title="Reboot appliance?"
         message={
           <span>
-            The host will power-cycle in ~10 seconds. Existing DHCP leases keep
-            their state (DB-backed); DNS zones reload from the served config;
-            the web UI will be unreachable for ~1 minute.
+            The host will power-cycle in ~10 seconds (up to a few minutes on the
+            node holding the database primary, which moves to another node
+            first). Existing DHCP leases keep their state (DB-backed); DNS zones
+            reload from the served config; the web UI will be unreachable for ~1
+            minute.
           </span>
         }
         confirmLabel="Reboot now"

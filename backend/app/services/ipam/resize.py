@@ -90,6 +90,11 @@ from app.models.dhcp import (
 from app.models.dns import DNSRecord
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_boundary import (
+    boundary_addresses,
+    boundary_host_conflicts,
+    ensure_boundary_rows,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -269,7 +274,7 @@ async def _try_advisory_lock(db: AsyncSession, resource_id: uuid.UUID, namespace
 # ── Shared validation ────────────────────────────────────────────────────────
 
 
-def _validate_grow(old_net: IPNetwork, new_net: IPNetwork) -> None:
+def _validate_grow(old_net: IPNetwork, new_net: IPNetwork, *, _what: str = "subnet") -> None:
     if isinstance(old_net, ipaddress.IPv4Network) != isinstance(new_net, ipaddress.IPv4Network):
         raise ResizeError(
             "Address family change is not supported (v4 ↔ v6). Create a new "
@@ -280,7 +285,7 @@ def _validate_grow(old_net: IPNetwork, new_net: IPNetwork) -> None:
         raise ResizeError(
             "Resize is grow-only — the new CIDR must have a smaller prefix "
             f"length (shorter mask) than the current /{old_net.prefixlen}. "
-            "To reduce a subnet, delete it and recreate at the smaller size.",
+            f"To reduce a {_what}, delete it and recreate at the smaller size.",
             status_code=422,
         )
     if not old_net.subnet_of(new_net):  # type: ignore[arg-type]
@@ -548,6 +553,14 @@ async def _parent_containment_conflicts_block(
 # ── Placeholder row helpers ──────────────────────────────────────────────────
 
 
+async def _subnet_rows(db: AsyncSession, subnet_id: uuid.UUID) -> list[IPAddress]:
+    return list(
+        (await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id)))
+        .scalars()
+        .all()
+    )
+
+
 async def _load_boundary_placeholders(
     db: AsyncSession, subnet_id: uuid.UUID, old_net: IPNetwork
 ) -> tuple[list[IPAddress], list[IPAddress]]:
@@ -707,6 +720,17 @@ async def preview_subnet_resize(
             )
         )
         conflicts.extend(await _parent_containment_conflicts_subnet(db, subnet, new_net))
+        conflicts.extend(
+            ResizeConflict(
+                type="host_on_new_boundary", detail=d.replace(" first.", " before resizing.")
+            )
+            for d in boundary_host_conflicts(
+                await _subnet_rows(db, subnet.id),
+                [new_net],
+                kind=subnet.kind,
+                already=boundary_addresses(old_net, subnet.kind),
+            )
+        )
 
     # Placeholder classification — independent of conflicts so the UI can
     # show the distribution even when the preview is otherwise blocked.
@@ -924,7 +948,7 @@ async def preview_block_resize(
         )
 
     try:
-        _validate_grow(old_net, new_net)
+        _validate_grow(old_net, new_net, _what="block")
     except ResizeError as exc:
         conflicts.append(ResizeConflict(type="validation", detail=str(exc)))
 
@@ -1154,6 +1178,21 @@ async def commit_subnet_resize(
     parent_conflicts = await _parent_containment_conflicts_subnet(db, subnet, new_net)
     if parent_conflicts:
         raise ResizeError(parent_conflicts[0].detail, status_code=422)
+    # Only a boundary the resize moves onto a host is refused: a host already
+    # on the old network address (skip_auto_addresses, or an IPv6 subnet from
+    # before #506) stays where it was when the network address does not move.
+    host_conflicts = boundary_host_conflicts(
+        await _subnet_rows(db, subnet.id),
+        [new_net],
+        kind=subnet.kind,
+        already=boundary_addresses(old_net, subnet.kind),
+    )
+    if host_conflicts:
+        raise ResizeError(
+            "Resize blocked: "
+            + "; ".join(d.replace(" first.", " before resizing.") for d in host_conflicts),
+            status_code=409,
+        )
 
     # Snapshot old state for audit + summary.
     old_gateway = str(subnet.gateway) if subnet.gateway else None
@@ -1181,43 +1220,15 @@ async def commit_subnet_resize(
 
     # 3. Re-create default-named placeholder rows at the new boundaries.
     placeholders_created = 0
-    is_v6 = isinstance(new_net, ipaddress.IPv6Network)
-    if replace_default_placeholders and new_net.prefixlen < 31:
-        # Only emit the rows that are "missing" — a renamed placeholder at
-        # the new boundary would still be covered by the rows we preserved
-        # above. Guard against accidentally creating a duplicate at the
-        # same address.
-        existing_addr_rows = (
-            (await db.execute(select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)))
-            .scalars()
-            .all()
+    if replace_default_placeholders:
+        # Same rows, same thresholds as create_subnet (#506, #2976).
+        placeholders_created += await ensure_boundary_rows(
+            db,
+            subnet.id,
+            new_net,
+            current_user.id if current_user is not None else None,
+            kind=subnet.kind,
         )
-        existing_addrs = {str(a) for a in existing_addr_rows}
-
-        if str(new_net.network_address) not in existing_addrs:
-            db.add(
-                IPAddress(
-                    subnet_id=subnet.id,
-                    address=str(new_net.network_address),
-                    status="network",
-                    description="Network address",
-                    created_by_user_id=(current_user.id if current_user is not None else None),
-                )
-            )
-            placeholders_created += 1
-        if not is_v6:
-            bcast = str(new_net.broadcast_address)
-            if bcast not in existing_addrs:
-                db.add(
-                    IPAddress(
-                        subnet_id=subnet.id,
-                        address=bcast,
-                        status="broadcast",
-                        description="Broadcast address",
-                        created_by_user_id=(current_user.id if current_user is not None else None),
-                    )
-                )
-                placeholders_created += 1
         await db.flush()
 
     # 3b. A moved gateway is reserved the way create_subnet reserves a new
@@ -1396,7 +1407,7 @@ async def commit_block_resize(
 
     old_net = _parse_cidr(str(block.network), label="block")
     new_net = _parse_cidr(new_cidr, label="new CIDR")
-    _validate_grow(old_net, new_net)
+    _validate_grow(old_net, new_net, _what="block")
     canonical_new = str(new_net)
     canonical_old = str(old_net)
 

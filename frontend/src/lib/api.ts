@@ -4,6 +4,7 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 import { idleHeader } from "@/lib/activity";
+import { sharedRefresh } from "@/lib/crossTabAuth";
 import {
   getAccessToken,
   setAccessToken,
@@ -119,7 +120,24 @@ function createClient(): AxiosInstance {
         }
 
         originalRequest._retry = true;
+        // The token THIS request carried, not the tab's current one: another
+        // tab's broadcast may already have moved this tab to a fresh token
+        // while the request was in flight (#2960). Then there is nothing to
+        // refresh: retry with the current token. Refreshing anyway would
+        // rotate again and kill the other tabs' tokens, the very churn this
+        // is meant to stop.
+        const sentAuth = originalRequest.headers?.Authorization;
+        const sentToken =
+          typeof sentAuth === "string" && sentAuth.startsWith("Bearer ")
+            ? sentAuth.slice("Bearer ".length)
+            : null;
+        const currentToken = getAccessToken();
+        if (sentToken && currentToken && sentToken !== currentToken) {
+          originalRequest.headers.Authorization = `Bearer ${currentToken}`;
+          return client(originalRequest);
+        }
         isRefreshing = true;
+        const staleToken = sentToken ?? currentToken;
         try {
           // The refresh token rides the HttpOnly cookie automatically; the
           // rotated refresh token comes back as a new Set-Cookie and the fresh
@@ -127,12 +145,19 @@ function createClient(): AxiosInstance {
           // cookie flow on a cross-ORIGIN (but same-site) API host when CORS
           // credentials are enabled; the cookie is SameSite=Strict, so a
           // genuinely cross-SITE SPA/API split is not supported by design.
-          const res = await client.post<RefreshResponse>(
-            "/auth/refresh",
-            {},
-            { withCredentials: true },
+          // One refresh for every tab of this browser (#2960): another tab
+          // may already have rotated, in which case its token is adopted.
+          const { access_token, force_password_change } = await sharedRefresh(
+            async (signal) =>
+              (
+                await client.post<RefreshResponse>(
+                  "/auth/refresh",
+                  {},
+                  { withCredentials: true, signal },
+                )
+              ).data,
+            staleToken,
           );
-          const { access_token, force_password_change } = res.data;
           setAccessToken(access_token);
           setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
@@ -180,6 +205,24 @@ export const api = createClient();
  * site in the app.
  */
 export function formatApiError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, false);
+}
+
+/**
+ * formatApiError for a form dialog: also drops the "Value error, " pydantic
+ * puts in front of a validator's message (#2435, #3041), which names nothing
+ * the reader can act on. Only a 422 entry's own `msg` is trimmed, and only at
+ * its start, so the same words inside a real message are left alone.
+ */
+export function formatDialogError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, true);
+}
+
+function formatError(
+  err: unknown,
+  fallback: string,
+  stripPydanticPrefix: boolean,
+): string {
   const anyErr = err as {
     response?: { data?: { detail?: unknown } };
     message?: string;
@@ -195,7 +238,12 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
         const loc = Array.isArray(rec.loc)
           ? rec.loc.filter((s) => s !== "body").join(".")
           : "";
-        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(e);
+        const msg =
+          typeof rec.msg === "string"
+            ? stripPydanticPrefix
+              ? rec.msg.replace(/^Value error, /, "")
+              : rec.msg
+            : JSON.stringify(e);
         return loc ? `${loc}: ${msg}` : msg;
       })
       .filter(Boolean);
@@ -207,11 +255,24 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
     //   {"field": "match_clients", "value": "10.0.0.300", "message": "…"}
     // Without this the operator was shown the raw JSON, which buries the
     // one sentence that tells them what to fix.
-    const rec = detail as { message?: unknown; field?: unknown };
+    const rec = detail as {
+      message?: unknown;
+      field?: unknown;
+      errors?: unknown;
+    };
     if (typeof rec.message === "string" && rec.message.trim()) {
       return typeof rec.field === "string" && rec.field
         ? `${rec.field}: ${rec.message}`
         : rec.message;
+    }
+    // The password policy's refusal (#3040): `{reason: "password_policy",
+    // errors: ["Password must be at least 12 characters", ...]}`. The same
+    // list ChangePasswordPage reads via parsePasswordError.
+    if (Array.isArray(rec.errors)) {
+      const msgs = rec.errors.filter(
+        (e): e is string => typeof e === "string" && !!e.trim(),
+      );
+      if (msgs.length) return msgs.join("; ");
     }
     // Unexpected shape — stringify defensively so we never render an object.
     try {
@@ -1462,6 +1523,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
@@ -1870,6 +1933,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
@@ -2970,6 +3035,11 @@ export interface BackupManifestPreviewResponse {
   /** True only for a custom-format dump — the one shape the API accepts
    *  a selective restore of. */
   selective_restore_supported?: boolean;
+  /** False when the restore itself would refuse this archive (no dump, no
+   *  secrets.enc, a newer format_version); `restore_refusal` says why.
+   *  Absent from a server older than #2949. */
+  restorable?: boolean;
+  restore_refusal?: string | null;
 }
 
 export const backupApi = {
@@ -3663,6 +3733,8 @@ export interface SearchResponse {
   total: number;
   results: SearchResult[];
   searched_types: SearchTypeInfo[];
+  /** True when `total` is a floor — a type hit the server's fetch cap. */
+  total_capped?: boolean;
 }
 
 export const searchApi = {
@@ -5517,6 +5589,11 @@ export interface DaemonStateFields {
   daemon_reason: string | null;
   daemon_status_since: string | null;
   daemon_not_serving: boolean | null;
+  /** #2962 — who reported the current not-`ok` state: the agent itself, or
+   * the appliance's supervisor from the kubelet's container state (the agent
+   * died with its container, or has gone silent). Null on `ok` / never
+   * reported. Optional: an older server omits it, which reads as `agent`. */
+  daemon_reported_by?: "agent" | "supervisor" | null;
 }
 
 export interface DNSServer {
@@ -7213,6 +7290,11 @@ export interface CloudDNSServerOption {
   has_credentials: boolean;
 }
 
+// The client defaults to application/json, which axios honours by turning a
+// FormData into JSON (a File becomes {}). The import previews read form
+// fields, so they must say multipart (#3038).
+const MULTIPART = { headers: { "Content-Type": "multipart/form-data" } };
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -7224,7 +7306,7 @@ export const dnsImportApi = {
     fd.append("target_group_id", target_group_id);
     if (target_view_id) fd.append("target_view_id", target_view_id);
     return api
-      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   bind9Commit: (body: {
@@ -7497,7 +7579,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   keaCommit: (body: DHCPImportCommitBody) =>
@@ -7512,7 +7594,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   iscCommit: (body: DHCPImportCommitBody) =>
@@ -8466,6 +8548,18 @@ export interface DHCPServerGroup {
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
+  /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
+   *  of two or more. HA does not render while this is non-empty. Empty for a
+   *  standalone group. Optional so fixtures predating it still type-check. */
+  ha_peer_urls_missing?: string[];
+  /** #2963 — why the control plane did not derive the missing URL(s):
+   *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
+   *  becomes a Kea backup and can take over the primary role, so it is left
+   *  to the operator). Null when it is derivable or nothing is missing. */
+  ha_autofill_skipped_reason?:
+    | "bridged_network_mode"
+    | "more_than_two_kea_members"
+    | null;
   // Member servers (rolled up by the /server-groups response).
   servers: DHCPServerGroupMember[];
   created_at: string;
@@ -9047,6 +9141,10 @@ export interface DHCPRateBucket {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPServerStatsResponse {
@@ -9990,7 +10088,8 @@ export interface DHCPMACBlock {
   id: string;
   group_id: string;
   mac_address: string;
-  reason: DHCPMACBlockReason;
+  // One of DHCPMACBlockReason, or the free text New Devices stored (#3083).
+  reason: string;
   description: string;
   enabled: boolean;
   expires_at: string | null;
@@ -10006,7 +10105,7 @@ export interface DHCPMACBlock {
 
 export interface DHCPMACBlockWrite {
   mac_address?: string;
-  reason?: DHCPMACBlockReason;
+  reason?: string;
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
@@ -10101,9 +10200,13 @@ export const authApi = {
   logout: () => api.post("/auth/logout", undefined, { withCredentials: true }),
   /** Exchange the HttpOnly refresh cookie for a fresh access token. No
    *  argument — the cookie rides the request automatically (#484). */
-  refresh: () =>
+  refresh: (signal?: AbortSignal) =>
     api
-      .post<RefreshResponse>("/auth/refresh", {}, { withCredentials: true })
+      .post<RefreshResponse>(
+        "/auth/refresh",
+        {},
+        { withCredentials: true, signal },
+      )
       .then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {
@@ -11820,6 +11923,10 @@ export interface DHCPMetricsPoint {
    *  never as 0. Zero is a measurement; null is the absence of one. */
   receive_drop: number | null;
   socket_drop: number | null;
+  /** #2889 — DHCPv4 requests the server read and then evicted from its full
+   *  packet queue during a burst; no server counter records them. Same
+   *  `null` rule. Optional: a control plane older than #2889 omits it. */
+  queue_evicted?: number | null;
 }
 
 export interface DHCPMetricsSeries {
@@ -11844,6 +11951,14 @@ export const metricsApi = {
 };
 
 export interface VersionInfo {
+  // Always present (#2935): enough to know this is a SpatiumDDI control plane.
+  product: string;
+  api_level: number;
+  // True for an anonymous caller: the version, release-check and appliance
+  // identity fields below are then withheld (null / false), and ``version`` is
+  // the placeholder "restricted", which parseRelease reads as unknown. The
+  // console only asks while signed in, so it always sees ``restricted: false``.
+  restricted: boolean;
   version: string;
   latest_version: string | null;
   update_available: boolean;
@@ -12562,6 +12677,10 @@ export interface MetalLBConfig {
   // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
   dns_vip?: string;
   dhcp_relay_vip?: string;
+  // #2899 — DHCP server groups the relay VIP fronts that are still in
+  // direct (raw socket) mode. Relays landing on the node announcing the
+  // VIP get no answer from them. Read-only; not sent on PUT.
+  dhcp_relay_vip_direct_groups?: string[];
   // issue #566 decision D1 — BGP mode. Layered on top of the same
   // MetalLB install; requires `enabled: true`. bgp_advertisements is
   // auto-derived server-side when omitted (see the backend cross-field
@@ -14063,7 +14182,11 @@ export interface ClusterWorkloadHealth {
   kind: string | null;
   ready: number;
   total: number;
+  /** Lifetime total: informational only. */
   restarts: number;
+  /** #2945 — containers restarted in the last 15 min; drives the amber. */
+  recent_restarts?: number;
+  last_restart_at?: string | null;
   /** Job pods still running for this component (#1213), e.g. a CNPG
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;
@@ -14196,8 +14319,16 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
+  reboot_in_progress?: boolean;
+  // #3008 — the node the reboot fields describe (the api pod's own node);
+  // null off-appliance.
+  node?: string | null;
   appliance_version: string | null;
   appliance_mode: boolean;
+  /** #3011 — false on a multi-node control plane: the local reboot acts on
+   *  whichever node answers, so Fleet's per-appliance reboot is the path. */
+  reboot_available: boolean;
+  reboot_unavailable_reason: string | null;
 }
 
 export const applianceSystemApi = {

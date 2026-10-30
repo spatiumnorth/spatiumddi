@@ -90,10 +90,27 @@ class ListZonesArgs(BaseModel):
 _ZONE_SCOPE_SCAN_CAP = 20_000
 
 
+def _missing_read(user: User, *types: str) -> dict[str, Any] | None:
+    """An error payload unless ``user`` may read EVERY one of ``types``.
+
+    A tool's ``permission`` declaration is any-of, so a tool whose REST twin
+    needs several DNS types (#3073: the zone export needs ``dns_zone`` and
+    ``dns_record``, drift also ``dns_group`` for its per-server rows) declares
+    one and checks the rest here, with the same function the REST gate uses.
+    """
+    # Lazy: ``app.core.permissions`` must not load on the tool-registry
+    # import path (see ``tool_permission_allows``).
+    from app.core.permissions import type_level_allows  # noqa: PLC0415
+
+    if all(type_level_allows(user, "read", t) for t in types):
+        return None
+    return {"error": f"permission denied: need 'read' on each of {list(types)}"}
+
+
 @register_tool(
     name="list_dns_zones",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_zone"),
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
         "Each summary includes name, type, kind (forward / reverse), "
@@ -191,7 +208,7 @@ class QueryRecordsArgs(BaseModel):
 @register_tool(
     name="query_dns_records",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "Search DNS records across zones. Filters: zone, record type, "
         "and name / FQDN substring. Returns each record's relative "
@@ -246,7 +263,7 @@ class ListServerGroupsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_server_groups",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List DNS server groups (logical groupings of authoritative "
         "DNS servers). Each summary includes name, group type, "
@@ -300,7 +317,7 @@ class FindDnsServersArgs(BaseModel):
 
 @register_tool(
     name="find_dns_servers",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List individual DNS servers with the group each belongs to, its "
         "driver, the version its agent runs, whether it is the group's "
@@ -683,7 +700,7 @@ class ListDNSRecordsArgs(BaseModel):
 @register_tool(
     name="list_dns_records",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "Cross-zone DNS record search. Filterable by relative name "
         "substring, FQDN substring, type, value substring, zone, or "
@@ -753,7 +770,7 @@ class ExportDNSZoneRecordsArgs(BaseModel):
 
 @register_tool(
     name="export_dns_zone_records",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "One zone's records as the rows of its CSV / XLSX export (Data → "
         "Export CSV in the zone view): id, name, type, ttl (null = the "
@@ -774,6 +791,9 @@ async def export_dns_zone_records(
 ) -> dict[str, Any]:
     from app.services.dns_io.spreadsheet import zone_record_rows
 
+    # The REST export needs both types (#3073).
+    if (denied := _missing_read(user, "dns_zone", "dns_record")) is not None:
+        return denied
     try:
         zone_uuid = uuid.UUID(args.zone_id)
     except ValueError:
@@ -987,7 +1007,7 @@ class ListDNSViewsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_views",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List split-horizon DNS views — different clients see "
         "different zone data. Each row carries id, name, "
@@ -1037,7 +1057,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 @register_tool(
     name="find_zone_dnssec_info",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_zone"),
     description=(
         "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
         "flag, the list of DS records (key tag, algorithm, digest "
@@ -1109,7 +1129,7 @@ class FindDNSRateLimitSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_rate_limit_settings",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "Return the BIND9 Response Rate Limiting (RRL) + amplification "
         "defense posture for one DNS server group (or all groups when "
@@ -1196,7 +1216,7 @@ class FindZoneDriftArgs(BaseModel):
 @register_tool(
     name="find_dns_zone_drift",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "Per-server config-drift report for one DNS zone (#61): AXFRs / "
         "pulls the live zone from every server in the zone's group and "
@@ -1217,6 +1237,10 @@ async def find_dns_zone_drift(
 ) -> dict[str, Any]:
     from app.services.dns.drift import compute_zone_drift  # noqa: PLC0415
 
+    # As the REST drift route (#3073): the zone, its records, and the group's
+    # servers the report is broken down by.
+    if (denied := _missing_read(user, "dns_zone", "dns_record", "dns_group")) is not None:
+        return denied
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
@@ -1251,7 +1275,7 @@ class ListDNSSECPoliciesArgs(BaseModel):
 
 @register_tool(
     name="list_dnssec_policies",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List the DNSSEC signing policies operators can attach to BIND9 "
         "zones (issue #49): name, algorithm, NSEC3 settings, and KSK/ZSK "
@@ -1303,7 +1327,7 @@ class FindDNSQueryStatsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_query_stats",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "Per-server DNS query stats over a trailing window from "
         "dns_metric_sample (the same rcode counters the NXDOMAIN-spike / "
@@ -1505,7 +1529,7 @@ class FindZoneUpdateAclsArgs(BaseModel):
 @register_tool(
     name="find_zone_update_acls",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_zone"),
     description=(
         "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "
         "whether ``dynamic_update_enabled`` is on, the ordered list of "
@@ -1528,6 +1552,9 @@ async def find_zone_update_acls(
         _group_driver_names,
     )
 
+    # As the REST route (#3073): the ACL names the group's TSIG keys.
+    if (denied := _missing_read(user, "dns_zone", "dns_group")) is not None:
+        return denied
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
@@ -1603,7 +1630,7 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_encrypted_transports",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "Report which DNS server groups serve DNS-over-TLS (DoT) or "
         "DNS-over-HTTPS (DoH) to clients (and DNS-over-QUIC, DoQ, on "
@@ -1726,7 +1753,7 @@ class ListResolverPresetsArgs(BaseModel):
 
 @register_tool(
     name="list_resolver_presets",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List the curated public upstream DNS resolvers SpatiumDDI ships "
         "presets for — Cloudflare, Google, Quad9 and friends — with each "

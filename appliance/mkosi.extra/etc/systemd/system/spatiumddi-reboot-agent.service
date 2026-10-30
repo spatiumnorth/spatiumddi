@@ -11,6 +11,10 @@ Type=oneshot
 # supervisor or the api; anything else is renamed aside and the unit
 # skips cleanly. See spatiumddi-trigger-guard.
 ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/reboot-pending-fleet
+# #3008 — the agent runs spatium-power-action, which can wait minutes on the
+# primary's handoff. No start timeout (a oneshot's default, stated so nobody
+# adds one): a timeout stops the wrapper, which takes it as a cancel.
+TimeoutStartSec=infinity
 ExecStart=/usr/local/bin/spatiumddi-reboot-agent
 # No Install section — only invoked by the matching .path unit, never
 # directly enabled at boot.

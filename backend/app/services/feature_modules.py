@@ -386,9 +386,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "The DNS subsystem as a whole — zones, records, views, server "
             "groups, blocklists and the DNS dashboard panels. Turn it off "
             "on an IPAM-only or DHCP-only install to put the entire DNS "
-            "surface away; every DNS feature below depends on it. Agent "
-            "registration and config polling are deliberately unaffected, "
-            "and disabling is refused while any DNS server or zone exists."
+            "surface away; every DNS feature below depends on it. Disabling "
+            "is refused while any DNS server or zone exists. While it is "
+            "off, new agents cannot register; agents already registered "
+            "keep heartbeating and polling their config."
         ),
     ),
     # DNS — togglable extras under the Settings → Import surface and
@@ -433,9 +434,10 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "reservations, leases, client classes and the DHCP dashboard "
             "panels, plus the DHCP affordances inside IPAM. Turn it off on "
             "a DNS-only or IPAM-only install; every DHCP feature below "
-            "depends on it. Agent registration and config polling are "
-            "deliberately unaffected, and disabling is refused while any "
-            "DHCP server or scope exists."
+            "depends on it. Disabling is refused while any DHCP server or "
+            "scope exists. While it is off, new agents cannot register; "
+            "agents already registered keep heartbeating and polling "
+            "their config."
         ),
     ),
     # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
@@ -641,7 +643,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="security.certificates",
         label="Certificates (ACME / Let's Encrypt)",
         group="Security",
-        description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in: registering an ACME account, under Appliance → Fleet → Web UI Certificate → Issue via Let's Encrypt.",
+        description="Embedded RFC 8555 ACME client that issues CA-trusted TLS certs from Let's Encrypt — the Web UI cert on an appliance, and DoT / DoH certs on every install — solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in: registering an ACME account, under Appliance → Fleet → TLS certificates (Web UI Certificate on an appliance host) → Issue via Let's Encrypt.",
     ),
     # Default-OFF (#1069): armed, this reaches out and opens TLS connections
     # to endpoints on a schedule, and its discovery half can mint its own

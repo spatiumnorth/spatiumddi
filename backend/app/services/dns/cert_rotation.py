@@ -40,6 +40,8 @@ async def _group_ids_serving_cert(db: AsyncSession, cert_id: uuid.UUID) -> list[
                     or_(
                         DNSServerOptions.dot_enabled.is_(True),
                         DNSServerOptions.doh_enabled.is_(True),
+                        # #3061 — DoQ serves the same cert (Technitium, #741)
+                        DNSServerOptions.doq_enabled.is_(True),
                     ),
                 )
             )

@@ -62,10 +62,18 @@ async def _appliance(db: AsyncSession, *, requested_ago: timedelta) -> tuple[App
     return appliance, token
 
 
-async def _beat(client: AsyncClient, appliance: Appliance, token: str, boot_id: str | None):
+async def _beat(
+    client: AsyncClient,
+    appliance: Appliance,
+    token: str,
+    boot_id: str | None,
+    cancelled_boot_id: str | None = None,
+):
     body: dict[str, object] = {"appliance_id": str(appliance.id), "session_token": token}
     if boot_id is not None:
         body["boot_id"] = boot_id
+    if cancelled_boot_id is not None:
+        body["reboot_cancelled_boot_id"] = cancelled_boot_id
     resp = await client.post(_URL, json=body)
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -161,3 +169,49 @@ async def test_a_new_request_does_not_inherit_an_earlier_boot(
     assert (await _row(db_session, appliance)).reboot_requested_boot_id is None
     # So boot A's next heartbeat records A afresh and delivers the request.
     assert (await _beat(client, appliance, token, _BOOT_A))["reboot_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_console_cancel_retires_the_request_at_once_3008(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3008 — after F9 cancels a Fleet reboot nothing can fire again in that
+    boot, yet the flag stayed up (Fleet: "reboot queued", Reboot host disabled)
+    until the 900 s give-up. The supervisor reports the cancel; the row clears."""
+    appliance, token = await _appliance(db_session, requested_ago=timedelta(seconds=20))
+    body = await _beat(client, appliance, token, _BOOT_A)  # delivered, boot recorded
+    assert body["reboot_requested"] is True
+
+    body = await _beat(client, appliance, token, _BOOT_A, cancelled_boot_id=_BOOT_A)
+
+    assert body["reboot_requested"] is False
+    row = await _row(db_session, appliance)
+    assert row.reboot_requested is False
+    assert row.reboot_requested_at is None
+    assert row.reboot_requested_boot_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_from_another_boot_retires_nothing_3008(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    appliance, token = await _appliance(db_session, requested_ago=timedelta(seconds=20))
+    await _beat(client, appliance, token, _BOOT_A)
+
+    body = await _beat(client, appliance, token, _BOOT_A, cancelled_boot_id=_BOOT_B)
+
+    assert body["reboot_requested"] is True
+    assert (await _row(db_session, appliance)).reboot_requested is True
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_report_does_not_swallow_a_request_not_yet_delivered_3008(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A stale cancel marker beside a fresh request: the request has not been
+    delivered in this boot yet (no boot recorded), so it is not the one cancelled."""
+    appliance, token = await _appliance(db_session, requested_ago=timedelta(seconds=1))
+
+    body = await _beat(client, appliance, token, _BOOT_A, cancelled_boot_id=_BOOT_A)
+
+    assert body["reboot_requested"] is True

@@ -90,3 +90,40 @@ describe.each([
     expect(container.innerHTML).toBe("");
   });
 });
+
+// #2962 — the text follows who reported: a supervisor verdict must not say
+// the agent is heartbeating, or that the agent reported it.
+describe("wording follows the source", () => {
+  const SUPERVISOR = {
+    daemon_status: "degraded",
+    daemon_reason:
+      "crash_loop: the dhcp-kea container (Kea and the DHCP agent with it) is crash-looping",
+    daemon_status_since: "2026-09-21T12:00:00.000Z",
+    daemon_not_serving: true,
+    daemon_reported_by: "supervisor" as const,
+  };
+
+  it("chip tooltip names the supervisor", () => {
+    render(<DaemonStateChip server={SUPERVISOR} />);
+    const title =
+      screen.getByText(/Daemon degraded/).getAttribute("title") ?? "";
+    expect(title).toMatch(/Supervisor reported: crash_loop:/);
+    expect(title).not.toMatch(/heartbeating/);
+    expect(title).not.toMatch(/Agent reported/);
+  });
+
+  it("chip tooltip keeps the agent wording for the agent's own report", () => {
+    render(
+      <DaemonStateChip server={{ ...DEFERRED, daemon_reported_by: "agent" }} />,
+    );
+    const title =
+      screen.getByText(/Daemon degraded/).getAttribute("title") ?? "";
+    expect(title).toMatch(/Agent reported: start deferred/);
+  });
+
+  it("banner names the supervisor", () => {
+    const { container } = render(<DaemonStateBanner server={SUPERVISOR} />);
+    expect(container.textContent).toMatch(/supervisor reports/);
+    expect(container.textContent).not.toMatch(/The agent is heartbeating/);
+  });
+});

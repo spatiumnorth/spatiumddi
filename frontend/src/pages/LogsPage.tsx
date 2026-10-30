@@ -29,6 +29,7 @@ import {
   type DNSQueryLogRow,
   type LogEventRow,
   type LogSource,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { AgentLogScopePicker } from "@/components/AgentLogScopePicker";
@@ -860,14 +861,7 @@ function RefreshButton({
 }
 
 function QueryErrorBanner({ query }: { query: { error: unknown } }) {
-  const detail =
-    (
-      query.error as
-        | {
-            response?: { data?: { detail?: string } };
-          }
-        | undefined
-    )?.response?.data?.detail ?? String(query.error);
+  const detail = formatApiError(query.error, String(query.error));
   return (
     <div className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
       <p className="font-medium">Query failed</p>

@@ -720,7 +720,16 @@ spatiumddi_api_request_duration_seconds{method, path_template} (histogram)
 spatiumddi_api_active_requests (gauge)
 ```
 
-Plus two counters declared but not yet wired to a call site (read zero):
+The DNS agent config long-poll (#1111) adds three counters, labelled
+`family="dns"` (the DHCP long-poll does not count yet):
+
+```
+spatiumddi_agent_bundle_served_total{family, outcome}   # full / not_modified / client_gone
+spatiumddi_agent_bundle_inline_renders_total{family}
+spatiumddi_agent_bundle_inline_failures_total{family}
+```
+
+Plus two counters declared but not yet wired to a call site (no samples):
 
 ```
 spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oidc
@@ -771,13 +780,13 @@ The control plane stores deltas in two small tables —
 `dns_metric_sample(server_id, bucket_at, queries_total, noerror,
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
-inform, receive_drop, socket_drop)`. Retention is enforced by the
+inform, receive_drop, socket_drop, queue_evicted)`. Retention is enforced by the
 `prune_metric_samples` Celery task (daily), which deletes samples older
 than `metric_retention_days` (default 7 days, 1–365, Settings → Data
 Retention).
 
-Two of those DHCP columns are about packets *not* handled, and they do not
-come from the same place or mean the same thing (issue #980).
+Three of those DHCP columns are about packets *not* handled, and they do not
+come from the same place or mean the same thing (issues #980, #2889).
 `socket_drop` is the kernel's per-socket `sk_drops` on the sockets Kea
 serves from, read by the agent directly. Normally those are the DHCP-port
 UDP sockets in `/proc/net/udp`. With `dhcp-socket-type: raw`, kea-dhcp4
@@ -789,13 +798,24 @@ report them.
 On a node short of CPU only this one moves, and it is the one the alert
 and the dashboard treat as loss.
 
+`queue_evicted` (#2889) is loss as well: DHCPv4 requests Kea read and then
+evicted from its full multi-threading packet queue during a burst. Kea keeps
+no statistic for it, so the agent derives it from DHCPv4 arrivals at Kea's
+intake (counted by a BPF-filtered `AF_PACKET` socket of its own), less the
+DHCPv4 share of `socket_drop`, less `pkt4-received`. The alert and the
+dashboard add it to `socket_drop`. See
+[`DHCP.md` §4c](features/DHCP.md#counting-what-the-queue-evicts-2889).
+
 `receive_drop` is Kea's own `pkt4/6-receive-drop` — packets it read and then
 discarded — and is **context, not a fault**: it counts deliberate drops too.
 Verified against kea-dhcp4 3.0.3, a client matching a `DROP` client-class
 increments it once per packet, and a `DROP` class is exactly what the shipped
 DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
-**Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
+**All three are nullable, and NULL means UNMEASURED.** `queue_evicted` is
+also NULL when the agent cannot open a raw socket, on a DHCPv6-only server,
+and for the bucket in which its counting socket reopened. (The minute in
+which the agent starts or Kea restarts has no bucket at all, for any counter.) An agent older than #980,
 or one whose runtime cannot read `/proc/net/udp` (or, in raw mode, Kea's
 AF_PACKET sockets), reports no `socket_drop`.
 Readers must render that as unknown — a 0 would say "this server has dropped
@@ -971,7 +991,9 @@ All services expose:
 - Unlike `/health/ready` (which returns a single binary verdict for
   orchestrator probes), this endpoint enumerates each control-plane
   piece so the UI can show a per-component status dot.
-- Response: `200 {"status": "ok"|"degraded", "components": [...]}`.
+- Response: `200 {"status": "ok"|"degraded", "components": [...]}` to a
+  signed-in caller. An anonymous caller gets `{"status": ...}` only —
+  enough for an uptime monitor, and nothing about the stack (#2935).
   Individual component failures **never** make the endpoint itself
   fail — the caller always gets a 200 with the rollup so a single
   flaky component doesn't blank the dashboard card.
@@ -1081,7 +1103,15 @@ running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The
 conformity evaluator follows the same rules.
 
-Rule types shipped today:
+Rule types described on this page. The build has 73 (`RULE_TYPES` in
+`backend/app/services/alerts.py`) and 41 of them have a row below.
+`GET /api/v1/alerts/rule-types` lists every type whose feature module is
+enabled, with its parameters, and some are documented on their own feature page
+instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in
+IPAM.md). Among those with no row below are `tls_cert_expiring` and the other
+`tls_cert_*` rules, `secret_expiring`, `new_mac_seen`, `rogue_dhcp`,
+`restore_drill_failed`, `schema_behind_head` and the `dns_*_suspected`
+threat-analytics rules.
 
 | Type | Fires when |
 |---|---|
@@ -1098,6 +1128,7 @@ Rule types shipped today:
 | `service_term_expiring` / `service_resource_orphaned` | Service-catalog alerts (#94). Orphan-sweep walks `network_service_resource` join rows whose target was deleted. |
 | `compliance_change` | Audit-log scanner rule type (#105). One event per mutation against a classification-flagged subnet (or descendant IP / DHCP scope). Params: `classification` (one of `pci_scope` / `hipaa_scope` / `internet_facing`) and `change_scope` (one of `any_change` / `create` / `delete`). Watermark column on the rule baselines to `now()` on first run so historical audit history doesn't retro-page operators. Resource resolution falls back to `audit_log.old_value.subnet_id` for delete actions where the live row no longer exists. Three disabled seed rules ship at first boot (PCI / HIPAA / internet-facing). Auto-resolves after 24 h. |
 | `node_pressure` | A cluster node reports sustained resource stalling through **PSI** (Pressure Stall Information, Kubernetes 1.36+, #983 Phase 2). Subject is the node NAME — cluster nodes have no row in this database. Reads `avg300` out of the kubelet Summary API the Cluster screen already fetches, so there is no new collector. Note that alert evaluation runs in the **Celery worker**, so this needs `worker.serviceAccount.enabled` (a narrow `nodes` + `nodes/stats` grant) or the rule evaluates to nothing while appearing enabled. A cluster the worker cannot read is treated as UNKNOWN and holds open events rather than resolving them — returning "no matches" on a kubeapi blip would close the alarm and re-open it a minute later, flapping notifications through exactly the incident it reports. The kernel's own 5-minute rolling average is what makes "sustained" need no state on our side. **Warning** when CPU or memory `some` stalling holds at or above `threshold_percent` (default 50); **critical** when memory `full` stalling — every runnable task blocked — holds at or above a fixed 1%. The two do not share a knob on purpose: `some` at 20% is a busy node, `full` at 20% is a node that did no work for a fifth of five minutes. CPU `full` is not evaluated at all (the kernel reports it as 0 at node level by definition). A node whose kubelet reports NO PSI never matches — null is UNRECORDED, not zero — so the rule is silent on a pre-1.36 fleet and is seeded **enabled** because of it. This is the alarm #980 needed: the appliance dropped relayed DHCP under CPU pressure with every dashboard green, because utilisation cannot tell a node at 70% CPU with a run queue from one without. |
+| `agent_daemon_degraded` | A DNS or DHCP server's daemon is not serving and has not been for 5 minutes (#1067). Subject is the **server** (`dns_server:<id>` / `dhcp_server:<id>`). Three sources feed the same `daemon_status` columns, and the message names which one spoke (#2962). **The agent's own report** (`Agent reported: …`): a daemon whose start is deferred, or whose control socket is unreachable. **The supervisor, from the kubelet's container state** (`Supervisor reported: …`), for the cases where the agent dies with its container and cannot say so: an `OOMKilled` termination (`oom_killed:`, #2018 / #2023); a **crash loop** whatever the termination reason (`crash_loop:`, #2961), meaning the container restarted at least 3 times **within 15 minutes**, is not a healthy pod and has not stayed up 10 minutes, with the in-window count, the lifetime restart count, last termination reason and exit code in the text (a kubelet records an OOM group kill as `Error` / 137 once the pod is in CrashLoopBackOff, so the OOM verdict alone misses it). The in-window count is measured by the control plane from successive supervisor heartbeats (a backend-owned `restart_history` on each `role_health` entry), never from the kubelet's lifetime `restartCount`: every node reboot and slot upgrade adds one restart to every container, so a lifetime count says how often the node rebooted, and right after a reboot a container is restarted, recently ended and not yet ready; and an **agent silent under a live supervisor** (`agent_unreachable:`, #2961), meaning no agent heartbeat for 3 minutes while the appliance's supervisor still reports the container, counted only over time the control plane could have heard the agent: from the latest of its last heartbeat, the container's current start, and the start of the supervisor's current unbroken run of heartbeats (a backend-owned `heard_since` on the entry; a gap over 2 minutes starts a new run), so a rebooted node or a control plane that was itself down never counts its own absence as the agent's. The 5-minute grace runs from the start of the state: the kill, the moment the third restart in the window was seen, or the start of the silence as just defined. One restart, a reboot, or a brief blip never fires. Paused (maintenance) and disabled servers are skipped. A health sweep that reads a server `unreachable` also sets a stale `daemon_status=ok` to NULL (unknown) rather than leaving a green the agent can no longer vouch for. Auto-resolves when the agent reports `ok` after the container has stayed up for 10 minutes. Seeded **enabled**. |
 | `appliance_heartbeat_stale` | An approved appliance's supervisor has not heartbeated for 5 minutes (**critical** after 30) (#2259). Subject is the **appliance** (its UUID). Fleet and every other appliance rule show the node's LAST reported roles, service health, firewall and storage state, so a node whose supervisor died keeps looking healthy; this is the alarm for the silence itself, and the only one that covers control-plane and observer-only nodes. The 5 min threshold sits above the Fleet UI's ~3-heartbeat (90 s) greying so a reboot or slot upgrade does not page. Pending / revoked appliances and rows that never heartbeated are skipped. Auto-resolves on the next heartbeat. Seeded **enabled**; cannot fire on an install with no appliances. |
 | `postgres_instance_unhealthy` | An instance of the appliance's CNPG PostgreSQL cluster has not been Ready, or a standby has not been streaming WAL from the current primary, for 5 minutes; **critical** after 15 (#2856). Subject is the **instance** (its pod name), and the message names its node. CNPG's readiness probe passes for a standby that is up but not replicating, so CNPG reports "Cluster in healthy state" 3/3 while a standby loops on removed WAL: in a three-node failover drill that held for more than 10 minutes with every alert quiet. Streaming is read from `pg_stat_replication` on the primary, which the api and worker already connect to: a standby with no WAL sender there is not streaming. The app's role is not in `pg_monitor`, so it sees each sender's name but not its `state`; a connected sender whose state is hidden is unverified and not flagged, a visible state other than `streaming` is. A supervisor `looping` / `stuck` verdict (#2765), when a supervisor ships one in `cluster_health.postgres_instances`, counts too. The verdict is the one the Cluster → Overview database row uses, so a degraded row and this rule describe the same fact. No streaming verdict is made mid-switchover (`targetPrimary` differs from `currentPrimary`). The 5-minute clock is kept per instance in Redis, so it survives the finding changing (not Ready, then Ready but looping); a not-Ready pod's own Ready transition time is used when it is earlier. Pods that cannot be listed, a `pg_stat_replication` that cannot be read while standbys exist, or an unreadable clock are UNKNOWN and hold open events rather than resolving them. Inert off the appliance and on a Postgres that is not a CNPG cluster; a single-node appliance can only match on its one instance not being Ready. Auto-resolves when the instance recovers. Seeded **enabled**. |
 | `cluster_dns_degraded` | The k3s cluster's DNS (CoreDNS) is down, thinner than the appliance targets, co-located on one node, or not answering (#985). Subject is the **cluster** — CoreDNS is cluster-scoped, and which node a replica sits on is already in the message. Every pod resolves `*.svc.cluster.local` through it (the api reaches Postgres and Redis that way), so a failure here surfaces later as unrelated components failing to start. Reads the same cluster-health snapshot the Cluster → Overview card renders, so there is no new collector and no new RBAC. **Warning** when fewer replicas are ready than `ensure_coredns_ha` targets (`min(nodes, 2)`), or when the ready replicas share a node — two replicas on one node is not HA, and Kubernetes never rebalances running pods (#633). **Critical** when no replica is ready, or when the live resolve probe fails. The probe is the load-bearing half: replica counts say the pods exist, the probe says the path works, and `ready 2 / spread ok / probe failed` is a real and distinct state pointing at kube-proxy or the CNI rather than at CoreDNS. It needs no RBAC (it is a DNS query from the pod) and therefore runs even in the **worker**, whose ServiceAccount deliberately cannot list pods cluster-wide — so the rule still fires there on a probe failure, and the worker is a genuine second vantage rather than a claimed one. A replica view that cannot be read is UNKNOWN and holds open events rather than resolving them; null is never treated as zero. Seeded **enabled**, and inert off the appliance. |
@@ -1213,40 +1244,53 @@ automatically. MCP: `find_bgp_hijacks` / `count_bgp_hijacks` /
 
 ### 9.2 Prometheus alerting rules (external)
 
-Reference Prometheus alerting rules for the `spatiumddi_*` metrics
-(a perf-testing Prometheus config already lives under
-`perf/dashboards/prometheus/`):
+The control plane's `/metrics` registry declares eight `spatiumddi_*` series
+(beside the client library's standard `process_*` and `python_*`). Six carry
+samples today; the two `auth` counters are declared but nothing increments
+them yet, so they carry no samples, and the agent-bundle counters only ever
+see `family="dns"`:
 
-| Alert | Condition | Severity |
+| Series | Type | Labels |
 |---|---|---|
-| `DHCPServerOffline` | `dhcp_server_status == 0` for 2m | critical |
-| `DHCPSyncStale` | `time() - dhcp_sync_last_success > 900` | warning |
-| `DHCPPoolNearExhaustion` | `pool_utilization > 90` | warning |
-| `DNSServerOffline` | `dns_server_status == 0` for 2m | critical |
-| `SubnetNearExhaustion` | `subnet_utilization > 90` | warning |
-| `SubnetExhausted` | `subnet_utilization > 99` | critical |
-| `APIHighErrorRate` | `rate(requests[5m]{status=~"5.."})/rate(requests[5m]) > 0.05` | warning |
-| `DBReplicationLag` | `replication_lag > 30` | warning |
-| `CeleryQueueBacklog` | `queue_length > 100` for 5m | warning |
-| `BackupFailed` | Checked via Celery task failure metric | critical |
+| `spatiumddi_api_requests_total` | counter | `method`, `path_template`, `status_code` |
+| `spatiumddi_api_request_duration_seconds` | histogram | `method`, `path_template` |
+| `spatiumddi_api_active_requests` | gauge | |
+| `spatiumddi_auth_login_total` | counter (no samples yet) | `method`, `result` |
+| `spatiumddi_auth_token_usage_total` | counter (no samples yet) | `scope` |
+| `spatiumddi_agent_bundle_served_total` | counter | `family`, `outcome` |
+| `spatiumddi_agent_bundle_inline_renders_total` | counter | `family` |
+| `spatiumddi_agent_bundle_inline_failures_total` | counter | `family` |
+
+For example, an API error-rate alert is
+`sum(rate(spatiumddi_api_requests_total{status_code=~"5.."}[5m])) / sum(rate(spatiumddi_api_requests_total[5m])) > 0.05`
+(a perf-testing Prometheus config already lives under
+`perf/dashboards/prometheus/`).
+
+**Planned, not emitted yet.** There are no Prometheus series for DHCP / DNS
+server status, DHCP sync age, pool or subnet utilization, database
+replication lag, Celery queue length or task failures, so the usual rules
+over them (server offline, pool near exhaustion, replication lag, queue
+backlog, failed backups) cannot be written against `/metrics` today. Use
+the in-product alert rules above (`server_unreachable`, `subnet_utilization`,
+`dhcp_pool_exhaustion`, `backup_failed`, ...) for those conditions. Exporting
+them as series is tracked in
+[#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146) and
+[#1267](https://github.com/spatiumnorth/spatiumddi/issues/1267).
 
 
 ## DNS Agent Telemetry
 
 See [`docs/deployment/DNS_AGENT.md`](deployment/DNS_AGENT.md) §4 for the full protocol.
 
-### Metrics (scraped from the control plane)
+### Metrics
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `spatium_dns_agent_up` | gauge | `server_id`, `flavor` | 1 if last heartbeat within 90s |
-| `spatium_dns_agent_config_lag_seconds` | gauge | `server_id` | Age of the applied config etag |
-| `spatium_dns_zone_serial` | gauge | `server_id`, `zone` | Last reported SOA serial |
-| `spatium_dns_failed_ops_total` | counter | `server_id` | RecordOps that exhausted retries |
-| `spatium_dns_agent_token_rotations_total` | counter | `server_id` | JWT rotations per server |
-
-Agents are egress-only and do **not** expose a scrape endpoint — all metrics
-are derived from the heartbeat body on the control plane.
+The control plane emits no per-agent Prometheus series yet (no agent-up,
+config-lag, zone-serial, failed-op or token-rotation metric). The same facts
+are on the server row in the console and in the API: heartbeat age and
+status, the applied config etag and apply status, per-server zone serials
+(`DNSServerZoneState`) and queued record ops. Agents are egress-only and do
+**not** expose a scrape endpoint; the control plane derives everything from
+the heartbeat body. Agent-level series are part of #2146.
 
 ### Logs
 
@@ -1255,6 +1299,4 @@ Agent logs are structured JSON (non-negotiable #7) and include the canonical
 
 - `dns_agent_registered` — bootstrap complete
 - `dns_agent_token_rotated` — JWT rotation
-- `dns_agent_config_applied` — new config etag applied
-- `dns_agent_op_failed` — RecordOp failed (attempt <= 5)
 - `dns_agent_stale_sweep` — control-plane Celery task marked servers unreachable

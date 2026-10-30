@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { customFieldsApi, type CustomField } from "@/lib/api";
+import { customFieldsApi, formatApiError, type CustomField } from "@/lib/api";
 import {
   customFieldCreatePayload,
   customFieldUpdatePayload,
@@ -356,10 +356,7 @@ export function CustomFieldsPage() {
       setModalError("");
     },
     onError: (e: unknown) => {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create field";
-      setModalError(msg);
+      setModalError(formatApiError(e, "Failed to create field"));
     },
   });
 
@@ -377,10 +374,7 @@ export function CustomFieldsPage() {
       setModalError("");
     },
     onError: (e: unknown) => {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to update field";
-      setModalError(msg);
+      setModalError(formatApiError(e, "Failed to update field"));
     },
   });
 

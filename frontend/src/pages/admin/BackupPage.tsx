@@ -328,8 +328,15 @@ function RestoreBackupCard() {
   const dumpFormat = preview
     ? (preview.dump_format ?? preview.manifest?.dump_format ?? null)
     : null;
+  // The restore's own refusals (no dump, no secrets.enc, a newer
+  // format_version), read from the same checks server-side (#2949). Blocks
+  // both modes.
+  const restoreRefused = !!preview && preview.restorable === false;
   const selectiveBlockedByPlainFormat =
-    mode === "selective" && !!preview && dumpFormat !== "custom";
+    mode === "selective" &&
+    !!preview &&
+    !restoreRefused &&
+    dumpFormat !== "custom";
 
   const canSubmit =
     !!file &&
@@ -337,6 +344,7 @@ function RestoreBackupCard() {
     passphrase.length >= 8 &&
     confirm === CONFIRM_PHRASE &&
     !restoreMut.isPending &&
+    !restoreRefused &&
     !selectiveBlockedByPlainFormat &&
     (mode !== "selective" || sections.length > 0);
 
@@ -406,6 +414,12 @@ function RestoreBackupCard() {
             selected={sections}
             onChange={setSections}
           />
+        )}
+        {restoreRefused && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            This archive cannot be restored:{" "}
+            {preview?.restore_refusal ?? "the restore refuses it"}
+          </div>
         )}
         {selectiveBlockedByPlainFormat && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -491,7 +505,8 @@ function ManifestPreview({
   preview: BackupManifestPreviewResponse;
 }) {
   const m = preview.manifest;
-  const recognised = preview.format_recognised;
+  const refused = preview.restorable === false;
+  const recognised = preview.format_recognised && !refused;
   return (
     <div
       className={`rounded-md border px-3 py-2 text-xs ${
@@ -503,9 +518,11 @@ function ManifestPreview({
       <div className="mb-1 flex items-center gap-1.5">
         <FileArchive className="h-3.5 w-3.5" />
         <span className="font-medium">
-          {recognised
-            ? "Recognised SpatiumDDI backup"
-            : "Format unrecognised — proceed with care"}
+          {refused
+            ? "SpatiumDDI backup that cannot be restored"
+            : recognised
+              ? "Recognised SpatiumDDI backup"
+              : "Format unrecognised — proceed with care"}
         </span>
       </div>
       <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5">

@@ -583,7 +583,12 @@ on its last-known-good config — so the chip, the banner and the alert all
 leave it to `agent_config_rejected`. They read one server-side
 classification, `daemon_not_serving` on the server response, so they
 cannot disagree. NULL means the agent has never reported one — a
-pre-#1061 agent, or an agentless driver — and is unknown, never healthy.
+pre-#1061 agent, or an agentless driver — and is unknown, never healthy;
+it is also what a row reads once its agent has been silent long enough for
+the health sweep to call the server `unreachable` (#2961), instead of the
+last `ok`. On an appliance the supervisor supplies the verdict the agent
+cannot (OOM kill, crash loop, a silent agent) from the kubelet's container
+state; the alert says so (`Supervisor reported: …`).
 
 ### Push spool — the reporting half of an outage (issue #1077)
 
@@ -718,7 +723,7 @@ heartbeat body is strict and an agent can be upgraded before its control plane.
 - Control plane marks `DNSServer.status = unreachable` if no heartbeat for **3 × heartbeat_interval** (90 s default).
 - UI: the existing server-group view shows colored status dots; a new "Last seen" column uses `last_health_check_at`.
 - A Celery beat job `dns_agent_stale_sweep` runs every 60 s, flips statuses, emits an audit entry, and triggers notifications (Phase 4).
-- Metrics: Prometheus gauges `spatium_dns_agent_up`, `spatium_dns_agent_config_lag_seconds`, `spatium_dns_zone_serial`, `spatium_dns_failed_ops_total` — scraped from the control plane (agent does not expose a scrape endpoint; keeps it egress-only).
+- Metrics: no per-agent Prometheus series yet (planned in [#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146)); the heartbeat age, config apply status and per-server zone serials are on the server row in the console and the API. The agent does not expose a scrape endpoint, which keeps it egress-only. See [OBSERVABILITY.md](../OBSERVABILITY.md#dns-agent-telemetry).
 
 ---
 

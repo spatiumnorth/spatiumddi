@@ -16,14 +16,25 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+const mockMeta = vi.hoisted(() => ({
+  total: 1,
+  total_capped: false as boolean,
+}));
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
+    // The shortcuts overlay reads the caller's grants (#3103).
+    authApi: {
+      ...actual.authApi,
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    },
     searchApi: {
       search: () =>
         Promise.resolve({
-          total: 1,
+          total: mockMeta.total,
+          total_capped: mockMeta.total_capped,
           results: [
             {
               type: "subnet",
@@ -85,7 +96,11 @@ async function openWithKeyboard(user: ReturnType<typeof userEvent.setup>) {
   return { dialog, box };
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  mockMeta.total = 1;
+  mockMeta.total_capped = false;
+});
 
 describe("global search palette", () => {
   it("opens as a named, modal dialog around the search box", async () => {
@@ -220,5 +235,28 @@ describe("global search palette", () => {
     const listbox = screen.getByRole("listbox");
     expect(within(listbox).queryByText(/Search IP addresses/)).toBeNull();
     expect(screen.getByText(/Search IP addresses/)).toBeTruthy();
+  });
+
+  it("footer shows the API's match count, not the rows fetched (#2987)", async () => {
+    mockMeta.total = 25;
+    const user = setup();
+    await user.keyboard("{Control>}k{/Control}");
+    const box = await screen.findByRole("combobox", { name: "Search" });
+    await user.type(box, "10.0");
+    await screen.findByRole("option", { name: /10\.0\.0\.0\/24/ });
+    expect(await screen.findByText(/25 results · showing top 1/)).toBeTruthy();
+  });
+
+  it("footer says the count is a floor when the server capped it (#2987)", async () => {
+    mockMeta.total = 100;
+    mockMeta.total_capped = true;
+    const user = setup();
+    await user.keyboard("{Control>}k{/Control}");
+    const box = await screen.findByRole("combobox", { name: "Search" });
+    await user.type(box, "10.0");
+    await screen.findByRole("option", { name: /10\.0\.0\.0\/24/ });
+    expect(
+      await screen.findByText(/100\+ results · showing top 1/),
+    ).toBeTruthy();
   });
 });

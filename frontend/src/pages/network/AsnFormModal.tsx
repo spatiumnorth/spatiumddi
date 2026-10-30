@@ -154,7 +154,7 @@ export function AsnFormModal({
         </Field>
         <Field
           label="Holder Org"
-          hint="Operator-provided override; the RDAP refresh job (follow-up) will populate this from WHOIS automatically."
+          hint="For a public ASN the RDAP refresh job fills this from WHOIS and replaces what you type here. Set it by hand for a private ASN."
         >
           <input
             className={inputCls}

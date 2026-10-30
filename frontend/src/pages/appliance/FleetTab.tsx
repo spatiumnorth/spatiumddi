@@ -957,8 +957,13 @@ export function FleetTab({
         response?: { status?: number; data?: { detail?: string } };
       };
       if (e?.response?.status === 403) {
+        // The response alone, so a 403 without a detail still says why
+        // instead of axios's "Request failed with status code 403".
         setDeletePwError(
-          e.response.data?.detail || "Current password incorrect.",
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setDeletePwError("Delete failed. Try again.");
@@ -1007,7 +1012,10 @@ export function FleetTab({
       };
       if (e?.response?.status === 403) {
         setPermanentDeletePwError(
-          e.response.data?.detail || "Current password incorrect.",
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setPermanentDeletePwError("Permanent delete failed. Try again.");
@@ -1136,17 +1144,16 @@ export function FleetTab({
           summary: "GitHub import or air-gap .raw.xz upload.",
         },
         // #404 — Web UI Certificate moved here from a top-level tab.
-        // Appliance-host only (a docker/k8s control plane has no local cert
-        // to manage).
-        ...(isApplianceHost
-          ? [
-              {
-                key: "web-ui-certificate" as const,
-                label: "Web UI Certificate",
-                summary: "TLS upload / CSR / Let's Encrypt.",
-              },
-            ]
-          : []),
+        // #3061 — the certificate store is on every install type (DoT / DoH
+        // pick from it); only the Web UI activation is appliance-specific, so
+        // off-appliance the entry is the store-only view.
+        {
+          key: "web-ui-certificate" as const,
+          label: isApplianceHost ? "Web UI Certificate" : "TLS certificates",
+          summary: isApplianceHost
+            ? "TLS upload / CSR / Let's Encrypt."
+            : "Certificate store: upload / CSR / Let's Encrypt.",
+        },
       ],
     },
     {
@@ -1297,8 +1304,8 @@ export function FleetTab({
           )}
 
           {/* #404 — Web UI Certificate, moved from a top-level tab. */}
-          {view === "web-ui-certificate" && isApplianceHost && (
-            <CertificatesTab />
+          {view === "web-ui-certificate" && (
+            <CertificatesTab isApplianceHost={isApplianceHost} />
           )}
 
           {view === "lldp" && (
@@ -3188,8 +3195,7 @@ function StorageActionModal({
       // The FastAPI detail, not axios's "Request failed with status code
       // 422" — which is what `err.message` always is and never what the
       // operator needs (the #1009 lesson).
-      const ax = e as { response?: { data?: { detail?: string } } };
-      setError(ax.response?.data?.detail ?? "The action could not be run.");
+      setError(formatApiError(e, "The action could not be run."));
     },
   });
 
@@ -3396,9 +3402,7 @@ function MountDiskModal({
       // Matched on the FastAPI detail, never on err.message — on an
       // AxiosError that is always "Request failed with status code 422"
       // and never the reason (#1009).
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(detail ?? "Could not mount the disk.");
+      setError(formatApiError(err, "Could not mount the disk."));
     },
   });
 
@@ -3508,10 +3512,11 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
     // never on err.message, which on an AxiosError is always "Request
     // failed with status code N" (#1009).
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
       setEjectError(
-        detail ?? "Could not eject the disk. It may still be mounted.",
+        formatApiError(
+          err,
+          "Could not eject the disk. It may still be mounted.",
+        ),
       );
     },
   });

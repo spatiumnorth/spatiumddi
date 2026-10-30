@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { UpdateCheckError } from "@/components/UpdateCheckError";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -66,6 +66,25 @@ function contrastRatio(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+// Mirrors BRANDING_ASSET_MAX_BYTES in the API's settings router.
+const LOGO_MAX_BYTES = 512 * 1024;
+const LOGO_TOO_LARGE = `Logo must be ${LOGO_MAX_BYTES / 1024} KB or smaller`;
+
+// Form controls a Field may wrap. A switch is a button, so it is listed
+// explicitly; other buttons are actions, not settings, and are left alone.
+const FIELD_CONTROLS =
+  'input:not([type="hidden"]), select, textarea, [role="switch"]';
+
+/** Does this control already have a name from somewhere other than the
+ *  Field's own label? (aria-label, aria-labelledby, an associated <label>,
+ *  or a title on a switch, which Toggle has always used as its name.) */
+function hasOwnName(el: Element): boolean {
+  if (el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"))
+    return true;
+  const labels = (el as HTMLInputElement).labels;
+  return !!labels && labels.length > 0;
+}
+
 function Field({
   label,
   description,
@@ -75,15 +94,29 @@ function Field({
   description?: string;
   children: React.ReactNode;
 }) {
+  // One place names every control a Settings row edits (#2952): the visible
+  // label is tied to the control by aria-labelledby, so a caller cannot
+  // forget to and a screen reader reads "Minimum length", not just "12".
+  const labelId = useId();
+  const controlsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    controlsRef.current?.querySelectorAll(FIELD_CONTROLS).forEach((el) => {
+      if (!hasOwnName(el)) el.setAttribute("aria-labelledby", labelId);
+    });
+  });
   return (
     <div className="flex items-center justify-between gap-8 py-3">
       <div>
-        <div className="text-sm font-medium">{label}</div>
+        <div id={labelId} className="text-sm font-medium">
+          {label}
+        </div>
         {description && (
           <div className="text-xs text-muted-foreground">{description}</div>
         )}
       </div>
-      <div className="flex-shrink-0">{children}</div>
+      <div ref={controlsRef} className="flex-shrink-0">
+        {children}
+      </div>
     </div>
   );
 }
@@ -1337,9 +1370,22 @@ export function SettingsPage() {
       qc.invalidateQueries({ queryKey: ["public-settings"] });
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setLogoError(typeof detail === "string" ? detail : "Logo upload failed.");
+      const resp = (
+        err as {
+          response?: { status?: number; data?: { detail?: string } };
+        }
+      )?.response;
+      const detail = resp?.data?.detail;
+      // A 413 may come from nginx (an HTML body, no `detail`) rather than
+      // the API when the upload is over nginx's 1 MiB default (#2951), so
+      // the status alone is read as "too large".
+      setLogoError(
+        typeof detail === "string"
+          ? detail
+          : resp?.status === 413
+            ? LOGO_TOO_LARGE
+            : "Logo upload failed.",
+      );
     },
   });
   const logoDelete = useMutation({
@@ -1605,7 +1651,15 @@ export function SettingsPage() {
                         // Reset the input so re-picking the same file
                         // after a failed upload still fires onChange.
                         e.target.value = "";
-                        if (file) logoUpload.mutate(file);
+                        if (!file) return;
+                        // Checked here so the reason is the real limit
+                        // whichever layer would have refused it (#2951).
+                        if (file.size > LOGO_MAX_BYTES) {
+                          setLogoError(LOGO_TOO_LARGE);
+                          return;
+                        }
+                        setLogoError("");
+                        logoUpload.mutate(file);
                       }}
                       className="max-w-[14rem] text-xs file:mr-2 file:rounded-md file:border file:bg-background file:px-2 file:py-1 file:text-xs"
                     />
