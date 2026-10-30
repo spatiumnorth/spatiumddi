@@ -46,6 +46,7 @@ import {
   type NodeStorage,
   type SelfApplianceInfo,
 } from "@/lib/api";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   formatEta,
   mdChipLabel,
@@ -1313,7 +1314,7 @@ export function ClusterOverview({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
     staleTime: 20_000,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: version } = useQuery({
     queryKey: ["version"],

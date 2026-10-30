@@ -3459,8 +3459,10 @@ async def _matching_secret_expiring_subjects(
     carry no expiry of their own (their issued certs do — out of scope), so
     they contribute no subjects here.
     """
+    from app.config import settings  # noqa: PLC0415
     from app.models.appliance import Appliance  # noqa: PLC0415
     from app.models.auth import APIToken  # noqa: PLC0415
+    from app.services.appliance.tls import certificate_store_location  # noqa: PLC0415
 
     threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
     cutoff = now + timedelta(days=threshold_days)
@@ -3579,7 +3581,7 @@ async def _matching_secret_expiring_subjects(
             f"Let's Encrypt Web UI certificate '{c.subject_cn or c.name}' "
             f"{_descriptor(days)} ({valid_to.isoformat()}, threshold "
             f"{threshold_days} d). Auto-renewal may be stuck — check "
-            f"Appliance → Web UI Certificate.{stale_note}"
+            f"{certificate_store_location(settings.appliance_mode)}.{stale_note}"
         )
         matches.append(
             (f"appliance_cert_tls:{c.id}", f"{c.subject_cn or c.name} (LE)", message, sev)
