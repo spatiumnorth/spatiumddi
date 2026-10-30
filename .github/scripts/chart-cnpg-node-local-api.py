@@ -45,9 +45,8 @@ PORT = "KUBERNETES_SERVICE_PORT"
 
 
 def _is_cnpg_cluster(doc: dict) -> bool:
-    return doc.get("kind") == "Cluster" and str(doc.get("apiVersion", "")).startswith(
-        "postgresql.cnpg.io/"
-    )
+    group = str(doc.get("apiVersion", "")).partition("/")[0]
+    return doc.get("kind") == "Cluster" and group == "postgresql.cnpg.io"
 
 
 def _env(doc: dict) -> dict[str, dict]:
