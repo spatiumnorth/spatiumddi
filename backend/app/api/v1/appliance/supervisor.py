@@ -8446,6 +8446,7 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
     empty shape after ~30 s so the supervisor re-polls."""
     import asyncio as _asyncio  # noqa: PLC0415
 
+    from app.core.shutdown import sleep_or_shutdown  # noqa: PLC0415
     from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
 
     appliance = await _require_cert_auth(request, db)
@@ -8456,7 +8457,11 @@ async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
             return PcapPollResponse(**cmd)
         if _asyncio.get_running_loop().time() >= deadline:
             return PcapPollResponse()
-        await _asyncio.sleep(2.0)
+        if await sleep_or_shutdown(2.0):
+            # #3015 — this api process is stopping: the next pass makes one
+            # last claim check and answers the empty shape, so the supervisor
+            # re-polls another pod instead of being cancelled into a 500.
+            deadline = _asyncio.get_running_loop().time()
 
 
 @router.post(

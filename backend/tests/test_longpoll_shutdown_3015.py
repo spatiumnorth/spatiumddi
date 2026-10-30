@@ -440,6 +440,7 @@ async def test_supervisor_heartbeat_hold_returns_a_normal_response(
         ("/supervisor/nettool/poll", "request_id"),
         ("/supervisor/storage/poll", "request_id"),
         ("/supervisor/k8s-proxy/poll", "request_id"),
+        ("/supervisor/pcap/poll", "capture_id"),  # the hold the first walk found missed
     ],
 )
 @pytest.mark.parametrize("before", [False, True], ids=["mid-wait", "before-request"])
