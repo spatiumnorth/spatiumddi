@@ -15,6 +15,7 @@ and a zone-bound API token are held to them.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 
 import pytest
@@ -28,7 +29,7 @@ from app.core.permissions import mount_route_key
 from app.core.security import create_access_token, generate_api_token, hash_password
 from app.main import app
 from app.models.auth import APIToken, Group, Role, User
-from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
 from tests.test_builtin_roles_match_routes import _dependency_calls, _iter_routes
 
 _DNS_TYPES = {"dns_group", "dns_zone", "dns_record"}
@@ -364,3 +365,127 @@ async def test_dns_tools_check_their_own_type(
             assert _denied(resp), f"{held} → {tool}: {resp}"
             assert "192.0.2.44" not in json.dumps(resp)
             assert str(t["zone"]) not in json.dumps(resp)
+
+
+# ── validator additions ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_every_live_route_resolves_its_own_map_entry(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # The map tests above compare the route TABLE's keys with the map. The gate
+    # computes its key from the route a REQUEST matched, which is a different
+    # object (router-relative on a FastAPI that nests included routers). So
+    # send a request to every gated route, as a caller holding nothing, and
+    # check the refusal names exactly that route's map entry rather than
+    # "no permission mapping" or another route's types.
+    h = await _holder(db_session, read("dns_blocklist"))
+    await db_session.commit()
+    seen = 0
+    for gate, mapping in _MAPS:
+        for r in _iter_routes(app.routes):
+            if not r.path.startswith("/api/v1/dns"):
+                continue
+            if not any(c is gate for c in _dependency_calls(r.dependant)):
+                continue
+            url = re.sub(r"\{\w+(:\w+)?\}", lambda _m: str(uuid.uuid4()), r.path)
+            for method in sorted(r.methods - {"HEAD", "OPTIONS"}):
+                needed = mapping[mount_route_key(method, r.path, "/dns")]
+                resp = await client.request(method, url, headers=h)
+                assert resp.status_code == 403, f"{method} {r.path}: {resp.status_code}"
+                detail = resp.json()["detail"]
+                assert f"on each of {list(needed)}" in detail, f"{method} {r.path}: {detail}"
+                seen += 1
+    assert seen == sum(len(m) for _g, m in _MAPS)
+
+
+@pytest.mark.asyncio
+async def test_zone_routes_that_report_servers_or_keys_need_dns_group(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # A zone's server state lists the group's servers, its update ACL names
+    # the group's TSIG keys, and drift is broken down per server.
+    t = await _tree(db_session)
+    zone_rec = await _holder(db_session, read("dns_zone", "dns_record"))
+    all_three = await _holder(db_session, read("dns_group", "dns_zone", "dns_record"))
+    await db_session.commit()
+    base = f"/api/v1/dns/groups/{t['group']}/zones/{t['zone']}"
+    for suffix in ("server-state", "update-acl", "drift"):
+        r = await client.get(f"{base}/{suffix}", headers=zone_rec)
+        assert r.status_code == 403, f"{suffix}: {r.status_code} {r.text[:200]}"
+        assert "dns_group" in r.json()["detail"]
+    for suffix in ("server-state", "update-acl"):
+        r = await client.get(f"{base}/{suffix}", headers=all_three)
+        assert r.status_code == 200, f"{suffix}: {r.status_code} {r.text[:200]}"
+
+
+@pytest.mark.asyncio
+async def test_a_zone_bound_token_is_held_to_its_zones_group(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # ZONE_TOKEN_COARSE_TYPES lets the token through the gate on dns_group;
+    # token_path_scope then holds a {group_id} / {server_id} route to a group
+    # one of its zones sits in, and the group list to those groups.
+    mine = await _tree(db_session)
+    other = await _tree(db_session)
+    servers = {}
+    for name, t in (("mine", mine), ("other", other)):
+        srv = DNSServer(
+            group_id=t["group"], name=f"srv-{name}-{uuid.uuid4().hex[:6]}", host="192.0.2.53"
+        )
+        db_session.add(srv)
+        db_session.add(DNSView(group_id=t["group"], name=f"view-{name}"))
+        await db_session.flush()
+        servers[name] = srv.id
+    h = await _token(
+        db_session,
+        [{"action": "read", "resource_type": "dns_zone", "resource_id": str(mine["zone"])}],
+    )
+    await db_session.commit()
+
+    r = await client.get("/api/v1/dns/groups", headers=h)
+    assert r.status_code == 200, r.text
+    assert {row["id"] for row in r.json()} == {str(mine["group"])}
+
+    for name, t, want in (("mine", mine, 200), ("other", other, 403)):
+        base = f"/api/v1/dns/groups/{t['group']}"
+        for url in (
+            base,
+            f"{base}/servers",
+            f"{base}/views",
+            f"{base}/acls",
+            f"{base}/tsig-keys",
+            f"{base}/options",
+            f"/api/v1/dns/servers/{servers[name]}/zone-state",
+            f"/api/v1/dns/servers/{servers[name]}/pending-ops",
+        ):
+            r = await client.get(url, headers=h)
+            assert r.status_code == want, f"{name} {url}: {r.status_code} {r.text[:200]}"
+            if want == 403:
+                assert "view-other" not in r.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "needs"),
+    [
+        ("export_dns_zone_records", ("dns_zone", "dns_record")),
+        ("find_dns_zone_drift", ("dns_group", "dns_zone", "dns_record")),
+        ("find_zone_update_acls", ("dns_group", "dns_zone")),
+    ],
+)
+async def test_multi_type_dns_tools_need_every_type_their_route_needs(
+    db_session: AsyncSession, tool: str, needs: tuple[str, ...]
+) -> None:
+    t = await _tree(db_session)
+    await db_session.commit()
+    args = {"zone_id": str(t["zone"])}
+    for held in needs:
+        user = await _tool_user(db_session, read(held))
+        resp = await _call(db_session, user, tool, args)
+        assert _denied(resp) or "permission denied" in json.dumps(resp), f"{held} → {tool}: {resp}"
+        assert "192.0.2.44" not in json.dumps(resp)
+    user = await _tool_user(db_session, read(*needs))
+    resp = await _call(db_session, user, tool, args)
+    assert not _denied(resp) and "permission denied" not in json.dumps(resp), resp

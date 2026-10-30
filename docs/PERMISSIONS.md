@@ -240,31 +240,37 @@ classified.
 | Routes | Needs |
 |---|---|
 | `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` | `dns_group` |
-| `/groups/{id}/zones`, a zone and its settings (server state, update ACL, DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
+| `/groups/{id}/zones`, a zone and its settings (DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
 | `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
 
 A route whose answer carries several types needs each of them:
 
 | Route | Needs |
 |---|---|
-| Zone export (one zone or the whole group), zone drift, delegation preview and delegate-from-parent | `dns_zone` and `dns_record` |
-| A server's zone state | `dns_group` and `dns_zone` |
+| Zone export (one zone or the whole group), delegation preview and delegate-from-parent | `dns_zone` and `dns_record` |
+| Zone drift (a per-server report) | `dns_group`, `dns_zone` and `dns_record` |
+| A server's zone state; a zone's per-server state; a zone's update ACL (it names the group's TSIG keys) | `dns_group` and `dns_zone` |
 | A server's pending record ops | `dns_group` and `dns_record` |
 
 The import previews and commits and sync-with-server, which answer with the
 zone's existing records, also need `read` on `dns_record`.
 
 An API token bound to DNS zones (#374) is checked against its owner's grants
-this way, and narrowed to its zones as before: its `dns_zone` grant lets it
-through on `dns_group` and `dns_record` too, and the route then answers for
-its zones only. Grants scoped to one zone keep working where a handler checks
+this way, and narrowed to its zones: its `dns_zone` grant lets it through on
+`dns_group` and `dns_record` too, and the route then answers for its zones
+only. A route keyed on a server group or a server (`{group_id}`,
+`{server_id}`) admits the token only for a group one of its zones sits in, and
+`GET /groups` lists only those groups; before #3073 such a token read every
+group's servers, views, ACLs and TSIG key names. Grants scoped to one zone keep working where a handler checks
 the zone itself (the IPAM subnet DNS pinning, for one).
 
 The Copilot / MCP DNS tools follow the same rule: the server-group, server,
 view, option and DNSSEC-policy tools need `dns_group`, `list_dns_zones` and
 the zone DNSSEC / update-ACL tools `dns_zone`, and the record tools
-(`query_dns_records`, `list_dns_records`, `export_dns_zone_records`,
-`find_dns_zone_drift`) `dns_record`. The DNS server traffic chart
+(`query_dns_records`, `list_dns_records`) `dns_record`. A tool whose REST
+twin needs several types checks each of them: `export_dns_zone_records` needs
+`dns_zone` and `dns_record`, `find_dns_zone_drift` all three, and
+`find_zone_update_acls` `dns_zone` and `dns_group`. The DNS server traffic chart
 (`/metrics/dns/timeseries`) needs `read` on `dns_group`, and tag search shows
 zones to a `dns_zone` reader and records to a `dns_record` reader.
 

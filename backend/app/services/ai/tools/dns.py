@@ -90,6 +90,23 @@ class ListZonesArgs(BaseModel):
 _ZONE_SCOPE_SCAN_CAP = 20_000
 
 
+def _missing_read(user: User, *types: str) -> dict[str, Any] | None:
+    """An error payload unless ``user`` may read EVERY one of ``types``.
+
+    A tool's ``permission`` declaration is any-of, so a tool whose REST twin
+    needs several DNS types (#3073: the zone export needs ``dns_zone`` and
+    ``dns_record``, drift also ``dns_group`` for its per-server rows) declares
+    one and checks the rest here, with the same function the REST gate uses.
+    """
+    # Lazy: ``app.core.permissions`` must not load on the tool-registry
+    # import path (see ``tool_permission_allows``).
+    from app.core.permissions import type_level_allows  # noqa: PLC0415
+
+    if all(type_level_allows(user, "read", t) for t in types):
+        return None
+    return {"error": f"permission denied: need 'read' on each of {list(types)}"}
+
+
 @register_tool(
     name="list_dns_zones",
     honours_token_binding=True,
@@ -774,6 +791,9 @@ async def export_dns_zone_records(
 ) -> dict[str, Any]:
     from app.services.dns_io.spreadsheet import zone_record_rows
 
+    # The REST export needs both types (#3073).
+    if (denied := _missing_read(user, "dns_zone", "dns_record")) is not None:
+        return denied
     try:
         zone_uuid = uuid.UUID(args.zone_id)
     except ValueError:
@@ -1217,6 +1237,10 @@ async def find_dns_zone_drift(
 ) -> dict[str, Any]:
     from app.services.dns.drift import compute_zone_drift  # noqa: PLC0415
 
+    # As the REST drift route (#3073): the zone, its records, and the group's
+    # servers the report is broken down by.
+    if (denied := _missing_read(user, "dns_zone", "dns_record", "dns_group")) is not None:
+        return denied
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
@@ -1528,6 +1552,9 @@ async def find_zone_update_acls(
         _group_driver_names,
     )
 
+    # As the REST route (#3073): the ACL names the group's TSIG keys.
+    if (denied := _missing_read(user, "dns_zone", "dns_group")) is not None:
+        return denied
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}

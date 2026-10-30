@@ -344,8 +344,10 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /groups/{group_id}/zones/{zone_id}": _Z,
     "PUT /groups/{group_id}/zones/{zone_id}": _Z,
     "DELETE /groups/{group_id}/zones/{zone_id}": _Z,
-    "GET /groups/{group_id}/zones/{zone_id}/server-state": _Z,
-    "GET /groups/{group_id}/zones/{zone_id}/update-acl": _Z,
+    # a zone's state on each server of its group (server names and hosts),
+    # and its update ACL, which names the group's TSIG keys
+    "GET /groups/{group_id}/zones/{zone_id}/server-state": ("dns_zone", "dns_group"),
+    "GET /groups/{group_id}/zones/{zone_id}/update-acl": ("dns_zone", "dns_group"),
     "PUT /groups/{group_id}/zones/{zone_id}/update-acl": _Z,
     "GET /groups/{group_id}/zones/{zone_id}/dnssec/info": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/sign": _Z,
@@ -357,11 +359,12 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /tld-registry": _Z,
     "GET /tld-registry/classify": _Z,
     "POST /tld-registry/refresh": _Z,
-    # zones with their records: exports, the live-vs-DB diff, and delegation,
-    # which reads and writes NS + glue records in the parent zone
+    # zones with their records: exports, the live-vs-DB diff (reported per
+    # server, so it carries the group's servers too), and delegation, which
+    # reads and writes NS + glue records in the parent zone
     "GET /groups/{group_id}/zones/export": ("dns_zone", "dns_record"),
     "GET /groups/{group_id}/zones/{zone_id}/export": ("dns_zone", "dns_record"),
-    "GET /groups/{group_id}/zones/{zone_id}/drift": ("dns_zone", "dns_record"),
+    "GET /groups/{group_id}/zones/{zone_id}/drift": ("dns_zone", "dns_record", "dns_group"),
     "GET /groups/{group_id}/zones/{zone_id}/delegation-preview": ("dns_zone", "dns_record"),
     "POST /groups/{group_id}/zones/{zone_id}/delegate-from-parent": ("dns_zone", "dns_record"),
     # records
@@ -2048,8 +2051,23 @@ def _enforce_bind_check_names(
 
 
 @router.get("/groups", response_model=list[ServerGroupResponse])
-async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
-    result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
+async def list_groups(db: DB, current_user: CurrentUser) -> list[ServerGroupResponse]:
+    stmt = select(DNSServerGroup).order_by(DNSServerGroup.name)
+    # A zone-bound API token lists only the groups its zones sit in (#3073),
+    # as ``token_path_scope`` holds it to them on every ``{group_id}`` route.
+    # A ``dns_group`` grant of the token's own admits the groups it names.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    token_group_ids = token_scoped_resource_ids(current_user, "dns_group")
+    if token_zone_ids is not None and token_group_ids is not None:
+        stmt = stmt.where(
+            or_(
+                DNSServerGroup.id.in_(
+                    select(DNSZone.group_id).where(DNSZone.id.in_(token_zone_ids))
+                ),
+                DNSServerGroup.id.in_(_uuids_of(token_group_ids)),
+            )
+        )
+    result = await db.execute(stmt)
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
@@ -10899,6 +10917,17 @@ def _enforce_zone_token_scope(user: Any, zone_id: uuid.UUID) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API token is not scoped to this DNS zone",
         )
+
+
+def _uuids_of(ids: set[str]) -> list[uuid.UUID]:
+    """The ids that parse as UUIDs; a malformed grant id matches nothing."""
+    out: list[uuid.UUID] = []
+    for raw in ids:
+        try:
+            out.append(uuid.UUID(raw))
+        except ValueError:
+            continue  # a malformed grant id names no group
+    return out
 
 
 def _zone_token_id_filter(user: Any) -> set[uuid.UUID] | None:
