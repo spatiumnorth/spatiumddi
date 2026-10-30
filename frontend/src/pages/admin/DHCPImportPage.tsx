@@ -555,7 +555,7 @@ function ConfigureForm({
 
 // ── preview + commit ──────────────────────────────────────────────────
 
-function PreviewPanel({
+export function PreviewPanel({
   preview,
   decisions,
   setDecisions,
@@ -641,10 +641,14 @@ function PreviewPanel({
                     <td className="px-3 py-2 font-mono text-xs">
                       {sc.subnet_cidr}
                       {sc.parse_warnings.length > 0 && (
-                        <div className="mt-0.5 text-[10px] text-amber-600 dark:text-amber-400">
-                          {sc.parse_warnings.length} note
-                          {sc.parse_warnings.length === 1 ? "" : "s"}
-                        </div>
+                        <ul
+                          aria-label={`Notes for ${sc.subnet_cidr}`}
+                          className="mt-1 list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 dark:text-amber-400"
+                        >
+                          {sc.parse_warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
                       )}
                     </td>
                     <td className="px-3 py-2 text-xs">{sc.address_family}</td>
