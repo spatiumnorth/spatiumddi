@@ -7,6 +7,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 
+import { usePermissions } from "@/hooks/usePermissions";
 import { reportsApi } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { humanTime } from "@/pages/network/_shared";
@@ -24,7 +25,10 @@ import { cn } from "@/lib/utils";
  * Read-only — every card is a ``useQuery`` against ``reportsApi`` with
  * loading / empty / error fallbacks. The whole surface is gated by the
  * ``reports.top_n`` feature module (sidebar entry + router both gate),
- * so a disabled module never routes here.
+ * so a disabled module never routes here. Each report route also takes
+ * its own read grant; a card whose grant the user lacks is not fetched
+ * and says so, rather than reading "Failed to load" (#3130, the #2702
+ * pattern).
  */
 export function ReportsPage() {
   return (
@@ -65,6 +69,7 @@ function ReportCard({
   isError,
   isEmpty,
   emptyHint,
+  withheld,
   onRefresh,
   children,
 }: {
@@ -76,6 +81,9 @@ function ReportCard({
   isError: boolean;
   isEmpty: boolean;
   emptyHint: string;
+  /** Set when the user lacks the route's read grant: the reason shown in
+   *  place of the report, which is never fetched. */
+  withheld?: string;
   onRefresh: () => void;
   children: React.ReactNode;
 }) {
@@ -91,31 +99,42 @@ function ReportCard({
             <p className="mt-0.5 text-xs text-muted-foreground">{subtitle}</p>
           )}
         </div>
-        <HeaderButton variant="secondary" icon={RefreshCw} onClick={onRefresh}>
-          Refresh
-        </HeaderButton>
+        {!withheld && (
+          <HeaderButton
+            variant="secondary"
+            icon={RefreshCw}
+            onClick={onRefresh}
+          >
+            Refresh
+          </HeaderButton>
+        )}
       </div>
 
       <div className="p-2">
-        {isLoading && (
+        {withheld && (
+          <p className="p-4 text-center text-sm text-muted-foreground">
+            {withheld}
+          </p>
+        )}
+        {!withheld && isLoading && (
           <p className="p-4 text-center text-sm text-muted-foreground">
             Loading…
           </p>
         )}
-        {!isLoading && isError && (
+        {!withheld && !isLoading && isError && (
           <p className="p-4 text-center text-sm text-destructive">
             Failed to load this report.
           </p>
         )}
-        {!isLoading && !isError && isEmpty && (
+        {!withheld && !isLoading && !isError && isEmpty && (
           <p className="p-4 text-center text-sm text-muted-foreground">
             {emptyHint}
           </p>
         )}
-        {!isLoading && !isError && !isEmpty && children}
+        {!withheld && !isLoading && !isError && !isEmpty && children}
       </div>
 
-      {!isLoading && !isError && generatedAt && (
+      {!withheld && !isLoading && !isError && generatedAt && (
         <div className="border-t px-4 py-2 text-[11px] text-muted-foreground">
           As of {humanTime(generatedAt)}
         </div>
@@ -143,12 +162,31 @@ function Bar({ pct }: { pct: number }) {
   );
 }
 
+/** The route's read grant, resolved against the caller's permissions.
+ *  ``allowed`` gates the fetch; ``withheld`` is the card's message once the
+ *  permission set has loaded and the grant is missing. */
+function useReportGrant(resourceType: string, what: string) {
+  const { can, isLoading } = usePermissions();
+  const allowed = can("read", resourceType);
+  return {
+    allowed,
+    // Shown as "Loading…" so a not-yet-fetched card never reads as empty.
+    pending: isLoading,
+    withheld:
+      !allowed && !isLoading
+        ? `You don't have permission to see ${what} (needs read on ${resourceType}).`
+        : undefined,
+  };
+}
+
 // ── Top subnets by utilization ──────────────────────────────────────
 
 function TopSubnetsCard() {
+  const grant = useReportGrant("subnet", "subnet utilization");
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["reports", "top-subnets"],
     queryFn: reportsApi.topSubnetsByUtilization,
+    enabled: grant.allowed,
   });
   const rows = data?.rows ?? [];
   return (
@@ -157,10 +195,11 @@ function TopSubnetsCard() {
       subtitle="Most-allocated subnets, highest first"
       icon={BarChart3}
       generatedAt={data?.generated_at}
-      isLoading={isLoading}
+      isLoading={isLoading || grant.pending}
       isError={isError}
       isEmpty={rows.length === 0}
       emptyHint="No subnets yet."
+      withheld={grant.withheld}
       onRefresh={() => void refetch()}
     >
       <ul className="divide-y">
@@ -194,9 +233,11 @@ function TopSubnetsCard() {
 // ── Top owners by IP count ──────────────────────────────────────────
 
 function TopOwnersCard() {
+  const grant = useReportGrant("customer", "owners by IP count");
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["reports", "top-owners"],
     queryFn: reportsApi.topOwnersByIpCount,
+    enabled: grant.allowed,
   });
   const rows = data?.rows ?? [];
   const max = rows.reduce((m, r) => Math.max(m, r.ip_count), 0);
@@ -206,10 +247,11 @@ function TopOwnersCard() {
       subtitle="Customers ranked by allocated addresses"
       icon={Users}
       generatedAt={data?.generated_at}
-      isLoading={isLoading}
+      isLoading={isLoading || grant.pending}
       isError={isError}
       isEmpty={rows.length === 0}
       emptyHint="No IP addresses allocated yet."
+      withheld={grant.withheld}
       onRefresh={() => void refetch()}
     >
       <ul className="divide-y">
@@ -247,9 +289,11 @@ function TopOwnersCard() {
 // ── Top modified resources ──────────────────────────────────────────
 
 function TopModifiedCard() {
+  const grant = useReportGrant("audit_log", "the audit log");
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["reports", "top-modified"],
     queryFn: reportsApi.topModifiedResources,
+    enabled: grant.allowed,
   });
   const rows = data?.rows ?? [];
   return (
@@ -258,10 +302,11 @@ function TopModifiedCard() {
       subtitle={`Mutations over the trailing ${data?.window_days ?? 7} days`}
       icon={ClipboardList}
       generatedAt={data?.generated_at}
-      isLoading={isLoading}
+      isLoading={isLoading || grant.pending}
       isError={isError}
       isEmpty={rows.length === 0}
       emptyHint="No mutations recorded in the window."
+      withheld={grant.withheld}
       onRefresh={() => void refetch()}
     >
       <ul className="divide-y">
@@ -294,9 +339,11 @@ function TopModifiedCard() {
 // ── Top DNS clients ─────────────────────────────────────────────────
 
 function TopDNSClientsCard() {
+  const grant = useReportGrant("server", "DNS query-log clients");
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["reports", "top-dns-clients"],
     queryFn: reportsApi.topDnsClients,
+    enabled: grant.allowed,
   });
   const rows = data?.rows ?? [];
   const max = rows.reduce((m, r) => Math.max(m, r.query_count), 0);
@@ -306,10 +353,11 @@ function TopDNSClientsCard() {
       subtitle="Query volume over the last 24 hours"
       icon={Globe}
       generatedAt={data?.generated_at}
-      isLoading={isLoading}
+      isLoading={isLoading || grant.pending}
       isError={isError}
       isEmpty={rows.length === 0}
       emptyHint="No DNS query logs shipped yet."
+      withheld={grant.withheld}
       onRefresh={() => void refetch()}
     >
       <ul className="divide-y">
