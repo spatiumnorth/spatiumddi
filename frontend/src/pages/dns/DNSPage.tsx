@@ -173,15 +173,13 @@ import {
 } from "@/lib/approvalQueue";
 
 // #1338 — a read-only user is offered no DNS write it would be refused.
-// The DNS router admits a write (a delete) on any of its three resource
-// types (dns/router.py, ``require_any_resource_permission``); record writes
-// need nothing more. #1861 — zone writes also take ``dns_zone``, view and
-// ACL writes ``dns_group``, a zone-file import ``dns_record``, and blocklist
-// entry / exception writes ``dns_blocklist``, each with the HTTP method's
-// action (``delete`` for a delete). Server groups, servers, server options,
-// TSIG keys, DNSSEC, dynamic-update ACLs, zone moves, blocklist
-// subscriptions and pools stay superadmin-only. The controls ask the same.
-const DNS_RESOURCES = ["dns_group", "dns_zone", "dns_record"];
+// Each DNS route needs the HTTP method's action on the type it serves
+// (dns/router.py ``_DNS_ROUTE_TYPES``, #3073): record writes ``dns_record``,
+// zone writes ``dns_zone``, view and ACL writes ``dns_group`` (#1861), and
+// blocklist entry / exception writes ``dns_blocklist`` (``delete`` for a
+// delete). Server groups, servers, server options, TSIG keys, DNSSEC,
+// dynamic-update ACLs, zone moves, blocklist subscriptions and pools stay
+// superadmin-only. The controls ask the same.
 const NEEDS_DNS_WRITE = "Requires write permission on DNS records";
 const NEEDS_DNS_DELETE = "Requires delete permission on DNS records";
 const NEEDS_RECORD_WRITE = NEEDS_DNS_WRITE;
@@ -197,8 +195,8 @@ function useDnsGrants() {
   return {
     isSuperadmin: perms.isSuperadmin,
     can: perms.can,
-    canWriteRecords: DNS_RESOURCES.some((t) => perms.can("write", t)),
-    canDeleteRecords: DNS_RESOURCES.some((t) => perms.can("delete", t)),
+    canWriteRecords: perms.can("write", "dns_record"),
+    canDeleteRecords: perms.can("delete", "dns_record"),
   };
 }
 

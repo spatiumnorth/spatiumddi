@@ -1015,7 +1015,6 @@ _TAG_KIND_DEFAULT = ["subnet", "ip_block", "ip_address", "ip_space"]
 # route. ``find_by_tag`` itself only requires an IPAM read, so the extended
 # kinds are checked one by one and a kind the caller can't read is skipped.
 _IPAM_TYPES = ("ip_space", "ip_block", "subnet", "ip_address")
-_DNS_TYPES = ("dns_group", "dns_zone", "dns_record")
 _TAG_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
     "ip_space": ("read", _IPAM_TYPES),
     "ip_block": ("read", _IPAM_TYPES),
@@ -1028,8 +1027,9 @@ _TAG_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
     "circuit": ("read", ("circuit",)),
     "network_service": ("read", ("network_service",)),
     "overlay_network": ("read", ("overlay_network",)),
-    "dns_zone": ("read", _DNS_TYPES),
-    "dns_record": ("read", _DNS_TYPES),
+    # Each DNS kind takes its own type, as its REST route does (#3073).
+    "dns_zone": ("read", ("dns_zone",)),
+    "dns_record": ("read", ("dns_record",)),
     "dhcp_scope": ("read", ("dhcp_scope",)),
     "dhcp_static_assignment": ("read", ("dhcp_static",)),
 }
