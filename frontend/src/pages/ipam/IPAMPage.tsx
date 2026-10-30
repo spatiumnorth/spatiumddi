@@ -131,6 +131,8 @@ import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
 import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -5098,6 +5100,9 @@ export function SubnetDetail({
     onSuccess: () => {
       setInlineEditError(null);
       qc.invalidateQueries({ queryKey: ["addresses"] });
+      // A static assignment's hostname / MAC mirror onto its address, so the
+      // statics lists cache the same object (#3076).
+      qc.invalidateQueries({ queryKey: ["dhcp-statics"] });
     },
     onError: (e) => setInlineEditError(formatApiError(e)),
   });
@@ -7536,9 +7541,9 @@ export function DnsSyncModal({
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
-      // independently. The API re-syncs each address whole, so the rows
-      // left unticked ride along as ``skip_records`` (#2471) and are not
-      // written.
+      // independently. The rows left unticked ride along as ``skip_records``
+      // (#2471) and are not written; an existing record changes only when
+      // its Mismatched row is in ``update_record_ids`` (#3081).
       const ipIds = new Set<string>();
       for (const m of data.missing) {
         if (sel.missing.has(missingKey(m))) ipIds.add(m.ip_id);
@@ -9262,13 +9267,32 @@ function withStoredValue(
   return value && !options.includes(value) ? [value, ...options] : options;
 }
 
-export function EditAddressModal({
-  address,
-  onClose,
-}: {
+type EditAddressModalProps = {
   address: IPAddress;
   onClose: () => void;
-}) {
+};
+
+// Reads the address fresh on open (#3077): the row comes from the cached
+// addresses list, which an inline edit, a static assignment's Save or this
+// dialog's own last Save may have outdated, and the form is seeded once.
+export function EditAddressModal(props: EditAddressModalProps) {
+  const fresh = useFreshRow<IPAddress>(props.address, () =>
+    ipamApi.getAddress(props.address.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title={`Edit ${props.address.address}`}
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditAddressModalForm {...props} address={fresh.row} />;
+}
+
+function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const qc = useQueryClient();
   const [hostname, setHostname] = useState(address.hostname ?? "");
   const [description, setDescription] = useState(address.description ?? "");
@@ -9461,7 +9485,7 @@ export function EditAddressModal({
         status === "reserved" && reservedUntil
           ? new Date(reservedUntil).toISOString()
           : null;
-      const updated = await ipamApi.updateAddress(address.id, {
+      const now = {
         // Send explicit null/"" so an operator can *clear* a field — the old
         // ``value || undefined`` was dropped by axios and ignored by the
         // backend's exclude_unset, making a clear a silent no-op (#502).
@@ -9472,13 +9496,59 @@ export function EditAddressModal({
         mac_address: macAddress || null,
         status,
         custom_fields: customFields,
-        // Send the zone only on a deliberate pick: a real zone moves the
-        // record, "" (the None option) sends null to remove it, and an
-        // untouched picker omits the field so the backend keeps the current
-        // zone (#493 / bot review of #502).
-        dns_zone_id: dnsZoneTouched ? dnsZoneId || null : undefined,
         role: (role || null) as IPRole | null,
         reserved_until: reservedIso,
+      };
+      // Send only what changed (#3091): the row was read fresh on open, but
+      // another surface can still change it while the dialog is open, and a
+      // full body would write the stale values back. Custom fields go as a
+      // whole map (the server replaces it), so they are sent only when this
+      // dialog changed one.
+      const diff: Record<string, unknown> = changedFields(
+        {
+          hostname: address.hostname ?? null,
+          description: address.description ?? "",
+          mac_address: address.mac_address ?? null,
+          status: address.status,
+          custom_fields: address.custom_fields ?? {},
+          role: address.role ?? null,
+          // Through the form's own round trip: the picker holds minutes, so a
+          // stored instant with seconds would otherwise read as a change on
+          // every Save, and a stray TTL on a row that is not reserved is what
+          // the form would send for it anyway.
+          reserved_until:
+            address.status === "reserved" && address.reserved_until
+              ? new Date(
+                  toLocalInputValue(address.reserved_until),
+                ).toISOString()
+              : null,
+        },
+        now,
+      );
+      // Send the zone only on a deliberate pick that moves it: a real zone
+      // moves the record, "" (the None option) sends null to remove it, and
+      // an untouched picker omits the field so the backend keeps the current
+      // zone (#493 / bot review of #502).
+      if (
+        dnsZoneTouched &&
+        (dnsZoneId || null) !== (address.forward_zone_id ?? null)
+      )
+        diff.dns_zone_id = dnsZoneId || null;
+      // A static_dhcp row with no linked reservation is the one untouched
+      // Save that is not a no-op: the update is what retries the reservation
+      // (#867 — fix the cause, e.g. create the scope offered above, and press
+      // Save again), so send the status to make that call.
+      if (
+        Object.keys(diff).length === 0 &&
+        status === "static_dhcp" &&
+        !address.static_assignment_id
+      )
+        diff.status = status;
+      if (Object.keys(diff).length === 0) {
+        return { updated: address, staticError: null as string | null };
+      }
+      const updated = await ipamApi.updateAddress(address.id, {
+        ...(diff as Partial<IPAddress>),
         force,
       });
       // #1628 — the backend syncs the DHCP reservation server-side on
@@ -11848,15 +11918,36 @@ function SpaceAsnBadge({ asnId }: { asnId: string }) {
 
 // ─── Edit IP Space Modal (name/description + delete trigger) ─────────────────
 
-export function EditSpaceModal({
-  space,
-  onClose,
-  onDeleted,
-}: {
+type EditSpaceModalProps = {
   space: IPSpace;
   onClose: () => void;
   onDeleted: () => void;
-}) {
+};
+
+// Reads the space fresh on open (#3075): the panel holds the space as it was
+// when clicked, and the form is seeded once from it.
+export function EditSpaceModal(props: EditSpaceModalProps) {
+  const fresh = useFreshRow<IPSpace>(props.space, () =>
+    ipamApi.getSpace(props.space.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit IP Space"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditSpaceModalForm {...props} space={fresh.row} />;
+}
+
+function EditSpaceModalForm({
+  space,
+  onClose,
+  onDeleted,
+}: EditSpaceModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -11911,8 +12002,8 @@ export function EditSpaceModal({
       : tabChoice;
 
   const saveMutation = useMutation({
-    mutationFn: () => {
-      return ipamApi.updateSpace(space.id, {
+    mutationFn: async () => {
+      const now = {
         name,
         description,
         color,
@@ -11925,7 +12016,28 @@ export function EditSpaceModal({
         customer_id: customerId,
         do_not_probe: doNotProbe,
         do_not_probe_reason: doNotProbeReason,
-      });
+      };
+      // Send only what changed (#3075), so a Save that touches nothing leaves
+      // the space as it is.
+      const diff = changedFields(
+        {
+          name: space.name,
+          description: space.description ?? "",
+          color: space.color ?? null,
+          dns_group_ids: space.dns_group_ids ?? [],
+          dns_zone_id: space.dns_zone_id ?? null,
+          dns_additional_zone_ids: space.dns_additional_zone_ids ?? [],
+          dhcp_server_group_id: space.dhcp_server_group_id ?? null,
+          vrf_id: space.vrf_id ?? null,
+          asn_id: space.asn_id ?? null,
+          customer_id: space.customer_id ?? null,
+          do_not_probe: space.do_not_probe ?? false,
+          do_not_probe_reason: space.do_not_probe_reason ?? "",
+        },
+        now,
+      );
+      if (Object.keys(diff).length === 0) return space;
+      return ipamApi.updateSpace(space.id, diff);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
@@ -12633,15 +12745,37 @@ export function CreateBlockModal({
 
 // ─── Edit Block Modal ─────────────────────────────────────────────────────────
 
-export function EditBlockModal({
-  block,
-  onClose,
-  onDeleted,
-}: {
+type EditBlockModalProps = {
   block: IPBlock;
   onClose: (updated?: IPBlock) => void;
   onDeleted?: () => void;
-}) {
+};
+
+// Reads the block fresh on open (#3091): the block panel holds the block as it
+// was when selected (and the tree's copy comes from a cached list), and the
+// form is seeded once from it.
+export function EditBlockModal(props: EditBlockModalProps) {
+  const fresh = useFreshRow<IPBlock>(props.block, () =>
+    ipamApi.getBlock(props.block.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Block"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={() => props.onClose()}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditBlockModalForm {...props} block={fresh.row} />;
+}
+
+function EditBlockModalForm({
+  block,
+  onClose,
+  onDeleted,
+}: EditBlockModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
   const [description, setDescription] = useState(block.description ?? "");
@@ -12743,8 +12877,8 @@ export function EditBlockModal({
   }
 
   const mutation = useMutation({
-    mutationFn: () =>
-      ipamApi.updateBlock(block.id, {
+    mutationFn: async () => {
+      const now = {
         name: name || undefined,
         description,
         custom_fields: customFields,
@@ -12760,7 +12894,45 @@ export function EditBlockModal({
         site_id: siteId,
         do_not_probe: doNotProbe,
         do_not_probe_reason: doNotProbeReason,
-      }),
+      };
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the block as it is. The baseline is shaped like the body: the
+      // inherited DNS / DHCP fields go out as null, so they are compared as
+      // null whatever the stored row holds under an inheriting block.
+      const was = {
+        name: block.name || undefined,
+        description: block.description ?? "",
+        custom_fields: block.custom_fields ?? {},
+        dns_inherit_settings: block.dns_inherit_settings ?? true,
+        dns_group_ids:
+          (block.dns_inherit_settings ?? true)
+            ? null
+            : (block.dns_group_ids ?? []),
+        dns_zone_id:
+          (block.dns_inherit_settings ?? true) ? null : block.dns_zone_id,
+        dns_additional_zone_ids:
+          (block.dns_inherit_settings ?? true)
+            ? null
+            : (block.dns_additional_zone_ids ?? []),
+        dhcp_inherit_settings: block.dhcp_inherit_settings ?? true,
+        dhcp_server_group_id:
+          (block.dhcp_inherit_settings ?? true)
+            ? null
+            : block.dhcp_server_group_id,
+        asn_id: block.asn_id,
+        vrf_id: block.vrf_id,
+        customer_id: block.customer_id,
+        site_id: block.site_id,
+        do_not_probe: block.do_not_probe ?? false,
+        do_not_probe_reason: block.do_not_probe_reason ?? "",
+      };
+      const diff = changedFields(was, now);
+      // A blanked name is dropped from the body as it always was (a block
+      // keeps its name); it is not a change to send.
+      if (diff.name === undefined) delete diff.name;
+      if (Object.keys(diff).length === 0) return block;
+      return ipamApi.updateBlock(block.id, diff);
+    },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
@@ -16893,6 +17065,17 @@ export function IPAMPage() {
       setSelectedSubnet(fresh);
     }
   }, [detailSubnets, selectedSubnet]);
+
+  // The space panel's snapshot follows the refetched list too (#3075), as the
+  // subnet's does (#509): an Edit IP Space Save refreshed the list and left
+  // the panel header on the old values.
+  useEffect(() => {
+    if (!selectedSpace || !spaces) return;
+    const fresh = spaces.find((s: IPSpace) => s.id === selectedSpace.id);
+    if (fresh && JSON.stringify(fresh) !== JSON.stringify(selectedSpace)) {
+      setSelectedSpace(fresh);
+    }
+  }, [spaces, selectedSpace]);
 
   function selectSubnet(subnet: Subnet | null) {
     setSelectedSubnet(subnet);
