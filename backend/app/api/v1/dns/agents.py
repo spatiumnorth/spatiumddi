@@ -86,6 +86,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
+from app.services.dns.new_object_defaults import add_group_with_defaults
 from app.services.dns.record_ops import (
     ack_op,
     apply_acks,
@@ -452,8 +453,7 @@ async def agent_register(
                 group = DNSServerGroup(
                     name=body.group_name, description="Auto-created by agent registration"
                 )
-                db.add(group)
-                await db.flush()
+                await add_group_with_defaults(db, group)
         else:
             res = await db.execute(
                 select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1)
@@ -463,8 +463,7 @@ async def agent_register(
                 group = DNSServerGroup(
                     name="default", description="Auto-created by agent registration"
                 )
-                db.add(group)
-                await db.flush()
+                await add_group_with_defaults(db, group)
 
     if server is None:
         res = await db.execute(

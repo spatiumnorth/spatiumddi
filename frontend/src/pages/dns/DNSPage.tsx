@@ -104,6 +104,7 @@ import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   applianceTlsApi,
   dnsApi,
+  settingsApi,
   dnsBlocklistApi,
   ipamApi,
   domainsApi,
@@ -1100,7 +1101,7 @@ function patchCachedRow(
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
-function GroupModal({
+export function GroupModal({
   group,
   onClose,
 }: {
@@ -1111,7 +1112,21 @@ function GroupModal({
   const [name, setName] = useState(group?.name ?? "");
   const [description, setDescription] = useState(group?.description ?? "");
   const [groupType, setGroupType] = useState(group?.group_type ?? "internal");
-  const [isRecursive, setIsRecursive] = useState(group?.is_recursive ?? true);
+  // #3087 — a new group starts from Settings → DNS "Recursive by Default"
+  // until the operator ticks the box; an existing group shows its own value.
+  const { data: dnsDefaults } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    enabled: !group,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const [pickedRecursive, setPickedRecursive] = useState<boolean | null>(
+    group?.is_recursive ?? null,
+  );
+  const isRecursive =
+    pickedRecursive ?? dnsDefaults?.dns_recursive_by_default ?? true;
+  const setIsRecursive = (v: boolean) => setPickedRecursive(v);
   // BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
   // ≥2-server BIND9 groups, and BIND 9.18+ is required.
   const [catalogZonesEnabled, setCatalogZonesEnabled] = useState(
@@ -2642,7 +2657,47 @@ export function ZoneModal({
     // Once, on open: later renders must not move a caret the operator placed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
+  // #1784 — the experimental agentless Technitium driver writes only the
+  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
+  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
+  // when the group list is already loaded.
+  const { data: groupList } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+    staleTime: 30_000,
+  });
+  const groupDrivers =
+    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
+  const technitiumApi = groupDrivers.includes("technitium_api");
+  // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
+  // Default Zone TTL) until the operator changes them. An existing zone
+  // shows its own values. The settings read is best-effort: a role that
+  // may not read Settings keeps the built-in "primary" / 3600.
+  const { data: dnsDefaults } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    enabled: !zone,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const [pickedZoneType, setPickedZoneType] = useState<string | null>(
+    zone?.zone_type ?? null,
+  );
+  const [pickedTtl, setPickedTtl] = useState<string | null>(
+    zone ? String(zone.ttl ?? 3600) : null,
+  );
+  // The agentless Technitium driver applies only a Primary zone at the
+  // stock TTL (above), so a stored default it would refuse is not offered.
+  const zoneType =
+    pickedZoneType ??
+    (technitiumApi
+      ? "primary"
+      : (dnsDefaults?.dns_default_zone_type ?? "primary"));
+  const setZoneType = setPickedZoneType;
+  const ttl =
+    pickedTtl ??
+    String(technitiumApi ? 3600 : (dnsDefaults?.dns_default_ttl ?? 3600));
+  const setTtl = setPickedTtl;
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
   // reverse-lookup zone, and IPAM publishes PTR records only into kind
@@ -2658,23 +2713,10 @@ export function ZoneModal({
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
-  const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
   // #1861 — DNSSEC at create is superadmin-only; the zone itself is not.
   const { isSuperadmin: zoneIsSuperadmin } = usePermissions();
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
-  // #1784 — the experimental agentless Technitium driver writes only the
-  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
-  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
-  // when the group list is already loaded.
-  const { data: groupList } = useQuery({
-    queryKey: ["dns-groups"],
-    queryFn: () => dnsApi.listGroups(),
-    staleTime: 30_000,
-  });
-  const groupDrivers =
-    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
-  const technitiumApi = groupDrivers.includes("technitium_api");
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // #986 — TLD scope hint under the name field. Classified server-side so
