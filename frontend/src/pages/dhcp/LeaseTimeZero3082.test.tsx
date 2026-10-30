@@ -109,6 +109,8 @@ describe("Edit DHCP Scope lease time (#3082)", () => {
       ),
     );
     const box = await open();
+    // A change, so the save is sent: an unchanged Save sends nothing (#3091).
+    fireEvent.change(box, { target: { value: "7200" } });
     fireEvent.submit(box.closest("form")!);
     await waitFor(() =>
       expect(screen.getByText("Failed to save scope")).toBeTruthy(),
