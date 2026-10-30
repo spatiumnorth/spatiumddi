@@ -723,7 +723,7 @@ heartbeat body is strict and an agent can be upgraded before its control plane.
 - Control plane marks `DNSServer.status = unreachable` if no heartbeat for **3 × heartbeat_interval** (90 s default).
 - UI: the existing server-group view shows colored status dots; a new "Last seen" column uses `last_health_check_at`.
 - A Celery beat job `dns_agent_stale_sweep` runs every 60 s, flips statuses, emits an audit entry, and triggers notifications (Phase 4).
-- Metrics: Prometheus gauges `spatium_dns_agent_up`, `spatium_dns_agent_config_lag_seconds`, `spatium_dns_zone_serial`, `spatium_dns_failed_ops_total` — scraped from the control plane (agent does not expose a scrape endpoint; keeps it egress-only).
+- Metrics: no per-agent Prometheus series yet (planned in [#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146)); the heartbeat age, config apply status and per-server zone serials are on the server row in the console and the API. The agent does not expose a scrape endpoint, which keeps it egress-only. See [OBSERVABILITY.md](../OBSERVABILITY.md#dns-agent-telemetry).
 
 ---
 

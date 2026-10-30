@@ -1,7 +1,9 @@
 """App-wide cap on the size of a request body (#2780).
 
-nginx admits 1 MiB on ``/api/`` (more on the backup and upgrade-image
-locations), but the api port itself (127.0.0.1 on compose, a ClusterIP
+nginx admits 1 MiB on ``/api/`` (more on the locations for the routes in
+:data:`ALLOWANCES` -- the backup and upgrade-image uploads, and since #3036
+the importers, the pcap upload and the ingested-records push --, which
+``tests/test_nginx_body_limit_matches_api_3036.py`` keeps in step), but the api port itself (127.0.0.1 on compose, a ClusterIP
 Service on Kubernetes) has no body limit, and FastAPI reads a JSON body
 whole into memory before any dependency runs. This middleware bounds that
 for every route, in front of everything else:

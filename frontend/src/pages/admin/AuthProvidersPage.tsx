@@ -10,6 +10,7 @@ import {
   type AuthGroupMappingCreate,
   type AuthGroupMappingUpdate,
   type AuthProviderTestResult,
+  formatApiError,
 } from "@/lib/api";
 import {
   Plus,
@@ -1053,7 +1054,7 @@ function TestConnectionPanel({
     onError: (err: Error & { response?: { data?: { detail?: string } } }) =>
       setResult({
         ok: false,
-        message: err.response?.data?.detail ?? err.message,
+        message: formatApiError(err),
         details: {},
       }),
   });
@@ -1218,10 +1219,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
       setError(null);
       return;
     }
-    const msg =
-      (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-        ?.detail ?? "Failed to save mapping";
-    setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    setError(formatApiError(err, "Failed to save mapping"));
   }
 
   const createMut = useMutation({
@@ -1901,7 +1899,7 @@ export function AuthProvidersPage() {
       setMutateError("");
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
-      setMutateError(err.response?.data?.detail ?? err.message);
+      setMutateError(formatApiError(err));
     },
   });
   const updateMut = useMutation({
@@ -1919,7 +1917,7 @@ export function AuthProvidersPage() {
       setMutateError("");
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
-      setMutateError(err.response?.data?.detail ?? err.message);
+      setMutateError(formatApiError(err));
     },
   });
   const deleteMut = useMutation({
