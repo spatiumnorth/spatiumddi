@@ -506,3 +506,64 @@ def test_a_console_cancel_replaces_the_reboot_flash(tmp_path: Path) -> None:
     dash = _FlashRecorder()
     con["do_cancel_reboot"](_FakeConsole(), dash)
     assert dash.flashes and dash.flashes[-1] == "Reboot cancelled"
+
+
+def test_cancelling_a_power_off_says_power_off_not_reboot(tmp_path: Path) -> None:
+    # #3101 — the modal, the printed note and the flash named a reboot while
+    # the pending action was a power-off.
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    marker = tmp_path / "power-action"
+    marker.write_text(f"{os.getpid()} poweroff\n")
+    con = _console(state, boot, lambda argv: None)
+    con["POWER_ACTION_MARKER"] = marker
+    asked: list[str] = []
+    con["confirm_modal"] = lambda _c, q: asked.append(q) or True
+    dash, fc = _FlashRecorder(), _FakeConsole()
+    con["do_cancel_reboot"](fc, dash)
+    assert asked == ["Cancel the pending power-off?"]
+    assert dash.flashes[-1] == "Power-off cancelled"
+    assert any("Power-off cancelled." in line for line in fc.out), fc.out
+    assert not any("eboot" in line for line in fc.out), fc.out
+
+
+def _dashboard_state_class(clock):
+    """DashboardState's flash helpers, lifted out of the shipped script."""
+    import __future__
+    import ast
+    tree = ast.parse(CONSOLE.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "DashboardState")
+    keep = [n for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name in ("flash", "status_for_draw")]
+    assert {n.name for n in keep} == {"flash", "status_for_draw"}
+    cls.body = keep
+    cls.bases = []
+    mod = ast.Module(body=[cls], type_ignores=[])
+    ns: dict = {"time": clock}
+    exec(compile(mod, str(CONSOLE), "exec",
+                 flags=__future__.annotations.compiler_flag, dont_inherit=True), ns)
+    return ns["DashboardState"]
+
+
+def test_a_flash_is_drawn_once_even_when_the_redraw_is_late() -> None:
+    # #3101 — the ttl counts from the first frame that draws the flash, so a
+    # footer redraw several seconds after the call cannot swallow it.
+    class Clock:
+        now = 1000.0
+
+        @classmethod
+        def time(cls) -> float:
+            return cls.now
+
+    st = _dashboard_state_class(Clock)()
+    st.status_message, st.status_expires = "", 0.0
+    st.flash("Reboot cancelled", ttl=5)
+    Clock.now += 8.0  # slow redraw, past the ttl
+    assert st.status_for_draw() == "Reboot cancelled"
+    Clock.now += 4.0
+    assert st.status_for_draw() == "Reboot cancelled"
+    Clock.now += 1.5  # 5.5 s after the first draw
+    assert st.status_for_draw() == ""
