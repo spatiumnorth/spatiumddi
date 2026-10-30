@@ -100,7 +100,6 @@ from app.models.dns import (
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
-    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSBlockList,
@@ -168,6 +167,7 @@ from app.services.dns.named_conf_validation import (
     validate_view_name,
     validate_zone_forwarders,
 )
+from app.services.dns.new_object_defaults import load_dns_defaults
 from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
@@ -400,7 +400,9 @@ class ServerGroupCreate(BaseModel):
     description: str = ""
     group_type: str = "internal"
     default_view: str | None = None
-    is_recursive: bool = True
+    # #3087 — omitted ⇒ Settings → DNS "Recursive by Default" (resolved in
+    # the create handler; an explicit value always wins).
+    is_recursive: bool | None = None
     # BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
     # ≥2-server BIND9 groups.
     catalog_zones_enabled: bool = False
@@ -1311,11 +1313,17 @@ def _validate_zone_forward_tls_hostname(v: str | None) -> str | None:
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
+    # Stays "primary" when omitted (#3087): Settings' Default Zone Type is a
+    # pre-selection for the Add Zone form only.  A forward / secondary / stub
+    # zone needs fields (forwarders, masters) a bare create never carries, so
+    # defaulting the API's type to it would turn an omitted type into a 422.
     zone_type: str = "primary"
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
+    # #3087 — omitted ⇒ Settings → DNS "Default Zone TTL" (resolved in the
+    # create handler; an explicit value, including 0, always wins).
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1943,12 +1951,16 @@ async def create_group(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A server group with that name already exists")
 
-    group = DNSServerGroup(**body.model_dump())
+    defaults = await load_dns_defaults(db)
+    group_fields = body.model_dump()
+    if body.is_recursive is None:
+        group_fields["is_recursive"] = defaults.recursive
+    group = DNSServerGroup(**group_fields)
     db.add(group)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
-    # Auto-create default options
-    options = DNSServerOptions(group=group)
+    # Auto-create default options (#3087: DNSSEC validation from Settings)
+    options = DNSServerOptions(group=group, dnssec_validation=defaults.dnssec_validation)
     db.add(options)
 
     db.add(
@@ -3190,6 +3202,8 @@ async def _sync_single_server(
     zones_imported: list[str] = []
     zones_skipped_system: list[str] = []
     if import_new_zones and new_zones:
+        # The server reports no zone TTL; the stored default fills the gap (#3087).
+        pull_defaults = await load_dns_defaults(db)
         for name in new_zones:
             if _is_system_zone_name(name):
                 zones_skipped_system.append(name)
@@ -3211,7 +3225,7 @@ async def _sync_single_server(
                 name=name if name.endswith(".") else name + ".",
                 zone_type="primary",
                 kind=kind,
-                ttl=3600,
+                ttl=pull_defaults.ttl,
                 refresh=ZONE_DEFAULT_REFRESH,
                 retry=ZONE_DEFAULT_RETRY,
                 expire=ZONE_DEFAULT_EXPIRE,
@@ -5646,12 +5660,17 @@ async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: CurrentUser
 ) -> ZoneResponse:
     await _require_group(group_id, db)
-    _refuse_superadmin_zone_fields(current_user, body.model_dump(), None)
-    await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
+    # #3087 — an omitted TTL takes Settings → DNS "Default Zone TTL". Resolved
+    # before the gates so they judge the value the zone will actually carry.
+    zone_fields = body.model_dump()
+    if zone_fields["ttl"] is None:
+        zone_fields["ttl"] = (await load_dns_defaults(db)).ttl
+    _refuse_superadmin_zone_fields(current_user, zone_fields, None)
+    await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
-    await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
+    await _check_zone_forward_transport(group_id, zone_fields, None, db)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -5665,7 +5684,7 @@ async def create_zone(
     if body.dnssec_enabled:
         await _check_driver_gated_operation("dnssec_sign", group_id, db)
 
-    payload = body.model_dump()
+    payload = zone_fields
     payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
     guard = await RenderGuard.capture(db, group_id, [body.name])
     zone = DNSZone(group_id=group_id, **payload)
@@ -7901,6 +7920,7 @@ async def create_zone_from_template(
         name=body.zone_name,
         zone_type=body.zone_type,
         kind=body.kind,
+        ttl=(await load_dns_defaults(db)).ttl,  # #3087
     )
     db.add(zone)
     await guard.check(db, f"create zone {body.zone_name!r}")  # #2275

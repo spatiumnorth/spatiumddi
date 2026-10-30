@@ -26,6 +26,7 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup, DNSZone
 from app.models.ipam import Subnet
+from app.services.dns.new_object_defaults import load_dns_defaults
 from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, reverse_zone_network re-exported
     _effective_dns,
     cidrs_overlap,
@@ -389,6 +390,7 @@ async def _ensure_zone_named(
         name=reverse_name,
         zone_type="primary",
         kind="reverse",
+        ttl=(await load_dns_defaults(db)).ttl,  # #3087
         is_auto_generated=True,
         linked_subnet_id=subnet.id,
     )
