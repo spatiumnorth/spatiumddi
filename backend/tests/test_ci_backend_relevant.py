@@ -51,6 +51,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     ),
     # #1468 — the group-name rule must match the supervisor's own pattern.
     "test_appliance_group_names.py": ("agent/supervisor/spatium_supervisor/role_orchestrator.py"),
+    # #3026 — the supervisor's "is the booted slot the target?" copy must
+    # answer exactly as the control plane's.
+    "test_nightly_upgrade_cleared_3026.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
     # #1465: runs the demo seeder's own template payloads through the API model.
@@ -128,6 +133,17 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/src/lib/bulk-allocate-template.vectors.json"
     ),
     "test_e911_held.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #3061 — both templates must proxy the ACME http-01 challenge.
+    "test_acme_client.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #3036 — each nginx location's body limit must cover the api allowance
+    # (body_limit.ALLOWANCES) of the routes it fronts, in both templates.
+    "test_nginx_body_limit_matches_api_3036.py": (
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),

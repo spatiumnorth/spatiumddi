@@ -720,7 +720,16 @@ spatiumddi_api_request_duration_seconds{method, path_template} (histogram)
 spatiumddi_api_active_requests (gauge)
 ```
 
-Plus two counters declared but not yet wired to a call site (read zero):
+The DNS agent config long-poll (#1111) adds three counters, labelled
+`family="dns"` (the DHCP long-poll does not count yet):
+
+```
+spatiumddi_agent_bundle_served_total{family, outcome}   # full / not_modified / client_gone
+spatiumddi_agent_bundle_inline_renders_total{family}
+spatiumddi_agent_bundle_inline_failures_total{family}
+```
+
+Plus two counters declared but not yet wired to a call site (no samples):
 
 ```
 spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oidc
@@ -1094,7 +1103,15 @@ running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The
 conformity evaluator follows the same rules.
 
-Rule types shipped today:
+Rule types described on this page. The build has 73 (`RULE_TYPES` in
+`backend/app/services/alerts.py`) and 41 of them have a row below.
+`GET /api/v1/alerts/rule-types` lists every type whose feature module is
+enabled, with its parameters, and some are documented on their own feature page
+instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in
+IPAM.md). Among those with no row below are `tls_cert_expiring` and the other
+`tls_cert_*` rules, `secret_expiring`, `new_mac_seen`, `rogue_dhcp`,
+`restore_drill_failed`, `schema_behind_head` and the `dns_*_suspected`
+threat-analytics rules.
 
 | Type | Fires when |
 |---|---|
@@ -1227,40 +1244,53 @@ automatically. MCP: `find_bgp_hijacks` / `count_bgp_hijacks` /
 
 ### 9.2 Prometheus alerting rules (external)
 
-Reference Prometheus alerting rules for the `spatiumddi_*` metrics
-(a perf-testing Prometheus config already lives under
-`perf/dashboards/prometheus/`):
+The control plane's `/metrics` registry declares eight `spatiumddi_*` series
+(beside the client library's standard `process_*` and `python_*`). Six carry
+samples today; the two `auth` counters are declared but nothing increments
+them yet, so they carry no samples, and the agent-bundle counters only ever
+see `family="dns"`:
 
-| Alert | Condition | Severity |
+| Series | Type | Labels |
 |---|---|---|
-| `DHCPServerOffline` | `dhcp_server_status == 0` for 2m | critical |
-| `DHCPSyncStale` | `time() - dhcp_sync_last_success > 900` | warning |
-| `DHCPPoolNearExhaustion` | `pool_utilization > 90` | warning |
-| `DNSServerOffline` | `dns_server_status == 0` for 2m | critical |
-| `SubnetNearExhaustion` | `subnet_utilization > 90` | warning |
-| `SubnetExhausted` | `subnet_utilization > 99` | critical |
-| `APIHighErrorRate` | `rate(requests[5m]{status=~"5.."})/rate(requests[5m]) > 0.05` | warning |
-| `DBReplicationLag` | `replication_lag > 30` | warning |
-| `CeleryQueueBacklog` | `queue_length > 100` for 5m | warning |
-| `BackupFailed` | Checked via Celery task failure metric | critical |
+| `spatiumddi_api_requests_total` | counter | `method`, `path_template`, `status_code` |
+| `spatiumddi_api_request_duration_seconds` | histogram | `method`, `path_template` |
+| `spatiumddi_api_active_requests` | gauge | |
+| `spatiumddi_auth_login_total` | counter (no samples yet) | `method`, `result` |
+| `spatiumddi_auth_token_usage_total` | counter (no samples yet) | `scope` |
+| `spatiumddi_agent_bundle_served_total` | counter | `family`, `outcome` |
+| `spatiumddi_agent_bundle_inline_renders_total` | counter | `family` |
+| `spatiumddi_agent_bundle_inline_failures_total` | counter | `family` |
+
+For example, an API error-rate alert is
+`sum(rate(spatiumddi_api_requests_total{status_code=~"5.."}[5m])) / sum(rate(spatiumddi_api_requests_total[5m])) > 0.05`
+(a perf-testing Prometheus config already lives under
+`perf/dashboards/prometheus/`).
+
+**Planned, not emitted yet.** There are no Prometheus series for DHCP / DNS
+server status, DHCP sync age, pool or subnet utilization, database
+replication lag, Celery queue length or task failures, so the usual rules
+over them (server offline, pool near exhaustion, replication lag, queue
+backlog, failed backups) cannot be written against `/metrics` today. Use
+the in-product alert rules above (`server_unreachable`, `subnet_utilization`,
+`dhcp_pool_exhaustion`, `backup_failed`, ...) for those conditions. Exporting
+them as series is tracked in
+[#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146) and
+[#1267](https://github.com/spatiumnorth/spatiumddi/issues/1267).
 
 
 ## DNS Agent Telemetry
 
 See [`docs/deployment/DNS_AGENT.md`](deployment/DNS_AGENT.md) §4 for the full protocol.
 
-### Metrics (scraped from the control plane)
+### Metrics
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `spatium_dns_agent_up` | gauge | `server_id`, `flavor` | 1 if last heartbeat within 90s |
-| `spatium_dns_agent_config_lag_seconds` | gauge | `server_id` | Age of the applied config etag |
-| `spatium_dns_zone_serial` | gauge | `server_id`, `zone` | Last reported SOA serial |
-| `spatium_dns_failed_ops_total` | counter | `server_id` | RecordOps that exhausted retries |
-| `spatium_dns_agent_token_rotations_total` | counter | `server_id` | JWT rotations per server |
-
-Agents are egress-only and do **not** expose a scrape endpoint — all metrics
-are derived from the heartbeat body on the control plane.
+The control plane emits no per-agent Prometheus series yet (no agent-up,
+config-lag, zone-serial, failed-op or token-rotation metric). The same facts
+are on the server row in the console and in the API: heartbeat age and
+status, the applied config etag and apply status, per-server zone serials
+(`DNSServerZoneState`) and queued record ops. Agents are egress-only and do
+**not** expose a scrape endpoint; the control plane derives everything from
+the heartbeat body. Agent-level series are part of #2146.
 
 ### Logs
 
@@ -1269,6 +1299,4 @@ Agent logs are structured JSON (non-negotiable #7) and include the canonical
 
 - `dns_agent_registered` — bootstrap complete
 - `dns_agent_token_rotated` — JWT rotation
-- `dns_agent_config_applied` — new config etag applied
-- `dns_agent_op_failed` — RecordOp failed (attempt <= 5)
 - `dns_agent_stale_sweep` — control-plane Celery task marked servers unreachable

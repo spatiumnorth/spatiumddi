@@ -237,6 +237,8 @@ def test_the_overrides_carry_the_sizing_and_state_the_redis_kind(monkeypatch) ->
         "cnpg": {
             "instances": 1,
             "parameters": {"shared_buffers": "384MB", "max_connections": "200"},
+            # #3021 — the instances reach their own node's API server.
+            "nodeLocalApiServer": {"enabled": True},
         },
         "resources": {"requests": {"memory": "384Mi"}, "limits": {"memory": "1536Mi"}},
     }
@@ -266,6 +268,7 @@ def test_the_overrides_carry_the_cpu_limits_2240(monkeypatch) -> None:
         "cnpg": {
             "instances": 7,
             "parameters": {"shared_buffers": "1024MB", "max_connections": "249"},
+            "nodeLocalApiServer": {"enabled": True},
         },
         "resources": {
             "requests": {"memory": "1024Mi"},
@@ -296,7 +299,9 @@ def test_without_a_size_the_document_is_what_it_was(monkeypatch) -> None:
     doc = rec.doc
     assert "resources" not in doc["api"] and "resources" not in doc["worker"]
     assert "concurrency" not in doc["worker"]
-    assert doc["postgresql"] == {"cnpg": {"instances": 3}}
+    assert doc["postgresql"] == {
+        "cnpg": {"instances": 3, "nodeLocalApiServer": {"enabled": True}}
+    }
     assert doc["redis"]["kind"] == "sentinel"
 
 
@@ -353,6 +358,7 @@ def test_an_operators_own_postgres_parameters_survive_the_merge(monkeypatch) -> 
                 "shared_buffers": "640MB",
                 "max_connections": "200",
             },
+            "nodeLocalApiServer": {"enabled": True},
         },
         # #2156 — three nodes' connections (134 x 16 MiB + 640 + 256).
         "resources": {"requests": {"memory": "640Mi"}, "limits": {"memory": "3040Mi"}},

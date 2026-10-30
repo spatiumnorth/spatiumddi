@@ -15,6 +15,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope, DHCPServerGroup
 from app.services.dhcp.class_refs import (
     classes_testing_membership,
@@ -242,6 +243,7 @@ async def update_class(
         )
         if "options" in changes:
             changes["options"] = options
+    before = snapshot(cc, changes)
     for k, v in changes.items():
         setattr(cc, k, v)
     write_audit(
@@ -251,7 +253,7 @@ async def update_class(
         resource_type="dhcp_client_class",
         resource_id=str(cc.id),
         resource_display=cc.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     collect_wake(dhcp_group_channel(cc.group_id))

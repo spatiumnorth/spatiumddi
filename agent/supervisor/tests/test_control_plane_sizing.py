@@ -331,6 +331,8 @@ def test_an_unreadable_memtotal_renders_no_postgres_fragment_and_stays_valid() -
         "cnpg": {
             "instances": 1,
             "podAntiAffinityType": "required",
+            # #3021 — the instances reach their own node's API server.
+            "nodeLocalApiServer": {"enabled": True},
             # #2132 — the CA publisher the supervisor's verified slot read needs.
             "caPublisher": {"enabled": True},
         },

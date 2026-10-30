@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.versions import is_installed_target
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance, ApplianceUpgradeImage
 from app.models.system_upgrade import SystemUpgradeRun
 from app.services.appliance.architecture import normalize
@@ -147,9 +148,6 @@ async def image_usage(
     usage = {i.id: ImageUsage() for i in images}
     if not usage:
         return usage
-    by_version: dict[str, list[ApplianceUpgradeImage]] = {}
-    for img in images:
-        by_version.setdefault(img.appliance_version, []).append(img)
     appliances = (
         await db.execute(
             select(
@@ -169,15 +167,19 @@ async def image_usage(
         if target in usage and hostname not in usage[target].scheduled_for:
             usage[target].scheduled_for.append(hostname)
         node_arch = normalize(arch)
-        for v in {installed, slot_a, slot_b}:
-            for img in by_version.get(v or "", []):
-                # An image labelled for another architecture is not what
-                # this node runs, even if the version string matches.
-                img_arch = normalize(img.architecture)
-                if img_arch and node_arch and img_arch != node_arch:
-                    continue
-                if hostname not in usage[img.id].installed_on:
-                    usage[img.id].installed_on.append(hostname)
+        running = {v for v in (installed, slot_a, slot_b) if v}
+        for img in images:
+            # #3026 — a nightly image is labelled with its release tag,
+            # which never equals the slot's ``0.0.0-nightly-…+<sha>``.
+            if not any(is_installed_target(v, img.appliance_version) for v in running):
+                continue
+            # An image labelled for another architecture is not what
+            # this node runs, even if the version string matches.
+            img_arch = normalize(img.architecture)
+            if img_arch and node_arch and img_arch != node_arch:
+                continue
+            if hostname not in usage[img.id].installed_on:
+                usage[img.id].installed_on.append(hostname)
     runs = (
         await db.execute(
             select(SystemUpgradeRun.id, SystemUpgradeRun.plan)

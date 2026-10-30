@@ -54,6 +54,6 @@ export function listReadErrorMessage(err: unknown, what: string): string {
  */
 export function pollUnlessRefused(
   ms: number,
-): (query: { state: { error: unknown } }) => number | false {
+): (query: { state: { error: Error | null } }) => number | false {
   return (query) => (isRefused(query.state.error) ? false : ms);
 }

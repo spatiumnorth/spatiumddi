@@ -27,6 +27,7 @@ from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     collect_wake,
     dhcp_wake_channels,
     wake_subscription,
@@ -35,6 +36,7 @@ from app.core.celery_dispatch import dispatch
 from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -1081,7 +1083,11 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)
@@ -1134,7 +1140,9 @@ async def agent_heartbeat(
     if (
         server.desired_appliance_version is not None
         and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
+        and is_installed_target(
+            server.installed_appliance_version, server.desired_appliance_version
+        )
         and (server.last_upgrade_state in ("done", None))
     ):
         server.desired_appliance_version = None

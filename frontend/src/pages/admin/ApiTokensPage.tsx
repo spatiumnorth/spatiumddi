@@ -916,7 +916,16 @@ export function ApiTokensPage() {
                             <PowerOff className="h-3.5 w-3.5" />
                           </button>
                         ) : (
-                          isSuperadmin && (
+                          isSuperadmin &&
+                          (isExpired(t.expires_at) ? (
+                            <button
+                              disabled
+                              className="rounded p-1 text-muted-foreground opacity-40"
+                              title="Expired — create a new token instead"
+                            >
+                              <Power className="h-3.5 w-3.5" />
+                            </button>
+                          ) : (
                             <button
                               onClick={() => setReenable(t)}
                               className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -924,7 +933,7 @@ export function ApiTokensPage() {
                             >
                               <Power className="h-3.5 w-3.5" />
                             </button>
-                          )
+                          ))
                         )}
                         <button
                           onClick={() => setConfirmDelete(t)}
