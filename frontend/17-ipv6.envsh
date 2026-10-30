@@ -1,0 +1,44 @@
+#!/bin/sh
+# Renders the IPv6 parts of the nginx config (#2308), sourced by the nginx
+# image's entrypoint before the templates are envsubst'd.
+#
+# * SPATIUM_LISTEN6_80 / SPATIUM_LISTEN6_80_DS / SPATIUM_LISTEN6_443_DS — the
+#   ``listen [::]:…;`` lines. Without them an IPv6-only cluster cannot reach
+#   the frontend (the pod has no IPv4 address). nginx refuses to start when it
+#   is told to listen on an IPv6 address the container does not have, so they
+#   render empty there — the same reason the upstream
+#   10-listen-on-ipv6-by-default.sh exists (it cannot edit a template that is
+#   not the stock one).
+# * SPATIUM_RESOLVER_IPV6 — ``ipv6=off`` only where the container has no IPv6.
+#   Unconditionally it made an api Service with only AAAA records
+#   unresolvable; leaving it off everywhere would let a v4-only container pick
+#   an AAAA answer it cannot route to.
+#
+# SPATIUM_FRONTEND_IPV6=on|off forces the answer; the default is to ask the
+# kernel whether this network namespace has any IPv6 address at all.
+
+set -eu
+
+_spatium_v6="${SPATIUM_FRONTEND_IPV6:-auto}"
+case "$_spatium_v6" in
+    on|off) ;;
+    *)
+        # /proc/net/if_inet6 lists one line per IPv6 address; it is absent
+        # without the ipv6 module and empty with disable_ipv6=1. Its stat size
+        # is always 0, so it has to be read (``-s`` would say "no IPv6").
+        if grep -q . /proc/net/if_inet6 2>/dev/null; then _spatium_v6=on; else _spatium_v6=off; fi
+        ;;
+esac
+
+if [ "$_spatium_v6" = "on" ]; then
+    SPATIUM_LISTEN6_80="listen [::]:80;"
+    SPATIUM_LISTEN6_80_DS="listen [::]:80 default_server;"
+    SPATIUM_LISTEN6_443_DS="listen [::]:443 ssl default_server;"
+    SPATIUM_RESOLVER_IPV6=""
+else
+    SPATIUM_LISTEN6_80=""
+    SPATIUM_LISTEN6_80_DS=""
+    SPATIUM_LISTEN6_443_DS=""
+    SPATIUM_RESOLVER_IPV6="ipv6=off"
+fi
+export SPATIUM_LISTEN6_80 SPATIUM_LISTEN6_80_DS SPATIUM_LISTEN6_443_DS SPATIUM_RESOLVER_IPV6
