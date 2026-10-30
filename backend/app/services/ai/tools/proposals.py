@@ -98,7 +98,9 @@ async def _persist_proposal(
 
 @register_tool(
     name="propose_create_ip_address",
-    permission=("write", "ip_address"),
+    # Same grant as the operation and the REST address write: the subnet
+    # owns its addresses (#3058).
+    permission=("write", "subnet"),
     description=(
         "Prepare an IP-address allocation proposal. The operator must "
         "explicitly click Apply (or you must call apply_proposal with "

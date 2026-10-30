@@ -477,7 +477,7 @@ def test_verify_pin_set_accepts_a_good_list() -> None:
 
 
 def test_display_fingerprint_matches_the_control_planes_format() -> None:
-    """``AB:CD:...``, as Appliance -> TLS shows it, so an operator can compare."""
+    """``AB:CD:...``, as Appliance -> Fleet -> Web UI Certificate shows it, so an operator can compare."""
     assert cp_tls.display_fingerprint("abcd12") == "AB:CD:12"
 
 

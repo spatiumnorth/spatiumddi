@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import {
   apiTokensApi,
+  formatDialogError,
   API_TOKEN_SCOPES,
   dnsApi,
   ipamApi,
@@ -137,15 +138,7 @@ function CreateTokenModal({
       onCreated(token);
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to create token.",
-      );
+      setError(formatDialogError(err, "Failed to create token."));
     },
   });
 
@@ -923,7 +916,16 @@ export function ApiTokensPage() {
                             <PowerOff className="h-3.5 w-3.5" />
                           </button>
                         ) : (
-                          isSuperadmin && (
+                          isSuperadmin &&
+                          (isExpired(t.expires_at) ? (
+                            <button
+                              disabled
+                              className="rounded p-1 text-muted-foreground opacity-40"
+                              title="Expired — create a new token instead"
+                            >
+                              <Power className="h-3.5 w-3.5" />
+                            </button>
+                          ) : (
                             <button
                               onClick={() => setReenable(t)}
                               className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -931,7 +933,7 @@ export function ApiTokensPage() {
                             >
                               <Power className="h-3.5 w-3.5" />
                             </button>
-                          )
+                          ))
                         )}
                         <button
                           onClick={() => setConfirmDelete(t)}

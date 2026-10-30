@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
   formatApiError,
+  formatDialogError,
   groupsApi,
   rolesApi,
   usersApi,
@@ -176,10 +177,7 @@ function GroupModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Failed to save group";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatDialogError(err, "Failed to save group"));
     },
   });
 
