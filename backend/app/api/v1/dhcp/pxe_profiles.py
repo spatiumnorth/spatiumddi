@@ -41,6 +41,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import (
     DHCPPXEArchMatch,
     DHCPPXEProfile,
@@ -329,6 +330,7 @@ async def update_profile(
     if "tags" in payload:
         payload["tags"] = dict(payload["tags"] or {})
 
+    before = snapshot(prof, payload)
     for k, v in payload.items():
         setattr(prof, k, v)
 
@@ -342,7 +344,8 @@ async def update_profile(
         resource_type="dhcp_pxe_profile",
         resource_id=str(prof.id),
         resource_display=prof.name,
-        changed_fields=list(payload.keys()) + (["matches"] if matches_input is not None else []),
+        changed_fields=changed_keys(before, payload)
+        + (["matches"] if matches_input is not None else []),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     collect_wake(dhcp_group_channel(prof.group_id))

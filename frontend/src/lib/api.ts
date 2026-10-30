@@ -1487,6 +1487,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
@@ -1895,6 +1897,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
@@ -10048,7 +10052,8 @@ export interface DHCPMACBlock {
   id: string;
   group_id: string;
   mac_address: string;
-  reason: DHCPMACBlockReason;
+  // One of DHCPMACBlockReason, or the free text New Devices stored (#3083).
+  reason: string;
   description: string;
   enabled: boolean;
   expires_at: string | null;
@@ -10064,7 +10069,7 @@ export interface DHCPMACBlock {
 
 export interface DHCPMACBlockWrite {
   mac_address?: string;
-  reason?: DHCPMACBlockReason;
+  reason?: string;
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
