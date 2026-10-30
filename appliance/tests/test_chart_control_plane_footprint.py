@@ -2,8 +2,8 @@
 
 ``.github/scripts/chart-control-plane-footprint.py`` refuses a render whose api
 autoscaler aims below what one api pod was measured to use, or whose api
-memory request or limit is below that use (with the sizing guide's headroom
-on the limit). Before #3110 the chart aimed memory at 80 % of a
+request, api limit or worker limit is below that use (with the sizing guide's
+headroom on the limits). Before #3110 the chart aimed memory at 80 % of a
 256Mi request, about 205 MiB, while one idle api process holds about 305 MiB,
 so every default install with a metrics-server ran 10 api replicas at rest.
 The Charts job runs the script over the default render
@@ -120,8 +120,8 @@ def test_the_charts_defaults_pass(tmp_path: Path) -> None:
 
 
 def test_the_charts_pre_3110_defaults_fail_on_every_rule(tmp_path: Path) -> None:
-    """The render that shipped: memory at 80 % of 256Mi, CPU at 70 % of 100m
-    and a 512Mi api limit."""
+    """The render that shipped: memory at 80 % of 256Mi, CPU at 70 % of 100m,
+    a 512Mi api limit and a 1Gi worker limit."""
     r = _run(_api(BEFORE) + _hpa(memory=80) + _worker("1Gi"), tmp_path, "--expect-metrics", "cpu")
     assert r.returncode == 1
     for line in (
@@ -130,9 +130,10 @@ def test_the_charts_pre_3110_defaults_fail_on_every_rule(tmp_path: Path) -> None
         "aims CPU at 70 % of 100m = 70m, below the 100m",
         "aims memory at 80 % of 256Mi = 205 MiB, below the 373 MiB",
         "scales on ['cpu', 'memory'], expected ['cpu']",
+        "the worker's memory limit is 1Gi, below 1626 MiB",
     ):
         assert line in r.stderr, line
-    assert r.stderr.count("(#3110") == 5
+    assert r.stderr.count("(#3110") == 6
 
 
 def test_an_opt_in_memory_target_passes_only_above_the_working_set(tmp_path: Path) -> None:
@@ -163,6 +164,14 @@ def test_quantities_compare_across_units(tmp_path: Path) -> None:
     sizing = {"cpu": "0.2", "memory": "0.5Gi"}, {"cpu": "1", "memory": "1073741824"}
     r = _run(_api(sizing) + _hpa() + _worker("2048Mi"), tmp_path)
     assert r.returncode == 0, r.stderr
+
+
+def test_a_worker_with_no_limit_passes_and_a_small_one_fails(tmp_path: Path) -> None:
+    r = _run(_api() + _hpa() + _worker(None), tmp_path)
+    assert r.returncode == 0, r.stderr
+    r = _run(_api() + _hpa() + _worker("1536Mi"), tmp_path)
+    assert r.returncode == 1
+    assert "the worker's memory limit is 1536Mi, below 1626 MiB" in r.stderr
 
 
 def test_require_fails_on_a_render_with_no_api(tmp_path: Path) -> None:

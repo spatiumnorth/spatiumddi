@@ -300,6 +300,7 @@ them:
 | `worker.replicas` | `2` |  |
 | `worker.concurrency` | `4` |  |
 | `worker.queues` | `"ipam,dns,dhcp,default,bundles"` |  |
+| `worker.resources` | requests `200m` / `256Mi`, limits `2000m` / `2Gi` | #3110 — the worker's memory grows for about its first hour and levels off near 1 GiB. The appliance sets its own limit from the node's RAM |
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job, a regular Job named per revision (`<release>-migrate-r<revision>`), not a Helm hook |
 | `migrate.annotations` | `{}` | Annotations on the Job object (not its pod). For GitOps, see below |

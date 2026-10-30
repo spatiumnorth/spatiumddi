@@ -612,9 +612,16 @@ worker:
   # ~1 - 1.5 kB per record of the group's largest zone. At most
   # ``DNS_AGENT_BUNDLE_RENDER_SLOTS`` (2) renders run at once fleet-wide. See
   # docs/features/DNS.md, "Control-plane memory for large groups".
+  # #3110 — measured (docs/deployment/SIZING.md, Kubernetes): the four
+  # processes grow for about the first hour, then level off near 1 GiB. Under
+  # the old 1Gi limit that left about 0.1 GiB for a burst of work (amd64: 0.87
+  # and 0.91 GiB two hours in; arm64 reached the limit after about 40 minutes,
+  # the kernel reclaiming page cache to stay under it), and with no limit one
+  # worker peaked at 1084 MiB. Hence 2Gi. The appliance sizes this limit from
+  # the node's RAM (firstboot, k8s_api.control_plane_resources).
   resources:
     requests: { cpu: 200m, memory: 256Mi }
-    limits:   { cpu: 2000m, memory: 1Gi }
+    limits:   { cpu: 2000m, memory: 2Gi }
   # Add CAP_NET_RAW to the worker pod so nmap can do SYN scans + ``-O``
   # OS detection from the device-profiling auto-nmap path. NET_RAW is
   # in containerd's default cap set so this is a no-op on permissive

@@ -72,7 +72,7 @@
 #                      render and negative controls: the api autoscaler aims at
 #                      least at one api pod's measured use and scales on CPU
 #                      alone unless memory is asked for, and the api's request
-#                      and limit hold what they were
+#                      and the api and worker limits hold what they were
 #                      measured to use (#3110). At 80 % of the old 256Mi
 #                      request one idle api process sat above the memory
 #                      target, and every default install ran 10 replicas.
@@ -444,14 +444,14 @@ api_replicas "$OUT/umbrella-appliance-cp-3.yaml" "$OUT/neg-hpa-replicas-dropped.
 neg3111 "an autoscaled api rendering replicas: 2" "$OUT/neg-hpa-replicas-set.yaml" --require
 neg3111 "an appliance api without its count" "$OUT/neg-hpa-replicas-dropped.yaml" --replicas api=3
 
-# #3110 — the chart's default sizing holds what the api was measured
-# to use (docs/deployment/SIZING.md, Kubernetes): the api autoscaler
+# #3110 — the chart's default sizing holds what the api and the worker were
+# measured to use (docs/deployment/SIZING.md, Kubernetes): the api autoscaler
 # aims at least at one api pod's use at rest and under light load, and by
 # default scales on CPU alone (memory is opt-in); the api's memory request
-# holds its working set; the api's limit leaves the sizing guide's headroom.
-# On the default render only: the appliance sizes the limits from
+# holds its working set; the api and worker limits leave the sizing guide's
+# headroom. On the default render only: the appliance sizes the limits from
 # the node's RAM. --require so the pass cannot succeed on a render with no api.
-echo "── api sizing holds its measured use (umbrella, #3110)"
+echo "── api and worker sizing hold their measured use (umbrella, #3110)"
 python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require \
     --expect-metrics cpu "$OUT/umbrella-defaults.yaml" || failures=$((failures + 1))
 # The opt-in memory metric renders, and at the 512Mi request 80 % aims above
@@ -488,6 +488,8 @@ neg3110 "a CPU target at 70 % of 100m" "aims CPU at 70 % of 100m = 70m" \
     --set api.resources.requests.cpu=100m
 neg3110 "a 512Mi api memory limit" "the api's memory limit is 512Mi" \
     --set api.resources.limits.memory=512Mi
+neg3110 "a 1Gi worker memory limit" "the worker's memory limit is 1Gi" \
+    --set worker.resources.limits.memory=1Gi
 
 # #3021 — the CNPG instance pods reach the API server on their own node, which
 # the appliance sets (firstboot's HelmChart and the supervisor's

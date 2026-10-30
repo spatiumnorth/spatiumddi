@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The chart's default api sizing must hold what it uses (#3110).
+"""The chart's default api and worker sizing must hold what they use (#3110).
 
 The api's HorizontalPodAutoscaler scales on the average share of its request
 that each pod uses. Before #3110 the chart requested 256Mi and aimed memory at
@@ -30,8 +30,12 @@ Rules, checked in every render that carries the api Deployment:
 * The api's memory limit is at least ``HEADROOM`` times the most one api
   process held taking all of the light load (``API_PEAK_MIB``), the sizing
   guide's own headroom factor.
+* The worker's memory limit is at least ``HEADROOM`` times the most one worker
+  pod held with no limit at all (``WORKER_PEAK_MIB``). Its processes grow for
+  about the first hour and level off near 1 GiB, so the old 1Gi left about
+  0.1 GiB for a burst of work.
 
-The appliance sizes the api's limits from the node's RAM
+The appliance sizes the api and worker limits from the node's RAM
 (``k8s_api.control_plane_resources``); run this over the chart's defaults.
 
 ``--expect-metrics cpu[,memory]`` also requires the api's autoscaler to scale
@@ -62,6 +66,10 @@ API_CPU_M = 100
 # The most one api process held taking all of the light load alone (Docker
 # Compose, one process): 469 MiB on arm64, 405 on amd64.
 API_PEAK_MIB = 469
+# The most one worker pod (four processes) held with no limit: 1084 MiB of
+# cgroup memory 28 minutes in (Docker Compose, arm64); 0.87 to 0.99 GiB on
+# amd64 once levelled off.
+WORKER_PEAK_MIB = 1084
 # The sizing guide's headroom over measured use.
 HEADROOM = 1.5
 
@@ -173,6 +181,22 @@ def check(
             f"expected {sorted(expect)} (#3110: memory is opt-in)"
         )
 
+    worker = next(
+        (d for d in docs if d.get("kind") == "Deployment" and _component(d) == "worker"), None
+    )
+    wcontainer = None if worker is None else _container(worker, "worker")
+    if worker is not None and wcontainer is None:
+        problems.append(f"{where}: the worker Deployment has no container named 'worker' (#3110)")
+    if wcontainer is not None:
+        wlim = ((wcontainer.get("resources") or {}).get("limits") or {}).get("memory")
+        want_w = WORKER_PEAK_MIB * HEADROOM
+        wlim_mib = _mib(wlim)
+        if wlim_mib is not None and wlim_mib < want_w:
+            problems.append(
+                f"{where}: the worker's memory limit is {wlim}, below {want_w:.0f} MiB "
+                f"({HEADROOM} x the {WORKER_PEAK_MIB} MiB one worker held with no limit): "
+                "it levels off near the limit with no room for a burst (#3110)"
+            )
     return problems, True
 
 
