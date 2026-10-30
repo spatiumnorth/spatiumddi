@@ -195,6 +195,22 @@ _SUBNET_INSTANCE_ROUTES = (
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
 )
 
+# A grant scoped to ONE space or ONE block (#3039) reaches that item's own
+# detail and edit and the collection (narrowed by its handler). The grant names
+# the item itself: it does not inherit down to the blocks or subnets inside it.
+_SPACE_INSTANCE_ROUTES = (
+    "ip_space",
+    "GET /spaces",
+    frozenset({"GET /spaces/{space_id}"}),
+    frozenset({"PUT /spaces/{space_id}"}),
+)
+_BLOCK_INSTANCE_ROUTES = (
+    "ip_block",
+    "GET /blocks",
+    frozenset({"GET /blocks/{block_id}"}),
+    frozenset({"PUT /blocks/{block_id}"}),
+)
+
 # The mutating routes an address-set delegate may reach (#103). Each handler
 # here resolves the caller's writable set ranges (``_load_writable_set_ranges``)
 # and checks every address it touches with ``_user_can_write_ip``, which is the
@@ -237,7 +253,12 @@ _IPAM_GATE = require_any_resource_or_scoped(
     # is listed. Left off on purpose: the DNS drift report (lists orphan
     # records of other subnets sharing the zone), NAT by-subnet (a separate
     # resource type), and every structural / bulk / DNS-sync / delete write.
-    instance_routes={"subnet_id": _SUBNET_INSTANCE_ROUTES},
+    # Likewise one space (#3039) and one block (#3039): detail + edit only.
+    instance_routes={
+        "subnet_id": _SUBNET_INSTANCE_ROUTES,
+        "space_id": _SPACE_INSTANCE_ROUTES,
+        "block_id": _BLOCK_INSTANCE_ROUTES,
+    },
 )
 
 router = APIRouter(dependencies=[Depends(_IPAM_GATE)])
@@ -1020,6 +1041,86 @@ _SUBNET_BINDING_FIELDS = (
     "dns_group_ids",
     "ddns_domain_override",
 )
+
+
+# The same rule for a grant scoped to one space or one block (#3039): the grant
+# names that item, not the DNS / DHCP servers, zones, customer, site, VRF, ASN
+# or parent it would be attached to. Nor does it name the subnets underneath,
+# so the settings those subnets INHERIT from the item (DDNS, the DNS / DHCP
+# inherit switches, split-horizon, do-not-probe) are refused too: flipping one
+# re-points or re-enables every descendant, none of which the grant reaches
+# (clearing a space's do-not-probe would open every fragile subnet in it to
+# sweeps, #722).
+_SPACE_BINDING_FIELDS = (
+    "dns_group_ids",
+    "dns_zone_id",
+    "dns_additional_zone_ids",
+    "dhcp_server_group_id",
+    "ddns_domain_override",
+    "vrf_id",
+    "asn_id",
+    "customer_id",
+    "ddns_enabled",
+    "ddns_hostname_policy",
+    "ddns_ttl",
+    "do_not_probe",
+)
+_BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
+    "parent_block_id",
+    "site_id",
+    "dns_inherit_settings",
+    "dhcp_inherit_settings",
+    "dns_split_horizon",
+    "ddns_inherit_settings",
+)
+# Fields whose handler treats an explicit null as "leave unchanged" (the
+# ``exclude_none`` dump), so a null there changes nothing and must not be
+# refused as a change.
+_SPACE_NULL_IS_NOOP = frozenset(
+    {
+        "dns_group_ids",
+        "dns_additional_zone_ids",
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "do_not_probe",
+    }
+)
+_BLOCK_NULL_IS_NOOP = frozenset(
+    {
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "ddns_inherit_settings",
+        "do_not_probe",
+        "dns_split_horizon",
+    }
+)
+
+
+def _assert_scoped_item_bindings(
+    user: Any,
+    rtype: str,
+    body: BaseModel,
+    row: Any,
+    fields: tuple[str, ...],
+    null_is_noop: frozenset[str] = frozenset(),
+) -> None:
+    """403 when a holder of a grant scoped to one ``rtype`` row changes a field
+    that points it at another resource, or that its descendants inherit
+    (#3039). Re-sending the current value passes, and so does a caller holding
+    the type-level write."""
+    if user_has_permission(user, "write", rtype):
+        return
+    for field in fields:
+        if field not in body.model_fields_set:
+            continue
+        value = getattr(body, field)
+        if value is None and field in null_is_noop:
+            continue
+        if _binding_value(value) != _binding_value(getattr(row, field, None)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: changing '{field}' needs 'write' on '{rtype}'",
+            )
 
 
 def _subnet_write_is_scoped(user: Any) -> bool:
@@ -4698,7 +4799,12 @@ async def list_spaces(
             IPSpace.id.in_(select(Subnet.space_id).where(Subnet.id.in_(scoped_subnets)))
         )
     result = await db.execute(query)
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    # A caller admitted only by grants scoped to individual spaces (#3039) sees
+    # those spaces and no others.
+    if not any(user_has_permission(current_user, "read", rt) for rt in _IPAM_GATE_TYPES):
+        rows = [r for r in rows if user_has_permission(current_user, "read", "ip_space", r.id)]
+    return rows
 
 
 @router.post("/spaces", response_model=IPSpaceResponse, status_code=status.HTTP_201_CREATED)
@@ -4768,10 +4874,13 @@ async def get_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -> I
 async def update_space(
     space_id: uuid.UUID, body: IPSpaceUpdate, current_user: CurrentUser, db: DB
 ) -> IPSpace:
-    _require_type_write(current_user, "ip_space")
+    _require_type_write(current_user, "ip_space", resource_id=space_id)
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+    _assert_scoped_item_bindings(
+        current_user, "ip_space", body, space, _SPACE_BINDING_FIELDS, _SPACE_NULL_IS_NOOP
+    )
     await _enforce_zone_token_scope(
         db,
         current_user,
@@ -5039,6 +5148,10 @@ async def list_blocks(
         )
     result = await db.execute(query)
     blocks = list(result.scalars().all())
+    # A caller admitted only by grants scoped to individual blocks (#3039) sees
+    # those blocks and no others.
+    if not any(user_has_permission(current_user, "read", rt) for rt in _IPAM_GATE_TYPES):
+        blocks = [b for b in blocks if user_has_permission(current_user, "read", "ip_block", b.id)]
     space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] = {}
     out: list[dict[str, Any]] = []
     for block in blocks:
@@ -5238,10 +5351,13 @@ async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> d
 async def update_block(
     block_id: uuid.UUID, body: IPBlockUpdate, current_user: CurrentUser, db: DB
 ) -> dict[str, Any]:
-    _require_type_write(current_user, "ip_block")
+    _require_type_write(current_user, "ip_block", resource_id=block_id)
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    _assert_scoped_item_bindings(
+        current_user, "ip_block", body, block, _BLOCK_BINDING_FIELDS, _BLOCK_NULL_IS_NOOP
+    )
     await _enforce_zone_token_scope(
         db,
         current_user,
