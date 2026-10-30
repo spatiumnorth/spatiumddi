@@ -15,7 +15,10 @@ vi.mock("@/lib/api", async () => {
     dhcpApi: {
       ...actual.dhcpApi,
       listClientClasses: () =>
-        Promise.resolve([{ id: "c1", name: "cc1", test: "", options: [] }]),
+        Promise.resolve([
+          { id: "c1", name: "cc1", test: "", options: [] },
+          { id: "c2", name: "cc2", test: "", options: [] },
+        ]),
       deleteClientClass: () =>
         Promise.reject({
           isAxiosError: true,
@@ -42,12 +45,20 @@ describe("client class delete (#3113)", () => {
       </QueryClientProvider>,
     );
     await screen.findByText("cc1");
-    const trash = Array.from(
-      container.querySelectorAll("tbody td:last-child button"),
-    ).pop();
-    fireEvent.click(trash as Element);
+    const trashes = () =>
+      Array.from(
+        container.querySelectorAll("tbody tr td:last-child button:last-child"),
+      );
+    fireEvent.click(trashes()[0]);
     fireEvent.click(await screen.findByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(await screen.findByText(/still referenced by 1 pool/)).toBeTruthy();
+
+    // Closing and opening the delete on another class starts clean: the
+    // first class's refusal must not be shown as the second's.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(trashes()[1]);
+    expect(await screen.findByText('Delete class "cc2"?')).toBeTruthy();
+    expect(screen.queryByText(/still referenced by 1 pool/)).toBeNull();
   });
 });

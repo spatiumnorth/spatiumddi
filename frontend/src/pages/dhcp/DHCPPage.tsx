@@ -1298,6 +1298,7 @@ function ScopeDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
   notice,
 }: {
   scope: DHCPScope;
@@ -1305,6 +1306,9 @@ function ScopeDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  // #3113 — the server's reason when it refuses the delete (a Windows
+  // failover scope answers 409 with the step to take first).
+  error?: string | null;
   // #62 two-person approval queue "Submitted for approval" message.
   notice?: string | null;
 }) {
@@ -1342,6 +1346,7 @@ function ScopeDeleteModal({
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
+      error={error}
       notice={notice}
     />
   );
@@ -1619,6 +1624,11 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
             delMut.reset();
           }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
           notice={delScopeNotice}
         />
       )}
