@@ -500,7 +500,7 @@ export function CircuitEditorModal({
               onChange={(e) => setTermEnd(e.target.value)}
             />
             <p className="mt-0.5 text-[11px] text-muted-foreground/80">
-              Drives the future expiring-soon alert rule.
+              Drives the circuit_term_expiring alert rule.
             </p>
           </div>
           <div>
@@ -697,8 +697,8 @@ export function CircuitsPage() {
             <h1 className="text-xl font-semibold">WAN circuits</h1>
             <p className="text-sm text-muted-foreground">
               Carrier-supplied transport pipes — provider, class, bandwidth,
-              endpoints, contract term + cost. Foundation for the future MPLS
-              service catalog and SD-WAN overlay routing roadmap items.
+              endpoints, contract term + cost. Circuits feed the service catalog
+              (MPLS L3VPN, SD-WAN) and the SD-WAN overlays.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">

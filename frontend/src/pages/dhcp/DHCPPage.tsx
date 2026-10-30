@@ -1347,7 +1347,7 @@ function ScopeDeleteModal({
   );
 }
 
-function ServerScopesTab({ groupId }: { groupId: string }) {
+export function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // #1339, #1861 — scope create / edit take write and delete takes delete on
   // ``dhcp_scope`` (scopes.py).
@@ -1372,6 +1372,20 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
         : Promise.resolve([]),
     enabled: !!groupId,
   });
+  // #3118 — the tag filter narrows the list, never what the group serves:
+  // the count line, the empty line and the subnet picker read the unfiltered
+  // set. Same key as the filtered query when no chip is set, so one fetch.
+  const unfilteredQ = useQuery({
+    queryKey: ["dhcp-scopes-group", groupId, []],
+    queryFn: () =>
+      groupId ? dhcpApi.listScopesByGroup(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
+  });
+  // Until the unfiltered list has loaded, which subnets the group serves is
+  // unknown: the picker then offers none rather than every subnet. A server
+  // with no group serves nothing, and its query never runs.
+  const unfilteredScopes = groupId ? unfilteredQ.data : [];
+  const unfilteredCount = unfilteredScopes?.length;
   const subnetById = new Map(subnets.map((s) => [s.id, s]));
   // #1110 — how the group's Windows members serve each scope. The column
   // only appears on a group that has Windows members.
@@ -1423,8 +1437,15 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
       />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} on this
-          group.
+          {tagFilters.length === 0
+            ? `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
+            : unfilteredCount === undefined
+              ? allScopes.length === 1
+                ? "1 scope matches the tag filter."
+                : `${allScopes.length} scopes match the tag filter.`
+              : unfilteredCount === 1
+                ? `${allScopes.length} of 1 scope matches the tag filter.`
+                : `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`}
         </p>
         <div className="flex items-center gap-2">
           <select
@@ -1438,8 +1459,17 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
             {...dhcpGate("write", "dhcp_scope")}
           >
             <option value="">+ Serve leases on subnet…</option>
-            {subnets
-              .filter((s) => !allScopes.some((sc) => sc.subnet_id === s.id))
+            {unfilteredScopes === undefined && (
+              <option value="" disabled>
+                {unfilteredQ.isError
+                  ? "Could not load the group's scopes"
+                  : "Loading the group's scopes…"}
+              </option>
+            )}
+            {(unfilteredScopes === undefined ? [] : subnets)
+              .filter(
+                (s) => !unfilteredScopes?.some((sc) => sc.subnet_id === s.id),
+              )
               .map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.network}
@@ -1452,7 +1482,9 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
       <div className="rounded-lg border">
         {allScopes.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            No scopes on this server.
+            {tagFilters.length > 0 && unfilteredCount !== 0
+              ? "No scopes match the current tag filter."
+              : "No scopes on this server."}
           </p>
         ) : (
           <div className="overflow-x-auto">
