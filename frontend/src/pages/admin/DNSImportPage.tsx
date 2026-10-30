@@ -1977,6 +1977,18 @@ export function PreviewPanel({
                           view <span className="font-mono">{z.view_name}</span>
                         </div>
                       )}
+                      {/* #3097: the "warnings" pill said a zone had notes
+                          and never what they were. */}
+                      {z.parse_warnings.length > 0 && (
+                        <ul
+                          aria-label={`Notes for ${z.name}`}
+                          className="mt-1 max-w-md list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-400"
+                        >
+                          {z.parse_warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
+                      )}
                     </td>
                     <td className="px-3 py-2 align-top">
                       {/* #986 — a bulk import is where an estate full of

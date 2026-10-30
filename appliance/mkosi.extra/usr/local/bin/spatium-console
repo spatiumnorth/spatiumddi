@@ -4670,7 +4670,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
                             overflow=pods_overflow)
         )
         layout["log"].update(render_log(state.tail, log_h))
-        layout["footer"].update(render_footer(state.status_message, state.role))
+        layout["footer"].update(render_footer(state.status_for_draw(), state.role))
         return layout
 
     # ── WIDE / MEDIUM tree (§2) ─────────────────────────────────────────
@@ -4730,7 +4730,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # Log — full-width bottom row (§2). It absorbs the flex remainder so it
     # can never be the thing that clips.
     layout["log"].update(render_log(state.tail, log_h))
-    layout["footer"].update(render_footer(state.status_message, state.role))
+    layout["footer"].update(render_footer(state.status_for_draw(), state.role))
     return layout
 
 
@@ -4775,6 +4775,7 @@ class DashboardState:
         self.slot_next_entry: str | None = None
         self.status_message = ""
         self.status_expires = 0.0
+        self.status_ttl = 0.0
         self.pending_action: str | None = None
         self.term_size = (80, 24)
         self.lock = threading.Lock()
@@ -4982,8 +4983,23 @@ class DashboardState:
             self.status_expires = 0.0
 
     def flash(self, msg: str, ttl: float = 3.0) -> None:
+        # #3101 — the clock starts at the first frame that draws it (see
+        # status_for_draw), not here: on a loaded node the next redraw can
+        # come several seconds later, and a flash timed from the call could
+        # expire before it was ever drawn.
         self.status_message = msg
-        self.status_expires = time.time() + ttl
+        self.status_ttl = ttl
+        self.status_expires = 0.0
+
+    def status_for_draw(self) -> str:
+        """The footer's flash text. A flash is always drawn at least once and
+        then lasts its ttl from that first draw."""
+        if self.status_message and not self.status_expires:
+            self.status_expires = time.time() + self.status_ttl
+        elif self.status_expires and time.time() > self.status_expires:
+            self.status_message = ""
+            self.status_expires = 0.0
+        return self.status_message
 
     def set_action(self, action: str) -> None:
         with self.lock:
@@ -5223,7 +5239,7 @@ def _record_reboot_cancel() -> None:
             pass
 
 
-def do_cancel_reboot(console: Console) -> None:
+def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) -> None:
     """#556 — abort a queued reboot from the physical console.
 
     A queued reboot runs a systemd service that *sleeps* for a grace
@@ -5250,10 +5266,13 @@ def do_cancel_reboot(console: Console) -> None:
         console.print("\n\n[dim]No reboot is currently pending.[/dim]\n")
         time.sleep(1.5)
         return
-    if not confirm_modal(console, "Cancel the pending reboot?"):
+    # #3101 — name what is actually pending; only a console / web-UI power
+    # run (the marker) can be a power-off.
+    noun = "power-off" if power_action_in_progress() == "poweroff" else "reboot"
+    if not confirm_modal(console, f"Cancel the pending {noun}?"):
         return
     console.clear()
-    console.print("\n\n[bold yellow]Cancelling pending reboot…[/bold yellow]\n")
+    console.print(f"\n\n[bold yellow]Cancelling pending {noun}…[/bold yellow]\n")
     # Stop both reboot services — one owns the web-UI path, the other the
     # fleet path; only one is active, and stopping the idle one is a no-op.
     # #2974 — and the console's own F5 / F6 runs; stopping one mid-handoff
@@ -5284,7 +5303,11 @@ def do_cancel_reboot(console: Console) -> None:
             # cancelled regardless of whether the trigger file lingers.
             console.print(f"[dim](left {name}: {exc})[/dim]")
     _record_reboot_cancel()
-    console.print("[green]Reboot cancelled.[/green]\n")
+    console.print(f"[green]{noun.capitalize()} cancelled.[/green]\n")
+    if state is not None:
+        # F5 / F6 set a 20 s "Rebooting · F9 cancels" flash; without this it
+        # outlived the cancel and the footer went on announcing the reboot.
+        state.flash(f"{noun.capitalize()} cancelled", ttl=5)
     time.sleep(1.5)
 
 
@@ -6448,7 +6471,7 @@ def main() -> int:
                                 elif action == "shutdown":
                                     do_shutdown(console, state)
                                 elif action == "cancel_reboot":
-                                    do_cancel_reboot(console)
+                                    do_cancel_reboot(console, state)
                                 elif action == "monitor":
                                     do_monitor(console, args.tty)
                                 elif action == "containers":
