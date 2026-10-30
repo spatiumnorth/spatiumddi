@@ -901,6 +901,37 @@ describe("Allocate IP sends the subnet's current DNS zone (#3078, #3080)", () =>
     await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
     expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zp" });
   });
+
+  it.each([
+    ["the zone read fails", () => Promise.reject(new Error("boom"))],
+    ["the group has no zones", () => Promise.resolve([])],
+  ])(
+    "does not hold Allocate forever when %s, and leaves the zone to the server",
+    async (_label, listZones) => {
+      answer("ipamApi", "getEffectiveSubnetDns", () =>
+        Promise.resolve({
+          dns_group_ids: ["gP"],
+          dns_zone_id: "zp",
+          dns_additional_zone_ids: [],
+        }),
+      );
+      answer("dnsApi", "listZones", listZones);
+      const nextAddress = allocateIp();
+      fireEvent.change(screen.getByPlaceholderText("Required"), {
+        target: { value: "web01" },
+      });
+      await press("Allocate");
+      await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+      // Absent, not "": the server falls back to the subnet's primary zone.
+      expect(nextAddress.mock.calls[0][1]).not.toHaveProperty(
+        "dns_zone_id",
+        "",
+      );
+      expect(
+        (nextAddress.mock.calls[0][1] as Record<string, unknown>).dns_zone_id,
+      ).toBeUndefined();
+    },
+  );
 });
 
 // ── #2468 — Edit address names the zone its record is in ─────────────────────

@@ -406,6 +406,11 @@ export function BulkAllocateModal({
         <button
           type="button"
           disabled={formInvalid || zonesPending || previewMut.isPending}
+          title={
+            zonesPending
+              ? "Waiting for the subnet's DNS zones to load"
+              : undefined
+          }
           onClick={() => previewMut.mutate()}
           className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >

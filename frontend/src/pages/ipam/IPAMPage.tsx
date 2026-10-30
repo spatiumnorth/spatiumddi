@@ -4201,6 +4201,11 @@ export function AddAddressModal({
                   mutation.mutate(pendingWarnings != null);
                 }}
                 disabled={!canSubmit || mutation.isPending}
+                title={
+                  zonesPending
+                    ? "Waiting for the subnet's DNS zones to load"
+                    : undefined
+                }
                 className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {mutation.isPending
