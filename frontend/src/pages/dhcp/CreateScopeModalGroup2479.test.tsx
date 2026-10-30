@@ -20,6 +20,15 @@ vi.mock("@/lib/api", () => ({
     listOptionTemplates: () => Promise.resolve([]),
     listPxeProfiles: () => Promise.resolve([]),
     updateScope: vi.fn(),
+    // Edit reads the scope fresh on open (#3077).
+    getScope: () =>
+      Promise.resolve({
+        id: "s1",
+        subnet_id: "sub-a",
+        group_id: "g-a",
+        name: "x",
+        options: [],
+      }),
   },
   ipamApi: {
     getSubnet: () =>

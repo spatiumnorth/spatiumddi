@@ -83,16 +83,15 @@ _TAGGED_TABLES: tuple[str, ...] = (
 
 # The resource types whose ``read`` opens each table's own router; any one
 # of them is enough, as it is there. The IPAM router admits a reader of any
-# of its four types, and the DNS router any of its three.
+# of its four types; each DNS route needs its own type (#3073).
 _IPAM = ("ip_space", "ip_block", "subnet", "ip_address")
-_DNS = ("dns_group", "dns_zone", "dns_record")
 _TABLE_READ_TYPES: dict[str, tuple[str, ...]] = {
     "asn": ("manage_asns",),
     "circuit": ("circuit",),
     "dhcp_scope": ("dhcp_scope",),
     "dhcp_static_assignment": ("dhcp_static",),
-    "dns_record": _DNS,
-    "dns_zone": _DNS,
+    "dns_record": ("dns_record",),
+    "dns_zone": ("dns_zone",),
     "domain": ("manage_domains",),
     "ip_address": _IPAM,
     "ip_block": _IPAM,

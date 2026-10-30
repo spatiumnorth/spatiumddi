@@ -277,6 +277,15 @@ def route_table() -> dict[tuple[str, str], Gate]:
                 req = getattr(c, "spatium_requires", None)
                 if req is None:
                     continue
+                # A per-route gate (the IPAM router, #3058) requires EVERY
+                # type it maps the route to: one dependency per type. An
+                # unclassified route admits no type-level grant at all.
+                per_route = getattr(c, "spatium_route_requires", None)
+                if per_route is not None:
+                    needs = per_route(method, r.path)
+                    action = _METHOD_TO_ACTION[method]
+                    deps.extend([[(action, t)] for t in needs] if needs else [[]])
+                    continue
                 kind, items = req
                 if kind == "exact":
                     deps.append(list(items))

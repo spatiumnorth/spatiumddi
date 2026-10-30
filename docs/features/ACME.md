@@ -470,7 +470,7 @@ cloud-hosted DNS-01 layer on top of it (Phases 3–4 below).
    advisory lock so one replica patches). The active row is the source
    of truth, as it has always been at api start: a certificate written
    into the Secret by hand is replaced within a minute, so set one
-   through the Web UI Certificate tab instead. The api publishes what
+   under Appliance → Fleet → Web UI Certificate instead. The api publishes what
    the Secret holds to Redis on each tick, and the `secret_expiring`
    alert (evaluated in the worker, which cannot read the Secret) judges
    that served certificate, saying so when the stored one is not

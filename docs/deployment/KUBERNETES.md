@@ -303,7 +303,7 @@ blocks) and a per-component `nodeSelector` / `tolerations` / `affinity` /
 `podAnnotations`. Override them under the matching key.
 
 Per-pod memory and CPU with these defaults, measured on a one-node k3s
-cluster (arm64), and on the appliance, which runs this same chart, are in
+cluster (amd64 and arm64), and on the appliance, which runs this same chart, are in
 [`SIZING.md`](SIZING.md#kubernetes). One api process holds about 300 MiB at
 rest, above the autoscaler's memory target (80 % of the 256Mi request), so
 with the defaults the autoscaler below runs 10 api replicas while idle; on

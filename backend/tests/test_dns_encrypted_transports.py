@@ -20,6 +20,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
 from app.models.appliance import ApplianceCertificate
@@ -87,9 +88,14 @@ async def test_defaults_are_off(client: AsyncClient, db_session: AsyncSession) -
     assert body["tls_certificate_id"] is None
 
 
+@pytest.mark.parametrize("appliance_mode", [True, False])
 async def test_enabling_listener_without_cert_is_422(
-    client: AsyncClient, db_session: AsyncSession
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    appliance_mode: bool,
 ) -> None:
+    monkeypatch.setattr(settings, "appliance_mode", appliance_mode)
     headers = await _superadmin(db_session)
     group = await _group(db_session)
     await db_session.commit()
@@ -101,6 +107,15 @@ async def test_enabling_listener_without_cert_is_422(
     )
     assert r.status_code == 422
     assert "certificate" in r.json()["detail"].lower()
+    # #3045: Web UI Certificate is an entry under Appliance -> Fleet, not an
+    # Appliance tab, and Fleet shows it only on an appliance-hosted control
+    # plane; Docker / Kubernetes are sent to the API that holds the store.
+    detail = r.json()["detail"]
+    if appliance_mode:
+        assert "Appliance → Fleet → Web UI Certificate" in detail
+    else:
+        assert "Web UI Certificate" not in detail
+        assert "POST /api/v1/appliance/tls/upload" in detail
 
 
 async def test_enabling_listener_with_csr_pending_cert_is_422(

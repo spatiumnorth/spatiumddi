@@ -985,8 +985,8 @@ Operators get a real Kubernetes node without managing one.
 #### Access
 
 Browse to `https://<appliance-ip>/`. Accept the self-signed
-cert warning (you'll replace it through **Appliance → Web UI
-Certificate** as soon as you're logged in). Sign in with
+cert warning (you'll replace it through **Appliance → Fleet →
+Web UI Certificate** as soon as you're logged in). Sign in with
 `admin / admin` — you'll be forced to set a real password on
 first login.
 
@@ -1299,7 +1299,10 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 
 Turn it on per group under **DNS → Server Groups → Options → Encrypted
 transports**, after linking a TLS certificate (upload one, or issue it
-from Let's Encrypt under **Appliance → Fleet → Web UI Certificate**). Both
+from Let's Encrypt under **Appliance → Fleet → Web UI Certificate**;
+a Docker or Kubernetes control plane has no certificate page, so there
+it goes through `POST /api/v1/appliance/tls/upload` or
+`POST /api/v1/appliance/acme/issue`). Both
 listeners are additive — plain DNS on `:53` keeps working.
 
 The listener port lives in the database; what you change to make it
@@ -1398,7 +1401,7 @@ EOF
 Measured on running appliances (amd64 VMs, 1.0 pre-release builds): at rest,
 under light and realistic load, through upgrades and HA drills, and over a
 3-day soak. Docker Compose and Kubernetes were measured at rest and under
-light load (arm64). The numbers behind each row, the rule that turns them into a
+light load (amd64 and arm64). The numbers behind each row, the rule that turns them into a
 Minimum and a Recommended, what is not measured yet and how to measure your
 own install are in [docs/deployment/SIZING.md](docs/deployment/SIZING.md).
 
@@ -1407,14 +1410,15 @@ own install are in [docs/deployment/SIZING.md](docs/deployment/SIZING.md).
 | **Appliance, one node** (control plane, with or without DNS / DHCP) | 4 vCPU, 6 GiB RAM, 40 GiB disk | 4 vCPU, 8 GiB RAM, 40 GiB SSD |
 | **Appliance, three-node control plane** | first node 4 vCPU / 8 GiB, the others 2 vCPU / 6 GiB, 40 GiB disks | every node 4 vCPU, 8 GiB RAM, 48 GiB SSD |
 | **Appliance role** (DNS / DHCP agent box) | 3 GiB RAM (its pods do not schedule below that) | 2 vCPU, 4 GiB RAM, 32 GiB SSD (not measured yet) |
-| **Docker Compose** (one host) | 2 vCPU, 4 GiB RAM (measured, arm64, Docker Desktop) | 4 vCPU, 8 GiB RAM (derived) |
-| **Kubernetes** (umbrella chart) | one node: 4 vCPU, 6 GiB RAM with the overrides in SIZING.md, 8 GiB on the chart's defaults (measured, arm64, Docker Desktop) | 4 vCPU, 8 GiB per node; api memory `512Mi` request and `1Gi` limit, worker `2Gi` |
+| **Docker Compose** (one host) | 2 vCPU, 4 GiB RAM (from use measured on amd64 and arm64) | 4 vCPU, 8 GiB RAM (derived) |
+| **Kubernetes** (umbrella chart) | one node: 4 vCPU, 6 GiB RAM with the overrides in SIZING.md; more than 8 GiB on the chart's defaults (measured, amd64; arm64 alike) | 4 vCPU, 8 GiB per node; api memory `512Mi` request and `1Gi` limit, worker `2Gi` |
 
 One node at rest used 3.3 GiB, and the busiest suites took it to 4.1 GiB:
 at this data size the memory is mostly the stack itself, not the load. For
 about 1M devices give every control-plane node 64 GiB of disk or more. On
 Kubernetes the chart's default api autoscaler runs 10 replicas at rest, since
-one api process is above its memory target; SIZING.md has the overrides.
+one api process is above its memory target, and on an 8 GiB node that leaves
+less than 1 GiB free; SIZING.md has the overrides.
 
 ---
 

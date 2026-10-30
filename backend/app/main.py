@@ -312,7 +312,11 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "audit_log"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "tls_cert"},
             {"action": "read", "resource_type": "alert"},
@@ -328,7 +332,11 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "audit_log"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "alert"},
         ],
