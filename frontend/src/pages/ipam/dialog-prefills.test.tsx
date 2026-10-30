@@ -313,18 +313,18 @@ describe("a custom field's Default Value is what the dialog sends (#1303)", () =
     // Never had owner or managed; legacy was stored as the string "false".
     const row = address({ custom_fields: { legacy: "false" } });
     answer("ipamApi", "getAddress", () => Promise.resolve(row));
-    open(<EditAddressModal address={row} onClose={() => {}} />);
+    const onClose = vi.fn();
+    open(<EditAddressModal address={row} onClose={onClose} />);
 
     expect((await findControl("Owner team")).value).toBe("");
     expect(control("Managed").checked).toBe(false);
     expect(control("Legacy").checked).toBe(false);
     await press("Save");
 
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(
-      (updateAddress.mock.calls[0][1] as { custom_fields: unknown })
-        .custom_fields,
-    ).toEqual({ legacy: "false" });
+    // Nothing was edited, so nothing is sent (#3091): the defaults the form
+    // does not show are not written into the row either.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 });
 
@@ -580,12 +580,13 @@ describe("Edit address shows the status and role it is stored with (#1305)", () 
     const updateAddress = sink(row);
     answer("ipamApi", "updateAddress", updateAddress);
     answer("ipamApi", "getAddress", () => Promise.resolve(row));
-    open(<EditAddressModal address={row} onClose={() => {}} />);
-    return updateAddress;
+    const onClose = vi.fn();
+    open(<EditAddressModal address={row} onClose={onClose} />);
+    return { updateAddress, onClose };
   }
 
   it("a TLS-serving role (web, api, lb) is shown and offered", async () => {
-    const updateAddress = editAddress(address({ role: "web" }));
+    const { updateAddress, onClose } = editAddress(address({ role: "web" }));
 
     const role = await findControl<HTMLSelectElement>("Role");
     expect(role.value).toBe("web");
@@ -594,22 +595,23 @@ describe("Edit address shows the status and role it is stored with (#1305)", () 
     );
     await press("Save");
 
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(updateAddress.mock.calls[0][1]).toMatchObject({ role: "web" });
+    // Kept: an edit sends only what changed (#3091), and the role did not.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 
   it("an integration-owned status is shown as itself, not as available", async () => {
-    const updateAddress = editAddress(address({ status: "docker-container" }));
+    const { updateAddress, onClose } = editAddress(
+      address({ status: "docker-container" }),
+    );
 
     expect((await findControl<HTMLSelectElement>("Status")).value).toBe(
       "docker-container",
     );
     await press("Save");
 
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(updateAddress.mock.calls[0][1]).toMatchObject({
-      status: "docker-container",
-    });
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 });
 // ── #1306 / #1629 — the DHCP Scope picker is gone ────────────────────────────
@@ -857,8 +859,9 @@ describe("Edit address names the zone its record is in (#2468)", () => {
     answer("ipamApi", "updateAddress", updateAddress);
     const row = address({ forward_zone_id: "zb" });
     answer("ipamApi", "getAddress", () => Promise.resolve(row));
-    open(<EditAddressModal address={row} onClose={() => {}} />);
-    return updateAddress;
+    const onClose = vi.fn();
+    open(<EditAddressModal address={row} onClose={onClose} />);
+    return { updateAddress, onClose };
   }
 
   it("with two zones left on the subnet it selects the stored zone, not None", async () => {
@@ -879,14 +882,13 @@ describe("Edit address names the zone its record is in (#2468)", () => {
   });
 
   it("an untouched Save still leaves the zone alone", async () => {
-    const updateAddress = editStored([A, C]);
+    const { updateAddress, onClose } = editStored([A, C]);
     const select = await zonePicker();
     await waitFor(() => expect(select.value).toBe("zb"));
     await press("Save");
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(
-      (updateAddress.mock.calls[0][1] as { dns_zone_id?: string }).dns_zone_id,
-    ).toBeUndefined();
+    // Nothing changed, so nothing is sent and the record stays in its zone.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 });
 

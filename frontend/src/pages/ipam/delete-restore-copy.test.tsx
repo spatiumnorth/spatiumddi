@@ -178,6 +178,7 @@ describe("Edit modals' Danger zone and delete steps", () => {
   });
 
   it("block", async () => {
+    answers.ipamApi = { getBlock: () => Promise.resolve(block) };
     open(
       <EditBlockModal block={block} onClose={() => {}} onDeleted={() => {}} />,
     );

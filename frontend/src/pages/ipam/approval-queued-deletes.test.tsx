@@ -163,16 +163,15 @@ describe("a delete the approval queue took", () => {
 
   it("Edit Block says it was submitted and does not report it deleted", async () => {
     const deleteBlock = vi.fn(() => QUEUED);
-    answers.ipamApi = { deleteBlock };
+    const block = {
+      id: "b-1",
+      space_id: "sp-1",
+      network: "10.0.0.0/8",
+    } as IPBlock;
+    answers.ipamApi = { deleteBlock, getBlock: () => Promise.resolve(block) };
     const onDeleted = vi.fn();
     open(
-      <EditBlockModal
-        block={
-          { id: "b-1", space_id: "sp-1", network: "10.0.0.0/8" } as IPBlock
-        }
-        onClose={() => {}}
-        onDeleted={onDeleted}
-      />,
+      <EditBlockModal block={block} onClose={() => {}} onDeleted={onDeleted} />,
     );
     await walkDelete(/^Delete this block/);
     await expectQueuedNotice(deleteBlock);

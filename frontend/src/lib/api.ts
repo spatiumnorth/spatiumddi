@@ -1487,6 +1487,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (

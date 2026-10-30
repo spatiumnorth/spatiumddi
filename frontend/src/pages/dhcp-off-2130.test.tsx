@@ -387,9 +387,19 @@ describe("Edit IP status choices", () => {
       answer("ipamApi", "updateAddress", updateAddress);
       const { select } = await options(status);
       expect(select.value).toBe(status);
+      // An edit sends only what changed (#3091), so change the description:
+      // the stored status is not in the body, which is what keeps it.
+      fireEvent.change(
+        screen.getByText("Description", { selector: "label" })
+          .nextElementSibling as HTMLInputElement,
+        { target: { value: "edited" } },
+      );
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
       await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-      expect(updateAddress.mock.calls[0][1]).toMatchObject({ status });
+      expect(updateAddress.mock.calls[0][1]).toMatchObject({
+        description: "edited",
+      });
+      expect(updateAddress.mock.calls[0][1]).not.toHaveProperty("status");
     },
   );
 });
