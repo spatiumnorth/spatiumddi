@@ -12,6 +12,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 import { errMsg, humanTime, inputCls } from "./_shared";
 
@@ -49,6 +50,17 @@ export function BgpMonitorTab({
   asnKind: string;
 }) {
   const qc = useQueryClient();
+  // #3104 — every route here sits under the router's 'manage_asns' gate
+  // (POST write, DELETE delete); a read-only user is offered none of them.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_asns"),
+    "Requires delete permission on ASNs",
+  );
   const [addOpen, setAddOpen] = useState(false);
   const [newPrefix, setNewPrefix] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -142,6 +154,7 @@ export function BgpMonitorTab({
             variant="secondary"
             onClick={() => refreshM.mutate()}
             disabled={refreshM.isPending || asnKind === "private"}
+            {...writeGate}
           >
             {refreshM.isPending ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -232,6 +245,7 @@ export function BgpMonitorTab({
                             className="rounded p-1 hover:bg-muted"
                             title="Acknowledge"
                             onClick={() => setAckTarget(h)}
+                            {...writeGate}
                           >
                             <ShieldCheck className="h-3.5 w-3.5" />
                           </button>
@@ -239,6 +253,7 @@ export function BgpMonitorTab({
                             className="rounded px-1.5 py-1 text-[10px] hover:bg-muted"
                             title="Mark this origin as expected (allowlist)"
                             onClick={() => setAllowTarget(h)}
+                            {...writeGate}
                           >
                             Allowlist
                           </button>
@@ -263,6 +278,7 @@ export function BgpMonitorTab({
               setErr(null);
               setAddOpen(true);
             }}
+            {...writeGate}
           >
             <Plus className="h-3.5 w-3.5" /> Track prefix
           </HeaderButton>
@@ -317,6 +333,7 @@ export function BgpMonitorTab({
                         className="rounded p-1 hover:bg-muted"
                         title="Stop tracking"
                         onClick={() => delM.mutate(p.id)}
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -356,6 +373,7 @@ export function BgpMonitorTab({
                 variant="primary"
                 onClick={() => addM.mutate()}
                 disabled={addM.isPending || !newPrefix.trim()}
+                {...writeGate}
               >
                 {addM.isPending ? "Adding…" : "Add"}
               </HeaderButton>

@@ -3,7 +3,12 @@ import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 
-import { asnsApi, type BGPPeering, type BGPRelationshipType } from "@/lib/api";
+import {
+  asnsApi,
+  formatApiError,
+  type BGPPeering,
+  type BGPRelationshipType,
+} from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
@@ -135,11 +140,7 @@ function PeeringFormModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

@@ -39,6 +39,7 @@ from app.core.permissions import (
 from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
+from app.models.dns import DNS_TTL_MAX
 from app.models.influxdb import (
     DEFAULT_MEASUREMENT_PREFIX,
     DEFAULT_PUSH_INTERVAL_SECONDS,
@@ -66,6 +67,8 @@ from app.services.appliance.apt import (
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 from app.services.audit_forward import targets_cache
+from app.services.dns.new_object_defaults import DNSSEC_VALIDATION_MODES
+from app.services.dns.new_object_defaults import ZONE_TYPES as DNS_ZONE_TYPES
 from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
@@ -1218,6 +1221,31 @@ class SettingsUpdate(BaseModel):
         # "DIRECT";`` — reject quotes / control chars for the same reason.
         if v and any(c == '"' or ord(c) < 0x20 for c in v):
             raise ValueError("no_proxy must not contain quotes or control characters")
+        return v
+
+    # #3087 — these seed new zones and server groups, and the DNSSEC mode is
+    # rendered into named.conf, so only a value the seeded object accepts.
+    @field_validator("dns_default_ttl")
+    @classmethod
+    def _valid_dns_default_ttl(cls, v: int | None) -> int | None:
+        if v is not None and not 0 <= v <= DNS_TTL_MAX:
+            raise ValueError(f"dns_default_ttl must be between 0 and {DNS_TTL_MAX}")
+        return v
+
+    @field_validator("dns_default_zone_type")
+    @classmethod
+    def _valid_dns_default_zone_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in DNS_ZONE_TYPES:
+            raise ValueError(f"dns_default_zone_type must be one of {sorted(DNS_ZONE_TYPES)}")
+        return v
+
+    @field_validator("dns_default_dnssec_validation")
+    @classmethod
+    def _valid_dns_default_dnssec(cls, v: str | None) -> str | None:
+        if v is not None and v not in DNSSEC_VALIDATION_MODES:
+            raise ValueError(
+                "dns_default_dnssec_validation must be one of " f"{sorted(DNSSEC_VALIDATION_MODES)}"
+            )
         return v
 
     @field_validator("resolver_mode")

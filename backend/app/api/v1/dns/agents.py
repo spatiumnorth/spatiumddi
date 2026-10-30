@@ -30,12 +30,14 @@ from app.api.pre_body_auth import PreBodyAuthRoute, header_auth
 from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     collecting_wakes,
     dns_wake_channels,
     wake_subscription,
 )
 from app.core.http_etag import etag_matches, format_etag
 from app.core.redis_client import make_async_redis
+from app.core.versions import is_installed_target
 from app.drivers.dns import get_driver as get_dns_driver
 from app.metrics import (
     AGENT_BUNDLE_INLINE_FAILURES,
@@ -84,6 +86,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
+from app.services.dns.new_object_defaults import add_group_with_defaults
 from app.services.dns.record_ops import (
     ack_op,
     apply_acks,
@@ -450,8 +453,7 @@ async def agent_register(
                 group = DNSServerGroup(
                     name=body.group_name, description="Auto-created by agent registration"
                 )
-                db.add(group)
-                await db.flush()
+                await add_group_with_defaults(db, group)
         else:
             res = await db.execute(
                 select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1)
@@ -461,8 +463,7 @@ async def agent_register(
                 group = DNSServerGroup(
                     name="default", description="Auto-created by agent registration"
                 )
-                db.add(group)
-                await db.flush()
+                await add_group_with_defaults(db, group)
 
     if server is None:
         res = await db.execute(
@@ -1066,7 +1067,11 @@ async def agent_config_longpoll(
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
                 AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
                 return Response(status_code=304, headers=headers)
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponseV2)
@@ -1147,7 +1152,9 @@ async def agent_heartbeat(
         if (
             server.desired_appliance_version is not None
             and server.installed_appliance_version
-            and server.installed_appliance_version == server.desired_appliance_version
+            and is_installed_target(
+                server.installed_appliance_version, server.desired_appliance_version
+            )
             and (server.last_upgrade_state in ("done", None))
         ):
             server.desired_appliance_version = None

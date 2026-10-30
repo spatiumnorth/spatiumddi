@@ -21,19 +21,22 @@ from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, PendingRollbackError
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     collect_wake,
     dhcp_wake_channels,
     wake_subscription,
 )
 from app.core.celery_dispatch import dispatch
+from app.core.db_transient import is_transient_db_error
 from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
+from app.core.versions import is_installed_target
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -467,6 +470,21 @@ async def _auth_agent(
     if server.agent_token_hash and server.agent_token_hash != hash_token(token):
         raise HTTPException(status_code=401, detail="Stale token")
     return server, payload
+
+
+def _reraise_if_database_gone(exc: Exception) -> None:
+    """The lease pass logs and skips a failed DDNS / profiling / sighting
+    step, but not one that failed because the database went away (#3017):
+    the session is unusable from then on, and swallowing it only moved the
+    failure to the next statement as a ``PendingRollbackError`` 500. Raised,
+    it is the dependency-down 503, and the agent resends the batch.
+
+    Deliberately the DATABASE classifier, not ``is_dependency_down``: that
+    one also counts any ``ConnectionError`` / ``TimeoutError``, and a DNS
+    server that refuses the DDNS update must stay a logged skip, not a 503
+    that has the agent resend the whole batch into the same refusal."""
+    if isinstance(exc, PendingRollbackError) or is_transient_db_error(exc):
+        raise exc
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
@@ -1065,7 +1083,11 @@ async def agent_config_longpoll(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return Response(status_code=304, headers={"ETag": format_etag(etag)})
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)
@@ -1118,7 +1140,9 @@ async def agent_heartbeat(
     if (
         server.desired_appliance_version is not None
         and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
+        and is_installed_target(
+            server.installed_appliance_version, server.desired_appliance_version
+        )
         and (server.last_upgrade_state in ("done", None))
     ):
         server.desired_appliance_version = None
@@ -1541,6 +1565,7 @@ async def agent_lease_events(
                         client_hostname=ev.hostname,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_ddns_failed",
                         server=str(server.id),
@@ -1561,6 +1586,7 @@ async def agent_lease_events(
 
                     await maybe_enqueue_for_lease(db, subnet=subnet, ipam_row=ipam_row)
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_auto_profile_failed",
                         server=str(server.id),
@@ -1594,6 +1620,7 @@ async def agent_lease_events(
 
                     await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=ipam_row)
                 except Exception as exc:  # noqa: BLE001
+                    _reraise_if_database_gone(exc)
                     logger.warning(
                         "dhcp_agent_lease_ddns_revoke_failed",
                         server=str(server.id),
@@ -1632,6 +1659,7 @@ async def agent_lease_events(
                 async with db.begin_nested():
                     result = await record_mac_observation(db, ipam_row.id, mac, source="dhcp_lease")
             except Exception as exc:  # noqa: BLE001
+                _reraise_if_database_gone(exc)
                 logger.warning(
                     "dhcp_agent_lease_mac_observation_failed",
                     server=str(server.id),

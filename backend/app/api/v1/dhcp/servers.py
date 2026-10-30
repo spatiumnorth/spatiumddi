@@ -27,6 +27,7 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.update_nulls import changed_keys, snapshot
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
@@ -686,6 +687,15 @@ async def update_server(
             db, target_group, target_driver, exclude_server_id=s.id
         )
         await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
+    if target_group != s.server_group_id:
+        # #2899 — a cluster node's Kea is behind the MetalLB relay VIP
+        # Service; it cannot move into a ``direct`` group while a VIP is set.
+        from app.services.dhcp.relay_vip import server_join_refusal  # noqa: PLC0415
+
+        refusal = await server_join_refusal(db, s, target_group)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
+    before = snapshot(s, changes)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -825,7 +835,7 @@ async def update_server(
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=audit_payload,
     )
     await db.commit()

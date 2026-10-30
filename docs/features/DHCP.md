@@ -27,7 +27,7 @@ DHCPServer
 
 ### DHCP Server Groups
 
-**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a group with two Kea members is implicitly an HA pair, driving the `libdhcp_ha.so` hook.
+**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a `hot-standby` or `load-balancing` group with two Kea members is an HA pair, driving the `libdhcp_ha.so` hook. A `standalone` group never renders HA (#2969).
 
 ```
 DHCPServerGroup
@@ -57,6 +57,47 @@ change re-renders the running Kea within a heartbeat. It is distinct from
 `network_mode` (host vs bridged), which controls the *container's* network
 namespace on supervisor-managed appliances — a directly-attached server
 typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
+
+**Behind the MetalLB DHCP relay VIP, a group must be `relay` (#2899).**
+The relay VIP (`dhcp_relay_vip`, Fleet → Network → MetalLB → Advanced) is a
+LoadBalancer Service over every Kea pod in the appliance cluster, with
+`externalTrafficPolicy: Cluster`. kube-proxy on the node announcing the VIP
+keeps about one relay flow in N on that node's own Kea. In `direct` mode
+Kea's raw socket sees that frame before netfilter, still addressed to the
+VIP, and its filter (broadcast or the socket's own address only) drops it;
+the DNATed copy reaches Kea's UDP socket, which raw mode drains and
+discards. So those relays' clients get no address, and no counter shows it —
+the #2889 arrival counter leaves VIP-addressed frames out on purpose. In
+`relay` mode Kea reads that UDP socket, so every relay is answered. Kea
+replies to the relay's `giaddr`, from the node's own address — the same way
+the other nodes already answer the flows forwarded to them — so the reply
+comes back from the VIP only when the relay sends from its `giaddr`.
+
+"Behind the VIP" means a node of the control plane's own k3s cluster: the
+seed, and every promoted member. An approved Additional node that was never
+promoted runs its own single-node k3s with no MetalLB, so a branch appliance
+serving its directly attached VLAN in `direct` mode is not affected and is
+never refused or alerted on.
+
+There is no way to serve both through the VIP: Kea cannot mix raw and UDP
+sockets in one daemon, and SpatiumDDI does not switch a group's mode on its
+own, because `relay` stops directly attached clients being served. Instead:
+
+- `PUT …/control-plane/metallb` refuses (422) to **turn on** a relay VIP
+  while any group it would front is `direct`, naming the groups;
+- `PUT /dhcp/server-groups/{id}` refuses to change a group behind the VIP
+  **to** `direct`; while a VIP is set, the Fleet / Copilot role assignment
+  refuses to point a cluster node's DHCP role at a `direct` group (or to add
+  the role to a node already pointed at one), `PUT /dhcp/servers/{id}`
+  refuses to move a cluster node's Kea into a `direct` group, and a
+  control-plane promote refuses a joiner that serves one;
+- the default-on `dhcp_relay_vip_direct_socket` alert (critical, one event
+  per group) and the MetalLB card report the state whenever it exists — an
+  install that had it before these checks, or a path they do not cover.
+
+A group that must also serve directly attached clients keeps `direct`, and its
+relays forward to every DHCP node's own address (several `ip helper-address`
+lines) rather than to the VIP.
 See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#dhcp-server-kea-doesnt-respond-to-discover)
 for the "no DHCPOFFER" diagnosis flow.
 
@@ -67,7 +108,7 @@ for the "no DHCPOFFER" diagnosis flow.
 This is the most granular part of the DHCP model. Within a **subnet**, you can define:
 - Multiple **pools** with different behaviors (dynamic, reserved, excluded)
 - **Static assignments** (fixed IPs by MAC address)
-- **Pool-level DHCP options** that override subnet defaults
+- **Pool-level DHCP options** that override subnet defaults (set through the API as `options_override`; the console's New Pool dialog has no options field)
 
 ### Hierarchy
 
@@ -432,9 +473,9 @@ errors.
 |---|---|---|---|
 | Infrastructure | 10.1.2.1–10.1.2.20 | excluded | Gateways, servers — never DHCP |
 | Static Only | 10.1.2.21–10.1.2.50 | reserved | Printers with static assignments |
-| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, short lease, option 150 |
+| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, option 150 (by API) |
 | Workstations | 10.1.2.101–10.1.2.200 | dynamic | Standard lease, all defaults |
-| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, 2h lease, no internal DNS |
+| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, options by API (no internal DNS) |
 | Management | 10.1.2.241–10.1.2.254 | excluded | Network equipment |
 
 ---
@@ -474,8 +515,8 @@ empty.
 **Prerequisite — create a scope for the subnet.** A scope lives on a DHCP
 **server group** that has at least one Kea member (DHCP is group-centric —
 scopes / pools / statics / classes all belong to the group). Create it from
-**IPAM → the subnet → "DHCP Pools" tab → Create Scope**, or from
-**DHCP → the server group → Scopes tab → New Scope**. A dynamic pool is optional;
+**IPAM → the subnet → DHCP tab → Create Scope**, or from
+**DHCP → the server group → Scopes tab → "+ Serve leases on subnet…"** (pick the subnet). A dynamic pool is optional;
 the scope alone is enough to emit the `subnet4` block that reservations hang off.
 
 **Create the reservation — two equivalent paths:**
@@ -484,7 +525,7 @@ the scope alone is enough to emit the `subnet4` block that reservations hang off
 New static assignment**. Pick the scope (a picker appears when the group has
 more than one), then enter the MAC + IP + hostname and save. Edit and Delete
 live on the per-row right-click menu. Creating / editing / deleting a
-reservation requires a **superadmin**.
+reservation requires `write` / `delete` on `dhcp_static` (the built-in DHCP Editor role holds `admin` on it).
 
 *From IPAM (at allocation time):*
 
@@ -531,7 +572,7 @@ Assignments** tab lists every reservation across the group's scopes.
   statics endpoints enforce. Without the grant the IPAM write still succeeds
   but the reservation is left untouched and the response carries the
   permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
-  still requires a superadmin, as above.
+  takes the same `dhcp_static` grants, as above.
 - **Deleting the address follows the same rule.** Deleting an IPAM row (or
   purging orphans) removes the reservations linked to it, on the DHCP server
   too, so it needs `delete` on `dhcp_static`. Without it the delete is
@@ -1482,22 +1523,17 @@ the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 ### Push (IPAM → DHCP Server)
 Triggered by:
 - Scope/pool/static assignment create/update/delete
-- Manual "Force Sync" from UI
-- Scheduled full sync (default: every 5 minutes)
+- Manual "Force Sync" from UI (every server except Windows DHCP)
 
-The push is **diff-based** — only changed objects are sent, not a full config replacement. This prevents unnecessary DHCP server disruption.
+There is no scheduled full push. Kea agents long-poll the control plane for the whole config bundle by ETag, so any change that alters the rendered config reaches them within seconds; the agent applies the bundle it gets rather than a diff.
 
 ### Pull (DHCP Server → IPAM)
 Triggered by:
 - Lease events (real-time via webhook or Kea hook)
-- Scheduled lease dump pull (fallback)
-- Manual "Import Leases" from UI
+- Scheduled lease pull for agentless servers (Windows DHCP, FortiGate), gated by **Settings → DHCP Lease Sync**
+- Manual **Sync Leases** on a Windows DHCP server's detail page (other servers show Force Sync instead)
 
-### Reconciliation Report
-Available from the admin UI: compares IPAM DB state vs. live DHCP server state and flags:
-- IPs in DHCP scope but not in IPAM
-- Static assignments in DHCP not in IPAM
-- Scopes in DHCP not known to IPAM
+There is no DHCP reconciliation report in the console or the API; drift between IPAM and a live DHCP server is not reported as a diff.
 
 ---
 
@@ -1652,7 +1688,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
-- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
+- A group with **one Kea member** is standalone; HA fields are ignored. A group whose `mode` is `hot-standby` or `load-balancing` with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A `standalone` group never does, whatever URLs its members carry (#2969): Kea refuses `"mode": "standalone"` and would reject the whole config. The HA listener firewall rule and the `kea_ha_version_skew` pre-flight follow the same rule. A standalone group with two or more Kea members and an active scope has every member serving that scope uncoordinated, and raises the `dhcp_scope_uncoordinated` alert naming the group. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
 - Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
@@ -1820,7 +1856,7 @@ Two Windows DHCP servers only share a scope safely inside a **failover relations
 - **Relationships are managed from the group's panel** — create, edit, delete, add or remove scopes, replicate one partner's configuration over the other's — over the CredSSP WinRM transport, which is the only one that can reach the partner from the server a cmdlet runs on.
 - The lease-sync poll records each server's relationships and the scopes it holds; one member imports each shared scope and the others are compared against it for drift.
 - A lease's shared IPAM mirror and DDNS records are not torn down while another server in the group still holds the lease.
-- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating.
+- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating, and per `standalone` group with two or more Kea members (#2969).
 
 The group page shows it all under **Windows DHCP failover**; the scopes table and the IPAM subnet's scope card carry a **Windows** badge. REST: `GET /dhcp/server-groups/{id}/failover`, `GET /dhcp/scopes/{id}/failover`, and the management routes under `/dhcp/server-groups/{id}/failover/relationships` (superadmin, audited — never the shared secret); MCP: `find_dhcp_failover_relationships` (read-only — deliberately no `propose_*` for relationship changes). Setup and every refusal: [WINDOWS.md](../deployment/WINDOWS.md#more-than-one-windows-dhcp-server-in-a-group). Internals: [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#failover-relationships-and-multi-member-groups-1110).
 

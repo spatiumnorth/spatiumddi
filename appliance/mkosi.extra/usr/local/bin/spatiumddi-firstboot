@@ -1426,6 +1426,18 @@ ${POSTGRES_PARAMETERS_YAML}
         # labelled yet), so a single node loss would have taken the
         # primary and a replica together. Inert at instances: 1.
         podAntiAffinityType: required
+        # #3021 — the instance pods reach the API server on their own node
+        # (every control-plane node is a k3s server), not through the
+        # kubernetes Service: losing a replica's node no longer cuts the
+        # primary from the API and restarts it. The chart's default is off (a
+        # BYO-Kubernetes node may run no API server); the seed supervisor
+        # writes the same value into the spatium-control HelmChartConfig
+        # (apply_control_plane_overrides), which is what a grown or upgraded
+        # cluster renders. On one node it changes no outcome (its node is the
+        # only one), and stating it here leaves the first heartbeat nothing to
+        # add (#1005).
+        nodeLocalApiServer:
+          enabled: true
         # #2132 — copy the cluster CA's public certificate into a ConfigMap
         # the supervisor reads, so it verifies the TLS of CNPG's status
         # endpoint before trusting the primary's slot state, with no grant

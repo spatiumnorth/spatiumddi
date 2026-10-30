@@ -330,7 +330,8 @@ async def export_pdf_endpoint(
     always includes its addresses — it exists to show them — so
     ``include_addresses`` is only meaningful on the tree shape, where it
     appends a scope-wide address table. Read-gated by the IPAM
-    router-level permission dependency, same as every other route here.
+    router-level permission dependency, which asks read on spaces, blocks,
+    subnets and addresses (``_IPAM_ROUTE_TYPES``, #3058).
     """
     from app.services.ipam_io.pdf import generate_ipam_pdf  # noqa: PLC0415
 

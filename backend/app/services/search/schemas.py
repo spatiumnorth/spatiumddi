@@ -35,6 +35,10 @@ class QueryShape:
     is_cidr: bool
     is_mac: bool
     mac_normalized: str
+    # The network a CIDR query names, host bits cleared (``10.0.96.5/24`` ->
+    # ``10.0.96.0/24``). PostgreSQL refuses ``CAST(... AS cidr)`` on a value
+    # with bits set right of the mask, so providers cast this, never ``raw``.
+    cidr: str = ""
 
     @property
     def is_address_like(self) -> bool:
@@ -76,6 +80,12 @@ def _is_cidr(q: str) -> bool:
     return True
 
 
+def _cidr_of(q: str) -> str:
+    if not _is_cidr(q):
+        return ""
+    return str(ipaddress.ip_network(q, strict=False))
+
+
 def _is_mac(q: str) -> bool:
     return any(p.match(q) for p in _MAC_PATTERNS)
 
@@ -88,6 +98,7 @@ def shape_of(q: str) -> QueryShape:
         is_cidr=_is_cidr(q),
         is_mac=_is_mac(q),
         mac_normalized=re.sub(r"[:\-.]", "", q).lower(),
+        cidr=_cidr_of(q),
     )
 
 
@@ -170,3 +181,6 @@ class SearchResponse(BaseModel):
     # feature-module filtering. The UI builds its scope chips from this, so
     # an operator is never offered a filter that can only return nothing.
     searched_types: list[SearchTypeInfo] = Field(default_factory=list)
+    # True when ``total`` is a floor: some type hit the fetch cap, so more rows
+    # match than were counted. ``total`` itself never depends on ``limit``.
+    total_capped: bool = False

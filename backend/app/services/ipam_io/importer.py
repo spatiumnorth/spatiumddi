@@ -36,6 +36,12 @@ from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam.resize import _total_ips
+from app.services.ipam.subnet_placeholders import (
+    boundary_rows,
+    create_placeholder_rows,
+    has_boundary_rows,
+    subnet_kind_for,
+)
 from app.services.ipam_io.parser import ParsedPayload
 
 logger = structlog.get_logger(__name__)
@@ -181,6 +187,27 @@ def _first_overlap(
     return None
 
 
+def _subnet_gateway(
+    canonical: str, gateway: Any, net: ipaddress.IPv4Network | ipaddress.IPv6Network, kind: str
+) -> tuple[str | None, str | None]:
+    """``(normalised gateway, error)`` for an imported subnet's gateway, by the
+    rule New Subnet applies. Shared by preview and commit so the preview names
+    the row commit refuses (#495). The gateway must be an address inside the
+    subnet (#504), and not the network / broadcast address the subnet's own
+    rows hold (#2979), which a gateway row would collide with."""
+    if gateway is None:
+        return None, None
+    try:
+        gw_addr = ipaddress.ip_address(str(gateway).strip())
+    except ValueError:
+        return None, f"{canonical}: invalid gateway {gateway!r}"
+    if gw_addr not in net:
+        return None, f"{canonical}: gateway {gateway} is not within the subnet"
+    if gw_addr in {ipaddress.ip_address(a) for a, _s, _d in boundary_rows(net, kind)}:
+        return None, f"{canonical}: gateway {gateway} is the subnet's network or broadcast address"
+    return str(gw_addr), None
+
+
 # ── Preview ────────────────────────────────────────────────────────────────────
 
 
@@ -245,7 +272,18 @@ async def preview_import(
         seen_networks.add(canonical)
 
         subnet_net = ipaddress.ip_network(canonical, strict=False)
+        subnet_kind = subnet_kind_for(subnet_net)
         name = str(row.get("name") or "")
+        _gw, gw_error = _subnet_gateway(
+            canonical, row.get("gateway") or None, subnet_net, subnet_kind
+        )
+        if gw_error is not None:
+            preview.errors.append(
+                DiffRow(
+                    kind="subnet", action="error", network=canonical, reason=gw_error, details=row
+                )
+            )
+            continue
 
         # Parent block detection
         parent = _find_parent_block(subnet_net, existing_blocks)
@@ -377,6 +415,14 @@ async def commit_import(
 
     existing_blocks = await _load_existing_blocks(db, space.id)
     existing_subnets = await _load_existing_subnets(db, space.id)
+    # Subnets created and the blocks they sit in, recounted once at the end
+    # in batches (#2981), not per row.
+    created_subnet_ids: list[uuid.UUID] = []
+    touched_blocks: set[uuid.UUID] = set()
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        _update_blocks_utilization,
+        _update_subnets_utilization,
+    )
 
     # Pre-flight: if fail-strategy and any subnet conflicts, bail out early —
     # BEFORE the mutation loop runs any side effects. Catches both pre-existing
@@ -416,26 +462,19 @@ async def commit_import(
             continue
 
         subnet_net = ipaddress.ip_network(canonical, strict=False)
+        subnet_kind = subnet_kind_for(subnet_net)
         name = str(row.get("name") or "")
         description = str(row.get("description") or "")
         vlan_id = row.get("vlan_id")
         vxlan_id = row.get("vxlan_id")
-        gateway = row.get("gateway") or None
         # Validate the gateway before it reaches the INET column — a malformed
-        # literal would otherwise raise a DataError → 500 mid-commit (#504) —
-        # and enforce the same in-subnet / same-family invariant create_subnet
-        # applies, so the importer can't land a Subnet later endpoints assume
-        # is valid (Copilot review of #504).
-        if gateway is not None:
-            try:
-                gw_addr = ipaddress.ip_address(str(gateway).strip())
-            except ValueError:
-                result_obj.errors.append(f"{canonical}: invalid gateway {gateway!r}")
-                continue
-            if gw_addr not in subnet_net:
-                result_obj.errors.append(f"{canonical}: gateway {gateway} is not within the subnet")
-                continue
-            gateway = str(gw_addr)
+        # literal would otherwise raise a DataError → 500 mid-commit (#504).
+        gateway, gw_error = _subnet_gateway(
+            canonical, row.get("gateway") or None, subnet_net, subnet_kind
+        )
+        if gw_error is not None:
+            result_obj.errors.append(gw_error)
+            continue
         custom_fields = row.get("custom_fields") or {}
 
         existing = existing_subnets.get(canonical)
@@ -557,6 +596,7 @@ async def commit_import(
             vxlan_id=vxlan_id,
             gateway=gateway,
             status="active",
+            kind=subnet_kind,
             total_ips=total,
             allocated_ips=0,
             utilization_percent=0.0,
@@ -565,6 +605,19 @@ async def commit_import(
         db.add(subnet)
         await db.flush()
         existing_subnets[canonical] = subnet
+        # The rows New Subnet makes (network, broadcast, gateway), so the
+        # counters and Next available never depend on which path created the
+        # subnet (#2979).
+        if has_boundary_rows(subnet_net, subnet_kind):
+            await create_placeholder_rows(
+                db,
+                subnet,
+                subnet_net,
+                gateway=gateway,
+                created_by_user_id=current_user.id,
+            )
+        created_subnet_ids.append(subnet.id)
+        touched_blocks.add(parent.id)
         db.add(
             _audit_entry(
                 current_user,
@@ -582,6 +635,13 @@ async def commit_import(
             )
         )
         result_obj.created_subnets += 1
+
+    # The counters follow the rows just made (#2412 / #2981): one grouped
+    # recount of the new subnets, then every block on their chains once.
+    await db.flush()
+    await _update_subnets_utilization(db, created_subnet_ids)
+    await db.flush()
+    await _update_blocks_utilization(db, touched_blocks)
 
     logger.info(
         "ipam_import_committed",
@@ -975,7 +1035,11 @@ async def commit_address_import(
     mutated. ``None`` means "no per-IP gate" (caller already proved
     subnet-wide write).
     """
-    from app.api.v1.ipam.router import _sync_dns_record
+    from app.api.v1.ipam.router import (
+        _sync_dns_record,
+        _update_blocks_utilization,
+        _update_utilization,
+    )
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
     from app.services.dns.sync_check import address_own_forward_zone_id
 
@@ -1032,7 +1096,6 @@ async def commit_address_import(
                 )
             seen_addr.add(canonical)
 
-    allocated_delta = 0
     for row in payload.addresses:
         canonical, fields, err = _row_address_fields(row)
         if err or canonical is None:
@@ -1152,7 +1215,6 @@ async def commit_address_import(
         db.add(new_ip)
         await db.flush()
         existing[canonical] = new_ip
-        allocated_delta += 1
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -1193,16 +1255,15 @@ async def commit_address_import(
             "the subnet or any address set you can write — nothing was imported."
         )
 
-    # Keep the subnet's utilization counters roughly honest by applying the
-    # net delta here — users expect the UI to reflect the new row count
-    # immediately. This is an estimate (a re-imported existing row bumps the
-    # delta but not the true count); the hourly
-    # ``app.tasks.ipam_utilization_recount.recount_ipam_utilization`` sweep
-    # reconciles any resulting drift against the live row count.
-    if allocated_delta:
-        subnet.allocated_ips = (subnet.allocated_ips or 0) + allocated_delta
-        if subnet.total_ips:
-            subnet.utilization_percent = round(100.0 * subnet.allocated_ips / subnet.total_ips, 2)
+    # Recount from the rows with the product's own rule (#2411), then roll the
+    # change up every block on the chain (#2981). A created ``available`` row is
+    # free and an overwritten status can move a row in or out of the count, so
+    # a running delta is not the answer.
+    if result_obj.created or result_obj.updated:
+        await db.flush()
+        await _update_utilization(db, subnet.id)
+        await db.flush()
+        await _update_blocks_utilization(db, [subnet.block_id])
 
     logger.info(
         "ipam_address_import_committed",

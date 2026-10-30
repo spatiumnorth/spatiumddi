@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import require_any_resource_permission, require_resource_permission
+from app.core.permissions import require_resource_permission
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.services.feature_modules import require_module
 
@@ -139,14 +139,14 @@ def _validate_window(window: str) -> None:
 
 
 # Each series reads the same grants as the server it describes: DNS server
-# traffic needs what the ``/dns`` router needs, DHCP traffic what the DHCP
-# server routes need.
+# traffic needs what the ``/dns`` server routes need (``dns_group``, #3073),
+# DHCP traffic what the DHCP server routes need.
 @router.get(
     "/dns/timeseries",
     response_model=DNSTimeseries,
     dependencies=[
         Depends(require_module("core.dns")),
-        Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record")),
+        Depends(require_resource_permission("dns_group")),
     ],
 )
 async def dns_timeseries(

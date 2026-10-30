@@ -42,6 +42,7 @@ from sqlalchemy import func, or_, select, text, update
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -546,6 +547,15 @@ RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 # shows, so the alarm and the panel cannot disagree.
 RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
 
+# Issue #2899 — a DHCP server group in ``direct`` socket mode (Kea raw
+# sockets) behind the MetalLB DHCP relay VIP. kube-proxy keeps about one relay
+# flow in N on the node announcing the VIP, whose raw socket drops the frame
+# still addressed to the VIP while raw mode discards the DNATed copy, so those
+# relays' clients get no address — and no counter records it (the #2889
+# arrival counter excludes VIP-addressed frames on purpose). Subject = the
+# group. Resolves when the group is set to ``relay`` or the VIP is cleared.
+RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET = "dhcp_relay_vip_direct_socket"
+
 # Issue #2313 — a blocklist feed whose refresh has not SUCCEEDED within three
 # of its own update intervals. A family filter that stopped refreshing keeps
 # enforcing the list it last had, and nothing else says so.
@@ -765,6 +775,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+        RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
         RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
         RULE_TYPE_DNS_POOL_HEALTH_STALE,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
@@ -3448,8 +3459,10 @@ async def _matching_secret_expiring_subjects(
     carry no expiry of their own (their issued certs do — out of scope), so
     they contribute no subjects here.
     """
+    from app.config import settings  # noqa: PLC0415
     from app.models.appliance import Appliance  # noqa: PLC0415
     from app.models.auth import APIToken  # noqa: PLC0415
+    from app.services.appliance.tls import certificate_store_location  # noqa: PLC0415
 
     threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
     cutoff = now + timedelta(days=threshold_days)
@@ -3568,7 +3581,7 @@ async def _matching_secret_expiring_subjects(
             f"Let's Encrypt Web UI certificate '{c.subject_cn or c.name}' "
             f"{_descriptor(days)} ({valid_to.isoformat()}, threshold "
             f"{threshold_days} d). Auto-renewal may be stuck — check "
-            f"Appliance → Web UI Certificate.{stale_note}"
+            f"{certificate_store_location(settings.appliance_mode)}.{stale_note}"
         )
         matches.append(
             (f"appliance_cert_tls:{c.id}", f"{c.subject_cn or c.name} (LE)", message, sev)
@@ -4257,7 +4270,95 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
                     "critical",
                 )
             )
+    matches.extend(await _standalone_kea_group_matches(db))
     return matches
+
+
+async def _standalone_kea_group_matches(
+    db: AsyncSession,
+) -> list[tuple[str, str, str, str | None]]:
+    """#2969 — a ``standalone`` group with 2+ Kea members and at least one
+    active scope. Scopes belong to the group, so every member renders and
+    serves its active ones with no HA hook to coordinate (``standalone`` never
+    renders HA). Fixed by setting the group's mode to hot-standby /
+    load-balancing, or by leaving one Kea member in the group.
+
+    Kea members only. A group that also has a Windows member is skipped: the
+    failover report above already reports each of its scopes uncoordinated
+    (a mixed group is, #1110), and a second, group-level event for the same
+    fault would page twice. An inactive scope is not rendered into any
+    bundle, so it is not served and does not count."""
+    from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup  # noqa: PLC0415
+
+    kea_count = func.count(DHCPServer.id)
+    # Aliased, or the subquery would auto-correlate to the outer DHCPServer
+    # join (a Kea row) and never find a Windows member.
+    win = aliased(DHCPServer)
+    has_windows = (
+        select(win.id)
+        .where(win.server_group_id == DHCPServerGroup.id, win.driver == "windows_dhcp")
+        .exists()
+    )
+    rows = (
+        await db.execute(
+            select(DHCPServerGroup.id, DHCPServerGroup.name, kea_count)
+            .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+            .where(
+                DHCPServerGroup.mode == "standalone",
+                DHCPServer.driver == "kea",
+                ~has_windows,
+            )
+            .group_by(DHCPServerGroup.id, DHCPServerGroup.name)
+            .having(kea_count >= 2)
+        )
+    ).all()
+    out: list[tuple[str, str, str, str | None]] = []
+    for gid, name, n in rows:
+        has_scope = await db.scalar(
+            select(DHCPScope.id)
+            .where(DHCPScope.group_id == gid, DHCPScope.is_active.is_(True))
+            .limit(1)
+        )
+        if has_scope is None:
+            continue
+        out.append(
+            (
+                f"{gid}:standalone",
+                f"{name} (standalone)",
+                f"DHCP server group '{name}' is standalone but has {n} Kea servers "
+                "serving the same scopes with no coordination: each can hand the "
+                "same address to a different client. Set the group mode to "
+                "hot-standby or load-balancing, or keep one Kea server in it.",
+                "critical",
+            )
+        )
+    return out
+
+
+async def _matching_dhcp_relay_vip_direct_socket_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dhcp_relay_vip_direct_socket`` — every DHCP server group in ``direct``
+    socket mode behind the MetalLB relay VIP (#2899).
+
+    Read from the same helper the MetalLB card and the configuration refusals
+    use, so the alarm, the card and the 422 cannot disagree. Silent on every
+    install without a relay VIP, which is every Compose / plain-k8s install.
+    """
+    from app.services.dhcp.relay_vip import (  # noqa: PLC0415
+        alert_message,
+        direct_groups_behind_relay_vip,
+        load_relay_vip,
+    )
+
+    vip = await load_relay_vip(db)
+    if not vip:
+        return []
+    return [
+        (str(g.id), g.name, alert_message(g.name, vip), rule.severity)
+        for g in await direct_groups_behind_relay_vip(db, vip)
+    ]
 
 
 async def _matching_dns_blocklist_feed_stale_subjects(
@@ -6328,6 +6429,48 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
         await session.commit()
 
 
+_DHCP_RELAY_VIP_DIRECT_SOCKET_RULE_NAME = "DHCP group in direct mode behind the relay VIP"
+
+
+async def seed_dhcp_relay_vip_direct_socket_alert_rule() -> None:
+    """Seed the #2899 rule, ENABLED by default.
+
+    Silent unless a MetalLB DHCP relay VIP is set AND a group it fronts reads
+    raw sockets — a state in which about one relay in N already gets no
+    answer, and no counter or other alarm says so. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DHCP_RELAY_VIP_DIRECT_SOCKET_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DHCP_RELAY_VIP_DIRECT_SOCKET_RULE_NAME,
+                description=(
+                    "Fires for each DHCP server group served through the MetalLB DHCP "
+                    "relay VIP while its client reachability is direct (Kea raw "
+                    "sockets). Relays whose flows land on the node announcing the VIP "
+                    "get no answer, about one relay in N for N nodes, and no packet "
+                    "counter shows it. Resolves when the group is set to relay, or the "
+                    "relay VIP is cleared."
+                ),
+                rule_type=RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNS_BLOCKLIST_FEED_STALE_RULE_NAME = "DNS blocklist feed stale"
 
 
@@ -7902,6 +8045,7 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
+    RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET: "core.dhcp",
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
     RULE_TYPE_DNS_BLOCKLIST_FEED_STALE: "core.dns",
     RULE_TYPE_DNS_POOL_HEALTH_STALE: "core.dns",
@@ -8196,6 +8340,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # A scope held on Windows need not have a SpatiumDDI row, so the
                 # subject is "<group id>:<cidr>", not a dhcp_scope id.
                 subject_type = "dhcp_scope"
+            elif rule.rule_type == RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET:
+                relay_vip_direct = await _matching_dhcp_relay_vip_direct_socket_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in relay_vip_direct]
+                subject_type = "dhcp_server_group"
             elif rule.rule_type == RULE_TYPE_DNS_BLOCKLIST_FEED_STALE:
                 stale_feeds = await _matching_dns_blocklist_feed_stale_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_feeds]

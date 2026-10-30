@@ -50,6 +50,8 @@ from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
+from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.ipam.address_create_rules import holds_address, take_address_row
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
 from app.services.pcap import (
@@ -410,6 +412,7 @@ async def _apply_create_ip_address(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet.id,
                 IPAddress.address == args.address,
+                holds_address(),  # an ``available`` row is a free slot (#2980)
             )
         )
     ).scalar_one_or_none()
@@ -472,9 +475,12 @@ async def _apply_create_ip_address(
     )
     from app.services.dhcp.static_ipam import sync_static_for_ipam_row
 
-    row = IPAddress(
-        subnet_id=subnet.id,
-        address=args.address,
+    # An ``available`` row is a free slot, taken over in place (#2980).
+    row = await take_address_row(
+        db,
+        subnet,
+        args.address,
+        user,
         status=args.status,
         hostname=args.hostname,
         fqdn=args.fqdn,
@@ -482,8 +488,6 @@ async def _apply_create_ip_address(
         description=args.description or "",
         created_by_user_id=user.id,
     )
-    db.add(row)
-    await db.flush()
 
     # #2900 — the downstream work the REST create runs that needs no
     # hostname: MAC history, the DHCP reservation a ``static_dhcp`` row owns
@@ -1867,7 +1871,9 @@ register(
         apply=_apply_create_ip_address,
         validate_submit=_validate_submit_create_ip_address,
         category="ipam",
-        required_permission=("write", "ip_address"),
+        # The REST address write needs ``write`` on the subnet that owns the
+        # address (#3058); the apply path delegates to that handler.
+        required_permission=("write", "subnet"),
     )
 )
 
@@ -2652,15 +2658,28 @@ class CreateDNSZoneArgs(BaseModel):
             "matching ``driver_hint`` to auto-select a compatible group."
         ),
     )
-    ttl: int = Field(
-        default=3600,
-        description="Default record TTL in seconds.",
+    ttl: int | None = Field(
+        default=None,
+        description=(
+            "Default record TTL in seconds. Omit to use the platform's "
+            "Default Zone TTL from Settings."
+        ),
         ge=60,
         le=604_800,
     )
 
 
-def _technitium_api_zone_arg_conflict(args: CreateDNSZoneArgs, drivers: set[str]) -> str | None:
+async def _effective_zone_ttl(db: AsyncSession, args: CreateDNSZoneArgs, group_id: UUID) -> int:
+    """The TTL the zone will carry: the caller's, else the group's default
+    (Settings' Default Zone TTL; the stock value on ``technitium_api``) (#3087)."""
+    if args.ttl is not None:
+        return args.ttl
+    return await default_zone_ttl(db, group_id)
+
+
+def _technitium_api_zone_arg_conflict(
+    args: CreateDNSZoneArgs, drivers: set[str], ttl: int
+) -> str | None:
     """#1784 — the REST zone-create scope gate for an experimental
     ``technitium_api`` group, applied to the Copilot's create too: the
     Copilot fronts the REST API and must not be a way around its 422s.
@@ -2674,7 +2693,7 @@ def _technitium_api_zone_arg_conflict(args: CreateDNSZoneArgs, drivers: set[str]
     try:
         technitium_api_scope.refuse_non_primary(args.zone_type)
         technitium_api_scope.refuse_unapplied_zone_changes(
-            {"ttl": args.ttl, "primary_ns": args.primary_ns, "admin_email": args.admin_email},
+            {"ttl": ttl, "primary_ns": args.primary_ns, "admin_email": args.admin_email},
             None,
         )
     except HTTPException as exc:
@@ -2804,7 +2823,9 @@ async def _preview_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
-    conflict = _technitium_api_zone_arg_conflict(args, drivers)
+    conflict = _technitium_api_zone_arg_conflict(
+        args, drivers, await _effective_zone_ttl(db, args, grp.id)
+    )
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
     if args.dnssec_enabled:
@@ -2875,7 +2896,9 @@ async def _apply_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         raise ValueError(conflict)
-    conflict = _technitium_api_zone_arg_conflict(args, drivers)
+    conflict = _technitium_api_zone_arg_conflict(
+        args, drivers, await _effective_zone_ttl(db, args, grp.id)
+    )
     if conflict is not None:
         raise ValueError(conflict)
     # #1762 — the single-signer rule the REST create applies, re-checked at
@@ -2907,7 +2930,7 @@ async def _apply_create_dns_zone(
         name=name,
         zone_type=args.zone_type,
         kind=kind,
-        ttl=args.ttl,
+        ttl=await _effective_zone_ttl(db, args, grp.id),
         primary_ns=args.primary_ns,
         admin_email=args.admin_email,
         dnssec_enabled=args.dnssec_enabled,
@@ -4402,6 +4425,7 @@ async def _apply_assign_appliance_role_locked(
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
     if signer_problem is not None:
         raise ValueError(signer_problem)
+    prev_roles = list(row.assigned_roles or [])
     row.assigned_roles = list(args.roles)
     # #1562 — same contract as the REST roles endpoint: a group field
     # present in the payload with a null value unassigns the group; an
@@ -4436,7 +4460,9 @@ async def _apply_assign_appliance_role_locked(
             # pointer alone would leave the appliance's server in the old group.
             # A refusal raises, and the proposal applies nothing.
             try:
-                dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, user)
+                dhcp_move = await move_appliance_dhcp_servers(
+                    db, row, dhcp_group, user, prev_roles=prev_roles
+                )
             except HTTPException as exc:
                 raise ValueError(str(exc.detail)) from exc
             moved_servers.extend(dhcp_move.moved)

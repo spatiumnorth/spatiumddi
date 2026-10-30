@@ -167,10 +167,7 @@ function emptyState(): NetBoxState {
 }
 
 function extractError(err: unknown): string {
-  return (
-    (err as { response?: { data?: { detail?: string } } })?.response?.data
-      ?.detail ?? formatApiError(err)
-  );
+  return formatApiError(err);
 }
 
 export function NetBoxImportPage() {

@@ -820,9 +820,11 @@ export function GlobalSearch() {
               {results.length > 0 && (
                 <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
                   <span>
-                    {data?.total ?? 0} result
-                    {(data?.total ?? 0) !== 1 ? "s" : ""}
-                    {(data?.total ?? 0) > results.length &&
+                    {data?.total ?? 0}
+                    {data?.total_capped ? "+" : ""} result
+                    {(data?.total ?? 0) !== 1 || data?.total_capped ? "s" : ""}
+                    {((data?.total ?? 0) > results.length ||
+                      data?.total_capped) &&
                       ` · showing top ${results.length}`}
                   </span>
                   <span className="flex items-center gap-2">
