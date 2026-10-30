@@ -2791,6 +2791,8 @@ Every open issue is on the public org project **[SpatiumDDI](https://github.com/
 | State | project field **Status** | Triage → Backlog or Todo → In progress → In review → Done. The project's workflows move most of these |
 | Kind and area | issue type and `area:*` / `theme:*` labels | the existing taxonomy |
 
+**PR milestones are automatic.** `.github/workflows/pr-milestone.yml` gives a PR the milestone its closing issues share, and at merge falls back to the next release (the lowest-versioned open milestone); it never changes one already set. A PR whose issues disagree, or one stacked on another branch (GitHub does not link its `Fixes #N`), gets the fallback.
+
 The QA loop (`spatiumnorth/ddi-pg`) reads two things from issues, and both are easy to break by accident:
 
 - **Assigning an issue to amoona6 hands it to QA.** `/issues-fix-check` works every open issue assigned to that account: it reproduces the issue, fixes it, proves the fix on a stacked build, and opens the PR. Don't assign there as a courtesy.

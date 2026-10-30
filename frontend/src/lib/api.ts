@@ -205,6 +205,24 @@ export const api = createClient();
  * site in the app.
  */
 export function formatApiError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, false);
+}
+
+/**
+ * formatApiError for a form dialog: also drops the "Value error, " pydantic
+ * puts in front of a validator's message (#2435, #3041), which names nothing
+ * the reader can act on. Only a 422 entry's own `msg` is trimmed, and only at
+ * its start, so the same words inside a real message are left alone.
+ */
+export function formatDialogError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, true);
+}
+
+function formatError(
+  err: unknown,
+  fallback: string,
+  stripPydanticPrefix: boolean,
+): string {
   const anyErr = err as {
     response?: { data?: { detail?: unknown } };
     message?: string;
@@ -220,7 +238,12 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
         const loc = Array.isArray(rec.loc)
           ? rec.loc.filter((s) => s !== "body").join(".")
           : "";
-        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(e);
+        const msg =
+          typeof rec.msg === "string"
+            ? stripPydanticPrefix
+              ? rec.msg.replace(/^Value error, /, "")
+              : rec.msg
+            : JSON.stringify(e);
         return loc ? `${loc}: ${msg}` : msg;
       })
       .filter(Boolean);
@@ -232,11 +255,24 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
     //   {"field": "match_clients", "value": "10.0.0.300", "message": "…"}
     // Without this the operator was shown the raw JSON, which buries the
     // one sentence that tells them what to fix.
-    const rec = detail as { message?: unknown; field?: unknown };
+    const rec = detail as {
+      message?: unknown;
+      field?: unknown;
+      errors?: unknown;
+    };
     if (typeof rec.message === "string" && rec.message.trim()) {
       return typeof rec.field === "string" && rec.field
         ? `${rec.field}: ${rec.message}`
         : rec.message;
+    }
+    // The password policy's refusal (#3040): `{reason: "password_policy",
+    // errors: ["Password must be at least 12 characters", ...]}`. The same
+    // list ChangePasswordPage reads via parsePasswordError.
+    if (Array.isArray(rec.errors)) {
+      const msgs = rec.errors.filter(
+        (e): e is string => typeof e === "string" && !!e.trim(),
+      );
+      if (msgs.length) return msgs.join("; ");
     }
     // Unexpected shape — stringify defensively so we never render an object.
     try {
@@ -1487,6 +1523,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
@@ -1895,6 +1933,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
@@ -7250,6 +7290,11 @@ export interface CloudDNSServerOption {
   has_credentials: boolean;
 }
 
+// The client defaults to application/json, which axios honours by turning a
+// FormData into JSON (a File becomes {}). The import previews read form
+// fields, so they must say multipart (#3038).
+const MULTIPART = { headers: { "Content-Type": "multipart/form-data" } };
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -7261,7 +7306,7 @@ export const dnsImportApi = {
     fd.append("target_group_id", target_group_id);
     if (target_view_id) fd.append("target_view_id", target_view_id);
     return api
-      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   bind9Commit: (body: {
@@ -7534,7 +7579,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   keaCommit: (body: DHCPImportCommitBody) =>
@@ -7549,7 +7594,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   iscCommit: (body: DHCPImportCommitBody) =>
@@ -10043,7 +10088,8 @@ export interface DHCPMACBlock {
   id: string;
   group_id: string;
   mac_address: string;
-  reason: DHCPMACBlockReason;
+  // One of DHCPMACBlockReason, or the free text New Devices stored (#3083).
+  reason: string;
   description: string;
   enabled: boolean;
   expires_at: string | null;
@@ -10059,7 +10105,7 @@ export interface DHCPMACBlock {
 
 export interface DHCPMACBlockWrite {
   mac_address?: string;
-  reason?: DHCPMACBlockReason;
+  reason?: string;
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
@@ -14273,6 +14319,10 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
+  reboot_in_progress?: boolean;
+  // #3008 — the node the reboot fields describe (the api pod's own node);
+  // null off-appliance.
+  node?: string | null;
   appliance_version: string | null;
   appliance_mode: boolean;
   /** #3011 — false on a multi-node control plane: the local reboot acts on

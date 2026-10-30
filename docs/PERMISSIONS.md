@@ -225,6 +225,62 @@ checks every listed route against a write-only role, and fails on a POST route
 named like a multi-row delete (`purge`, `prune`, `clear`, `remove`, …) that is
 neither on the list nor reviewed as something else.
 
+### DNS: each route needs its own type (#3073)
+
+Every route under `/api/v1/dns` that the DNS router serves needs the HTTP
+method's action on the type it serves, listed per route in `_DNS_ROUTE_TYPES`
+(`backend/app/api/v1/dns/router.py`; the two `/dns/tools` routes in
+`_DNS_TOOLS_ROUTE_TYPES`, `backend/app/api/v1/dns_tools.py`). Until #3073 the
+DNS gate admitted a type-level grant on *any* of `dns_group`, `dns_zone` and
+`dns_record`, so a role holding only `read` on `dns_group` or on `dns_record`
+listed every group, server, zone and record. A route missing from the map
+admits nobody, and `backend/tests/test_dns_route_types.py` fails until it is
+classified.
+
+| Routes | Needs |
+|---|---|
+| `/groups`, `/groups/{id}`, servers, server options and trust anchors, forwarder presets, DNSSEC policies, views, ACLs, TSIG keys, dynamic-update capabilities, a server's events / rendered config / `rndc status` | `dns_group` |
+| `/groups/{id}/zones`, a zone and its settings (DNSSEC, move), zone templates, the TLD registry | `dns_zone` |
+| `/groups/{id}/records`, a zone's records (list, create, edit, delete, bulk), zone-file and spreadsheet import, sync with server, the import template, `/tools/propagation-check`, `/tools/default-resolvers` | `dns_record` |
+
+A route whose answer carries several types needs each of them:
+
+| Route | Needs |
+|---|---|
+| Zone export (one zone or the whole group), delegation preview and delegate-from-parent | `dns_zone` and `dns_record` |
+| Zone drift (a per-server report) | `dns_group`, `dns_zone` and `dns_record` |
+| A server's zone state; a zone's per-server state; a zone's update ACL (it names the group's TSIG keys) | `dns_group` and `dns_zone` |
+| A server's pending record ops | `dns_group` and `dns_record` |
+
+The import previews and commits and sync-with-server, which answer with the
+zone's existing records, also need `read` on `dns_record`.
+
+An API token bound to DNS zones (#374) is checked against its owner's grants
+this way, and narrowed to its zones: its `dns_zone` grant lets it through on
+`dns_group` and `dns_record` too, and the route then answers for its zones
+only. A route keyed on a server group or a server (`{group_id}`,
+`{server_id}`) admits the token only for a group one of its zones sits in, and
+`GET /groups` lists only those groups; before #3073 such a token read every
+group's servers, views, ACLs and TSIG key names. Grants scoped to one zone keep working where a handler checks
+the zone itself (the IPAM subnet DNS pinning, for one).
+
+The Copilot / MCP DNS tools follow the same rule: the server-group, server,
+view, option and DNSSEC-policy tools need `dns_group`, `list_dns_zones` and
+the zone DNSSEC / update-ACL tools `dns_zone`, and the record tools
+(`query_dns_records`, `list_dns_records`) `dns_record`. A tool whose REST
+twin needs several types checks each of them: `export_dns_zone_records` needs
+`dns_zone` and `dns_record`, `find_dns_zone_drift` all three, and
+`find_zone_update_acls` `dns_zone` and `dns_group`. The DNS server traffic chart
+(`/metrics/dns/timeseries`) needs `read` on `dns_group`, and tag search shows
+zones to a `dns_zone` reader and records to a `dns_record` reader.
+
+**Upgrading.** A custom role that relied on one DNS grant to read the rest of
+DNS loses those reads. Add `read` on each type the role should see —
+typically `dns_group`, `dns_zone` and `dns_record` together (the DNS page
+starts at the server groups). The built-in roles keep what they had
+(`Auditor` and `Compliance Editor` gain `read` on `dns_group` and
+`dns_record`, which their zone read used to open).
+
 ## Built-in roles (seeded on first start)
 
 | Role           | Permissions                                                  |
@@ -235,8 +291,8 @@ neither on the list nor reviewed as something else.
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists. Infrastructure stays superadmin-only (see below) |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
 | `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`; `read` on `alert` |
-| `Auditor`        | `read` on `conformity`, `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
-| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
+| `Auditor`        | `read` on `conformity`, `audit_log`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
+| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `alert` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103); `read` on `alert` — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62); `read` on `alert` — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
 | `Requester`        | `write` + `read` on `provisioning_request` (#696); `read` on `alert` — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. |
@@ -256,7 +312,7 @@ Editor roles grant the writes they always claimed to:
 | Surface | Gate |
 |---|---|
 | DNS zones (create, from template, edit, delete) | `write` / `delete` on `dns_zone` |
-| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`; the import preview and commit, which answer with the zone's existing records, also take `read` on `dns_group`, `dns_zone` or `dns_record`, as the export does) |
+| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`; the import preview and commit, which answer with the zone's existing records, also take `read` on `dns_record`, as the record list does) |
 | DNS views and named ACLs | `write` / `delete` on `dns_group` |
 | Blocklist entries and exceptions | `write` / `delete` on `dns_blocklist` |
 | DHCP scopes, phone profiles, PXE profiles | `write` / `delete` on `dhcp_scope` |

@@ -60,7 +60,7 @@ from app.services.logs.agent_logs import (
 # The agent fleet-health tools span three resource families; each kind is
 # shown only to a caller who can read that family on its own REST surface.
 _AGENT_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
-    "dns_server": ("read", ("dns_group", "dns_zone", "dns_record")),
+    "dns_server": ("read", ("dns_group",)),
     "dhcp_server": ("read", ("dhcp_server",)),
     "looking_glass_collector": ("read", ("bgp_lg_peer",)),
 }
@@ -312,7 +312,7 @@ class GetDNSQueryRateArgs(BaseModel):
 
 @register_tool(
     name="get_dns_query_rate",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "DNS query-rate timeseries from the ``dns_metric_sample`` "
         "table. Returns recent buckets with queries_total / noerror "

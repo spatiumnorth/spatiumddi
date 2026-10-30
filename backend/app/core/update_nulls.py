@@ -34,7 +34,9 @@ Contract for ``resolve_update_changes(body, clearable, non_nullable)``:
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
+from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException
@@ -74,14 +76,83 @@ def resolve_update_changes(
     return {k: v for k, v in changes.items() if v is not None or k in clearable_set}
 
 
-def changed_keys(before: Mapping[str, Any], changes: Mapping[str, Any]) -> list[str]:
-    """The keys of ``changes`` whose value differs from ``before`` (#2463).
+class _Empty:
+    """The one value an empty list and an empty mapping both normalise to."""
+
+    def __repr__(self) -> str:
+        return "<empty>"
+
+
+_EMPTY = _Empty()
+
+
+def _norm(value: Any) -> Any:
+    """A comparable form of ``value``: empty text is NULL, rich types are text.
+
+    A stored NULL and the empty string a dialog posts back for it are the same
+    value: every text field an update dialog shows reads both as "not set".
+    An empty list and an empty mapping are the same as each other (a dialog
+    posts ``[]`` for an options column the row stores as ``{}``) but NOT the
+    same as NULL, because for some columns they mean different things: a DNS
+    zone's ``allow_transfer`` of NULL inherits the server's list while ``[]``
+    narrows transfers to the group's keys, and ``allow_recursion`` /
+    ``allow_query_cache`` render ``none`` for ``[]`` but a default for NULL.
+    Merging them would leave a real change out of the audit row.
+
+    Mappings and lists are normalised member by member (a dialog posts options
+    as the same nested structure the row stores), and anything that is not a
+    plain JSON scalar (UUID, ipaddress, Enum, ...) is compared by its text,
+    since the row and the request body hold the same value as different types.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (Mapping, list, tuple)) and not value:
+        return _EMPTY
+    if isinstance(value, Mapping):
+        return {str(k): _norm(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_norm(v) for v in value]
+    if isinstance(value, (str, int, float, bool, Decimal, datetime)):
+        return value
+    return str(value)
+
+
+def _same(old: Any, new: Any, *, unordered: bool) -> bool:
+    a, b = _norm(old), _norm(new)
+    if unordered and isinstance(a, list) and isinstance(b, list):
+        return sorted(map(repr, a)) == sorted(map(repr, b))
+    return bool(a == b)
+
+
+def snapshot(obj: Any, keys: Iterable[str]) -> dict[str, Any]:
+    """``{key: current value}`` for each key that is a real attribute of ``obj``.
+
+    Taken just before a handler's ``setattr`` loop, it is the ``before`` that
+    ``changed_keys`` compares against. A key that is not an attribute (a
+    handler-computed marker) is left out so it counts as changed.
+    """
+    return {k: getattr(obj, k) for k in keys if hasattr(obj, k)}
+
+
+def changed_keys(
+    before: Mapping[str, Any],
+    changes: Mapping[str, Any],
+    *,
+    unordered: Collection[str] = (),
+) -> list[str]:
+    """The keys of ``changes`` whose value differs from ``before`` (#2463, #3086).
 
     An update dialog sends every field it shows, so ``changes`` holds keys the
-    operator never touched; the audit row names only those that moved. A key
-    absent from ``before`` was added by the handler itself and counts.
+    operator never touched; the audit row names only those that moved. Values
+    are compared normalised (see ``_norm``): NULL and empty are the same, and a
+    list named in ``unordered`` is compared as a multiset. A key absent from
+    ``before`` was added by the handler itself and counts.
     """
-    return [k for k, v in changes.items() if k not in before or before[k] != v]
+    return [
+        k
+        for k, v in changes.items()
+        if k not in before or not _same(before[k], v, unordered=k in unordered)
+    ]
 
 
-__all__ = ["changed_keys", "resolve_update_changes"]
+__all__ = ["changed_keys", "resolve_update_changes", "snapshot"]

@@ -17,6 +17,7 @@ on DHCP scopes instead of DNS zones.
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -168,3 +169,25 @@ class ImportPreview:
     total_pools: int
     total_reservations: int
     address_family_histogram: dict[str, int]
+
+
+def pool_problem(start: str, end: str, subnet_cidr: str) -> str | None:
+    """Why ``start``-``end`` cannot be a pool of ``subnet_cidr``, or None.
+
+    Checked at parse time so the preview names a bad pool; otherwise the
+    commit hands the raw string to an INET column and the scope fails
+    with the driver's error text.
+    """
+    try:
+        a = ipaddress.ip_address(start)
+        b = ipaddress.ip_address(end)
+        net = ipaddress.ip_network(subnet_cidr, strict=False)
+    except ValueError:
+        return "not a valid address range"
+    if a.version != b.version or a.version != net.version:
+        return "address family does not match the subnet"
+    if int(a) > int(b):
+        return "start is after end"
+    if a not in net or b not in net:
+        return f"outside {net}"
+    return None

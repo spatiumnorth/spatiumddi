@@ -1521,3 +1521,191 @@ async def test_renew_manual_dns01_renews_when_now_managed(
     assert len(orders) == 1
     assert orders[0].challenge_type == "dns-01"
     assert orders[0].allow_manual is False
+
+
+# ── #3061: DoT / DoH certs renew in place ───────────────────────────
+
+
+def _self_signed_chain(cn: str) -> tuple[str, str]:
+    """A real PEM cert + key, so ``_store_certificate`` can parse it."""
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.now(UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=90))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    return cert.public_bytes(serialization.Encoding.PEM).decode(), key_pem
+
+
+async def _dot_group_on(db: AsyncSession, cert) -> uuid.UUID:  # noqa: ANN001
+    from app.models.dns import DNSServerGroup, DNSServerOptions
+
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add(group)
+    await db.flush()
+    db.add(DNSServerOptions(group_id=group.id, dot_enabled=True, tls_certificate_id=cert.id))
+    await db.flush()
+    return group.id
+
+
+@pytest.mark.asyncio
+async def test_renew_includes_an_inactive_cert_a_dot_listener_serves(
+    db_session: AsyncSession,
+) -> None:
+    """A second ACME issue deactivates the first, and off an appliance nothing
+    else ever re-activates it — so keying the sweep on ``is_active`` alone let
+    every DoT cert but the newest expire. The renewal order also names the cert
+    it renews, which is what makes the orchestrator rewrite it in place."""
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["dot.example.com"])
+    cert.is_active = False
+    await _dot_group_on(db_session, cert)
+    # An inactive LE cert nothing serves stays out of the sweep.
+    idle = await _seed_le_cert(db_session, days_to_expiry=10, sans=["idle.example.com"])
+    idle.is_active = False
+    cert_id = cert.id
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    orders = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(orders) == 1
+    assert orders[0].domains == ["dot.example.com"]
+    assert orders[0].certificate_id == cert_id
+
+
+@pytest.mark.asyncio
+async def test_renewal_rewrites_the_dot_cert_in_place_and_keeps_activation(
+    db_session: AsyncSession,
+) -> None:
+    """Renewal used to land in a NEW row and make it the sole active cert, so
+    the DNS group kept pointing at the old row until it expired, and on an
+    appliance a DoT-only cert took over the Web UI. Now the renewed chain
+    lands in the row the group already names, and activation is untouched."""
+    from app.models.appliance import ApplianceCertificate
+    from app.models.dns import DNSServerOptions
+
+    await _seed_shape(db_session)
+    web = await _seed_le_cert(db_session, days_to_expiry=60, sans=["ui.example.com"])
+    dot = await _seed_le_cert(db_session, days_to_expiry=10, sans=["dot.example.com"])
+    dot.is_active = False
+    web.is_active = True
+    group_id = await _dot_group_on(db_session, dot)
+    dot_id, web_id = dot.id, web.id
+    account = (await db_session.execute(select(ACMEClientAccount).limit(1))).scalar_one()
+    order = ACMEOrder(
+        account_id=account.id,
+        domains=["dot.example.com"],
+        challenge_type="dns-01",
+        status=ACME_ORDER_PENDING,
+        certificate_id=dot_id,
+    )
+    db_session.add(order)
+    await db_session.flush()
+
+    chain_pem, key_pem = _self_signed_chain("dot.example.com")
+    row = await orchestrator._store_certificate(db_session, order, chain_pem, key_pem)
+
+    assert row.id == dot_id
+    db_session.expire_all()
+    renewed = await db_session.get(ApplianceCertificate, dot_id)
+    assert renewed is not None
+    assert renewed.cert_pem == chain_pem
+    assert renewed.is_active is False
+    still_web = await db_session.get(ApplianceCertificate, web_id)
+    assert still_web is not None and still_web.is_active is True
+    opts = (
+        await db_session.execute(
+            select(DNSServerOptions).where(DNSServerOptions.group_id == group_id)
+        )
+    ).scalar_one()
+    assert opts.tls_certificate_id == dot_id
+    count = len(
+        (
+            await db_session.execute(
+                select(ApplianceCertificate).where(ApplianceCertificate.name.like("letsencrypt-%"))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert count == 0  # no new ``letsencrypt-<order>`` row was minted
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_issue_still_becomes_the_sole_active_cert(
+    db_session: AsyncSession,
+) -> None:
+    """The fresh-issue path is unchanged: no ``certificate_id`` on the order,
+    so a new row lands and becomes the active cert."""
+    from app.models.appliance import ApplianceCertificate
+
+    await _seed_shape(db_session)
+    old = await _seed_le_cert(db_session, days_to_expiry=60, sans=["ui.example.com"])
+    old_id = old.id
+    account = (await db_session.execute(select(ACMEClientAccount).limit(1))).scalar_one()
+    order = ACMEOrder(
+        account_id=account.id,
+        domains=["new.example.com"],
+        challenge_type="dns-01",
+        status=ACME_ORDER_PENDING,
+    )
+    db_session.add(order)
+    await db_session.flush()
+
+    chain_pem, key_pem = _self_signed_chain("new.example.com")
+    row = await orchestrator._store_certificate(db_session, order, chain_pem, key_pem)
+
+    assert row.id != old_id
+    assert row.is_active is True
+    db_session.expire_all()
+    previous = await db_session.get(ApplianceCertificate, old_id)
+    assert previous is not None and previous.is_active is False
+
+
+def test_nginx_proxies_acme_challenge_in_both_templates() -> None:
+    """#3061 — the certificate store's UI offers http-01 on every install
+    type, so both shipped templates must route the challenge to the api;
+    without a location it falls through to the SPA and the CA reads
+    index.html. Skipped when the repo root is absent (the api image carries
+    only ``backend/``), as ``test_nginx_proxies_held_in_both_templates``."""
+    import pathlib as _p
+
+    root = _p.Path(__file__).resolve().parents[2]
+    templates = [
+        root / "frontend" / "default.conf.template",
+        root / "charts" / "spatiumddi" / "templates" / "frontend-tls-config.yaml",
+    ]
+    if not all(t.is_file() for t in templates):
+        pytest.skip("nginx templates are outside the api image; run from a checkout")
+    for t in templates:
+        assert "location /.well-known/acme-challenge/" in t.read_text(), str(t)

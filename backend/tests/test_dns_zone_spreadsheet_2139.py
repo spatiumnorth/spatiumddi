@@ -635,7 +635,14 @@ async def test_rbac_read_exports_write_imports(
     grp, zone, _ = await _zone(db_session)
     gone = _rec(zone, "gone", "A", "192.0.2.2")
     db_session.add(gone)
-    reader = await _headers(db_session, [{"action": "read", "resource_type": "dns_zone"}])
+    # The export carries the zone and its records, so it needs read on both (#3073).
+    reader = await _headers(
+        db_session,
+        [
+            {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
+        ],
+    )
     # The import answers with the zone's records, so it needs read as well.
     writer = await _headers(
         db_session,

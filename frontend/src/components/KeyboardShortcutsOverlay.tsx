@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Keyboard } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import {
   formatCombo,
   isMacPlatform,
@@ -49,6 +50,7 @@ export function KeyboardShortcutsHelp() {
   const [open, setOpen] = useState(false);
   const close = useCallback(() => setOpen(false), []);
   const { enabled } = useFeatureModules();
+  const { can } = usePermissions();
 
   // The keydown listener is bound once, so it can't close over `open`.
   // A ref keeps the current value available without re-binding on every
@@ -83,7 +85,18 @@ export function KeyboardShortcutsHelp() {
 
   // Hide groups whose surface is switched off — no point advertising
   // Copilot bindings when the drawer can't be opened.
-  const groups = SHORTCUT_GROUPS.filter((g) => !g.module || enabled(g.module));
+  // Hide a binding whose handler stands down for this user (a Viewer's
+  // `n` adds no record, #3103), and a group left with none.
+  const groups = SHORTCUT_GROUPS.filter((g) => !g.module || enabled(g.module))
+    .map((g) => ({
+      ...g,
+      shortcuts: g.shortcuts.filter(
+        (s) =>
+          !s.requires ||
+          s.requires.resourceTypes.some((t) => can(s.requires!.action, t)),
+      ),
+    }))
+    .filter((g) => g.shortcuts.length > 0);
 
   return (
     <>
