@@ -9,6 +9,7 @@ const BUILTIN_ROLE_TYPES = [
   "appliance",
   "av_flow",
   "bacnet_device",
+  "certificate_store",
   "dhcp_mac_block",
   "dhcp_option_template",
   "dicom_ae",

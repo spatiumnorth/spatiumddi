@@ -57,6 +57,7 @@ export const GRANT_RESOURCE_TYPES = [
   "conformity",
   "change_request",
   "appliance",
+  "certificate_store",
   "av_flow",
   "bacnet_device",
   "bgp_lg_peer",

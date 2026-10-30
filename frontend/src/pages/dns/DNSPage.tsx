@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import {
@@ -126,6 +126,7 @@ import {
   type DNSGroupSyncResult,
   type ResolverPreset,
 } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   DNS_TTL_MAX,
@@ -7301,9 +7302,10 @@ function OptionsTab({ groupId }: { groupId: string }) {
   });
   // Certificate picker for the DoT/DoH listeners (issue #50). Shares the
   // appliance cert store with the web UI cert + the ACME client, so the
-  // operator issues once and points both at it. Non-admins get a 403 here;
-  // the select just falls back to "— none —" rather than erroring the page.
-  const { data: certs } = useQuery({
+  // operator issues once and points both at it. Reading it takes ``read`` on
+  // ``certificate_store`` (#3067); a 403 is said under the picker rather than
+  // shown as an empty store.
+  const { data: certs, error: certsError } = useQuery({
     queryKey: ["appliance-tls-certs"],
     queryFn: () => applianceTlsApi.list(),
     retry: false,
@@ -8133,11 +8135,26 @@ function OptionsTab({ groupId }: { groupId: string }) {
             ))}
           </select>
         </Field>
+        {isRefused(certsError) && (
+          <p className="text-xs text-muted-foreground">
+            You don't have permission to see the TLS certificate store, so the
+            certificates in it are not listed here. Seeing them takes read on
+            the <code>certificate_store</code> permission (the built-in DNS
+            Editor role has it); ask an administrator.
+          </p>
+        )}
         <p className="text-xs text-muted-foreground">
-          Managed under Appliance → Web UI Certificate — upload one, or issue it
-          from Let's Encrypt with the built-in ACME client. Renewals are picked
-          up automatically. A listener with no usable certificate is skipped and
-          the server stays Do53-only rather than failing to start.
+          Managed in the{" "}
+          <Link
+            to="/appliance?tab=tls"
+            className="text-primary hover:underline"
+          >
+            TLS certificate store
+          </Link>{" "}
+          — upload one, or issue it from Let's Encrypt with the built-in ACME
+          client. Renewals are picked up automatically. A listener with no
+          usable certificate is skipped and the server stays Do53-only rather
+          than failing to start.
         </p>
 
         <div className="flex items-center justify-between border-t pt-3">

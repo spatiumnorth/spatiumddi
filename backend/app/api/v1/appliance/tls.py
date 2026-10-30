@@ -7,9 +7,14 @@ the active row into ``/etc/nginx/certs/active.{pem,key}`` and reload
 nginx; 4b.1 just persists, so the surface is testable in dev before
 the appliance-side wiring lands.
 
-All mutating routes require ``admin`` on ``appliance``; reads accept
-``read``. The "Appliance Operator" built-in role grants admin;
-superadmin bypasses both.
+Permissions (#3067): the store is its own resource type,
+``certificate_store`` — ``read`` lists, ``write`` uploads / generates a CSR /
+imports, ``delete`` deletes. Each route also accepts the ``appliance`` grant it
+took before (``read`` / ``admin``). Making a certificate the Web UI
+certificate — ``/activate``, or ``activate: true`` on upload / import —
+deploys it to nginx, so it still needs ``admin`` on ``appliance``. The "DNS
+Editor" and "Appliance Operator" built-in roles grant ``admin`` on the store;
+superadmin bypasses all of it.
 """
 
 from __future__ import annotations
@@ -18,14 +23,20 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
 from app.core.crypto import encrypt_str
-from app.core.permissions import require_permission
+from app.core.permissions import (
+    RESOURCE_TYPE_APPLIANCE,
+    refuse_and_audit,
+    require_certificate_store,
+    require_permission,
+    user_has_permission,
+)
 from app.models.appliance import (
     CERT_SOURCE_CSR,
     CERT_SOURCE_UPLOADED,
@@ -163,7 +174,7 @@ class CSRImport(BaseModel):
 @router.get(
     "",
     response_model=list[CertificateSummary],
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_certificate_store("read"))],
     summary="List Web UI certificates",
 )
 async def list_certificates(db: DB) -> list[CertificateSummary]:
@@ -179,7 +190,7 @@ async def list_certificates(db: DB) -> list[CertificateSummary]:
 @router.get(
     "/{cert_id:uuid}",
     response_model=CertificateDetail,
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_certificate_store("read"))],
     summary="Get one certificate (with PEM, never key)",
 )
 async def get_certificate(cert_id: uuid.UUID, db: DB) -> CertificateDetail:
@@ -194,19 +205,22 @@ async def get_certificate(cert_id: uuid.UUID, db: DB) -> CertificateDetail:
     "/upload",
     response_model=CertificateSummary,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("write"))],
     summary="Upload a PEM certificate + private key",
 )
 async def upload_certificate(
     body: CertificateUpload,
     db: DB,
     user: CurrentUser,
+    request: Request,
 ) -> CertificateSummary:
     """Parse, validate, store. 422 on any parse / mismatch failure.
 
     The key is Fernet-encrypted before persistence. The cert PEM is
     stored verbatim — public material, no need to encrypt.
     """
+    if body.activate:
+        await require_web_ui_activation(db, user, request, body.name)
     try:
         info = parse_pem_certificate(body.cert_pem)
         validate_key_matches_cert(body.cert_pem, body.key_pem)
@@ -284,7 +298,7 @@ async def upload_certificate(
     "/csr",
     response_model=CertificateSummary,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("write"))],
     summary="Generate a private key + CSR on the server, save them",
 )
 async def generate_csr(
@@ -387,7 +401,7 @@ async def generate_csr(
 @router.post(
     "/{cert_id:uuid}/import-cert",
     response_model=CertificateSummary,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("write"))],
     summary="Attach a CA-signed certificate to a CSR-pending row",
 )
 async def import_signed_cert(
@@ -395,6 +409,7 @@ async def import_signed_cert(
     body: CSRImport,
     db: DB,
     user: CurrentUser,
+    request: Request,
 ) -> CertificateSummary:
     """Finalize a CSR-pending row by pairing it with the signed cert.
 
@@ -411,6 +426,8 @@ async def import_signed_cert(
     row = await db.get(ApplianceCertificate, cert_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "certificate not found")
+    if body.activate:
+        await require_web_ui_activation(db, user, request, row.name)
     if row.cert_pem is not None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -532,7 +549,7 @@ async def activate_certificate(
 @router.delete(
     "/{cert_id:uuid}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    dependencies=[Depends(require_certificate_store("delete"))],
     summary="Delete a certificate",
 )
 async def delete_certificate(
@@ -594,6 +611,35 @@ async def delete_certificate(
 
 
 # ── Internal helpers ────────────────────────────────────────────────
+
+
+async def require_web_ui_activation(
+    db: DB, user: CurrentUser, request: Request | None, display: str
+) -> None:
+    """Refuse (403, audited) unless the caller may set the Web UI certificate.
+
+    Activation deploys the certificate to the appliance's nginx (the k3s TLS
+    Secret on a cluster), which is appliance administration, not certificate
+    store work (#3067) — so ``certificate_store`` alone does not confer it.
+    Called before anything is written: ``refuse_and_audit`` commits.
+    """
+    if user_has_permission(user, "admin", RESOURCE_TYPE_APPLIANCE):
+        return
+    await refuse_and_audit(
+        db,
+        user,
+        request,
+        action="activate_certificate",
+        resource_type="appliance_certificate",
+        resource_id="",
+        resource_display=display,
+        reason="permission denied (admin on appliance)",
+        detail=(
+            "Making a certificate the Web UI certificate needs 'admin' on "
+            "'appliance'. Save it without activating (activate: false) — it "
+            "can still serve DoT / DoH / DoQ."
+        ),
+    )
 
 
 async def _dns_groups_serving_cert(db: DB, cert_id: uuid.UUID) -> list[str]:
