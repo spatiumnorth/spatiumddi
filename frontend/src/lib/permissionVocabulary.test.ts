@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GRANT_RESOURCE_TYPES } from "./permissionVocabulary";
@@ -49,6 +49,30 @@ describe("GRANT_RESOURCE_TYPES", () => {
     expect(
       documented.filter((t) => t !== "resource_type" && !offered.has(t)),
     ).toEqual([]);
+  });
+
+  it("offers every type a backend router checks (#3119)", () => {
+    // Scan the routers' permission dependencies, so a new integration whose
+    // router checks a type of its own cannot ship unreachable from New Role.
+    const root = resolve(__dirname, "../../../backend/app");
+    const files: string[] = [];
+    const walk = (d: string) => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const f = resolve(d, e.name);
+        if (e.isDirectory()) walk(f);
+        else if (e.name.endsWith(".py")) files.push(f);
+      }
+    };
+    walk(root);
+    const used = new Set<string>();
+    const re =
+      /require_(?:any_)?permission\(\s*"[a-z_*]+"\s*,\s*"([a-z_*]+)"|require_resource_permission\(\s*"([a-z_*]+)"/g;
+    for (const f of files) {
+      for (const m of readFileSync(f, "utf8").matchAll(re))
+        used.add(m[1] ?? m[2]);
+    }
+    expect(used.size).toBeGreaterThan(40);
+    expect([...used].filter((t) => !offered.has(t))).toEqual([]);
   });
 
   it("offers no type that no route checks (#2621)", () => {
