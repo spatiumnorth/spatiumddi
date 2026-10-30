@@ -459,3 +459,100 @@ async def test_migration_seeds_one_enabled_rule_and_respects_an_existing_one(
     await db_session.commit()
     await run_seed()
     assert await count() == 1
+
+
+# ── first registration, a deleted row, approval-required installs ──────────
+
+
+@pytest.mark.asyncio
+async def test_a_new_agent_still_registers_and_auto_creates_its_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The agent_id lookup now runs before the group auto-create; a first
+    registration (unknown agent_id, unknown group) is unchanged by it."""
+    agent_id = uuid.uuid4()
+    group = f"auto-{uuid.uuid4().hex[:6]}"
+    resp = await client.post(
+        REGISTER_URL,
+        headers={"X-DHCP-Agent-Key": PSK, INSTANCE: "first-process"},
+        json={
+            "hostname": f"kea-{uuid.uuid4().hex[:6]}",
+            "driver": "kea",
+            "fingerprint": "fp",
+            "agent_id": str(agent_id),
+            "group_name": group,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["agent_token"]
+    srv = (
+        await db_session.execute(select(DHCPServer).where(DHCPServer.agent_id == agent_id))
+    ).scalar_one()
+    grp = (
+        await db_session.execute(select(DHCPServerGroup).where(DHCPServerGroup.name == group))
+    ).scalar_one()
+    assert srv.server_group_id == grp.id
+    # Registration names the process but does not claim the server; the
+    # first poll does.
+    assert srv.agent_instance is None
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_rows_refused_process_re_registers_onto_a_new_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Pattern 3: a 404 sends the agent to re-register from its PSK. The
+    ownership state lived on the deleted row, so even the process that row
+    had refused registers again (and is not locked out)."""
+    server, headers = await _agent(db_session)
+    await db_session.commit()
+    assert (await _poll(client, headers, "agent-a")).status_code == 200
+    assert (await _poll(client, headers, "agent-b")).status_code == 200
+    assert (await _register(client, server, "agent-a")).status_code == 409
+
+    srv = await _reload(db_session, server.id)
+    await db_session.delete(srv)
+    await db_session.commit()
+
+    resp = await _register(client, server, "agent-a")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["server_id"] != str(server.id)
+
+
+@pytest.mark.asyncio
+async def test_an_agent_awaiting_approval_claims_nothing_until_approved(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DHCP_REQUIRE_AGENT_APPROVAL: a pending agent's poll is answered with
+    the pending marker, never 409, and claims nothing; once approved, its
+    first poll takes the server."""
+    monkeypatch.setenv("DHCP_REQUIRE_AGENT_APPROVAL", "true")
+    agent_id = uuid.uuid4()
+    reg = await client.post(
+        REGISTER_URL,
+        headers={"X-DHCP-Agent-Key": PSK, INSTANCE: "p1"},
+        json={
+            "hostname": f"kea-{uuid.uuid4().hex[:6]}",
+            "driver": "kea",
+            "fingerprint": "fp",
+            "agent_id": str(agent_id),
+        },
+    )
+    assert reg.status_code == 200, reg.text
+    assert reg.json()["pending_approval"] is True
+    headers = {"Authorization": f"Bearer {reg.json()['agent_token']}"}
+
+    for instance in ("p1", "p2", "p1"):
+        pending = await _poll(client, headers, instance)
+        assert pending.status_code == 200, pending.text
+        assert pending.json().get("pending_approval") is True
+    srv = (
+        await db_session.execute(select(DHCPServer).where(DHCPServer.agent_id == agent_id))
+    ).scalar_one()
+    assert srv.agent_instance is None and not srv.agent_instances_displaced
+
+    srv.agent_approved = True
+    await db_session.commit()
+    assert (await _poll(client, headers, "p1")).status_code == 200
+    srv = await _reload(db_session, srv.id)
+    assert srv.agent_instance == "p1"

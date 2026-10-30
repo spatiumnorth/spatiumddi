@@ -16,8 +16,8 @@ from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
-from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .ha_tls import AGENT_CAPABILITIES
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch
 from .spool import SpoolManager
 

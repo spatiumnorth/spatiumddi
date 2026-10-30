@@ -672,7 +672,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
     # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
     # is inserted once by migration f4c2a8e61b93, so an operator who deletes
-    # it keeps it deleted (the #2138 pattern).
+    # it keeps it deleted (the #2138 pattern). Its DHCP twin,
+    # ``dhcp_agent_duplicate_instance`` (#3143), is seeded the same way, by
+    # migration 833ee80c8c6b.
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
