@@ -662,6 +662,7 @@ backend/alembic/versions/e2b6f81d4a37_dhcp_server_last_sync_error.py:drop_column
 backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102
 backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
 backend/alembic/versions/e3a81c5d07f2_appliance_evict_after_demote.py:drop_column:44
+backend/alembic/versions/e3a9c71f40d2_acme_order_activate_on_issue.py:drop_column:43
 backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:58
 backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:59
 backend/alembic/versions/e3b7c19f5a42_dns_record_op_dispatched_to.py:drop_column:49

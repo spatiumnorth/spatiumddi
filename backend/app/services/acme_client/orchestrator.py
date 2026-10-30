@@ -438,7 +438,9 @@ async def _store_certificate(
     Idempotent on the order's stable name: a re-run for the same order
     updates the existing row in place rather than colliding on the
     unique ``name``. A fresh issue makes the row the sole active cert; the
-    api deploys it to nginx on the wake published here (#1895).
+    api deploys it to nginx on the wake published here (#1895) — unless the
+    order was placed with ``activate_on_issue`` false (#3067), which stores
+    the cert for DoT / DoH / DoQ and leaves the Web UI cert alone.
 
     A renewal (the beat task points ``order.certificate_id`` at the cert it
     renews, #3061) rewrites that row in place and leaves ``is_active`` as it
@@ -487,7 +489,7 @@ async def _store_certificate(
         row.valid_to = info.valid_to
     await db.flush()
 
-    if not renewing:
+    if not renewing and order.activate_on_issue:
         await _make_sole_active(db, row)
     # Audit the serving-cert swap (non-negotiable #4). This runs off the
     # request thread in the Celery worker, so there is no operator actor —

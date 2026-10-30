@@ -105,13 +105,13 @@ describe("Encrypted transports certificate pointer", () => {
     expect(link.getAttribute("href")).toBe("/appliance?tab=tls");
   });
 
-  it("names the API, not a page, on Docker / Kubernetes", async () => {
+  it("links to the Fleet entry by its Docker / Kubernetes name off an appliance", async () => {
     deployment.applianceMode = false;
     renderCard();
-    expect(
-      await screen.findByText("POST /api/v1/appliance/tls/upload"),
-    ).toBeTruthy();
+    const link = await screen.findByRole("link", {
+      name: "Appliance → Fleet → TLS certificates",
+    });
+    expect(link.getAttribute("href")).toBe("/appliance?tab=tls");
     expect(screen.queryByText(/Web UI Certificate/)).toBeNull();
-    expect(screen.queryByRole("link", { name: /Appliance/ })).toBeNull();
   });
 });

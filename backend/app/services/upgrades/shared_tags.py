@@ -43,6 +43,9 @@ until every node reports the target, then moves them once (mzac's call on
   or when :func:`release_lingering_hold` ends a failed run's hold. The
   bootstrap pin comes off before the control pins, so the chart goes in
   after the last of them: one roll, onto the new chart, tag and version.
+  The bootstrap chart (the supervisor DaemonSet, the CNPG operator) is held
+  the same way, as ``spatium-bootstrap.yaml.held``, and released first,
+  when its ``global.imageTag`` pin is off (#3022).
 * The appliance chart cannot be pinned that way (the seed's supervisor
   rewrites that HelmChartConfig whole on every heartbeat), so the hold goes
   to the supervisors instead. Every member's heartbeat carries it

@@ -1,10 +1,11 @@
 [Unit]
-Description=Release the control chart a cluster Rolling Upgrade held back (#2865)
+Description=Release the control and bootstrap charts a cluster Rolling Upgrade held back (#2865, #3022)
 Documentation=https://github.com/spatiumnorth/spatiumddi/issues/2865
 # Not on the live ISO: k3s does not run there.
 ConditionKernelCommandLine=!boot=live
-# spatiumddi-firstboot starts it when it holds the control chart back.
-ConditionPathExists=/var/lib/rancher/k3s/server/manifests/spatium-control.yaml.held
+# spatiumddi-firstboot starts it when it holds the control chart or the
+# bootstrap chart back (spatium-control.yaml.held, spatium-bootstrap.yaml.held).
+ConditionPathExistsGlob=/var/lib/rancher/k3s/server/manifests/spatium-*.yaml.held
 After=k3s.service
 # Neither Requires= nor Wants= k3s.service, as spatiumddi-helm-stuck-recover:
 # a k3s restart must not take the runner down with it, and the runner must not

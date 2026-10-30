@@ -64,6 +64,21 @@ RESOURCE_TYPE_VRF = "vrf"
 # return empty data because the underlying OS surfaces aren't there.
 RESOURCE_TYPE_APPLIANCE = "appliance"
 
+# The TLS certificate store (issue #3067): ``/api/v1/appliance/tls/*`` and
+# ``/api/v1/appliance/acme/*`` — the certificates and private keys
+# SpatiumDDI itself holds, which DNS server groups pick from for DoT / DoH /
+# DoQ. Separate from ``appliance`` so a DNS team can manage those
+# certificates without fleet approve / upgrade / reboot, and separate from
+# ``tls_cert`` (the *monitoring* of other hosts' certificates, #118), so a
+# grant to watch someone else's expiry dates never confers custody of our
+# private keys. The store routes also accept the ``appliance`` grant they
+# took before (read for reads, admin for writes), so no existing role loses
+# access. Making a certificate the appliance's Web UI certificate — anything
+# that deploys to nginx / the k3s TLS Secret — still needs ``admin`` on
+# ``appliance``. The builtin "DNS Editor" and "Appliance Operator" roles
+# grant ``admin`` on this type.
+RESOURCE_TYPE_CERTIFICATE_STORE = "certificate_store"
+
 # Two-person approval workflow surface (issue #62). The
 # /api/v1/change-requests/* router gates on ``read`` (queue + history)
 # and the new ``approve`` action (decide a request) against this
@@ -711,6 +726,21 @@ def require_any_permission(*pairs: tuple[str, str]) -> Callable[..., Awaitable[U
     return _dep
 
 
+def require_certificate_store(action: str) -> Callable[..., Awaitable[User]]:
+    """Gate for a certificate-store route (#3067).
+
+    Passes on ``action`` over ``certificate_store``, or on the ``appliance``
+    grant the store took before it had its own type — ``read`` for a read,
+    ``admin`` for anything else — so a custom role built on ``appliance``
+    keeps exactly what it could do.
+    """
+    appliance_action = "read" if action == "read" else "admin"
+    return require_any_permission(
+        (action, RESOURCE_TYPE_CERTIFICATE_STORE),
+        (appliance_action, RESOURCE_TYPE_APPLIANCE),
+    )
+
+
 def require_permission_or_scoped(
     action: str,
     resource_type: str,
@@ -1178,6 +1208,7 @@ __all__ = [
     "effective_grants",
     "is_effective_superadmin",
     "require_any_permission",
+    "require_certificate_store",
     "require_any_resource_permission",
     "require_permission",
     "require_permission_or_scoped",

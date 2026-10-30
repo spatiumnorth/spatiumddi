@@ -61,6 +61,8 @@ CHECKED_INLINE: dict[str, str] = {
 
 _DNS = "/api/v1/dns"
 _DHCP = "/api/v1/dhcp"
+_TLS = "/api/v1/appliance/tls"
+_ACME = "/api/v1/appliance/acme"
 
 # What each role's description promises, as routes. Keep this next to the
 # description in ``app.main._BUILTIN_ROLES``: the description is the prose,
@@ -100,6 +102,15 @@ PROMISES: dict[str, list[tuple[str, str]]] = {
         ("GET", f"{_DNS}/groups"),
         ("GET", f"{_DNS}/blocklists"),
         ("GET", f"{_DNS}/pools/{{pool_id}}"),
+        # #3067 — the TLS certificate store DoT / DoH / DoQ serve from
+        ("GET", f"{_TLS}"),
+        ("POST", f"{_TLS}/upload"),
+        ("POST", f"{_TLS}/csr"),
+        ("POST", f"{_TLS}/{{cert_id:uuid}}/import-cert"),
+        ("DELETE", f"{_TLS}/{{cert_id:uuid}}"),
+        ("PUT", f"{_ACME}/account"),
+        ("POST", f"{_ACME}/issue"),
+        ("GET", f"{_ACME}/orders"),
     ],
     "DHCP Editor": [
         # scopes
@@ -165,7 +176,14 @@ PROMISES: dict[str, list[tuple[str, str]]] = {
 # writes are the Editor roles' promises; the rest predate #1861 and are
 # listed so the "everything else is superadmin" assertion below is exact.
 OPEN_DNS_DHCP_WRITES: frozenset[tuple[str, str]] = frozenset(
-    {(m, p) for role in ("DNS Editor", "DHCP Editor") for m, p in PROMISES[role] if m != "GET"}
+    {
+        (m, p)
+        for role in ("DNS Editor", "DHCP Editor")
+        for m, p in PROMISES[role]
+        # The DNS Editor also promises the certificate store (#3067), which
+        # lives under /appliance, not /dns.
+        if m != "GET" and p.startswith((_DNS + "/", _DHCP + "/"))
+    }
     | {
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records/bulk-delete"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/delegate-from-parent"),
@@ -197,6 +215,8 @@ INFRASTRUCTURE: dict[str, list[tuple[str, str]]] = {
         ("POST", f"{_DNS}/blocklists/{{list_id}}/refresh"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/pools"),
         ("POST", f"{_DNS}/import/bind9/commit"),
+        # #3067 — the store, yes; making a cert the Web UI cert, no.
+        ("POST", f"{_TLS}/{{cert_id:uuid}}/activate"),
     ],
     "DHCP Editor": [
         ("POST", f"{_DHCP}/server-groups"),

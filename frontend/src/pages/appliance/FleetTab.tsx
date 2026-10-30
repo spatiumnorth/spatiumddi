@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -785,6 +786,13 @@ export function FleetTab({
     staleTime: 60_000,
   });
   const isSuperadmin = me?.is_superadmin ?? false;
+  // #3067 — the certificate store is the one Fleet section a non-superadmin
+  // can use: its routes take `certificate_store` (or the `appliance` read
+  // they took before), so a DNS Editor managing DoT / DoH / DoQ certs lands
+  // here from the DNS options card's link.
+  const { can } = usePermissions();
+  const canReadCertStore =
+    can("read", "certificate_store") || can("read", "appliance");
 
   const { data, isLoading, isFetching, refetch, error } = useQuery({
     queryKey: ["appliance", "fleet"],
@@ -1065,7 +1073,7 @@ export function FleetTab({
 
   if (!isSuperadmin) {
     return (
-      <div className="mx-auto max-w-4xl">
+      <div className="mx-auto max-w-4xl space-y-6">
         <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
           <div className="flex items-start gap-2">
             <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700 dark:text-amber-400" />
@@ -1082,6 +1090,7 @@ export function FleetTab({
             </div>
           </div>
         </div>
+        {canReadCertStore && <CertificatesTab />}
       </div>
     );
   }
@@ -1304,9 +1313,7 @@ export function FleetTab({
           )}
 
           {/* #404 — Web UI Certificate, moved from a top-level tab. */}
-          {view === "web-ui-certificate" && (
-            <CertificatesTab isApplianceHost={isApplianceHost} />
-          )}
+          {view === "web-ui-certificate" && <CertificatesTab />}
 
           {view === "lldp" && (
             <div>
