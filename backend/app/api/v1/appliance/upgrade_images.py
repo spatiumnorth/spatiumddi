@@ -86,6 +86,7 @@ from app.core.body_limit import UPGRADE_IMAGE_MAX_BYTES
 from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission
 from app.core.responses import OctetStreamResponse
+from app.core.versions import is_installed_target
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
@@ -1443,7 +1444,7 @@ def _node_has_committed(
     operator-cancelled write; one installed but on a trial boot can still
     fall back to the other slot. Either needs the image again."""
     return (
-        installed == version
+        is_installed_target(installed, version)
         and current_slot is not None
         and durable_default == current_slot
         and not is_trial_boot

@@ -10,6 +10,7 @@ import {
   type IPAMTemplateAppliesTo,
   type IPAMTemplateCreate,
   type IPAMTemplateUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { parseTtlInput } from "@/lib/dnsNames";
@@ -639,10 +640,7 @@ export function IPAMTemplatesPage() {
       setEditorErr("");
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
@@ -655,10 +653,7 @@ export function IPAMTemplatesPage() {
       setEditorErr("");
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 

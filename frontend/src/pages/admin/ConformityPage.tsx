@@ -24,6 +24,7 @@ import {
   type ConformitySeverity,
   type ConformityStatus,
   type ConformityTargetKind,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -113,10 +114,7 @@ export function ConformityPage() {
     mutationFn: (framework: string | undefined) =>
       conformityApi.exportPdf(framework),
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      alert(
-        `PDF export failed: ${err?.response?.data?.detail ?? "unknown error"}`,
-      );
+      alert(`PDF export failed: ${formatApiError(e, "unknown error")}`);
     },
   });
 
@@ -791,11 +789,7 @@ function PolicyEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

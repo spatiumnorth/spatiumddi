@@ -314,10 +314,7 @@ function ImportTab({ source }: { source: DHCPImportSource }) {
 }
 
 function extractError(err: unknown): string {
-  return (
-    (err as { response?: { data?: { detail?: string } } })?.response?.data
-      ?.detail ?? formatApiError(err)
-  );
+  return formatApiError(err);
 }
 
 // ── configure source + target ────────────────────────────────────────

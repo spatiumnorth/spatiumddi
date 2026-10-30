@@ -1299,7 +1299,7 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 
 Turn it on per group under **DNS → Server Groups → Options → Encrypted
 transports**, after linking a TLS certificate (upload one, or issue it
-from Let's Encrypt under **Appliance → Web UI Certificate**). Both
+from Let's Encrypt under **Appliance → Fleet → Web UI Certificate**). Both
 listeners are additive — plain DNS on `:53` keeps working.
 
 The listener port lives in the database; what you change to make it

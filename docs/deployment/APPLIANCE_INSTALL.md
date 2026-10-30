@@ -185,7 +185,7 @@ a real password when prompted.
 
 Two things worth doing straight away:
 
-- **Replace the certificate** under **Appliance → Web UI Certificate** —
+- **Replace the certificate** under **Appliance → Fleet → Web UI Certificate** —
   paste a PEM and key, generate a CSR on the server, or issue one from
   Let's Encrypt with the built-in ACME client. The web tier reloads on its
   own.

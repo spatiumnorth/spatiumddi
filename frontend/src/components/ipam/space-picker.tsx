@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from "react";
 import { Plus } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ipamApi, type IPSpace } from "@/lib/api";
+import { formatApiError, ipamApi, type IPSpace } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 
@@ -96,9 +96,7 @@ function QuickCreateSpaceModal({
       onCreated(space);
     },
     onError: (e) => {
-      const ae = e as { response?: { data?: { detail?: unknown } } };
-      const d = ae?.response?.data?.detail;
-      setError(typeof d === "string" ? d : "Failed to create space");
+      setError(formatApiError(e, "Failed to create space"));
     },
   });
 
