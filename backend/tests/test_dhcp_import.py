@@ -768,3 +768,46 @@ async def test_kea_commit_rechecks_pools_in_the_plan_3037(
     assert any("10.1.1.1" in w for w in body["warnings"]), body["warnings"]
     starts = (await db_session.execute(select(DHCPPool.start_ip))).scalars().all()
     assert [str(x) for x in starts] == ["192.0.2.10"]
+
+
+@pytest.mark.asyncio
+async def test_kea_commit_autocreates_v6_64_subnet_3093(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A /64 has 2**64 addresses, one past BIGINT: the auto-created Subnet's
+    ``total_ips`` must be clamped like every other creation path."""
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "2001:db8::/32")
+    await db_session.commit()
+
+    conf = '{"Dhcp6": {"subnet6": [{"id": 64, "subnet": "2001:db8:6::/64", "pools": []}]}}'
+    headers = {"Authorization": f"Bearer {token}"}
+    preview = (
+        await client.post(
+            "/api/v1/dhcp/import/kea/preview",
+            headers=headers,
+            files={"file": ("kea.conf", conf, "application/json")},
+            data={"target_group_id": str(group.id), "ipam_space_id": str(space.id)},
+        )
+    ).json()
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers=headers,
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": preview,
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scopes"][0]["action_taken"] == "created", body
+    assert body["total_subnets_created"] == 1
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.network == "2001:db8:6::/64"))
+    ).scalar_one()
+    assert subnet.total_ips == 2**63 - 1
