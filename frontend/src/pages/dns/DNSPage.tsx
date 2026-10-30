@@ -10765,7 +10765,7 @@ function BlocklistModal({
   );
 }
 
-function BlocklistDetail({
+export function BlocklistDetail({
   list,
   onBack,
 }: {
@@ -10969,7 +10969,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -10981,7 +10983,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
