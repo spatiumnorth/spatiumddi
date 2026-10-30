@@ -154,7 +154,8 @@ docs/PRIVACY.md
 # the application root rather than under /api/, so without one it falls through
 # to the SPA `location /` and a PBX asking where a phone is gets index.html
 # with a 200 — unreachable in production while every backend test passes.
-# Editing either must therefore run the suite that contains that assertion.
+# `test_acme_client.py` (#3061) asserts the same of the ACME http-01 challenge
+# location. Editing either must therefore run the suite that contains that assertion.
 frontend/default.conf.template
 
 # test_frontend_proxy_trust.py (#1868) executes the FRONTEND_TRUSTED_PROXY_CIDRS renderer

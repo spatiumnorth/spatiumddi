@@ -46,6 +46,7 @@ from app.api.v1.dhcp.client_classes import refuse_if_name_referenced
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPServerGroup
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
@@ -467,6 +468,7 @@ async def update_device_policy(
     # a class by name, so regenerating it here would leave every pool with
     # a ``client-class`` naming a class that no longer exists — which Kea
     # accepts and which silently stops the pool serving anyone.
+    before = snapshot(row, changes)
     for k, v in changes.items():
         setattr(row, k, v)
 
@@ -477,7 +479,7 @@ async def update_device_policy(
         resource_type="dhcp_device_policy",
         resource_id=str(row.id),
         resource_display=row.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     collect_wake(dhcp_group_channel(row.group_id))

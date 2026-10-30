@@ -357,6 +357,22 @@ export function DHCPOptionsEditor({
                 }
                 defaultValue={rendered}
                 onBlur={(e) => setStandard(def, e.target.value)}
+                // #3085 — the field hands its text over on blur, and Enter
+                // submits the surrounding form with no blur: the dialog
+                // would save the options as they were before the typing.
+                // Commit the field and keep the dialog open, as the code
+                // picker above does. An Enter that confirms an IME
+                // composition is left to the IME.
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    !e.nativeEvent.isComposing &&
+                    e.keyCode !== 229
+                  ) {
+                    e.preventDefault();
+                    setStandard(def, e.currentTarget.value);
+                  }
+                }}
               />
             </Field>
           </div>

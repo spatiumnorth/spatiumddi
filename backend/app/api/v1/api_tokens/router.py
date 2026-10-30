@@ -39,6 +39,7 @@ from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_operator_stepup
+from app.config import settings
 from app.core.permissions import (
     is_effective_superadmin,
     refuse_and_audit,
@@ -384,8 +385,11 @@ async def enrolment_context(db: DB, current_user: CurrentUser) -> EnrolmentConte
     there is an active ``ApplianceCertificate``, which is the row deployed to
     the TLS secret the frontend serves. On a Compose or plain-Kubernetes
     install an external proxy or ingress terminates TLS with a certificate
-    this process has never seen, and there is no row: the honest answer is
-    ``None``, not a guess. A fingerprint that does not match the wire would
+    this process has never seen, and nothing is deployed: the honest answer
+    is ``None``, not a guess. A row there is not evidence — the certificate
+    store holds DoT / DoH certs on every install type, and an ACME issue
+    marks its cert active wherever it runs (#3061) — so off an appliance the
+    row is not consulted at all. A fingerprint that does not match the wire would
     make the client report a mismatch on a correct setup, which trains
     operators to click through the one warning this exists to make meaningful.
     """
@@ -394,17 +398,19 @@ async def enrolment_context(db: DB, current_user: CurrentUser) -> EnrolmentConte
     # shadowed by the UUID path param and 422 on the literal segment.
     del current_user  # auth-only dependency; the answer is not per-user
 
-    row = (
-        (
-            await db.execute(
-                select(ApplianceCertificate)
-                .where(ApplianceCertificate.is_active.is_(True))
-                .limit(1)
+    row = None
+    if settings.appliance_mode:
+        row = (
+            (
+                await db.execute(
+                    select(ApplianceCertificate)
+                    .where(ApplianceCertificate.is_active.is_(True))
+                    .limit(1)
+                )
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
 
     if row is None or not row.fingerprint_sha256:
         return EnrolmentContext(
