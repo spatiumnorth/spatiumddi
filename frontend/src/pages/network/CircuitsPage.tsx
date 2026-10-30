@@ -500,7 +500,7 @@ export function CircuitEditorModal({
               onChange={(e) => setTermEnd(e.target.value)}
             />
             <p className="mt-0.5 text-[11px] text-muted-foreground/80">
-              Drives the future expiring-soon alert rule.
+              Drives the circuit_term_expiring alert rule.
             </p>
           </div>
           <div>

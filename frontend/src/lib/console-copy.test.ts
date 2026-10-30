@@ -34,6 +34,12 @@ const PHRASES: { re: RegExp; why: string }[] = [
     re: /\b(?:coming soon|not yet (?:implemented|supported|available))\b/i,
     why: "roadmap language",
   },
+  {
+    // #3114: four shipped features were each called roadmap or follow-up
+    // work in exactly these words.
+    re: /\b(?:is|are) on the roadmap\b|\broadmap items?\b|\(follow-up\)/i,
+    why: "roadmap language",
+  },
 ];
 
 /**

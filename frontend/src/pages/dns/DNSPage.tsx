@@ -1721,10 +1721,10 @@ export function ServerModal({
               ghcr.io/spatiumnorth/dns-technitium
             </code>{" "}
             container alongside this server. Serves primary, secondary, stub and
-            forward zones, online DNSSEC signing, and native DoT, DoH and DoQ
-            listeners (set from the group's Options). The agent provisions and
-            rotates its own API token automatically — leave the field below
-            blank.
+            forward zones, and native DoT, DoH and DoQ listeners (set from the
+            group&apos;s Options). DNSSEC signing is BIND9 and PowerDNS only.
+            The agent provisions and rotates its own API token automatically —
+            leave the field below blank.
           </div>
         )}
         {driver === "technitium_api" && (

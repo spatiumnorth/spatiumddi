@@ -132,7 +132,7 @@ export function SetupWizardPage() {
         <Step
           done={false}
           title="SSH access"
-          subtitle="Manage SSH keys from the web under Appliance → Fleet → SSH (Authorized keys), or directly on the OS account you created in the installer (~/.ssh/authorized_keys)."
+          subtitle="Manage SSH keys from the web under Appliance → Fleet → SSH (Authorized keys). Until you do, edit ~/.ssh/authorized_keys on the OS account you created in the installer by hand; once managed there, the web list replaces that file."
           icon={ContainerIcon}
         />
         <Step

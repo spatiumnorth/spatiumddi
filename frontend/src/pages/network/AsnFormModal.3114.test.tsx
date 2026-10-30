@@ -25,5 +25,6 @@ describe("AsnFormModal copy (#3114)", () => {
     const hint = screen.getByText(/RDAP refresh job/);
     expect(hint.textContent).not.toMatch(/follow-up|roadmap|future/i);
     expect(hint.textContent).toMatch(/public ASN/);
+    expect(hint.textContent).not.toMatch(/override/i);
   });
 });
