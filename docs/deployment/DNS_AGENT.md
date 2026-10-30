@@ -150,6 +150,28 @@ The hold is cleared through the API with `POST /api/v1/dns/groups/{group_id}/ser
 
 On restart, the agent tries its cached token first. If the control plane returns `401`, it falls back to bootstrap with the PSK. If the PSK has rotated too, the agent logs and enters a retry loop with jittered backoff (cap 5 min).
 
+### Duplicate agent processes
+
+Two agent processes can run on one server identity at once: a cloned VM
+keeps its `agent_id`, and so do two containers given one state directory.
+Both authenticate as the same server, against its one token. Each agent
+therefore sends a random per-process id (`X-Spatium-Agent-Instance`, never
+persisted) and the control plane serves only one process per server; the
+full rules, and the DNS record-op consequences, are under §5 *Retries,
+unacknowledged ops and supersession* (#2044, #2219). The **DHCP agent**
+follows the same rules since
+[#3143](https://github.com/spatiumnorth/spatiumddi/issues/3143): the newest
+process owns the server (`dhcp_server.agent_instance`), the one it
+displaced is answered `409` + `X-Spatium-Duplicate-Agent-Instance: 1` on
+its config polls and registrations while the owner is live, is never
+minted or rotated a token, keeps Kea on its cached config and retries every
+30 s, and takes the server back by itself once the owner has been silent
+for 5 minutes. Its heartbeats count for liveness and op acks, but not for
+the row's daemon / config-apply / spool state. A persisting episode shows
+the **Duplicate agent** chip on the DHCP server and raises the default-on
+`dhcp_agent_duplicate_instance` alert. An agent that sends no id (older
+than these changes) is never judged and registers and polls as before.
+
 ### Alternatives considered
 
 - **mTLS with internal CA** — more robust but requires a CA pipeline (cert-manager in K8s, something custom in Docker Compose). Deferred to Phase 4; the token model is a clean superset.
