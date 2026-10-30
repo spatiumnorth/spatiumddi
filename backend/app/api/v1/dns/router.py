@@ -397,19 +397,19 @@ router = APIRouter(
 # preview / commit, a sync-with-server) also needs what a GET of those records
 # needs: ``read`` on ``dns_record``, as the record list asks.
 async def _dns_records_read(request: Request, current_user: CurrentUser, db: DB) -> Any:
-    if type_level_allows(current_user, "read", "dns_record"):
-        return current_user
-    await refuse_and_audit(
-        db,
-        current_user,
-        request,
-        action="read",
-        resource_type="dns_record",
-        resource_id="",
-        resource_display="dns_record:*",
-        reason="permission denied (read on dns_record)",
-        detail="Permission denied: need 'read' on 'dns_record'",
-    )
+    if not type_level_allows(current_user, "read", "dns_record"):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="read",
+            resource_type="dns_record",
+            resource_id="",
+            resource_display="dns_record:*",
+            reason="permission denied (read on dns_record)",
+            detail="Permission denied: need 'read' on 'dns_record'",
+        )
+    return current_user
 
 
 _dns_records_read.spatium_requires = ("exact", [("read", "dns_record")])  # type: ignore[attr-defined]
