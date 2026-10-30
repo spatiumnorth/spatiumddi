@@ -430,10 +430,14 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
         )
         pool.start_ip = net_addr  # type: ignore[assignment]
         pool.end_ip = net_addr  # type: ignore[assignment]
-    elif body.start_ip or body.end_ip:
+    elif body.start_ip or body.end_ip or pool.pool_type == "pd":
         # Merged range (stored row under the patch). Only checked when the
         # range itself is edited, so renaming a pre-existing out-of-subnet
-        # pool (an importer / Windows-pull row) is not blocked (#2500).
+        # pool (an importer / Windows-pull row) is not blocked (#2500). A pd
+        # pool turned into an address pool is checked too: its stored
+        # start/end are the prefix placeholder, not a range, and a body that
+        # names only the new type (#3091 — the dialog sends only changes)
+        # would otherwise render that placeholder as a pool.
         parent = await db.get(DHCPScope, pool.scope_id)
         if parent is not None:
             await _check_range_in_subnet(db, parent, new_start, new_end)

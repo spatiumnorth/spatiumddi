@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useFreshRow } from "@/hooks/useFreshRow";
+import { changedFields, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -394,7 +394,7 @@ function ScopeModalForm({
   }, [editing, subnetDetail, subnetId, subnetPrefill, poolStart, poolEnd]);
 
   const mut = useMutation({
-    mutationFn: (adoptExisting: boolean) => {
+    mutationFn: async (adoptExisting: boolean) => {
       // #3082 — never send a lease time the field does not show. The API
       // refuses 0 (a lease must last at least a second), so refuse it here with
       // the reason instead of swapping in a default through a falsy `||`.
@@ -501,21 +501,73 @@ function ScopeModalForm({
         data.ra_prefix_autonomous = raAutonomous;
         data.ra_interface = raInterface.trim();
       }
-      // PXE binding (issue #51). The backend distinguishes "no
-      // change" from "explicit detach" via ``clear_pxe_profile``;
-      // pass it true when the operator picked "(none)" on an
-      // existing scope that previously had a profile bound.
-      if (pxeProfileId) {
-        data.pxe_profile_id = pxeProfileId;
-      } else if (editing && scope?.pxe_profile_id) {
-        data.clear_pxe_profile = true;
-      }
       if (needsPlacement && placement.startsWith("rel:")) {
         data.windows_placement = { failover_relationship: placement.slice(4) };
       } else if (needsPlacement && placement.startsWith("srv:")) {
         data.windows_placement = { server_id: placement.slice(4) };
       }
-      if (editing) return dhcpApi.updateScope(scope!.id, data, adoptExisting);
+      if (editing) {
+        // Send only what changed (#3091). The scope was read fresh on open,
+        // but another surface can change it while the dialog is open, and a
+        // full body would write the stale values back. The body is built
+        // from the same fields as a create, so the baseline below mirrors
+        // the form's own defaults for a column the row does not carry.
+        const was: Record<string, unknown> = {
+          name: scope!.name ?? "",
+          description: scope!.description ?? "",
+          enabled: scope!.enabled ?? true,
+          lease_time: scope!.lease_time ?? 86400,
+          min_lease_time: scope!.min_lease_time ?? null,
+          max_lease_time: scope!.max_lease_time ?? null,
+          lease_cache_threshold: scope!.lease_cache_threshold ?? null,
+          lease_cache_max_age: scope!.lease_cache_max_age ?? null,
+          hostname_sync_mode: scope!.hostname_sync_mode ?? "on_lease",
+          dns_track_dynamic_leases: scope!.dns_track_dynamic_leases ?? true,
+          options: scope!.options ?? [],
+          relay_addresses: scope!.relay_addresses ?? [],
+          v6_address_mode: scope!.v6_address_mode ?? "stateful",
+          ra_managed_flag: scope!.ra_managed_flag ?? true,
+          ra_other_flag: scope!.ra_other_flag ?? true,
+          ra_enabled: scope!.ra_enabled ?? false,
+          ra_mo_override: scope!.ra_mo_override ?? false,
+          ra_router_lifetime: scope!.ra_router_lifetime ?? 1800,
+          ra_prefix_valid_lifetime: scope!.ra_prefix_valid_lifetime ?? 86400,
+          ra_prefix_preferred_lifetime:
+            scope!.ra_prefix_preferred_lifetime ?? 14400,
+          ra_prefix_on_link: scope!.ra_prefix_on_link ?? true,
+          ra_prefix_autonomous: scope!.ra_prefix_autonomous ?? true,
+          ra_interface: scope!.ra_interface ?? "",
+          pxe_profile_id: scope!.pxe_profile_id ?? null,
+        };
+        // The group is not editable (the API refuses a move), so it is never
+        // sent; the PXE binding goes as an id, or as the explicit detach.
+        const { group_id: _group, ...rest } = data;
+        const body: Record<string, unknown> = {
+          ...rest,
+          pxe_profile_id: pxeProfileId || null,
+        };
+        const diff: Record<string, unknown> = changedFields(was, body);
+        if (!pxeProfileId && scope!.pxe_profile_id) {
+          delete diff.pxe_profile_id;
+          diff.clear_pxe_profile = true;
+        }
+        // Naming where an unheld scope goes is itself the change: the update
+        // is what puts it on that Windows member, so it rides even when no
+        // field changed.
+        if (data.windows_placement)
+          diff.windows_placement = data.windows_placement;
+        if (Object.keys(diff).length === 0) return scope!;
+        return dhcpApi.updateScope(
+          scope!.id,
+          diff as Partial<DHCPScope>,
+          adoptExisting,
+        );
+      }
+      // PXE binding (issue #51). The backend distinguishes "no
+      // change" from "explicit detach" via ``clear_pxe_profile``;
+      // pass it true when the operator picked "(none)" on an
+      // existing scope that previously had a profile bound.
+      if (pxeProfileId) data.pxe_profile_id = pxeProfileId;
       return dhcpApi
         .createScope(subnetId, data, adoptExisting)
         .then(async (created) => {

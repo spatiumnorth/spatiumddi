@@ -9485,7 +9485,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
         status === "reserved" && reservedUntil
           ? new Date(reservedUntil).toISOString()
           : null;
-      const updated = await ipamApi.updateAddress(address.id, {
+      const now = {
         // Send explicit null/"" so an operator can *clear* a field — the old
         // ``value || undefined`` was dropped by axios and ignored by the
         // backend's exclude_unset, making a clear a silent no-op (#502).
@@ -9496,13 +9496,59 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
         mac_address: macAddress || null,
         status,
         custom_fields: customFields,
-        // Send the zone only on a deliberate pick: a real zone moves the
-        // record, "" (the None option) sends null to remove it, and an
-        // untouched picker omits the field so the backend keeps the current
-        // zone (#493 / bot review of #502).
-        dns_zone_id: dnsZoneTouched ? dnsZoneId || null : undefined,
         role: (role || null) as IPRole | null,
         reserved_until: reservedIso,
+      };
+      // Send only what changed (#3091): the row was read fresh on open, but
+      // another surface can still change it while the dialog is open, and a
+      // full body would write the stale values back. Custom fields go as a
+      // whole map (the server replaces it), so they are sent only when this
+      // dialog changed one.
+      const diff: Record<string, unknown> = changedFields(
+        {
+          hostname: address.hostname ?? null,
+          description: address.description ?? "",
+          mac_address: address.mac_address ?? null,
+          status: address.status,
+          custom_fields: address.custom_fields ?? {},
+          role: address.role ?? null,
+          // Through the form's own round trip: the picker holds minutes, so a
+          // stored instant with seconds would otherwise read as a change on
+          // every Save, and a stray TTL on a row that is not reserved is what
+          // the form would send for it anyway.
+          reserved_until:
+            address.status === "reserved" && address.reserved_until
+              ? new Date(
+                  toLocalInputValue(address.reserved_until),
+                ).toISOString()
+              : null,
+        },
+        now,
+      );
+      // Send the zone only on a deliberate pick that moves it: a real zone
+      // moves the record, "" (the None option) sends null to remove it, and
+      // an untouched picker omits the field so the backend keeps the current
+      // zone (#493 / bot review of #502).
+      if (
+        dnsZoneTouched &&
+        (dnsZoneId || null) !== (address.forward_zone_id ?? null)
+      )
+        diff.dns_zone_id = dnsZoneId || null;
+      // A static_dhcp row with no linked reservation is the one untouched
+      // Save that is not a no-op: the update is what retries the reservation
+      // (#867 — fix the cause, e.g. create the scope offered above, and press
+      // Save again), so send the status to make that call.
+      if (
+        Object.keys(diff).length === 0 &&
+        status === "static_dhcp" &&
+        !address.static_assignment_id
+      )
+        diff.status = status;
+      if (Object.keys(diff).length === 0) {
+        return { updated: address, staticError: null as string | null };
+      }
+      const updated = await ipamApi.updateAddress(address.id, {
+        ...(diff as Partial<IPAddress>),
         force,
       });
       // #1628 — the backend syncs the DHCP reservation server-side on
@@ -12699,15 +12745,37 @@ export function CreateBlockModal({
 
 // ─── Edit Block Modal ─────────────────────────────────────────────────────────
 
-export function EditBlockModal({
-  block,
-  onClose,
-  onDeleted,
-}: {
+type EditBlockModalProps = {
   block: IPBlock;
   onClose: (updated?: IPBlock) => void;
   onDeleted?: () => void;
-}) {
+};
+
+// Reads the block fresh on open (#3091): the block panel holds the block as it
+// was when selected (and the tree's copy comes from a cached list), and the
+// form is seeded once from it.
+export function EditBlockModal(props: EditBlockModalProps) {
+  const fresh = useFreshRow<IPBlock>(props.block, () =>
+    ipamApi.getBlock(props.block.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Block"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={() => props.onClose()}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditBlockModalForm {...props} block={fresh.row} />;
+}
+
+function EditBlockModalForm({
+  block,
+  onClose,
+  onDeleted,
+}: EditBlockModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
   const [description, setDescription] = useState(block.description ?? "");
@@ -12809,8 +12877,8 @@ export function EditBlockModal({
   }
 
   const mutation = useMutation({
-    mutationFn: () =>
-      ipamApi.updateBlock(block.id, {
+    mutationFn: async () => {
+      const now = {
         name: name || undefined,
         description,
         custom_fields: customFields,
@@ -12826,7 +12894,45 @@ export function EditBlockModal({
         site_id: siteId,
         do_not_probe: doNotProbe,
         do_not_probe_reason: doNotProbeReason,
-      }),
+      };
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the block as it is. The baseline is shaped like the body: the
+      // inherited DNS / DHCP fields go out as null, so they are compared as
+      // null whatever the stored row holds under an inheriting block.
+      const was = {
+        name: block.name || undefined,
+        description: block.description ?? "",
+        custom_fields: block.custom_fields ?? {},
+        dns_inherit_settings: block.dns_inherit_settings ?? true,
+        dns_group_ids:
+          (block.dns_inherit_settings ?? true)
+            ? null
+            : (block.dns_group_ids ?? []),
+        dns_zone_id:
+          (block.dns_inherit_settings ?? true) ? null : block.dns_zone_id,
+        dns_additional_zone_ids:
+          (block.dns_inherit_settings ?? true)
+            ? null
+            : (block.dns_additional_zone_ids ?? []),
+        dhcp_inherit_settings: block.dhcp_inherit_settings ?? true,
+        dhcp_server_group_id:
+          (block.dhcp_inherit_settings ?? true)
+            ? null
+            : block.dhcp_server_group_id,
+        asn_id: block.asn_id,
+        vrf_id: block.vrf_id,
+        customer_id: block.customer_id,
+        site_id: block.site_id,
+        do_not_probe: block.do_not_probe ?? false,
+        do_not_probe_reason: block.do_not_probe_reason ?? "",
+      };
+      const diff = changedFields(was, now);
+      // A blanked name is dropped from the body as it always was (a block
+      // keeps its name); it is not a change to send.
+      if (diff.name === undefined) delete diff.name;
+      if (Object.keys(diff).length === 0) return block;
+      return ipamApi.updateBlock(block.id, diff);
+    },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
