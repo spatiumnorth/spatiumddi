@@ -818,6 +818,91 @@ describe("Allocate IP pre-fills the primary zone whichever DNS group answers fir
   });
 });
 
+// ── #3078 / #3080 — what Allocate IP sends tracks the subnet's current zones ─
+describe("Allocate IP sends the subnet's current DNS zone (#3078, #3080)", () => {
+  const zone = (id: string, group: string, name: string) =>
+    ({ id, group_id: group, name, kind: "forward" }) as DNSZone;
+  const zp = zone("zp", "gP", "p.test.");
+  const zq = zone("zq", "gQ", "q.test.");
+
+  it("opened over a cached read from before Edit Subnet, it shows and sends the new primary (#3078)", async () => {
+    // The previous opening cached zone A as primary; Edit Subnet then moved
+    // the primary to B. The cache is still inside its old 30 s window.
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    qc.setQueryData(["effective-dns-subnet", "sub-1"], {
+      dns_group_ids: ["g1"],
+      dns_zone_id: "za",
+      dns_additional_zone_ids: ["zb"],
+    });
+    const za = zone("za", "g1", "a.test.");
+    const zb = zone("zb", "g1", "b.test.");
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: "zb",
+        dns_additional_zone_ids: ["za"],
+      }),
+    );
+    answer("dnsApi", "listZones", () => Promise.resolve([za, zb]));
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    answer("ipamApi", "previewNextIp", () =>
+      Promise.resolve({ address: "10.0.0.2", strategy: "sequential" }),
+    );
+    const nextAddress = sink({ id: "ip-new", address: "10.0.0.2" });
+    answer("ipamApi", "nextAddress", nextAddress);
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <AddAddressModal subnetId="sub-1" onClose={() => {}} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await waitFor(() =>
+      expect(control("DNS Zone").querySelector("select")?.value).toBe("zb"),
+    );
+    await press("Allocate");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zb" });
+  });
+
+  it("holds Allocate while the primary's group is loading and never sends an empty zone (#3080)", async () => {
+    let releasePrimary: (v: unknown) => void = () => {};
+    const held = new Promise((r) => (releasePrimary = r));
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["gP", "gQ"],
+        dns_zone_id: "zp",
+        dns_additional_zone_ids: ["zq"],
+      }),
+    );
+    answer("dnsApi", "listZones", (g: unknown) =>
+      g === "gP" ? held : Promise.resolve([zq]),
+    );
+    const nextAddress = allocateIp();
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    // The additional zone already shows; the primary's group has not answered.
+    await screen.findByText("DNS Zone", { selector: "label" });
+    await screen.findByText(/q\.test/);
+    const button = screen.getByRole("button", {
+      name: "Allocate",
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(nextAddress).not.toHaveBeenCalled();
+    releasePrimary([zp]);
+    await press("Allocate");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zp" });
+  });
+});
+
 // ── #2468 — Edit address names the zone its record is in ─────────────────────
 describe("Edit address names the zone its record is in (#2468)", () => {
   function zone(id: string, name: string, group = "g1"): DNSZone {
