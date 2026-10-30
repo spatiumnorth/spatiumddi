@@ -120,7 +120,7 @@ async function confirmMoveToTrash() {
 }
 
 async function walkDelete(openLabel: RegExp) {
-  fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
   fireEvent.click(screen.getByRole("button", { name: openLabel }));
   fireEvent.click(
     within(topDialog()).getByRole("button", { name: "Continue" }),
@@ -150,14 +150,11 @@ async function expectQueuedNotice(deleteCall: ReturnType<typeof vi.fn>) {
 describe("a delete the approval queue took", () => {
   it("Edit Space says it was submitted and does not report it deleted", async () => {
     const deleteSpace = vi.fn(() => QUEUED);
-    answers.ipamApi = { deleteSpace };
+    const space = { id: "sp-1", name: "s" } as IPSpace;
+    answers.ipamApi = { deleteSpace, getSpace: () => Promise.resolve(space) };
     const onDeleted = vi.fn();
     open(
-      <EditSpaceModal
-        space={{ id: "sp-1", name: "s" } as IPSpace}
-        onClose={() => {}}
-        onDeleted={onDeleted}
-      />,
+      <EditSpaceModal space={space} onClose={() => {}} onDeleted={onDeleted} />,
     );
     await walkDelete(/^Delete this IP space/);
     await expectQueuedNotice(deleteSpace);

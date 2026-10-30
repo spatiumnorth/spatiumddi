@@ -480,6 +480,17 @@ async def update_token(
                 "Create a new token instead."
             ),
         )
+    # An expired token stays refused at auth whatever is_active says, so
+    # re-enabling it would report success and change nothing (#3120). The
+    # update payload carries no expiry, so the only way back is a new token.
+    if reenables and token.expires_at is not None and token.expires_at <= datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This API token has expired, so re-enabling it would not let it "
+                "authenticate. Create a new token instead."
+            ),
+        )
     stepup_method: str | None = None
     if reenables or widens:
         stepup_method = await require_operator_stepup(

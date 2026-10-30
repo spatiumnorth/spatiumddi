@@ -288,15 +288,13 @@ describe("Saving with DNS off keeps the stored DNS linkage", () => {
         dns_additional_zone_ids: ["z2"],
       }),
     );
-    open(
-      <EditAddressModal
-        address={address({
-          forward_zone_id: "z1",
-          extra_zone_ids: ["z2"],
-        } as Partial<IPAddress>)}
-        onClose={() => {}}
-      />,
-    );
+    const row = address({
+      forward_zone_id: "z1",
+      extra_zone_ids: ["z2"],
+    } as Partial<IPAddress>);
+    // Edit address reads its row fresh on open (#3077).
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    open(<EditAddressModal address={row} onClose={() => {}} />);
     await screen.findByText("Hostname");
     await new Promise((r) => setTimeout(r, 20));
     expect(screen.queryByText("DNS Zone")).toBeNull();
