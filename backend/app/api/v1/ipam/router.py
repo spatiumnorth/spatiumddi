@@ -2533,8 +2533,11 @@ async def _sync_dns_record(
 
     ``skip_existing`` holds the IDs of the address's EXISTING records to leave
     exactly as they are: the Sync DNS rows the operator left unticked under
-    Mismatched (#3081). The address is still synced for the records not named
-    here; a listed one is neither rewritten, moved nor retracted.
+    Mismatched, and any Stale row, which only the commit's delete list
+    removes (#3081). The address is still synced for the records not named
+    here; a listed one is neither rewritten, moved nor retracted, and a
+    listed host record outside every desired zone is not replaced by a new
+    one in the primary zone.
 
     A blank or whitespace-only hostname publishes nothing: the address's own
     auto-generated host record and PTR are retracted, on strict and
@@ -2782,6 +2785,8 @@ async def _sync_dns_record(
         # user renamed the IP back to the default. PTR continues below. A
         # zone IPAM does not author never took the record (#1633): no op.
         for record in existing_records:
+            if record.id in skip_existing:
+                continue  # #3081 — the operator unticked this stale record
             old_zone = await db.get(DNSZone, record.zone_id)
             if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
@@ -2801,6 +2806,14 @@ async def _sync_dns_record(
         existing_by_zone: dict[uuid.UUID, DNSRecord] = {
             rec.zone_id: rec for rec in existing_records
         }
+        # #3081 — a held-back host record outside every desired zone is the
+        # one Sync DNS offered to MOVE into the primary zone (a single
+        # Mismatched row). Unticked, it stays where it is, and no second host
+        # record is written in the primary zone beside it.
+        held_outside = any(
+            rec.id in skip_existing and rec.zone_id not in desired_zone_ids
+            for rec in existing_records
+        )
 
         # Phase 1: cleanup zones that are no longer desired. Delete the
         # record + enqueue the agent op so the live nameserver drops it.
@@ -2852,6 +2865,9 @@ async def _sync_dns_record(
             if existing is not None and existing.id in skip_existing:
                 forward_published = True
                 continue  # #3081 — the operator unticked this record
+            if existing is None and is_primary_zone and held_outside:
+                forward_published = True
+                continue  # #3081 — the unticked move of the host record
             if existing is None:
                 if await _cname_at(db, target_zone, ip, forward_rtype):
                     primary_cname_skip = primary_cname_skip or is_primary_zone

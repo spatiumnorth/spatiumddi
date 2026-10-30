@@ -7542,9 +7542,9 @@ export function DnsSyncModal({
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
-      // independently. The API re-syncs each address whole, so the rows
-      // left unticked ride along as ``skip_records`` (#2471) and are not
-      // written.
+      // independently. The rows left unticked ride along as ``skip_records``
+      // (#2471) and are not written; an existing record changes only when
+      // its Mismatched row is in ``update_record_ids`` (#3081).
       const ipIds = new Set<string>();
       for (const m of data.missing) {
         if (sel.missing.has(missingKey(m))) ipIds.add(m.ip_id);

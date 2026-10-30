@@ -124,3 +124,138 @@ async def test_ticked_extra_zone_a_leaves_unticked_a_and_ptr(
     assert vals["XA"] == "10.104.5.40"
     assert vals["A"] == _HAND_A
     assert vals["PTR"] == "h3081-hand.example."
+
+
+# ── Validation pass: the paths that could still write a held-back record ──
+
+
+async def _preview(client: AsyncClient, env: Any) -> dict[str, Any]:
+    p = await client.get(f"/api/v1/ipam/subnets/{env.sid}/dns-sync/preview", headers=env.headers)
+    assert p.status_code == 200, p.text
+    return p.json()  # type: ignore[no-any-return]
+
+
+@pytest.mark.asyncio
+async def test_create_only_writes_the_missing_ptr_and_leaves_an_unticked_a(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A missing PTR ticked, the mismatched A unticked: a create-only commit
+    writes the PTR, naming the address's host, and leaves the A's hand value."""
+    env, ip_id, recs, _ = await _drifted(client, db_session)
+    await db_session.delete(recs["PTR"])
+    await db_session.commit()
+    c = await client.post(
+        f"/api/v1/ipam/subnets/{env.sid}/dns-sync/commit",
+        headers=env.headers,
+        json={"create_for_ip_ids": [ip_id]},
+    )
+    assert c.status_code == 200, c.text
+    assert c.json()["errors"] == [], c.text
+    vals = await _values(db_session, env, ip_id)
+    assert vals["A"] == _HAND_A
+    assert vals["PTR"] == f"h3081.{env.zone.name}"
+
+
+@pytest.mark.asyncio
+async def test_an_unticked_zone_move_writes_no_second_a(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A host record hand-moved into another zone is ONE Mismatched row (the
+    move). Unticked while the PTR is ticked, it stays where it is, and no new A
+    is written in the primary zone beside it."""
+    env, ip_id, recs, _ = await _drifted(client, db_session)
+    recs["A"].value = "10.104.5.40"
+    recs["A"].zone_id = env.other.id
+    await db_session.commit()
+    pv = await _preview(client, env)
+    assert {m["record_id"] for m in pv["mismatched"]} == {str(recs["A"].id), str(recs["PTR"].id)}
+    assert [m for m in pv["missing"] if m["ip_id"] == ip_id] == []
+    await _commit(client, env, "subnet", [recs["PTR"].id])
+    forward = [r for r in await _rows(db_session, ip_id) if r.record_type == "A"]
+    assert [(r.id, r.zone_id) for r in forward] == [(recs["A"].id, env.other.id)]
+    vals = await _values(db_session, env, ip_id)
+    assert vals["PTR"] == f"h3081.{env.zone.name}"
+
+
+@pytest.mark.asyncio
+async def test_a_ticked_zone_move_still_moves(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    env, ip_id, recs, _ = await _drifted(client, db_session)
+    recs["A"].value = "10.104.5.40"
+    recs["A"].zone_id = env.other.id
+    await db_session.commit()
+    await _commit(client, env, "subnet", [recs["A"].id])
+    forward = [r for r in await _rows(db_session, ip_id) if r.record_type == "A"]
+    assert [r.zone_id for r in forward] == [env.zone.id]
+
+
+@pytest.mark.asyncio
+async def test_an_unticked_stale_gateway_a_is_not_retracted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Renamed to the default ``gateway``: its A is listed Stale, its PTR
+    Mismatched. Ticking the PTR alone does not delete the unticked A."""
+    from sqlalchemy import update
+
+    from app.models.ipam import IPAddress
+
+    env, ip_id, recs, _ = await _drifted(client, db_session)
+    await db_session.execute(
+        update(IPAddress).where(IPAddress.id == uuid.UUID(ip_id)).values(hostname="gateway")
+    )
+    await db_session.commit()
+    pv = await _preview(client, env)
+    assert str(recs["A"].id) in {s["record_id"] for s in pv["stale"]}
+    await _commit(client, env, "subnet", [recs["PTR"].id])
+    vals = await _values(db_session, env, ip_id)
+    assert vals["A"] == _HAND_A  # unticked stale: kept
+    assert vals["PTR"] == f"gateway.{env.zone.name}"
+
+
+@pytest.mark.asyncio
+async def test_ipv6_ticked_aaaa_leaves_an_unticked_ptr(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    env = await _setup(client, db_session)
+    r = await client.post(
+        "/api/v1/ipam/blocks",
+        headers=env.headers,
+        json={"space_id": env.space_id, "network": "2001:db8:3081::/48", "name": "v6"},
+    )
+    assert r.status_code == 201, r.text
+    r = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=env.headers,
+        json={
+            "space_id": env.space_id,
+            "block_id": r.json()["id"],
+            "network": "2001:db8:3081:1::/64",
+            "dns_group_id": str(env.zone.group_id),
+            "dns_zone_id": str(env.zone.id),
+        },
+    )
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    r = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/addresses",
+        headers=env.headers,
+        json={"address": "2001:db8:3081:1::10", "hostname": "v6h"},
+    )
+    assert r.status_code == 201, r.text
+    ip_id = str(r.json()["id"])
+    rows = {rec.record_type: rec for rec in await _rows(db_session, ip_id)}
+    assert set(rows) == {"AAAA", "PTR"}, rows
+    rows["AAAA"].value = "2001:db8:3081:1::99"
+    rows["PTR"].value = "v6h-hand.example."
+    await db_session.commit()
+    c = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/dns-sync/commit",
+        headers=env.headers,
+        json={"update_record_ids": [str(rows["AAAA"].id)]},
+    )
+    assert c.status_code == 200, c.text
+    assert c.json()["errors"] == [], c.text
+    after = {rec.record_type: rec.value for rec in await _rows(db_session, ip_id)}
+    assert after["AAAA"] == "2001:db8:3081:1::10"
+    assert after["PTR"] == "v6h-hand.example."
