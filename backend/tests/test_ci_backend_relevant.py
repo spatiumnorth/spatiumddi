@@ -136,6 +136,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
+    # #3061 — both templates must proxy the ACME http-01 challenge.
+    "test_acme_client.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
     # #3036 — each nginx location's body limit must cover the api allowance
     # (body_limit.ALLOWANCES) of the routes it fronts, in both templates.
     "test_nginx_body_limit_matches_api_3036.py": (
