@@ -34,11 +34,14 @@ _VARS = (
 )
 
 
-def _render(mode: str) -> dict[str, str]:
+def _render(mode: str, if_inet6: pathlib.Path | None = None) -> dict[str, str]:
     script = f". {_SCRIPT} && " + " && ".join(f'printf "%s=%s\\n" {v} "${v}"' for v in _VARS)
+    env = {"PATH": "/usr/bin:/bin", "SPATIUM_FRONTEND_IPV6": mode}
+    if if_inet6 is not None:
+        env["SPATIUM_IF_INET6_PATH"] = str(if_inet6)
     proc = subprocess.run(
         ["sh", "-c", script],
-        env={"PATH": "/usr/bin:/bin", "SPATIUM_FRONTEND_IPV6": mode},
+        env=env,
         capture_output=True,
         text=True,
     )
@@ -62,10 +65,35 @@ def test_ipv6_off_renders_no_ipv6_listener_and_keeps_the_resolver_v4_only() -> N
     assert out["SPATIUM_RESOLVER_IPV6"] == "ipv6=off"
 
 
-def test_auto_is_a_known_answer() -> None:
-    out = _render("auto")
+# /proc/net/if_inet6 lines: address, ifindex, prefix length, scope, flags, name.
+_LO = "00000000000000000000000000000001 01 80 10 80       lo\n"
+_LINK = "fe800000000000000042acfffe110002 2c 40 20 80     eth0\n"
+_ULA = "fd0010244000000100000000000000a1 2c 40 00 80     eth0\n"
+
+
+@pytest.mark.parametrize(
+    ("content", "listen", "resolve"),
+    [
+        (None, False, False),  # no ipv6 module
+        ("", False, False),  # disable_ipv6=1
+        (_LO + _LINK, True, False),  # IPv4-only pod / compose container
+        (_LO + _LINK + _ULA, True, True),  # dual-stack or IPv6-only pod
+    ],
+    ids=["absent", "empty", "loopback-and-link-local", "routable"],
+)
+def test_auto_reads_the_kernels_addresses(
+    tmp_path: pathlib.Path, content: str | None, listen: bool, resolve: bool
+) -> None:
+    """Every IPv4-only pod and compose container still has ``::1``; that is
+    enough to listen on ``[::]`` but not to route to an AAAA answer, so the
+    resolver keeps ``ipv6=off`` until a scope-global address exists."""
+    path = tmp_path / "if_inet6"
+    if content is not None:
+        path.write_text(content)
+    out = _render("auto", path)
+    assert (out["SPATIUM_LISTEN6_80"] == "listen [::]:80;") is listen
+    assert (out["SPATIUM_RESOLVER_IPV6"] == "") is resolve
     assert out["SPATIUM_RESOLVER_IPV6"] in ("", "ipv6=off")
-    assert (out["SPATIUM_LISTEN6_80"] != "") == (out["SPATIUM_RESOLVER_IPV6"] == "")
 
 
 @pytest.mark.parametrize("path", [_PLAIN, _TLS], ids=["plain", "tls"])

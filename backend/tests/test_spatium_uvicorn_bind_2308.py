@@ -119,6 +119,21 @@ def test_explicit_host_flag_is_respected(tmp_path: pathlib.Path) -> None:
             assert not _reaches("::1", port, socket.AF_INET6)
 
 
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [(("--workers", "2"), {}), ((), {"WEB_CONCURRENCY": "2"})],
+    ids=["--workers", "WEB_CONCURRENCY"],
+)
+def test_more_than_one_worker_still_starts(
+    tmp_path: pathlib.Path, args: tuple[str, ...], env: dict[str, str]
+) -> None:
+    """uvicorn binds ONE socket in the parent for multiple workers
+    (``Config.bind_socket``), which raises TypeError on a ``None`` host. The
+    wrapper keeps the pre-#2308 IPv4 wildcard there instead of crashing."""
+    with _serve(tmp_path, *args, **env) as port:
+        assert _reaches("127.0.0.1", port, socket.AF_INET)
+
+
 def test_runtime_image_runs_the_wrapper_without_a_host_literal() -> None:
     dockerfile = BACKEND / "Dockerfile"
     cmd = [ln for ln in dockerfile.read_text().splitlines() if ln.startswith("CMD [")]

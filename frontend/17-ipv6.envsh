@@ -9,24 +9,37 @@
 #   render empty there — the same reason the upstream
 #   10-listen-on-ipv6-by-default.sh exists (it cannot edit a template that is
 #   not the stock one).
-# * SPATIUM_RESOLVER_IPV6 — ``ipv6=off`` only where the container has no IPv6.
-#   Unconditionally it made an api Service with only AAAA records
-#   unresolvable; leaving it off everywhere would let a v4-only container pick
-#   an AAAA answer it cannot route to.
+# * SPATIUM_RESOLVER_IPV6 — ``ipv6=off`` only where the container has no
+#   routable IPv6 address. Unconditionally it made an api Service with only
+#   AAAA records unresolvable; dropping it everywhere would let a v4-only
+#   container pick an AAAA answer it cannot route to. "Routable" is a
+#   scope-global address (ULA included): every pod and container has ``::1``
+#   on loopback and often an ``fe80::`` on eth0, and neither reaches an api
+#   address, so they decide the listeners (binding ``[::]`` only needs IPv6
+#   enabled) but not the resolver.
 #
-# SPATIUM_FRONTEND_IPV6=on|off forces the answer; the default is to ask the
-# kernel whether this network namespace has any IPv6 address at all.
+# SPATIUM_FRONTEND_IPV6=on|off forces both answers; the default asks the
+# kernel what this network namespace has.
 
 set -eu
 
 _spatium_v6="${SPATIUM_FRONTEND_IPV6:-auto}"
+# The path is overridable only so the tests can feed it a fixture.
+_spatium_if_inet6="${SPATIUM_IF_INET6_PATH:-/proc/net/if_inet6}"
+_spatium_v6_resolve="$_spatium_v6"
 case "$_spatium_v6" in
     on|off) ;;
     *)
         # /proc/net/if_inet6 lists one line per IPv6 address; it is absent
         # without the ipv6 module and empty with disable_ipv6=1. Its stat size
         # is always 0, so it has to be read (``-s`` would say "no IPv6").
-        if grep -q . /proc/net/if_inet6 2>/dev/null; then _spatium_v6=on; else _spatium_v6=off; fi
+        # Field 4 is the scope: 00 global (ULA too), 10 host, 20 link.
+        if grep -q . "$_spatium_if_inet6" 2>/dev/null; then _spatium_v6=on; else _spatium_v6=off; fi
+        if awk '$4 == "00" { found = 1 } END { exit !found }' "$_spatium_if_inet6" 2>/dev/null; then
+            _spatium_v6_resolve=on
+        else
+            _spatium_v6_resolve=off
+        fi
         ;;
 esac
 
@@ -34,11 +47,14 @@ if [ "$_spatium_v6" = "on" ]; then
     SPATIUM_LISTEN6_80="listen [::]:80;"
     SPATIUM_LISTEN6_80_DS="listen [::]:80 default_server;"
     SPATIUM_LISTEN6_443_DS="listen [::]:443 ssl default_server;"
-    SPATIUM_RESOLVER_IPV6=""
 else
     SPATIUM_LISTEN6_80=""
     SPATIUM_LISTEN6_80_DS=""
     SPATIUM_LISTEN6_443_DS=""
+fi
+if [ "$_spatium_v6_resolve" = "on" ]; then
+    SPATIUM_RESOLVER_IPV6=""
+else
     SPATIUM_RESOLVER_IPV6="ipv6=off"
 fi
 export SPATIUM_LISTEN6_80 SPATIUM_LISTEN6_80_DS SPATIUM_LISTEN6_443_DS SPATIUM_RESOLVER_IPV6
