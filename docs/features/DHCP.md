@@ -108,7 +108,7 @@ for the "no DHCPOFFER" diagnosis flow.
 This is the most granular part of the DHCP model. Within a **subnet**, you can define:
 - Multiple **pools** with different behaviors (dynamic, reserved, excluded)
 - **Static assignments** (fixed IPs by MAC address)
-- **Pool-level DHCP options** that override subnet defaults
+- **Pool-level DHCP options** that override subnet defaults (set through the API as `options_override`; the console's New Pool dialog has no options field)
 
 ### Hierarchy
 
@@ -473,9 +473,9 @@ errors.
 |---|---|---|---|
 | Infrastructure | 10.1.2.1–10.1.2.20 | excluded | Gateways, servers — never DHCP |
 | Static Only | 10.1.2.21–10.1.2.50 | reserved | Printers with static assignments |
-| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, short lease, option 150 |
+| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, option 150 (by API) |
 | Workstations | 10.1.2.101–10.1.2.200 | dynamic | Standard lease, all defaults |
-| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, 2h lease, no internal DNS |
+| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, options by API (no internal DNS) |
 | Management | 10.1.2.241–10.1.2.254 | excluded | Network equipment |
 
 ---
@@ -515,8 +515,8 @@ empty.
 **Prerequisite — create a scope for the subnet.** A scope lives on a DHCP
 **server group** that has at least one Kea member (DHCP is group-centric —
 scopes / pools / statics / classes all belong to the group). Create it from
-**IPAM → the subnet → "DHCP Pools" tab → Create Scope**, or from
-**DHCP → the server group → Scopes tab → New Scope**. A dynamic pool is optional;
+**IPAM → the subnet → DHCP tab → Create Scope**, or from
+**DHCP → the server group → Scopes tab → "+ Serve leases on subnet…"** (pick the subnet). A dynamic pool is optional;
 the scope alone is enough to emit the `subnet4` block that reservations hang off.
 
 **Create the reservation — two equivalent paths:**
@@ -525,7 +525,7 @@ the scope alone is enough to emit the `subnet4` block that reservations hang off
 New static assignment**. Pick the scope (a picker appears when the group has
 more than one), then enter the MAC + IP + hostname and save. Edit and Delete
 live on the per-row right-click menu. Creating / editing / deleting a
-reservation requires a **superadmin**.
+reservation requires `write` / `delete` on `dhcp_static` (the built-in DHCP Editor role holds `admin` on it).
 
 *From IPAM (at allocation time):*
 
@@ -572,7 +572,7 @@ Assignments** tab lists every reservation across the group's scopes.
   statics endpoints enforce. Without the grant the IPAM write still succeeds
   but the reservation is left untouched and the response carries the
   permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
-  still requires a superadmin, as above.
+  takes the same `dhcp_static` grants, as above.
 - **Deleting the address follows the same rule.** Deleting an IPAM row (or
   purging orphans) removes the reservations linked to it, on the DHCP server
   too, so it needs `delete` on `dhcp_static`. Without it the delete is
@@ -1523,22 +1523,17 @@ the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 ### Push (IPAM → DHCP Server)
 Triggered by:
 - Scope/pool/static assignment create/update/delete
-- Manual "Force Sync" from UI
-- Scheduled full sync (default: every 5 minutes)
+- Manual "Force Sync" from UI (every server except Windows DHCP)
 
-The push is **diff-based** — only changed objects are sent, not a full config replacement. This prevents unnecessary DHCP server disruption.
+There is no scheduled full push. Kea agents long-poll the control plane for the whole config bundle by ETag, so any change that alters the rendered config reaches them within seconds; the agent applies the bundle it gets rather than a diff.
 
 ### Pull (DHCP Server → IPAM)
 Triggered by:
 - Lease events (real-time via webhook or Kea hook)
-- Scheduled lease dump pull (fallback)
-- Manual "Import Leases" from UI
+- Scheduled lease pull for agentless servers (Windows DHCP, FortiGate), gated by **Settings → DHCP Lease Sync**
+- Manual **Sync Leases** on a Windows DHCP server's detail page (other servers show Force Sync instead)
 
-### Reconciliation Report
-Available from the admin UI: compares IPAM DB state vs. live DHCP server state and flags:
-- IPs in DHCP scope but not in IPAM
-- Static assignments in DHCP not in IPAM
-- Scopes in DHCP not known to IPAM
+There is no DHCP reconciliation report in the console or the API; drift between IPAM and a live DHCP server is not reported as a diff.
 
 ---
 

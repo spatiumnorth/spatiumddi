@@ -1,9 +1,9 @@
 #!/bin/bash
 # spatium-power-action — the one entry point for an operator-initiated
-# reboot or poweroff of an appliance node that is not the Fleet reboot
-# (#2974): the web-UI local reboot (spatiumddi-reboot.service) and the
-# console's F5 / F6 (spatium-power-action@reboot|poweroff.service, so that
-# systemd owns the run and not the console process).
+# reboot or poweroff of an appliance node (#2974): the web-UI local reboot
+# (spatiumddi-reboot.service), the Fleet reboot (spatiumddi-reboot-agent,
+# #3008) and the console's F5 / F6 (spatium-power-action@reboot|poweroff
+# .service, so that systemd owns the run and not the console process).
 #
 # Usage: spatium-power-action reboot|poweroff
 #
@@ -27,13 +27,46 @@
 # While it runs, MARKER holds "<pid> <action>", so the console shows the
 # reboot or poweroff as under way and F9 can cancel it. /run is a tmpfs:
 # nothing of it outlives the reboot.
-# The Fleet path (spatiumddi-reboot-agent) does the same steps itself.
+#
+# The api cannot see /run, so the wrapper also holds an flock(2) on LOCK,
+# the release-state DIRECTORY itself, which the api has mounted (#3008): the
+# web UI keeps its Reboot button disabled while the lock is held, i.e. from
+# the moment the trigger is renamed until systemctl has been issued (the
+# node's own api pod is stopped moments later by the kubelet's graceful
+# shutdown). A lock is released by the kernel when its holder dies, so a
+# wrapper killed outright leaves nothing stuck (the api checks no pid: it has
+# no view of the host's). The directory and not a file in it, because the api
+# and the supervisor can write in that directory and this runs as root: a
+# file there could be a symlink planted to make root create or truncate any
+# path on the host (GHSA-h2j9-qrg7-grfw's threat model). The directory is
+# the api's mount point; it cannot replace it.
+#
+# The lock ends when this script does, moments after systemctl was issued and
+# before the node is actually down. So just before systemctl the wrapper also
+# writes ISSUED, "<action> <boot_id>" (#3008), which the api reads as still
+# under way while the boot id is the host's current one: it expires by itself
+# with the reboot (a new boot has a new id) and needs no cleanup. A failed
+# systemctl removes it. It is written under a fresh name and renamed into
+# place (state_write), never through the name, for the same planted-symlink
+# reason as the lock.
 
 set -uo pipefail
 
 HANDOFF="${SPATIUM_REBOOT_HANDOFF:-/usr/local/bin/spatium-reboot-handoff}"
 HANDOFF_CAP_S="${SPATIUM_POWER_ACTION_HANDOFF_CAP_S:-240}"
 MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
+LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state}"
+ISSUED="${SPATIUM_POWER_ACTION_ISSUED:-/var/lib/spatiumddi/release-state/power-action-issued}"
+BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+# #3008 — a grace between taking the lock and the handoff / systemctl. The
+# console's unit sets it (10 s, as the web-UI reboot has); the web-UI and Fleet
+# paths sleep their own grace before calling this, so they leave it 0. It is
+# spent while the lock and the marker are held, so the web UI reads the reboot
+# under way and F9 can cancel it, and the api answers long enough for the
+# Maintenance tab's poll to see it on a one-node install (where systemctl would
+# otherwise be issued within a second of the console's confirm).
+GRACE_S="${SPATIUM_POWER_ACTION_GRACE_S:-0}"
+case "$GRACE_S" in ''|*[!0-9]*) GRACE_S=0 ;; esac
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -56,6 +89,18 @@ undo() {
 
 clear_marker() {
     rm -f "$MARKER" 2>/dev/null || true
+}
+
+# Root writes in release-state go under a fresh name and are renamed onto the
+# target (GHSA-h2j9-qrg7-grfw).
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
 }
 
 child=""
@@ -82,10 +127,28 @@ trap on_signal TERM INT HUP
 
 printf '%s %s\n' "$$" "$ACTION" > "$MARKER" 2>/dev/null || true
 
+# fd 9 holds the lock for the life of this process; the children get it
+# closed (9>&-) so a stray child cannot keep it held after we are gone.
+# Opened read-only: nothing is created or written. A short wait, not -n: the
+# api's probe takes a shared lock for an instant, and failing on that would
+# run the whole action without the lock, the button enabled throughout.
+if { exec 9<"$LOCK"; } 2>/dev/null; then
+    flock -w 5 9 || log "another power action holds $LOCK: going on regardless"
+fi
+
+if [ "$GRACE_S" -gt 0 ]; then
+    log "$ACTION in ${GRACE_S}s (a stop cancels it)"
+    # In the background and waited for, so a stop is acted on at once.
+    sleep "$GRACE_S" 9>&- &
+    child=$!
+    wait "$child"
+    child=""
+fi
+
 if [ -x "$HANDOFF" ]; then
     # In the background and waited for, so a stop is acted on at once: bash
     # runs a trap only once a foreground command has finished.
-    timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 &
+    timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 9>&- &
     child=$!
     wait "$child"
     rc=$?
@@ -95,10 +158,18 @@ if [ -x "$HANDOFF" ]; then
     fi
 fi
 
+# Written while the lock is still held, so the api never sees a gap between
+# the two.
+boot_id="$(cat "$BOOT_ID_FILE" 2>/dev/null || true)"
+if [ -n "$boot_id" ]; then
+    printf '%s %s\n' "$ACTION" "$boot_id" | state_write "$ISSUED" 9>&- \
+        || log "could not write $ISSUED"
+fi
 issued=1
 log "issuing systemctl $ACTION"
-if ! systemctl "$ACTION"; then
+if ! systemctl "$ACTION" 9>&-; then
     log "systemctl $ACTION failed: the node stays up, so the handoff's cordon is undone"
+    rm -f -- "$ISSUED" 2>/dev/null || true
     undo
     clear_marker
     exit 1

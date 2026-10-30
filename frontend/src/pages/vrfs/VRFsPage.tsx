@@ -23,6 +23,7 @@ import {
   type VRF,
   type VRFCreate,
   type VRFUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -195,11 +196,7 @@ export function VRFEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string } };
-        message?: string;
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -385,8 +382,7 @@ function BulkDeleteModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Bulk delete failed");
+      setError(formatApiError(e, "Bulk delete failed"));
     },
   });
 

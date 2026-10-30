@@ -8,6 +8,7 @@ import {
   type NATMapping,
   type NATMappingWrite,
   type NATProtocol,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -87,10 +88,7 @@ function NATMappingModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Save failed";
-      setError(typeof detail === "string" ? detail : JSON.stringify(detail));
+      setError(formatApiError(err, "Save failed"));
     },
   });
 
