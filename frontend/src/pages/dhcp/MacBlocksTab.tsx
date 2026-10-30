@@ -35,12 +35,19 @@ const REASON_COLORS: Record<DHCPMACBlockReason, string> = {
   other: "bg-muted text-muted-foreground",
 };
 
-function ReasonPill({ reason }: { reason: DHCPMACBlockReason }) {
+// New Devices stores the operator's free text as the reason, so the stored
+// value can be outside the five codes (#3083): show it as typed.
+function isKnownReason(reason: string): reason is DHCPMACBlockReason {
+  return Object.prototype.hasOwnProperty.call(REASON_LABELS, reason);
+}
+
+function ReasonPill({ reason }: { reason: string }) {
+  const known = isKnownReason(reason);
   return (
     <span
-      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${REASON_COLORS[reason]}`}
+      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${known ? REASON_COLORS[reason] : REASON_COLORS.other}`}
     >
-      {REASON_LABELS[reason]}
+      {known ? REASON_LABELS[reason] : reason}
     </span>
   );
 }
@@ -330,9 +337,7 @@ function MacBlockModal({
   const qc = useQueryClient();
   const editing = !!block;
   const [mac, setMac] = useState(block?.mac_address ?? "");
-  const [reason, setReason] = useState<DHCPMACBlockReason>(
-    block?.reason ?? "other",
-  );
+  const [reason, setReason] = useState<string>(block?.reason ?? "other");
   const [description, setDescription] = useState(block?.description ?? "");
   const [enabled, setEnabled] = useState(block?.enabled ?? true);
   const [expiresAt, setExpiresAt] = useState(
@@ -392,8 +397,13 @@ function MacBlockModal({
           <select
             className={inputCls}
             value={reason}
-            onChange={(e) => setReason(e.target.value as DHCPMACBlockReason)}
+            onChange={(e) => setReason(e.target.value)}
           >
+            {/* The stored free text stays offered after another reason is
+                picked, so the operator can go back to it (#3083). */}
+            {block && !isKnownReason(block.reason) && (
+              <option value={block.reason}>{block.reason}</option>
+            )}
             {Object.entries(REASON_LABELS).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}

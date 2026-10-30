@@ -311,23 +311,20 @@ describe("a custom field's Default Value is what the dialog sends (#1303)", () =
     const updateAddress = sink(address());
     answer("ipamApi", "updateAddress", updateAddress);
     // Never had owner or managed; legacy was stored as the string "false".
-    open(
-      <EditAddressModal
-        address={address({ custom_fields: { legacy: "false" } })}
-        onClose={() => {}}
-      />,
-    );
+    const row = address({ custom_fields: { legacy: "false" } });
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    const onClose = vi.fn();
+    open(<EditAddressModal address={row} onClose={onClose} />);
 
     expect((await findControl("Owner team")).value).toBe("");
     expect(control("Managed").checked).toBe(false);
     expect(control("Legacy").checked).toBe(false);
     await press("Save");
 
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(
-      (updateAddress.mock.calls[0][1] as { custom_fields: unknown })
-        .custom_fields,
-    ).toEqual({ legacy: "false" });
+    // Nothing was edited, so nothing is sent (#3091): the defaults the form
+    // does not show are not written into the row either.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 });
 
@@ -582,34 +579,39 @@ describe("Edit address shows the status and role it is stored with (#1305)", () 
     answer("customFieldsApi", "list", () => Promise.resolve([]));
     const updateAddress = sink(row);
     answer("ipamApi", "updateAddress", updateAddress);
-    open(<EditAddressModal address={row} onClose={() => {}} />);
-    return updateAddress;
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    const onClose = vi.fn();
+    open(<EditAddressModal address={row} onClose={onClose} />);
+    return { updateAddress, onClose };
   }
 
   it("a TLS-serving role (web, api, lb) is shown and offered", async () => {
-    const updateAddress = editAddress(address({ role: "web" }));
+    const { updateAddress, onClose } = editAddress(address({ role: "web" }));
 
-    const role = control<HTMLSelectElement>("Role");
+    const role = await findControl<HTMLSelectElement>("Role");
     expect(role.value).toBe("web");
     expect([...role.options].map((o) => o.value)).toEqual(
       expect.arrayContaining(["web", "api", "lb"]),
     );
     await press("Save");
 
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(updateAddress.mock.calls[0][1]).toMatchObject({ role: "web" });
+    // Kept: an edit sends only what changed (#3091), and the role did not.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 
   it("an integration-owned status is shown as itself, not as available", async () => {
-    const updateAddress = editAddress(address({ status: "docker-container" }));
+    const { updateAddress, onClose } = editAddress(
+      address({ status: "docker-container" }),
+    );
 
-    expect(control<HTMLSelectElement>("Status").value).toBe("docker-container");
+    expect((await findControl<HTMLSelectElement>("Status")).value).toBe(
+      "docker-container",
+    );
     await press("Save");
 
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(updateAddress.mock.calls[0][1]).toMatchObject({
-      status: "docker-container",
-    });
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 });
 // ── #1306 / #1629 — the DHCP Scope picker is gone ────────────────────────────
@@ -818,6 +820,122 @@ describe("Allocate IP pre-fills the primary zone whichever DNS group answers fir
   });
 });
 
+// ── #3078 / #3080 — what Allocate IP sends tracks the subnet's current zones ─
+describe("Allocate IP sends the subnet's current DNS zone (#3078, #3080)", () => {
+  const zone = (id: string, group: string, name: string) =>
+    ({ id, group_id: group, name, kind: "forward" }) as DNSZone;
+  const zp = zone("zp", "gP", "p.test.");
+  const zq = zone("zq", "gQ", "q.test.");
+
+  it("opened over a cached read from before Edit Subnet, it shows and sends the new primary (#3078)", async () => {
+    // The previous opening cached zone A as primary; Edit Subnet then moved
+    // the primary to B. The cache is still inside its old 30 s window.
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    qc.setQueryData(["effective-dns-subnet", "sub-1"], {
+      dns_group_ids: ["g1"],
+      dns_zone_id: "za",
+      dns_additional_zone_ids: ["zb"],
+    });
+    const za = zone("za", "g1", "a.test.");
+    const zb = zone("zb", "g1", "b.test.");
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: "zb",
+        dns_additional_zone_ids: ["za"],
+      }),
+    );
+    answer("dnsApi", "listZones", () => Promise.resolve([za, zb]));
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    answer("ipamApi", "previewNextIp", () =>
+      Promise.resolve({ address: "10.0.0.2", strategy: "sequential" }),
+    );
+    const nextAddress = sink({ id: "ip-new", address: "10.0.0.2" });
+    answer("ipamApi", "nextAddress", nextAddress);
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <AddAddressModal subnetId="sub-1" onClose={() => {}} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await waitFor(() =>
+      expect(control("DNS Zone").querySelector("select")?.value).toBe("zb"),
+    );
+    await press("Allocate");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zb" });
+  });
+
+  it("holds Allocate while the primary's group is loading and never sends an empty zone (#3080)", async () => {
+    let releasePrimary: (v: unknown) => void = () => {};
+    const held = new Promise((r) => (releasePrimary = r));
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["gP", "gQ"],
+        dns_zone_id: "zp",
+        dns_additional_zone_ids: ["zq"],
+      }),
+    );
+    answer("dnsApi", "listZones", (g: unknown) =>
+      g === "gP" ? held : Promise.resolve([zq]),
+    );
+    const nextAddress = allocateIp();
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    // The additional zone already shows; the primary's group has not answered.
+    await screen.findByText("DNS Zone", { selector: "label" });
+    await screen.findByText(/q\.test/);
+    const button = screen.getByRole("button", {
+      name: "Allocate",
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(nextAddress).not.toHaveBeenCalled();
+    releasePrimary([zp]);
+    await press("Allocate");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zp" });
+  });
+
+  it.each([
+    ["the zone read fails", () => Promise.reject(new Error("boom"))],
+    ["the group has no zones", () => Promise.resolve([])],
+  ])(
+    "does not hold Allocate forever when %s, and leaves the zone to the server",
+    async (_label, listZones) => {
+      answer("ipamApi", "getEffectiveSubnetDns", () =>
+        Promise.resolve({
+          dns_group_ids: ["gP"],
+          dns_zone_id: "zp",
+          dns_additional_zone_ids: [],
+        }),
+      );
+      answer("dnsApi", "listZones", listZones);
+      const nextAddress = allocateIp();
+      fireEvent.change(screen.getByPlaceholderText("Required"), {
+        target: { value: "web01" },
+      });
+      await press("Allocate");
+      await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+      // Absent, not "": the server falls back to the subnet's primary zone.
+      expect(nextAddress.mock.calls[0][1]).not.toHaveProperty(
+        "dns_zone_id",
+        "",
+      );
+      expect(
+        (nextAddress.mock.calls[0][1] as Record<string, unknown>).dns_zone_id,
+      ).toBeUndefined();
+    },
+  );
+});
+
 // ── #2468 — Edit address names the zone its record is in ─────────────────────
 describe("Edit address names the zone its record is in (#2468)", () => {
   function zone(id: string, name: string, group = "g1"): DNSZone {
@@ -855,13 +973,11 @@ describe("Edit address names the zone its record is in (#2468)", () => {
     );
     const updateAddress = sink(address());
     answer("ipamApi", "updateAddress", updateAddress);
-    open(
-      <EditAddressModal
-        address={address({ forward_zone_id: "zb" })}
-        onClose={() => {}}
-      />,
-    );
-    return updateAddress;
+    const row = address({ forward_zone_id: "zb" });
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    const onClose = vi.fn();
+    open(<EditAddressModal address={row} onClose={onClose} />);
+    return { updateAddress, onClose };
   }
 
   it("with two zones left on the subnet it selects the stored zone, not None", async () => {
@@ -882,14 +998,13 @@ describe("Edit address names the zone its record is in (#2468)", () => {
   });
 
   it("an untouched Save still leaves the zone alone", async () => {
-    const updateAddress = editStored([A, C]);
+    const { updateAddress, onClose } = editStored([A, C]);
     const select = await zonePicker();
     await waitFor(() => expect(select.value).toBe("zb"));
     await press("Save");
-    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
-    expect(
-      (updateAddress.mock.calls[0][1] as { dns_zone_id?: string }).dns_zone_id,
-    ).toBeUndefined();
+    // Nothing changed, so nothing is sent and the record stays in its zone.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateAddress).not.toHaveBeenCalled();
   });
 });
 
@@ -987,7 +1102,9 @@ describe("the zone pickers tell reverse zones by suffix, not by substring (#2472
   it("Edit address offers both forward zones and no reverse zone", async () => {
     dnsAnswers();
     answer("customFieldsApi", "list", () => Promise.resolve([]));
-    open(<EditAddressModal address={address()} onClose={() => {}} />);
+    const row = address();
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    open(<EditAddressModal address={row} onClose={() => {}} />);
     expect(await offered()).toEqual(["zp", "zs"]);
   });
 });

@@ -28,7 +28,8 @@ Scope (this driver):
   stub zones carry primaries to transfer from, no views).
 
 Landed after the v1 cut, so the sections below are no longer "deferred":
-online DNSSEC signing (#740), native DNS-over-TLS/HTTPS/QUIC listeners plus
+online DNSSEC signing (#740; new signing withdrawn again by #1783, full
+support is #1767), native DNS-over-TLS/HTTPS/QUIC listeners plus
 encrypted *upstream* forwarding over all three (#741 — a real differentiator
 over both PowerDNS, which needs a dnsdist sidecar and cannot forward at all,
 and BIND9, which forwards over DoT only), secondary / stub / catalog zones

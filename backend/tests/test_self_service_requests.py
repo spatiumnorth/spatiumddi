@@ -651,6 +651,37 @@ async def _assert_failed_with(
 
 
 @pytest.mark.asyncio
+async def test_ip_request_approver_needs_write_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3074: an address is written through the subnet that owns it (#3058),
+    so ``create_ip_address`` names ``write subnet``. An approver holding only
+    ``write ip_address`` is refused up front (403, still pending, so another
+    approver can take it) instead of approving a request whose apply then
+    fails on the subnet check."""
+    from app.models.ipam import IPAddress
+
+    req_id, _, _, _ = await _pending_ip_request(client, db_session)
+    _, addr_token = await _user(
+        db_session,
+        name="addr-only",
+        permissions=[
+            {"action": "approve", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "write", "resource_type": "ip_address"},
+        ],
+    )
+    resp = await client.post(
+        f"/api/v1/requests/{req_id}/approve", headers=_auth(addr_token), json={}
+    )
+    assert resp.status_code == 403, resp.text
+    row = (await client.get(f"/api/v1/requests/{req_id}", headers=_auth(addr_token))).json()
+    assert row["state"] == "pending"
+    assert not (await db_session.execute(select(IPAddress))).scalars().all()
+
+
+@pytest.mark.asyncio
 async def test_approve_when_the_address_was_taken_meanwhile_records_failed(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

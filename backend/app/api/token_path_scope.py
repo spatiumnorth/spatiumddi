@@ -15,6 +15,9 @@ handler runs:
 * ``subnet_id``: the token must be bound to that subnet;
 * ``address_id``: the token must be bound to the address's subnet;
 * ``zone_id``: the token must be bound to that zone;
+* ``group_id`` / ``server_id`` (DNS): the server group, or the server's
+  group, must hold a zone the token is bound to (#3073), or be named by a
+  ``dns_group`` grant of its own;
 * ``block_id`` / ``space_id``: the block or space must contain a subnet the
   token is bound to (a block is checked through its parent chain), or be
   named by a grant of its own.
@@ -63,6 +66,7 @@ from app.core.permissions import (
     token_scope_allows,
     token_scoped_resource_ids,
 )
+from app.models.dns import DNSServer, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 
 __all__ = ["enforce_path_token_scope", "include_token_scoped"]
@@ -131,6 +135,19 @@ def _token_subnet_uuids(user: object) -> set[uuid.UUID] | None:
     return {u for u in (_uuid(r) for r in scoped) if u is not None}
 
 
+async def _token_zone_groups(db: AsyncSession, user: object) -> set[uuid.UUID] | None:
+    """The server groups holding a zone the token is bound to, or ``None``
+    for a wildcard ``dns_zone`` grant (every group is in scope)."""
+    scoped = token_scoped_resource_ids(user, "dns_zone")  # type: ignore[arg-type]
+    if scoped is None:
+        return None
+    zone_ids = {u for u in (_uuid(r) for r in scoped) if u is not None}
+    if not zone_ids:
+        return set()
+    rows = await db.execute(select(DNSZone.group_id).where(DNSZone.id.in_(zone_ids)))
+    return set(rows.scalars())
+
+
 async def enforce_path_token_scope(request: Request, current_user: CurrentUser, db: DB) -> None:
     if not _token_grants_for(current_user):
         return  # session / unscoped token: nothing to narrow
@@ -149,6 +166,25 @@ async def enforce_path_token_scope(request: Request, current_user: CurrentUser, 
     for zone_id in _ids(request, "zone_id"):
         if not token_scope_allows(current_user, "dns_zone", zone_id):
             raise _deny("DNS zone")
+
+    # A zone-bound token gets through the DNS gate on ``dns_group`` too
+    # (``ZONE_TOKEN_COARSE_TYPES``), so a route keyed on a server group or a
+    # server must be one of the groups its zones sit in; otherwise it read
+    # another group's servers, views, ACLs and TSIG key names (#3073).
+    group_ids = _ids(request, "group_id")
+    server_ids = _ids(request, "server_id")
+    if group_ids or server_ids:
+        zone_groups = await _token_zone_groups(db, current_user)
+        if zone_groups is not None:
+            for server_id in server_ids:
+                server = await db.get(DNSServer, server_id)
+                if server is not None:
+                    group_ids.append(server.group_id)
+            for group_id in group_ids:
+                if group_id not in zone_groups and not token_scope_allows(
+                    current_user, "dns_group", group_id
+                ):
+                    raise _deny("DNS server group")
 
     block_ids = _ids(request, "block_id")
     space_ids = _ids(request, "space_id")

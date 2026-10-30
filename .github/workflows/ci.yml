@@ -374,6 +374,15 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_ssh_recovery_claims.py
 
+      # #3045 — no surface may send an operator to a "Web UI Certificate"
+      # Appliance tab; since #404 it is an entry under Appliance → Fleet.
+      # Reads frontend/src, docs/ and the supervisor package as well as
+      # backend/app, which the backend shards are path-filtered off.
+      # stdlib-only, no database; runs from repo root.
+      - name: Web UI Certificate pointer linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_web_ui_certificate_pointers.py
+
       # #1070 — the published docs site carries docs/ and nothing else, so a
       # relative link out of it 404s for every reader while still working on
       # GitHub, where docs/ sits beside the code. There were 92 such links
