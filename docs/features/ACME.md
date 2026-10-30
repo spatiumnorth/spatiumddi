@@ -406,7 +406,8 @@ feature module (group **Security**, label *Certificates (ACME /
 Let's Encrypt)*). It's **default-enabled** as a discovery toggle so
 operators see the "Issue via Let's Encrypt" affordance exists — but
 enabling the module does **not** auto-issue anything. Issuance is
-separately RBAC-gated (`admin` on `appliance`) and requires the
+separately RBAC-gated (`write` on `certificate_store`, or `admin` on
+`appliance`; see [PERMISSIONS.md](../PERMISSIONS.md)) and requires the
 operator's explicit `platform_settings.acme_enabled` intent. When
 the module is off, every `/api/v1/appliance/acme` endpoint 404s.
 
@@ -495,21 +496,25 @@ must be an `https://` URL; `http://` / unschemed values are rejected.
 
 All under `/api/v1/appliance/acme` (full path; mounted inside the
 appliance router behind `require_module("security.certificates")`).
-Mutations require `admin` on `appliance`; reads accept `read` on
-`appliance`. Secret material — the account key and the EAB HMAC — is
+Reads take `read` on `certificate_store`, the account and issuance `write`,
+the account delete `delete` (#3067); each also accepts the `appliance`
+grant it took before (`read` for a read, `admin` otherwise). An issue with
+`activate: true` — the default, which makes the new cert the Web UI
+certificate — also needs `admin` on `appliance`; a DNS Editor issuing a
+DoT / DoH / DoQ certificate sends `activate: false`. Secret material — the account key and the EAB HMAC — is
 **never** returned; the account responses expose only an
 `eab_hmac_set` boolean. Every mutation is audited.
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | `GET` | `/account` | read | Account metadata, or `null` if none configured (not 404). |
-| `PUT` | `/account` | admin | Upsert the install's ACME account. `directory_url` https-validated; `eab_hmac_b64` write-only (omit to leave unchanged). |
-| `DELETE` | `/account` | admin | 204. Orders cascade (`ON DELETE CASCADE`). |
+| `PUT` | `/account` | write | Upsert the install's ACME account. `directory_url` https-validated; `eab_hmac_b64` write-only (omit to leave unchanged). On an appliance whose active Web UI certificate came from Let's Encrypt, changing the directory URL or EAB binding also needs `admin` on `appliance` (the account renews that certificate). |
+| `DELETE` | `/account` | delete | 204. Orders cascade (`ON DELETE CASCADE`). Also needs `admin` on `appliance` while the account renews an active Let's Encrypt Web UI certificate. |
 | `POST` | `/preview` | read | Body `domains[]`. Returns one `ACMEDomainResolution` per domain — whether the name is auto-solvable, and how (`managed` boolean + `zone_name` / `record_name` / `driver`). No mutation; safe to call before `/issue`. |
-| `POST` | `/issue` | admin | Body `domains[]` + `challenge_type` (`dns-01` default, or `http-01`; `tls-alpn-01` → 422) + optional `dns_provider` + `allow_manual`. Creates a `pending` order + enqueues the task. 201. Requires an account to exist first. |
+| `POST` | `/issue` | write | Body `domains[]` + `challenge_type` (`dns-01` default, or `http-01`; `tls-alpn-01` → 422) + optional `dns_provider` + `allow_manual` + `activate` (default `true`: make the issued cert the Web UI certificate, which also needs `admin` on `appliance`). Creates a `pending` order + enqueues the task. 201. Requires an account to exist first. |
 | `GET` | `/orders` | read | All orders, newest first. |
 | `GET` | `/orders/{id}` | read | One order — poll while `status` ∈ {`pending`, `processing`}. `manual_challenges[]` carries the TXT pairs to add when `allow_manual` left a domain unsolvable automatically. |
-| `POST` | `/orders/{id}/cancel` | admin | Local bookkeeping cancel (marks `invalid`); RFC 8555 has no client-driven order recall. Only `pending` / `processing` orders. |
+| `POST` | `/orders/{id}/cancel` | write | Local bookkeeping cancel (marks `invalid`); RFC 8555 has no client-driven order recall. Only `pending` / `processing` orders. |
 
 One more route lives **outside** `/api/v1` and outside the auth
 chain: `GET /.well-known/acme-challenge/{token}` returns the HTTP-01
@@ -523,8 +528,9 @@ Matching MCP tools surface cert state to the copilot:
 `find_certificates` (read, default enabled, no key material),
 `count_certificates_expiring` (read, default enabled), and
 `get_acme_account` (default **disabled**, exposes `eab_hmac_set`
-boolean only — never key/HMAC material). `propose_*` issuance writes
-are deferred.
+boolean only — never key/HMAC material). All three take the store's read
+grant (`read` on `certificate_store`, or on `appliance`), as the matching
+REST reads do. `propose_*` issuance writes are deferred.
 
 ### Phase 2 — auto-renewal
 
