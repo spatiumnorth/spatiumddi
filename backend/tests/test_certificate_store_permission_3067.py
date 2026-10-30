@@ -283,7 +283,8 @@ async def test_admin_appliance_alone_keeps_every_store_action(
     assert (await client.post(f"{TLS}/{other}/activate", headers=h)).status_code == 200
     first = (await client.get(TLS, headers=h)).json()
     inactive = next(c["id"] for c in first if not c["is_active"])
-    assert (await client.delete(f"{TLS}/{inactive}", headers=h)).status_code == 204
+    resp = await client.delete(f"{TLS}/{inactive}", headers=h)
+    assert resp.status_code == 204
 
     r = await client.put(
         f"{ACME}/account",
@@ -329,7 +330,8 @@ async def test_write_without_delete_cannot_delete(
     )
     r = await client.post(f"{TLS}/upload", json=_upload_body(activate=False), headers=h)
     assert r.status_code == 201, r.text
-    assert (await client.delete(f"{TLS}/{r.json()['id']}", headers=h)).status_code == 403
+    resp = await client.delete(f"{TLS}/{r.json()['id']}", headers=h)
+    assert resp.status_code == 403
 
 
 async def test_a_role_with_neither_grant_is_refused(
@@ -557,7 +559,8 @@ async def test_store_holder_cannot_repoint_the_account_renewing_the_web_ui_cert(
         headers=h,
     )
     assert r.status_code == 403, r.text
-    assert (await client.delete(f"{ACME}/account", headers=h)).status_code == 403
+    resp = await client.delete(f"{ACME}/account", headers=h)
+    assert resp.status_code == 403
 
     db_session.expire_all()
     account = (await db_session.execute(select(ACMEClientAccount))).scalar_one()
@@ -567,7 +570,8 @@ async def test_store_holder_cannot_repoint_the_account_renewing_the_web_ui_cert(
     # The appliance admin still can.
     r = await client.put(f"{ACME}/account", json={"directory_url": evil}, headers=admin_h)
     assert r.status_code == 200, r.text
-    assert (await client.delete(f"{ACME}/account", headers=admin_h)).status_code == 204
+    resp = await client.delete(f"{ACME}/account", headers=admin_h)
+    assert resp.status_code == 204
 
 
 async def test_store_holder_manages_the_account_when_it_renews_no_web_ui_cert(
@@ -583,4 +587,5 @@ async def test_store_holder_manages_the_account_when_it_renews_no_web_ui_cert(
         headers=h,
     )
     assert r.status_code == 200, r.text
-    assert (await client.delete(f"{ACME}/account", headers=h)).status_code == 204
+    resp = await client.delete(f"{ACME}/account", headers=h)
+    assert resp.status_code == 204
