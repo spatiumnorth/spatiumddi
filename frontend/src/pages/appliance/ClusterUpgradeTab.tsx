@@ -28,6 +28,7 @@ import {
   type UpgradeImage,
   type UpgradeLeaseState,
 } from "@/lib/api";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
@@ -121,13 +122,14 @@ export function ClusterUpgradeTab() {
   const { data: lease, isLoading: leaseLoading } = useQuery({
     queryKey: ["upgrades", "lease"],
     queryFn: clusterUpgradesApi.lease,
-    refetchInterval: 5_000,
+    refetchInterval: pollUnlessRefused(5_000),
   });
 
   const { data: runs, refetch: refetchRuns } = useQuery({
     queryKey: ["upgrades", "runs"],
     queryFn: () => clusterUpgradesApi.runs(25),
     refetchInterval: (q) => {
+      if (isRefused(q.state.error)) return false;
       const list = q.state.data as SystemUpgradeRun[] | undefined;
       const anyActive = list?.some((r) => ACTIVE_STATES.has(r.state));
       return anyActive ? 2_000 : 15_000;

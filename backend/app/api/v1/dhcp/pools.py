@@ -17,7 +17,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.class_refs import is_builtin_or_generated, known_class_names
@@ -430,10 +430,14 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
         )
         pool.start_ip = net_addr  # type: ignore[assignment]
         pool.end_ip = net_addr  # type: ignore[assignment]
-    elif body.start_ip or body.end_ip:
+    elif body.start_ip or body.end_ip or pool.pool_type == "pd":
         # Merged range (stored row under the patch). Only checked when the
         # range itself is edited, so renaming a pre-existing out-of-subnet
-        # pool (an importer / Windows-pull row) is not blocked (#2500).
+        # pool (an importer / Windows-pull row) is not blocked (#2500). A pd
+        # pool turned into an address pool is checked too: its stored
+        # start/end are the prefix placeholder, not a range, and a body that
+        # names only the new type (#3091 — the dialog sends only changes)
+        # would otherwise render that placeholder as a pool.
         parent = await db.get(DHCPScope, pool.scope_id)
         if parent is not None:
             await _check_range_in_subnet(db, parent, new_start, new_end)
@@ -470,6 +474,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
             address_family=(scope.address_family if scope else None) or "ipv4",
             previous=pool.options_override or {},
         )
+    before = snapshot(pool, changes)
     for k, v in changes.items():
         setattr(pool, k, v)
     await db.flush()
@@ -483,7 +488,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: Curren
         resource_type="dhcp_pool",
         resource_id=str(pool.id),
         resource_display=f"{pool.start_ip}-{pool.end_ip}",
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()

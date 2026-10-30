@@ -80,6 +80,8 @@ import {
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -102,6 +104,7 @@ import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   applianceTlsApi,
   dnsApi,
+  settingsApi,
   dnsBlocklistApi,
   ipamApi,
   domainsApi,
@@ -1096,7 +1099,7 @@ function patchCachedRow(
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
-function GroupModal({
+export function GroupModal({
   group,
   onClose,
 }: {
@@ -1107,7 +1110,21 @@ function GroupModal({
   const [name, setName] = useState(group?.name ?? "");
   const [description, setDescription] = useState(group?.description ?? "");
   const [groupType, setGroupType] = useState(group?.group_type ?? "internal");
-  const [isRecursive, setIsRecursive] = useState(group?.is_recursive ?? true);
+  // #3087 — a new group starts from Settings → DNS "Recursive by Default"
+  // until the operator ticks the box; an existing group shows its own value.
+  const { data: dnsDefaults } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    enabled: !group,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const [pickedRecursive, setPickedRecursive] = useState<boolean | null>(
+    group?.is_recursive ?? null,
+  );
+  const isRecursive =
+    pickedRecursive ?? dnsDefaults?.dns_recursive_by_default ?? true;
+  const setIsRecursive = (v: boolean) => setPickedRecursive(v);
   // BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
   // ≥2-server BIND9 groups, and BIND 9.18+ is required.
   const [catalogZonesEnabled, setCatalogZonesEnabled] = useState(
@@ -2638,7 +2655,47 @@ export function ZoneModal({
     // Once, on open: later renders must not move a caret the operator placed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
+  // #1784 — the experimental agentless Technitium driver writes only the
+  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
+  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
+  // when the group list is already loaded.
+  const { data: groupList } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+    staleTime: 30_000,
+  });
+  const groupDrivers =
+    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
+  const technitiumApi = groupDrivers.includes("technitium_api");
+  // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
+  // Default Zone TTL) until the operator changes them. An existing zone
+  // shows its own values. The settings read is best-effort: a role that
+  // may not read Settings keeps the built-in "primary" / 3600.
+  const { data: dnsDefaults } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    enabled: !zone,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const [pickedZoneType, setPickedZoneType] = useState<string | null>(
+    zone?.zone_type ?? null,
+  );
+  const [pickedTtl, setPickedTtl] = useState<string | null>(
+    zone ? String(zone.ttl ?? 3600) : null,
+  );
+  // The agentless Technitium driver applies only a Primary zone at the
+  // stock TTL (above), so a stored default it would refuse is not offered.
+  const zoneType =
+    pickedZoneType ??
+    (technitiumApi
+      ? "primary"
+      : (dnsDefaults?.dns_default_zone_type ?? "primary"));
+  const setZoneType = setPickedZoneType;
+  const ttl =
+    pickedTtl ??
+    String(technitiumApi ? 3600 : (dnsDefaults?.dns_default_ttl ?? 3600));
+  const setTtl = setPickedTtl;
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
   // reverse-lookup zone, and IPAM publishes PTR records only into kind
@@ -2654,23 +2711,10 @@ export function ZoneModal({
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
-  const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
   // #1861 — DNSSEC at create is superadmin-only; the zone itself is not.
   const { isSuperadmin: zoneIsSuperadmin } = usePermissions();
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
-  // #1784 — the experimental agentless Technitium driver writes only the
-  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
-  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
-  // when the group list is already loaded.
-  const { data: groupList } = useQuery({
-    queryKey: ["dns-groups"],
-    queryFn: () => dnsApi.listGroups(),
-    staleTime: 30_000,
-  });
-  const groupDrivers =
-    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
-  const technitiumApi = groupDrivers.includes("technitium_api");
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // #986 — TLD scope hint under the name field. Classified server-side so
@@ -3207,19 +3251,50 @@ const RECORD_VALUE_PLACEHOLDER: Record<string, string> = {
   DNAME: "target.example.net.",
 };
 
-function RecordModal({
-  groupId,
-  zoneId,
-  zoneName,
-  record,
-  onClose,
-}: {
+type RecordModalProps = {
   groupId: string;
   zoneId: string;
   zoneName?: string;
   record?: DNSRecord;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the record fresh on open (#3077): the row the page holds comes
+// from a cached records page that may predate a Save made a moment ago. It is
+// opened from the zone's records page or the group-wide records list, so both
+// are refetched and the row is taken from whichever holds it.
+export function RecordModal(props: RecordModalProps) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow(props.record, () =>
+    refetchRow<DNSRecord>(
+      qc,
+      [
+        ["dns-records", props.zoneId],
+        ["dns-group-records", props.groupId],
+      ],
+      props.record!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Record"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <RecordModalForm {...props} record={fresh.row} />;
+}
+
+function RecordModalForm({
+  groupId,
+  zoneId,
+  zoneName,
+  record,
+  onClose,
+}: RecordModalProps) {
   const qc = useQueryClient();
   const isReverseZone =
     !!zoneName && /\.(in-addr|ip6)\.arpa\.?$/i.test(zoneName);
@@ -3274,7 +3349,7 @@ function RecordModal({
       setError(`TTL ${recordTtl}.`);
       return;
     }
-    mut.mutate({
+    const body = {
       name,
       record_type: type,
       value,
@@ -3285,7 +3360,30 @@ function RecordModal({
       weight: isSrv && weight !== "" ? parseInt(weight, 10) : null,
       port: isSrv && port !== "" ? parseInt(port, 10) : null,
       view_id: viewId || null,
-    });
+    };
+    if (!record) {
+      mut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3077), so a dialog opened
+    // on an out-of-date row cannot write the old values back. The type is not
+    // editable, so it never rides an update.
+    const { record_type: _type, ...fields } = body;
+    const was = {
+      name: record.name,
+      value: record.value,
+      ttl: record.ttl ?? null,
+      priority: record.priority ?? null,
+      weight: record.weight ?? null,
+      port: record.port ?? null,
+      view_id: record.view_id ?? null,
+    };
+    const diff = changedFields(was, fields);
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   }
 
   return (
@@ -10707,7 +10805,7 @@ function BlocklistModal({
   );
 }
 
-function BlocklistDetail({
+export function BlocklistDetail({
   list,
   onBack,
 }: {
@@ -10911,7 +11009,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -10923,7 +11023,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -12147,10 +12249,7 @@ export function DNSPage() {
     },
   });
   const deleteGroupError =
-    deleteGroup.error &&
-    (((deleteGroup.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroup.error));
+    deleteGroup.error && formatApiError(deleteGroup.error);
 
   function toggleGroup(id: string) {
     setExpandedGroups((prev) => {

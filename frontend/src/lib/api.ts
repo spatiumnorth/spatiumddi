@@ -1487,6 +1487,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
@@ -1895,6 +1897,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
@@ -7250,6 +7254,11 @@ export interface CloudDNSServerOption {
   has_credentials: boolean;
 }
 
+// The client defaults to application/json, which axios honours by turning a
+// FormData into JSON (a File becomes {}). The import previews read form
+// fields, so they must say multipart (#3038).
+const MULTIPART = { headers: { "Content-Type": "multipart/form-data" } };
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -7261,7 +7270,7 @@ export const dnsImportApi = {
     fd.append("target_group_id", target_group_id);
     if (target_view_id) fd.append("target_view_id", target_view_id);
     return api
-      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   bind9Commit: (body: {
@@ -7534,7 +7543,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   keaCommit: (body: DHCPImportCommitBody) =>
@@ -7549,7 +7558,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   iscCommit: (body: DHCPImportCommitBody) =>
@@ -10043,7 +10052,8 @@ export interface DHCPMACBlock {
   id: string;
   group_id: string;
   mac_address: string;
-  reason: DHCPMACBlockReason;
+  // One of DHCPMACBlockReason, or the free text New Devices stored (#3083).
+  reason: string;
   description: string;
   enabled: boolean;
   expires_at: string | null;
@@ -10059,7 +10069,7 @@ export interface DHCPMACBlock {
 
 export interface DHCPMACBlockWrite {
   mac_address?: string;
-  reason?: DHCPMACBlockReason;
+  reason?: string;
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
@@ -14273,6 +14283,10 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
+  reboot_in_progress?: boolean;
+  // #3008 — the node the reboot fields describe (the api pod's own node);
+  // null off-appliance.
+  node?: string | null;
   appliance_version: string | null;
   appliance_mode: boolean;
   /** #3011 — false on a multi-node control plane: the local reboot acts on
