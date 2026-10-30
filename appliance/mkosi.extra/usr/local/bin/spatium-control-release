@@ -1,0 +1,104 @@
+#!/bin/sh
+# spatium-control-release: release the control chart a cluster Rolling
+# Upgrade's hold kept back (#2865).
+#
+# While a Rolling Upgrade's hold is on, spatiumddi-firstboot keeps the control
+# chart its boot rendered back as spatium-control.yaml.held, instead of
+# letting k3s roll the control plane mid-run onto the new chart on the held
+# image, and starts this runner (see control_hold_state there). The runner
+# waits until nothing pins the control chart to another version, and for the
+# run of spatium-control that removing the pins started in helm-controller to
+# end, then releases the chart through firstboot's own gate,
+# release_control_manifest (the PriorityClass guard, #983, and the sizing
+# reconcile, #1210), so the control plane rolls ONCE: the new chart, the new
+# image tag and the new version together.
+#
+# The pins come off at the run's flip, whichever release drives the run (the
+# first upgrade into this release is driven, and flipped, by the release
+# before it), and, for a run that failed or was aborted, when the beat task
+# releases its hold (release_lingering_hold). A new run's Start pins the same
+# values again: the chart stays held, and the gate starts this runner again if
+# it had ended.
+#
+# Only spatiumddi-firstboot starts it (spatiumddi-control-release.service has
+# no [Install]). A reboot runs firstboot again, which renders the chart again
+# and holds it back or releases it.
+set -eu
+
+FIRSTBOOT="${SPATIUM_FIRSTBOOT:-/usr/local/bin/spatiumddi-firstboot}"
+POLL_S="${SPATIUM_CONTROL_RELEASE_POLL_S:-10}"
+
+log() { printf '[control-release] %s\n' "$*"; }
+
+# firstboot's globals and node_is_cluster_member, without its boot-time side
+# effects: the guard its unit tests source it through.
+SPATIUM_FIRSTBOOT_LIB=1
+# shellcheck source=/dev/null
+. "$FIRSTBOOT"
+
+# The gate itself, and the helpers it calls, are defined further down, below
+# firstboot's SPATIUM_FIRSTBOOT_RENDER_ONLY guard (they call k3s, which nothing
+# above that guard may: #1866). Their definitions are taken from the same file
+# the way its unit tests take them: each runs from its "name() {" line to the
+# first "}" in column 0. So the chart is released by the very gate firstboot
+# releases it by, the PriorityClass guard (#983) and the sizing reconcile
+# (#1210) with it.
+for fn in _strip_control_priority_class control_sizing_patch \
+        apply_control_sizing_patch control_hold_state control_helm_job_active \
+        release_control_manifest; do
+    def=$(sed -n "/^$fn() {\$/,/^}\$/p" "$FIRSTBOOT")
+    if [ -z "$def" ]; then
+        log "$FIRSTBOOT defines no $fn(): the held control chart cannot be released"
+        exit 1
+    fi
+    eval "$def"
+done
+
+export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+
+# #590: the seed's releases govern a cluster, and a joined member places none.
+if node_is_cluster_member; then
+    log "joined cluster member: not releasing $CONTROL_MANIFEST_HELD into the seed's cluster"
+    exit 0
+fi
+
+# Polls the release waits, once the hold has ended, for helm-controller's run
+# of spatium-control that the removal of the pins started.
+JOB_WAIT_POLLS="${SPATIUM_CONTROL_RELEASE_JOB_WAIT_POLLS:-30}"
+
+last="" free=0
+while [ -f "$CONTROL_MANIFEST_HELD" ]; do
+    state=$(control_hold_state "$CONTROL_MANIFEST_HELD" release)
+    if [ "$state" != free ]; then
+        free=0
+        if [ "$state" != "$last" ]; then
+            log "waiting for the Rolling Upgrade's hold to end ($state)"
+            last="$state"
+        fi
+    else
+        free=$((free + 1))
+        # The first read that finds the pins gone gives helm-controller a poll
+        # to start the Job their removal starts; the release then waits for
+        # that Job to end, for JOB_WAIT_POLLS polls at most.
+        if [ "$free" -eq 1 ]; then
+            log "the Rolling Upgrade's hold has ended"
+        elif [ "$free" -le "$JOB_WAIT_POLLS" ] && control_helm_job_active; then
+            if [ "$last" != job ]; then
+                log "waiting for helm-controller's run of spatium-control to end"
+                last=job
+            fi
+        else
+            log "releasing $CONTROL_MANIFEST_HELD"
+            # The gate reads the hold again: a new run's Start that pinned it
+            # in between keeps the chart held, and this loop goes on waiting.
+            # As in firstboot, a release that fails is not fatal: it is tried
+            # again.
+            release_control_manifest "$CONTROL_MANIFEST_HELD" \
+                || log "WARN: the release of $CONTROL_MANIFEST_HELD failed; trying again in ${POLL_S}s"
+            [ -f "$CONTROL_MANIFEST_HELD" ] || break
+            last="" free=0
+        fi
+    fi
+    sleep "$POLL_S"
+done
+log "no control chart held back"
