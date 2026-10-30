@@ -589,6 +589,26 @@ async def platform_health(current_user: OptionalUser) -> JSONResponse:
         logger.warning("platform_health_check_failed", component="celery-beat", error=str(exc))
         components.append({"name": "celery-beat", "status": "error", "detail": "celery-beat error"})
 
+    # Log partitions (#2185). The agent-shipped log tables keep a line only
+    # where a partition covers its timestamp, and ``maintain_log_partitions``
+    # creates them a day or more ahead. A table whose partitions stop before
+    # now is losing current lines; one whose lead has shrunk has missed many
+    # runs. Read from the per-process coverage cache, so this costs a catalog
+    # query at most every 30 s.
+    try:
+        from app.services.logs.partitions import partition_health  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as session:
+            partitions_status, partitions_detail = await partition_health(session)
+        components.append(
+            {"name": "log-partitions", "status": partitions_status, "detail": partitions_detail}
+        )
+    except Exception as exc:
+        logger.warning("platform_health_check_failed", component="log-partitions", error=str(exc))
+        components.append(
+            {"name": "log-partitions", "status": "error", "detail": "log-partitions error"}
+        )
+
     rollup = "ok"
     for c in components:
         if c["status"] == "error":

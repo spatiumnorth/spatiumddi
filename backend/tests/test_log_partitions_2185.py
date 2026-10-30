@@ -2,7 +2,8 @@
 
 Covers the lifecycle in ``app.services.logs.partitions`` (create ahead, retire,
 the hourly / daily grain, the detach-pending recovery, orphans, the advisory
-lock), what ingest does with a line no partition can hold, and the migration.
+lock), the beat task, and what ingest does with a line no partition can hold.
+The migration has its own file, ``test_migration_e5a93c1b7d24_partition_log_tables.py``.
 
 The suite's schema carries daily partitions around "now" (``conftest``). The
 lifecycle tests start from none, at a fixed clock, and put them back after.
@@ -10,17 +11,11 @@ lifecycle tests start from none, at a fixed clock, and put them back after.
 
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from types import ModuleType
 
 import pytest
 import pytest_asyncio
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
 from httpx import AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
@@ -339,33 +334,49 @@ async def test_coverage_is_the_range_the_attached_partitions_span(
     assert cov.contains(datetime(2026, 10, 27, 12, 0))  # naive means UTC
 
 
-async def test_ingest_counts_a_line_dated_beyond_the_partitions_as_expired(
+def _counts(r, *keys: str) -> tuple[int, ...]:  # type: ignore[no-untyped-def]
+    assert r.status_code == 200, r.text
+    return tuple(r.json()[k] for k in keys)
+
+
+async def test_ingest_tells_a_line_no_partition_covers_from_an_expired_one(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     dns = await _dns_server(db_session)
     dhcp = await _dhcp_server(db_session)
     now = datetime.now(UTC)
     far = now + timedelta(days=30)
+    old = now - timedelta(days=3)
 
     r = await _post(
         client,
         "dns",
         dns,
         "query-log-entries",
-        {"lines": [_bind_line(far, "future.example"), _bind_line(now, "now.example")]},
+        {
+            "lines": [
+                _bind_line(far, "future.example"),
+                _bind_line(old, "old.example"),
+                _bind_line(now, "now.example"),
+            ]
+        },
     )
-    assert r.status_code == 200, r.text
-    assert (r.json()["inserted"], r.json()["expired"]) == (1, 1)
+    assert _counts(r, "inserted", "expired", "no_partition") == (1, 1, 1)
 
     r = await _post(
         client,
         "dhcp",
         dhcp,
         "log-entries",
-        {"lines": [_kea_line(far, "aa:bb:cc:dd:ee:01"), _kea_line(now, "aa:bb:cc:dd:ee:02")]},
+        {
+            "lines": [
+                _kea_line(far, "aa:bb:cc:dd:ee:01"),
+                _kea_line(old, "aa:bb:cc:dd:ee:03"),
+                _kea_line(now, "aa:bb:cc:dd:ee:02"),
+            ]
+        },
     )
-    assert r.status_code == 200, r.text
-    assert (r.json()["inserted"], r.json()["expired"]) == (1, 1)
+    assert _counts(r, "inserted", "expired", "no_partition") == (1, 1, 1)
     names = (await db_session.execute(select(DNSQueryLogEntry.qname))).scalars().all()
     assert names == ["now.example"]
 
@@ -380,14 +391,12 @@ async def test_ingest_into_a_table_with_no_partitions_drops_instead_of_failing(
     r = await _post(
         client, "dns", dns, "query-log-entries", {"lines": [_bind_line(now, "a.example")]}
     )
-    assert r.status_code == 200, r.text
-    assert (r.json()["inserted"], r.json()["expired"]) == (0, 1)
+    assert _counts(r, "inserted", "expired", "no_partition") == (0, 0, 1)
 
     r = await _post(
         client, "dhcp", dhcp, "log-entries", {"lines": [_kea_line(now, "aa:bb:cc:dd:ee:01")]}
     )
-    assert r.status_code == 200, r.text
-    assert (r.json()["inserted"], r.json()["expired"]) == (0, 1)
+    assert _counts(r, "inserted", "expired", "no_partition") == (0, 0, 1)
 
 
 _RPZ = (
@@ -396,7 +405,7 @@ _RPZ = (
 )
 
 
-async def test_ingest_counts_an_rpz_hit_beyond_the_partitions_as_expired(
+async def test_ingest_sorts_rpz_hits_the_same_way(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     db_session.add(FeatureModule(id="security.dns_threat", enabled=True))
@@ -414,12 +423,12 @@ async def test_ingest_counts_an_rpz_hit_beyond_the_partitions_as_expired(
             "lines": [
                 _RPZ.format(ts=now.strftime(stamp)),
                 _RPZ.format(ts=(now + timedelta(days=30)).strftime(stamp)),
+                _RPZ.format(ts=(now - timedelta(days=40)).strftime(stamp)),
             ]
         },
     )
 
-    assert r.status_code == 200, r.text
-    assert (r.json()["rpz_inserted"], r.json()["expired"]) == (1, 1)
+    assert _counts(r, "rpz_inserted", "expired", "no_partition") == (1, 1, 1)
     assert await db_session.scalar(select(func.count()).select_from(DNSRPZHit)) == 1
 
 
@@ -459,229 +468,123 @@ async def test_a_servers_log_rows_go_when_the_server_does(db_session: AsyncSessi
     assert await db_session.scalar(select(func.count()).select_from(DNSQueryLogEntry)) == 0
 
 
-# ── the migration ─────────────────────────────────────────────────────────
-
-_NAMES = [t.name for t in LOG_TABLES]
-_MIGRATION = next(
-    (pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions").glob("e5a93c1b7d24_*.py")
-)
-
-_LEGACY_DDL = {
-    "dns_query_log_entry": """
-        CREATE TABLE dns_query_log_entry (
-          id bigserial PRIMARY KEY,
-          server_id uuid NOT NULL REFERENCES dns_server (id) ON DELETE CASCADE,
-          ts timestamptz NOT NULL, client_ip inet, client_port integer, qname varchar(512),
-          qclass varchar(8), qtype varchar(16), flags varchar(64), view varchar(255),
-          raw text NOT NULL DEFAULT '', rcode varchar(16), answer_count integer);
-        CREATE INDEX ix_dns_query_log_server_ts ON dns_query_log_entry (server_id, ts);
-        CREATE INDEX ix_dns_query_log_ts ON dns_query_log_entry (ts)""",
-    "dhcp_log_entry": """
-        CREATE TABLE dhcp_log_entry (
-          id bigserial PRIMARY KEY,
-          server_id uuid NOT NULL REFERENCES dhcp_server (id) ON DELETE CASCADE,
-          ts timestamptz NOT NULL, severity varchar(16), code varchar(64), mac_address macaddr,
-          ip_address inet, transaction_id varchar(32), raw text NOT NULL DEFAULT '');
-        CREATE INDEX ix_dhcp_log_server_ts ON dhcp_log_entry (server_id, ts);
-        CREATE INDEX ix_dhcp_log_ts ON dhcp_log_entry (ts)""",
-    "dns_rpz_hit": """
-        CREATE TABLE dns_rpz_hit (
-          id bigserial PRIMARY KEY,
-          server_id uuid NOT NULL REFERENCES dns_server (id) ON DELETE CASCADE,
-          ts timestamptz NOT NULL, client_ip inet, qname varchar(512), trigger varchar(16) NOT NULL,
-          policy varchar(16) NOT NULL, rpz_zone varchar(255), raw text NOT NULL DEFAULT '');
-        CREATE INDEX ix_dns_rpz_hit_client_ts ON dns_rpz_hit (client_ip, ts);
-        CREATE INDEX ix_dns_rpz_hit_ts ON dns_rpz_hit (ts);
-        CREATE INDEX ix_dns_rpz_hit_zone_ts ON dns_rpz_hit (rpz_zone, ts)""",
-}
+# ── reading the catalog ───────────────────────────────────────────────────
 
 
-def _migration() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("e5a93c1b7d24", _MIGRATION)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+async def test_bounds_read_the_same_whatever_the_session_date_style(bare: AsyncConnection) -> None:
+    await maintain(bare, DHCP_LOG, 24, now=NOW)
+    expected = await _bounds(bare, DHCP_LOG.name)
+
+    await bare.exec_driver_sql("SET DateStyle = 'SQL, DMY'")
+    await bare.exec_driver_sql("SET TimeZone = 'Asia/Seoul'")
+    try:
+        assert await _bounds(bare, DHCP_LOG.name) == expected
+    finally:
+        await bare.exec_driver_sql("RESET DateStyle")
+        await bare.exec_driver_sql("RESET TimeZone")
 
 
-def _run(sync_conn: object, direction: str) -> None:
-    with Operations.context(MigrationContext.configure(connection=sync_conn)):
-        getattr(_migration(), direction)()
+# ── the beat task ─────────────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def legacy() -> AsyncGenerator[tuple[AsyncConnection, uuid.UUID, uuid.UUID], None]:
-    """The three tables as the previous release had them, with a row each, in a
-    transaction that is rolled back."""
-    async with _test_engine.connect() as conn:
-        trans = await conn.begin()
-        try:
-            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
-                dns = (await _dns_server(session)).id
-                dhcp = (await _dhcp_server(session)).id
-            for table in _NAMES:
-                await conn.exec_driver_sql(f"DROP TABLE {table} CASCADE")
-            for ddl in _LEGACY_DDL.values():
-                for stmt in ddl.split(";"):
-                    await conn.exec_driver_sql(stmt)
-            await conn.execute(
-                text(
-                    "INSERT INTO dns_query_log_entry (server_id, ts, qname) "
-                    "VALUES (:s, now(), 'old.example')"
-                ),
-                {"s": dns},
-            )
-            await conn.execute(
-                text("INSERT INTO dhcp_log_entry (server_id, ts) VALUES (:s, now())"), {"s": dhcp}
-            )
-            await conn.execute(
-                text(
-                    "INSERT INTO dns_rpz_hit (server_id, ts, trigger, policy) "
-                    "VALUES (:s, now(), 'QNAME', 'NXDOMAIN')"
-                ),
-                {"s": dns},
-            )
-            yield conn, dns, dhcp
-        finally:
-            await trans.rollback()
-
-
-async def _scalar(conn: AsyncConnection, sql: str) -> object:
-    return (await conn.execute(text(sql))).scalar()
-
-
-async def test_the_migration_swaps_each_table_and_keeps_the_old_rows(
-    legacy: tuple[AsyncConnection, uuid.UUID, uuid.UUID],
+async def test_the_beat_task_maintains_every_table_on_a_connection_that_can_detach(
+    bare: AsyncConnection,
 ) -> None:
-    conn, dns, _dhcp = legacy
-    before = await _scalar(conn, "SELECT max(id) FROM dns_query_log_entry")
+    """The task's own path: a session from the task engine, switched to
+    AUTOCOMMIT, which ``DETACH ... CONCURRENTLY`` needs."""
+    from app.tasks.log_partitions import _maintain_all
 
-    await conn.run_sync(_run, "upgrade")
+    today = datetime.now(UTC).date()
+    stale = today - timedelta(days=10)
+    await bare.exec_driver_sql(
+        f"CREATE TABLE dhcp_log_entry_p{stale:%Y%m%d} PARTITION OF dhcp_log_entry "
+        f"FOR VALUES FROM ('{stale} 00:00+00') TO ('{stale + timedelta(days=1)} 00:00+00')"
+    )
 
-    for table in _NAMES:
-        kind = await _scalar(conn, f"SELECT relkind::text FROM pg_class WHERE relname = '{table}'")
-        assert kind == "p"
-        assert await _scalar(conn, f"SELECT count(*) FROM {table}") == 0
-        assert await _scalar(conn, f"SELECT count(*) FROM {table}_legacy") == 1
-        # Constraints and indexes moved with the legacy table; none clash.
-        names = (
-            (
-                await conn.execute(
-                    text(
-                        "SELECT indexrelid::regclass::text FROM pg_index "
-                        "WHERE indrelid = CAST(:t AS regclass) ORDER BY 1"
-                    ),
-                    {"t": f"{table}_legacy"},
-                )
-            )
-            .scalars()
-            .all()
+    result = await _maintain_all()
+
+    assert set(result) == {t.name for t in LOG_TABLES}
+    assert all(r["failed"] == 0 and r["created"] > 0 for r in result.values()), result
+    assert result["dhcp_log_entry"]["dropped"] == 1
+    names = {p.name for p in await list_partitions(bare, DHCP_LOG.name)}
+    assert f"dhcp_log_entry_p{stale:%Y%m%d}" not in names
+
+
+async def test_one_table_failing_does_not_hold_up_the_others(
+    bare: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.tasks.log_partitions import _maintain_all
+
+    real = lp.maintain
+
+    async def flaky(conn, table, hours, **kw):  # type: ignore[no-untyped-def]
+        if table is DNS_QUERY_LOG:
+            raise ConnectionResetError("connection was closed in the middle of operation")
+        return await real(conn, table, hours, **kw)
+
+    monkeypatch.setattr(lp, "maintain", flaky)
+
+    result = await _maintain_all()
+
+    assert result["dns_query_log_entry"] == {"error": "ConnectionResetError"}
+    assert result["dhcp_log_entry"]["created"] > 0
+    assert result["dns_rpz_hit"]["created"] > 0
+
+
+def test_beat_and_worker_start_queue_the_maintenance() -> None:
+    from unittest.mock import patch
+
+    from celery.signals import beat_init, worker_ready
+
+    from app import celery_app as ca
+
+    with patch.object(ca.celery_app, "send_task") as send:
+        ca._queue_log_partitions_at_start()
+    send.assert_called_once_with("app.tasks.log_partitions.maintain_log_partitions")
+    with patch.object(ca.celery_app, "send_task", side_effect=OSError("no broker")):
+        ca._queue_log_partitions_at_start()
+    for signal in (beat_init, worker_ready):
+        assert any(
+            getattr(r(), "__name__", "") == "_queue_log_partitions_at_start"
+            for _, r in signal.receivers
         )
-        assert names and all(n.endswith("_legacy") for n in names)
-    pk = await _scalar(
-        conn,
-        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-        "WHERE conrelid = 'dns_query_log_entry'::regclass AND contype = 'p'",
-    )
-    assert pk == "PRIMARY KEY (id, ts)"
-    fk = await _scalar(
-        conn,
-        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-        "WHERE conrelid = 'dns_query_log_entry'::regclass AND contype = 'f'",
-    )
-    assert fk == "FOREIGN KEY (server_id) REFERENCES dns_server(id) ON DELETE CASCADE"
-
-    # The previous release's pods insert without an id, into the new table,
-    # and the ids carry on from where the legacy table stopped.
-    await conn.execute(
-        text(
-            "INSERT INTO dns_query_log_entry (server_id, ts, qname) VALUES (:s, now(), 'new.example')"
-        ),
-        {"s": dns},
-    )
-    assert await _scalar(conn, "SELECT id FROM dns_query_log_entry") == before + 1
-    # And the sequence now belongs to the new table.
-    owner = await _scalar(
-        conn,
-        "SELECT d.refobjid::regclass::text FROM pg_depend d "
-        "WHERE d.objid = pg_get_serial_sequence('dns_query_log_entry', 'id')::regclass "
-        "AND d.deptype = 'a'",
-    )
-    assert owner == "dns_query_log_entry"
 
 
-async def test_the_migration_covers_the_retention_windows(
-    legacy: tuple[AsyncConnection, uuid.UUID, uuid.UUID],
+# ── health ────────────────────────────────────────────────────────────────
+
+
+async def test_health_says_when_current_lines_have_nowhere_to_go(
+    bare: AsyncConnection, db_session: AsyncSession
 ) -> None:
-    conn, dns, dhcp = legacy
-    await conn.run_sync(_run, "upgrade")
-
     now = datetime.now(UTC)
-    for table, days in (("dns_query_log_entry", 7), ("dhcp_log_entry", 7), ("dns_rpz_hit", 30)):
-        parts = await list_partitions(conn, table)
-        lower, upper = min(p.lower for p in parts), max(p.upper for p in parts)  # type: ignore[type-var]
-        assert lower <= now - timedelta(days=days), table
-        assert upper > now + timedelta(hours=24), table
-        _assert_contiguous(sorted((p.lower, p.upper) for p in parts))  # type: ignore[type-var]
-    # ``maintain_log_partitions`` picks up where the migration stopped.
-    await conn.exec_driver_sql("SET lock_timeout = 3000")
-    daily = lp.MaintenanceResult(DHCP_LOG.name)
-    await lp._create_ahead(conn, DHCP_LOG, DHCP_LOG.window(24), now, daily)  # noqa: SLF001
-    assert daily.created >= 1
-    _assert_contiguous(await _bounds(conn, DHCP_LOG.name))
+    status, detail = await lp.partition_health(db_session, now=now)
+    assert status == "error"
+    assert "dns_query_log_entry" in detail
+
+    for table in LOG_TABLES:
+        await maintain(bare, table, 24, now=now)
+    lp.invalidate_coverage_cache()
+    assert (await lp.partition_health(db_session, now=now))[0] == "ok"
+
+    # Twenty hours without maintenance: the hourly table has four left of its 24.
+    lp.invalidate_coverage_cache()
+    status, detail = await lp.partition_health(db_session, now=now + timedelta(hours=20))
+    assert status == "warn"
+    assert "dns_query_log_entry" in detail
 
 
-async def test_the_migration_downgrade_parks_the_new_tables_and_restores_the_old(
-    legacy: tuple[AsyncConnection, uuid.UUID, uuid.UUID],
+async def test_platform_health_lists_the_log_partitions(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    conn, dns, _dhcp = legacy
-    await conn.run_sync(_run, "upgrade")
-    await conn.execute(
-        text(
-            "INSERT INTO dns_query_log_entry (server_id, ts, qname) VALUES (:s, now(), 'mid.example')"
-        ),
-        {"s": dns},
-    )
+    from app.celery_app import celery_app
+    from tests._signed_in import signed_in_headers
+    from tests.test_platform_health_worker_ping import _CountingControl, _FakeRedis
 
-    await conn.run_sync(_run, "downgrade")
+    monkeypatch.setattr(celery_app, "control", _CountingControl())
+    monkeypatch.setattr("app.core.redis_client.make_async_redis", lambda *a, **k: _FakeRedis())
 
-    for table in _NAMES:
-        assert (
-            await _scalar(conn, f"SELECT relkind::text FROM pg_class WHERE relname = '{table}'")
-            == "r"
-        )
-        assert await _scalar(conn, f"SELECT to_regclass('{table}_legacy')") is None
-        assert (
-            await _scalar(
-                conn, f"SELECT relkind::text FROM pg_class WHERE relname = '{table}_partitioned'"
-            )
-            == "p"
-        )
-    # Nothing was lost: the rows written under the new release are parked, and
-    # the legacy rows are back where the previous release reads them.
-    assert await _scalar(conn, "SELECT count(*) FROM dns_query_log_entry_partitioned") == 1
-    assert await _scalar(conn, "SELECT qname FROM dns_query_log_entry") == "old.example"
-    pk = await _scalar(
-        conn,
-        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-        "WHERE conrelid = 'dns_query_log_entry'::regclass AND contype = 'p'",
-    )
-    assert pk == "PRIMARY KEY (id)"
-    # The sequence belongs to the table that is live again, and it still counts.
-    await conn.execute(
-        text(
-            "INSERT INTO dns_query_log_entry (server_id, ts, qname) VALUES (:s, now(), 'back.example')"
-        ),
-        {"s": dns},
-    )
-    assert await _scalar(conn, "SELECT count(*) FROM dns_query_log_entry") == 2
+    r = await client.get("/health/platform", headers=await signed_in_headers(db_session))
 
-    # Up again, as after a rollback that was undone: the parked set is not in the way.
-    await conn.run_sync(_run, "upgrade")
-    assert (
-        await _scalar(
-            conn, "SELECT relkind::text FROM pg_class WHERE relname = 'dns_query_log_entry'"
-        )
-        == "p"
-    )
-    assert await _scalar(conn, "SELECT count(*) FROM dns_query_log_entry_legacy") == 2
+    assert r.status_code == 200, r.text
+    component = next(c for c in r.json()["components"] if c["name"] == "log-partitions")
+    assert component["status"] == "ok", component

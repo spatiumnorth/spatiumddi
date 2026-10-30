@@ -8,8 +8,12 @@ no default partition.
 
 Safe to retry and to overlap (non-negotiable #9): every step is idempotent
 and a session advisory lock per table makes a second worker skip the table.
-A table that fails (a lock that could not be taken in time, say) is retried by
-the next tick; the others are not held up by it.
+A table that fails (a lock that could not be taken in time, a dropped
+connection) is retried by the next tick; the others are not held up by it,
+each runs on a session of its own.
+
+Also queued when beat or a worker starts, so a stretch with neither running
+does not wait up to 15 minutes more before partitions are made again.
 """
 
 from __future__ import annotations
@@ -20,21 +24,15 @@ from typing import Any
 import structlog
 
 from app.celery_app import celery_app
-from app.db import task_session
-from app.services.logs.partitions import LOG_TABLES, maintain
-from app.tasks.prune_logs import log_retention_hours
+from app.db import task_sessionmaker
+from app.services.logs.partitions import maintain_all
 
 logger = structlog.get_logger(__name__)
 
 
 async def _maintain_all() -> dict[str, Any]:
-    async with task_session() as db:
-        # ``DETACH ... CONCURRENTLY`` cannot run inside a transaction block.
-        # The task engine holds a single connection, which this session and
-        # the maintenance share.
-        conn = await db.connection(execution_options={"isolation_level": "AUTOCOMMIT"})
-        hours = await log_retention_hours(db)
-        return {table.name: (await maintain(conn, table, hours)).as_dict() for table in LOG_TABLES}
+    async with task_sessionmaker() as sessions:
+        return await maintain_all(sessions)
 
 
 @celery_app.task(name="app.tasks.log_partitions.maintain_log_partitions")

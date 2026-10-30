@@ -1,34 +1,47 @@
-"""#2185 — time-partition the agent-shipped log tables (expand step).
+"""#2185 — time-partition the agent-shipped log tables.
 
 ``dns_query_log_entry``, ``dhcp_log_entry`` and ``dns_rpz_hit`` become
 ``PARTITION BY RANGE (ts)`` so retention is a partition drop instead of a
 mass ``DELETE``.
 
-Each table is swapped in one transaction:
+Each table is swapped in one step, inside this revision's transaction:
 
-* the existing table is renamed to ``<table>_legacy``, with its constraints
-  and indexes, and keeps its rows;
+* the existing table is renamed out of the way, with its constraints and
+  indexes;
 * a partitioned table takes the original name, with the same columns, the
   same foreign key and indexes, and primary key ``(id, ts)`` (PostgreSQL
   needs the partition key in every unique constraint);
-* the ``id`` sequence moves to the new table, so ids keep counting up and a
-  default-less ``INSERT`` from the previous release's pods lands in the new
-  table;
-* a daily partition for each day of the retention window (the settings cap
-  it at 7 days, RPZ hits are kept 30), plus today and tomorrow.
-  ``maintain_log_partitions`` takes over from the end of the last one.
+* the ``id`` sequence moves to it, so ids keep counting up and a
+  default-less ``INSERT`` from the previous release's pods lands in it;
+* it gets a daily partition for each day of the retention window (the
+  settings cap the logs at 7 days, RPZ hits are kept 30), plus today and
+  tomorrow; ``maintain_log_partitions`` takes over from the end of the last
+  one;
+* RPZ hits inside those partitions are copied across: they are 30 days of
+  threat evidence in a non-volatile backup section. The query and activity
+  logs start empty, as agreed in #2185: they hold a day of triage data, and
+  at the rates the issue cites copying them is the mass write it removes,
+  done while the previous release's ingest waits on the swap;
+* the old table is dropped. Nothing reads it: the previous release's pods use
+  the original name. Keeping it would keep rows past their retention and
+  its foreign key would make a selective restore of ``dns`` / ``dhcp``
+  refuse to run.
 
-Expand/contract: during the rolling upgrade the previous release's pods
-read, insert into and delete from the same table name with the same columns,
-so nothing they do breaks. The rows in ``<table>_legacy`` are not copied
-across: these are short-lived triage logs, and the tables start empty after
-the upgrade (release notes say so). The ``_legacy`` tables are dropped in
-the next release.
+During a rolling upgrade the previous release's pods read, insert into and
+delete from the same table name with the same columns, so nothing they do
+breaks; their prepared statements are re-planned against the new table.
 
-Downgrade keeps everything: the partitioned table and its partitions are
-parked as ``<table>_partitioned`` / ``<table>_partitioned_pYYYYMMDD…``, the
-legacy table gets its name back, and the sequence goes back to it. A
-previously parked set is replaced.
+The swap needs ``ACCESS EXCLUSIVE`` on the three tables and on
+``dns_server`` / ``dhcp_server`` (dropping a table with a foreign key into them
+takes that much). It takes all of them first, under a short ``lock_timeout``,
+and does the work only once it holds them; when one is not granted in time it
+lets go of everything, sleeps and tries again. A long reader on one of these
+busy tables therefore makes the migration wait, a few seconds at a time,
+rather than leave every insert, or every read of the server tables, queued
+behind it.
+
+Downgrade swaps back the same way to plain tables with the old shape,
+copying the RPZ hits and starting the two logs empty.
 
 Revision ID: e5a93c1b7d24
 Revises: c4f81e2a9d37
@@ -43,7 +56,15 @@ down_revision: str | None = "c4f81e2a9d37"
 branch_labels: str | None = None
 depends_on: str | None = None
 
-# table, referenced server table, indexes, days of retention to cover
+#: How long one attempt at a swap waits for a lock, and how many attempts.
+_LOCK_TIMEOUT_MS = 3000
+_ATTEMPTS = 10
+
+#: Every table the swap locks, server tables first, as a cascading delete of a
+#: server reaches them.
+_LOCKED = ("dns_server", "dhcp_server", "dns_query_log_entry", "dhcp_log_entry", "dns_rpz_hit")
+
+# table, referenced server table, indexes, days of retention to cover, copy rows
 _TABLES = (
     (
         "dns_query_log_entry",
@@ -53,6 +74,7 @@ _TABLES = (
             ("ix_dns_query_log_ts", "ts"),
         ),
         8,
+        False,
     ),
     (
         "dhcp_log_entry",
@@ -62,6 +84,7 @@ _TABLES = (
             ("ix_dhcp_log_ts", "ts"),
         ),
         8,
+        False,
     ),
     (
         "dns_rpz_hit",
@@ -72,111 +95,138 @@ _TABLES = (
             ("ix_dns_rpz_hit_zone_ts", "rpz_zone, ts"),
         ),
         31,
+        True,
     ),
 )
 
 
-def _rename_all(table: str, *, suffix: str, add: bool) -> str:
-    """Rename every constraint and standalone index of ``table`` by ``suffix``.
-
-    Constraints go first: renaming the primary key renames its index too, and
-    the second loop skips indexes that back a constraint.
-    """
-    new = "r.conname || '{s}'" if add else "left(r.conname, -{n})"
-    new_idx = "r.relname || '{s}'" if add else "left(r.relname, -{n})"
-    fmt = {"s": suffix, "n": len(suffix)}
+def _move_aside(table: str) -> str:
+    """Rename ``table`` to ``<table>_old``, with every constraint and index, so
+    the new table can take all their names. Constraints first: renaming the
+    primary key renames its index too, and the second loop skips indexes that
+    back a constraint."""
+    old = f"{table}_old"
     return f"""
-DO $$
-DECLARE r record;
+      ALTER TABLE {table} RENAME TO {old};
+      FOR r IN SELECT conname FROM pg_constraint WHERE conrelid = '{old}'::regclass LOOP
+        EXECUTE format('ALTER TABLE %I RENAME CONSTRAINT %I TO %I', '{old}', r.conname, r.conname || '_old');
+      END LOOP;
+      FOR r IN
+        SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE i.indrelid = '{old}'::regclass
+          AND i.indexrelid NOT IN (SELECT conindid FROM pg_constraint WHERE conrelid = '{old}'::regclass)
+      LOOP
+        EXECUTE format('ALTER INDEX %I RENAME TO %I', r.relname, r.relname || '_old');
+      END LOOP;"""
+
+
+def _swap(body: str) -> str:
+    """The whole swap as one block, retried when a lock is not granted in time.
+
+    Every lock is taken first; a failed attempt rolls back to the start of the
+    block, which releases all of them before the sleep.
+    """
+    return f"""
+DO $swap$
+DECLARE
+  attempt int := 0;
+  r record;
+  seq text;
+  cols text;
+  today date := (now() AT TIME ZONE 'UTC')::date;
 BEGIN
-  FOR r IN SELECT conname FROM pg_constraint WHERE conrelid = '{table}'::regclass LOOP
-    EXECUTE format('ALTER TABLE %I RENAME CONSTRAINT %I TO %I', '{table}', r.conname, {new.format(**fmt)});
-  END LOOP;
-  FOR r IN
-    SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
-    WHERE i.indrelid = '{table}'::regclass
-      AND i.indexrelid NOT IN (SELECT conindid FROM pg_constraint WHERE conrelid = '{table}'::regclass)
   LOOP
-    EXECUTE format('ALTER INDEX %I RENAME TO %I', r.relname, {new_idx.format(**fmt)});
+    attempt := attempt + 1;
+    BEGIN
+      LOCK TABLE {", ".join(_LOCKED)} IN ACCESS EXCLUSIVE MODE;
+      {body}
+      EXIT;
+    EXCEPTION WHEN lock_not_available OR deadlock_detected THEN
+      IF attempt >= {_ATTEMPTS} THEN
+        RAISE;
+      END IF;
+      RAISE NOTICE 'log tables: a lock was not granted in time, retrying (attempt %)', attempt;
+      PERFORM pg_sleep(least(attempt, 5));
+    END;
   END LOOP;
-END $$;
+END $swap$;
 """
 
 
+def _common(table: str, server_table: str, indexes: tuple[tuple[str, str], ...]) -> str:
+    """The foreign key, the indexes and the sequence of the table just created
+    under ``table``, taken over from ``<table>_old``."""
+    old = f"{table}_old"
+    return (
+        f"""
+      ALTER TABLE {table} ADD CONSTRAINT {table}_server_id_fkey
+        FOREIGN KEY (server_id) REFERENCES {server_table} (id) ON DELETE CASCADE;"""
+        + "".join(f"\n      CREATE INDEX {name} ON {table} ({cols});" for name, cols in indexes)
+        + f"""
+      seq := pg_get_serial_sequence('{old}', 'id');
+      IF seq IS NULL THEN
+        RAISE EXCEPTION '{old}.id has no owned sequence to hand over';
+      END IF;
+      EXECUTE format('ALTER SEQUENCE %s OWNED BY {table}.id', seq);
+      SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols
+        FROM pg_attribute WHERE attrelid = '{old}'::regclass AND attnum > 0 AND NOT attisdropped;"""
+    )
+
+
 def upgrade() -> None:
-    for table, server_table, indexes, back_days in _TABLES:
-        legacy = f"{table}_legacy"
-        op.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
-        op.execute(_rename_all(legacy, suffix="_legacy", add=True))
-        op.execute(
-            f"CREATE TABLE {table} (LIKE {legacy} INCLUDING DEFAULTS, PRIMARY KEY (id, ts)) "
-            "PARTITION BY RANGE (ts)"
+    op.execute(f"SET LOCAL lock_timeout = {_LOCK_TIMEOUT_MS}")
+    body = ""
+    for table, server_table, indexes, back_days, copy in _TABLES:
+        old = f"{table}_old"
+        lower = f"((today - {back_days})::timestamp AT TIME ZONE 'UTC')"
+        upper = "((today + 2)::timestamp AT TIME ZONE 'UTC')"
+        body += (
+            _move_aside(table)
+            + f"""
+      CREATE TABLE {table} (LIKE {old} INCLUDING DEFAULTS, PRIMARY KEY (id, ts))
+        PARTITION BY RANGE (ts);"""
+            + _common(table, server_table, indexes)
+            + f"""
+      FOR i IN -{back_days}..1 LOOP
+        EXECUTE format(
+          'CREATE TABLE %I PARTITION OF {table} FOR VALUES FROM (%L) TO (%L)',
+          '{table}_p' || to_char(today + i, 'YYYYMMDD'),
+          ((today + i)::timestamp AT TIME ZONE 'UTC'),
+          ((today + i + 1)::timestamp AT TIME ZONE 'UTC')
+        );
+      END LOOP;"""
+            + (
+                f"""
+      EXECUTE format(
+        'INSERT INTO {table} (%s) SELECT %s FROM {old} WHERE ts >= %L AND ts < %L',
+        cols, cols, {lower}, {upper}
+      );"""
+                if copy
+                else ""
+            )
+            + f"""
+      DROP TABLE {old};"""
         )
-        op.execute(
-            f"ALTER TABLE {table} ADD CONSTRAINT {table}_server_id_fkey "
-            f"FOREIGN KEY (server_id) REFERENCES {server_table} (id) ON DELETE CASCADE"
-        )
-        for name, columns in indexes:
-            op.execute(f"CREATE INDEX {name} ON {table} ({columns})")
-        # The sequence follows the column that is written now, so it survives
-        # the legacy table being dropped in the next release.
-        op.execute(f"""
-DO $$
-DECLARE seq text := pg_get_serial_sequence('{legacy}', 'id');
-BEGIN
-  IF seq IS NULL THEN
-    RAISE EXCEPTION '{legacy}.id has no owned sequence to hand over';
-  END IF;
-  EXECUTE format('ALTER SEQUENCE %s OWNED BY {table}.id', seq);
-END $$;
-""")
-        op.execute(f"""
-DO $$
-DECLARE
-  today date := (now() AT TIME ZONE 'UTC')::date;
-  d date;
-BEGIN
-  FOR i IN -{back_days}..1 LOOP
-    d := today + i;
-    EXECUTE format(
-      'CREATE TABLE %I PARTITION OF {table} FOR VALUES FROM (%L) TO (%L)',
-      '{table}_p' || to_char(d, 'YYYYMMDD'),
-      (d::timestamp AT TIME ZONE 'UTC'),
-      ((d + 1)::timestamp AT TIME ZONE 'UTC')
-    );
-  END LOOP;
-END $$;
-""")
+    op.execute(_swap(body))
 
 
 def downgrade() -> None:
-    for table, _server_table, _indexes, _back_days in reversed(_TABLES):
-        legacy = f"{table}_legacy"
-        parked = f"{table}_partitioned"
-        # Rows written while this release ran stay in the parked table; an
-        # earlier parked set, from a previous downgrade, is replaced.
-        op.execute(f"DROP TABLE IF EXISTS {parked}")
-        op.execute(f"ALTER TABLE {table} RENAME TO {parked}")
-        op.execute(_rename_all(parked, suffix="_partitioned", add=True))
-        op.execute(f"""
-DO $$
-DECLARE r record;
-BEGIN
-  FOR r IN SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-           WHERE i.inhparent = '{parked}'::regclass LOOP
-    EXECUTE format('ALTER TABLE %I RENAME TO %I', r.relname,
-                   replace(r.relname, '{table}_p', '{parked}_p'));
-  END LOOP;
-END $$;
-""")
-        op.execute(_rename_all(legacy, suffix="_legacy", add=False))
-        op.execute(f"ALTER TABLE {legacy} RENAME TO {table}")
-        op.execute(f"""
-DO $$
-DECLARE seq text := pg_get_serial_sequence('{parked}', 'id');
-BEGIN
-  IF seq IS NOT NULL THEN
-    EXECUTE format('ALTER SEQUENCE %s OWNED BY {table}.id', seq);
-  END IF;
-END $$;
-""")
+    op.execute(f"SET LOCAL lock_timeout = {_LOCK_TIMEOUT_MS}")
+    body = ""
+    for table, server_table, indexes, _back_days, copy in reversed(_TABLES):
+        old = f"{table}_old"
+        body += (
+            _move_aside(table)
+            + f"""
+      CREATE TABLE {table} (LIKE {old} INCLUDING DEFAULTS, PRIMARY KEY (id));"""
+            + _common(table, server_table, indexes)
+            + (
+                f"""
+      EXECUTE format('INSERT INTO {table} (%s) SELECT %s FROM {old}', cols, cols);"""
+                if copy
+                else ""
+            )
+            + f"""
+      DROP TABLE {old};"""
+        )
+    op.execute(_swap(body))
