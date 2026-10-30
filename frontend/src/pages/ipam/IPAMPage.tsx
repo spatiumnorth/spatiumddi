@@ -4552,6 +4552,8 @@ const NEEDS_ADDRESS_DELETE =
 const NEEDS_DNS_SYNC =
   "Requires read permission in IPAM and write permission on subnets";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
+const NEEDS_BLOCK_DELETE = "Requires delete permission on this IP block";
+const NEEDS_SPACE_DELETE = "Requires delete permission on this IP space";
 const NEEDS_ORPHAN_PURGE =
   "Requires delete permission in IPAM and write permission on subnets";
 
@@ -11966,6 +11968,8 @@ function EditSpaceModalForm({
   onClose,
   onDeleted,
 }: EditSpaceModalProps) {
+  // The dialog opens for a holder of write on this one space; Delete needs its own grant.
+  const canDeleteSpace = usePermissions().can("delete", "ip_space", space.id);
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -12324,7 +12328,8 @@ function EditSpaceModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteSpace, NEEDS_SPACE_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this IP space…
           </button>
@@ -12794,6 +12799,8 @@ function EditBlockModalForm({
   onClose,
   onDeleted,
 }: EditBlockModalProps) {
+  // The dialog opens for a holder of write on this one block; Delete needs its own grant.
+  const canDeleteBlock = usePermissions().can("delete", "ip_block", block.id);
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
   const [description, setDescription] = useState(block.description ?? "");
@@ -13209,7 +13216,8 @@ function EditBlockModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this block…
           </button>

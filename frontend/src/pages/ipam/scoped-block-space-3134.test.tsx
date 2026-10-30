@@ -114,12 +114,27 @@ function mount(ui: React.ReactNode, url = "/") {
 
 const settle = () => new Promise((r) => setTimeout(r, 50));
 
-function blockScoped(writeId = "blk-x") {
-  answers.authApi = { myPermissions: grants("ip_block", "blk-x", writeId) };
+function blockScoped(writeId = "blk-x", extra: string[] = []) {
+  answers.authApi = {
+    myPermissions: () =>
+      Promise.resolve({
+        is_superadmin: false,
+        grants: [
+          { action: "read", resource_type: "ip_block", resource_id: "blk-x" },
+          { action: "write", resource_type: "ip_block", resource_id: writeId },
+          ...extra.map((a) => ({
+            action: a,
+            resource_type: "ip_block",
+            resource_id: "blk-x",
+          })),
+        ],
+      }),
+  };
   answers.ipamApi = {
     listSpaces: refused,
     listSubnets: refused,
     listBlocks: () => Promise.resolve([block]),
+    getBlock: () => Promise.resolve(block),
   };
 }
 
@@ -169,7 +184,77 @@ describe("a grant scoped to one block", () => {
   });
 });
 
+async function openDanger(editName: string, deleteName: string) {
+  const edit = (await screen.findByRole("button", {
+    name: editName,
+  })) as HTMLButtonElement;
+  await waitFor(() => expect(edit.disabled).toBe(false));
+  fireEvent.click(edit);
+  fireEvent.click(
+    await screen.findByText("Danger zone", {}, { timeout: 4000 }),
+  );
+  return (await screen.findByRole("button", {
+    name: deleteName,
+  })) as HTMLButtonElement;
+}
+
+describe("the Danger zone of the Edit block dialog", () => {
+  it("is disabled, with the reason, for a holder without delete", async () => {
+    blockScoped();
+    mount(<IPAMPage />, "/ipam?block=blk-x");
+    const del = await openDanger("Edit", "Delete this block…");
+    await settle();
+    expect(del.disabled).toBe(true);
+    expect(del.title).toBe("Requires delete permission on this IP block");
+  });
+
+  it("stays enabled for a holder with a delete grant on the block", async () => {
+    blockScoped("blk-x", ["delete"]);
+    mount(<IPAMPage />, "/ipam?block=blk-x");
+    const del = await openDanger("Edit", "Delete this block…");
+    await settle();
+    expect(del.disabled).toBe(false);
+  });
+});
+
 describe("a grant scoped to one space", () => {
+  function spaceScoped(extra: string[] = []) {
+    answers.authApi = {
+      myPermissions: () =>
+        Promise.resolve({
+          is_superadmin: false,
+          grants: ["read", "write", ...extra].map((action) => ({
+            action,
+            resource_type: "ip_space",
+            resource_id: "sp-x",
+          })),
+        }),
+    };
+    answers.ipamApi = {
+      listSpaces: () => Promise.resolve([space]),
+      getSpace: () => Promise.resolve(space),
+      listBlocks: refused,
+      listSubnets: refused,
+    };
+  }
+
+  it("disables the Edit IP Space Danger zone delete, with the reason", async () => {
+    spaceScoped();
+    mount(<IPAMPage />, "/ipam?space=sp-x");
+    const del = await openDanger("Edit Space", "Delete this IP space…");
+    await settle();
+    expect(del.disabled).toBe(true);
+    expect(del.title).toBe("Requires delete permission on this IP space");
+  });
+
+  it("keeps it enabled with a delete grant on the space", async () => {
+    spaceScoped(["delete"]);
+    mount(<IPAMPage />, "/ipam?space=sp-x");
+    const del = await openDanger("Edit Space", "Delete this IP space…");
+    await settle();
+    expect(del.disabled).toBe(false);
+  });
+
   it("opens the space with Edit Space enabled", async () => {
     answers.authApi = { myPermissions: grants("ip_space", "sp-x") };
     answers.ipamApi = {
