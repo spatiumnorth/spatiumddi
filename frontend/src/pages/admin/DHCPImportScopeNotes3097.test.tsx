@@ -70,6 +70,14 @@ describe("DHCP import preview scope notes", () => {
     expect(screen.getByText(NOTE)).toBeTruthy();
   });
 
+  it("renders a note taken from the source file as text, not markup", () => {
+    const hostile =
+      "Pool '<img src=x onerror=alert(1)>' not imported: not a valid address range.";
+    show(preview([hostile]));
+    expect(screen.getByText(hostile)).toBeTruthy();
+    expect(document.querySelector("img")).toBeNull();
+  });
+
   it("shows no notes list for a scope without notes", () => {
     show(preview([]));
     expect(screen.queryByRole("list")).toBeNull();

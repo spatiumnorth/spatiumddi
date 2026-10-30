@@ -643,7 +643,7 @@ export function PreviewPanel({
                       {sc.parse_warnings.length > 0 && (
                         <ul
                           aria-label={`Notes for ${sc.subnet_cidr}`}
-                          className="mt-1 list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 dark:text-amber-400"
+                          className="mt-1 max-w-md list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-400"
                         >
                           {sc.parse_warnings.map((w, i) => (
                             <li key={i}>{w}</li>

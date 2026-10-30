@@ -768,3 +768,54 @@ async def test_kea_commit_rechecks_pools_in_the_plan_3037(
     assert any("10.1.1.1" in w for w in body["warnings"]), body["warnings"]
     starts = (await db_session.execute(select(DHCPPool.start_ip))).scalars().all()
     assert [str(x) for x in starts] == ["192.0.2.10"]
+
+
+# ── #3097: every dropped pool gets a note ────────────────────────────
+
+
+def test_kea_pool_that_is_not_an_object_is_a_preview_warning_3097() -> None:
+    import json
+
+    body = {
+        "subnet4": [
+            {
+                "subnet": "10.0.0.0/24",
+                "pools": [{"pool": "10.0.0.10-10.0.0.20"}, "10.0.0.30-10.0.0.40"],
+            }
+        ]
+    }
+    sc = parse_kea_config(json.dumps(body).encode()).scopes[0]
+    assert [(p.start_ip, p.end_ip) for p in sc.pools] == [("10.0.0.10", "10.0.0.20")]
+    assert len(sc.parse_warnings) == 1
+    assert "10.0.0.30-10.0.0.40" in sc.parse_warnings[0]
+
+
+def test_isc_range_with_no_address_is_a_preview_warning_3097() -> None:
+    p = parse_isc_config(
+        b"subnet 10.0.0.0 netmask 255.255.255.0 {\n"
+        b"  range 10.0.0.10 10.0.0.20;\n  range dynamic-bootp;\n"
+        b"  pool { range; }\n}\n"
+    )
+    sc = p.scopes[0]
+    assert [(x.start_ip, x.end_ip) for x in sc.pools] == [("10.0.0.10", "10.0.0.20")]
+    notes = [w for w in sc.parse_warnings if "no address" in w]
+    assert len(notes) == 2
+    assert any("dynamic-bootp" in w for w in notes)
+
+
+def test_windows_pool_with_no_end_is_a_preview_warning_3097() -> None:
+    from app.services.dhcp_import.windows_dhcp_pull import _scope_from_dict
+
+    sc = _scope_from_dict(
+        {
+            "subnet_cidr": "10.0.0.0/24",
+            "pools": [
+                {"start_ip": "10.0.0.10", "end_ip": "10.0.0.20"},
+                {"start_ip": "10.0.0.30", "end_ip": None},
+            ],
+        }
+    )
+    assert sc is not None
+    assert len(sc.pools) == 1
+    assert len(sc.parse_warnings) == 1
+    assert "10.0.0.30" in sc.parse_warnings[0]
