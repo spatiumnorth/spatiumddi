@@ -1411,14 +1411,13 @@ own install are in [docs/deployment/SIZING.md](docs/deployment/SIZING.md).
 | **Appliance, three-node control plane** | first node 4 vCPU / 8 GiB, the others 2 vCPU / 6 GiB, 40 GiB disks | every node 4 vCPU, 8 GiB RAM, 48 GiB SSD |
 | **Appliance role** (DNS / DHCP agent box) | 3 GiB RAM (its pods do not schedule below that) | 2 vCPU, 4 GiB RAM, 32 GiB SSD (not measured yet) |
 | **Docker Compose** (one host) | 2 vCPU, 4 GiB RAM (from use measured on amd64 and arm64) | 4 vCPU, 8 GiB RAM (derived) |
-| **Kubernetes** (umbrella chart) | one node: 4 vCPU, 6 GiB RAM with the overrides in SIZING.md; more than 8 GiB on the chart's defaults (measured, amd64; arm64 alike) | 4 vCPU, 8 GiB per node; api memory `512Mi` request and `1Gi` limit, worker `2Gi` |
+| **Kubernetes** (umbrella chart) | one node: 4 vCPU, 6 GiB RAM (measured, amd64; arm64 alike) | 4 vCPU, 8 GiB per node |
 
 One node at rest used 3.3 GiB, and the busiest suites took it to 4.1 GiB:
 at this data size the memory is mostly the stack itself, not the load. For
 about 1M devices give every control-plane node 64 GiB of disk or more. On
-Kubernetes the chart's default api autoscaler runs 10 replicas at rest, since
-one api process is above its memory target, and on an 8 GiB node that leaves
-less than 1 GiB free; SIZING.md has the overrides.
+Kubernetes the chart's api and worker defaults are sized from these
+measurements, and its api autoscaler stays at 2 replicas at rest (#3110).
 
 ---
 

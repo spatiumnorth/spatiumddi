@@ -302,14 +302,12 @@ Every workload has `resources.requests`/`limits` defaults in
 blocks) and a per-component `nodeSelector` / `tolerations` / `affinity` /
 `podAnnotations`. Override them under the matching key.
 
-Per-pod memory and CPU with these defaults, measured on a one-node k3s
-cluster (amd64 and arm64), and on the appliance, which runs this same chart, are in
-[`SIZING.md`](SIZING.md#kubernetes). One api process holds about 300 MiB at
-rest, above the autoscaler's memory target (80 % of the 256Mi request), so
-with the defaults the autoscaler below runs 10 api replicas while idle; on
-the appliance the process held 0.4 to 0.85 GiB. Set
-`api.resources.requests.memory` to `512Mi`, `api.resources.limits.memory` to
-`1Gi` and `worker.resources.limits.memory` to `2Gi`.
+Per-pod memory and CPU, measured on a one-node k3s cluster (amd64 and
+arm64) and on the appliance, which runs this same chart, are in
+[`SIZING.md`](SIZING.md#kubernetes), and the api and worker defaults are
+sized from them (#3110). One api process holds about 300 MiB at rest and
+held 0.4 to 0.85 GiB on the appliance, hence its 512Mi request and 1Gi
+limit; the worker levels off near 1 GiB, hence its 2Gi limit.
 
 The **api Deployment has a HorizontalPodAutoscaler** (`autoscaling/v2`), gated
 on `api.autoscaling.enabled` (**default `true`**):
