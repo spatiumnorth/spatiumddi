@@ -304,6 +304,9 @@ async def test_kea_commit_autocreates_subnet_with_provenance(
         await db_session.execute(select(Subnet).where(Subnet.network == "192.0.2.0/24"))
     ).scalar_one()
     assert str(subnet.dhcp_server_group_id) == str(group.id)
+    # Usable size, as every other create path stores it (#3093, #2411):
+    # network + broadcast are left out of a v4 subnet's total.
+    assert subnet.total_ips == 254
 
     # scope + provenance
     scope = (
@@ -819,3 +822,88 @@ def test_windows_pool_with_no_end_is_a_preview_warning_3097() -> None:
     assert len(sc.pools) == 1
     assert len(sc.parse_warnings) == 1
     assert "10.0.0.30" in sc.parse_warnings[0]
+
+
+_V6_64_IMPORTS_3093 = [
+    pytest.param(
+        "kea",
+        "kea.conf",
+        '{"Dhcp6": {"subnet6": [{"id": 64, "subnet": "2001:db8:6::/64", "pools": []}]}}',
+        [],
+        id="kea-no-pool",
+    ),
+    pytest.param(
+        "kea",
+        "kea.conf",
+        '{"Dhcp6": {"subnet6": [{"id": 64, "subnet": "2001:db8:6::/64", '
+        '"pools": [{"pool": "2001:db8:6::100 - 2001:db8:6::1ff"}]}]}}',
+        [("2001:db8:6::100", "2001:db8:6::1ff")],
+        id="kea-range-pool",
+    ),
+    pytest.param(
+        "isc",
+        "dhcpd6.conf",
+        "subnet6 2001:db8:6::/64 {\n  range6 2001:db8:6::100 2001:db8:6::1ff;\n}\n",
+        [("2001:db8:6::100", "2001:db8:6::1ff")],
+        id="isc-range6",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source", "filename", "conf", "pools"), _V6_64_IMPORTS_3093)
+async def test_commit_autocreates_v6_64_subnet_3093(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    source: str,
+    filename: str,
+    conf: str,
+    pools: list[tuple[str, str]],
+) -> None:
+    """A /64 has 2**64 addresses, one past BIGINT: the auto-created Subnet's
+    ``total_ips`` must be clamped like every other creation path, so a v6
+    scope whose /64 is not yet in IPAM imports — with or without pools, from
+    any source (they share one commit path)."""
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "2001:db8::/32")
+    await db_session.commit()
+
+    headers = {"Authorization": f"Bearer {token}"}
+    preview_resp = await client.post(
+        f"/api/v1/dhcp/import/{source}/preview",
+        headers=headers,
+        files={"file": (filename, conf, "application/octet-stream")},
+        data={"target_group_id": str(group.id), "ipam_space_id": str(space.id)},
+    )
+    assert preview_resp.status_code == 200, preview_resp.text
+    resp = await client.post(
+        f"/api/v1/dhcp/import/{source}/commit",
+        headers=headers,
+        json={
+            "target_group_id": str(group.id),
+            "ipam_space_id": str(space.id),
+            "ipam_block_id": str(block.id),
+            "plan": preview_resp.json(),
+            "conflict_actions": {},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scopes"][0]["action_taken"] == "created", body
+    assert body["total_subnets_created"] == 1
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.network == "2001:db8:6::/64"))
+    ).scalar_one()
+    assert subnet.total_ips == 2**63 - 1
+    scope = (
+        await db_session.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet.id))
+    ).scalar_one()
+    assert scope.address_family == "ipv6"
+    got = (
+        await db_session.execute(
+            select(DHCPPool.start_ip, DHCPPool.end_ip).where(DHCPPool.scope_id == scope.id)
+        )
+    ).all()
+    assert sorted((str(a), str(b)) for a, b in got) == pools
