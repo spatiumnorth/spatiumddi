@@ -12,7 +12,11 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import contains_zonefile_unsafe, primary_ns_error
+from app.core.dns_names import (
+    admin_email_error,
+    contains_zonefile_unsafe,
+    primary_ns_error,
+)
 
 
 def soa_field_error(value: str | None, field: str | None = None) -> str | None:
@@ -30,6 +34,11 @@ def soa_field_error(value: str | None, field: str | None = None) -> str | None:
         err = primary_ns_error(value)
         if err is not None:
             return f"Primary NS (primary_ns) {err}"
+    if field == "admin_email":
+        # #2916 — the SOA RNAME is checked by BIND too (check-names).
+        err = admin_email_error(value)
+        if err is not None:
+            return f"Admin Email (admin_email) {err}"
     return None
 
 

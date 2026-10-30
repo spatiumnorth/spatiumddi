@@ -67,6 +67,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `settings`        | Platform settings                                     |
 | `api_token`       | API tokens                                            |
 | `acme_account`    | ACME DNS-01 provider credentials (`/api/v1/acme/`)    |
+| `certificate_store` | The TLS certificates and private keys SpatiumDDI holds — `/api/v1/appliance/tls/*` and the embedded Let's Encrypt client at `/api/v1/appliance/acme/*` (#3067). DNS server groups pick their DoT / DoH / DoQ certificate from it. `read` lists, `write` uploads, generates a CSR, imports a signed cert, configures the ACME account and issues, `delete` deletes. Each route also accepts the `appliance` grant it took before (`read` for a read, `admin` for anything else), so no role built on `appliance` lost anything. **Making a certificate the Web UI certificate is not included**: `/activate`, and `activate: true` on an upload, an import or an ACME issue, deploy it to the appliance's nginx (the k3s TLS Secret), and still need `admin` on `appliance`. So does re-pointing (directory URL, EAB binding) or deleting the ACME account on an appliance whose active Web UI certificate came from Let's Encrypt, since that account renews it. Not the same as `tls_cert`, below |
 | `customer`        | Customer logical-ownership entity (#91)               |
 | `site`            | Site logical-ownership entity (#91)                   |
 | `provider`        | Provider logical-ownership entity (#91)               |
@@ -77,6 +78,18 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `looking_glass_collector` | BGP Looking Glass receive-only GoBGP collectors — register / CRUD + learned-route reads (#566) |
 | `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
+| `proxmox_node` | Proxmox VE integration targets (`/proxmox`) |
+| `unifi_controller` | UniFi Network controllers (`/unifi`) |
+| `kubernetes_cluster` | Kubernetes cluster integrations (`/kubernetes`) |
+| `docker_host` | Docker host integrations (`/docker`) |
+| `tailscale_tenant` | Tailscale tenant integrations (`/tailscale`) |
+| `cloud_endpoint` | Cloud connector endpoints — AWS / Azure / GCP (`/cloud`) |
+| `meraki_org` | Cisco Meraki organisations (`/meraki`) |
+| `panos_firewall` | Palo Alto PAN-OS / Panorama firewalls (`/paloalto`) |
+| `opnsense_router` | OPNsense routers (`/opnsense`) |
+| `fortinet_firewall` | Fortinet FortiGate firewalls (`/fortinet`) |
+| `netbird_instance` | NetBird management instances (`/netbird`) |
+| `firewall_feed` | Firewall block-list feeds (`/firewall-feeds`) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
 | `manage_block_sync` | Active block sync / write-back enforcement (#601) — create/lift SpatiumDDI-owned IP/MAC blocks, arm per-target OPNsense/UniFi enforcement + write-scoped creds, reveal + reconcile. High blast-radius (pushes a real firewall/gateway block that can lock devices out); granted to `Network Editor`, not `Viewer`. Every push is audited and eligible for two-person approval (`admin:manage_block_sync`). |
@@ -89,6 +102,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `av_flow`         | AV-over-IP flow descriptors + operator-declared reserved multicast ranges (#540) — the Dante / AES67 / SMPTE 2110 layer over the multicast registry |
 | `bacnet_device`   | BACnet/IP device registry (#541) — internetwork-unique device instance numbers, vendor/model metadata, BBMD flag + BDT/FDT snapshots |
 | `dicom_ae`        | DICOM Application Entity registry (#723) — institution-wide-unique AE Titles, their host/port bindings, and the configured AE→AE association map. Network identity only; this permission never grants access to imaging data, which SpatiumDDI does not store |
+| `tls_cert`        | TLS certificate *monitoring* (#118) — probe targets and the chains other hosts present (`/api/v1/tls-certs/`). Watching someone else's expiry dates; it confers nothing on `certificate_store`, which holds our own private keys, and vice versa |
 | `ot_device`       | Industrial / OT device inventory + Purdue zoning (#542) — read-only identification; this permission never grants control-protocol access, which is out of scope entirely |
 | `appliance`       | The SpatiumDDI OS appliance on a node — TLS certificate upload and ACME, releases catalogue, slot apply / rollback, container control and logs, host network and firewall, maintenance mode, diagnostic bundle (#134). Fleet management stays superadmin (see `Appliance Operator` below) |
 | `dhcp_mac_block`  | DHCP MAC deny-list entries (block a client by MAC) |
@@ -354,7 +368,7 @@ starts at the server groups). The built-in roles keep what they had
 | `Superadmin`   | `[{"action": "*", "resource_type": "*"}]`                    |
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service`; `read` on `alert` |
-| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists. Infrastructure stays superadmin-only (see below) |
+| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `certificate_store`; `read` on `manage_dns_pools`, `alert` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists; manage the TLS certificate store DoT / DoH / DoQ serve from (#3067), short of making a certificate the Web UI certificate. Infrastructure stays superadmin-only (see below), including the server-group options that turn a DoT / DoH / DoQ listener on |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block`; `read` on `alert` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
 | `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert`, `dnsbl`; `read` on `alert` |
 | `Auditor`        | `read` on `conformity`, `audit_log`, `ip_space`, `ip_block`, `subnet`, `ip_address`, `dns_group`, `dns_zone`, `dns_record`, `dhcp_scope`, `tls_cert`, `alert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
@@ -362,7 +376,7 @@ starts at the server groups). The built-in roles keep what they had
 | `Address Set Editor` | `admin` on `address_set` (#103); `read` on `alert` — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62); `read` on `alert` — the second-person decision capability in the two-person approval workflow. Reading the queue needs no grant for your own rows (#1863): any signed-in user sees, and may cancel, the requests they made themselves; `read` widens nothing, and seeing every row takes `approve`. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
 | `Requester`        | `write` + `read` on `provisioning_request` (#696); `read` on `alert` — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. The role carries no `read` on subnets, blocks, zones or scopes: grant `read` on the ones a department may request into, or submits are refused. |
-| `Appliance Operator` | `admin` on `appliance` (#134); `read` on `alert` — runs the SpatiumDDI OS appliance on a node (TLS cert upload and ACME, the read-only releases catalogue, node-local slot apply and rollback, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage a node's lifecycle without full superadmin over the DDI data plane. **Fleet management still needs a superadmin** (#2620): the upgrade-image store, every Fleet member action (approve, role assignment, OS upgrade, reboot), MetalLB, the kube-api CIDRs and pairing codes. |
+| `Appliance Operator` | `admin` on `appliance` (#134) and `certificate_store` (#3067); `read` on `alert` — runs the SpatiumDDI OS appliance on a node (TLS cert upload and ACME, the read-only releases catalogue, node-local slot apply and rollback, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage a node's lifecycle without full superadmin over the DDI data plane. **Fleet management still needs a superadmin** (#2620): the upgrade-image store, every Fleet member action (approve, role assignment, OS upgrade, reboot), MetalLB, the kube-api CIDRs and pairing codes. |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
 
@@ -470,6 +484,8 @@ check, `isSuperadmin` (reason `NEEDS_SUPERADMIN`) for a handler that takes
 gated on `delete`, although most `POST …/bulk-delete` routes are admitted by the
 router's method gate as `write` (only Domains checks `delete` inline); the
 console asks what the action does rather than widen a delete to every writer. Appliance actions use
-`useApplianceAdminGate()` (`admin` on `appliance`). When you add a write control,
+`useApplianceAdminGate()` (`admin` on `appliance`); the certificate store's
+controls ask `certificate_store` (or `admin` on `appliance`), and its
+activation controls `admin` on `appliance`. When you add a write control,
 gate it the same way, and give its mutation an error display so a refusal the
 console could not predict still says why (#1338–#1342).
