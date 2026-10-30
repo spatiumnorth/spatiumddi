@@ -307,9 +307,17 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "read", "resource_type": "conformity"},
             {"action": "read", "resource_type": "audit_log"},
+            # The spaces and blocks a subnet sits in: until #3058 any IPAM
+            # read opened them, and the IPAM tree starts there.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "ip_block"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "tls_cert"},
             {"action": "read", "resource_type": "alert"},
@@ -317,15 +325,24 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "Compliance Editor": (
         "Full CRUD on conformity policies (issue #106) plus read on the "
-        "underlying resources (subnets / IPs / zones / scopes) so the "
+        "underlying resources (spaces / blocks / subnets / IPs / zones / "
+        "scopes) so the "
         "compliance team can author + tune policies without touching "
         "operational config.",
         [
             {"action": "admin", "resource_type": "conformity"},
             {"action": "read", "resource_type": "audit_log"},
+            # The spaces and blocks a subnet sits in: until #3058 any IPAM
+            # read opened them, and the IPAM tree starts there.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "ip_block"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "alert"},
         ],

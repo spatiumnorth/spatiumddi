@@ -4548,32 +4548,22 @@ const NEEDS_ADDRESS_WRITE =
   "Requires write permission on this subnet or on an address set in it";
 const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
 const NEEDS_ADDRESS_DELETE =
-  "Requires delete permission in IPAM, and write on this subnet or on an address set in it";
+  "Requires delete permission on subnets, and write on this subnet or on an address set in it";
 const NEEDS_DNS_SYNC =
-  "Requires read permission in IPAM and write permission on subnets";
+  "Requires read permission on subnets and IP addresses, and write permission on subnets";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
-const NEEDS_ORPHAN_PURGE =
-  "Requires delete permission in IPAM and write permission on subnets";
+const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 
-// The IPAM router's gate: a multi-row delete (Bulk delete, Clean Orphans)
-// needs ``delete`` on one of these types, as a single-row DELETE does
-// (``require_any_resource_or_scoped`` in ``api/v1/ipam/router.py``).
-const IPAM_GATE_TYPES = [
-  "ip_space",
-  "ip_block",
-  "subnet",
-  "ip_address",
-  "custom_field",
-  "nat_mapping",
-  "manage_ipam_templates",
-];
-
+// The IPAM router's gate: an address delete and the multi-row deletes (Bulk
+// delete, Clean Orphans) need ``delete`` on ``subnet`` — the subnet owns its
+// addresses (``_IPAM_ROUTE_TYPES`` in ``api/v1/ipam/router.py``, #3058) — or
+// on an address set.
 function canDeleteInIpam(
   can: (action: string, type: string, id?: string | null) => boolean,
   addressSetIds: string[] = [],
 ): boolean {
   return (
-    IPAM_GATE_TYPES.some((t) => can("delete", t)) ||
+    can("delete", "subnet") ||
     can("delete", "address_set") ||
     addressSetIds.some((id) => can("delete", "address_set", id))
   );
@@ -5063,11 +5053,13 @@ export function SubnetDetail({
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
-  // #2571 — DNS sync: the drift preview is a read on the IPAM router and the
-  // commit is write on subnets, both at the type level (a grant scoped to one
-  // subnet reaches neither, #2497).
+  // #2571 — DNS sync: the drift preview reads the subnet and its addresses
+  // and the commit is write on subnets, all at the type level (a grant scoped
+  // to one subnet reaches neither, #2497; #3058).
   const canDnsSync =
-    IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
+    perms.can("read", "subnet") &&
+    perms.can("read", "ip_address") &&
+    canWriteSubnets;
   const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
   // #2699 — the lease sync behind Sync > DHCP / All takes a superadmin.
   const dhcpSyncGate = permissionGate(perms.isSuperadmin, NEEDS_SUPERADMIN);
@@ -6062,7 +6054,7 @@ export function SubnetDetail({
                   ? "border-primary text-foreground"
                   : "border-transparent text-muted-foreground hover:text-foreground",
               )}
-              title="NAT mappings whose internal IP falls inside this subnet"
+              title="NAT mappings whose internal or external IP falls inside this subnet"
             >
               NAT
             </button>
@@ -10207,8 +10199,8 @@ function NatSubnetPanel({ subnetId }: { subnetId: string }) {
   return (
     <div className="space-y-2 p-2">
       <p className="px-3 pt-1 text-xs text-muted-foreground">
-        Every NAT mapping whose internal IP falls inside this subnet's CIDR, or
-        that's pinned to it as a hide-NAT source.
+        Every NAT mapping whose internal or external IP falls inside this
+        subnet's CIDR, or that's pinned to it as a hide-NAT source.
       </p>
       <NatRowsTable
         rows={data}

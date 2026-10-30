@@ -69,11 +69,12 @@ from app.core.dns_names import (
 from app.core.permissions import (
     _token_grants_for,
     is_effective_superadmin,
-    require_any_permission,
-    require_any_resource_permission,
+    refuse_and_audit,
     require_permission,
+    require_route_types,
     token_scope_allows,
     token_scoped_resource_ids,
+    type_level_allows,
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
@@ -128,6 +129,7 @@ from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
 )
+from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns import dnssec_signers, technitium_api_scope
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
@@ -275,26 +277,149 @@ from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
 
-# Router-level RBAC: GET=read, POST/PUT/PATCH=write, DELETE=delete. The DNS
-# router covers server groups, servers, views, ACLs, zones and records, so a
-# user with `admin` on any of (dns_group, dns_zone, dns_record) passes the
-# router gate. Handlers that need finer scoping (e.g. "record write permitted
-# only when dns_zone permits write") can do inline checks with
-# `user_has_permission`.
+# Router-level RBAC: GET=read, POST/PUT/PATCH=write, DELETE=delete, on EVERY
+# type the route serves (#3073). Until then the gate admitted a type-level
+# grant on ANY of (dns_group, dns_zone, dns_record), so a role holding only
+# ``{read, dns_record}`` listed every group, server and zone. Server groups,
+# servers, their options, views, ACLs and TSIG keys are ``dns_group``; zones
+# (and zone-level settings: DNSSEC, update ACLs, moves) ``dns_zone``; records
+# ``dns_record``. A route whose answer carries several types needs each of
+# them. A route missing from this map admits nobody;
+# ``tests/test_dns_route_types.py`` fails until it is classified.
+_G = ("dns_group",)
+_Z = ("dns_zone",)
+_R = ("dns_record",)
+_DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
+    # server groups
+    "GET /groups": _G,
+    "POST /groups": _G,
+    "GET /groups/{group_id}": _G,
+    "PUT /groups/{group_id}": _G,
+    "DELETE /groups/{group_id}": _G,
+    "POST /groups/{group_id}/group-tsig-key/rotate": _G,
+    "POST /groups/{group_id}/sync-with-servers": _G,
+    "GET /groups/{group_id}/dynamic-update-caps": _G,
+    # servers
+    "GET /groups/{group_id}/servers": _G,
+    "POST /groups/{group_id}/servers": _G,
+    "PUT /groups/{group_id}/servers/{server_id}": _G,
+    "DELETE /groups/{group_id}/servers/{server_id}": _G,
+    "POST /groups/{group_id}/servers/{server_id}/approve": _G,
+    "POST /groups/{group_id}/servers/{server_id}/pause": _G,
+    "POST /groups/{group_id}/servers/{server_id}/resume": _G,
+    "POST /groups/{group_id}/servers/{server_id}/test-connection": _G,
+    "POST /groups/{group_id}/servers/{server_id}/pull-zones-from-server": _G,
+    "POST /groups/{group_id}/servers/{server_id}/sync-from-server": _G,
+    "POST /test-windows-credentials": _G,
+    "GET /servers/{server_id}/recent-events": _G,
+    "GET /servers/{server_id}/rendered-config": _G,
+    "GET /servers/{server_id}/rndc-status": _G,
+    # a server's view of every zone in its group, and its queued record ops
+    "GET /servers/{server_id}/zone-state": ("dns_group", "dns_zone"),
+    "GET /servers/{server_id}/pending-ops": ("dns_group", "dns_record"),
+    "POST /servers/{server_id}/apply-record": _R,
+    # options, forwarders, trust anchors, DNSSEC policies
+    "GET /groups/{group_id}/options": _G,
+    "PUT /groups/{group_id}/options": _G,
+    "POST /groups/{group_id}/options/trust-anchors": _G,
+    "DELETE /groups/{group_id}/options/trust-anchors/{anchor_id}": _G,
+    "GET /forwarder-presets": _G,
+    "GET /dnssec-policies": _G,
+    "POST /dnssec-policies": _G,
+    "PUT /dnssec-policies/{policy_id}": _G,
+    "DELETE /dnssec-policies/{policy_id}": _G,
+    # ACLs, TSIG keys, views
+    "GET /groups/{group_id}/acls": _G,
+    "POST /groups/{group_id}/acls": _G,
+    "PUT /groups/{group_id}/acls/{acl_id}": _G,
+    "DELETE /groups/{group_id}/acls/{acl_id}": _G,
+    "GET /groups/{group_id}/tsig-keys/generate-secret": _G,
+    "GET /groups/{group_id}/tsig-keys": _G,
+    "POST /groups/{group_id}/tsig-keys": _G,
+    "GET /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "PUT /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "POST /groups/{group_id}/tsig-keys/{key_id}/rotate": _G,
+    "DELETE /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "GET /groups/{group_id}/views": _G,
+    "POST /groups/{group_id}/views": _G,
+    "PUT /groups/{group_id}/views/{view_id}": _G,
+    "DELETE /groups/{group_id}/views/{view_id}": _G,
+    # zones
+    "GET /groups/{group_id}/zones": _Z,
+    "POST /groups/{group_id}/zones": _Z,
+    "POST /groups/{group_id}/zones/from-template": _Z,
+    "GET /groups/{group_id}/zones/{zone_id}": _Z,
+    "PUT /groups/{group_id}/zones/{zone_id}": _Z,
+    "DELETE /groups/{group_id}/zones/{zone_id}": _Z,
+    # a zone's state on each server of its group (server names and hosts),
+    # and its update ACL, which names the group's TSIG keys
+    "GET /groups/{group_id}/zones/{zone_id}/server-state": ("dns_zone", "dns_group"),
+    "GET /groups/{group_id}/zones/{zone_id}/update-acl": ("dns_zone", "dns_group"),
+    "PUT /groups/{group_id}/zones/{zone_id}/update-acl": _Z,
+    "GET /groups/{group_id}/zones/{zone_id}/dnssec/info": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/sign": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/unsign": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/rollover": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/move/preview": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/move/commit": _Z,
+    "GET /zone-templates": _Z,
+    "GET /tld-registry": _Z,
+    "GET /tld-registry/classify": _Z,
+    "POST /tld-registry/refresh": _Z,
+    # zones with their records: exports, the live-vs-DB diff (reported per
+    # server, so it carries the group's servers too), and delegation, which
+    # reads and writes NS + glue records in the parent zone
+    "GET /groups/{group_id}/zones/export": ("dns_zone", "dns_record"),
+    "GET /groups/{group_id}/zones/{zone_id}/export": ("dns_zone", "dns_record"),
+    "GET /groups/{group_id}/zones/{zone_id}/drift": ("dns_zone", "dns_record", "dns_group"),
+    "GET /groups/{group_id}/zones/{zone_id}/delegation-preview": ("dns_zone", "dns_record"),
+    "POST /groups/{group_id}/zones/{zone_id}/delegate-from-parent": ("dns_zone", "dns_record"),
+    # records
+    "GET /groups/{group_id}/records": _R,
+    "GET /groups/{group_id}/zones/{zone_id}/records": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/records": _R,
+    "PUT /groups/{group_id}/zones/{zone_id}/records/{record_id}": _R,
+    "DELETE /groups/{group_id}/zones/{zone_id}/records/{record_id}": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/records/bulk-delete": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/records/bulk-create": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/preview": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/commit": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/sync-with-server": _R,
+    "GET /groups/{group_id}/zones/{zone_id}/import/template": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit": _R,
+}
+_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns")
+
 # The upload routes here check the login from the request headers before
 # the multipart body is read (app.api.pre_body_auth, #2780).
 router = APIRouter(
     route_class=PreBodyAuthUploadRoute,
-    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))],
+    dependencies=[Depends(_DNS_GATE)],
 )
+
 
 # The router gate takes the action from the HTTP method, so a POST asks for
 # ``write``. A POST that answers with the zone's existing records (an import
 # preview / commit, a sync-with-server) also needs what a GET of those records
-# needs: ``read`` on any of the three types, as the export and record list ask.
-_DNS_RECORDS_READ = require_any_permission(
-    ("read", "dns_group"), ("read", "dns_zone"), ("read", "dns_record")
-)
+# needs: ``read`` on ``dns_record``, as the record list asks.
+async def _dns_records_read(request: Request, current_user: CurrentUser, db: DB) -> Any:
+    if not type_level_allows(current_user, "read", "dns_record"):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="read",
+            resource_type="dns_record",
+            resource_id="",
+            resource_display="dns_record:*",
+            reason="permission denied (read on dns_record)",
+            detail="Permission denied: need 'read' on 'dns_record'",
+        )
+    return current_user
+
+
+_dns_records_read.spatium_requires = ("exact", [("read", "dns_record")])  # type: ignore[attr-defined]
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
 # don't also need a schema edit to be accepted on create/update.
@@ -1941,8 +2066,23 @@ def _enforce_bind_check_names(
 
 
 @router.get("/groups", response_model=list[ServerGroupResponse])
-async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
-    result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
+async def list_groups(db: DB, current_user: CurrentUser) -> list[ServerGroupResponse]:
+    stmt = select(DNSServerGroup).order_by(DNSServerGroup.name)
+    # A zone-bound API token lists only the groups its zones sit in (#3073),
+    # as ``token_path_scope`` holds it to them on every ``{group_id}`` route.
+    # A ``dns_group`` grant of the token's own admits the groups it names.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    token_group_ids = token_scoped_resource_ids(current_user, "dns_group")
+    if token_zone_ids is not None and token_group_ids is not None:
+        stmt = stmt.where(
+            or_(
+                DNSServerGroup.id.in_(
+                    select(DNSZone.group_id).where(DNSZone.id.in_(token_zone_ids))
+                ),
+                DNSServerGroup.id.in_(_uuids_of(token_group_ids)),
+            )
+        )
+    result = await db.execute(stmt)
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
@@ -3640,7 +3780,8 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
             raise HTTPException(
                 422,
                 "A TLS certificate is required to enable DoT, DoH or DoQ. "
-                "Upload or issue one under Appliance → Web UI Certificate first.",
+                "Upload or issue one through "
+                f"{certificate_store_location(settings.appliance_mode)} first.",
             )
         cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
         if cert is None:
@@ -9878,7 +10019,7 @@ async def _queue_import_ops(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
-    dependencies=[Depends(_DNS_RECORDS_READ)],
+    dependencies=[Depends(_dns_records_read)],
 )
 async def import_zone_preview(
     group_id: uuid.UUID,
@@ -9921,7 +10062,7 @@ async def import_zone_preview(
     response_model=ImportCommitResponse,
     dependencies=[
         Depends(require_permission("write", "dns_record")),
-        Depends(_DNS_RECORDS_READ),
+        Depends(_dns_records_read),
     ],
 )
 async def import_zone_commit(
@@ -10163,7 +10304,7 @@ class SyncWithServerResponse(BaseModel):
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/sync-with-server",
     response_model=SyncWithServerResponse,
-    dependencies=[Depends(_DNS_RECORDS_READ)],
+    dependencies=[Depends(_dns_records_read)],
 )
 async def sync_zone_with_server_endpoint(
     group_id: uuid.UUID,
@@ -10590,7 +10731,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
     response_model=SheetImportPreviewResponse,
-    dependencies=[Depends(_DNS_RECORDS_READ)],
+    dependencies=[Depends(_dns_records_read)],
 )
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
@@ -10648,7 +10789,7 @@ async def import_zone_spreadsheet_preview(
     response_model=SheetImportCommitResponse,
     dependencies=[
         Depends(require_permission("write", "dns_record")),
-        Depends(_DNS_RECORDS_READ),
+        Depends(_dns_records_read),
     ],
 )
 async def import_zone_spreadsheet_commit(
@@ -10893,6 +11034,17 @@ def _enforce_zone_token_scope(user: Any, zone_id: uuid.UUID) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API token is not scoped to this DNS zone",
         )
+
+
+def _uuids_of(ids: set[str]) -> list[uuid.UUID]:
+    """The ids that parse as UUIDs; a malformed grant id matches nothing."""
+    out: list[uuid.UUID] = []
+    for raw in ids:
+        try:
+            out.append(uuid.UUID(raw))
+        except ValueError:
+            continue  # a malformed grant id names no group
+    return out
 
 
 def _zone_token_id_filter(user: Any) -> set[uuid.UUID] | None:

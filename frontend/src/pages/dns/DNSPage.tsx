@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import {
@@ -103,6 +103,7 @@ import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   applianceTlsApi,
+  versionApi,
   dnsApi,
   settingsApi,
   dnsBlocklistApi,
@@ -173,15 +174,13 @@ import {
 } from "@/lib/approvalQueue";
 
 // #1338 — a read-only user is offered no DNS write it would be refused.
-// The DNS router admits a write (a delete) on any of its three resource
-// types (dns/router.py, ``require_any_resource_permission``); record writes
-// need nothing more. #1861 — zone writes also take ``dns_zone``, view and
-// ACL writes ``dns_group``, a zone-file import ``dns_record``, and blocklist
-// entry / exception writes ``dns_blocklist``, each with the HTTP method's
-// action (``delete`` for a delete). Server groups, servers, server options,
-// TSIG keys, DNSSEC, dynamic-update ACLs, zone moves, blocklist
-// subscriptions and pools stay superadmin-only. The controls ask the same.
-const DNS_RESOURCES = ["dns_group", "dns_zone", "dns_record"];
+// Each DNS route needs the HTTP method's action on the type it serves
+// (dns/router.py ``_DNS_ROUTE_TYPES``, #3073): record writes ``dns_record``,
+// zone writes ``dns_zone``, view and ACL writes ``dns_group`` (#1861), and
+// blocklist entry / exception writes ``dns_blocklist`` (``delete`` for a
+// delete). Server groups, servers, server options, TSIG keys, DNSSEC,
+// dynamic-update ACLs, zone moves, blocklist subscriptions and pools stay
+// superadmin-only. The controls ask the same.
 const NEEDS_DNS_WRITE = "Requires write permission on DNS records";
 const NEEDS_DNS_DELETE = "Requires delete permission on DNS records";
 const NEEDS_RECORD_WRITE = NEEDS_DNS_WRITE;
@@ -197,8 +196,8 @@ function useDnsGrants() {
   return {
     isSuperadmin: perms.isSuperadmin,
     can: perms.can,
-    canWriteRecords: DNS_RESOURCES.some((t) => perms.can("write", t)),
-    canDeleteRecords: DNS_RESOURCES.some((t) => perms.can("delete", t)),
+    canWriteRecords: perms.can("write", "dns_record"),
+    canDeleteRecords: perms.can("delete", "dns_record"),
   };
 }
 
@@ -637,7 +636,7 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
  *  never sends a delete it knows will be refused. The server's refusal stays
  *  the backstop and its reason shows in the dialog. What a delete still takes
  *  is the group's zones already in Trash, for good. */
-function DeleteDNSGroupModal({
+export function DeleteDNSGroupModal({
   group,
   onConfirm,
   onClose,
@@ -660,6 +659,36 @@ function DeleteDNSGroupModal({
     queryKey: ["dns-zones", group.id],
     queryFn: () => dnsApi.listZones(group.id),
   });
+  // What else a delete destroys (#3112): the group's views, ACLs and TSIG keys
+  // go with it by FK cascade and none of it goes to Trash. Counted from the
+  // lists the group's tabs already read; one that fails to load is named
+  // without a number.
+  const configQs = [
+    {
+      one: "view",
+      many: "views",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "views", group.id],
+        queryFn: () => dnsApi.listViews(group.id),
+      }),
+    },
+    {
+      one: "ACL",
+      many: "ACLs",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "acls", group.id],
+        queryFn: () => dnsApi.listAcls(group.id),
+      }),
+    },
+    {
+      one: "TSIG key",
+      many: "TSIG keys",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "tsig-keys", group.id],
+        queryFn: () => dnsApi.listTSIGKeys(group.id),
+      }),
+    },
+  ];
   const title = "Delete Server Group";
 
   if (serversQ.isPending || zonesQ.isPending) {
@@ -702,11 +731,33 @@ function DeleteDNSGroupModal({
       </Modal>
     );
   }
+  // Only the delete path needs the configuration counts.
+  if (configQs.some(({ q }) => q.isPending)) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" holds…
+        </p>
+      </Modal>
+    );
+  }
+  const held = configQs
+    .map(({ one, many, q }) => ({ one, many, count: q.data?.length ?? null }))
+    .filter((k) => k.count === null || k.count > 0)
+    .map((k) =>
+      k.count === null
+        ? `its ${k.many}`
+        : `${k.count} ${k.count === 1 ? k.one : k.many}`,
+    );
+  const config =
+    held.length > 0
+      ? ` The group's own configuration is deleted with it, none of it into Trash: ${held.join(", ")}.`
+      : "";
   return (
     <ConfirmDestroyModal
       title={title}
-      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records, and can no longer be restored.`}
-      checkLabel={`I understand the group "${group.name}" and its zones in Trash will be deleted for good.`}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records and pools, and can no longer be restored.${config} Its server options go too. None of this can be restored.`}
+      checkLabel={`I understand the group "${group.name}", its zones in Trash and its views, ACLs, TSIG keys and options will be deleted for good.`}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
@@ -1737,10 +1788,11 @@ export function ServerModal({
             <code className="rounded bg-emerald-500/20 px-1">
               ghcr.io/spatiumnorth/dns-technitium
             </code>{" "}
-            container alongside this server. v1 supports primary zones +
-            standard record types; DNSSEC, native DoT/DoH/DoQ listeners, and
-            secondary zones are on the roadmap. The agent provisions and rotates
-            its own API token automatically — leave the field below blank.
+            container alongside this server. Serves primary, secondary, stub and
+            forward zones, and native DoT, DoH and DoQ listeners (set from the
+            group&apos;s Options). DNSSEC signing is BIND9 and PowerDNS only.
+            The agent provisions and rotates its own API token automatically —
+            leave the field below blank.
           </div>
         )}
         {driver === "technitium_api" && (
@@ -7389,7 +7441,7 @@ export function RevealedSecretModal({
 
 // ── Options Tab ───────────────────────────────────────────────────────────────
 
-function OptionsTab({ groupId }: { groupId: string }) {
+export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
   const { isSuperadmin } = useDnsGrants();
@@ -7406,6 +7458,14 @@ function OptionsTab({ groupId }: { groupId: string }) {
     queryFn: () => applianceTlsApi.list(),
     retry: false,
   });
+  // #3045 — where that store is managed. Web UI Certificate is an entry in
+  // Appliance → Fleet's side list, and Fleet shows it only on an
+  // appliance-hosted control plane; Docker / Kubernetes reach it by API.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+  });
+  const applianceMode = versionInfo?.appliance_mode ?? true;
 
   // Options the agent-managed Technitium driver cannot apply (#1763): the
   // API refuses a non-default value for a group holding such a server, so the
@@ -8232,10 +8292,27 @@ function OptionsTab({ groupId }: { groupId: string }) {
           </select>
         </Field>
         <p className="text-xs text-muted-foreground">
-          Managed under Appliance → Web UI Certificate — upload one, or issue it
-          from Let's Encrypt with the built-in ACME client. Renewals are picked
-          up automatically. A listener with no usable certificate is skipped and
-          the server stays Do53-only rather than failing to start.
+          {applianceMode ? (
+            <>
+              Managed under{" "}
+              <Link to="/appliance?tab=tls" className="underline">
+                Appliance → Fleet → Web UI Certificate
+              </Link>{" "}
+              — upload one, or issue it from Let's Encrypt with the built-in
+              ACME client.
+            </>
+          ) : (
+            <>
+              This control plane runs on Docker or Kubernetes, which has no
+              certificate page: upload one with{" "}
+              <code>POST /api/v1/appliance/tls/upload</code>, or issue it from
+              Let's Encrypt with <code>POST /api/v1/appliance/acme/issue</code>,
+              and it is listed here.
+            </>
+          )}{" "}
+          Renewals are picked up automatically. A listener with no usable
+          certificate is skipped and the server stays Do53-only rather than
+          failing to start.
         </p>
 
         <div className="flex items-center justify-between border-t pt-3">

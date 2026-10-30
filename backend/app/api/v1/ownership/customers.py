@@ -23,12 +23,28 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ownership import CUSTOMER_STATUSES, Customer
 
 router = APIRouter(
     tags=["customers"],
-    dependencies=[Depends(require_resource_permission("customer"))],
+    dependencies=[
+        Depends(
+            require_resource_permission(
+                "customer",
+                # A grant scoped to one customer (#3039) reaches that row's detail
+                # and edit and the list, which narrows to the granted rows.
+                instance_routes=(
+                    "customer",
+                    "GET /",
+                    frozenset({"GET /{customer_id}"}),
+                    frozenset({"PUT /{customer_id}"}),
+                ),
+                instance_param="customer_id",
+                prefix="/customers",
+            )
+        )
+    ],
 )
 
 
@@ -100,7 +116,7 @@ class CustomerBulkDelete(BaseModel):
 @router.get("", response_model=CustomerListResponse)
 async def list_customers(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     status: Literal["active", "inactive", "decommissioning"] | None = Query(default=None),
@@ -119,6 +135,15 @@ async def list_customers(
                 Customer.name.ilike(needle),
                 Customer.account_number.ilike(needle),
                 Customer.contact_email.ilike(needle),
+            )
+        )
+    # A caller admitted only by grants scoped to individual rows (#3039) sees
+    # those rows and no others.
+    if not user_has_permission(user, "read", "customer"):
+        ids = (await db.execute(select(Customer.id))).scalars().all()
+        stmt = stmt.where(
+            Customer.id.in_(
+                [i for i in ids if user_has_permission(user, "read", "customer", str(i))]
             )
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0

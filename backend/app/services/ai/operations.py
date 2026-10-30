@@ -1871,7 +1871,9 @@ register(
         apply=_apply_create_ip_address,
         validate_submit=_validate_submit_create_ip_address,
         category="ipam",
-        required_permission=("write", "ip_address"),
+        # The REST address write needs ``write`` on the subnet that owns the
+        # address (#3058); the apply path delegates to that handler.
+        required_permission=("write", "subnet"),
     )
 )
 

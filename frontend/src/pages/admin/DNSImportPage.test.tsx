@@ -98,3 +98,21 @@ describe("PreviewPanel apex NS choice (#1892)", () => {
     expect(onCommit).toHaveBeenCalledWith("replace");
   });
 });
+
+describe("PreviewPanel zone notes (#3097)", () => {
+  it("shows the text of each zone's parse warnings", () => {
+    const z = {
+      ...zone("example.com.", []),
+      parse_warnings: ["Skipped 2 DNSSEC records.", "Line 14: bad TTL."],
+    };
+    renderPanel(preview([z]));
+    const list = screen.getByRole("list", { name: "Notes for example.com." });
+    expect(list.textContent).toContain("Skipped 2 DNSSEC records.");
+    expect(list.textContent).toContain("Line 14: bad TTL.");
+  });
+
+  it("shows no notes list for a zone without warnings", () => {
+    renderPanel(preview([zone("example.com.", [])]));
+    expect(screen.queryByRole("list", { name: /^Notes for/ })).toBeNull();
+  });
+});

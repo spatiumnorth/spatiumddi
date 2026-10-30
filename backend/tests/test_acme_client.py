@@ -1178,6 +1178,45 @@ async def test_secret_expiring_covers_letsencrypt_web_cert(
     assert f"appliance_cert_tls:{far.id}" not in ids
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("appliance_mode", [True, False])
+async def test_secret_expiring_le_message_names_where_the_cert_is_managed(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    appliance_mode: bool,
+) -> None:
+    """#3045 — the alert sends the operator to the Web UI Certificate entry
+    under Appliance → Fleet (there is no Appliance tab of that name), and only
+    on an appliance-hosted control plane, the one place Fleet shows it."""
+    from datetime import UTC, datetime
+
+    from app.config import settings
+    from app.models.alerts import AlertRule
+    from app.services.alerts import _matching_secret_expiring_subjects
+
+    monkeypatch.setattr(settings, "appliance_mode", appliance_mode)
+    now = datetime.now(UTC)
+    rule = AlertRule(
+        name="Secret expiry",
+        rule_type="secret_expiring",
+        severity="warning",
+        threshold_days=30,
+        enabled=True,
+    )
+    db_session.add(rule)
+    near = await _seed_le_cert(db_session, days_to_expiry=5, sans=["ui.example.com"])
+    await db_session.commit()
+
+    subjects = await _matching_secret_expiring_subjects(db_session, rule, now)
+    messages = [m for sid, _d, m, _s in subjects if sid == f"appliance_cert_tls:{near.id}"]
+    assert len(messages) == 1
+    if appliance_mode:
+        assert "check Appliance → Fleet → Web UI Certificate." in messages[0]
+    else:
+        assert "Web UI Certificate" not in messages[0]
+        assert "POST /api/v1/appliance/acme/issue" in messages[0]
+
+
 # ── (i) Manual DNS-01 propagation check queries authoritative NS ─────
 
 

@@ -16,9 +16,9 @@ to the dominant resource type each report draws from:
   so it must gate on the same resource type the canonical customers
   surface does, not on the ``ip_address`` rows we happen to count)
 * top-modified      → ``read`` on ``audit_log``
-* top-dns-clients   → ``read`` on ``server`` OR ``dns_group`` (the DNS
-  query-log surface in the Logs router gates on ``server``; we accept
-  the DNS family root too)
+* top-dns-clients   → ``read`` on ``server``, the grant the DNS query log
+  in the Logs router takes. It ranks every server's clients, so a grant
+  on one ``dns_group`` is not enough (#3130)
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
-from app.core.permissions import require_any_permission, require_permission
+from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.logs import DNSQueryLogEntry
@@ -329,7 +329,7 @@ async def top_modified_resources(db: DB) -> TopModifiedResourcesReport:
 @router.get(
     "/top-dns-clients",
     response_model=TopDNSClientsReport,
-    dependencies=[Depends(require_any_permission(("read", "server"), ("read", "dns_group")))],
+    dependencies=[Depends(require_permission("read", "server"))],
 )
 async def top_dns_clients(db: DB) -> TopDNSClientsReport:
     """Top 10 noisiest DNS query-log clients (24 h retention window)."""
