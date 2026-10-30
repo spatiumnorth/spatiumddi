@@ -3569,10 +3569,13 @@ export function AddAddressModal({
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   // Fetch effective DNS for this subnet to know which zones are available
-  const { data: effectiveDns } = useQuery({
+  // Always re-read on open: Edit Subnet can have moved the primary zone since
+  // the last read, and the dialog sends what it shows (#3078).
+  const { data: effectiveDns, isFetching: effectiveFetching } = useQuery({
     queryKey: ["effective-dns-subnet", subnetId],
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId),
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   // Issue #25 — split-horizon mode flips the modal into multi-zone
   // picker rendering. Read straight off the subnet row.
@@ -3622,6 +3625,11 @@ export function AddAddressModal({
   const zonesSettled = zoneQueries.every(
     (q: { isLoading: boolean }) => !q.isLoading,
   );
+  // The pick is not final while zones are still on their way or the subnet's
+  // DNS is being re-read over a cached copy: Allocate waits (#3080).
+  const zonesPending =
+    dnsOn &&
+    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
   useEffect(() => {
     if (dnsZoneTouched || availableZones.length === 0) return;
     const target =
@@ -3637,9 +3645,10 @@ export function AddAddressModal({
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
       // "None (no DNS record)" is sent as "" — an absent / null zone means
-      // "use the subnet's effective zone" to the API (#2466).
-      const zoneParam =
-        dnsZoneId || (availableZones.length > 0 ? "" : undefined);
+      // "use the subnet's effective zone" to the API (#2466). "" goes out only
+      // when the operator picked None (#3080): an untouched, still-empty pick
+      // is no choice at all, so it is left to the subnet's own zone.
+      const zoneParam = dnsZoneId || (dnsZoneTouched ? "" : undefined);
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
         .filter((a) => a.name.length > 0);
@@ -3749,6 +3758,7 @@ export function AddAddressModal({
   const canSubmit =
     !!hostname.trim() &&
     !hostnameErr &&
+    !zonesPending &&
     (mode === "next" ? !!nextPreview?.address : !!address);
 
   // Compute preview FQDN
@@ -4187,6 +4197,11 @@ export function AddAddressModal({
                   mutation.mutate(pendingWarnings != null);
                 }}
                 disabled={!canSubmit || mutation.isPending}
+                title={
+                  zonesPending
+                    ? "Waiting for the subnet's DNS zones to load"
+                    : undefined
+                }
                 className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {mutation.isPending
@@ -8416,6 +8431,9 @@ export function EditSubnetModal({
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
+      // The zones Allocate IP / Bulk allocate offer come from here (#3078).
+      qc.invalidateQueries({ queryKey: ["effective-dns-subnet"] });
+      qc.invalidateQueries({ queryKey: ["subnet", subnet.id] });
       // Refresh "Subnets using this VLAN" lists on the VLANs page
       qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
       onClose(updated);
