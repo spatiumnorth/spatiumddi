@@ -2044,7 +2044,8 @@ WAN IP, a peer's NAT endpoint).
   on either side).
 - **Per-subnet listing** — `GET /ipam/nat-mappings/by-subnet/{id}`
   uses Postgres `inet <<= cidr` containment to find every mapping
-  whose internal IP falls inside a subnet's CIDR.
+  whose internal or external IP falls inside a subnet's CIDR, plus
+  every hide-NAT mapping pinned to the subnet as its source (#2617).
 
 UI: clicking the NAT badge on an IP row opens a modal listing
 every mapping for that IP; new "NAT" tab on the subnet detail

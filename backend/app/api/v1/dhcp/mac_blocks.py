@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
@@ -25,6 +25,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPMACBlock, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
@@ -89,7 +90,10 @@ class MACBlockUpdate(BaseModel):
     # ``mac_address`` is immutable once created — change means "delete
     # the row and add a new one" so the audit trail for each MAC stays
     # linear. Everything else can be toggled.
-    reason: Literal["rogue", "lost_stolen", "quarantine", "policy", "other"] | None = None
+    # A block made from New Devices carries the operator's free text, so an
+    # update must accept the reason the block already holds (#3083); any
+    # other value is still held to the five codes in the handler.
+    reason: str | None = Field(default=None, max_length=20)
     description: str | None = None
     enabled: bool | None = None
     expires_at: datetime | None = None
@@ -254,6 +258,15 @@ async def update_mac_block(
         raise HTTPException(status_code=404, detail="MAC block not found")
 
     changes = body.model_dump(exclude_unset=True)
+    if changes.get("reason") is None:
+        changes.pop("reason", None)  # NOT NULL column: null means "leave it"
+    elif changes["reason"] not in _VALID_REASONS and changes["reason"] != block.reason:
+        raise HTTPException(
+            status_code=422,
+            detail="reason must be one of rogue, lost_stolen, quarantine, policy or other "
+            "(or the reason the block already holds)",
+        )
+    before = snapshot(block, changes)
     for k, v in changes.items():
         setattr(block, k, v)
     block.updated_by_user_id = user.id
@@ -265,7 +278,7 @@ async def update_mac_block(
         resource_type="dhcp_mac_block",
         resource_id=str(block.id),
         resource_display=str(block.mac_address),
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     collect_wake(dhcp_group_channel(block.group_id))

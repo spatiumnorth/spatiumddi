@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
   formatApiError,
+  formatDialogError,
   rolesApi,
   type AppRole,
   type PermissionEntry,
@@ -184,10 +185,7 @@ function RoleModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Failed to save role";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatDialogError(err, "Failed to save role"));
     },
   });
 
@@ -277,10 +275,7 @@ function CloneModal({ role, onClose }: { role: AppRole; onClose: () => void }) {
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail ?? "Clone failed";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatDialogError(err, "Clone failed"));
     },
   });
 

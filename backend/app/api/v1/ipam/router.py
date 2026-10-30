@@ -42,6 +42,7 @@ from app.core.permissions import (
     require_any_resource_or_scoped,
     token_scope_allows,
     token_scoped_resource_ids,
+    type_level_allows,
     user_has_permission,
 )
 from app.models.address_set import AddressSet
@@ -155,14 +156,13 @@ DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_do
 
 # Router-level permission gate: GET → `read`, POST/PUT/PATCH → `write`,
 # DELETE → `delete`, and the multi-row delete POSTs (`/addresses/bulk-delete`,
-# `/subnets/{id}/orphans/purge`) → `delete` too. Endpoints under /ipam manipulate IPAM resources, so we
-# accept any of the IPAM resource types (an "IPAM Editor" role grants all
-# four; a scoped Subnet-writer role would be matched here for subnet routes
-# and fail for space routes — which is intended). ``address_set`` is admitted
-# separately, on ``_ADDRESS_SET_ROUTES`` only, so the "Address Set Editor" role
-# (admin on address_set only, #103) reaches the per-IP delegation gate
-# (``_user_can_write_ip``) and nothing else. Per-row scoping happens inline in
-# the handlers via `user_has_permission`.
+# `/subnets/{id}/orphans/purge`) → `delete` too. Each route needs that action on
+# the type(s) ``_IPAM_ROUTE_TYPES`` maps it to (#3058) — a grant on some other
+# IPAM type (``nat_mapping``, ``custom_field``, …) no longer opens it.
+# ``address_set`` is admitted separately, on ``_ADDRESS_SET_ROUTES`` only, so
+# the "Address Set Editor" role (admin on address_set only, #103) reaches the
+# per-IP delegation gate (``_user_can_write_ip``) and nothing else. Per-row
+# scoping happens inline in the handlers via `user_has_permission`.
 _IPAM_GATE_TYPES = (
     "ip_space",
     "ip_block",
@@ -195,6 +195,22 @@ _SUBNET_INSTANCE_ROUTES = (
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
 )
 
+# A grant scoped to ONE space or ONE block (#3039) reaches that item's own
+# detail and edit and the collection (narrowed by its handler). The grant names
+# the item itself: it does not inherit down to the blocks or subnets inside it.
+_SPACE_INSTANCE_ROUTES = (
+    "ip_space",
+    "GET /spaces",
+    frozenset({"GET /spaces/{space_id}"}),
+    frozenset({"PUT /spaces/{space_id}"}),
+)
+_BLOCK_INSTANCE_ROUTES = (
+    "ip_block",
+    "GET /blocks",
+    frozenset({"GET /blocks/{block_id}"}),
+    frozenset({"PUT /blocks/{block_id}"}),
+)
+
 # The mutating routes an address-set delegate may reach (#103). Each handler
 # here resolves the caller's writable set ranges (``_load_writable_set_ranges``)
 # and checks every address it touches with ``_user_can_write_ip``, which is the
@@ -221,9 +237,171 @@ _ADDRESS_SET_ROUTES = frozenset(
     }
 )
 
+# What each route under /ipam needs (#3058): the method's action on EVERY type
+# listed. A route reads or writes the type it serves; a route whose answer
+# carries several types (an address list with its subnet, the free space of a
+# block, an export) needs each of them, so it never shows more than the types'
+# own routes would. Writes name the type their handler re-checks inline
+# (``_require_type_write``, or ``write`` on the subnet for an address write —
+# the subnet owns its addresses, #103), so the gate and the handler agree.
+# The nested routers (NAT, templates, plans) keep their own gate as well.
+# A route missing here admits no type-level grant at all: a route added later
+# stays closed until it is classified, and
+# ``tests/test_ipam_route_types.py`` fails until it is.
+_SPACE = ("ip_space",)
+_BLOCK = ("ip_block",)
+_SUBNET = ("subnet",)
+_ADDR = ("ip_address",)
+_SUBNET_ADDR = ("subnet", "ip_address")
+_BLOCK_OCCUPANCY = ("ip_block", "subnet")
+_NAT = ("nat_mapping",)
+_TEMPLATES = ("manage_ipam_templates",)
+_IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
+    # ── spaces ──
+    "GET /spaces": _SPACE,
+    "POST /spaces": _SPACE,
+    "GET /spaces/{space_id}": _SPACE,
+    "PUT /spaces/{space_id}": _SPACE,
+    "DELETE /spaces/{space_id}": _SPACE,
+    "GET /spaces/{space_id}/effective-dns": _SPACE,
+    "GET /spaces/{space_id}/effective-dhcp": _SPACE,
+    # Free CIDRs in a space are its blocks' and subnets' occupancy inverted.
+    "POST /spaces/{space_id}/find-free": _BLOCK_OCCUPANCY,
+    # The preview lists the DNS records the space's addresses would get.
+    "GET /spaces/{space_id}/dns-sync/preview": ("ip_space", "ip_address"),
+    "POST /spaces/{space_id}/dns-sync/commit": _SPACE,
+    "POST /spaces/{space_id}/reverse-zones/backfill": _SPACE,
+    # ── blocks ──
+    "GET /blocks": _BLOCK,
+    "POST /blocks": _BLOCK,
+    "GET /blocks/{block_id}": _BLOCK,
+    "PUT /blocks/{block_id}": _BLOCK,
+    "DELETE /blocks/{block_id}": _BLOCK,
+    "GET /blocks/{block_id}/effective-dns": _BLOCK,
+    "GET /blocks/{block_id}/effective-ddns": _BLOCK,
+    "GET /blocks/{block_id}/effective-dhcp": _BLOCK,
+    "GET /blocks/{block_id}/effective-fields": _BLOCK,
+    "GET /blocks/{block_id}/available-subnets": _BLOCK_OCCUPANCY,
+    "GET /blocks/{block_id}/free-space": _BLOCK_OCCUPANCY,
+    "GET /blocks/{block_id}/aggregation-suggestions": _BLOCK_OCCUPANCY,
+    "POST /blocks/{block_id}/plan-allocation": _BLOCK_OCCUPANCY,
+    "POST /blocks/{block_id}/allocate-subnet": _SUBNET,
+    "POST /blocks/{block_id}/resize/preview": _BLOCK,
+    "POST /blocks/{block_id}/resize": _BLOCK,
+    "POST /blocks/{block_id}/move/preview": _BLOCK,
+    "POST /blocks/{block_id}/move/commit": _BLOCK,
+    "GET /blocks/{block_id}/dns-sync/preview": ("ip_block", "ip_address"),
+    "POST /blocks/{block_id}/dns-sync/commit": _BLOCK,
+    "POST /blocks/{block_id}/reverse-zones/backfill": _BLOCK,
+    "POST /aggregation-snoozes/snooze": _BLOCK,
+    "POST /aggregation-snoozes/dismiss": _BLOCK,
+    "POST /aggregation-snoozes/clear": _BLOCK,
+    # ── subnets ──
+    "GET /subnets": _SUBNET,
+    "POST /subnets": _SUBNET,
+    "POST /subnets/bulk-edit": _SUBNET,
+    "GET /subnets/{subnet_id}": _SUBNET,
+    "PUT /subnets/{subnet_id}": _SUBNET,
+    "DELETE /subnets/{subnet_id}": _SUBNET,
+    "GET /subnets/{subnet_id}/utilization-history": _SUBNET,
+    "GET /subnets/{subnet_id}/probe-policy": _SUBNET,
+    "GET /subnets/{subnet_id}/effective-dns": _SUBNET,
+    "GET /subnets/{subnet_id}/effective-ddns": _SUBNET,
+    "GET /subnets/{subnet_id}/effective-dhcp": _SUBNET,
+    "GET /subnets/{subnet_id}/effective-fields": _SUBNET,
+    "GET /subnets/{subnet_id}/next-ip-preview": _SUBNET,
+    "GET /subnets/{subnet_id}/domains": _SUBNET,
+    "POST /subnets/{subnet_id}/domains": _SUBNET,
+    "DELETE /subnets/{subnet_id}/domains/{domain_id}": _SUBNET,
+    "POST /subnets/{subnet_id}/discover": _SUBNET,
+    "POST /subnets/{subnet_id}/resize/preview": _SUBNET,
+    "POST /subnets/{subnet_id}/resize": _SUBNET,
+    "POST /subnets/{subnet_id}/split/preview": _SUBNET,
+    "POST /subnets/{subnet_id}/split/commit": _SUBNET,
+    "POST /subnets/{subnet_id}/merge/preview": _SUBNET,
+    "POST /subnets/{subnet_id}/merge/commit": _SUBNET,
+    "POST /subnets/{subnet_id}/dns-sync/commit": _SUBNET,
+    "POST /subnets/{subnet_id}/reverse-zones/backfill": _SUBNET,
+    # The subnet's own addresses: a read on the subnet reaches them, as a grant
+    # scoped to the subnet does (#2438) — these are on its instance allow-list,
+    # which admits a type-level subnet read too.
+    "GET /subnets/{subnet_id}/addresses": _SUBNET,
+    "GET /subnets/{subnet_id}/aliases": _SUBNET,
+    "GET /subnets/{subnet_id}/network-context": _SUBNET,
+    "GET /subnets/{subnet_id}/reconciliation": _SUBNET,
+    # The DNS drift of the subnet's addresses (not on the instance allow-list:
+    # it lists orphan records of other subnets sharing the zone).
+    "GET /subnets/{subnet_id}/dns-sync/summary": _SUBNET_ADDR,
+    "GET /subnets/{subnet_id}/dns-sync/preview": _SUBNET_ADDR,
+    # Address writes: the handler checks ``write`` on the subnet (or an
+    # address set covering the address, admitted via _ADDRESS_SET_ROUTES).
+    "POST /subnets/{subnet_id}/addresses": _SUBNET,
+    "POST /subnets/{subnet_id}/next": _SUBNET,
+    "POST /subnets/{subnet_id}/bulk-allocate/preview": _SUBNET,
+    "POST /subnets/{subnet_id}/bulk-allocate": _SUBNET,
+    "POST /subnets/{subnet_id}/orphans/purge": _SUBNET,
+    # ── addresses ──
+    "GET /addresses/search": _ADDR,
+    "GET /addresses/search/ids": _ADDR,
+    "GET /addresses/{address_id}": _ADDR,
+    "GET /addresses/{address_id}/mac-history": _ADDR,
+    "GET /addresses/{address_id}/aliases": _ADDR,
+    "GET /addresses/{address_id}/dhcp-fingerprint": _ADDR,
+    "GET /addresses/{address_id}/network-context": _ADDR,
+    "PUT /addresses/{address_id}": _SUBNET,
+    "DELETE /addresses/{address_id}": _SUBNET,
+    "POST /addresses/{address_id}/aliases": _SUBNET,
+    "DELETE /addresses/{address_id}/aliases/{record_id}": _SUBNET,
+    "POST /addresses/{address_id}/profile": _SUBNET,
+    "POST /addresses/{address_id}/wake": _SUBNET,
+    "POST /addresses/bulk-edit": _SUBNET,
+    "POST /addresses/bulk-delete": _SUBNET,
+    # ── reports (address rows; the subnet CIDR on a row is the address's own
+    # context, as on the address search) ──
+    "GET /reports/stale-ips": _ADDR,
+    "POST /reports/stale-ips/deprecate": _SUBNET,
+    "GET /reports/hygiene": _ADDR,
+    "GET /reports/vendors": _ADDR,
+    "GET /reports/vendors/devices": _ADDR,
+    # ── import / export ──
+    # The whole-space import commit checks write on ip_block and subnet.
+    "POST /import/preview": _BLOCK_OCCUPANCY,
+    "POST /import/preview-json": _BLOCK_OCCUPANCY,
+    "POST /import/commit": _BLOCK_OCCUPANCY,
+    "POST /import/addresses/preview": _SUBNET,
+    "POST /import/addresses/commit": _SUBNET,
+    # An export or report carries the space, its blocks, subnets and addresses.
+    "GET /export": ("ip_space", "ip_block", "subnet", "ip_address"),
+    "GET /export.pdf": ("ip_space", "ip_block", "subnet", "ip_address"),
+    # ── nested routers (each keeps its own gate too) ──
+    "GET /nat-mappings": _NAT,
+    "POST /nat-mappings": _NAT,
+    "GET /nat-mappings/{mapping_id}": _NAT,
+    "PATCH /nat-mappings/{mapping_id}": _NAT,
+    "DELETE /nat-mappings/{mapping_id}": _NAT,
+    "GET /nat-mappings/by-ip/{ip_address_id}": _NAT,
+    "GET /nat-mappings/by-subnet/{subnet_id}": _NAT,
+    "GET /templates": _TEMPLATES,
+    "POST /templates": _TEMPLATES,
+    "GET /templates/{template_id}": _TEMPLATES,
+    "PUT /templates/{template_id}": _TEMPLATES,
+    "DELETE /templates/{template_id}": _TEMPLATES,
+    "POST /templates/{template_id}/apply": _TEMPLATES,
+    "POST /templates/{template_id}/reapply-all": _TEMPLATES,
+    "GET /plans": _BLOCK,
+    "POST /plans": _BLOCK,
+    "POST /plans/validate-tree": _BLOCK,
+    "GET /plans/{plan_id}": _BLOCK,
+    "PATCH /plans/{plan_id}": _BLOCK,
+    "DELETE /plans/{plan_id}": _BLOCK,
+    "POST /plans/{plan_id}/validate": _BLOCK,
+    "POST /plans/{plan_id}/reopen": _BLOCK,
+    "POST /plans/{plan_id}/apply": _BLOCK,
+}
+
 _IPAM_GATE = require_any_resource_or_scoped(
-    # Unscoped types: a normal (type-level / wildcard) grant on any of these
-    # admits the request.
+    # Recorded for the route walkers only: ``route_types`` below decides which
+    # type-level grant a route takes.
     _IPAM_GATE_TYPES,
     # Scoped admit (write/delete only): a delegate holding only an
     # instance-scoped ``{write, address_set, <id>}`` grant clears this coarse
@@ -237,7 +415,14 @@ _IPAM_GATE = require_any_resource_or_scoped(
     # is listed. Left off on purpose: the DNS drift report (lists orphan
     # records of other subnets sharing the zone), NAT by-subnet (a separate
     # resource type), and every structural / bulk / DNS-sync / delete write.
-    instance_routes={"subnet_id": _SUBNET_INSTANCE_ROUTES},
+    # Likewise one space (#3039) and one block (#3039): detail + edit only.
+    instance_routes={
+        "subnet_id": _SUBNET_INSTANCE_ROUTES,
+        "space_id": _SPACE_INSTANCE_ROUTES,
+        "block_id": _BLOCK_INSTANCE_ROUTES,
+    },
+    # Type-level grants: the route's own type(s), never "any IPAM type" (#3058).
+    route_types=_IPAM_ROUTE_TYPES,
 )
 
 router = APIRouter(dependencies=[Depends(_IPAM_GATE)])
@@ -251,11 +436,12 @@ def _require_type_write(
 ) -> None:
     """Per-type inline gate for the structural IPAM handlers (space/block/subnet
     create, update, resize, split, merge, move, purge, DNS sync, delete). The
-    router-level gate admits an any-of grant over the whole IPAM surface —
-    including peripheral types like ``nat_mapping`` and ``custom_field`` — so
-    without this a ``write:nat_mapping`` grant could mutate core structure it
-    holds no permission on (#508). (An ``address_set`` grant no longer reaches
-    these routes at all: the gate admits it on ``_ADDRESS_SET_ROUTES`` only.)
+    router-level gate takes the route's own type since #3058; this check
+    predates it (#508, when the gate admitted a grant on any IPAM type) and
+    stays as the handler's own statement of what it needs, including for a
+    resource-scoped grant the gate admits through an instance allow-list. (An
+    ``address_set`` grant reaches none of these routes: the gate admits it on
+    ``_ADDRESS_SET_ROUTES`` only.)
     ``action`` is ``write`` (the default) or ``delete`` for the delete routes.
     Superadmin and wildcard grants pass via ``user_has_permission``."""
     if not user_has_permission(current_user, action, resource_type, resource_id):
@@ -1020,6 +1206,86 @@ _SUBNET_BINDING_FIELDS = (
     "dns_group_ids",
     "ddns_domain_override",
 )
+
+
+# The same rule for a grant scoped to one space or one block (#3039): the grant
+# names that item, not the DNS / DHCP servers, zones, customer, site, VRF, ASN
+# or parent it would be attached to. Nor does it name the subnets underneath,
+# so the settings those subnets INHERIT from the item (DDNS, the DNS / DHCP
+# inherit switches, split-horizon, do-not-probe) are refused too: flipping one
+# re-points or re-enables every descendant, none of which the grant reaches
+# (clearing a space's do-not-probe would open every fragile subnet in it to
+# sweeps, #722).
+_SPACE_BINDING_FIELDS = (
+    "dns_group_ids",
+    "dns_zone_id",
+    "dns_additional_zone_ids",
+    "dhcp_server_group_id",
+    "ddns_domain_override",
+    "vrf_id",
+    "asn_id",
+    "customer_id",
+    "ddns_enabled",
+    "ddns_hostname_policy",
+    "ddns_ttl",
+    "do_not_probe",
+)
+_BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
+    "parent_block_id",
+    "site_id",
+    "dns_inherit_settings",
+    "dhcp_inherit_settings",
+    "dns_split_horizon",
+    "ddns_inherit_settings",
+)
+# Fields whose handler treats an explicit null as "leave unchanged" (the
+# ``exclude_none`` dump), so a null there changes nothing and must not be
+# refused as a change.
+_SPACE_NULL_IS_NOOP = frozenset(
+    {
+        "dns_group_ids",
+        "dns_additional_zone_ids",
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "do_not_probe",
+    }
+)
+_BLOCK_NULL_IS_NOOP = frozenset(
+    {
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "ddns_inherit_settings",
+        "do_not_probe",
+        "dns_split_horizon",
+    }
+)
+
+
+def _assert_scoped_item_bindings(
+    user: Any,
+    rtype: str,
+    body: BaseModel,
+    row: Any,
+    fields: tuple[str, ...],
+    null_is_noop: frozenset[str] = frozenset(),
+) -> None:
+    """403 when a holder of a grant scoped to one ``rtype`` row changes a field
+    that points it at another resource, or that its descendants inherit
+    (#3039). Re-sending the current value passes, and so does a caller holding
+    the type-level write."""
+    if user_has_permission(user, "write", rtype):
+        return
+    for field in fields:
+        if field not in body.model_fields_set:
+            continue
+        value = getattr(body, field)
+        if value is None and field in null_is_noop:
+            continue
+        if _binding_value(value) != _binding_value(getattr(row, field, None)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: changing '{field}' needs 'write' on '{rtype}'",
+            )
 
 
 def _subnet_write_is_scoped(user: Any) -> bool:
@@ -2492,6 +2758,7 @@ async def _sync_dns_record(
     strict: bool = False,
     skip_own_alias: bool = False,
     skip_create: frozenset[tuple[str, uuid.UUID]] = frozenset(),
+    skip_existing: frozenset[uuid.UUID] = frozenset(),
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -2529,6 +2796,14 @@ async def _sync_dns_record(
     ``skip_create`` holds ``(record_type, zone_id)`` keys whose record is NOT
     to be newly written, however missing: the Sync DNS rows the operator
     unticked (#2471). Records that already exist are still updated.
+
+    ``skip_existing`` holds the IDs of the address's EXISTING records to leave
+    exactly as they are: the Sync DNS rows the operator left unticked under
+    Mismatched, and any Stale row, which only the commit's delete list
+    removes (#3081). The address is still synced for the records not named
+    here; a listed one is neither rewritten, moved nor retracted, and a
+    listed host record outside every desired zone is not replaced by a new
+    one in the primary zone.
 
     A blank or whitespace-only hostname publishes nothing: the address's own
     auto-generated host record and PTR are retracted, on strict and
@@ -2776,6 +3051,8 @@ async def _sync_dns_record(
         # user renamed the IP back to the default. PTR continues below. A
         # zone IPAM does not author never took the record (#1633): no op.
         for record in existing_records:
+            if record.id in skip_existing:
+                continue  # #3081 — the operator unticked this stale record
             old_zone = await db.get(DNSZone, record.zone_id)
             if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
@@ -2795,13 +3072,21 @@ async def _sync_dns_record(
         existing_by_zone: dict[uuid.UUID, DNSRecord] = {
             rec.zone_id: rec for rec in existing_records
         }
+        # #3081 — a held-back host record outside every desired zone is the
+        # one Sync DNS offered to MOVE into the primary zone (a single
+        # Mismatched row). Unticked, it stays where it is, and no second host
+        # record is written in the primary zone beside it.
+        held_outside = any(
+            rec.id in skip_existing and rec.zone_id not in desired_zone_ids
+            for rec in existing_records
+        )
 
         # Phase 1: cleanup zones that are no longer desired. Delete the
         # record + enqueue the agent op so the live nameserver drops it.
         # This is the "shrink" path — operator removed a zone from
         # ``extra_zone_ids`` and we need to retract the record.
         for rec in list(existing_records):
-            if rec.zone_id in desired_zone_ids:
+            if rec.zone_id in desired_zone_ids or rec.id in skip_existing:
                 continue
             old_zone = await db.get(DNSZone, rec.zone_id)
             # #1633 — a zone IPAM does not author never took the record (a
@@ -2843,6 +3128,12 @@ async def _sync_dns_record(
             target_fqdn = f"{ip.hostname}.{target_zone_domain}"
 
             existing = existing_by_zone.get(desired_zone_id)
+            if existing is not None and existing.id in skip_existing:
+                forward_published = True
+                continue  # #3081 — the operator unticked this record
+            if existing is None and is_primary_zone and held_outside:
+                forward_published = True
+                continue  # #3081 — the unticked move of the host record
             if existing is None:
                 if await _cname_at(db, target_zone, ip, forward_rtype):
                     primary_cname_skip = primary_cname_skip or is_primary_zone
@@ -3095,6 +3386,8 @@ async def _sync_dns_record(
             .all()
         )
         for rec in stale_ptrs:
+            if rec.id in skip_existing:
+                continue  # #3081 — the operator unticked this record
             old_zone = await db.get(DNSZone, rec.zone_id)
             if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
@@ -3196,6 +3489,8 @@ async def _sync_dns_record(
         await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, ttl)
     else:
         for record in existing_ptr:
+            if record.id in skip_existing:
+                continue  # #3081 — the operator unticked this record
             if record.zone_id != rev_zone.id:
                 old_zone = await db.get(DNSZone, record.zone_id)
                 if old_zone is not None and ipam_authors_zone(old_zone):
@@ -4669,7 +4964,12 @@ async def list_spaces(
             IPSpace.id.in_(select(Subnet.space_id).where(Subnet.id.in_(scoped_subnets)))
         )
     result = await db.execute(query)
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    # A caller admitted only by grants scoped to individual spaces (#3039) sees
+    # those spaces and no others.
+    if not type_level_allows(current_user, "read", "ip_space"):
+        rows = [r for r in rows if user_has_permission(current_user, "read", "ip_space", r.id)]
+    return rows
 
 
 @router.post("/spaces", response_model=IPSpaceResponse, status_code=status.HTTP_201_CREATED)
@@ -4739,10 +5039,13 @@ async def get_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -> I
 async def update_space(
     space_id: uuid.UUID, body: IPSpaceUpdate, current_user: CurrentUser, db: DB
 ) -> IPSpace:
-    _require_type_write(current_user, "ip_space")
+    _require_type_write(current_user, "ip_space", resource_id=space_id)
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+    _assert_scoped_item_bindings(
+        current_user, "ip_space", body, space, _SPACE_BINDING_FIELDS, _SPACE_NULL_IS_NOOP
+    )
     await _enforce_zone_token_scope(
         db,
         current_user,
@@ -5010,6 +5313,10 @@ async def list_blocks(
         )
     result = await db.execute(query)
     blocks = list(result.scalars().all())
+    # A caller admitted only by grants scoped to individual blocks (#3039) sees
+    # those blocks and no others.
+    if not type_level_allows(current_user, "read", "ip_block"):
+        blocks = [b for b in blocks if user_has_permission(current_user, "read", "ip_block", b.id)]
     space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] = {}
     out: list[dict[str, Any]] = []
     for block in blocks:
@@ -5209,10 +5516,13 @@ async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> d
 async def update_block(
     block_id: uuid.UUID, body: IPBlockUpdate, current_user: CurrentUser, db: DB
 ) -> dict[str, Any]:
-    _require_type_write(current_user, "ip_block")
+    _require_type_write(current_user, "ip_block", resource_id=block_id)
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    _assert_scoped_item_bindings(
+        current_user, "ip_block", body, block, _BLOCK_BINDING_FIELDS, _BLOCK_NULL_IS_NOOP
+    )
     await _enforce_zone_token_scope(
         db,
         current_user,
@@ -5831,10 +6141,9 @@ def _aggregation_snooze_audit(
 
 
 # The snooze map is platform-wide (``platform_settings.aggregation_snooze``):
-# changing it changes the suggestions every operator sees. The router-level
-# gate admits any IPAM write grant (a ``custom_field`` writer, an address-set
-# delegate), so these routes require type-level write on ``ip_block`` — the
-# resource the suggestions are computed over — and audit every change.
+# changing it changes the suggestions every operator sees, so these routes
+# require type-level write on ``ip_block`` — the resource the suggestions are
+# computed over (the router gate asks the same, #3058) — and audit every change.
 @router.post("/aggregation-snoozes/snooze", status_code=status.HTTP_204_NO_CONTENT)
 async def snooze_aggregation_candidate(
     body: AggregationSnoozeRequest, current_user: CurrentUser, db: DB
@@ -6037,9 +6346,9 @@ async def list_subnets(
     result = await db.execute(query)
     rows = list(result.scalars().all())
     # A caller admitted only by grants scoped to individual subnets (#2438)
-    # sees those subnets and no others. Anyone holding a type-level IPAM read
-    # keeps the full list, as before.
-    if not any(user_has_permission(current_user, "read", rt) for rt in _IPAM_GATE_TYPES):
+    # sees those subnets and no others. A type-level subnet read keeps the full
+    # list.
+    if not type_level_allows(current_user, "read", "subnet"):
         rows = [r for r in rows if user_has_permission(current_user, "read", "subnet", r.id)]
     return rows
 
@@ -8564,6 +8873,7 @@ async def _apply_dns_sync(
     skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
     for key in body.skip_records:
         skip_by_ip.setdefault(key.ip_id, set()).add((key.record_type, key.zone_id))
+    ticked_ids = frozenset(body.update_record_ids)
     if body.update_record_ids:
         rec_res = await db.execute(
             select(DNSRecord.id, DNSRecord.ip_address_id).where(
@@ -8582,6 +8892,20 @@ async def _apply_dns_sync(
         # Cache subnets so we don't re-fetch per IP in the same subnet.
         subnet_cache: dict[uuid.UUID, Subnet | None] = {}
         wrote_ip_ids: set[uuid.UUID] = set()
+        # #3081 — an address is re-synced whole, so every auto-generated
+        # record it already has that the request does not name in
+        # ``update_record_ids`` is held back: the operator unticked it (or
+        # was never shown it), and Sync writes only what was ticked.
+        existing_by_ip: dict[uuid.UUID, set[uuid.UUID]] = {}
+        held_res = await db.execute(
+            select(DNSRecord.id, DNSRecord.ip_address_id).where(
+                DNSRecord.ip_address_id.in_(ip_ids_to_sync),
+                DNSRecord.auto_generated.is_(True),
+            )
+        )
+        for rid, rip in held_res.all():
+            if rid not in ticked_ids:
+                existing_by_ip.setdefault(rip, set()).add(rid)
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
@@ -8619,6 +8943,7 @@ async def _apply_dns_sync(
                         strict=True,
                         skip_own_alias=True,
                         skip_create=frozenset(skip_by_ip.get(ip.id, ())),
+                        skip_existing=frozenset(existing_by_ip.get(ip.id, ())),
                     )
                     if collector is not None and len(collector) == ops_before:
                         continue
