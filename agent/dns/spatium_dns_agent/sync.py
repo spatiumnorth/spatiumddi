@@ -379,6 +379,7 @@ class SyncLoop:
                 # ``previous``: committing there would copy the still-bad
                 # ``current.json`` over the only good config we have.
                 commit_config(self.cfg.state_dir, etag or "")
+                self._prune_dnssec_keys(bundle)
             # #296 A2 — warm-restart readiness. The hostPath cache carries
             # the bundle we just successfully re-applied; the marker tells
             # the K8s readinessProbe this pod is ready to serve without
@@ -1325,8 +1326,19 @@ class SyncLoop:
         # being served, as far as the daemon allows, and the last-known-good
         # must not lag behind it.
         commit_config(self.cfg.state_dir, etag)
+        self._prune_dnssec_keys(bundle)
         self._report_applied(etag)
         return True
+
+    def _prune_dnssec_keys(self, bundle: dict[str, Any]) -> None:
+        """#2309 — drop key files of zones no longer signed, after a good apply."""
+        prune = getattr(self.driver, "prune_dnssec_keys", None)
+        if prune is None:
+            return
+        try:
+            prune(bundle)
+        except Exception as e:  # noqa: BLE001 — housekeeping must not fail an apply
+            log.warning("dnssec_key_prune_failed", error=str(e))
 
     def _report_applied(self, etag: str | None) -> None:
         """The verdict on a bundle the daemon took: whole, or partially."""

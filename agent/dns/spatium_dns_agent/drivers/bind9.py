@@ -1409,6 +1409,21 @@ _DNSSEC_ALGO_NUM: dict[str, int] = {
 # Where BIND's dnssec-policy keeps its key files (rendered as key-directory).
 DNSSEC_KEY_DIR = "/var/cache/bind/keys"
 
+# ``K<zone>.+<alg>+<tag>.(key|private|state)`` as BIND names them. Anchored on
+# the ``.+NNN+NNNNN.`` tail so the zone part is taken exactly: ``Kexample.com.``
+# never matches ``sub.example.com`` files (#2309).
+_KEYFILE_RE = re.compile(
+    r"^K(?P<zone>.+?)\.?\+\d{3}\+\d{5}\.(?:key|private|state)(?:\.backup)?$"
+)
+
+
+def _key_zone(filename: str) -> str | None:
+    """Lower-cased, dot-less zone a BIND key file belongs to, or None."""
+    m = _KEYFILE_RE.match(filename)
+    if not m:
+        return None
+    return m.group("zone").rstrip(".").lower()
+
 
 def _parse_dnssec_status(text: str) -> list[dict[str, Any]]:
     """Parse ``rndc dnssec -status <zone>`` into per-key state dicts.
@@ -5680,6 +5695,47 @@ class Bind9Driver(DriverBase):
         if agent_conf.exists():
             cmd += ["-c", str(agent_conf)]
         return cmd
+
+    def prune_dnssec_keys(self, bundle: dict[str, Any]) -> list[str]:
+        """Delete key files of zones this server no longer serves signed (#2309).
+
+        The key directory is persistent and BIND never removes a zone's keys
+        itself, so a deleted / unsigned / moved zone left its private keys on
+        disk forever, and a same-name zone created later inherited them (and
+        the DS the operator would publish). ``key-directory`` is one global
+        directory shared by every view, so a zone is kept while ANY zone entry
+        in the bundle (any view) is still ``dnssec_enabled``.
+
+        Only call this after the bundle has been applied successfully: a
+        failed apply must never cost a still-signed zone its keys. Returns the
+        removed file names.
+        """
+        signed = {
+            (z.get("name") or "").rstrip(".").lower()
+            for z in bundle.get("zones", [])
+            if z.get("dnssec_enabled")
+        }
+        removed: list[str] = []
+        key_dir = DNSSEC_KEY_DIR
+        try:
+            names = sorted(os.listdir(key_dir))
+        except OSError:
+            return removed
+        for fn in names:
+            zone = _key_zone(fn)
+            if zone is None or zone in signed:
+                continue
+            path = os.path.join(key_dir, fn)
+            try:
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                os.unlink(path)
+            except OSError as e:
+                log.warning("dnssec_key_remove_failed", file=fn, error=str(e))
+                continue
+            removed.append(fn)
+            log.info("dnssec_key_removed", file=fn, zone=zone, reason="zone_not_signed")
+        return removed
 
     def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
         """For every signed primary zone, read its DS rrset + per-key state
