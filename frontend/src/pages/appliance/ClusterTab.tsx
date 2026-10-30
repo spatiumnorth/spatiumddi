@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 
 import { applianceApprovalApi } from "@/lib/api";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSessionState } from "@/lib/useSessionState";
 import { ClusterOverview } from "./ClusterOverview";
 import { ContainersTab } from "./ContainersTab";
@@ -90,7 +91,7 @@ export function ClusterTab({
   // Shared with EtcdSnapshotsCard (same query key → React Query dedupes)
   // purely so the etcd section can show a friendly placeholder instead of
   // a blank pane before the seed first reports its snapshots on heartbeat.
-  const { data: etcd } = useQuery({
+  const { data: etcd, error: etcdError } = useQuery({
     queryKey: ["appliance", "etcd-snapshots"],
     queryFn: applianceApprovalApi.listEtcdSnapshots,
     staleTime: 20_000,
@@ -141,10 +142,13 @@ export function ClusterTab({
           </div>
         ) : (
           <div className="mx-auto max-w-2xl rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
-            No recoverable etcd snapshots yet. These appear once the cluster
-            seed reports its embedded-etcd snapshots on heartbeat (k3s takes one
-            every ~6&nbsp;h, retains 8 — or run{" "}
-            <code>k3s etcd-snapshot save</code> on the seed for one now).
+            {/* #3107 — a refused read is not "no snapshots yet". */}
+            <ListEmpty error={etcdError} what="the etcd snapshots">
+              No recoverable etcd snapshots yet. These appear once the cluster
+              seed reports its embedded-etcd snapshots on heartbeat (k3s takes
+              one every ~6&nbsp;h, retains 8 — or run{" "}
+              <code>k3s etcd-snapshot save</code> on the seed for one now).
+            </ListEmpty>
           </div>
         )}
       </div>
