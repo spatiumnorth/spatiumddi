@@ -14,6 +14,7 @@ import {
   type ApplianceRelease,
   formatApiError,
 } from "@/lib/api";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { safeExternalHref } from "@/lib/safeUrl";
 import { helmChartVersion } from "@/lib/versions";
@@ -47,7 +48,7 @@ export function ReleasesTab({
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "releases"],
     queryFn: applianceReleasesApi.list,
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
 
   return (

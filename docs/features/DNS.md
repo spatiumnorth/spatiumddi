@@ -1921,7 +1921,7 @@ Implementation: `app.tasks.ipam_dns_sync.auto_sync_ipam_dns` (Celery beat fires 
 
 **Which zone an address is judged against.** The address's own zone (`ip_address.forward_zone_id`, set by Allocate, Edit and Bulk edit) when it has one that is still live, otherwise the subnet's effective zone ([#2104](https://github.com/spatiumnorth/spatiumddi/issues/2104)). The same rule applies to the manual Sync DNS at subnet, block and space scope, to auto-sync, and to the records a commit writes, so an address an operator placed in another zone stays there. `forward_zone_id` cannot tell a chosen zone from one inherited from the subnet, so **changing a subnet's zone does not move its existing addresses on Sync DNS, and removing it does not list their records as stale**. Move them with Bulk edit → DNS zone, or remove them by setting the address's DNS zone to None in Edit. Only addresses with no zone of their own, or whose zone was deleted, follow the subnet. DDNS is different: a lease's name goes into the DDNS domain override's zone, else the subnet's, on every rename.
 
-**Unticked rows are not written.** Each missing record (an address's A, each extra-zone A, its PTR) has its own tick in the Sync DNS dialog. The commit sends the unticked ones as `skip_records` (`ip_id`, `record_type`, `zone_id`) and the API writes none of them, even when another row of the same address is ticked ([#2471](https://github.com/spatiumnorth/spatiumddi/issues/2471)). Records that already exist are still updated.
+**Unticked rows are not written.** Each missing record (an address's A, each extra-zone A, its PTR) has its own tick in the Sync DNS dialog. The commit sends the unticked ones as `skip_records` (`ip_id`, `record_type`, `zone_id`) and the API writes none of them, even when another row of the same address is ticked ([#2471](https://github.com/spatiumnorth/spatiumddi/issues/2471)). Records that already exist change only when ticked: `update_record_ids` names exactly the mismatched records to rewrite, and every other record of a synced address keeps its value, so an unticked hand-edited PTR survives its address's A being ticked ([#3081](https://github.com/spatiumnorth/spatiumddi/issues/3081)).
 
 ### 14.2 Zone ↔ Server Reconciliation
 
@@ -2662,8 +2662,13 @@ on :53 stays up, so turning DoT on never cuts off existing clients.
 The listeners serve a certificate from the existing
 `appliance_certificate` store — the same one behind the Web UI cert and
 the embedded ACME client (#438). Issue or upload once under
-Appliance → Web UI Certificate, then point the group at it
-(`dns_server_options.tls_certificate_id`).
+Appliance → Fleet → Web UI Certificate, then point the group at it
+(`dns_server_options.tls_certificate_id`). That page exists only on an
+appliance-hosted control plane; on Docker Compose or Kubernetes the store
+is reached through the API instead — `POST /api/v1/appliance/tls/upload`
+(PEM + key), `POST /api/v1/appliance/tls/csr`, or
+`POST /api/v1/appliance/acme/issue` for Let's Encrypt — and the group's
+certificate picker lists whatever is stored there.
 
 The FK is `ON DELETE SET NULL`, so deleting a certificate can never delete
 a group's options row. That leaves one state worth understanding: listener

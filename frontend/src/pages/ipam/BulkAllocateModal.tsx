@@ -46,6 +46,7 @@ import {
   ipamApi,
   type Subnet,
 } from "@/lib/api";
+import { zoneKindForName } from "@/lib/dnsNames";
 import {
   expandTemplate,
   hostLabelError,
@@ -213,6 +214,7 @@ export function BulkAllocateModal({
   const [statusValue, setStatusValue] = useState("allocated");
   const [description, setDescription] = useState("");
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   const [createDnsRecordsChoice, setCreateDnsRecords] = useState(true);
   // #2135 — with core.dns off there is no zone to read and no record to
   // create: the choice is hidden and the request asks for none.
@@ -228,10 +230,13 @@ export function BulkAllocateModal({
 
   // Pull effective DNS so we can populate the zone dropdown with just the
   // zones that actually apply to this subnet (mirrors AddAddressModal).
-  const { data: effectiveDns } = useQuery({
+  const { data: effectiveDns, isFetching: effectiveFetching } = useQuery({
     queryKey: ["effective-dns-subnet", subnet.id],
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnet.id),
-    staleTime: 30_000,
+    // Always re-read on open: Edit Subnet can have moved the primary zone
+    // since the last read (#3078).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
@@ -245,7 +250,7 @@ export function BulkAllocateModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q) => (q.data as DNSZone[] | undefined) ?? [])
-    .filter((z) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z) => zoneKindForName(z.name) !== "reverse");
   const explicitZoneIds = [
     ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
     ...(effectiveDns?.dns_additional_zone_ids ?? []),
@@ -255,16 +260,28 @@ export function BulkAllocateModal({
       ? allGroupZones.filter((z) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // Pre-select the primary zone, as Allocate IP does (#2469 / #3079): the
+  // subnet's zones can come from several DNS groups, each its own request, so
+  // the primary may land after another group's zones. Wait for it (falling
+  // back to the first zone once every group has answered) and re-pick when it
+  // lands, until the operator has chosen.
+  const primaryZoneId = effectiveDns?.dns_zone_id;
+  const zonesSettled = zoneQueries.every((q) => !q.isLoading);
+  // Zones still on their way, or the subnet's DNS being re-read over a cached
+  // copy: the pick is not final yet, so Preview waits (#3080).
+  const zonesPending =
+    dnsOn &&
+    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (dnsZoneTouched || availableZones.length === 0) return;
+    const target =
+      primaryZoneId && availableZones.some((z) => z.id === primaryZoneId)
+        ? primaryZoneId
+        : !primaryZoneId || zonesSettled
+          ? availableZones[0].id
+          : null;
+    if (target && target !== dnsZoneId) setDnsZoneId(target);
+  }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Client-side live preview: shows the first few rendered hostnames as
   // the operator types so they see the template effect before posting.
@@ -388,7 +405,12 @@ export function BulkAllocateModal({
         </button>
         <button
           type="button"
-          disabled={formInvalid || previewMut.isPending}
+          disabled={formInvalid || zonesPending || previewMut.isPending}
+          title={
+            zonesPending
+              ? "Waiting for the subnet's DNS zones to load"
+              : undefined
+          }
           onClick={() => previewMut.mutate()}
           className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
@@ -576,7 +598,10 @@ export function BulkAllocateModal({
                   <select
                     className={inputCls}
                     value={dnsZoneId}
-                    onChange={(e) => setDnsZoneId(e.target.value)}
+                    onChange={(e) => {
+                      setDnsZoneId(e.target.value);
+                      setDnsZoneTouched(true);
+                    }}
                   >
                     {availableZones.map((z) => (
                       <option key={z.id} value={z.id}>

@@ -56,7 +56,14 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
  * Phase 4b.4 will add "Issue via Let's Encrypt"; 4b.5 will pre-populate
  * a self-signed default on first boot.
  */
-export function CertificatesTab() {
+export function CertificatesTab({
+  isApplianceHost = true,
+}: {
+  /** false on Docker Compose / Kubernetes installs (#3061): the store is the
+   *  same, but there is no appliance nginx to activate a cert on, so the
+   *  activation controls and the Active badge go away. */
+  isApplianceHost?: boolean;
+} = {}) {
   const qc = useQueryClient();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [csrOpen, setCsrOpen] = useState(false);
@@ -102,14 +109,25 @@ export function CertificatesTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <ShieldCheck className="h-4 w-4 text-muted-foreground" />
-            Web UI Certificate
+            {isApplianceHost ? "Web UI Certificate" : "TLS certificates"}
           </h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            The certificate nginx serves on the appliance's HTTPS frontend.
-            Upload a PEM cert + private key from an existing CA, or generate a
-            CSR locally (key stays on the server) and bring back the signed
-            cert. Activating a certificate makes nginx serve it.
-          </p>
+          {isApplianceHost ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              The certificate nginx serves on the appliance's HTTPS frontend.
+              Upload a PEM cert + private key from an existing CA, or generate a
+              CSR locally (key stays on the server) and bring back the signed
+              cert. Activating a certificate makes nginx serve it.
+            </p>
+          ) : (
+            <p className="mt-1 text-xs text-muted-foreground">
+              The certificate store. DNS server groups pick a certificate from
+              here for DNS-over-TLS / DNS-over-HTTPS / DNS-over-QUIC. Upload a
+              PEM cert + private key, generate a CSR locally (key stays on the
+              server), or issue one with Let's Encrypt. This install does not
+              terminate TLS itself, so certificates here are not served as a Web
+              UI certificate; put one on your own reverse proxy or ingress.
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-2">
           {acmeModuleOn && (
@@ -153,13 +171,14 @@ export function CertificatesTab() {
           Loading…
         </div>
       ) : !data || data.length === 0 ? (
-        <EmptyState />
+        <EmptyState isApplianceHost={isApplianceHost} />
       ) : (
         <div className="space-y-3">
           {data.map((cert) => (
             <CertificateCard
               key={cert.id}
               cert={cert}
+              isApplianceHost={isApplianceHost}
               onActivate={() => activate.mutate(cert.id)}
               onDelete={() => setDeleteTarget(cert)}
               onViewCsr={() => setCsrViewing(cert)}
@@ -172,6 +191,7 @@ export function CertificatesTab() {
 
       {uploadOpen && (
         <UploadCertificateModal
+          isApplianceHost={isApplianceHost}
           onClose={() => setUploadOpen(false)}
           onSuccess={() => {
             setUploadOpen(false);
@@ -207,6 +227,7 @@ export function CertificatesTab() {
 
       {importTarget && (
         <ImportSignedCertModal
+          isApplianceHost={isApplianceHost}
           cert={importTarget}
           onClose={() => setImportTarget(null)}
           onSuccess={() => {
@@ -218,6 +239,7 @@ export function CertificatesTab() {
 
       {acmeOpen && (
         <AcmeIssueModal
+          isApplianceHost={isApplianceHost}
           onClose={() => setAcmeOpen(false)}
           onIssued={() => {
             setAcmeOpen(false);
@@ -263,16 +285,15 @@ export function CertificatesTab() {
   );
 }
 
-function EmptyState() {
+function EmptyState({ isApplianceHost }: { isApplianceHost: boolean }) {
   return (
     <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center">
       <ShieldCheck className="mx-auto h-8 w-8 text-muted-foreground/50" />
       <h3 className="mt-3 text-sm font-medium">No certificates yet</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Use the buttons above to upload an existing cert + key, or generate a
-        CSR so a CA can sign a fresh cert for this appliance. Until you activate
-        something, nginx serves the self-signed default the appliance generated
-        on first boot.
+        {isApplianceHost
+          ? "Use the buttons above to upload an existing cert + key, or generate a CSR so a CA can sign a fresh cert for this appliance. Until you activate something, nginx serves the self-signed default the appliance generated on first boot."
+          : "Use the buttons above to upload an existing cert + key, generate a CSR so a CA can sign one, or issue one with Let's Encrypt."}
       </p>
     </div>
   );
@@ -285,7 +306,9 @@ function CertificateCard({
   onViewCsr,
   onPasteCert,
   activating,
+  isApplianceHost,
 }: {
+  isApplianceHost: boolean;
   cert: ApplianceCertificate;
   onActivate: () => void;
   onDelete: () => void;
@@ -320,7 +343,7 @@ function CertificateCard({
   return (
     <div
       className={`rounded-lg border bg-card p-4 shadow-sm ${
-        cert.is_active
+        isApplianceHost && cert.is_active
           ? "ring-1 ring-primary/40"
           : cert.pending
             ? "ring-1 ring-amber-500/30 bg-amber-500/[0.03]"
@@ -331,7 +354,7 @@ function CertificateCard({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="truncate text-sm font-semibold">{cert.name}</h3>
-            {cert.is_active && (
+            {isApplianceHost && cert.is_active && (
               <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary">
                 <CheckCircle2 className="h-3 w-3" />
                 Active
@@ -412,6 +435,7 @@ function CertificateCard({
               </button>
             </>
           ) : (
+            isApplianceHost &&
             !cert.is_active && (
               <button
                 type="button"
@@ -434,10 +458,10 @@ function CertificateCard({
           <button
             type="button"
             onClick={onDelete}
-            disabled={cert.is_active}
+            disabled={isApplianceHost && cert.is_active}
             className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
             title={
-              cert.is_active
+              isApplianceHost && cert.is_active
                 ? "Activate a different certificate first"
                 : "Delete this certificate"
             }
@@ -499,9 +523,11 @@ function Field({
 // ── Upload modal (4b.1) ─────────────────────────────────────────────
 
 function UploadCertificateModal({
+  isApplianceHost,
   onClose,
   onSuccess,
 }: {
+  isApplianceHost: boolean;
   onClose: () => void;
   onSuccess: () => void;
 }) {
@@ -529,7 +555,7 @@ function UploadCertificateModal({
             cert_pem: certPem,
             key_pem: keyPem,
             notes: notes.trim() || null,
-            activate,
+            activate: isApplianceHost && activate,
           });
         }}
         className="space-y-3"
@@ -571,15 +597,17 @@ function UploadCertificateModal({
           placeholder="optional — e.g. 'Renewal script in cron'"
         />
 
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={activate}
-            onChange={(e) => setActivate(e.target.checked)}
-            className="rounded border-input"
-          />
-          Activate immediately
-        </label>
+        {isApplianceHost && (
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={activate}
+              onChange={(e) => setActivate(e.target.checked)}
+              className="rounded border-input"
+            />
+            Activate immediately
+          </label>
+        )}
 
         {error && <ErrorBanner message={error} />}
 
@@ -866,10 +894,12 @@ function ViewCsrModal({
 // ── Import signed cert modal (4b.3) ─────────────────────────────────
 
 function ImportSignedCertModal({
+  isApplianceHost,
   cert,
   onClose,
   onSuccess,
 }: {
+  isApplianceHost: boolean;
   cert: ApplianceCertificate;
   onClose: () => void;
   onSuccess: () => void;
@@ -895,7 +925,10 @@ function ImportSignedCertModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError(null);
-          importIt.mutate({ cert_pem: certPem, activate });
+          importIt.mutate({
+            cert_pem: certPem,
+            activate: isApplianceHost && activate,
+          });
         }}
         className="space-y-3"
       >
@@ -924,15 +957,17 @@ function ImportSignedCertModal({
           hint="Paste the full chain — leaf + intermediates."
         />
 
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={activate}
-            onChange={(e) => setActivate(e.target.checked)}
-            className="rounded border-input"
-          />
-          Activate immediately
-        </label>
+        {isApplianceHost && (
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={activate}
+              onChange={(e) => setActivate(e.target.checked)}
+              className="rounded border-input"
+            />
+            Activate immediately
+          </label>
+        )}
 
         {error && <ErrorBanner message={error} />}
 
@@ -1152,13 +1187,13 @@ const ACME_CHALLENGE_OPTIONS: {
   {
     value: "http-01",
     label: "HTTP-01 (CA fetches a token over port 80/443)",
-    hint: "No DNS needed — the appliance must be reachable on port 80/443 at each requested name.",
+    hint: "No DNS needed — SpatiumDDI must be reachable on port 80/443 at each requested name.",
   },
   {
     value: "tls-alpn-01",
     label: "TLS-ALPN-01",
     disabled: true,
-    disabledReason: "Not supported on this appliance (nginx terminates TLS).",
+    disabledReason: "Not supported (nginx terminates TLS).",
   },
 ];
 
@@ -1171,9 +1206,11 @@ const ACME_CHALLENGE_OPTIONS: {
  * hostname + any control-plane host IPs.
  */
 function AcmeIssueModal({
+  isApplianceHost,
   onClose,
   onIssued,
 }: {
+  isApplianceHost: boolean;
   onClose: () => void;
   onIssued: () => void;
 }) {
@@ -1192,10 +1229,12 @@ function AcmeIssueModal({
   const infoQuery = useQuery({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
+    enabled: isApplianceHost,
   });
   const systemQuery = useQuery({
     queryKey: ["appliance", "system-info"],
     queryFn: applianceSystemApi.info,
+    enabled: isApplianceHost,
   });
 
   // Account form state.
@@ -1342,8 +1381,10 @@ function AcmeIssueModal({
           SpatiumDDI requests a CA-trusted certificate from Let's Encrypt and
           proves domain control via DNS-01 (over SpatiumDDI-managed or
           cloud-hosted zones, with a manual-TXT fallback) or HTTP-01. When the
-          order completes the issued cert is stored and activated automatically,
-          and active certs auto-renew ~30 days before they expire.
+          order completes the issued cert is stored{" "}
+          {isApplianceHost
+            ? "and activated automatically. The active cert, and any a DNS group serves for DoT / DoH, auto-renew ~30 days before they expire."
+            : "in the certificate store, ready to pick for DoT / DoH. A cert a DNS group serves auto-renews ~30 days before it expires."}
         </p>
 
         <ModalTabs
@@ -1518,7 +1559,9 @@ function AcmeIssueModal({
                 <span className="font-mono">
                   http(s)://&lt;domain&gt;/.well-known/acme-challenge/…
                 </span>{" "}
-                — the appliance must be reachable on port 80/443 at that name.
+                {isApplianceHost
+                  ? "— the appliance must be reachable on port 80/443 at that name."
+                  : "— that name must reach this install's frontend on port 80/443. Behind your own reverse proxy or ingress, forward /.well-known/acme-challenge/ to it as well."}
               </p>
             )}
 
@@ -1798,11 +1841,7 @@ function ErrorBanner({ message }: { message: string }) {
 }
 
 function extractError(err: unknown): string {
-  const e = err as {
-    response?: { data?: { detail?: string } };
-    message?: string;
-  };
-  return e.response?.data?.detail ?? e.message ?? "request failed";
+  return formatApiError(err, "request failed");
 }
 
 function fmtDate(s: string): string {

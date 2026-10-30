@@ -210,7 +210,14 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
 
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
+    # #3015 — the api-shutdown flag is process-global: a test that sets it
+    # (or runs a lifespan to its end) would make every later long-poll on
+    # the same worker answer at once.
+    from app.core import shutdown
+
+    shutdown.reset()
     yield
+    shutdown.reset()
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
     maintenance_mode.invalidate_cache()

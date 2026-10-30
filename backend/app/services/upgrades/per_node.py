@@ -101,6 +101,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import appliance_channel, publish_wake
 from app.core.db_transient import is_transient_db_error
+from app.core.versions import is_installed_target
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.services.appliance import k8s
@@ -932,7 +933,7 @@ async def _step_mirror_ready(
             False, error=f"no single approved Appliance row with hostname={node_name!r}"
         )
     await db.refresh(appliance)
-    if appliance.installed_appliance_version == target_version:
+    if is_installed_target(appliance.installed_appliance_version, target_version):
         return step.finish(True, skipped=True, reason="already running the target")
     if appliance.desired_slot_image_url == desired_slot_image_url(appliance, slot_image):
         return step.finish(
@@ -1152,7 +1153,7 @@ async def _wait_for_staged_slot(
         if appliance is None:
             return step.finish(False, error=f"appliance row vanished mid-upgrade: {node_name}")
         await db.refresh(appliance)
-        if appliance.installed_appliance_version == target_version:
+        if is_installed_target(appliance.installed_appliance_version, target_version):
             # A resumed run whose node already rebooted into the new slot.
             return step.finish(True, already_running_target=True)
         if appliance.last_upgrade_state == "failed" and not _stale_failure(appliance, stamped_at):
@@ -1327,10 +1328,9 @@ async def _step_health_gate(
         # committed new slot the supervisor settles the host's stale
         # ``done``/``reboot-pending`` to ``ready``, and that can land before
         # the first heartbeat this step sees.
-        if (
-            appliance.installed_appliance_version == target_version
-            and appliance.last_upgrade_state in (None, "done", "ready")
-        ):
+        if is_installed_target(
+            appliance.installed_appliance_version, target_version
+        ) and appliance.last_upgrade_state in (None, "done", "ready"):
             return step.finish(
                 True,
                 installed_version=last_installed,
