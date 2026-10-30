@@ -2492,6 +2492,7 @@ async def _sync_dns_record(
     strict: bool = False,
     skip_own_alias: bool = False,
     skip_create: frozenset[tuple[str, uuid.UUID]] = frozenset(),
+    skip_existing: frozenset[uuid.UUID] = frozenset(),
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -2529,6 +2530,11 @@ async def _sync_dns_record(
     ``skip_create`` holds ``(record_type, zone_id)`` keys whose record is NOT
     to be newly written, however missing: the Sync DNS rows the operator
     unticked (#2471). Records that already exist are still updated.
+
+    ``skip_existing`` holds the IDs of the address's EXISTING records to leave
+    exactly as they are: the Sync DNS rows the operator left unticked under
+    Mismatched (#3081). The address is still synced for the records not named
+    here; a listed one is neither rewritten, moved nor retracted.
 
     A blank or whitespace-only hostname publishes nothing: the address's own
     auto-generated host record and PTR are retracted, on strict and
@@ -2801,7 +2807,7 @@ async def _sync_dns_record(
         # This is the "shrink" path — operator removed a zone from
         # ``extra_zone_ids`` and we need to retract the record.
         for rec in list(existing_records):
-            if rec.zone_id in desired_zone_ids:
+            if rec.zone_id in desired_zone_ids or rec.id in skip_existing:
                 continue
             old_zone = await db.get(DNSZone, rec.zone_id)
             # #1633 — a zone IPAM does not author never took the record (a
@@ -2843,6 +2849,9 @@ async def _sync_dns_record(
             target_fqdn = f"{ip.hostname}.{target_zone_domain}"
 
             existing = existing_by_zone.get(desired_zone_id)
+            if existing is not None and existing.id in skip_existing:
+                forward_published = True
+                continue  # #3081 — the operator unticked this record
             if existing is None:
                 if await _cname_at(db, target_zone, ip, forward_rtype):
                     primary_cname_skip = primary_cname_skip or is_primary_zone
@@ -3095,6 +3104,8 @@ async def _sync_dns_record(
             .all()
         )
         for rec in stale_ptrs:
+            if rec.id in skip_existing:
+                continue  # #3081 — the operator unticked this record
             old_zone = await db.get(DNSZone, rec.zone_id)
             if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
@@ -3196,6 +3207,8 @@ async def _sync_dns_record(
         await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, ttl)
     else:
         for record in existing_ptr:
+            if record.id in skip_existing:
+                continue  # #3081 — the operator unticked this record
             if record.zone_id != rev_zone.id:
                 old_zone = await db.get(DNSZone, record.zone_id)
                 if old_zone is not None and ipam_authors_zone(old_zone):
@@ -8564,6 +8577,7 @@ async def _apply_dns_sync(
     skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
     for key in body.skip_records:
         skip_by_ip.setdefault(key.ip_id, set()).add((key.record_type, key.zone_id))
+    ticked_ids = frozenset(body.update_record_ids)
     if body.update_record_ids:
         rec_res = await db.execute(
             select(DNSRecord.id, DNSRecord.ip_address_id).where(
@@ -8582,6 +8596,20 @@ async def _apply_dns_sync(
         # Cache subnets so we don't re-fetch per IP in the same subnet.
         subnet_cache: dict[uuid.UUID, Subnet | None] = {}
         wrote_ip_ids: set[uuid.UUID] = set()
+        # #3081 — an address is re-synced whole, so every auto-generated
+        # record it already has that the request does not name in
+        # ``update_record_ids`` is held back: the operator unticked it (or
+        # was never shown it), and Sync writes only what was ticked.
+        existing_by_ip: dict[uuid.UUID, set[uuid.UUID]] = {}
+        held_res = await db.execute(
+            select(DNSRecord.id, DNSRecord.ip_address_id).where(
+                DNSRecord.ip_address_id.in_(ip_ids_to_sync),
+                DNSRecord.auto_generated.is_(True),
+            )
+        )
+        for rid, rip in held_res.all():
+            if rid not in ticked_ids:
+                existing_by_ip.setdefault(rip, set()).add(rid)
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
@@ -8619,6 +8647,7 @@ async def _apply_dns_sync(
                         strict=True,
                         skip_own_alias=True,
                         skip_create=frozenset(skip_by_ip.get(ip.id, ())),
+                        skip_existing=frozenset(existing_by_ip.get(ip.id, ())),
                     )
                     if collector is not None and len(collector) == ops_before:
                         continue
