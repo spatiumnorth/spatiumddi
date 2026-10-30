@@ -30,6 +30,7 @@ from typing import Any
 import httpx
 
 from app.services._mirror_shape import require_list
+from app.services.backup.targets.base import describe_exc
 
 
 class NetbirdClientError(Exception):
@@ -114,7 +115,9 @@ class NetbirdClient:
         try:
             r = await self._client.get(path, params=params or None)
         except httpx.ConnectError as exc:
-            raise NetbirdClientError(f"Could not reach NetBird at {self._base_url}: {exc}") from exc
+            raise NetbirdClientError(
+                f"Could not reach NetBird at {self._base_url}: {describe_exc(exc)}"
+            ) from exc
         except httpx.TimeoutException as exc:
             raise NetbirdClientError(f"Request to {path} timed out: {exc}") from exc
         except httpx.HTTPError as exc:

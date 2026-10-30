@@ -39,6 +39,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.kubernetes import KubernetesCluster
+from app.services.backup.targets.base import describe_exc
 from app.services.dns.bundle_dirty import mark_integration_dns_released
 from app.services.integration_ownership import release_integration_rows
 
@@ -317,7 +318,9 @@ async def _probe_cluster(
             ok=False, message=f"HTTP {exc.response.status_code} from apiserver"
         )
     except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach apiserver: {exc}")
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach apiserver: {describe_exc(exc)}"
+        )
     except ssl.SSLError as exc:
         return TestConnectionResponse(ok=False, message=f"TLS error: {exc}")
     except Exception as exc:  # noqa: BLE001 — surface anything else verbatim
@@ -481,7 +484,7 @@ async def _detect_cidrs(
         return DetectCIDRsResponse(
             pod_cidr=None,
             service_cidr=None,
-            messages=[f"Could not reach apiserver: {exc}"],
+            messages=[f"Could not reach apiserver: {describe_exc(exc)}"],
         )
     except ssl.SSLError as exc:
         return DetectCIDRsResponse(

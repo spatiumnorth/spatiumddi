@@ -31,6 +31,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.docker import DockerHost
 from app.models.ipam import IPSpace
+from app.services.backup.targets.base import describe_exc
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -262,7 +263,9 @@ async def _probe(
                 ok=False, message=f"HTTP {exc.response.status_code} from daemon"
             )
         except httpx.ConnectError as exc:
-            return TestConnectionResponse(ok=False, message=f"Could not reach daemon: {exc}")
+            return TestConnectionResponse(
+                ok=False, message=f"Could not reach daemon: {describe_exc(exc)}"
+            )
         except ssl.SSLError as exc:
             return TestConnectionResponse(ok=False, message=f"TLS error: {exc}")
         except Exception as exc:  # noqa: BLE001

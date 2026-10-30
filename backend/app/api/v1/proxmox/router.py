@@ -28,6 +28,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.proxmox import ProxmoxNode
+from app.services.backup.targets.base import describe_exc
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -303,7 +304,7 @@ async def _probe(
     except httpx.HTTPStatusError as exc:
         return TestConnectionResponse(ok=False, message=f"HTTP {exc.response.status_code} from PVE")
     except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach PVE: {exc}")
+        return TestConnectionResponse(ok=False, message=f"Could not reach PVE: {describe_exc(exc)}")
     except ssl.SSLError as exc:
         return TestConnectionResponse(
             ok=False,

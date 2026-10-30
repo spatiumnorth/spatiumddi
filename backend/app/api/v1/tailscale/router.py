@@ -27,6 +27,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.tailscale import TailscaleTenant
+from app.services.backup.targets.base import describe_exc
 from app.services.dns.bundle_dirty import mark_integration_dns_released
 from app.services.integration_credentials import credential_status
 from app.services.integration_ownership import release_integration_rows
@@ -257,7 +258,9 @@ async def _probe(*, tailnet: str, api_key: str) -> TestConnectionResponse:
             ok=False, message=f"HTTP {exc.response.status_code} from Tailscale"
         )
     except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach Tailscale: {exc}")
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach Tailscale: {describe_exc(exc)}"
+        )
     except Exception as exc:  # noqa: BLE001
         return TestConnectionResponse(ok=False, message=str(exc))
 

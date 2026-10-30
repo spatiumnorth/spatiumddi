@@ -38,6 +38,7 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
+from app.services.backup.targets.base import describe_exc
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -455,7 +456,9 @@ async def _probe(
                 site_count=site_count,
             )
     except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach controller: {exc}")
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach controller: {describe_exc(exc)}"
+        )
     except ssl.SSLError as exc:
         return TestConnectionResponse(
             ok=False,

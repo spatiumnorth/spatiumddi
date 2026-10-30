@@ -38,6 +38,8 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import structlog
 
+from app.services.backup.targets.base import describe_exc
+
 logger = structlog.get_logger(__name__)
 
 # DRF page size we request. NetBox's default is 50; 500 keeps the round
@@ -181,7 +183,7 @@ class NetBoxClient:
             try:
                 resp = await self._client.get(target, params=params)
             except httpx.HTTPError as exc:
-                raise NetBoxClientError(f"{target}: {exc}") from exc
+                raise NetBoxClientError(f"{target}: {describe_exc(exc)}") from exc
 
             status = resp.status_code
             if status == 429:

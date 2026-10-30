@@ -27,6 +27,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.opnsense import OPNsenseRouter
+from app.services.backup.targets.base import describe_exc
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -259,7 +260,9 @@ async def _probe(
             ok=False, message=f"HTTP {exc.response.status_code} from OPNsense"
         )
     except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach OPNsense: {exc}")
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach OPNsense: {describe_exc(exc)}"
+        )
     except ssl.SSLError as exc:
         return TestConnectionResponse(
             ok=False,

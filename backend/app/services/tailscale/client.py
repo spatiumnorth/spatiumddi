@@ -31,6 +31,7 @@ import httpx
 import structlog
 
 from app.services._mirror_shape import require_keyed_list
+from app.services.backup.targets.base import describe_exc
 
 logger = structlog.get_logger(__name__)
 
@@ -119,7 +120,9 @@ class TailscaleClient:
         try:
             r = await self._client.get(path, params=params or None)
         except httpx.ConnectError as exc:
-            raise TailscaleClientError(f"Could not reach api.tailscale.com: {exc}") from exc
+            raise TailscaleClientError(
+                f"Could not reach api.tailscale.com: {describe_exc(exc)}"
+            ) from exc
         except httpx.TimeoutException as exc:
             raise TailscaleClientError(f"Request to {path} timed out: {exc}") from exc
         except httpx.HTTPError as exc:
