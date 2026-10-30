@@ -30,6 +30,7 @@ import {
   type PXEProfile,
   type PXEProfileCreate,
   type PXEProfileUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -366,9 +367,7 @@ export function ProfileEditor({
     },
     onSuccess: () => onSaved(),
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Save failed.");
+      setError(formatApiError(err, "Save failed."));
     },
   });
 

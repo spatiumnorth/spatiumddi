@@ -29,6 +29,7 @@ import {
   type SiteKind,
   type SiteRead,
   type SiteUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSessionState } from "@/lib/useSessionState";
@@ -137,11 +138,7 @@ function SiteEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -308,11 +305,7 @@ function MoveSiteModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Move failed");
+      setError(formatApiError(e, "Move failed"));
     },
   });
 
@@ -625,11 +618,7 @@ function SiteTreeView({
     mutationFn: ({ id, parentId }: { id: string; parentId: string | null }) =>
       sitesApi.update(id, { parent_site_id: parentId }),
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Move failed");
+      setError(formatApiError(e, "Move failed"));
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ["sites"] }),
   });
@@ -790,13 +779,7 @@ export function SitesPage() {
   // points at the site (#2298); show the server's reason, don't swallow it.
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const onDeleteError = (e: unknown) => {
-    const err = e as {
-      response?: { data?: { detail?: string } };
-      message?: string;
-    };
-    setDeleteError(
-      err?.response?.data?.detail ?? err?.message ?? "Delete failed",
-    );
+    setDeleteError(formatApiError(e, "Delete failed"));
   };
 
   const bulkDelete = useMutation({

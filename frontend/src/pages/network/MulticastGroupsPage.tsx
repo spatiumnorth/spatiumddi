@@ -23,6 +23,7 @@ import {
   type MulticastMembershipRead,
   type MulticastMembershipRole,
   type MulticastPortTransport,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -143,16 +144,7 @@ function MulticastGroupModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string | { msg?: string }[] } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
-      } else {
-        setError(detail ?? err?.message ?? "Save failed");
-      }
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -347,7 +339,7 @@ function MulticastGroupModal({
 
 // ── Ports tab ───────────────────────────────────────────────────────
 
-function PortsTab({ groupId }: { groupId: string }) {
+export function PortsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const [portStart, setPortStart] = useState("");
   const [portEnd, setPortEnd] = useState("");
@@ -371,8 +363,7 @@ function PortsTab({ groupId }: { groupId: string }) {
       setError(null);
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Add failed");
+      setError(formatApiError(e, "Add failed"));
     },
   });
 
@@ -531,8 +522,7 @@ function MembershipsTab({ groupId }: { groupId: string }) {
       setError(null);
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Add failed");
+      setError(formatApiError(e, "Add failed"));
     },
   });
 
@@ -710,15 +700,7 @@ function BulkAllocateModal({
       setError(null);
     },
     onError: (e: unknown) => {
-      const err = e as {
-        response?: { data?: { detail?: string | { msg?: string }[] } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
-      } else {
-        setError(detail ?? "Preview failed");
-      }
+      setError(formatApiError(e, "Preview failed"));
     },
   });
 
@@ -742,10 +724,8 @@ function BulkAllocateModal({
         setError(
           `${detail.message ?? "Commit failed"}${conflicts ? ` — ${conflicts}…` : ""}`,
         );
-      } else if (typeof detail === "string") {
-        setError(detail);
       } else {
-        setError("Commit failed");
+        setError(formatApiError(e, "Commit failed"));
       }
     },
   });

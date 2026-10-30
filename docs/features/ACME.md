@@ -530,10 +530,17 @@ are deferred.
 
 Once a cert is issued, SpatiumDDI keeps it fresh on its own. A Celery
 beat task — `app.tasks.acme.renew_due_certificates` — runs every
-**12 hours** and re-issues any active Let's Encrypt cert that falls
+**12 hours** and re-issues any Let's Encrypt cert in use — the active
+Web UI cert, or one a DNS group's DoT / DoH listener serves — that falls
 within **30 days of its `valid_to`**. The re-issue reuses the exact
 `POST /issue` machinery (same orchestrator, same self-solve), so a
 renewal is just a normal order against the stored account.
+
+**A renewal rewrites the cert in place** (#3061). The renewal order names
+the row it renews, so the new chain lands in that same row: a DNS group's
+`tls_certificate_id` keeps pointing at live material, and whether the row
+is the active Web UI cert does not change. Only a fresh issue lands a new
+row and makes it the active one.
 
 **Renewal reuses each cert's own issuance shape.** The sweep reads the
 challenge type, DNS provider and domain list from the *successful
