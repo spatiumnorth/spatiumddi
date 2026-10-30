@@ -22,6 +22,7 @@ import {
   type ServiceResourceRead,
   type ServiceStatus,
   type ServiceUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -351,8 +352,7 @@ function ResourcesTab({
       onChange();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Attach failed");
+      setError(formatApiError(e, "Attach failed"));
     },
   });
 
@@ -814,11 +814,7 @@ function ServiceEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

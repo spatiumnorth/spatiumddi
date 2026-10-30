@@ -4,6 +4,7 @@ import {
   type NmapScanCreate,
   type NmapScanRead,
   nmapApi,
+  formatApiError,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
@@ -114,9 +115,7 @@ export function NmapScanForm({
       const scan = await nmapApi.createScan(body);
       onScanStarted(scan);
     } catch (e: unknown) {
-      const detail = (e as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Failed to start scan");
+      setError(formatApiError(e, "Failed to start scan"));
     } finally {
       setSubmitting(false);
     }
