@@ -62,7 +62,8 @@ async def test_space_scoped_grant(db_session: AsyncSession, client: AsyncClient)
     assert r.status_code == 403
     assert (await client.get(f"/api/v1/ipam/blocks/{blk.id}", headers=h)).status_code == 403
     assert (await client.get("/api/v1/ipam/blocks", headers=h)).status_code == 403
-    assert (await client.delete(f"/api/v1/ipam/spaces/{x.id}", headers=h)).status_code == 403
+    denied = await client.delete(f"/api/v1/ipam/spaces/{x.id}", headers=h)
+    assert denied.status_code == 403
     # A binding to another resource is not the grant's to change.
     r = await client.put(
         f"/api/v1/ipam/spaces/{x.id}", json={"customer_id": str(uuid.uuid4())}, headers=h
@@ -105,7 +106,8 @@ async def test_block_scoped_grant(db_session: AsyncSession, client: AsyncClient)
         assert r.status_code == 403
     assert (await client.get(f"/api/v1/ipam/subnets/{sub.id}", headers=h)).status_code == 403
     assert (await client.get("/api/v1/ipam/spaces", headers=h)).status_code == 403
-    assert (await client.delete(f"/api/v1/ipam/blocks/{x.id}", headers=h)).status_code == 403
+    denied = await client.delete(f"/api/v1/ipam/blocks/{x.id}", headers=h)
+    assert denied.status_code == 403
     # Re-parenting X touches a block the grant does not name.
     r = await client.put(
         f"/api/v1/ipam/blocks/{child.id}", json={"parent_block_id": str(y.id)}, headers=h
@@ -154,7 +156,8 @@ async def test_ownership_scoped_grant(
     assert lst.json()["total"] == 1
     assert (await client.get(f"{base}/{y.id}", headers=h)).status_code == 403
     assert (await client.put(f"{base}/{y.id}", json=body, headers=h)).status_code == 403
-    assert (await client.delete(f"{base}/{x.id}", headers=h)).status_code == 403
+    denied = await client.delete(f"{base}/{x.id}", headers=h)
+    assert denied.status_code == 403
     assert (await client.post(base, json={"name": "new"}, headers=h)).status_code == 403
     assert (await client.get(f"{base}/{y.id}", headers=sa)).status_code == 200
     assert lst.json()["total"] == 1
