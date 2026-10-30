@@ -101,7 +101,7 @@ def tool_permission_allows(user: User, permission: ToolPermission) -> bool:
     # must not load on the tool-registry import path.
     from app.core.permissions import (  # noqa: PLC0415
         is_effective_superadmin,
-        user_has_permission,
+        type_level_allows,
     )
 
     if permission == SUPERADMIN:
@@ -112,7 +112,11 @@ def tool_permission_allows(user: User, permission: ToolPermission) -> bool:
         return False  # unknown named permission — fail closed
     action, rtypes = permission
     types = rtypes if isinstance(rtypes, tuple) else (rtypes,)
-    return any(user_has_permission(user, action, rt) for rt in types)
+    # ``type_level_allows`` is ``user_has_permission`` except that a
+    # subnet-bound token passes on the IPAM types, as at the IPAM REST gate:
+    # the tools that serve such a token narrow to its subnets themselves
+    # (``honours_token_binding``, enforced in ``tool_callable_by``).
+    return any(type_level_allows(user, action, rt) for rt in types)
 
 
 def _carries_token_binding(user: User) -> bool:

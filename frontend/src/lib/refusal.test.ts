@@ -89,4 +89,8 @@ describe("pollUnlessRefused", () => {
       30_000,
     );
   });
+
+  it("keeps polling through a 401, which a token refresh heals", () => {
+    expect(every30s({ state: { error: answered(401) } })).toBe(30_000);
+  });
 });

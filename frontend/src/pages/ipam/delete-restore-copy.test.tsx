@@ -154,7 +154,7 @@ const subnet = {
 
 describe("Edit modals' Danger zone and delete steps", () => {
   async function walk(openLabel: RegExp) {
-    fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
     let said = words(topDialog());
     expectNamesSuperadmin(said);
     fireEvent.click(screen.getByRole("button", { name: openLabel }));
@@ -178,6 +178,7 @@ describe("Edit modals' Danger zone and delete steps", () => {
   });
 
   it("block", async () => {
+    answers.ipamApi = { getBlock: () => Promise.resolve(block) };
     open(
       <EditBlockModal block={block} onClose={() => {}} onDeleted={() => {}} />,
     );
@@ -185,6 +186,7 @@ describe("Edit modals' Danger zone and delete steps", () => {
   });
 
   it("space", async () => {
+    answers.ipamApi = { getSpace: () => Promise.resolve(space) };
     open(
       <EditSpaceModal space={space} onClose={() => {}} onDeleted={() => {}} />,
     );
