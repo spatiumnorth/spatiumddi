@@ -112,6 +112,8 @@ async def get_or_shutdown(queue: asyncio.Queue[Any], timeout: float) -> tuple[An
         try:
             await getter
         except asyncio.CancelledError:
+            # Expected: we cancelled the getter just above; awaiting it only
+            # lets the cancellation finish before we inspect its state.
             pass
     if getter.cancelled():
         # A put that lands while the getter is being cancelled leaves the

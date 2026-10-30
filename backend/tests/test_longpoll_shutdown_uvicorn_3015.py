@@ -100,6 +100,7 @@ def _run(route: str, *, neuter: bool, cut_s: int = CUT_S) -> dict[str, Any]:
                 if _get(port, "/ready", 1)[0] == 200:
                     break
             except OSError:
+                # Not listening yet; keep polling until the deadline.
                 pass
             if proc.poll() is not None or time.monotonic() > deadline:
                 raise AssertionError(
