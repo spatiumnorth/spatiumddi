@@ -489,8 +489,9 @@ export function AlertsPage() {
             <h1 className="text-2xl font-bold tracking-tight">Alerts</h1>
             <p className="mt-1 text-xs text-muted-foreground">
               Rule-based notifications on subnet utilization + server health.
-              Each rule notifies by syslog, webhook or email (SMTP), as set on
-              the rule.
+              Each rule notifies by syslog, webhook and/or email (SMTP), as set
+              on the rule, through the Settings → Audit Event Forwarding targets
+              of that kind.
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
