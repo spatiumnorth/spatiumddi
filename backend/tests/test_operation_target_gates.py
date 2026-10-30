@@ -5,9 +5,10 @@ Two halves:
 
 * **Apply.** ``create_ip_address`` (an applied Copilot proposal, an approved
   portal request) needs what ``POST /subnets/{id}/addresses`` needs: write on
-  that subnet, or write on an address set covering the address. The
-  operation's type-wide ``write ip_address`` alone does not reach a subnet,
-  with or without a hostname.
+  that subnet, or write on an address set covering the address. Like the
+  REST route's gate (#3058), the operation admits a ``write subnet`` grant
+  scoped to one subnet, or an address-set delegate, and then holds it to that
+  subnet or set, with or without a hostname.
 * **Preview / submit.** A subnet, block, zone or scope the caller cannot read
   is answered exactly like an id that does not exist: by the request portal's
   submit, and by the previews the Copilot shows.
@@ -151,9 +152,15 @@ async def _proposal(db: AsyncSession, user_id: uuid.UUID, args: dict) -> AIOpera
 
 
 def _ip_writer_reading(subnet: Subnet) -> list[dict]:
-    """Type-wide ``write ip_address``; ``read`` on the subnet, no write on it."""
+    """``write`` on some OTHER subnet; ``read`` on this one, no write on it.
+
+    The scoped grant passes the operation's type-level check exactly as it
+    passes the REST route's gate (#3058), so what refuses is the per-resource
+    gate. (``write ip_address`` no longer opens the REST address create at all
+    since #3058, so it would be refused before reaching that gate.)
+    """
     return [
-        {"action": "write", "resource_type": "ip_address"},
+        {"action": "write", "resource_type": "subnet", "resource_id": str(uuid.uuid4())},
         {"action": "read", "resource_type": "subnet", "resource_id": str(subnet.id)},
     ]
 
@@ -230,13 +237,35 @@ async def test_apply_function_itself_refuses_without_subnet_write(db_session: As
 
 
 @pytest.mark.asyncio
-async def test_copilot_apply_with_subnet_write_lands(db_session: AsyncSession) -> None:
+async def test_ip_address_write_alone_is_refused_like_the_rest_route(
+    db_session: AsyncSession,
+) -> None:
+    """``write ip_address`` does not open ``POST /subnets/{id}/addresses``
+    since #3058, so it does not reach the operation either."""
     env = await _estate(db_session)
     user, _ = await _user(
         db_session,
         name="ipw",
         permissions=[
             {"action": "write", "resource_type": "ip_address"},
+            {"action": "read", "resource_type": "subnet", "resource_id": str(env.subnet.id)},
+        ],
+    )
+    prop = await _proposal(db_session, user.id, _ip_args(env.subnet, "10.77.5.15"))
+    with pytest.raises(HTTPException) as ei:
+        await apply_proposal(prop.id, user, db_session, _fake_request())
+    assert ei.value.status_code == 403
+    assert "need 'write' on 'subnet'" in str(ei.value.detail)
+    assert await _addresses(db_session, env.subnet_id) == []
+
+
+@pytest.mark.asyncio
+async def test_copilot_apply_with_subnet_write_lands(db_session: AsyncSession) -> None:
+    env = await _estate(db_session)
+    user, _ = await _user(
+        db_session,
+        name="ipw",
+        permissions=[
             {"action": "write", "resource_type": "subnet", "resource_id": str(env.subnet.id)},
         ],
     )
@@ -262,7 +291,6 @@ async def test_address_set_writer_may_create_inside_the_set_only(db_session: Asy
         db_session,
         name="setw",
         permissions=[
-            {"action": "write", "resource_type": "ip_address"},
             {"action": "write", "resource_type": "address_set", "resource_id": str(aset.id)},
         ],
     )

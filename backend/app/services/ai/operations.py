@@ -104,6 +104,14 @@ class Operation:
     # (e.g. archiving your own chat session) that gate on ownership
     # inside their own apply rather than on a coarse RBAC permission.
     required_permission: tuple[str, str] | None = None
+    # Types on which a grant of ``required_permission``'s action ALSO passes
+    # ``enforce_operation_permission`` when it is scoped to one instance, the
+    # way the REST twin's router gate admits a subnet-scoped writer or an
+    # address-set delegate (#3058, #103). Only for an operation whose own
+    # apply then enforces the per-resource gate on the instance it acts on
+    # (``create_ip_address`` → ``_require_address_writable``): without that
+    # gate, a grant on one subnet would reach every subnet.
+    scoped_grant_types: tuple[str, ...] = ()
     # The gate for operations whose REST equivalent is superadmin-only
     # (webhooks, DNSSEC sign/unsign, zone update ACL, SNMP/NTP/syslog
     # settings, the importers, alert rules, temporary access, service
@@ -193,6 +201,7 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
     ``archive_session``, which check ownership inside their own apply).
     """
     from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        has_any_grant_for,
         is_effective_superadmin,
         user_has_permission,
     )
@@ -206,8 +215,14 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
     if op.required_permission is None:
         return
     action, resource_type = op.required_permission
-    if not user_has_permission(user, action, resource_type):
-        raise OperationPermissionError(action, resource_type)
+    if user_has_permission(user, action, resource_type):
+        return
+    # An instance-scoped grant on a ``scoped_grant_types`` type passes here as
+    # it passes the REST twin's router gate; the apply's per-resource gate
+    # decides whether it reaches the instance named.
+    if any(has_any_grant_for(user, action, rt) for rt in op.scoped_grant_types):
+        return
+    raise OperationPermissionError(action, resource_type)
 
 
 # ── Target resources: read visibility + per-resource apply gates ───────────
@@ -503,7 +518,8 @@ async def _apply_create_ip_address(
 
     # The REST create's per-resource gate, for every address (named or not):
     # write on this subnet, or on an address set covering the address. The
-    # type-wide ``ip_address`` grant above does not reach a subnet on its own.
+    # check above admits a grant scoped to ANY subnet or address set
+    # (``scoped_grant_types``), so this is the gate that holds it to this one.
     await _require_address_writable(db, user, subnet, addr_obj)
 
     net = ipaddress.ip_network(str(subnet.network), strict=False)
@@ -1991,8 +2007,12 @@ register(
         validate_submit=_validate_submit_create_ip_address,
         category="ipam",
         # The REST address write needs ``write`` on the subnet that owns the
-        # address (#3058); the apply path delegates to that handler.
+        # address (#3058); the apply path delegates to that handler. Its router
+        # gate also admits a writer scoped to one subnet or an address-set
+        # delegate (#103), so this does too, and the apply's
+        # ``_require_address_writable`` holds either to its own subnet / set.
         required_permission=("write", "subnet"),
+        scoped_grant_types=("subnet", "address_set"),
     )
 )
 
