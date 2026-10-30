@@ -73,4 +73,27 @@ describe("Edit MAC Block reason (#3083)", () => {
       reason: "xp found on desk",
     });
   });
+
+  it("keeps the stored reason offered after another one is picked", async () => {
+    const Tab = (mod as any).MacBlocksTab ?? (mod as any).default;
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Tab groupId="g1" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getAllByText("xp found on desk").length).toBeGreaterThan(0),
+    );
+    fireEvent.click(screen.getByTitle("Edit"));
+    const select = (await screen.findByText("Reason", { selector: "label" }))
+      .nextElementSibling as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "policy" } });
+    fireEvent.change(select, { target: { value: "xp found on desk" } });
+    expect(select.value).toBe("xp found on desk");
+    fireEvent.submit(select.closest("form")!);
+    await waitFor(() => expect(updateMacBlock).toHaveBeenCalled());
+    expect((updateMacBlock.mock.calls[0] as unknown[])[2]).toMatchObject({
+      reason: "xp found on desk",
+    });
+  });
 });

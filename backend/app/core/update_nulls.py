@@ -76,19 +76,38 @@ def resolve_update_changes(
     return {k: v for k, v in changes.items() if v is not None or k in clearable_set}
 
 
-def _norm(value: Any) -> Any:
-    """A comparable form of ``value``: "nothing" is one thing, rich types are text.
+class _Empty:
+    """The one value an empty list and an empty mapping both normalise to."""
 
-    ``None``, ``""``, ``[]`` and ``{}`` all mean "not set" to every update
-    dialog, so a stored NULL and the empty string the dialog posts back are the
-    same value. Mappings and lists are normalised member by member (a dialog
-    posts options as the same nested structure the row stores), and anything
-    that is not a plain JSON scalar (UUID, ipaddress, Enum, ...) is compared by
-    its text, since the row and the request body hold the same value as
-    different types.
+    def __repr__(self) -> str:
+        return "<empty>"
+
+
+_EMPTY = _Empty()
+
+
+def _norm(value: Any) -> Any:
+    """A comparable form of ``value``: empty text is NULL, rich types are text.
+
+    A stored NULL and the empty string a dialog posts back for it are the same
+    value: every text field an update dialog shows reads both as "not set".
+    An empty list and an empty mapping are the same as each other (a dialog
+    posts ``[]`` for an options column the row stores as ``{}``) but NOT the
+    same as NULL, because for some columns they mean different things: a DNS
+    zone's ``allow_transfer`` of NULL inherits the server's list while ``[]``
+    narrows transfers to the group's keys, and ``allow_recursion`` /
+    ``allow_query_cache`` render ``none`` for ``[]`` but a default for NULL.
+    Merging them would leave a real change out of the audit row.
+
+    Mappings and lists are normalised member by member (a dialog posts options
+    as the same nested structure the row stores), and anything that is not a
+    plain JSON scalar (UUID, ipaddress, Enum, ...) is compared by its text,
+    since the row and the request body hold the same value as different types.
     """
-    if value is None or value == "" or value == [] or value == {}:
+    if value is None or value == "":
         return None
+    if isinstance(value, (Mapping, list, tuple)) and not value:
+        return _EMPTY
     if isinstance(value, Mapping):
         return {str(k): _norm(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

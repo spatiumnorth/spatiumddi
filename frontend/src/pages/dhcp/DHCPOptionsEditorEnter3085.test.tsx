@@ -57,4 +57,22 @@ describe("Enter in a DHCP option field (#3085)", () => {
     ]);
     expect(submitted).toEqual([]);
   });
+
+  it("leaves an Enter that confirms an IME composition alone", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+    const box = screen.getByText("DNS Servers (option 6)", {
+      selector: "label",
+    }).nextElementSibling as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "10.98.130.99" } });
+    const notCancelled = fireEvent.keyDown(box, {
+      key: "Enter",
+      isComposing: true,
+    });
+    expect(notCancelled).toBe(true);
+    expect(latest.find((o) => o.code === 6)?.value).toEqual(["10.98.130.53"]);
+  });
 });

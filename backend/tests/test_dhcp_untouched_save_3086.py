@@ -125,3 +125,55 @@ async def test_mac_block_free_text_reason_survives_untouched_save(
         f"/api/v1/dhcp/mac-blocks/{block.id}", headers=h, json={"reason": "policy"}
     )
     assert r.status_code == 200 and r.json()["reason"] == "policy"
+
+
+def test_changed_keys_keeps_an_empty_list_apart_from_null() -> None:
+    # Empty text is NULL, but an empty list is not: a DNS zone's allow_transfer
+    # of NULL inherits the server's list while ``[]`` narrows transfers to the
+    # group's keys, so NULL -> [] is a real change the audit row must name.
+    assert changed_keys({"a": None}, {"a": []}) == ["a"]
+    assert changed_keys({"a": []}, {"a": None}) == ["a"]
+    assert changed_keys({"a": None}, {"a": {}}) == ["a"]
+    # ...while [] and {} for one column are the same "no options".
+    assert changed_keys({"o": {}}, {"o": []}) == []
+
+
+@pytest.mark.asyncio
+async def test_zone_allow_transfer_null_to_empty_is_audited(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from tests.test_dns_untouched_save_2463 import _setup
+
+    h, zone = await _setup(db_session)
+    assert zone.allow_transfer is None
+    r = await client.put(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}",
+        headers=h,
+        json={"allow_transfer": []},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["allow_transfer"] == []
+    assert (await _updates(db_session, "dns_zone"))[-1] == ["allow_transfer"]
+
+
+@pytest.mark.asyncio
+async def test_scope_pxe_detach_is_audited(client: AsyncClient, db_session: AsyncSession) -> None:
+    from app.models.dhcp import DHCPPXEProfile
+
+    h, subnet, grp, _ = await _world(db_session)
+    prof = DHCPPXEProfile(group_id=grp.id, name="p", next_server="192.0.2.9")
+    db_session.add(prof)
+    await db_session.commit()
+    r = await _create(client, h, subnet, grp, lease_time=3600, pxe_profile_id=str(prof.id))
+    assert r.status_code in (200, 201), r.text
+    sid = r.json()["id"]
+    assert r.json()["pxe_profile_id"] == str(prof.id)
+
+    r = await client.put(
+        f"/api/v1/dhcp/scopes/{sid}",
+        headers=h,
+        json={"pxe_profile_id": None, "clear_pxe_profile": True},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["pxe_profile_id"] is None
+    assert (await _updates(db_session, "dhcp_scope"))[-1] == ["pxe_profile_id"]

@@ -24,6 +24,8 @@ vi.mock("@/lib/api", () => ({
     listOptionCodes: () => Promise.resolve([]),
     listOptionTemplates: () => Promise.resolve([]),
     listPxeProfiles: () => Promise.resolve([]),
+    // #3077 reads the scope fresh on open; undefined keeps the row passed in.
+    getScope: () => Promise.resolve(undefined),
     updateScope: (...a: unknown[]) => (updateScope as any)(...a),
   },
   ipamApi: {
@@ -45,7 +47,7 @@ afterEach(() => {
   updateScope.mockClear();
 });
 
-function open() {
+async function open() {
   const scope = {
     id: "s1",
     subnet_id: "sub-a",
@@ -59,13 +61,13 @@ function open() {
       <CreateScopeModal scope={scope} onClose={() => {}} />
     </QueryClientProvider>,
   );
-  return screen.getByText("Lease Time (sec)", { selector: "label" })
+  return (await screen.findByText("Lease Time (sec)", { selector: "label" }))
     .nextElementSibling as HTMLInputElement;
 }
 
 describe("Edit DHCP Scope lease time (#3082)", () => {
   it("refuses a lease time of 0 and sends nothing", async () => {
-    const box = open();
+    const box = await open();
     expect(box.value).toBe("3600");
     fireEvent.change(box, { target: { value: "0" } });
     fireEvent.submit(box.closest("form")!);
@@ -76,7 +78,7 @@ describe("Edit DHCP Scope lease time (#3082)", () => {
   });
 
   it("refuses a cleared lease time too", async () => {
-    const box = open();
+    const box = await open();
     fireEvent.change(box, { target: { value: "" } });
     fireEvent.submit(box.closest("form")!);
     await waitFor(() =>
@@ -86,12 +88,26 @@ describe("Edit DHCP Scope lease time (#3082)", () => {
   });
 
   it("sends the lease time the field shows", async () => {
-    const box = open();
+    const box = await open();
     fireEvent.change(box, { target: { value: "7200" } });
     fireEvent.submit(box.closest("form")!);
     await waitFor(() => expect(updateScope).toHaveBeenCalled());
     expect((updateScope.mock.calls[0] as unknown[])[1]).toMatchObject({
       lease_time: 7200,
     });
+  });
+
+  it("shows the generic message, not a raw JS error, for an unexpected failure", async () => {
+    updateScope.mockImplementationOnce(() =>
+      Promise.reject(
+        new TypeError("Cannot read properties of undefined (reading 'x')"),
+      ),
+    );
+    const box = await open();
+    fireEvent.submit(box.closest("form")!);
+    await waitFor(() =>
+      expect(screen.getByText("Failed to save scope")).toBeTruthy(),
+    );
+    expect(screen.queryByText(/Cannot read properties/)).toBeNull();
   });
 });

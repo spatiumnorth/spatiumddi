@@ -361,9 +361,14 @@ export function DHCPOptionsEditor({
                 // submits the surrounding form with no blur: the dialog
                 // would save the options as they were before the typing.
                 // Commit the field and keep the dialog open, as the code
-                // picker above does.
+                // picker above does. An Enter that confirms an IME
+                // composition is left to the IME.
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") {
+                  if (
+                    e.key === "Enter" &&
+                    !e.nativeEvent.isComposing &&
+                    e.keyCode !== 229
+                  ) {
                     e.preventDefault();
                     setStandard(def, e.currentTarget.value);
                   }

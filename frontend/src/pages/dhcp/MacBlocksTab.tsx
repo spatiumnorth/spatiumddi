@@ -399,7 +399,11 @@ function MacBlockModal({
             value={reason}
             onChange={(e) => setReason(e.target.value)}
           >
-            {!isKnownReason(reason) && <option value={reason}>{reason}</option>}
+            {/* The stored free text stays offered after another reason is
+                picked, so the operator can go back to it (#3083). */}
+            {block && !isKnownReason(block.reason) && (
+              <option value={block.reason}>{block.reason}</option>
+            )}
             {Object.entries(REASON_LABELS).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}

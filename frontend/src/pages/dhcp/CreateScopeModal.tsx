@@ -20,6 +20,10 @@ import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
+// A refusal raised by the dialog's own checks before anything is sent; its
+// message is the reason shown to the operator (#3082).
+class ScopeFormError extends Error {}
+
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
 // for IPv6 or subnets too small to be useful.
@@ -372,7 +376,7 @@ export function CreateScopeModal({
       // the reason instead of swapping in a default through a falsy `||`.
       const parsedLeaseTime = parseInt(leaseTime, 10);
       if (Number.isNaN(parsedLeaseTime) || parsedLeaseTime <= 0) {
-        throw new Error(
+        throw new ScopeFormError(
           "Lease time must be a whole number of seconds, at least 1.",
         );
       }
@@ -395,16 +399,18 @@ export function CreateScopeModal({
           parsedCacheThreshold < 0 ||
           parsedCacheThreshold > 1)
       ) {
-        throw new Error("Lease cache threshold must be between 0 and 1.");
+        throw new ScopeFormError(
+          "Lease cache threshold must be between 0 and 1.",
+        );
       }
 
       if (parsedMinLease !== null && parsedMinLease > parsedLeaseTime) {
-        throw new Error(
+        throw new ScopeFormError(
           "Minimum lease time must be less than or equal to lease time.",
         );
       }
       if (parsedMaxLease !== null && parsedLeaseTime > parsedMaxLease) {
-        throw new Error(
+        throw new ScopeFormError(
           "Lease time must be less than or equal to maximum lease time.",
         );
       }
@@ -413,7 +419,7 @@ export function CreateScopeModal({
         parsedMaxLease !== null &&
         parsedMinLease > parsedMaxLease
       ) {
-        throw new Error(
+        throw new ScopeFormError(
           "Minimum lease time must be less than or equal to maximum lease time.",
         );
       }
@@ -530,10 +536,14 @@ export function CreateScopeModal({
         setError("");
       } else {
         setAdoptConflict(null);
-        // A refusal thrown by the mutation itself (lease time, cache and
-        // lease-bound checks) has no response; its message is the reason.
-        const local = e instanceof Error && !("response" in e);
-        setError(errMsg(e, local ? e.message : "Failed to save scope"));
+        // The dialog's own refusals (lease time, cache and lease-bound
+        // checks) carry their reason; any other error without an API detail
+        // keeps the generic message rather than surfacing a raw JS error.
+        setError(
+          e instanceof ScopeFormError
+            ? e.message
+            : errMsg(e, "Failed to save scope"),
+        );
       }
     },
   });

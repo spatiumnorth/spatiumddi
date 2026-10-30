@@ -978,6 +978,9 @@ async def update_scope(
     # second boolean field to disambiguate. Apply detach first; a
     # later ``pxe_profile_id`` set in the same call (operator
     # detaches one profile and binds another) still wins.
+    # The audit's before-image, taken ahead of the detach below (which writes
+    # the row directly) so a detach is named as a ``pxe_profile_id`` change.
+    before = snapshot(scope, [*changes, "pxe_profile_id"])
     if changes.pop("clear_pxe_profile", False):
         scope.pxe_profile_id = None
     if changes.get("pxe_profile_id") is not None:
@@ -1004,7 +1007,6 @@ async def update_scope(
             )
     placement_in = body.windows_placement
     changes.pop("windows_placement", None)
-    before = snapshot(scope, changes)
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()
@@ -1022,7 +1024,11 @@ async def update_scope(
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
         resource_display=str(scope.id),
-        changed_fields=changed_keys(before, changes, unordered={"relay_addresses"}),
+        changed_fields=changed_keys(
+            before,
+            {**changes, "pxe_profile_id": scope.pxe_profile_id},
+            unordered={"relay_addresses"},
+        ),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     await db.commit()

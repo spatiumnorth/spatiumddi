@@ -12,5 +12,6 @@
   assignment, pool, client class, option template, MAC block, device
   policy, PXE profile, phone profile or DNS blocking list now audits no
   changed field, instead of naming every field the dialog sent; values are
-  compared as the database holds them (empty vs unset, list order of relay
-  addresses, nested options).
+  compared as the database holds them (empty text vs unset, list order of
+  relay addresses, nested options), while an empty list is still told apart
+  from unset. Detaching a scope's PXE profile is now named in its audit row.
