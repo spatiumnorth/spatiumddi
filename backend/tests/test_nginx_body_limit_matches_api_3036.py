@@ -8,16 +8,23 @@ checked by resolving a concrete path for each allowance the way nginx picks a
 location -- while the generic ``/api/`` location keeps the 1 MiB default and
 every raised location streams the body (``proxy_request_buffering off``), so
 nginx never spools a large body for a caller the api has not authenticated.
+
+nginx's limit must not be ABOVE the api's either. Streaming, a body the api
+refuses is refused before the api reads it, and the api closes; nginx's next
+write then meets the closed socket and the client gets a 502 about one time
+in three. So the importer-family locations sit at exactly the allowance, and
+answer their own 413 in the api's JSON shape.
 """
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
 import pytest
 
-from app.core.body_limit import ALLOWANCES, MIB, Allowance
+from app.core.body_limit import ALLOWANCES, MIB, Allowance, too_large_detail
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _CONFS = (
@@ -37,8 +44,15 @@ _NGINX_DEFAULT = MIB
 _NOT_BEHIND_NGINX = (r"/api/v1/appliance/internal/slot-images/",)
 
 # The api's allowance adds multipart framing headroom (body_limit._FORM_OVERHEAD)
-# over the file cap; a dedicated location sized to the file cap itself is fine.
+# over the file cap. The backup and upgrade-image locations predate #3036 and
+# are sized to the file cap itself, 1 MiB under the allowance: nginx still
+# refuses first (at the file cap), so the api never refuses a body nginx
+# proxied, and their HTML 413 is unchanged. Every other location must sit at
+# exactly the allowance and answer its 413 as the api's JSON.
 _FORM_OVERHEAD = MIB
+_SIZED_TO_FILE_CAP = (r"/api/v1/backup/", r"/api/v1/appliance/upgrade-images")
+
+_TOO_LARGE_URI = "/_api_body_too_large/"
 
 _Loc = tuple[str, str, str]
 
@@ -103,15 +117,59 @@ def test_nginx_location_covers_the_api_allowance(conf: pathlib.Path, allowance: 
     locs = _locations(conf.read_text())
     path = _sample_path(allowance.pattern.pattern)
     mod, spec, body = _select(locs, path)
-    assert _limit(body) >= allowance.max_bytes - _FORM_OVERHEAD, (
+    limit = _limit(body)
+    assert limit >= allowance.max_bytes - _FORM_OVERHEAD, (
         f"{conf.name}: {path} is served by location {mod} {spec}, which admits "
-        f"{_limit(body)} bytes, but the api accepts {allowance.max_bytes}; nginx "
+        f"{limit} bytes, but the api accepts {allowance.max_bytes}; nginx "
         "413s it as HTML before the api reads it"
+    )
+    assert limit <= allowance.max_bytes, (
+        f"{conf.name}: location {mod} {spec} admits {limit} bytes for {path}, more "
+        f"than the api's {allowance.max_bytes}; a body between the two is streamed "
+        "to an api that refuses it unread and closes, and the client gets a 502"
     )
     assert re.search(r"proxy_request_buffering\s+off;", body), (
         f"{conf.name}: location {mod} {spec} raises the body limit but buffers the "
         "whole body to disk before the api's pre-body auth runs"
     )
+    if allowance.pattern.pattern.startswith(_SIZED_TO_FILE_CAP):
+        return
+    assert limit == allowance.max_bytes, (
+        f"{conf.name}: location {mod} {spec} admits {limit} bytes for {path}; it "
+        f"must be the api's exact {allowance.max_bytes}"
+    )
+    page = re.search(r"error_page\s+413\s+(\S+);", body)
+    assert page and page.group(1) == f"{_TOO_LARGE_URI}{allowance.max_bytes}", (
+        f"{conf.name}: location {mod} {spec} must answer its 413 through "
+        f"{_TOO_LARGE_URI}{allowance.max_bytes}, the api's JSON 413 for that limit, "
+        "not nginx's HTML page"
+    )
+
+
+@pytest.mark.parametrize("conf", _CONFS, ids=lambda p: p.name)
+@pytest.mark.parametrize("allowance", _fronted(), ids=lambda a: a.pattern.pattern)
+def test_nginx_413_is_the_api_json(conf: pathlib.Path, allowance: Allowance) -> None:
+    """What ``error_page 413`` lands on renders the api's own 413 body."""
+    if allowance.pattern.pattern.startswith(_SIZED_TO_FILE_CAP):
+        pytest.skip("nginx's own HTML 413, at the file cap (see _SIZED_TO_FILE_CAP)")
+    locs = _locations(conf.read_text())
+    uri = f"{_TOO_LARGE_URI}{allowance.max_bytes}"
+    mod, spec, body = _select(locs, uri)
+    assert re.search(r"^\s*internal;", body, re.M), f"{conf.name}: {spec} must be internal"
+    assert re.search(r"default_type\s+application/json;", body), spec
+    # A chunked body refused mid-stream reaches this location carrying its
+    # length so far; under a limit here it is refused again, as HTML.
+    assert re.search(r"client_max_body_size\s+0;", body), (
+        f"{conf.name}: {spec} must set client_max_body_size 0, or a chunked "
+        "over-limit body gets nginx's HTML 413 instead of this one"
+    )
+    ret = re.search(r"return\s+(\d+)\s+'(.*)';", body)
+    assert ret, f"{conf.name}: {spec} returns nothing"
+    capture = re.search(spec, uri)
+    assert capture
+    rendered = re.sub(r"\$(\d)", lambda m: capture.group(int(m.group(1))), ret.group(2))
+    assert int(ret.group(1)) == 413
+    assert json.loads(rendered) == {"detail": too_large_detail(allowance.max_bytes)}
 
 
 @pytest.mark.parametrize("conf", _CONFS, ids=lambda p: p.name)

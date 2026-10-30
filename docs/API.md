@@ -714,12 +714,14 @@ is counted as it arrives and refused once it passes the cap. The cap is
 `MAX_REQUEST_BODY_BYTES` (default **8 MiB**, minimum 64 KiB), set in the
 api's environment: `.env` on Docker Compose, `api.env` in the Helm chart.
 It applies to the api port itself. The bundled nginx admits 1 MiB on
-`/api/`, except on the routes below: each has an nginx location that
-passes its body through to the api unbuffered (128 MiB for the importers,
+`/api/`, except on the routes below, which each have an nginx location
+that passes the body through to the api unbuffered. For the importers,
 the zone spreadsheet, the pcap upload and the agents' ingested-records
-push; 2 GiB for backups; 4 GiB for upgrade images), so the limit that
-applies is the api's own and an over-limit body gets the api's JSON 413
-([#3036](https://github.com/spatiumnorth/spatiumddi/issues/3036)).
+push, that location's limit is exactly the route's own limit in the table
+below, and nginx answers a body over it with the same JSON 413 the api
+sends, before any of it is proxied
+([#3036](https://github.com/spatiumnorth/spatiumddi/issues/3036)). Backups
+(2 GiB) and upgrade images (4 GiB) pass through at those sizes.
 
 Routes that take larger bodies keep their own limits, which the cap never
 lowers:
