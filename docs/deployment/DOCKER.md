@@ -8,9 +8,9 @@
 ## Prerequisites
 
 - Docker Engine 25+ and Docker Compose v2.20+
-- 2 vCPU and 4 GiB RAM minimum, 4 vCPU and 8 GiB recommended. These are
-  derived from the same containers measured on the appliance and are not yet
-  measured on Compose: see [`SIZING.md`](SIZING.md)
+- 2 vCPU and 4 GiB RAM minimum, 4 vCPU and 8 GiB recommended. The containers
+  held 1.6 GiB at rest and at most 1.9 GiB under light load (measured on
+  arm64); the recommendation is derived: see [`SIZING.md`](SIZING.md#docker-compose)
 - Ports 8077 (frontend, `HTTP_PORT`) and optionally 8000 (API direct access, `API_PORT`) free on the host
 
 ---

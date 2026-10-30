@@ -1,9 +1,9 @@
 # Sizing
 
 How much memory, CPU and disk SpatiumDDI needs, measured on running
-appliances: the numbers per deployment shape and load, the Minimum and
-Recommended they give, what is not measured yet, and how to measure your
-own install. The README carries the short table
+appliances (amd64), and on Docker Compose and Kubernetes (arm64): the numbers
+per deployment shape and load, the Minimum and Recommended they give, what is
+not measured yet, and how to measure your own install. The README carries the short table
 ([Requirements, Memory / CPU](https://github.com/spatiumnorth/spatiumddi#memory--cpu)).
 
 ## Minimum and Recommended
@@ -14,8 +14,8 @@ own install. The README carries the short table
 | **Appliance, one node**: control plane only | 4 vCPU, 6 GiB RAM, 40 GiB disk | 4 vCPU, 8 GiB RAM, 40 GiB SSD | Derived from the row above: at this data size the DNS and DHCP pods (BIND, Kea and their agents) held about 0.2 GiB |
 | **Appliance, three-node control plane** | first node 4 vCPU / 8 GiB, two more 2 vCPU / 6 GiB, 40 GiB disks | every node 4 vCPU, 8 GiB RAM, 48 GiB SSD | Yes |
 | **Appliance role** (a DNS and / or DHCP agent box) | 3 GiB RAM: its pods do not schedule below that | 2 vCPU, 4 GiB RAM, 32 GiB SSD | No |
-| **Docker Compose**, one host | 2 vCPU, 4 GiB RAM | 4 vCPU, 8 GiB RAM | No: derived from the same containers on the appliance |
-| **Kubernetes**, the umbrella chart | per pod, see [Kubernetes](#kubernetes) | per pod, see [Kubernetes](#kubernetes) | No: per pod, from the appliance |
+| **Docker Compose**, one host | 2 vCPU, 4 GiB RAM | 4 vCPU, 8 GiB RAM | Minimum measured (arm64, Docker Desktop): the containers held at most 1.9 GiB, at rest and under light load. Recommended derived: no realistic load or agent profiles on Compose |
+| **Kubernetes**, the umbrella chart | one node: 4 vCPU, 6 GiB RAM with the overrides in [Kubernetes](#kubernetes), 8 GiB on the chart's defaults | 4 vCPU, 8 GiB RAM per node, with those overrides | Measured (arm64, Docker Desktop) on one k3s node, at rest and under light load; per pod in [Kubernetes](#kubernetes) |
 
 Give every control-plane node 64 GiB of disk or more for about 1M devices,
 and plan for more memory with very large DNS groups (250k records and up).
@@ -188,12 +188,11 @@ measured floor, not the comfortable size.
 
 ## Not measured yet
 
-- **Docker Compose.** Derived: on the appliance the same application
-  containers (api, worker and beat, PostgreSQL, Redis) held 2.7 GiB of RSS at
-  p50 and 3.1 GiB at p95 under the light load, with two worker processes.
-  Compose starts four (`--concurrency=4`). Hence 4 GiB Minimum and 8 GiB
-  Recommended, above the 2 GB older docs gave.
-- **Kubernetes.** Per pod, from the appliance; see the next section.
+- **Docker Compose and Kubernetes beyond light load, and on amd64.** Both were
+  measured on arm64, at rest and under the light load only (see [Docker
+  Compose](#docker-compose) and [Kubernetes](#kubernetes)): no realistic load,
+  no DNS or DHCP agents, one Kubernetes node. Each ran for 29 to 47 minutes,
+  and the worker was still growing at the end.
 - **The Appliance role on its own.** No run installed a DNS-only or
   DHCP-only agent box. On the measured nodes BIND held 15 to 41 MiB and Kea
   30 to 45 MiB at this data size. The rest of such a box is k3s (0.6 to 0.9
@@ -204,20 +203,123 @@ measured floor, not the comfortable size.
   load ran on the three-node clusters only. The single-node floor tests of
   2026-09 were heavier (250k records, 20k active devices) and passed at 6 GiB
   and 3 vCPU (see "Measured floors" in [`APPLIANCE.md`](APPLIANCE.md)).
-- **CPU per pod and disk I/O rates.** The samples carry no per-pod CPU and no
-  disk throughput. The CPU figures above are for the whole node.
+- **CPU per pod on the appliance, and disk I/O rates.** The appliance samples
+  carry no per-pod CPU and no disk throughput; their CPU figures are for the
+  whole node. Docker Compose and Kubernetes have CPU per container below
+  (arm64).
 - **Growth past 3.3 days.** On the soak, used memory rose 0.4 to 0.6 GiB per
   node and `/var` 1 to 2 GiB, still rising at the end.
 - **Smaller sizes** than the Minimums (5 GiB or 2 vCPU on one node, a
-  three-node cluster of 6 GiB nodes only), and **arm64**.
+  three-node cluster of 6 GiB nodes only), and **arm64 appliances**.
+
+## Docker Compose and Kubernetes: how they were measured
+
+- **What:** the 2026-10-28 nightly build's published images, arm64, on Docker
+  Desktop (Apple silicon, 10 CPUs, 11.7 GiB for its VM). The two shapes ran
+  one after the other, never side by side.
+- **Light load,** the same for both: the demo seed (`scripts/seed_demo.py`),
+  then four clients looping over 29 list pages of the API through the
+  frontend (IPAM, DNS, DHCP, VRFs, ASNs, devices, sites, customers, alerts,
+  audit, users, dashboards, settings, search), pausing half a second after
+  each answer. About 6 requests a second for 10 minutes, every answer a 200.
+- **Sampled:** every 15 seconds, at rest after the start, under the light
+  load, and at rest again after it. Memory is what `docker stats` and
+  `kubectl top` report: the container's memory less its inactive page cache
+  (the working set). It counts a page shared by forked processes once, unlike
+  RSS. CPU is each container's average over the stretch.
+- **arm64:** memory should carry to amd64 within a small margin (the same
+  Python, the same libraries, 64-bit on both). CPU does not: these cores are
+  faster than the VMs the appliance rows ran on, so read the CPU figures as
+  lower bounds.
+
+## Docker Compose
+
+The shipped `docker-compose.yml` with its default services (PostgreSQL,
+Redis, the api, one worker with four processes, beat, the frontend; no agent
+profiles) and a `.env` made from `.env.example`.
+
+| Container | At rest, MiB p50 | Light load, MiB p50 / max | CPU at rest / light load, millicores |
+|---|---|---|---|
+| api (one uvicorn process) | 352 | 431 / 435 | 6 / 101 |
+| worker (four processes) | 782, rising | 884 / 980 | 28 / 31 |
+| beat | 269 | 269 / 270 | 3 / 3 |
+| PostgreSQL | 103 | 163 / 164 | 8 / 14 |
+| Redis | 77 | 77 / 78 | 5 / 4 |
+| frontend (nginx) | 18 | 19 / 20 | 1 / 3 |
+| All containers | 1600 | 1843 / 1944 | 50 / 156 |
+
+At rest again after the load the containers held 1960 MiB (1989 at most).
+The worker was still growing: 641 MiB a minute after the start, 1021 MiB 28
+minutes later, its cgroup at 1084 MiB at the peak. The host's own OS and the
+Docker engine come on top. Hence the 4 GiB Minimum: it leaves about 2 GiB for
+them and for that growth. The 8 GiB Recommended stays derived: the realistic
+load, the DNS and DHCP agent profiles and long runs were not measured on
+Compose.
 
 ## Kubernetes
 
 The appliance runs the same umbrella chart on k3s, but its supervisor sizes
 the api, worker and PostgreSQL limits from the node's RAM (see
 [`APPLIANCE.md`](APPLIANCE.md)). On another cluster the chart's defaults in
-`values.yaml` apply. Measured on the appliance, RSS in MiB across every
-shape:
+`values.yaml` apply.
+
+**With the chart's defaults,** measured on one k3s 1.36 node with
+metrics-server, installed with `helm install` and only the image tag set.
+Working set per pod, as `kubectl top` reports it and as the autoscaler reads
+it:
+
+| Pod | Chart default, request / limit | At rest, MiB | Light load, MiB p50 / max | CPU at rest / light load, millicores per pod |
+|---|---|---|---|---|
+| api (one uvicorn process) | 256Mi / 512Mi | 295 to 305 | 344 / 355 (363 / 366 on 2 replicas) | 4 / 16 (3 / 53 on 2 replicas) |
+| worker (four processes) | 256Mi / 1Gi | 774, rising to 966 | 834 / 879 | 31 / 32 |
+| beat | 128Mi / 256Mi | 173 | 173 / 177 | 5 / 4 |
+| PostgreSQL | 256Mi / 1Gi | 73 | 324 / 387 | 16 / 23 |
+| Redis | 64Mi / 512Mi | 16 | 16 / 17 | 6 / 5 |
+| frontend (nginx), each of 2 | 64Mi / 128Mi | 9 | 10 / 11 | 0 / 2 |
+| CoreDNS, metrics-server, the local-path provisioner | | 59 | 69 | 8 / 7 |
+
+The node (pods, k3s and containerd) used 6.5 GiB at rest after the load with
+the defaults, and 3.7 GiB with two api replicas. Three things the defaults
+do:
+
+- **The api autoscaler runs 10 replicas at rest.** Its memory target is 80 %
+  of a 256Mi request, about 205 MiB, and one api process holds about 300 MiB
+  as soon as it has started. It went from 2 to 10 replicas within two
+  minutes of the install, with no traffic, and stayed there: memory does not
+  fall when replicas are added. The eight extra replicas cost about 2.8 GiB
+  and served the light load no faster than two did (#3110). Each holds its
+  own database pool: PostgreSQL saw 46 connections under the light load,
+  against the measured build's `max_connections` of 100; the chart now sizes
+  `max_connections` from the pools and the autoscaler's maximum (#2955).
+- **The worker sits at its 1Gi limit.** Its four processes reached the limit
+  about 40 minutes after the install, half of them under the light load, and
+  the kernel kept it under by reclaiming page cache (no OOM kill in 47
+  minutes). On Compose, with no limit, the same worker reached 1084 MiB.
+- **The api's 512Mi limit leaves little room.** One api process taking all of
+  the light load (on Compose) peaked at 469 MiB. On the appliance it held 0.4
+  to 0.85 GiB under the API suite.
+
+Until the chart's defaults change, set:
+
+```yaml
+api:
+  resources:
+    requests: { memory: 512Mi }
+    limits:   { memory: 1Gi }
+worker:
+  resources:
+    limits: { memory: 2Gi }
+```
+
+With a 512Mi request the autoscaler's memory target is about 410 MiB, above
+what each api pod held here at rest and under the light load (366 MiB at
+most, on two replicas). Or set
+`api.autoscaling.enabled: false` and `api.replicas` to the count you want.
+Once the autoscaler has scaled the api, `helm upgrade` with Helm 4 stops on a
+conflict over the Deployment's `replicas` until you add `--force-conflicts`
+(#3111).
+
+**Measured on the appliance,** RSS in MiB across every shape:
 
 | Pod | Chart default, request / limit | Measured on the appliance |
 |---|---|---|
@@ -227,11 +329,11 @@ shape:
 | PostgreSQL | 256Mi / 1Gi | not readable from RSS (shared buffers count once per backend). The appliance gives it 1.3 GiB or more |
 | Redis | 64Mi / 512Mi | 23 to 70 at p50 |
 
-The api's resident memory was above the default 512Mi limit in nearly every
-shape. Set `api.resources.limits.memory` to `1Gi` or more. Give the worker
-`2Gi` at the default four processes, or run two (`worker.concurrency: 2`),
-as the appliance does on nodes of 12 GiB or less. Per node, plan as for the
-appliance: its figures include k3s itself (0.6 to 0.9 GiB).
+The api's resident memory there was above the default 512Mi limit in nearly
+every shape, hence the `1Gi` above. Instead of a `2Gi` worker you can run two
+worker processes (`worker.concurrency: 2`), as the appliance does on nodes of
+12 GiB or less. Per node, plan as for the appliance: its figures include k3s
+itself (0.6 to 0.9 GiB; 0.55 GiB for the k3s server on the arm64 node).
 
 ## Measure your own install
 
@@ -255,7 +357,10 @@ kubectl get --raw "/api/v1/nodes/<node>/proxy/stats/summary"   # per-pod CPU and
 The appliance runs no metrics-server, so `kubectl top` does not work there.
 
 **Docker Compose:** `docker stats --no-stream` gives each container's memory
-and CPU. Read `/proc` on the host as above.
+and CPU. Its CPU is a sample of a second or two, which misses the worker's
+short tasks; for an average, read `usage_usec` from
+`/sys/fs/cgroup/cpu.stat` inside the container twice and divide by the time
+between. Read `/proc` on the host as above.
 
 **Kubernetes:** `kubectl top pod -n <namespace>` and `kubectl top node`.
 Both need metrics-server, which the api's autoscaler needs too.
