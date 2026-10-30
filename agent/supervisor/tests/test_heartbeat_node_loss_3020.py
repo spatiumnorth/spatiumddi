@@ -39,7 +39,9 @@ def _quiet_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(st, "read_firewall_state", dict)
     monkeypatch.setattr(hb, "probe_port_conflicts", dict)
     monkeypatch.setattr(hb, "_capabilities_payload", dict)
-    monkeypatch.setattr(hb, "_effective_control_plane_url", lambda cfg: "http://cp.invalid")
+    monkeypatch.setattr(
+        hb, "_effective_control_plane_url", lambda cfg: "http://cp.invalid"
+    )
     monkeypatch.setattr(hb, "load_cert", lambda d: None)
 
 
@@ -62,14 +64,18 @@ def test_a_5xx_heartbeat_did_not_land_and_is_resent_like_a_failed_one(
         return httpx.Response(status, headers=headers, json={"detail": "x"})
 
     cfg = types.SimpleNamespace(heartbeat_interval_seconds=30, state_dir=tmp_path)
-    with capture_logs() as logs, httpx.Client(transport=httpx.MockTransport(handler)) as client:
+    with capture_logs() as logs, httpx.Client(
+        transport=httpx.MockTransport(handler)
+    ) as client:
         held = hb.heartbeat_once(
             cfg, uuid.uuid4(), "tok", None, client, structlog.get_logger()  # type: ignore[arg-type]
         )
     assert held is None
-    assert [e["status_code"] for e in logs if e["event"] == "supervisor.heartbeat.server_error"] == [
-        status
-    ]
+    assert [
+        e["status_code"]
+        for e in logs
+        if e["event"] == "supervisor.heartbeat.server_error"
+    ] == [status]
     # The loop counts it as a failure and re-sends after 5 s, not 30 s.
     assert hb.next_heartbeat_delay(held, 1, 30.0, 2.0) == 5.0
 
@@ -80,8 +86,11 @@ def test_the_red_runs_sequence_now_stays_far_inside_the_bound() -> None:
     # costs at most the housekeeping wait, and the 500 is re-sent after 5 s; one
     # more 5xx while the database is still away doubles to 10 s.
     before = 28.0 + 30.4 + 2.0 + 30.0
-    after = 28.0 + hb.HOUSEKEEPING_WAIT_S + 2.0 + sum(
-        hb.next_heartbeat_delay(None, n, 30.0, 2.0) for n in (1, 2)
+    after = (
+        28.0
+        + hb.HOUSEKEEPING_WAIT_S
+        + 2.0
+        + sum(hb.next_heartbeat_delay(None, n, 30.0, 2.0) for n in (1, 2))
     )
     assert before > 90.0
     assert after < 75.0 - 10.0
@@ -105,7 +114,8 @@ class _Log:
 
 def test_work_that_finishes_inside_the_wait_is_done_before_run_returns() -> None:
     keeper, log, done = hb._Housekeeper(), _Log(), []
-    assert keeper.run(lambda: done.append(1), 2.0, log) is True
+    ran = keeper.run(lambda: done.append(1), 2.0, log)
+    assert ran is True
     assert done == [1]
     assert not keeper.busy()
     assert log.events == []
@@ -121,7 +131,8 @@ def test_slow_work_returns_after_the_wait_and_finishes_on_the_worker() -> None:
 
     t = time.monotonic()
     try:
-        assert keeper.run(slow, 0.2, log) is False
+        ran = keeper.run(slow, 0.2, log)
+        assert ran is False
         assert time.monotonic() - t < 2.0
         assert keeper.busy()
         assert done == []
@@ -144,10 +155,13 @@ def test_work_queued_behind_running_work_runs_after_it_and_only_the_newest() -> 
         done.append("first")
 
     try:
-        assert keeper.run(first, 0.1, log) is False
+        ran = keeper.run(first, 0.1, log)
+        assert ran is False
         assert started.wait(5)
-        assert keeper.run(lambda: done.append("second"), 0.1, log) is False
-        assert keeper.run(lambda: done.append("third"), 0.1, log) is False
+        ran = keeper.run(lambda: done.append("second"), 0.1, log)
+        assert ran is False
+        ran = keeper.run(lambda: done.append("third"), 0.1, log)
+        assert ran is False
         assert len(log.said("housekeeping_superseded")) == 1
     finally:
         release.set()
@@ -162,11 +176,13 @@ def test_a_crash_is_logged_and_the_worker_lives_on() -> None:
     def boom() -> None:
         raise RuntimeError("kubeapi GET /api/v1/nodes: timed out")
 
-    assert keeper.run(boom, 2.0, log) is True
+    ran = keeper.run(boom, 2.0, log)
+    assert ran is True
     assert log.said("housekeeping_crashed") == [
         {"error": "kubeapi GET /api/v1/nodes: timed out"}
     ]
-    assert keeper.run(lambda: done.append(1), 2.0, log) is True
+    ran = keeper.run(lambda: done.append(1), 2.0, log)
+    assert ran is True
     assert done == [1]
 
 
@@ -203,11 +219,18 @@ def seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         monkeypatch.setattr(st, name, lambda *a, **k: None)
     monkeypatch.setattr(hb, "probe_port_conflicts", dict)
     monkeypatch.setattr(hb, "_capabilities_payload", dict)
-    monkeypatch.setattr(hb, "_effective_control_plane_url", lambda cfg: "http://cp.invalid")
+    monkeypatch.setattr(
+        hb, "_effective_control_plane_url", lambda cfg: "http://cp.invalid"
+    )
     monkeypatch.setattr(hb, "load_cert", lambda d: None)
     monkeypatch.setattr(hb, "record_shared_chart_hold", lambda *a, **k: None)
     scale = types.SimpleNamespace(
-        current=3, ready=3, reported=3, scaled=False, deferred="", error=None,
+        current=3,
+        ready=3,
+        reported=3,
+        scaled=False,
+        deferred="",
+        error=None,
         spec_after=lambda size: size,
     )
     state = types.SimpleNamespace(
@@ -237,14 +260,20 @@ def seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "ensure_cnpg_operator_spread",
     ):
         monkeypatch.setattr(k8s_api, name, lambda *a, **k: (False, None))
-    monkeypatch.setattr(k8s_api, "reclaim_stranded_mirror_storage", lambda *a, **k: ({}, None))
     monkeypatch.setattr(
-        k8s_api, "reclaim_stranded_postgres_storage", lambda **k: k8s_api.PostgresReclaim()
+        k8s_api, "reclaim_stranded_mirror_storage", lambda *a, **k: ({}, None)
+    )
+    monkeypatch.setattr(
+        k8s_api,
+        "reclaim_stranded_postgres_storage",
+        lambda **k: k8s_api.PostgresReclaim(),
     )
     monkeypatch.setattr(hb, "_reclaim_stranded_redis", lambda *a, **k: None)
     monkeypatch.setattr(hb, "_reclone_stuck_postgres", lambda *a, **k: None)
     monkeypatch.setattr(
-        hb, "_etcd_evictions", types.SimpleNamespace(tick=lambda asked, wanted=(): ([], {}))
+        hb,
+        "_etcd_evictions",
+        types.SimpleNamespace(tick=lambda asked, wanted=(): ([], {})),
     )
     for name in ("_nodes_deleted", "_evicted_pending", "_stranded_pending"):
         monkeypatch.setattr(hb, name, set())
@@ -307,7 +336,9 @@ def test_the_watchdog_waits_while_housekeeping_runs(
     monkeypatch.setattr(hb, "_run_role_lifecycle", lambda *a, **k: None)
     monkeypatch.setattr(hb, "_last_watchdog_at", 0.0)
     checks: list[object] = []
-    monkeypatch.setattr(watchdog, "check_health", lambda *a, **k: checks.append(a) or {})
+    monkeypatch.setattr(
+        watchdog, "check_health", lambda *a, **k: checks.append(a) or {}
+    )
     seed.slow = True
     seed.tick()
     assert len(checks) == 1  # due, and nothing was running yet
