@@ -93,7 +93,7 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
 @register_tool(
     name="list_dns_zones",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_zone"),
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
         "Each summary includes name, type, kind (forward / reverse), "
@@ -191,7 +191,7 @@ class QueryRecordsArgs(BaseModel):
 @register_tool(
     name="query_dns_records",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "Search DNS records across zones. Filters: zone, record type, "
         "and name / FQDN substring. Returns each record's relative "
@@ -246,7 +246,7 @@ class ListServerGroupsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_server_groups",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List DNS server groups (logical groupings of authoritative "
         "DNS servers). Each summary includes name, group type, "
@@ -300,7 +300,7 @@ class FindDnsServersArgs(BaseModel):
 
 @register_tool(
     name="find_dns_servers",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List individual DNS servers with the group each belongs to, its "
         "driver, the version its agent runs, whether it is the group's "
@@ -683,7 +683,7 @@ class ListDNSRecordsArgs(BaseModel):
 @register_tool(
     name="list_dns_records",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "Cross-zone DNS record search. Filterable by relative name "
         "substring, FQDN substring, type, value substring, zone, or "
@@ -753,7 +753,7 @@ class ExportDNSZoneRecordsArgs(BaseModel):
 
 @register_tool(
     name="export_dns_zone_records",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "One zone's records as the rows of its CSV / XLSX export (Data → "
         "Export CSV in the zone view): id, name, type, ttl (null = the "
@@ -987,7 +987,7 @@ class ListDNSViewsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_views",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List split-horizon DNS views — different clients see "
         "different zone data. Each row carries id, name, "
@@ -1037,7 +1037,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 @register_tool(
     name="find_zone_dnssec_info",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_zone"),
     description=(
         "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
         "flag, the list of DS records (key tag, algorithm, digest "
@@ -1109,7 +1109,7 @@ class FindDNSRateLimitSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_rate_limit_settings",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "Return the BIND9 Response Rate Limiting (RRL) + amplification "
         "defense posture for one DNS server group (or all groups when "
@@ -1196,7 +1196,7 @@ class FindZoneDriftArgs(BaseModel):
 @register_tool(
     name="find_dns_zone_drift",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_record"),
     description=(
         "Per-server config-drift report for one DNS zone (#61): AXFRs / "
         "pulls the live zone from every server in the zone's group and "
@@ -1251,7 +1251,7 @@ class ListDNSSECPoliciesArgs(BaseModel):
 
 @register_tool(
     name="list_dnssec_policies",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List the DNSSEC signing policies operators can attach to BIND9 "
         "zones (issue #49): name, algorithm, NSEC3 settings, and KSK/ZSK "
@@ -1303,7 +1303,7 @@ class FindDNSQueryStatsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_query_stats",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "Per-server DNS query stats over a trailing window from "
         "dns_metric_sample (the same rcode counters the NXDOMAIN-spike / "
@@ -1505,7 +1505,7 @@ class FindZoneUpdateAclsArgs(BaseModel):
 @register_tool(
     name="find_zone_update_acls",
     honours_token_binding=True,
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_zone"),
     description=(
         "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "
         "whether ``dynamic_update_enabled`` is on, the ordered list of "
@@ -1603,7 +1603,7 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_encrypted_transports",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "Report which DNS server groups serve DNS-over-TLS (DoT) or "
         "DNS-over-HTTPS (DoH) to clients (and DNS-over-QUIC, DoQ, on "
@@ -1726,7 +1726,7 @@ class ListResolverPresetsArgs(BaseModel):
 
 @register_tool(
     name="list_resolver_presets",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    permission=("read", "dns_group"),
     description=(
         "List the curated public upstream DNS resolvers SpatiumDDI ships "
         "presets for — Cloudflare, Google, Quad9 and friends — with each "
