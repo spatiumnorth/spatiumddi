@@ -277,6 +277,7 @@ ingress:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-body-size: "4g"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
 ```
 
 - `frontend.trustedProxyCidrs` sets `FRONTEND_TRUSTED_PROXY_CIDRS` on the

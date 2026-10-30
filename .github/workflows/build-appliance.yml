@@ -204,19 +204,31 @@ jobs:
           # built a single ``docker-overlay.img`` overlay file via a
           # docker:dind sandbox is gone (no docker on the appliance
           # post-Phase-7).
-          # ``sudo -E`` preserves SPATIUMDDI_VERSION + BAKE_SOURCE +
-          # the two #1026 platform vars from the job env. Without ``-E``, sudo strips them and
-          # bake-images.sh falls back to its ``SPATIUMDDI_VERSION=dev``
-          # / ``BAKE_SOURCE=local`` defaults — which then fails on the
-          # runner with "no local image found" because no :dev tags
-          # exist (the runner pulls from ghcr, not local).
+          # The job env (SPATIUMDDI_VERSION, BAKE_SOURCE and the two
+          # #1026 platform vars) is handed to the script through ``env``,
+          # not ``sudo -E``. Ubuntu 26.04 runners ship sudo-rs, which
+          # ignores ``-E`` ("preserving the entire environment is not
+          # supported"); the script then falls back to its
+          # ``SPATIUMDDI_VERSION=dev`` / ``BAKE_SOURCE=local`` defaults and
+          # fails with "no local image found", since the runner pulls from
+          # ghcr and has no :dev tags. ``env`` sets them itself, under
+          # classic sudo and sudo-rs alike.
           #
           # ``DOCKER_CONFIG=$HOME/.docker`` re-points root's docker CLI
           # at the runner-user's ``~/.docker/config.json`` where the
           # docker/login-action step above stamped the GHCR creds. Our
           # ghcr.io/spatiumnorth/* images are private; without this redirect
           # root would docker-pull anonymously and 401 on every image.
-          sudo DOCKER_CONFIG="$HOME/.docker" -E appliance/scripts/bake-images.sh
+          sudo env \
+            DOCKER_CONFIG="$HOME/.docker" \
+            SPATIUMDDI_VERSION="$SPATIUMDDI_VERSION" \
+            BAKE_SOURCE="$BAKE_SOURCE" \
+            DOCKER_DEFAULT_PLATFORM="$DOCKER_DEFAULT_PLATFORM" \
+            BAKE_SAVE_PLATFORM="$BAKE_SAVE_PLATFORM" \
+            ${APPLIANCE_ARCH:+APPLIANCE_ARCH="$APPLIANCE_ARCH"} \
+            ${ALLOW_STALE_IMAGES:+ALLOW_STALE_IMAGES="$ALLOW_STALE_IMAGES"} \
+            ${STALE_MAX_AGE_S:+STALE_MAX_AGE_S="$STALE_MAX_AGE_S"} \
+            appliance/scripts/bake-images.sh
           echo "→ Baked image tarballs:"
           ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
           echo "→ Total size:"

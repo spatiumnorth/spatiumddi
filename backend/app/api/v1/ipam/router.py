@@ -107,6 +107,7 @@ from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
 )
+from app.services.ipam.gateway_rules import gateway_problem
 from app.services.ipam.hygiene import (
     DEFAULT_FREE_RESPONDING_DAYS,
     DEFAULT_SQUAT_DAYS,
@@ -6116,17 +6117,21 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
 
     await _assert_no_overlap(db, body.space_id, canonical)
 
-    # Validate gateway is within the subnet if explicitly provided
-    if body.gateway:
-        try:
-            gw = ipaddress.ip_address(body.gateway)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"Invalid gateway IP: {body.gateway}")
-        if gw not in net:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Gateway {body.gateway} is not within subnet {canonical}",
-            )
+    # Validate an explicit gateway: inside the subnet, and not on the network
+    # or broadcast address its own placeholder rows hold (which used to reach
+    # the unique constraint as a generic 409). Subnet Planner runs the same
+    # rule (#2984).
+    gw_problem = gateway_problem(
+        body.gateway or None,
+        net,
+        reject_reserved=(
+            subnet_kind != "multicast"
+            and not body.skip_auto_addresses
+            and net.prefixlen < (127 if net.version == 6 else 31)
+        ),
+    )
+    if gw_problem:
+        raise HTTPException(status_code=422, detail=gw_problem)
 
     total = _total_ips(net)
 
@@ -7225,18 +7230,11 @@ async def update_subnet(
                 detail=f"Subnet {subnet.network} is not contained within block {target.network}",
             )
 
-    # Validate new gateway is within the subnet
+    # Validate new gateway is within the subnet (same rule as create, #2984).
     if body.gateway is not None:
-        try:
-            gw = ipaddress.ip_address(body.gateway)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"Invalid gateway IP: {body.gateway}")
-        net = _parse_network(str(subnet.network))
-        if gw not in net:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Gateway {body.gateway} is not within subnet {subnet.network}",
-            )
+        gw_problem = gateway_problem(body.gateway, _parse_network(str(subnet.network)))
+        if gw_problem:
+            raise HTTPException(status_code=422, detail=gw_problem)
 
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:

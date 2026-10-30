@@ -4405,6 +4405,7 @@ async def _apply_assign_appliance_role_locked(
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
     if signer_problem is not None:
         raise ValueError(signer_problem)
+    prev_roles = list(row.assigned_roles or [])
     row.assigned_roles = list(args.roles)
     # #1562 — same contract as the REST roles endpoint: a group field
     # present in the payload with a null value unassigns the group; an
@@ -4439,7 +4440,9 @@ async def _apply_assign_appliance_role_locked(
             # pointer alone would leave the appliance's server in the old group.
             # A refusal raises, and the proposal applies nothing.
             try:
-                dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, user)
+                dhcp_move = await move_appliance_dhcp_servers(
+                    db, row, dhcp_group, user, prev_roles=prev_roles
+                )
             except HTTPException as exc:
                 raise ValueError(str(exc.detail)) from exc
             moved_servers.extend(dhcp_move.moved)

@@ -35,6 +35,7 @@ import {
   type MulticastMembershipReadWithGroup,
   type NmapScanRead,
   type Subnet,
+  formatApiError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
@@ -199,16 +200,9 @@ export function IPDetailModal({
       });
     },
     onError: (err: unknown) => {
-      // detail is a string for our HTTPExceptions but a list of objects for a
-      // Pydantic 422 — only render it when it's actually a string.
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
       setWakeMsg({
         ok: false,
-        text:
-          typeof detail === "string"
-            ? detail
-            : "Failed to send the magic packet.",
+        text: formatApiError(err, "Failed to send the magic packet."),
       });
     },
   });
@@ -1287,9 +1281,7 @@ function DeviceProfileSection({
       qc.invalidateQueries({ queryKey: ["nmap-scans"] });
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Failed to dispatch scan");
+      setError(formatApiError(err, "Failed to dispatch scan"));
     },
   });
 

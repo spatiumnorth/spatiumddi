@@ -406,14 +406,175 @@ def test_the_image_enables_the_unit_and_makes_the_runner_executable() -> None:
     assert 'chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-handoff.service"' in text
 
 
-def test_the_agent_hands_off_before_it_reboots_and_undoes_a_reboot_that_failed() -> None:
+def test_the_agent_delegates_to_the_power_action_wrapper() -> None:
+    """#3008 — one implementation: the wrapper owns the handoff, the cancel
+    trap, the marker and the undo; the agent keeps its trigger semantics and
+    runs none of those itself."""
     lines = [ln.strip() for ln in AGENT.read_text().splitlines()
              if ln.strip() and not ln.strip().startswith("#")]
-    before = next(i for i, ln in enumerate(lines) if "--before-reboot" in ln)
-    reboot = next(i for i, ln in enumerate(lines) if ln == "if ! systemctl reboot; then")
-    undo = next(i for i, ln in enumerate(lines) if "--undo" in ln)
-    assert before < reboot < undo
-    assert not any(ln.startswith("exec systemctl reboot") for ln in lines)
+    text = "\n".join(lines)
+    assert '"$POWER_ACTION" reboot' in text
+    assert "--before-reboot" not in text and "--undo" not in text
+    assert "systemctl reboot" not in text.replace("spatium-power-action reboot", "")
+    assert 'mv -fT "$TRIGGER" "${TRIGGER}.done"' in text
+    mv = next(i for i, ln in enumerate(lines) if ln.startswith('mv -fT "$TRIGGER"'))
+    call = next(i for i, ln in enumerate(lines) if '"$POWER_ACTION" reboot' in ln)
+    assert mv < call
+    # the grace for in-flight DNS / DHCP responses is still served, before
+    # the wrapper (the first cut of #3008 dropped it with the old block)
+    grace = next(i for i, ln in enumerate(lines) if ln == 'sleep "$GRACE_SECONDS" &')
+    assert mv < grace < call
+    # the grace marker goes up before the trigger is moved aside, so there is
+    # no instant in which neither is there (#3008, QA case 2)
+    marker = next(i for i, ln in enumerate(lines) if 'state_write "$GRACE_MARKER"' in ln)
+    assert marker < mv
+    assert "trap clear_grace EXIT" in text
+    assert 'GRACE_SECONDS="${SPATIUM_REBOOT_AGENT_GRACE_S:-5}"' in text
+
+
+BOOT = "11111111-2222-3333-4444-555555555555"
+
+
+def _agent_start(tmp_path: Path, *, grace_s: int, wrapper_body: str = "exit 0",
+                 plant: Path | None = None):
+    """The real agent in a tmp tree, started and not waited for. The stub
+    wrapper records its call and whether the grace marker was still there."""
+    import os
+    import subprocess
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "reboot-pending-fleet").write_text("stamp-1\n")
+    if plant is not None:
+        (state / "reboot-fleet-grace").symlink_to(plant)
+    (tmp_path / "boot_id").write_text(BOOT + "\n")
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(
+        "#!/bin/bash\n"
+        f'if [ -e {state}/reboot-fleet-grace ]; then g=grace; else g=nograce; fi\n'
+        f'echo "wrapper $* $g" >> {tmp_path}/calls\n{wrapper_body}\n'
+    )
+    wrapper.chmod(0o755)
+    src = (AGENT.read_text().replace("/var/lib/spatiumddi/release-state", str(state))
+           .replace("/var/log/spatiumddi", str(tmp_path / "log")))
+    script = tmp_path / "agent"
+    script.write_text(src)
+    script.chmod(0o755)
+    proc = subprocess.Popen(
+        [str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env={**os.environ, "SPATIUM_POWER_ACTION": str(wrapper),
+             "SPATIUM_REBOOT_AGENT_GRACE_S": str(grace_s),
+             "SPATIUM_BOOT_ID_FILE": str(tmp_path / "boot_id")})
+    return proc, state
+
+
+def _until(pred, timeout: float = 10) -> None:
+    import time
+    deadline = time.monotonic() + timeout
+    while not pred():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def test_the_agent_holds_the_grace_marker_through_its_grace(tmp_path: Path) -> None:
+    """#3008 (QA case 2) — the trigger is renamed before the grace, so the
+    marker is what the console and the api see during it."""
+    proc, state = _agent_start(tmp_path, grace_s=30)
+    try:
+        marker = state / "reboot-fleet-grace"
+        _until(lambda: (state / "reboot-pending-fleet.done").exists())
+        assert marker.read_text().split() == [str(proc.pid), BOOT]
+        assert not (state / "reboot-pending-fleet").exists()
+        assert oct(marker.stat().st_mode & 0o777) == oct(0o644)
+        assert not (tmp_path / "calls").exists()
+    finally:
+        proc.terminate()
+        proc.wait(10)
+
+
+def test_a_stop_during_the_grace_never_reboots_and_clears_the_marker(tmp_path: Path) -> None:
+    """The console's F9 stops the unit during the grace: the wrapper is never
+    called, the run ends at once, and the marker comes down."""
+    import time
+    proc, state = _agent_start(tmp_path, grace_s=30)
+    _until(lambda: (state / "reboot-fleet-grace").exists()
+           and (state / "reboot-pending-fleet.done").exists())
+    started = time.monotonic()
+    proc.terminate()
+    assert proc.wait(10) == 1
+    assert time.monotonic() - started < 5
+    assert not (state / "reboot-fleet-grace").exists()
+    assert not (tmp_path / "calls").exists()
+
+
+def test_the_marker_overlaps_the_wrapper_and_comes_down_after_the_handover(
+    tmp_path: Path,
+) -> None:
+    """Up while the wrapper runs (its lock takes over with no gap), down once
+    the agent has handed over and exited."""
+    proc, state = _agent_start(tmp_path, grace_s=0)
+    assert proc.wait(30) == 0
+    assert (tmp_path / "calls").read_text().splitlines() == ["wrapper reboot grace"]
+    assert not (state / "reboot-fleet-grace").exists()
+
+
+def test_a_stop_during_the_wrapper_waits_for_it_then_clears_the_marker(tmp_path: Path) -> None:
+    proc, state = _agent_start(tmp_path, grace_s=0, wrapper_body="sleep 1; exit 1")
+    _until(lambda: (tmp_path / "calls").exists())
+    proc.terminate()
+    assert proc.wait(10) == 1
+    assert not (state / "reboot-fleet-grace").exists()
+
+
+def test_the_grace_marker_never_writes_through_a_planted_symlink(tmp_path: Path) -> None:
+    """The api and the supervisor can create names in release-state; the
+    agent runs as root (GHSA-h2j9-qrg7-grfw)."""
+    victim = tmp_path / "victim"
+    victim.write_text("precious\n")
+    victim.chmod(0o640)
+    proc, state = _agent_start(tmp_path, grace_s=30, plant=victim)
+    try:
+        _until(lambda: (state / "reboot-pending-fleet.done").exists())
+        marker = state / "reboot-fleet-grace"
+        assert not marker.is_symlink()
+        assert marker.read_text().split() == [str(proc.pid), BOOT]
+    finally:
+        proc.terminate()
+        proc.wait(10)
+    assert victim.read_text() == "precious\n"
+
+
+def _agent_run(tmp_path: Path, *, wrapper_rc: int):
+    import os
+    import subprocess
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(f'#!/bin/bash\necho "wrapper $*" >> {tmp_path}/calls\nexit {wrapper_rc}\n')
+    wrapper.chmod(0o755)
+    src = AGENT.read_text()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "reboot-pending-fleet").write_text("stamp-1\n")
+    src = (src.replace("/var/lib/spatiumddi/release-state", str(state))
+              .replace("/var/log/spatiumddi", str(tmp_path / "log")))
+    script = tmp_path / "agent"
+    script.write_text(src)
+    script.chmod(0o755)
+    proc = subprocess.run([str(script)], env={**os.environ, "SPATIUM_POWER_ACTION": str(wrapper),
+                                              "SPATIUM_REBOOT_AGENT_GRACE_S": "0"},
+                          capture_output=True, text=True, timeout=30)
+    return proc, state
+
+
+def test_the_agent_renames_the_trigger_and_runs_the_wrapper(tmp_path: Path) -> None:
+    proc, state = _agent_run(tmp_path, wrapper_rc=0)
+    assert proc.returncode == 0
+    assert (tmp_path / "calls").read_text().splitlines() == ["wrapper reboot"]
+    assert not (state / "reboot-pending-fleet").exists()
+    assert (state / "reboot-pending-fleet.done").exists()
+
+
+def test_the_agent_fails_when_the_wrapper_does(tmp_path: Path) -> None:
+    proc, _ = _agent_run(tmp_path, wrapper_rc=1)
+    assert proc.returncode == 1
 
 
 # ---- pure: what CNPG would do, and when the handoff is done ------------------------

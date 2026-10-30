@@ -337,12 +337,14 @@ returns `403`.
 { "username": "admin", "password": "admin" }
 ```
 
-On success (and no MFA) the response is:
+The refresh token is never in a response body. On success the server sets it
+as the HttpOnly `spatium_refresh` cookie (`Set-Cookie`), and the same holds for
+the response of `POST /api/v1/auth/login/mfa`. On success (and no MFA) the
+body is:
 
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "9c2f...e1",
   "token_type": "bearer",
   "force_password_change": true,
   "mfa_required": false,
@@ -357,7 +359,6 @@ factor at `POST /api/v1/auth/login/mfa`:
 ```json
 {
   "access_token": null,
-  "refresh_token": null,
   "token_type": "bearer",
   "force_password_change": false,
   "mfa_required": true,
@@ -377,12 +378,11 @@ password-recovery allowlist (`/auth/change-password`, `/auth/logout`,
 
 `POST /api/v1/auth/refresh`
 
-```json
-{ "refresh_token": "9c2f...e1" }
-```
-
-returns a fresh `{ access_token, refresh_token, token_type,
-force_password_change }`. Refresh is **rotating**: the presented
+takes no body: the refresh token is read from the `spatium_refresh` cookie
+the login set. Without the cookie the answer is 401 "Missing refresh token".
+It returns a fresh `{ access_token, token_type, force_password_change }`
+and sets the rotated
+refresh token as the cookie again. Refresh is **rotating**: the presented
 refresh token's session is revoked and a new session (and new refresh
 token) is issued. Each access token carries the issuing session's UUID
 as its `jti` claim, so revoking the session (`POST /api/v1/auth/logout`
@@ -482,8 +482,8 @@ entry and nowhere else — a `feature_module` row means an operator
 changed it. A module ships **enabled** only if it is core IPAM / DNS /
 DHCP workflow, a zero-footprint UI convenience, or a hand-invoked
 read-only diagnostic; everything else ships **disabled**
-([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 14 of
-53 are on out of the box. Settings → Features lists every module with
+([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 16 of
+57 are on out of the box. Settings → Features lists every module with
 its description either way, so a disabled one is still discoverable.
 Examples of gated prefixes (from `router.py`):
 
@@ -504,10 +504,15 @@ Operators toggle modules via the admin feature-modules surface under
 
 ## 6. Pagination
 
-There are two list shapes in the codebase. New routers should use the
-envelope; the legacy core routers return bare arrays.
+There are three list shapes in the codebase: the `{items, total, limit,
+offset}` envelope (6.1), bare arrays (6.2), and `Page[T]`
+(`{items, total, page, page_size}`, `backend/app/api/pagination.py`), which
+DNS records and DHCP leases answer and which that module names as the shape
+for new endpoints that can grow unbounded. The audit list answers
+`{total, items}`. Check the route's schema in `/api/docs` rather than
+assuming one shape.
 
-### 6.1 `{items, total, limit, offset}` envelope (preferred)
+### 6.1 `{items, total, limit, offset}` envelope
 
 The network-modeling and newer routers (circuits, services, ASNs,
 VRFs, overlays, multicast, TLS certs, …) accept `limit` + `offset`
@@ -702,7 +707,7 @@ Common status codes across the surface:
 | `409 Conflict` | Uniqueness / overlap / collision conflict, or a delete refused because rows still reference the target |
 | `413 Content Too Large` | The request body is over the API's body cap (see below) |
 | `422 Unprocessable Entity` | Pydantic request-body / query-param validation failure, or a request-supplied reference to a row that does not exist |
-| `429 Too Many Requests` | Per-IP login rate limit tripped |
+| `429 Too Many Requests` | A rate limit or attempt budget tripped: the per-IP, per-username or install-wide sign-in ceilings, the MFA wrong-code and step-up budgets, appliance registration, and a few others (some carry `Retry-After`) |
 | `503 Service Unavailable` | Maintenance mode, transient DB-connection-closed (carries `Retry-After`), or a failing readiness check |
 
 ### Request body limits
@@ -713,8 +718,15 @@ over it is refused before any of the body is read; a body sent without one
 is counted as it arrives and refused once it passes the cap. The cap is
 `MAX_REQUEST_BODY_BYTES` (default **8 MiB**, minimum 64 KiB), set in the
 api's environment: `.env` on Docker Compose, `api.env` in the Helm chart.
-It applies to the api port itself; traffic through the bundled nginx is
-already limited to 1 MiB on `/api/`.
+It applies to the api port itself. The bundled nginx admits 1 MiB on
+`/api/`, except on the routes below, which each have an nginx location
+that passes the body through to the api unbuffered. For the importers,
+the zone spreadsheet, the pcap upload and the agents' ingested-records
+push, that location's limit is exactly the route's own limit in the table
+below, and nginx answers a body over it with the same JSON 413 the api
+sends, before any of it is proxied
+([#3036](https://github.com/spatiumnorth/spatiumddi/issues/3036)). Backups
+(2 GiB) and upgrade images (4 GiB) pass through at those sizes.
 
 Routes that take larger bodies keep their own limits, which the cap never
 lowers:
@@ -805,7 +817,9 @@ server-side log lines for that request (non-negotiable #7).
 - **CORS** — origins come from the `CORS_ORIGINS` env var (comma-
   separated; default `*`). With a wildcard, credentialed CORS is
   disabled by construction (the API authenticates via the
-  `Authorization` header, not cookies). Pin explicit origins to enable
+  `Authorization` header; the HttpOnly `spatium_refresh` cookie and the
+  short-lived OIDC / SAML sign-in flow cookies are scoped to
+  `/api/v1/auth`). Pin explicit origins to enable
   `allow_credentials`.
 - **Trusted hosts** — `TRUSTED_HOSTS` (default `*`) gates the inbound
   `Host` header; set it to your real hostnames to harden against
