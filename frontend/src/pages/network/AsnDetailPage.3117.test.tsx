@@ -41,7 +41,7 @@ vi.mock("@/lib/api", async () => {
                 : name === "authApi" && method === "myPermissions"
                   ? async () => ({ is_superadmin: true, grants: [] })
                   : name === "asnsApi" && method === "get"
-                    ? async () => ASN
+                    ? async () => current
                     : pending,
           },
         ),
@@ -52,7 +52,12 @@ vi.mock("@/lib/api", async () => {
 
 const { AsnDetailPage } = await import("./AsnDetailPage");
 
-afterEach(cleanup);
+let current: Record<string, unknown> = ASN;
+
+afterEach(() => {
+  cleanup();
+  current = ASN;
+});
 
 function show() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -73,5 +78,20 @@ describe("AsnDetailPage WHOIS empty state (#3117)", () => {
     const msg = await screen.findByText(/No raw WHOIS data/);
     expect(msg.textContent).toMatch(/no public WHOIS/i);
     expect(msg.textContent).not.toMatch(/run Refresh WHOIS/i);
+  });
+
+  it("still points a public ASN at the Refresh WHOIS it can press", async () => {
+    current = {
+      ...ASN,
+      number: 13335,
+      kind: "public",
+      registry: "arin",
+      whois_state: "unknown",
+    };
+    show();
+    const msg = await screen.findByText(/No raw WHOIS data/);
+    expect(msg.textContent).toMatch(/run Refresh WHOIS/i);
+    const button = screen.getByRole("button", { name: /Refresh WHOIS/ });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
   });
 });
