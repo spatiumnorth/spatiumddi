@@ -269,9 +269,7 @@ async def test_approver_who_cannot_read_the_subnet_is_refused_and_request_stays_
         ],
     )
     await db_session.commit()  # a wrongly-failed request rolls back first
-    resp = await client.post(
-        f"/api/v1/requests/{rid}/approve", headers=_auth(blind_token), json={}
-    )
+    resp = await client.post(f"/api/v1/requests/{rid}/approve", headers=_auth(blind_token), json={})
     assert resp.status_code == 403, resp.text
     assert "No write permission on subnet" in resp.json()["detail"]
     assert "not found" not in resp.json()["detail"]
@@ -356,9 +354,7 @@ async def test_deleted_subnet_still_fails_the_request(
     # The failed path rolls back before stamping; keep the delete and the
     # approver row through that rollback.
     await db_session.commit()
-    resp = await client.post(
-        f"/api/v1/requests/{rid}/approve", headers=_auth(blind_token), json={}
-    )
+    resp = await client.post(f"/api/v1/requests/{rid}/approve", headers=_auth(blind_token), json={})
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "failed"
     cr = await _cr_state(db_session, rid)

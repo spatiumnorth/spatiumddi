@@ -2372,9 +2372,7 @@ def _zone_records_refusal(user: User, zone_id: object) -> OperationPermissionErr
 
     if not user_has_permission(user, "write", "dns_record"):
         return OperationPermissionError("write", "dns_record")
-    return OperationPermissionError(
-        "write", "dns_zone", "API token is not scoped to this DNS zone"
-    )
+    return OperationPermissionError("write", "dns_zone", "API token is not scoped to this DNS zone")
 
 
 async def _preview_create_dns_record(
@@ -2419,9 +2417,7 @@ async def _preview_create_dns_record(
     if not (
         _can_read_target(user, "dns_zone", zone.id) or _user_can_write_zone_records(user, zone.id)
     ):
-        return hidden_target_preview(
-            "dns_zone", args.zone_id, _zone_records_refusal(user, zone.id)
-        )
+        return hidden_target_preview("dns_zone", args.zone_id, _zone_records_refusal(user, zone.id))
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
     # #2653 — the REST create's refusal; the reconciler would revert the row.
