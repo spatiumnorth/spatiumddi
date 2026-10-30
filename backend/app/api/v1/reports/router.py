@@ -16,9 +16,9 @@ to the dominant resource type each report draws from:
   so it must gate on the same resource type the canonical customers
   surface does, not on the ``ip_address`` rows we happen to count)
 * top-modified      → ``read`` on ``audit_log``
-* top-dns-clients   → ``read`` on ``server`` OR ``dns_group`` (the DNS
-  query-log surface in the Logs router gates on ``server``; we accept
-  the DNS family root too)
+* top-dns-clients   → ``read`` on ``server``, the grant the DNS query log
+  in the Logs router takes. It ranks every server's clients, so a grant
+  on one ``dns_group`` is not enough (#3130)
 """
 
 from __future__ import annotations
