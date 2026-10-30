@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import {
@@ -103,6 +103,7 @@ import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   applianceTlsApi,
+  versionApi,
   dnsApi,
   settingsApi,
   dnsBlocklistApi,
@@ -7387,7 +7388,7 @@ export function RevealedSecretModal({
 
 // ── Options Tab ───────────────────────────────────────────────────────────────
 
-function OptionsTab({ groupId }: { groupId: string }) {
+export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
   const { isSuperadmin } = useDnsGrants();
@@ -7404,6 +7405,14 @@ function OptionsTab({ groupId }: { groupId: string }) {
     queryFn: () => applianceTlsApi.list(),
     retry: false,
   });
+  // #3045 — where that store is managed. Web UI Certificate is an entry in
+  // Appliance → Fleet's side list, and Fleet shows it only on an
+  // appliance-hosted control plane; Docker / Kubernetes reach it by API.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+  });
+  const applianceMode = versionInfo?.appliance_mode ?? true;
 
   // Options the agent-managed Technitium driver cannot apply (#1763): the
   // API refuses a non-default value for a group holding such a server, so the
@@ -8230,10 +8239,27 @@ function OptionsTab({ groupId }: { groupId: string }) {
           </select>
         </Field>
         <p className="text-xs text-muted-foreground">
-          Managed under Appliance → Web UI Certificate — upload one, or issue it
-          from Let's Encrypt with the built-in ACME client. Renewals are picked
-          up automatically. A listener with no usable certificate is skipped and
-          the server stays Do53-only rather than failing to start.
+          {applianceMode ? (
+            <>
+              Managed under{" "}
+              <Link to="/appliance?tab=tls" className="underline">
+                Appliance → Fleet → Web UI Certificate
+              </Link>{" "}
+              — upload one, or issue it from Let's Encrypt with the built-in
+              ACME client.
+            </>
+          ) : (
+            <>
+              This control plane runs on Docker or Kubernetes, which has no
+              certificate page: upload one with{" "}
+              <code>POST /api/v1/appliance/tls/upload</code>, or issue it from
+              Let's Encrypt with <code>POST /api/v1/appliance/acme/issue</code>,
+              and it is listed here.
+            </>
+          )}{" "}
+          Renewals are picked up automatically. A listener with no usable
+          certificate is skipped and the server stays Do53-only rather than
+          failing to start.
         </p>
 
         <div className="flex items-center justify-between border-t pt-3">

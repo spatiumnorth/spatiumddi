@@ -25,6 +25,25 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
 from cryptography.x509.oid import NameOID
 
+# #3045 — where an operator manages ``ApplianceCertificate`` rows, for the
+# texts that send them there (the DoT / DoH refusal, the expiry alert). Since
+# #404 the Web UI Certificate page is an entry in the Appliance page's Fleet
+# side list, and Fleet shows it only on an appliance-hosted control plane; a
+# Docker or Kubernetes control plane reaches the same store through the API.
+WEB_UI_CERTIFICATE_PAGE = "Appliance → Fleet → Web UI Certificate"
+CERTIFICATE_API = "POST /api/v1/appliance/tls/upload"
+ACME_ISSUE_API = "POST /api/v1/appliance/acme/issue"
+
+
+def certificate_store_location(appliance_mode: bool) -> str:
+    """Name the place a certificate is uploaded or issued, as a noun phrase."""
+    if appliance_mode:
+        return WEB_UI_CERTIFICATE_PAGE
+    return (
+        f"the API ({CERTIFICATE_API}, or {ACME_ISSUE_API} for Let's Encrypt; "
+        "a Docker or Kubernetes control plane has no certificate page)"
+    )
+
 
 class TLSValidationError(ValueError):
     """Raised when uploaded PEMs fail parsing or key/cert mismatch.
