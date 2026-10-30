@@ -512,8 +512,9 @@ function AuditDetails({ id }: { id: string }) {
 function ChainIntegrityBadge() {
   // Verify the NEWEST 1000 rows (where tampering matters) so opening the
   // audit page on a huge deployment doesn't take seconds. The nightly
-  // Celery task does the full sweep + writes an alert event; the tooltip
-  // says which range this badge covered (#2297).
+  // Celery task checks new rows each night and the whole chain once its
+  // last full pass is over 7 days old (#2286), and writes an alert event
+  // on a break; the tooltip says which range this badge covered (#2297).
   const { data } = useQuery({
     queryKey: ["audit-integrity-newest-1000"],
     queryFn: () => auditApi.integrity(1000, true),
@@ -533,7 +534,7 @@ function ChainIntegrityBadge() {
         className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
         title={
           data.partial
-            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify walks the whole chain.`
+            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify checks the rows added since its last run, and the whole chain again once its last full pass is more than 7 days old.`
             : `Whole chain verified (${data.rows_checked.toLocaleString()} rows)`
         }
       >

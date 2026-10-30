@@ -12,6 +12,7 @@ import {
   type CircuitStatus,
   type CircuitUpdate,
   type TransportClass,
+  formatApiError,
 } from "@/lib/api";
 import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -143,7 +144,7 @@ function formatCost(cost: string | null, currency: string): string {
 
 type EditorTab = "general" | "endpoints" | "term" | "notes";
 
-function CircuitEditorModal({
+export function CircuitEditorModal({
   existing,
   onClose,
 }: {
@@ -247,11 +248,7 @@ function CircuitEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

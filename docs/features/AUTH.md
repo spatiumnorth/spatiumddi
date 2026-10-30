@@ -33,7 +33,8 @@ SpatiumDDI's auth stack has three layers:
 ## Local auth
 
 - `POST /auth/login` accepts JSON `{username, password}`. Returns
-  `{access_token, refresh_token, force_password_change}`.
+  `{access_token, token_type, force_password_change}`; the refresh token is
+  set only as the HttpOnly `spatium_refresh` cookie and is never in the body.
 - Passwords are `bcrypt` hashed. New users default `force_password_change=True`
   so the UI redirects them to `/change-password` before they can do anything
   else.
@@ -209,7 +210,7 @@ session alone doesn't prove and an SSO account has no local password.
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and
   exchanges the pre-token via `POST /auth/login/mfa` for the
-  real `{access_token, refresh_token}` pair. Backup codes are
+  real `{access_token, ...}` body, with the refresh token set as the `spatium_refresh` cookie. Backup codes are
   invalidated on use.
 - **MFA attempt limits**: `POST /auth/login/mfa` checks three bounds
   before it looks at the code, and a TOTP code and a backup code are
@@ -678,8 +679,8 @@ Prefixes match on a whole path segment, so `/api/v1/dns` covers
 Multiple scopes compose by **union** (any single match passes). An
 **empty** scope set means no scope restriction at all (the token still
 inherits the owning user's RBAC, which is the only gate) — equivalent
-to the pre-#74 behaviour. New tokens pick scopes via a chip selector in
-the create modal.
+to the pre-#74 behaviour. New tokens pick scopes by ticking checkboxes in
+the create dialog.
 
 Scope enforcement runs **before** RBAC: a non-empty scope set narrows the
 token, and the owning user's RBAC still applies on top, so a `read`-scoped
@@ -819,13 +820,12 @@ up by hash, enforces `is_active` and `expires_at`, then loads the
 owning user and records the use in `last_used_at`. The write is at most
 once a minute per token and commits on its own, so a token used only for
 reads shows its use too (#1158). JWTs take the original path. A
-missing / wrong / revoked token returns the same generic 401 as an
-invalid JWT to avoid confirming token existence to an attacker.
+missing / wrong / revoked token returns 401 (`Invalid or revoked API token`; an expired one, `API token has expired`), a different detail from an invalid JWT.
 
 **Lifecycle.**
 - Create via the Admin → API Tokens UI or `POST /api/v1/api-tokens`
-  (JSON: `{name, description?, expires_in_days?, stepup_password?,
-  stepup_totp_code?}` — the owner's step-up is required, #1355). The create
+  (JSON: `{name, description?, expires_at?, expires_in_days?, scopes?,
+  resource_grants?, stepup_password?, stepup_totp_code?}` — the owner's step-up is required, #1355). The create
   response contains the raw `token` field **once** — the UI forces a
   "copy now" dialog before it disappears.
 - List via `GET /api/v1/api-tokens` (your tokens only; superadmins

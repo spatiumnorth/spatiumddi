@@ -34,6 +34,7 @@ from app.services.dhcp_import import (
     WindowsDHCPImportError,
     commit_import,
     detect_conflicts,
+    drop_invalid_pools,
     drop_unservable_hostnames,
     parse_isc_config,
     parse_kea_config,
@@ -366,6 +367,9 @@ async def _attach_conflicts(
     )
     # #2919 — the preview shows what the commit will store.
     preview.warnings.extend(drop_unservable_hostnames(preview.scopes))
+    # #3037 — Kea / ISC drop a bad pool at parse; this covers Windows too.
+    preview.warnings.extend(drop_invalid_pools(preview.scopes))
+    preview.total_pools = sum(len(s.pools) for s in preview.scopes)
 
 
 # ── Kea endpoints ────────────────────────────────────────────────────
