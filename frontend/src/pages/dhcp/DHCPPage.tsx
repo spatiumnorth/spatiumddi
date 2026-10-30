@@ -2066,7 +2066,7 @@ export function ServerPoolsOrStaticsTab({
   );
 }
 
-function ClientClassesTab({ groupId }: { groupId: string }) {
+export function ClientClassesTab({ groupId }: { groupId: string }) {
   // #1339, #1861 — each write takes the tab's own resource permission, with
   // the HTTP method's action (``delete`` for a delete).
   const dhcpGate = useDhcpGate();
@@ -2188,8 +2188,16 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
           title="Delete Client Class"
           description={`Delete class "${del.name}"?`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
