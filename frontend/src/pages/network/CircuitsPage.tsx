@@ -697,8 +697,8 @@ export function CircuitsPage() {
             <h1 className="text-xl font-semibold">WAN circuits</h1>
             <p className="text-sm text-muted-foreground">
               Carrier-supplied transport pipes — provider, class, bandwidth,
-              endpoints, contract term + cost. Foundation for the future MPLS
-              service catalog and SD-WAN overlay routing roadmap items.
+              endpoints, contract term + cost. Circuits feed the service catalog
+              (MPLS L3VPN, SD-WAN) and the SD-WAN overlays.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
