@@ -20,6 +20,7 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
+from app.services.dhcp.normalize import norm_duid, norm_ip, norm_mac
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.static_conflicts import check_static_conflicts as _conflict_check
 from app.services.dhcp.static_ipam import (
@@ -160,6 +161,36 @@ class StaticResponse(BaseModel):
         return str(v) if v is not None else v
 
 
+def _comparable(field: str, v: Any) -> Any:
+    """The form of a static's field that a no-op update is detected in (#3076).
+
+    Spellings of one value compare equal: a MAC in any case or separator, an
+    address in any IP notation (the column is INET, so it reads back as an
+    ``ipaddress`` object), a hostname with or without its root dot or capitals,
+    a DUID with or without separators, and ``None`` / ``""`` for the optional
+    text fields.
+    """
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    text = str(v).strip()
+    if field == "mac_address":
+        return norm_mac(text)
+    if field == "ip_address":
+        return norm_ip(text.split("/", 1)[0])
+    if field == "duid":
+        return norm_duid(text)
+    if field == "hostname":
+        return text.rstrip(".").lower()
+    return text
+
+
+def _same_value(field: str, current: Any, sent: Any) -> bool:
+    """True when ``sent`` is the stored ``current`` value, however spelled."""
+    return bool(_comparable(field, current) == _comparable(field, sent))
+
+
 @router.get("/scopes/{scope_id}/statics", response_model=list[StaticResponse])
 async def list_statics(
     scope_id: uuid.UUID,
@@ -270,6 +301,11 @@ async def update_static(
             address_family=scope.address_family or "ipv4",
             previous=st.options_override or {},
         )
+    # #3076 — a field sent back at the value the row already holds is not a
+    # change. A dialog opened on a stale row resends every field, and writing
+    # them through would revert whatever another surface (an IPAM inline
+    # edit) stored since.
+    changes = {k: v for k, v in changes.items() if not _same_value(k, getattr(st, k), v)}
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
@@ -278,6 +314,10 @@ async def update_static(
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
+    if not changes:
+        # Nothing differs from what is stored: no push, no IPAM / DNS write.
+        await db.refresh(st)
+        return st
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st, action="update")

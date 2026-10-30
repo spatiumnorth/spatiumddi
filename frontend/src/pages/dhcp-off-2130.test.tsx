@@ -345,29 +345,32 @@ describe("New Subnet dialog", () => {
 });
 
 describe("Edit IP status choices", () => {
-  function options(status: string) {
-    open(<EditAddressModal address={address({ status })} onClose={() => {}} />);
-    const select = screen.getByText("Status", { selector: "label" })
+  async function options(status: string) {
+    // Edit address reads its row fresh on open (#3077).
+    const row = address({ status });
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    open(<EditAddressModal address={row} onClose={() => {}} />);
+    const select = (await screen.findByText("Status", { selector: "label" }))
       .nextElementSibling as HTMLSelectElement;
     return { select, values: [...select.options].map((o) => o.value) };
   }
 
-  it("offers dhcp and static_dhcp while DHCP is on (control)", () => {
-    const { values } = options("allocated");
+  it("offers dhcp and static_dhcp while DHCP is on (control)", async () => {
+    const { values } = await options("allocated");
     expect(values).toEqual(expect.arrayContaining(["dhcp", "static_dhcp"]));
   });
 
-  it("does not offer them as choices while DHCP is off", () => {
+  it("does not offer them as choices while DHCP is off", async () => {
     dhcpOff();
-    const { values } = options("allocated");
+    const { values } = await options("allocated");
     expect(values).not.toContain("dhcp");
     expect(values).not.toContain("static_dhcp");
     expect(values).toContain("allocated");
   });
 
-  it("a stored static_dhcp address shows no 'create a scope' notice while DHCP is off", () => {
+  it("a stored static_dhcp address shows no 'create a scope' notice while DHCP is off", async () => {
     dhcpOff();
-    options("static_dhcp");
+    await options("static_dhcp");
     expect(
       screen.queryByText("No DHCP scope exists", { exact: false }),
     ).toBeNull();
@@ -382,7 +385,7 @@ describe("Edit IP status choices", () => {
         Promise.resolve(address({ status })),
       );
       answer("ipamApi", "updateAddress", updateAddress);
-      const { select } = options(status);
+      const { select } = await options(status);
       expect(select.value).toBe(status);
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
       await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
