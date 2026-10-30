@@ -34,6 +34,10 @@ UTM, or a bare-metal box. Size it for the role you will pick in the wizard:
 | **First node** (control plane: api, web UI, worker, PostgreSQL, Redis, k3s) | 4 | 8 GiB | 40 GiB SSD |
 | **Additional node** (DNS / DHCP agent, promotable to the control plane later) | 2 | 4 GiB | 32 GiB SSD |
 
+Size a node you mean to promote into the control plane like the first node.
+Measured figures, the minimums, and the 48 GiB disk advice for a three-node
+control plane are in [`SIZING.md`](SIZING.md).
+
 The installer **refuses any disk under 32 GiB** — the A/B upgrade layout
 needs two 8 GiB OS slots plus a `/var` that holds the image store, the
 database and the logs. Below the recommended figures on a first node it

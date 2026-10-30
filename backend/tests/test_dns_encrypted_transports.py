@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -437,6 +438,82 @@ async def test_delete_cert_linked_but_listeners_off_succeeds(
 
     r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
     assert r.status_code == 204, r.text
+
+
+async def test_delete_active_cert_off_appliance_succeeds(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """#3061 — ``is_active`` means "the cert nginx serves" and only an
+    appliance has one, yet an ACME issue sets it anywhere. Refusing the
+    delete would leave an issued cert undeletable on compose / k8s."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", False)
+    headers = await _superadmin(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = True
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 204, r.text
+
+
+async def test_delete_active_cert_on_appliance_is_409(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", True)
+    headers = await _superadmin(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = True
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+
+
+@pytest.mark.parametrize("appliance_mode", [True, False])
+async def test_delete_active_cert_in_use_by_listener_is_409_on_every_install(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch, appliance_mode: bool
+) -> None:
+    """#3061 relaxed the ``is_active`` refusal off an appliance; the DoT/DoH
+    in-use guard is the one that protects encrypted-DNS clients, and it must
+    still refuse on both install shapes, whatever ``is_active`` says."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "appliance_mode", appliance_mode)
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    cert = await _cert(db_session)
+    cert.is_active = not appliance_mode  # off-appliance: the ACME-issued shape
+    db_session.add(
+        DNSServerOptions(group_id=group.id, dot_enabled=True, tls_certificate_id=cert.id)
+    )
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+    assert group.name in r.json()["detail"]
+
+
+async def test_delete_cert_serving_doq_only_is_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3061 — DoQ (Technitium, #741) serves the same certificate, but the
+    in-use guard only looked at DoT and DoH, so a DoQ-only group's cert could
+    be deleted out from under it with nothing said."""
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    cert = await _cert(db_session)
+    db_session.add(
+        DNSServerOptions(group_id=group.id, doq_enabled=True, tls_certificate_id=cert.id)
+    )
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/appliance/tls/{cert.id}", headers=headers)
+    assert r.status_code == 409, r.text
+    assert group.name in r.json()["detail"]
 
 
 # ── MCP read tool (#2887) ───────────────────────────────────────────────

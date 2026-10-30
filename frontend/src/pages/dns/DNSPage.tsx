@@ -80,6 +80,8 @@ import {
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -3209,19 +3211,50 @@ const RECORD_VALUE_PLACEHOLDER: Record<string, string> = {
   DNAME: "target.example.net.",
 };
 
-function RecordModal({
-  groupId,
-  zoneId,
-  zoneName,
-  record,
-  onClose,
-}: {
+type RecordModalProps = {
   groupId: string;
   zoneId: string;
   zoneName?: string;
   record?: DNSRecord;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the record fresh on open (#3077): the row the page holds comes
+// from a cached records page that may predate a Save made a moment ago. It is
+// opened from the zone's records page or the group-wide records list, so both
+// are refetched and the row is taken from whichever holds it.
+export function RecordModal(props: RecordModalProps) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow(props.record, () =>
+    refetchRow<DNSRecord>(
+      qc,
+      [
+        ["dns-records", props.zoneId],
+        ["dns-group-records", props.groupId],
+      ],
+      props.record!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Record"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <RecordModalForm {...props} record={fresh.row} />;
+}
+
+function RecordModalForm({
+  groupId,
+  zoneId,
+  zoneName,
+  record,
+  onClose,
+}: RecordModalProps) {
   const qc = useQueryClient();
   const isReverseZone =
     !!zoneName && /\.(in-addr|ip6)\.arpa\.?$/i.test(zoneName);
@@ -3276,7 +3309,7 @@ function RecordModal({
       setError(`TTL ${recordTtl}.`);
       return;
     }
-    mut.mutate({
+    const body = {
       name,
       record_type: type,
       value,
@@ -3287,7 +3320,30 @@ function RecordModal({
       weight: isSrv && weight !== "" ? parseInt(weight, 10) : null,
       port: isSrv && port !== "" ? parseInt(port, 10) : null,
       view_id: viewId || null,
-    });
+    };
+    if (!record) {
+      mut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3077), so a dialog opened
+    // on an out-of-date row cannot write the old values back. The type is not
+    // editable, so it never rides an update.
+    const { record_type: _type, ...fields } = body;
+    const was = {
+      name: record.name,
+      value: record.value,
+      ttl: record.ttl ?? null,
+      priority: record.priority ?? null,
+      weight: record.weight ?? null,
+      port: record.port ?? null,
+      view_id: record.view_id ?? null,
+    };
+    const diff = changedFields(was, fields);
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   }
 
   return (
@@ -10709,7 +10765,7 @@ function BlocklistModal({
   );
 }
 
-function BlocklistDetail({
+export function BlocklistDetail({
   list,
   onBack,
 }: {
@@ -10913,7 +10969,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -10925,7 +10983,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -12149,10 +12209,7 @@ export function DNSPage() {
     },
   });
   const deleteGroupError =
-    deleteGroup.error &&
-    (((deleteGroup.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroup.error));
+    deleteGroup.error && formatApiError(deleteGroup.error);
 
   function toggleGroup(id: string) {
     setExpandedGroups((prev) => {

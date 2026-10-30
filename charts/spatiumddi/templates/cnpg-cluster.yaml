@@ -113,6 +113,23 @@ spec:
   # sessions never end on their own. Rendered at every instance count, so
   # a Cluster already carries it when a demote leaves it one instance.
   smartShutdownTimeout: {{ .Values.postgresql.cnpg.smartShutdownTimeout }}
+  {{- if .Values.postgresql.cnpg.nodeLocalApiServer.enabled }}
+
+  # #3021: the instance pods reach the API server on their own node (see
+  # values.yaml). The kubernetes Service sends the primary's one long-lived
+  # API connection to any node's API server; when that node was the one
+  # lost, the primary's liveness isolation check failed on the replica on
+  # it and kubelet restarted the primary although it had lost no peer it
+  # needed. CNPG hands ``env`` to the instance pods; an explicit variable
+  # outranks the one kubelet injects for the kubernetes Service.
+  env:
+    - name: KUBERNETES_SERVICE_HOST
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    - name: KUBERNETES_SERVICE_PORT
+      value: {{ .Values.postgresql.cnpg.nodeLocalApiServer.port | default 6443 | quote }}
+  {{- end }}
 
   postgresql:
     parameters:

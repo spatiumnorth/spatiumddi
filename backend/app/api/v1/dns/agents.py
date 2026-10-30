@@ -30,6 +30,7 @@ from app.api.pre_body_auth import PreBodyAuthRoute, header_auth
 from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    WakeResult,
     collecting_wakes,
     dns_wake_channels,
     wake_subscription,
@@ -1067,7 +1068,11 @@ async def agent_config_longpoll(
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
                 AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
                 return Response(status_code=304, headers=headers)
-            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+            if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.SHUTDOWN:
+                # #3015 — this api process is stopping: end the hold now so the
+                # next pass makes one last ETag check and answers 304, and the
+                # agent re-polls another pod instead of being cancelled.
+                deadline = asyncio.get_running_loop().time()
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponseV2)

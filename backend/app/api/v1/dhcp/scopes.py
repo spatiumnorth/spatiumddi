@@ -24,6 +24,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import changed_keys, snapshot
 from app.models.dhcp import DHCPPXEProfile, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
@@ -977,6 +978,9 @@ async def update_scope(
     # second boolean field to disambiguate. Apply detach first; a
     # later ``pxe_profile_id`` set in the same call (operator
     # detaches one profile and binds another) still wins.
+    # The audit's before-image, taken ahead of the detach below (which writes
+    # the row directly) so a detach is named as a ``pxe_profile_id`` change.
+    before = snapshot(scope, [*changes, "pxe_profile_id"])
     if changes.pop("clear_pxe_profile", False):
         scope.pxe_profile_id = None
     if changes.get("pxe_profile_id") is not None:
@@ -1020,7 +1024,11 @@ async def update_scope(
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
         resource_display=str(scope.id),
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(
+            before,
+            {**changes, "pxe_profile_id": scope.pxe_profile_id},
+            unordered={"relay_addresses"},
+        ),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     await db.commit()

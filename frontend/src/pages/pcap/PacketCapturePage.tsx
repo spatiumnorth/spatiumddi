@@ -472,8 +472,7 @@ function CaptureForm({
       )}
       {start.isError && (
         <p className="text-[11px] text-destructive">
-          {(start.error as { response?: { data?: { detail?: string } } })
-            ?.response?.data?.detail ?? "Failed to start capture."}
+          {formatApiError(start.error, "Failed to start capture.")}
         </p>
       )}
 

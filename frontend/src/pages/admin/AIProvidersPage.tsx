@@ -21,6 +21,7 @@ import {
   type AIProviderKind,
   type AIProviderUpdate,
   type AITestConnectionResult,
+  formatApiError,
 } from "@/lib/api";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -648,10 +649,7 @@ export function AIProvidersPage() {
       setTestResult(null);
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
@@ -665,10 +663,7 @@ export function AIProvidersPage() {
       setTestResult(null);
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? String(err);
-      setEditorErr(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setEditorErr(formatApiError(err, String(err)));
     },
   });
 
