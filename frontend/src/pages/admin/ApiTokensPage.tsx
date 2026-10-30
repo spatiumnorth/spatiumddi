@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import {
   apiTokensApi,
+  formatDialogError,
   API_TOKEN_SCOPES,
   dnsApi,
   ipamApi,
@@ -137,15 +138,7 @@ function CreateTokenModal({
       onCreated(token);
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      setError(
-        typeof detail === "string"
-          ? detail
-          : detail
-            ? JSON.stringify(detail)
-            : "Failed to create token.",
-      );
+      setError(formatDialogError(err, "Failed to create token."));
     },
   });
 
