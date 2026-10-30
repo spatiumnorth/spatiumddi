@@ -288,21 +288,25 @@ describe("Saving with DNS off keeps the stored DNS linkage", () => {
         dns_additional_zone_ids: ["z2"],
       }),
     );
-    open(
-      <EditAddressModal
-        address={address({
-          forward_zone_id: "z1",
-          extra_zone_ids: ["z2"],
-        } as Partial<IPAddress>)}
-        onClose={() => {}}
-      />,
-    );
+    const row = address({
+      forward_zone_id: "z1",
+      extra_zone_ids: ["z2"],
+    } as Partial<IPAddress>);
+    // Edit address reads its row fresh on open (#3077).
+    answer("ipamApi", "getAddress", () => Promise.resolve(row));
+    open(<EditAddressModal address={row} onClose={() => {}} />);
     await screen.findByText("Hostname");
     await new Promise((r) => setTimeout(r, 20));
     expect(screen.queryByText("DNS Zone")).toBeNull();
     expect(screen.queryByText("DNS Aliases")).toBeNull();
+    // An edit sends only what changed (#3091), so change the hostname: the
+    // zone must still be left out of the body.
+    fireEvent.change(screen.getByDisplayValue("web01"), {
+      target: { value: "web02" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(body).toBeDefined());
+    expect(body?.hostname).toBe("web02");
     // ``undefined`` is dropped on the wire, so the backend keeps the zone.
     expect(body?.dns_zone_id).toBeUndefined();
     expect(body).not.toHaveProperty("extra_zone_ids");

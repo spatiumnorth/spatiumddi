@@ -5,6 +5,7 @@ import {
   formatApiError,
   type EtcdSnapshotRow,
 } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 
 // #272 Phase 9b — etcd snapshot inventory + guided restore.
@@ -44,10 +45,12 @@ export function EtcdSnapshotsCard() {
     // Poll faster while a restore is in flight so the state banner tracks
     // the host runner; idle otherwise.
     refetchInterval: (q) =>
-      q.state.data?.desired_restore_snapshot ||
-      q.state.data?.restore_state === "restoring"
-        ? 5_000
-        : 30_000,
+      isRefused(q.state.error)
+        ? false
+        : q.state.data?.desired_restore_snapshot ||
+            q.state.data?.restore_state === "restoring"
+          ? 5_000
+          : 30_000,
   });
 
   const [restoreTarget, setRestoreTarget] = useState<EtcdSnapshotRow | null>(
