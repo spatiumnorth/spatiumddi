@@ -1298,6 +1298,7 @@ function ScopeDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
   notice,
 }: {
   scope: DHCPScope;
@@ -1305,6 +1306,9 @@ function ScopeDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  // #3113 — the server's reason when it refuses the delete (a Windows
+  // failover scope answers 409 with the step to take first).
+  error?: string | null;
   // #62 two-person approval queue "Submitted for approval" message.
   notice?: string | null;
 }) {
@@ -1342,6 +1346,7 @@ function ScopeDeleteModal({
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
+      error={error}
       notice={notice}
     />
   );
@@ -1651,6 +1656,11 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
             delMut.reset();
           }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
           notice={delScopeNotice}
         />
       )}
@@ -2098,7 +2108,7 @@ export function ServerPoolsOrStaticsTab({
   );
 }
 
-function ClientClassesTab({ groupId }: { groupId: string }) {
+export function ClientClassesTab({ groupId }: { groupId: string }) {
   // #1339, #1861 — each write takes the tab's own resource permission, with
   // the HTTP method's action (``delete`` for a delete).
   const dhcpGate = useDhcpGate();
@@ -2220,8 +2230,16 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
           title="Delete Client Class"
           description={`Delete class "${del.name}"?`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>

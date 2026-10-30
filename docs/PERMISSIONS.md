@@ -77,6 +77,18 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `looking_glass_collector` | BGP Looking Glass receive-only GoBGP collectors — register / CRUD + learned-route reads (#566) |
 | `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
+| `proxmox_node` | Proxmox VE integration targets (`/proxmox`) |
+| `unifi_controller` | UniFi Network controllers (`/unifi`) |
+| `kubernetes_cluster` | Kubernetes cluster integrations (`/kubernetes`) |
+| `docker_host` | Docker host integrations (`/docker`) |
+| `tailscale_tenant` | Tailscale tenant integrations (`/tailscale`) |
+| `cloud_endpoint` | Cloud connector endpoints — AWS / Azure / GCP (`/cloud`) |
+| `meraki_org` | Cisco Meraki organisations (`/meraki`) |
+| `panos_firewall` | Palo Alto PAN-OS / Panorama firewalls (`/paloalto`) |
+| `opnsense_router` | OPNsense routers (`/opnsense`) |
+| `fortinet_firewall` | Fortinet FortiGate firewalls (`/fortinet`) |
+| `netbird_instance` | NetBird management instances (`/netbird`) |
+| `firewall_feed` | Firewall block-list feeds (`/firewall-feeds`) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
 | `manage_block_sync` | Active block sync / write-back enforcement (#601) — create/lift SpatiumDDI-owned IP/MAC blocks, arm per-target OPNsense/UniFi enforcement + write-scoped creds, reveal + reconcile. High blast-radius (pushes a real firewall/gateway block that can lock devices out); granted to `Network Editor`, not `Viewer`. Every push is audited and eligible for two-person approval (`admin:manage_block_sync`). |
