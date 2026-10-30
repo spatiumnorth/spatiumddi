@@ -90,6 +90,16 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `bacnet_device`   | BACnet/IP device registry (#541) — internetwork-unique device instance numbers, vendor/model metadata, BBMD flag + BDT/FDT snapshots |
 | `dicom_ae`        | DICOM Application Entity registry (#723) — institution-wide-unique AE Titles, their host/port bindings, and the configured AE→AE association map. Network identity only; this permission never grants access to imaging data, which SpatiumDDI does not store |
 | `ot_device`       | Industrial / OT device inventory + Purdue zoning (#542) — read-only identification; this permission never grants control-protocol access, which is out of scope entirely |
+| `appliance`       | The SpatiumDDI OS appliance on a node — TLS certificate upload and ACME, releases catalogue, slot apply / rollback, container control and logs, host network and firewall, maintenance mode, diagnostic bundle (#134). Fleet management stays superadmin (see `Appliance Operator` below) |
+| `dhcp_mac_block`  | DHCP MAC deny-list entries (block a client by MAC) |
+| `dhcp_option_template` | Reusable DHCP option-set templates |
+| `manage_dns_pools` | DNS pools (GSLB-lite, health-checked members). Writes are superadmin-only on top of this gate; the DNS Editor holds `read` |
+| `manage_network_devices` | Network devices (SNMP polling, ARP / FDB / LLDP data) |
+| `manage_nmap_scans` | On-demand nmap scans |
+| `multicast`       | Multicast group registry |
+| `nat_mapping`     | NAT mappings (1:1, PAT, hide) recorded against IPAM addresses and subnets |
+| `tls_cert`        | TLS certificate inventory and the expiry / chain monitoring on it |
+| `use_network_tools` | The Tools page (ping / traceroute / dig / whois and the rest), plus Wake-on-LAN sends |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules

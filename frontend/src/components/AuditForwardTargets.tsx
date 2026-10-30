@@ -26,6 +26,7 @@ import {
   type AuditForwardSeverity,
   type AuditForwardTarget,
   type AuditForwardTargetWrite,
+  formatApiError,
 } from "@/lib/api";
 
 const inputCls =
@@ -162,12 +163,7 @@ export function AuditForwardTargets({
         [id]: { status: "ok", msg: `delivered to ${r.target}` },
       }));
     } catch (e) {
-      let msg = "delivery failed";
-      if (e && typeof e === "object" && "response" in e) {
-        const resp = (e as { response?: { data?: { detail?: string } } })
-          .response;
-        if (resp?.data?.detail) msg = resp.data.detail;
-      }
+      const msg = formatApiError(e, "delivery failed");
       setTestState((s) => ({ ...s, [id]: { status: "error", msg } }));
     }
     window.setTimeout(() => {
@@ -461,13 +457,7 @@ function TargetModal({
       onClose();
     },
     onError: (e: unknown) => {
-      let msg = "Save failed";
-      if (e && typeof e === "object" && "response" in e) {
-        const resp = (e as { response?: { data?: { detail?: unknown } } })
-          .response;
-        if (resp?.data?.detail) msg = String(resp.data.detail);
-      }
-      setError(msg);
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

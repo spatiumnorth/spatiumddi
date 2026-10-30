@@ -7,6 +7,7 @@ import {
   type NmapHostResult,
   type NmapPortResult,
   type NmapScanRead,
+  formatApiError,
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
@@ -173,10 +174,7 @@ function StampDiscoveredModal({
   });
   const result = stamp.data;
   const errMsg =
-    stamp.isError &&
-    ((stamp.error as { response?: { data?: { detail?: string } } })?.response
-      ?.data?.detail ??
-      "Failed to stamp hosts");
+    stamp.isError && formatApiError(stamp.error, "Failed to stamp hosts");
   const { dialogProps, titleProps } = useModalDialog(onClose);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">

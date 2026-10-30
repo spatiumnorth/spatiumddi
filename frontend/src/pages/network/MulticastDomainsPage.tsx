@@ -8,6 +8,7 @@ import {
   type MulticastDomainRead,
   type MulticastDomainUpdate,
   type MulticastPIMMode,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -101,16 +102,7 @@ function MulticastDomainModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string | { msg?: string }[] } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (Array.isArray(detail)) {
-        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
-      } else {
-        setError(detail ?? err?.message ?? "Save failed");
-      }
+      setError(formatApiError(e, "Save failed"));
     },
   });
 

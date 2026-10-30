@@ -207,7 +207,11 @@ describe("Active Sessions scope (#3010)", () => {
     expect(await screen.findByText("bob")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "My sessions" }));
-    await waitFor(() => expect(screen.queryByText("bob")).toBeNull());
+    // bob also vanishes while the "mine" query is still loading, so wait for
+    // the row that only the "mine" answer renders before going on: the
+    // assertions after the refetch must not outrun that fetch.
+    expect(await screen.findByText("admin")).toBeTruthy();
+    expect(screen.queryByText("bob")).toBeNull();
     const allRequests = listAll.mock.calls.length;
 
     await act(async () => {
@@ -220,6 +224,6 @@ describe("Active Sessions scope (#3010)", () => {
 
     expect(screen.queryByText("bob")).toBeNull();
     expect(listAll.mock.calls.length).toBe(allRequests);
-    expect(screen.getByText("admin")).toBeTruthy();
+    expect(await screen.findByText("admin")).toBeTruthy();
   });
 });
