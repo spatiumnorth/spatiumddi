@@ -150,14 +150,18 @@ async def _state(url: str) -> dict[str, Any]:
 
 
 async def _foreign_keys(url: str) -> list[tuple[str, str, str, bool]]:
-    """Every foreign key in the schema, with its definition and validity."""
+    """Every foreign key in the schema, with its definition and validity.
+
+    A partition's copy of its parent's key is left out: it comes and goes with
+    the partition, and a restore runs the log tables' maintenance (#2185)."""
     conn = await asyncpg.connect(_dsn(url))
     try:
         rows = await conn.fetch(
             "SELECT c.conrelid::regclass::text, c.conname, pg_get_constraintdef(c.oid), "
             "c.convalidated FROM pg_constraint c "
             "JOIN pg_namespace n ON n.oid = c.connamespace "
-            "WHERE c.contype = 'f' AND n.nspname = 'public' ORDER BY 1, 2"
+            "WHERE c.contype = 'f' AND c.conparentid = 0 AND n.nspname = 'public' "
+            "ORDER BY 1, 2"
         )
         return [tuple(r) for r in rows]
     finally:

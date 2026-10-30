@@ -78,9 +78,8 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
-from app.services.logs.partitions import DHCP_LOG
+from app.services.logs.partitions import DHCP_LOG, log_retention_hours
 from app.services.logs.partitions import coverage as log_coverage
-from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -407,10 +406,17 @@ class DHCPLogAck(IngestAck):
     inserted: int = 0
     dropped: int = 0
     #: Lines older than the control plane's activity-log retention
-    #: (``PlatformSettings.log_retention_hours``, #2273), or dated beyond the
-    #: partitions the table has (#2185, an agent clock running far ahead),
-    #: skipped rather than inserted into a table that has nowhere to keep them.
+    #: (``PlatformSettings.log_retention_hours``, #2273), skipped rather than
+    #: inserted into a table whose next partition drop would remove them.
     expired: int = 0
+    #: Lines inside the window that no partition covers (#2185): a line dated
+    #: ahead of the partitions created so far (an agent clock running ahead),
+    #: or any line while partition maintenance has fallen behind (beat or the
+    #: workers down for longer than the partitions reach ahead, or a restore
+    #: that brought back older partitions). Counted apart from ``expired`` and
+    #: logged as ``log_lines_without_partition``, because a run of them means
+    #: current lines are being lost.
+    no_partition: int = 0
 
 
 class DHCPFingerprintsAck(IngestAck):
@@ -2015,10 +2021,12 @@ async def agent_log_entries(
     Lines whose own timestamp is older than the activity-log retention
     window are counted as ``expired`` and not inserted (#1077): a replayed
     outage backlog would otherwise write rows the next partition drop
-    removes. So are lines dated beyond the partitions the table has (#2185):
-    the table is time-partitioned, with no default partition to catch them.
-    A line with no parseable timestamp is stamped with the arrival time by
-    the parser, so it is never expired.
+    removes. A line with no parseable timestamp is stamped with the arrival
+    time by the parser, so it is never expired.
+
+    The table is time-partitioned, with no default partition (#2185), so a
+    line inside the window that no partition covers is counted as
+    ``no_partition`` and logged, instead of failing the batch.
     """
     from app.services.logs.kea_parser import parse_kea_line  # noqa: PLC0415
 
@@ -2032,12 +2040,16 @@ async def agent_log_entries(
     storable = await log_coverage(db, DHCP_LOG)
     inserted = 0
     expired = 0
+    no_partition = 0
     for raw in capped:
         parsed = parse_kea_line(raw, fallback_ts=now)
         if parsed is None:
             continue
-        if parsed.ts < expired_cutoff or not storable.contains(parsed.ts):
+        if parsed.ts < expired_cutoff:
             expired += 1
+            continue
+        if not storable.contains(parsed.ts):
+            no_partition += 1
             continue
         db.add(
             DHCPLogEntry(
@@ -2053,7 +2065,21 @@ async def agent_log_entries(
         )
         inserted += 1
     await db.commit()
-    return {"status": "ok", "inserted": inserted, "dropped": dropped, "expired": expired}
+    if no_partition:
+        logger.warning(
+            "log_lines_without_partition",
+            stream="dhcp.log",
+            server_id=str(server.id),
+            lines=no_partition,
+            covered_until=storable.upper.isoformat() if storable.upper else None,
+        )
+    return {
+        "status": "ok",
+        "inserted": inserted,
+        "dropped": dropped,
+        "expired": expired,
+        "no_partition": no_partition,
+    }
 
 
 # ── DHCP fingerprint ingestion (Phase 2 device profiling) ─────────────

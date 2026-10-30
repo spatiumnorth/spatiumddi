@@ -1291,6 +1291,24 @@ def _queue_release_check_at_start(**_: object) -> None:
         )
 
 
+@beat_init.connect
+@worker_ready.connect
+def _queue_log_partitions_at_start(**_: object) -> None:
+    """#2185 — make the log tables' partitions once when beat or a worker starts.
+
+    Ingest keeps a log line only where a partition covers it, and partitions
+    are made a day or more ahead by a task beat runs every 15 minutes. After a
+    stretch with beat or every worker down, the present may have run past
+    them; this closes the gap at start instead of up to 15 minutes later.
+    Several starts queue it several times, which is harmless: the task is
+    idempotent and takes an advisory lock per table. A broker that is not up
+    yet never blocks the start."""
+    try:
+        celery_app.send_task("app.tasks.log_partitions.maintain_log_partitions")
+    except Exception:  # noqa: BLE001 - the 15-minute schedule still covers it
+        structlog.get_logger(__name__).warning("log_partitions_at_start_not_queued", exc_info=True)
+
+
 @task_failure.connect
 def _capture_task_failure(
     sender: object | None = None,

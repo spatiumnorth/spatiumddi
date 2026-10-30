@@ -12,7 +12,9 @@ the control plane's own reads and writes.
   ``ATTACH``ed, which takes ``SHARE UPDATE EXCLUSIVE`` on the parent, so it
   neither waits for a long reader nor queues the agents' inserts behind it.
   (Attaching also takes ``SHARE ROW EXCLUSIVE`` on ``dns_server`` /
-  ``dhcp_server`` for the foreign key, briefly, under ``lock_timeout``.)
+  ``dhcp_server`` for the foreign key, and dropping a retired partition
+  ``ACCESS EXCLUSIVE``, both for milliseconds and under a short
+  ``lock_timeout``: see :data:`LOCK_TIMEOUT_MS`.)
   Partitions are created from the end of the last one, so the ranges never
   overlap and a few skipped ticks change nothing.
 * **retire** — a partition whose whole range is older than the retention
@@ -45,7 +47,6 @@ from racing anyway.
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -54,14 +55,21 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+
+from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
 
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
+
+#: The query / activity log window when no settings row exists (the column's
+#: own default is the same). Anyone wanting longer history should ship to Loki
+#: or a SIEM in addition to (or instead of) the agent push.
+DEFAULT_RETENTION_HOURS = 24
 
 #: RPZ policy hits are kept far longer than raw queries (issue #699): a hit
 #: is summary-shaped, and "has this host been reaching for blocked domains
@@ -83,9 +91,15 @@ MAX_CREATES_PER_TICK = 400
 #: Namespace for the per-table session advisory lock (the table name hashes
 #: into the second key).
 LOCK_NAMESPACE = 0x4C4F4750  # "LOGP"
-#: Every DDL statement here waits at most this long for its lock. A timeout
-#: is retried by the next tick.
-LOCK_TIMEOUT_MS = 3000
+#: Every DDL statement here waits at most this long for its lock; a timeout is
+#: retried by the next tick, and partitions are created a day or more ahead,
+#: so a missed tick costs nothing. Kept short because of the foreign key:
+#: attaching or detaching a partition takes ``SHARE ROW EXCLUSIVE`` on
+#: ``dns_server`` / ``dhcp_server``, and dropping a retired one takes ``ACCESS
+#: EXCLUSIVE`` there. Normally that is held for milliseconds; this bounds how
+#: long the server table's writers (and, for the drop, its readers) can queue
+#: behind a statement that is itself waiting.
+LOCK_TIMEOUT_MS = 500
 
 #: How long a process trusts what it read of a table's partitions.
 COVERAGE_TTL_S = 30.0
@@ -103,6 +117,10 @@ class LogTable:
 
     def hourly(self, window: timedelta) -> bool:
         return self.hourly_ok and window <= HOURLY_MAX_WINDOW
+
+    def lead(self, window: timedelta) -> timedelta:
+        """How far ahead of now maintenance keeps partitions."""
+        return HOURLY_LEAD if self.hourly(window) else DAILY_LEAD
 
 
 DNS_QUERY_LOG = LogTable(
@@ -149,32 +167,36 @@ class MaintenanceResult:
 
 # ── The catalog ────────────────────────────────────────────────────────────
 
-_BOUNDS = re.compile(r"FROM \('([^']+)'\) TO \('([^']+)'\)")
-
-
-def _parse_bound(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+#: The bounds come back as ``timestamptz`` from the database itself: the text
+#: ``pg_get_expr`` prints follows the session's ``DateStyle`` and ``TimeZone``,
+#: and casting it back in the same session reads it the same way, whatever
+#: those are set to.
+_PARTITIONS_SQL = r"""
+SELECT c.relname,
+       (regexp_match(b.expr, 'FROM \(''([^'']+)''\)'))[1]::timestamptz,
+       (regexp_match(b.expr, 'TO \(''([^'']+)''\)'))[1]::timestamptz,
+       i.inhdetachpending
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+CROSS JOIN LATERAL (SELECT pg_get_expr(c.relpartbound, c.oid) AS expr) b
+WHERE i.inhparent = to_regclass(:parent)
+ORDER BY c.relname
+"""
 
 
 async def list_partitions(conn: AsyncConnection | AsyncSession, table: str) -> list[Partition]:
-    """The partitions of ``table`` as the catalog has them, detach-pending ones included."""
-    rows = await conn.execute(
-        text(
-            "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid), i.inhdetachpending "
-            "FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
-            "WHERE i.inhparent = to_regclass(:parent) ORDER BY c.relname"
-        ),
-        {"parent": table},
-    )
-    out: list[Partition] = []
-    for name, bound, pending in rows:
-        match = _BOUNDS.search(bound or "")
-        if match is None:  # DEFAULT, or a shape this does not manage
-            out.append(Partition(name, None, None, bool(pending)))
-            continue
-        out.append(Partition(name, _parse_bound(match[1]), _parse_bound(match[2]), bool(pending)))
-    return out
+    """The partitions of ``table`` as the catalog has them, detach-pending ones
+    included. A default partition, or any bound that is not a plain range, has
+    no ``lower`` / ``upper``."""
+    rows = await conn.execute(text(_PARTITIONS_SQL), {"parent": table})
+    return [
+        (
+            Partition(name, lower, upper, bool(pending))
+            if lower is not None and upper is not None
+            else Partition(name, None, None, bool(pending))
+        )
+        for name, lower, upper, pending in rows
+    ]
 
 
 # ── What ingest may store ──────────────────────────────────────────────────
@@ -294,7 +316,7 @@ async def _create_ahead(
     ]
     start = _floor(now - window, HOUR if hourly else DAY)
     cursor = max([start, *uppers])
-    target = now + (HOURLY_LEAD if hourly else DAILY_LEAD)
+    target = now + table.lead(window)
 
     while cursor < target and result.created < MAX_CREATES_PER_TICK:
         # Daily once a day starts at midnight; the hours left over from an
@@ -390,15 +412,84 @@ async def maintain(
     if not await _lock(conn, table.name, acquire=True):
         result.skipped_locked = True
         return result
+    previous = (await conn.exec_driver_sql("SHOW lock_timeout")).scalar()
     try:
         await conn.exec_driver_sql(f"SET lock_timeout = {LOCK_TIMEOUT_MS}")
-        await conn.exec_driver_sql("SET TIME ZONE 'UTC'")
         # Creating comes before retiring: ingest stalls without a partition
         # to write into, while an expired one that lingers costs only space.
         await _drop_orphans(conn, table.name, result)
         await _create_ahead(conn, table, window, now, result)
         await _retire(conn, table, window, now, result)
     finally:
+        # The connection may go back to a pool: leave it as it came.
+        await conn.execute(
+            text("SELECT set_config('lock_timeout', :v, false)"), {"v": str(previous)}
+        )
         await _lock(conn, table.name, acquire=False)
         _coverage_cache.pop(table.name, None)
     return result
+
+
+async def log_retention_hours(db: AsyncSession) -> int:
+    """The configured query / activity log window, in hours (#2273).
+
+    Read by the partition maintenance and by the two agent ingest endpoints,
+    which skip lines already older than the window. Falls back to
+    :data:`DEFAULT_RETENTION_HOURS` when no settings row exists yet.
+    """
+    ps = (await db.execute(select(PlatformSettings).limit(1))).scalar_one_or_none()
+    if ps is not None and isinstance(ps.log_retention_hours, int) and ps.log_retention_hours > 0:
+        return ps.log_retention_hours
+    return DEFAULT_RETENTION_HOURS
+
+
+async def maintain_all(sessions: async_sessionmaker[AsyncSession]) -> dict[str, dict[str, Any]]:
+    """Run :func:`maintain` for every log table, each on a session of its own.
+
+    One table that fails (a dropped connection, a statement timeout, anything
+    :func:`maintain` does not already absorb) is logged and reported, and the
+    others still run.
+    """
+    async with sessions() as db:
+        hours = await log_retention_hours(db)
+    out: dict[str, dict[str, Any]] = {}
+    for table in LOG_TABLES:
+        try:
+            async with sessions() as db:
+                # ``DETACH ... CONCURRENTLY`` cannot run inside a transaction block.
+                conn = await db.connection(execution_options={"isolation_level": "AUTOCOMMIT"})
+                out[table.name] = (await maintain(conn, table, hours)).as_dict()
+        except Exception as exc:  # noqa: BLE001 — the next table, and the next tick, still run
+            logger.error("log_partitions_table_failed", table=table.name, error=repr(exc))
+            out[table.name] = {"error": type(exc).__name__}
+    return out
+
+
+async def partition_health(db: AsyncSession, *, now: datetime | None = None) -> tuple[str, str]:
+    """``ok`` / ``warn`` / ``error`` and a one-line detail, for the platform health rollup.
+
+    ``error`` when no partition covers the present for a table: its current
+    lines are being dropped at ingest. ``warn`` when what is covered ahead has
+    shrunk below half of what maintenance keeps, which takes many missed ticks.
+    """
+    now = now or datetime.now(UTC)
+    hours = await log_retention_hours(db)
+    behind: list[str] = []
+    short: list[str] = []
+    for table in LOG_TABLES:
+        covered = await coverage(db, table)
+        if covered.upper is None or not covered.contains(now):
+            behind.append(table.name)
+        elif covered.upper - now < table.lead(table.window(hours)) / 2:
+            short.append(table.name)
+    if behind:
+        return "error", (
+            f"no partition covers the present for {', '.join(behind)}: "
+            "current log lines are dropped until maintain_log_partitions runs"
+        )
+    if short:
+        return "warn", (
+            f"partitions run out soon for {', '.join(short)}: "
+            "maintain_log_partitions has missed many runs"
+        )
+    return "ok", "partitions cover the present and the time ahead"

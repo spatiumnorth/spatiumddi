@@ -24,8 +24,8 @@ from app.models.dns import DNSServer, DNSServerGroup
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.models.settings import PlatformSettings
-from app.tasks import prune_logs, prune_metrics
-from tests.conftest import _test_engine
+from app.tasks import prune_metrics
+from tests.conftest import _test_engine, create_test_log_partitions
 
 # field -> (non-default value, defaults, lowest accepted, highest accepted)
 RETENTION: dict[str, tuple[int, int, int, int]] = {
@@ -186,15 +186,20 @@ async def test_partition_retention_honours_log_retention_hours(db_session: Async
         )
     await db_session.commit()
 
-    hours = await prune_logs.log_retention_hours(db_session)
+    hours = await log_partitions.log_retention_hours(db_session)
     assert hours == 72
     async with _test_engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-        await log_partitions.maintain(conn, log_partitions.DNS_QUERY_LOG, hours, now=now)
-
-    # Under the old fixed 24 h window the 30 h row would be gone; the 6 day row
-    # sits in a partition wholly past the 72 h window.
-    assert await _qnames(db_session, server) == {"30h.example"}
+        try:
+            await log_partitions.maintain(conn, log_partitions.DNS_QUERY_LOG, hours, now=now)
+            # Under the old fixed 24 h window the 30 h row would be gone; the 6 day
+            # row sits in a partition wholly past the 72 h window.
+            assert await _qnames(db_session, server) == {"30h.example"}
+        finally:
+            # The partitions this retired belong to the whole suite. The
+            # session's open read would hold their re-creation back.
+            await db_session.rollback()
+            await create_test_log_partitions(conn)
 
 
 @pytest.mark.asyncio

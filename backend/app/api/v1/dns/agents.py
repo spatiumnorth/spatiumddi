@@ -108,9 +108,13 @@ from app.services.dns.soa_timers import (
 from app.services.dns.tsig import ensure_group_tsig_key, transfer_view_name
 from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
-from app.services.logs.partitions import DNS_QUERY_LOG, DNS_RPZ_HIT
+from app.services.logs.partitions import (
+    DNS_QUERY_LOG,
+    DNS_RPZ_HIT,
+    RPZ_HIT_RETENTION_DAYS,
+    log_retention_hours,
+)
 from app.services.logs.partitions import coverage as log_coverage
-from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
 
@@ -1889,11 +1893,18 @@ class QueryLogAck(IngestAck):
     responses_unmatched: int = 0
     dropped: int = 0
     #: Query lines older than the control plane's own query-log retention
-    #: (``PlatformSettings.log_retention_hours``, #2273), or lines (RPZ hits
-    #: included) dated beyond the partitions the table has (#2185, an agent
-    #: clock running far ahead) — skipped rather than inserted into a table
-    #: that has nowhere to keep them.
+    #: (``PlatformSettings.log_retention_hours``, #2273), and RPZ hits older
+    #: than their 30 days — skipped rather than inserted into a table whose
+    #: next partition drop would remove them.
     expired: int = 0
+    #: Lines inside the window that no partition covers (#2185): a line dated
+    #: ahead of the partitions created so far (an agent clock running ahead),
+    #: or any line while partition maintenance has fallen behind (beat or the
+    #: workers down for longer than the partitions reach ahead, or a restore
+    #: that brought back older partitions). Counted apart from ``expired`` and
+    #: logged as ``log_lines_without_partition``, because a run of them means
+    #: current lines are being lost.
+    no_partition: int = 0
 
 
 @router.post("/query-log-entries", response_model=QueryLogAck)
@@ -1930,8 +1941,8 @@ async def agent_query_log_entries(
     not 24 h.
 
     The log tables are time-partitioned, with no default partition (#2185),
-    so a line dated beyond what the partitions cover, RPZ hits included, is
-    counted as ``expired`` as well instead of failing the batch.
+    so a line inside the window that no partition covers, RPZ hits included,
+    is counted as ``no_partition`` and logged, instead of failing the batch.
     """
     from app.services.logs import bind9_parser, pdns_parser  # noqa: PLC0415
 
@@ -1982,8 +1993,10 @@ async def agent_query_log_entries(
     expired_cutoff = now - timedelta(hours=await log_retention_hours(db))
     query_storable = await log_coverage(db, DNS_QUERY_LOG)
     rpz_storable = await log_coverage(db, DNS_RPZ_HIT) if rpz_capable else None
+    rpz_cutoff = now - timedelta(days=RPZ_HIT_RETENTION_DAYS)
     inserted = 0
     expired = 0
+    no_partition = 0
     rpz_inserted = 0
     responses_matched = 0
     # Query rows added in THIS batch, keyed for the response line that
@@ -2011,8 +2024,11 @@ async def agent_query_log_entries(
         if rpz_capable:
             rpz = bind9_parser.parse_rpz_line(raw, fallback_ts=now)
             if rpz is not None:
-                if rpz_storable is not None and not rpz_storable.contains(rpz.ts):
+                if rpz.ts < rpz_cutoff:
                     expired += 1
+                    continue
+                if rpz_storable is not None and not rpz_storable.contains(rpz.ts):
+                    no_partition += 1
                     continue
                 db.add(
                     DNSRPZHit(
@@ -2050,8 +2066,11 @@ async def agent_query_log_entries(
         parsed = parse_fn(raw, fallback_ts=now)
         if parsed is None or parsed.qname is None:
             continue
-        if parsed.ts < expired_cutoff or not query_storable.contains(parsed.ts):
+        if parsed.ts < expired_cutoff:
             expired += 1
+            continue
+        if not query_storable.contains(parsed.ts):
+            no_partition += 1
             continue
         entry = DNSQueryLogEntry(
             server_id=server.id,
@@ -2076,6 +2095,14 @@ async def agent_query_log_entries(
 
     deferred_matched = await _stamp_deferred_responses(db, server.id, deferred)
     await db.commit()
+    if no_partition:
+        logger.warning(
+            "log_lines_without_partition",
+            stream="dns.query_log",
+            server_id=str(server.id),
+            lines=no_partition,
+            covered_until=query_storable.upper.isoformat() if query_storable.upper else None,
+        )
     return {
         "status": "ok",
         "inserted": inserted,
@@ -2087,6 +2114,7 @@ async def agent_query_log_entries(
         "responses_unmatched": len(deferred) - deferred_matched,
         "dropped": dropped,
         "expired": expired,
+        "no_partition": no_partition,
     }
 
 
