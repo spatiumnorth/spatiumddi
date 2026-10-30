@@ -170,6 +170,12 @@ charts/spatiumddi/templates/frontend-tls-config.yaml
 # could disagree with only the frontend job noticing.
 frontend/src/lib/bulk-allocate-template.vectors.json
 
+# test_grant_vocabulary_covers_routes_3119.py (#3119) checks that the grant
+# vocabulary the role editor offers holds every resource type the routes,
+# copilot tools and search providers check. Dropping a type there is a
+# frontend-only edit, so without this the backend half would not run on it.
+frontend/src/lib/permissionVocabulary.ts
+
 # test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
 # watcher, and checks the Dockerfile copies it in and the chart's frontend
 # Deployment no longer rolls on a certificate change.
