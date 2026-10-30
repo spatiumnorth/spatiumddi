@@ -37,6 +37,7 @@ export function UnifiControllerDetailPage() {
   );
   const [tab, setTab] = useState<Tab>("overview");
   const [testResult, setTestResult] = useState<UnifiTestResult | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const { data, isFetching, isError, error } = useQuery({
     queryKey: ["unifi-dashboard", id],
@@ -47,6 +48,8 @@ export function UnifiControllerDetailPage() {
 
   const syncMut = useMutation({
     mutationFn: () => unifiApi.syncNow(id!),
+    onMutate: () => setSyncError(null),
+    onError: (e) => setSyncError(formatApiError(e, "Sync failed")),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["unifi-dashboard", id] });
       setTimeout(
@@ -202,6 +205,9 @@ export function UnifiControllerDetailPage() {
           >
             {testResult.ok ? "✓" : "✗"} {testResult.message}
           </p>
+        )}
+        {syncError && (
+          <p className="mt-2 text-xs text-destructive">✗ {syncError}</p>
         )}
       </div>
 

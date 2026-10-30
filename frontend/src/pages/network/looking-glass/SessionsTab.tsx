@@ -77,6 +77,7 @@ export function SessionsTab({
     "Requires delete permission on BGP peers",
   );
   const [deleteTarget, setDeleteTarget] = useState<BGPLGPeer | null>(null);
+  const [deleteErr, setDeleteErr] = useState<string | null>(null);
   const [viewingPeerId, setViewingPeerId] = useState<string | null>(null);
 
   // Session-state rows are live telemetry — poll modestly so a flap shows up
@@ -105,6 +106,8 @@ export function SessionsTab({
 
   const deleteM = useMutation({
     mutationFn: (id: string) => lookingGlassApi.deletePeer(id),
+    onMutate: () => setDeleteErr(null),
+    onError: (e) => setDeleteErr(errMsg(e, "Failed to delete peer.")),
     onSuccess: () => {
       setDeleteTarget(null);
       void qc.invalidateQueries({ queryKey: ["bgp-lg-sessions"] });
@@ -266,14 +269,24 @@ export function SessionsTab({
         open={!!deleteTarget}
         title="Delete peer"
         message={
-          deleteTarget
-            ? `Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`
-            : ""
+          deleteTarget ? (
+            <>
+              {`Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`}
+              {deleteErr && (
+                <span className="mt-2 block text-destructive">{deleteErr}</span>
+              )}
+            </>
+          ) : (
+            ""
+          )
         }
         confirmLabel="Delete"
         tone="destructive"
         loading={deleteM.isPending}
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null);
+          setDeleteErr(null);
+        }}
         onConfirm={() => deleteTarget && deleteM.mutate(deleteTarget.id)}
       />
 

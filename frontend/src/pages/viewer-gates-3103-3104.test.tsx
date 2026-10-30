@@ -244,7 +244,12 @@ describe("an ASN's BGP Monitoring tab (#3104)", () => {
   });
 
   it("offers an ASN manager every one", async () => {
-    await open("superadmin");
+    // The exact grants the API's 'manage_asns' router gate checks.
+    await open([
+      ["read", "*"],
+      ["write", "manage_asns"],
+      ["delete", "manage_asns"],
+    ]);
     expectOffered(byName(/Track prefix/));
     expectOffered(byName(/Check BGP now/));
     expectOffered(byName("Acknowledge"));
@@ -290,6 +295,12 @@ const LG_PEER = {
   modified_at: STAMP,
 };
 
+const LG_MANAGER: Grants = [
+  ["read", "*"],
+  ["write", "bgp_lg_peer"],
+  ["delete", "bgp_lg_peer"],
+];
+
 describe("a Looking Glass peer row (#3104)", () => {
   async function open(g: Grants) {
     signInAs(g);
@@ -323,10 +334,155 @@ describe("a Looking Glass peer row (#3104)", () => {
     );
   });
 
-  it("offers a superadmin both", async () => {
-    await open("superadmin");
+  it("offers a BGP peer manager both", async () => {
+    // The exact grants the API's 'bgp_lg_peer' router gate checks.
+    await open(LG_MANAGER);
     expectOffered(byName("Edit peer"));
     expectOffered(byName("Delete peer"));
+  });
+
+  it("says why a refused Delete failed", async () => {
+    signInAs(LG_MANAGER);
+    answers.lookingGlassApi = {
+      listSessions: () => Promise.resolve([LG_SESSION]),
+      listPeers: () => Promise.resolve([LG_PEER]),
+      deletePeer: () =>
+        Promise.reject({
+          response: {
+            status: 403,
+            data: {
+              detail: "Permission denied: need 'delete' on 'bgp_lg_peer'",
+            },
+          },
+        }),
+    };
+    const { SessionsTab } = await import("./network/looking-glass/SessionsTab");
+    await show(
+      <SessionsTab
+        collectors={[{ id: "co-1" } as never]}
+        onEdit={() => {}}
+        onViewRoutes={() => {}}
+      />,
+      "/",
+      "/",
+    );
+    await screen.findByText("edge-rtr");
+    await settled();
+    fireEvent.click(byName("Delete peer"));
+    fireEvent.click(byName("Delete"));
+    expect(
+      await screen.findByText(
+        "Permission denied: need 'delete' on 'bgp_lg_peer'",
+      ),
+    ).toBeTruthy();
+  });
+});
+
+describe("the Looking Glass page's Add Peer (#3104)", () => {
+  async function open(g: Grants) {
+    signInAs(g);
+    answers.lookingGlassApi = {
+      listCollectors: () =>
+        Promise.resolve([
+          {
+            id: "co-1",
+            name: "collector",
+            description: "",
+            host: null,
+            status: "online",
+            enabled: true,
+            agent_id: null,
+            agent_registered: true,
+            agent_version: null,
+            last_seen_ip: null,
+            config_apply_status: null,
+            config_apply_error: null,
+            config_failed_etag: null,
+            config_apply_at: null,
+            last_seen_at: null,
+            last_health_check_at: null,
+            appliance_id: null,
+            created_at: STAMP,
+            modified_at: STAMP,
+          },
+        ]),
+    };
+    const { LookingGlassPage } =
+      await import("./network/looking-glass/LookingGlassPage");
+    await show(<LookingGlassPage />, "/", "/");
+    await settled();
+  }
+
+  it("is denied to a Viewer", async () => {
+    await open(VIEWER);
+    expectDenied(byName(/Add Peer/), "Requires write permission on BGP peers");
+  });
+
+  it("is offered to a BGP peer manager", async () => {
+    await open(LG_MANAGER);
+    expectOffered(byName(/Add Peer/));
+  });
+});
+
+describe("a Looking Glass peer's detail modal (#3104)", () => {
+  async function open(g: Grants) {
+    signInAs(g);
+    answers.lookingGlassApi = {
+      getPeerDetail: () =>
+        Promise.resolve({
+          peer: LG_PEER,
+          collector: {
+            id: "co-1",
+            name: "collector",
+            host: null,
+            status: "online",
+            last_seen_ip: null,
+            agent_version: null,
+            enabled: true,
+          },
+          matched_asn: null,
+          peer_router: null,
+          route_stats: {
+            active_total: 0,
+            withdrawn_total: 0,
+            best_count: 0,
+            rpki: { valid: 0, invalid: 0, unknown: 0 },
+            top_origin_asns: [],
+            top_communities: [],
+            has_vpn_routes: false,
+            sample_routes: [],
+          },
+          active_alerts: [],
+        }),
+    };
+    answers.asnsApi = { listStandardCommunities: () => Promise.resolve([]) };
+    const { PeerDetailModal } =
+      await import("./network/looking-glass/PeerDetailModal");
+    await show(
+      <PeerDetailModal
+        peerId="pr-1"
+        onClose={() => {}}
+        onEdit={() => {}}
+        onDelete={() => {}}
+        onViewRoutes={() => {}}
+      />,
+      "/",
+      "/",
+    );
+    await screen.findAllByText("edge-rtr");
+    await settled();
+  }
+
+  it("offers a Viewer no Edit or Delete", async () => {
+    await open(VIEWER);
+    expectDenied(byName(/^Edit$/), "Requires write permission on BGP peers");
+    expectDenied(byName(/^Delete$/), "Requires delete permission on BGP peers");
+  });
+
+  it("offers a BGP peer manager both", async () => {
+    await open(LG_MANAGER);
+    expectOffered(byName(/^Edit$/));
+    expectOffered(byName(/^Delete$/));
   });
 });
 
@@ -374,5 +530,47 @@ describe("a UniFi controller's own page (#3104)", () => {
     await open("superadmin");
     expectOffered(byName("Test"));
     expectOffered(byName(/Sync Now/));
+  });
+
+  it("says why a refused Sync Now failed", async () => {
+    await open("superadmin");
+    answers.unifiApi.syncNow = () =>
+      Promise.reject({
+        response: { status: 403, data: { detail: "Superadmin required" } },
+      });
+    fireEvent.click(byName(/Sync Now/));
+    expect(
+      await screen.findByText("Superadmin required", { exact: false }),
+    ).toBeTruthy();
+  });
+});
+
+// ── The ? shortcuts overlay ──────────────────────────────────────────────
+
+describe("the keyboard shortcuts overlay (#3103)", () => {
+  async function open(g: Grants) {
+    signInAs(g);
+    const { KeyboardShortcutsHelp } =
+      await import("@/components/KeyboardShortcutsOverlay");
+    await show(<KeyboardShortcutsHelp />, "/", "/");
+    await settled();
+    fireEvent.click(byName("Show keyboard shortcuts"));
+    await screen.findByText("Keyboard shortcuts");
+  }
+
+  it("lists no Add Record key to a Viewer, whose n does nothing", async () => {
+    await open(VIEWER);
+    expect(screen.queryByText("Add a record to the open zone")).toBeNull();
+    // ...and drops the group it leaves empty.
+    expect(screen.queryByText("DNS zone")).toBeNull();
+    expect(screen.getByText("Open global search")).toBeTruthy();
+  });
+
+  it("lists it to a user who may write records", async () => {
+    await open([
+      ["read", "*"],
+      ["write", "dns_record"],
+    ]);
+    expect(screen.getByText("Add a record to the open zone")).toBeTruthy();
   });
 });
