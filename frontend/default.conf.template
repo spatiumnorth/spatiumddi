@@ -75,6 +75,7 @@ map "$spatium_proxy_trusted:$http_x_forwarded_proto" $spatium_forwarded_proto {
 
 server {
     listen 80;
+    ${SPATIUM_LISTEN6_80}
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
@@ -132,7 +133,7 @@ ${SPATIUM_REAL_IP_FROM}
     # nameserver list comes from /etc/resolv.conf at container start —
     # 127.0.0.11 under Docker Compose, the kube-dns Service IP under
     # Kubernetes, host /etc/resolv.conf under ``--network=host``.
-    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ${SPATIUM_RESOLVER_IPV6};
 
     # Issue #299 phase 2 — when the api upstream isn't reachable
     # (cold boot before the api passes /health/ready, mid-rolling-
