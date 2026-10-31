@@ -16,8 +16,10 @@ Subcommands:
   rollback               — Set inactive slot as next boot (Phase 8c)
 
 The current slot is detected from /proc/cmdline's root=UUID=... by
-looking up the matching partition via blkid. Inactive slot is the
+looking up the matching partition via lsblk. Inactive slot is the
 OTHER partition carrying a root_a / root_b PARTLABEL on the same disk.
+On a mirrored install (#999) each slot is the md array its two
+root_a / root_b members belong to (#3172).
 
 Matched on the PARTLABEL, not the GPT type code — which is what makes
 it architecture-independent: the root type is 8304 on x86-64 and 8305
@@ -72,9 +74,29 @@ def parse_cmdline_root_uuid() -> str | None:
 
 
 def find_slot_partitions() -> list[dict[str, str]]:
-    """Enumerate the A/B slot partitions on the active disk.
+    """Enumerate the A/B slots: one entry per slot, naming the device that
+    HOLDS its filesystem.
 
-    Returns a list of dicts: {device, uuid, partlabel, fslabel}.
+    Returns a list of dicts: {device, uuid, partlabel, fslabel}, plus
+    ``members`` on a mirrored install.
+
+    On a single disk that device is the slot partition itself. On a
+    mirrored install (#999) it is not: the partitions carrying the
+    ``root_A`` / ``root_B`` GPT names are raid1 MEMBERS, two per slot, and
+    a member's UUID is the ARRAY's UUID, not the filesystem's that
+    ``root=UUID=`` names. So a member resolves to the md array lsblk lists
+    as its child (``/dev/md/root_a`` → md125), and both members of one slot
+    collapse into a single entry (#3172). ``partlabel`` stays the GPT name
+    either way — the version keys and the GRUB entry names hang off it.
+
+    A member whose array is not assembled is never named in its place:
+    writing an image into one member of a mirror forks the data. It is
+    skipped (a member kicked out of a degraded array looks exactly like
+    that, and the slot is still its surviving array), so a slot whose
+    members ALL lack an array has no entry at all. Two members of one slot
+    resolving to different arrays (each half assembled on its own) is a
+    refusal too — which half is the slot is not a question this tool can
+    answer.
     """
     try:
         out = run(["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL,LABEL,PARTTYPE,FSTYPE"]).stdout
@@ -84,22 +106,71 @@ def find_slot_partitions() -> list[dict[str, str]]:
     data = json.loads(out)
 
     slots: list[dict[str, str]] = []
+    mirrored: dict[str, dict[str, str]] = {}
+    conflicted: set[str] = set()
 
     def walk(node: dict) -> None:
         partlabel = (node.get("partlabel") or "").lower()
         if partlabel in SLOT_PARTLABELS:
-            slots.append({
-                "device": node.get("path") or "",
-                "uuid": node.get("uuid") or "",
-                "partlabel": partlabel,
-                "fslabel": node.get("label") or "",
-            })
+            if (node.get("fstype") or "").lower() == "linux_raid_member":
+                _add_member(partlabel, node)
+            else:
+                slots.append({
+                    "device": node.get("path") or "",
+                    "uuid": node.get("uuid") or "",
+                    "partlabel": partlabel,
+                    "fslabel": node.get("label") or "",
+                })
         for child in node.get("children") or []:
             walk(child)
 
+    def _add_member(partlabel: str, node: dict) -> None:
+        array = next(
+            (
+                c for c in node.get("children") or []
+                if (c.get("fstype") or "").lower() not in ("", "linux_raid_member")
+            ),
+            None,
+        )
+        if array is None:
+            return  # not (or no longer) in an assembled array: see docstring
+        device = _md_device_name(array.get("path") or "", partlabel)
+        member = node.get("path") or ""
+        seen = mirrored.get(partlabel)
+        if seen is None:
+            mirrored[partlabel] = {
+                "device": device,
+                "uuid": array.get("uuid") or "",
+                "partlabel": partlabel,
+                "fslabel": array.get("label") or "",
+                "members": member,
+            }
+        elif seen["device"] != device:
+            conflicted.add(partlabel)
+        elif member and member not in seen["members"].split():
+            seen["members"] = f"{seen['members']} {member}".strip()
+
     for top in data.get("blockdevices") or []:
         walk(top)
+    for partlabel, slot in mirrored.items():
+        if partlabel not in conflicted:
+            slots.append(slot)
     return slots
+
+
+def _md_device_name(path: str, partlabel: str) -> str:
+    """``/dev/md/<slot>`` when that named-array link is this very array,
+    else lsblk's kernel path (``/dev/md125``). The kernel numbers md
+    devices in assembly order, so the name is the stable one to print and
+    log; the realpath check means a stale link can never redirect a write.
+    """
+    named = f"/dev/md/{partlabel}"
+    try:
+        if path and os.path.exists(named) and os.path.realpath(named) == os.path.realpath(path):
+            return named
+    except OSError:
+        pass  # unresolvable link: the kernel path below is just as correct
+    return path
 
 
 def detect_active_inactive() -> tuple[dict[str, str], dict[str, str]] | None:
@@ -761,6 +832,28 @@ def cmd_apply(args) -> int:
                 return 3
             print(f"  checksum OK: {actual}")
 
+        # #3172 — on a mirrored install the target is an md array, which is
+        # smaller than the image (see _SPILL_DM_NAME); write through a spill
+        # device that is big enough, then shrink the filesystem into the
+        # array before anything reads it.
+        write_dev = target_dev
+        spill_loop: str | None = None
+        array_bytes: int | None = None
+        if inactive.get("members"):
+            image_bytes = _xz_uncompressed_bytes(staged)
+            array_bytes = _device_bytes(target_dev)
+            if image_bytes is None or array_bytes is None:
+                msg = (f"could not size the image ({image_bytes}) or the "
+                       f"mirrored slot {target_dev} ({array_bytes}); nothing written")
+                print(f"ERROR: {msg}", file=sys.stderr)
+                _write_progress("failed", None, msg)
+                return 4
+            if image_bytes > array_bytes:
+                print(f"  mirrored slot: {target_dev} is {array_bytes} B, the image "
+                      f"{image_bytes} B — writing through a spill device, then "
+                      "shrinking the filesystem into the array")
+                write_dev, spill_loop = _open_spill(target_dev, array_bytes, image_bytes)
+
         # Decompress + dd directly into the inactive partition. xz can
         # stream-decompress so we don't need disk space for an intermediate
         # uncompressed file.
@@ -781,33 +874,61 @@ def cmd_apply(args) -> int:
               f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
         xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
                               stdout=subprocess.PIPE)
-        dd = subprocess.Popen(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
+        dd = subprocess.Popen(["dd", f"of={write_dev}", "bs=4M", "iflag=fullblock",
                                "oflag=direct", "conv=fsync", "status=progress"],
                               stdin=subprocess.PIPE)
         try:
-            _paced_copy(xz.stdout, dd.stdin)
-        except BrokenPipeError:
-            pass  # dd stopped reading; its exit status below says why
-        finally:
             try:
-                dd.stdin.close()
+                _paced_copy(xz.stdout, dd.stdin)
             except BrokenPipeError:
-                pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
-        if dd.wait() != 0:
-            xz.kill()
+                pass  # dd stopped reading; its exit status below says why
+            finally:
+                try:
+                    dd.stdin.close()
+                except BrokenPipeError:
+                    pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
+            if dd.wait() != 0:
+                xz.kill()
+                xz.wait()
+                raise subprocess.CalledProcessError(dd.returncode, "dd")
             xz.wait()
-            raise subprocess.CalledProcessError(dd.returncode, "dd")
-        xz.wait()
-        if xz.returncode != 0:
-            print("ERROR: xz exited non-zero", file=sys.stderr)
+            if xz.returncode != 0:
+                print("ERROR: xz exited non-zero", file=sys.stderr)
+                return 4
+            if spill_loop is not None and array_bytes is not None:
+                failure = _shrink_into_array(write_dev, array_bytes)
+                if failure:
+                    print(f"ERROR: {failure}", file=sys.stderr)
+                    _write_progress("failed", None, failure)
+                    return 4
+        finally:
+            spill_gone = spill_loop is None or _close_spill(spill_loop)
+        if not spill_gone:
+            msg = (f"could not remove the spill mapping /dev/mapper/{_SPILL_DM_NAME}; "
+                   f"it holds {target_dev} open. `dmsetup remove {_SPILL_DM_NAME}` "
+                   "and re-run the upgrade; the active slot is untouched")
+            print(f"ERROR: {msg}", file=sys.stderr)
+            _write_progress("failed", None, msg)
             return 4
+        if spill_loop is not None:
+            # Read back through the array alone: the spill device is gone,
+            # so a block the shrink left behind in it reads as corruption
+            # here, before the bootloader is ever pointed at the slot.
+            if subprocess.run(["e2fsck", "-f", "-n", target_dev], check=False).returncode != 0:
+                msg = (f"the filesystem on {target_dev} does not check clean after "
+                       "fitting it into the mirror; the active slot is untouched")
+                print(f"ERROR: {msg}", file=sys.stderr)
+                _write_progress("failed", None, msg)
+                return 4
     finally:
         staged.unlink(missing_ok=True)
         (workdir / "slot.sha256").unlink(missing_ok=True)
 
     _write_progress("bootloader", None, "updating bootloader + slot versions")
     print("  flushing kernel buffers + re-reading filesystem metadata…")
-    subprocess.run(["partprobe", _parent_disk(target_dev)], check=False)
+    if not inactive.get("members"):
+        # An md array has no partition table of its own to re-read (#3172).
+        subprocess.run(["partprobe", _parent_disk(target_dev)], check=False)
     subprocess.run(["udevadm", "settle"], check=False)
 
     # The dd overwrote the partition with the slot image's ext4
@@ -1081,6 +1202,116 @@ def _refresh_baked_images(target_dev: str) -> None:
             subprocess.run(["umount", str(mountpoint)], check=False)
     except OSError as exc:
         print(f"  WARN: baked-image refresh skipped ({exc})", file=sys.stderr)
+
+
+# #3172 — a mirrored slot is a raid1 array, and the array is SMALLER than the
+# partition it is built from: metadata 1.2 keeps its data offset at the start
+# of each member (18432 sectors — 9 MiB — on an 8 GiB slot, measured with
+# mdadm on the installer's own geometry). The slot image is built for the bare
+# partition, so its filesystem is 9 MiB bigger than the array. dd'd straight
+# in it fails with ENOSPC at the very end, and had it been cut short instead
+# the kernel would refuse to mount it ("block count exceeds size of device").
+#
+# So the write goes to a device-mapper concatenation of the array plus a
+# small sparse file for the overflow (the "spill"), and resize2fs then moves
+# whatever landed past the array's end back inside it. Only the overflow is
+# staged — a few MiB — never the whole decompressed image, which would cost
+# gigabytes of the /var the cluster is running on.
+_SPILL_DM_NAME = "spatium-slot-write"
+_SPILL_TAIL_NAME = "slot-tail.raw"
+
+
+def _xz_uncompressed_bytes(path: Path) -> int | None:
+    """The uncompressed size recorded in an .xz file's index, or None."""
+    proc = subprocess.run(["xz", "--robot", "--list", str(path)],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        if fields[0] == "totals" and len(fields) > 4:
+            try:
+                return int(fields[4])
+            except ValueError:
+                return None
+    return None
+
+
+def _device_bytes(device: str) -> int | None:
+    proc = subprocess.run(["blockdev", "--getsize64", device],
+                          capture_output=True, text=True, check=False)
+    try:
+        return int(proc.stdout.strip()) if proc.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def _open_spill(array_dev: str, array_bytes: int, image_bytes: int) -> tuple[str, str]:
+    """Map ``array_dev`` + a sparse overflow file as one device big enough for
+    the image. Returns ``(device to write, loop device)``; raises on failure
+    with nothing left mapped."""
+    _close_spill(None)  # whatever a killed earlier apply left behind
+    tail = _STAGING_DIR / _SPILL_TAIL_NAME
+    tail_sectors = -(-(image_bytes - array_bytes) // 512)
+    with open(tail, "wb") as fh:
+        fh.truncate(tail_sectors * 512)
+    loop = ""
+    try:
+        loop = run(["losetup", "--find", "--show", str(tail)]).stdout.strip()
+        array_sectors = array_bytes // 512
+        table = (f"0 {array_sectors} linear {array_dev} 0\n"
+                 f"{array_sectors} {tail_sectors} linear {loop} 0\n")
+        subprocess.run(["dmsetup", "create", _SPILL_DM_NAME], input=table,
+                       capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        _close_spill(loop or None)
+        raise
+    return f"/dev/mapper/{_SPILL_DM_NAME}", loop
+
+
+def _close_spill(loop: str | None) -> bool:
+    """Unmap the spill device and free its loop + file. Idempotent.
+
+    Returns whether the mapping is gone. It holds the array open, so while it
+    stays the slot cannot be mounted — the version probe, the image refresh
+    and the next boot's assembly all need it gone. The removal races udev,
+    which re-opens a device to probe it the moment a writer closes it (as
+    resize2fs just did), hence settle first and ``--retry``: measured, a bare
+    ``dmsetup remove`` straight after the shrink fails with the device busy.
+    """
+    subprocess.run(["udevadm", "settle"], capture_output=True, check=False)
+    subprocess.run(["dmsetup", "remove", "--retry", _SPILL_DM_NAME],
+                   capture_output=True, check=False)
+    gone = subprocess.run(["dmsetup", "info", _SPILL_DM_NAME],
+                          capture_output=True, check=False).returncode != 0
+    tail = _STAGING_DIR / _SPILL_TAIL_NAME
+    loops = [loop] if loop else []
+    if tail.exists():
+        proc = subprocess.run(["losetup", "-j", str(tail)],
+                              capture_output=True, text=True, check=False)
+        loops += [line.split(":", 1)[0] for line in proc.stdout.splitlines() if ":" in line]
+    for dev in dict.fromkeys(loops):
+        subprocess.run(["losetup", "-d", dev], capture_output=True, check=False)
+    tail.unlink(missing_ok=True)
+    return gone
+
+
+def _shrink_into_array(spill_dev: str, array_bytes: int) -> str | None:
+    """Shrink the filesystem on ``spill_dev`` to end inside the array.
+    Returns why it failed, or None. resize2fs refuses a filesystem that has
+    been mounted since its last full check, which an image built by mounting
+    and filling it always has, so the check comes first; e2fsck's 1 means it
+    fixed something, which leaves a filesystem resize2fs will take."""
+    print(f"  checking the written filesystem (e2fsck -f) on {spill_dev}…")
+    rc = subprocess.run(["e2fsck", "-f", "-y", spill_dev], check=False).returncode
+    if rc not in (0, 1):
+        return f"e2fsck exited {rc} on the written slot image; nothing made bootable"
+    print(f"  shrinking it to {array_bytes // 1024} KiB (resize2fs)…")
+    rc = subprocess.run(["resize2fs", spill_dev, f"{array_bytes // 1024}K"],
+                        check=False).returncode
+    if rc != 0:
+        return f"resize2fs exited {rc} fitting the slot image into the mirror"
+    return None
 
 
 def _parent_disk(part_dev: str) -> str:
@@ -1534,6 +1765,9 @@ def cmd_rollback(_args) -> int:
         print(f"ERROR: grub-set-default failed: {exc}", file=sys.stderr)
         return 3
     print(f"  grubenv saved_entry = {_read_grubenv_default()}")
+    # #999 / #3172 — grubenv lives on the ESP, which is NOT mirrored: without
+    # this the mirror member's ESP keeps booting the slot rolled back from.
+    _sync_mirror_esp()
     print()
     print(f"Run `reboot` when ready to switch.")
     return 0
