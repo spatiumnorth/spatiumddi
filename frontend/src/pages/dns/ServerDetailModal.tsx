@@ -1031,7 +1031,7 @@ function StatsTab({ serverId }: { serverId: string }) {
         </div>
       </div>
 
-      {isRefused(analytics.error) && (
+      {analytics.error != null && !analytics.data && (
         <p
           role="alert"
           className="rounded-md border bg-card p-3 text-center text-xs text-muted-foreground"
@@ -1042,9 +1042,10 @@ function StatsTab({ serverId }: { serverId: string }) {
           />
         </p>
       )}
-      {/* The cards would read "No data in window." over a refused read
-          (#3148): withhold them, the sentence above says why. */}
-      {!isRefused(analytics.error) && (
+      {/* The cards would read "No data in window." over a read that was
+          refused or failed (#3148): withhold them, the sentence above says
+          why. */}
+      {!(analytics.error != null && !analytics.data) && (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           <AnalyticsCard
             title="Top qnames"

@@ -18,6 +18,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const answers = new Map<string, () => Promise<unknown>>();
 
+function unavailable() {
+  return Promise.reject({
+    response: { status: 503, data: { detail: "Service Unavailable" } },
+  });
+}
+
 function refused(detail: string) {
   return () => Promise.reject({ response: { status: 403, data: { detail } } });
 }
@@ -143,6 +149,46 @@ describe("refused reads are not shown as results (#3148)", () => {
       "You don't have permission to see this server's query",
     );
     expect(text).not.toContain("No data in window.");
+  });
+
+  it("a read that failed for another reason says so, not that it was refused", async () => {
+    answers.set("auditApi.integrity", unavailable);
+    answers.set("auditApi.list", unavailable);
+    await show(<AuditPage />);
+    let text = document.body.textContent ?? "";
+    expect(text).not.toContain("Checking integrity");
+    expect(text).toContain("Integrity check unavailable");
+    expect(text).not.toContain("not permitted");
+    cleanup();
+
+    answers.set("logsApi.dnsQueryAnalytics", unavailable);
+    await show(
+      <ServerDetailModal
+        server={
+          {
+            id: "s1",
+            group_id: "g1",
+            name: "ns1",
+            driver: "bind9",
+            roles: [],
+            host: "192.0.2.53",
+            port: 53,
+            is_primary: true,
+            is_enabled: true,
+            status: "active",
+          } as never
+        }
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Stats/ }));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    text = document.body.textContent ?? "";
+    expect(text).toContain("Couldn't load this server's query analytics");
+    expect(text).not.toContain("No data in window.");
+    expect(text).not.toContain("permission");
   });
 
   it("the VRF picker says why it is empty and is disabled", async () => {
