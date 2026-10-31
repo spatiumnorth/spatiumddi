@@ -3534,6 +3534,11 @@ def fleet_reboot_in_grace() -> bool:
 #: #2974 — spatium-power-action writes "<pid> <action>" here while it runs
 #: (the handoff of the PostgreSQL primary, then systemctl). /run is a tmpfs.
 POWER_ACTION_MARKER = Path("/run/spatium-power-action")
+#: #3162 — spatium-reboot-handoff writes this just before its cordon asks
+#: CloudNativePG to switch the primary over, and a cancel leaves it: a
+#: switchover CNPG has begun completes whatever the cordon does next, so after
+#: F9 the console says so instead of implying nothing happened.
+POWER_ACTION_SWITCHOVER = Path("/run/spatium-power-action-switchover")
 
 
 def power_action_in_progress() -> str | None:
@@ -5256,7 +5261,9 @@ def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) ->
     F5 / F6 unit then hand the PostgreSQL primary off before
     ``systemctl reboot`` (up to a few minutes); stopping them during that
     makes ``spatium-power-action`` undo the handoff's cordon, and nothing
-    reboots.
+    reboots. #3162 — a switchover the handoff had already asked of
+    CloudNativePG still completes (it cannot be taken back), and this says
+    so; a cancel within the console's grace never reaches CNPG.
 
     Best-effort: if ``systemctl reboot`` has already been issued there's
     nothing to stop and the box reboots anyway — same as before this key
@@ -5273,6 +5280,13 @@ def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) ->
         return
     console.clear()
     console.print(f"\n\n[bold yellow]Cancelling pending {noun}…[/bold yellow]\n")
+    # #3162 — whether this cancel can have met a switchover: a note is only
+    # this run's when the wrapper was running as we stopped it, or was written
+    # since. Anything else is left from an earlier run stopped some other way
+    # (a manual ``systemctl stop``), which a cancel during the web-UI or Fleet
+    # grace (no wrapper yet) must not report.
+    wrapper_running = power_action_in_progress() is not None
+    stop_started = time.time()
     # Stop both reboot services — one owns the web-UI path, the other the
     # fleet path; only one is active, and stopping the idle one is a no-op.
     # #2974 — and the console's own F5 / F6 runs; stopping one mid-handoff
@@ -5304,11 +5318,40 @@ def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) ->
             console.print(f"[dim](left {name}: {exc})[/dim]")
     _record_reboot_cancel()
     console.print(f"[green]{noun.capitalize()} cancelled.[/green]\n")
+    # #3162 — read once the stop above has returned (the wrapper has exited):
+    # the handoff had already asked CloudNativePG to switch the primary over,
+    # which cannot be taken back. Say so, or the API outage that follows reads
+    # as a fault of the cancel.
+    try:
+        noted_at: float | None = POWER_ACTION_SWITCHOVER.stat().st_mtime
+    except OSError:
+        noted_at = None
+    # 1 s of slack: file times come from the kernel's coarse clock, a few ms
+    # behind time.time(); a note from an earlier run is far older than that.
+    switchover = noted_at is not None and (
+        wrapper_running or noted_at >= stop_started - 1.0)
+    if switchover:
+        # Not "and is uncordoned": --undo leaves a cordon it did not set, and
+        # can run out of time; the wrapper's log says which.
+        console.print(
+            "[yellow]The PostgreSQL primary handoff had already begun: "
+            "CloudNativePG completes the switchover it started, so the API "
+            "pauses for a few seconds while the primary moves to another node. "
+            "This node stays up.[/yellow]\n")
+    if noted_at is not None:
+        try:
+            POWER_ACTION_SWITCHOVER.unlink()
+        except OSError:
+            # Harmless: the next power action removes it when it starts.
+            pass
     if state is not None:
         # F5 / F6 set a 20 s "Rebooting · F9 cancels" flash; without this it
         # outlived the cancel and the footer went on announcing the reboot.
-        state.flash(f"{noun.capitalize()} cancelled", ttl=5)
-    time.sleep(1.5)
+        msg = f"{noun.capitalize()} cancelled"
+        if switchover:
+            msg += " · the DB switchover already begun still completes"
+        state.flash(msg, ttl=10 if switchover else 5)
+    time.sleep(3 if switchover else 1.5)
 
 
 def _term_env() -> dict[str, str]:
