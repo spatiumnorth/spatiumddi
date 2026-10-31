@@ -1268,6 +1268,7 @@ class SyncLoop:
         # longer exists. Not while zones are held back (#1403) or refused
         # (#1280): that verdict was set by this very apply, and is true until
         # they load.
+        recovered = False
         if (
             self._quarantine.etag is None
             and not self.apply_status.healthy
@@ -1275,6 +1276,7 @@ class SyncLoop:
             and not self._zones_refused
         ):
             self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
+            recovered = True
             self.heartbeat.config_apply = self.apply_status
             log.info("config_apply_recovered", etag=etag)
 
@@ -1290,6 +1292,15 @@ class SyncLoop:
         # apply path never fires. Without this, ``previous`` would keep
         # pointing at an older etag indefinitely.
         commit_config(self.cfg.state_dir, etag)
+        # #2309 — a failed apply cleared the prune set, and undoing the change
+        # leaves the live structure as it was, so no structural apply follows
+        # to set it again. The bundle just confirmed good IS what is live:
+        # resume key cleanup from it, exactly as after a structural apply.
+        # Only here, never on the revert path, and never while the newest
+        # config is failing (this point is reached only with nothing
+        # quarantined and nothing held back).
+        if recovered:
+            self._prune_dnssec_keys(bundle)
         # #2019 — a bundle from the control plane is live: the startup hold,
         # if there was one, is over.
         self._end_boot_hold()

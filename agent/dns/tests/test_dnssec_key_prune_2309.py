@@ -233,3 +233,55 @@ def test_prune_failure_does_not_fail_the_apply(tmp_path: Path) -> None:
 
     loop = _loop(tmp_path, _Boom(tmp_path))
     assert loop._apply_with_revert(_signed("one", "a.test"), "one") is True
+
+
+def _polled(tag: str, structural: str, *signed: str) -> dict[str, Any]:
+    return {
+        "etag": tag,
+        "structural_etag": structural,
+        "zones": [_z(z) for z in signed],
+        "pending_record_ops": [],
+    }
+
+
+def test_key_cleanup_resumes_after_a_recovered_config(tmp_path: Path, monkeypatch) -> None:
+    """A failed apply clears the prune set. Undoing the bad change leaves the
+    live structure unchanged, so the poll takes the recovery path and no
+    structural apply follows: cleanup must still resume from that poll."""
+    from spatium_dns_agent.sync import STATUS_OK
+    from .test_config_revert import _Http
+
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _PruneDriver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http(
+        [
+            _polled("e1", "s1", "a.test"),
+            _polled("e2", "s2", "a.test", "b.test"),
+            _polled("e3", "s1", "a.test"),
+        ]
+    )
+    loop._client = lambda: http  # type: ignore[method-assign]
+
+    loop._poll_once()
+    assert driver.pruned[-1] == {"a.test"}
+    driver.pruned.clear()
+
+    driver.fail_on = "render"
+    loop._poll_once()
+    assert not loop.apply_status.healthy
+    assert driver.pruned == []
+    assert loop._key_prune_bundle is None
+
+    # The operator undoes the change: same structure as what is live.
+    driver.fail_on = None
+    loop._poll_once()
+    assert loop.apply_status.status == STATUS_OK
+    assert driver.pruned == [{"a.test"}]
+    assert loop._key_prune_bundle is not None
+
+    # And the periodic check is armed again.
+    driver.pruned.clear()
+    loop._prune_dnssec_keys()
+    assert driver.pruned == [{"a.test"}]
