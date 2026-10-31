@@ -12045,7 +12045,7 @@ function ZoneTreeRows({
             {node.zone ? (
               /* This node is also a registered zone — make label clickable */
               <button
-                className={`flex flex-1 items-center gap-1.5 rounded py-1 pr-2 text-xs ${
+                className={`flex min-w-0 flex-1 items-center gap-1.5 rounded py-1 pr-2 text-xs ${
                   selectedZoneId === node.zone.id
                     ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -12075,7 +12075,7 @@ function ZoneTreeRows({
                  literally at the TLD. Deeper folders (e.g. "example.com")
                  open the Create Zone modal on click. */
               <button
-                className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
+                className="flex min-w-0 flex-1 items-center gap-1 rounded py-1 pr-2 text-left text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
                 onClick={() =>
                   node.domain.includes(".")
                     ? setCreateZoneName(node.domain)
@@ -12087,7 +12087,7 @@ function ZoneTreeRows({
                     : "Expand / collapse"
                 }
               >
-                {node.domain}
+                <span className="truncate">{node.domain}</span>
               </button>
             )}
           </div>
@@ -12126,7 +12126,9 @@ function ZoneTreeRows({
             style={{ paddingLeft }}
           >
             <Folder className="h-3 w-3 flex-shrink-0" />
-            <span className="font-medium font-mono">{node.domain}</span>
+            <span className="truncate font-medium font-mono">
+              {node.domain}
+            </span>
           </div>
         )}
         {/* Children */}

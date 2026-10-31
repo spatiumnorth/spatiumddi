@@ -69,16 +69,26 @@ export function useResizableWidth(storageKey: string, defaultWidth: number) {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  // The latest width, so a drag can be persisted once when it ends instead
+  // of writing localStorage on every pointermove.
+  const latest = useRef(width);
   const setWidth = useCallback(
     (next: number, persist = true) => {
       const clamped = clampPaneWidth(next, window.innerWidth);
+      latest.current = clamped;
       setWidthState(clamped);
       if (persist) writeStored(storageKey, clamped);
     },
     [storageKey],
   );
+  const persist = useCallback(
+    () => writeStored(storageKey, latest.current),
+    [storageKey],
+  );
   const reset = useCallback(() => {
-    setWidthState(clampPaneWidth(defaultWidth, window.innerWidth));
+    const clamped = clampPaneWidth(defaultWidth, window.innerWidth);
+    latest.current = clamped;
+    setWidthState(clamped);
     writeStored(storageKey, null);
   }, [storageKey, defaultWidth]);
 
@@ -89,6 +99,7 @@ export function useResizableWidth(storageKey: string, defaultWidth: number) {
     min: PANE_MIN_WIDTH,
     max,
     setWidth,
+    persist,
     reset,
   };
 }
@@ -120,25 +131,41 @@ export function ResizablePane({
   children,
 }: ResizablePaneProps) {
   const isDesktop = useMediaQuery("(min-width: 768px)");
-  const { width, min, max, setWidth, reset } = useResizableWidth(
+  const { width, min, max, setWidth, persist, reset } = useResizableWidth(
     storageKey,
     defaultWidth,
   );
   const drag = useRef<{ startX: number; startWidth: number } | null>(null);
   const [dragging, setDragging] = useState(false);
 
+  // The handle unmounts when the window narrows below `md`; a drag in
+  // progress at that moment can never see its pointerup, so drop it here
+  // rather than leave the body cursor stuck on col-resize.
+  if (dragging && !isDesktop) setDragging(false);
+
+  const finishDrag = useCallback(() => {
+    if (!drag.current) return;
+    drag.current = null;
+    setDragging(false);
+    persist();
+  }, [persist]);
+
   // Col-resize cursor + no text selection for the length of a drag, even when
-  // the pointer is over other elements.
+  // the pointer is over other elements. Restored when the drag ends, when the
+  // pane unmounts mid-drag, and when the window loses focus (alt-tab during a
+  // drag may never deliver the pointerup).
   useEffect(() => {
     if (!dragging) return;
     const { cursor, userSelect } = document.body.style;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+    window.addEventListener("blur", finishDrag);
     return () => {
+      window.removeEventListener("blur", finishDrag);
       document.body.style.cursor = cursor;
       document.body.style.userSelect = userSelect;
     };
-  }, [dragging]);
+  }, [dragging, finishDrag]);
 
   function onPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
     if (e.button !== 0) return;
@@ -148,14 +175,14 @@ export function ResizablePane({
     setDragging(true);
   }
   function onPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
-    if (!drag.current) return;
-    setWidth(drag.current.startWidth + e.clientX - drag.current.startX);
+    if (!drag.current || !dragging) return;
+    setWidth(drag.current.startWidth + e.clientX - drag.current.startX, false);
   }
   function endDrag(e: ReactPointerEvent<HTMLDivElement>) {
     if (!drag.current) return;
-    drag.current = null;
-    setDragging(false);
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId))
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    finishDrag();
   }
   function onKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
     const step = e.shiftKey ? KEY_STEP_LARGE : KEY_STEP;
@@ -169,41 +196,41 @@ export function ResizablePane({
     setWidth(next);
   }
 
-  if (!isDesktop) {
-    return (
-      <Tag
-        className={cn("flex-shrink-0", className)}
-        style={{ width: defaultWidth }}
-      >
-        {children}
-      </Tag>
-    );
-  }
-
+  // One element tree at every width, so crossing `md` does not remount the
+  // pane's children (and drop their expand / scroll state). Below `md` the
+  // pane is its old fixed width with no handle.
   return (
-    <div className="relative flex flex-shrink-0" style={{ width }}>
+    <div
+      className="flex flex-shrink-0"
+      style={{ width: isDesktop ? width : defaultWidth }}
+    >
       <Tag className={cn("min-w-0 flex-1", className)}>{children}</Tag>
-      <div
-        role="separator"
-        aria-orientation="vertical"
-        aria-label={label}
-        aria-valuenow={width}
-        aria-valuemin={min}
-        aria-valuemax={max}
-        tabIndex={0}
-        title="Drag to resize, double-click to reset"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onDoubleClick={reset}
-        onKeyDown={onKeyDown}
-        className={cn(
-          "absolute inset-y-0 -right-[3px] z-10 w-[7px] cursor-col-resize touch-none",
-          "hover:bg-primary/30 focus-visible:bg-primary/40 focus-visible:outline-none",
-          dragging && "bg-primary/40",
-        )}
-      />
+      {isDesktop && (
+        // In flow beside the pane's border rather than overlapping it, so the
+        // grab strip never covers the tree's scrollbar or the detail pane.
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={label}
+          aria-valuenow={width}
+          aria-valuemin={min}
+          aria-valuemax={max}
+          tabIndex={0}
+          title="Drag to resize, double-click to reset"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onLostPointerCapture={endDrag}
+          onDoubleClick={reset}
+          onKeyDown={onKeyDown}
+          className={cn(
+            "w-1.5 flex-shrink-0 cursor-col-resize touch-none",
+            "hover:bg-primary/30 focus-visible:bg-primary/40 focus-visible:outline-none",
+            dragging && "bg-primary/40",
+          )}
+        />
+      )}
     </div>
   );
 }
