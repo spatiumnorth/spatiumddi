@@ -1175,7 +1175,9 @@ def _recopy_slot_images_for_switch(target: dict[str, str]) -> None:
             f"  containerd still holds its images. If they come up\n"
             f"  ErrImageNeverPull: mount {target['device']} read-only, copy its\n"
             f"  var/lib/rancher/k3s/agent/images/*.tar.zst into\n"
-            f"  /var/lib/rancher/k3s/agent/images/, touch them, restart k3s.",
+            f"  /var/lib/rancher/k3s/agent/images/, touch them, restart k3s\n"
+            f"  (docs/TROUBLESHOOTING.md, \"Pods stuck in ErrImageNeverPull after\n"
+            f"  a slot rollback\", covers a slot that carries no tarballs).",
             file=sys.stderr,
         )
     elif copied == 0:

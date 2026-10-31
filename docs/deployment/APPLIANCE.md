@@ -3615,10 +3615,16 @@ container images. k3s imports its image tarballs from the shared `/var`,
 which holds the newest upgraded slot's set, so a rolled-back slot can
 come up with pods in `ErrImageNeverPull` if containerd no longer holds
 its images (a cluster join on the newer slot, or kubelet image GC,
-removes them). Recovery by hand is in
-[Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback);
-the permanent fix is tracked in
-[#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169). Across a
+removes them). A rollback, a set-default to the other slot and a
+"boot this slot next" therefore first copy the target slot's own tarballs
+into that directory with a fresh mtime, so k3s re-imports them before the
+reboot ([#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169)).
+The copy is about 1 GB, and a reboot requested meanwhile waits for it.
+It cannot help a slot the installer laid down, which carries no tarballs
+of its own, nor a node that falls back on its own after a failed trial
+boot; recovery by hand for those is in
+[Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback).
+Across a
 Kubernetes *minor* the revert is not a rollback at all, and the
 difference is easy to miss because the slot machinery behaves
 identically.

@@ -607,6 +607,8 @@ Appliance only. Tracked in [#3169](https://github.com/spatiumnorth/spatiumddi/is
 
 **Cause.** k3s imports image tarballs from one directory on the shared `/var` (`/var/lib/rancher/k3s/agent/images`), not from the running slot. A slot upgrade copies the *new* slot's tarballs into it, and k3s's import cache (`.cache.json`, keyed on path, size and mtime) records them as imported. After a rollback the old slot's k3s therefore imports nothing, and every SpatiumDDI pod is `imagePullPolicy: Never`, so it only starts if containerd still holds the old images. A cluster join, promote or demote made on the newer slot, or kubelet image GC, removes them. The old slot's own tarballs are still on its root filesystem, but at the same path, so the `/var` mount hides them.
 
+Since [#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169)'s fix, `spatium-upgrade-slot rollback`, `set-default` to the other slot and `set-next-boot` to the other slot copy the target slot's tarballs into that directory with a fresh mtime before they switch, so the running k3s imports them before the reboot. This recipe is still needed when that copy could not run: the slot-switch log (`/var/log/spatiumddi/slot-upgrade.log`, or the console's output) then carries `WARNING: could not re-copy … baked images`. The usual reason is a slot laid down by the installer (see *When this does not apply* below). A node that fell back to its previous slot on its own, after a trial boot that failed, also never ran the copy.
+
 **Recovery.** Run as root on the affected node, on the slot you rolled back to:
 
 ```bash
