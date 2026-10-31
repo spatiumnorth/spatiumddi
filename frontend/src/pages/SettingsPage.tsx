@@ -514,7 +514,7 @@ const RETENTION_ROWS: {
     key: "log_retention_hours",
     label: "DNS query & DHCP activity logs",
     description:
-      "Agent-shipped query and activity log rows. 1–168 hours. Capped at a week: the nightly prune is one DELETE, and a longer window makes it larger. Ship to Loki or a SIEM for longer history.",
+      "Agent-shipped query and activity log rows. 1–168 hours, applied by dropping time partitions, so rows can outlive the window by up to an hour (or a day above 48 hours). Ship to Loki or a SIEM for longer history.",
     unit: "hours",
     min: 1,
     max: 168,
