@@ -78,7 +78,12 @@ from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
-from app.services.dns.agent_instance import claim_poll, is_displaced
+from app.services.dns.agent_instance import (
+    claim_poll,
+    is_displaced,
+    is_refused,
+    refuse_registration,
+)
 from app.services.dns.agent_token import (
     hash_token,
     mint_agent_token,
@@ -250,6 +255,12 @@ class AgentHeartbeatResponseV2(BaseModel):
     rotated_expires_at: datetime | None = None
 
 
+#: #2042 — the per-process id a DNS agent sends on every config poll (and,
+#: since #2219, heartbeat and registration). A new value for a server means a
+#: new agent process; see ``agent_config_longpoll``.
+AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
+
+
 # ── Auth dependencies ──────────────────────────────────────────────────────────
 
 
@@ -382,15 +393,30 @@ async def _warn_if_second_signer(db: DB, group: DNSServerGroup, server: DNSServe
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
-@router.post("/register", response_model=AgentRegisterResponseV2)
+@router.post(
+    "/register",
+    response_model=AgentRegisterResponseV2,
+    responses={
+        409: {
+            "description": (
+                "#2219 — another live agent process owns this server identity; "
+                "this one is its refused duplicate (header "
+                "X-Spatium-Duplicate-Agent-Instance). No token is minted."
+            )
+        }
+    },
+)
 async def agent_register(
+    request: Request,
     body: AgentRegisterRequestV2,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
     # #1171 — what the agent renders (``soa-timers``: each zone's own SOA
     # timers). A header so an older control plane ignores it.
     agent_features: str | None = Header(default=None, alias=AGENT_FEATURES_HEADER),
-) -> AgentRegisterResponseV2:
+    # #2219 — the registering process, as on its polls and heartbeats.
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+) -> AgentRegisterResponseV2 | JSONResponse:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
     # the one agent call that creates a server row, so without this an
@@ -417,6 +443,19 @@ async def agent_register(
             raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
         res = await db.execute(select(DNSServer).where(DNSServer.agent_id == aid))
         server = res.scalar_one_or_none()
+        # #2219 — the refused half of a duplicate pair (#2044) is refused here
+        # too. Registering would mint it a token and overwrite the server's
+        # one token hash, staling the owner's; the owner then re-registers,
+        # staling this one's, and the pair trade re-registrations forever.
+        # Before anything is written, so a refusal changes nothing but the
+        # duplicate episode the server chip and alert read.
+        if server is not None and await refuse_registration(
+            db,
+            server,
+            _agent_instance(agent_instance),
+            client_ip=request.client.host if request.client is not None else None,
+        ):
+            return _duplicate_instance_response(server)
 
     # #2190 — an agent with no row yet that runs on an appliance lands in the
     # group the APPLIANCE is assigned, not the one its pod env names. The env
@@ -821,9 +860,6 @@ async def _bounded_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle
                 pass
 
 
-#: #2042 — the per-process id a DNS agent sends on every config poll. A new
-#: value for a server means a new agent process; see ``agent_config_longpoll``.
-AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
 _AGENT_INSTANCE_MAX = 64  # dns_record_op.dispatched_to
 
 
@@ -842,7 +878,8 @@ DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
 
 
 def _duplicate_instance_response(server: DNSServer) -> JSONResponse:
-    """409 for a poll from an agent process that does not own ``server`` (#2044).
+    """409 for a poll (#2044) or a registration (#2219) from an agent process
+    that does not own ``server``.
 
     Not 401 / 404: those make the agent drop its token and re-register
     (#2052), which would not change which process owns the row. The agent logs
@@ -1215,7 +1252,10 @@ async def agent_heartbeat(
 
     rotated_token = None
     rotated_exp = None
-    if needs_rotation(payload):
+    # #2219 — not for the refused half of a duplicate pair: its new token's
+    # hash would replace the owner's and stale it. Its token runs out instead,
+    # and the re-registration that follows is refused until the owner stops.
+    if needs_rotation(payload) and not is_refused(server, _agent_instance(agent_instance), now):
         rotated_token, rotated_exp = mint_agent_token(
             server_id=str(server.id),
             agent_id=str(server.agent_id),

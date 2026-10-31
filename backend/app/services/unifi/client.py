@@ -50,6 +50,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services._mirror_shape import require_keyed_list, require_list
 
 logger = structlog.get_logger(__name__)
@@ -295,7 +296,7 @@ class UnifiClient:
                 },
             )
         except httpx.HTTPError as exc:
-            raise UnifiClientError(f"/api/login: {exc}") from exc
+            raise UnifiClientError(f"/api/login: {describe_exc(exc)}") from exc
         if resp.status_code >= 400:
             raise UnifiClientError(f"/api/login: HTTP {resp.status_code} {resp.text[:200]}")
         # Newer controllers return the CSRF in a header; older ones
@@ -359,7 +360,7 @@ class UnifiClient:
         try:
             resp = await self._client.get(path)
         except httpx.HTTPError as exc:
-            raise UnifiClientError(f"{path}: {exc}") from exc
+            raise UnifiClientError(f"{path}: {describe_exc(exc)}") from exc
         if resp.status_code == 401:
             raise UnifiClientError(f"{path}: HTTP 401 — auth invalid / expired")
         if resp.status_code == 403:
@@ -392,7 +393,7 @@ class UnifiClient:
         try:
             resp = await self._client.post(path, json=payload, headers=headers)
         except httpx.HTTPError as exc:
-            raise UnifiClientError(f"{path}: {exc}") from exc
+            raise UnifiClientError(f"{path}: {describe_exc(exc)}") from exc
         if resp.status_code == 401:
             raise UnifiClientError(f"{path}: HTTP 401 — auth invalid / expired")
         if resp.status_code == 403:

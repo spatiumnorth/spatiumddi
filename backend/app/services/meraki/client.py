@@ -36,6 +36,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
+
 logger = structlog.get_logger(__name__)
 
 _MAX_429_RETRIES = 3
@@ -259,7 +261,7 @@ class MerakiClient:
             try:
                 resp = await self._client.request(method, path, params=params, json=json)
             except httpx.HTTPError as exc:
-                raise MerakiClientError(f"{method} {path}: {exc}") from exc
+                raise MerakiClientError(f"{method} {path}: {describe_exc(exc)}") from exc
             if resp.status_code == 429 and attempts < _MAX_429_RETRIES:
                 attempts += 1
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))

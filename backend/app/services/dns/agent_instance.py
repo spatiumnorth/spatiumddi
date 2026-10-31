@@ -24,6 +24,12 @@ So the server keeps one OWNER, and only the owner is served:
   takes back over, so the survivor of a duplicate pair recovers by itself when
   the other one is shut down.
 
+- #2219: the refused process does not change the server's token either. It
+  authenticates as the same server, against the same ``agent_jwt_hash``, so a
+  token minted for it makes the owner's stale; the owner re-registers, and the
+  two trade re-registrations forever. Its registration is refused (409) like
+  its poll, and its heartbeat does not rotate.
+
 The newest arrival winning is what keeps a replacement seamless; refusing the
 returning one is what stops the ping-pong. Polls that carry no instance id (an
 agent too old to send one) bypass all of this, as they bypass #2043.
@@ -86,6 +92,87 @@ def is_displaced(server: DNSServer, instance: str | None) -> bool:
     return instance in (server.agent_instances_displaced or [])
 
 
+def _owner_live(server: DNSServer, now: datetime) -> bool:
+    """Whether the server's owner has started a config poll recently."""
+    seen = server.agent_instance_seen_at
+    return server.agent_instance is not None and seen is not None and now - seen <= OWNER_GONE_AFTER
+
+
+def _record_refusal(server: DNSServer, now: datetime, client_ip: str | None) -> None:
+    """Stamp a refused poll or registration on the (locked) row's episode."""
+    last = server.duplicate_agent_last_at
+    if last is None or now - last > DUPLICATE_WINDOW:
+        server.duplicate_agent_first_at = now  # a new episode
+    # At most every SEEN_REFRESH: an older agent retries a refusal every
+    # 5 s, and the episode needs minutes of resolution, not seconds.
+    if last is None or now - last >= SEEN_REFRESH:
+        server.duplicate_agent_last_at = now
+        server.duplicate_agent_ip = client_ip
+
+
+def is_refused(server: DNSServer, instance: str | None, now: datetime | None = None) -> bool:
+    """Whether ``instance`` is the refused half of a duplicate pair right now:
+    a process the owner displaced, while the owner is still polling (#2219).
+
+    Such a process must not change the server's token. Both processes of a
+    pair authenticate as the one server, against its one ``agent_jwt_hash``;
+    a token minted for the refused process (a re-registration, or a heartbeat
+    rotation) makes the owner's stale, the owner re-registers, which makes
+    the refused one's stale, and the two trade re-registrations forever."""
+    return is_displaced(server, instance) and _owner_live(server, now or datetime.now(UTC))
+
+
+async def refuse_registration(
+    db: AsyncSession,
+    server: DNSServer,
+    instance: str | None,
+    *,
+    now: datetime | None = None,
+    client_ip: str | None = None,
+) -> bool:
+    """Decide whether a registration from ``instance`` is refused (#2219).
+
+    True for the refused half of a duplicate pair (:func:`is_refused`): the
+    episode is recorded on the row, as a refused poll records it, and
+    committed. The caller answers 409 and mints nothing, so the owner's token
+    stays valid. False otherwise, with nothing written and no lock held: an
+    agent that sends no instance id (older than #2219), a process the server
+    has never seen, the owner itself, or a displaced one whose owner went
+    quiet (it may take the server back, as at poll).
+
+    The common case is decided from the row as read, without a lock, so a
+    registration that is not refused takes its locks in the order it always
+    did. Only a likely refusal locks the row, re-checks, and commits."""
+    now = now or datetime.now(UTC)
+    if instance is None or not is_refused(server, instance, now):
+        return False
+    locked = (
+        await db.execute(
+            select(DNSServer)
+            .where(DNSServer.id == server.id)
+            .with_for_update(key_share=True)  # as in claim_poll
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked is None:
+        return False
+    if not is_refused(locked, instance, now):
+        await db.commit()  # nothing written; releases the row lock
+        return False
+    _record_refusal(locked, now, client_ip)
+    await db.commit()
+    logger.warning(
+        "dns_agent_duplicate_instance_register_refused",
+        server_id=str(locked.id),
+        server=locked.name,
+        refused_instance=instance,
+        owner_instance=locked.agent_instance,
+        client_ip=client_ip,
+        issue="#2219",
+    )
+    return True
+
+
 async def claim_poll(
     db: AsyncSession,
     server: DNSServer,
@@ -133,17 +220,9 @@ async def claim_poll(
         return True
 
     displaced = [d for d in (locked.agent_instances_displaced or []) if isinstance(d, str)]
-    owner_seen = locked.agent_instance_seen_at
-    owner_live = owner_seen is not None and now - owner_seen <= OWNER_GONE_AFTER
-    if instance in displaced and owner_live:
-        last = locked.duplicate_agent_last_at
-        if last is None or now - last > DUPLICATE_WINDOW:
-            locked.duplicate_agent_first_at = now  # a new episode
-        # At most every SEEN_REFRESH: an older agent retries a refusal every
-        # 5 s, and the episode needs minutes of resolution, not seconds.
-        if last is None or now - last >= SEEN_REFRESH:
-            locked.duplicate_agent_last_at = now
-            locked.duplicate_agent_ip = client_ip
+    live = _owner_live(locked, now)
+    if instance in displaced and live:
+        _record_refusal(locked, now, client_ip)
         await db.commit()
         logger.warning(
             "dns_agent_duplicate_instance_refused",
@@ -167,6 +246,6 @@ async def claim_poll(
         server=locked.name,
         instance=instance,
         previous_instance=owner,
-        previous_gone=not owner_live,
+        previous_gone=not live,
     )
     return True

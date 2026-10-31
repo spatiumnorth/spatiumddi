@@ -16,7 +16,7 @@ not measured yet, and how to measure your own install. The README carries the sh
 | **Appliance, three-node control plane** | first node 4 vCPU / 8 GiB, two more 2 vCPU / 6 GiB, 40 GiB disks | every node 4 vCPU, 8 GiB RAM, 48 GiB SSD | Yes |
 | **Appliance role** (a DNS and / or DHCP agent box) | 3 GiB RAM: its pods do not schedule below that | 2 vCPU, 4 GiB RAM, 32 GiB SSD | No |
 | **Docker Compose**, one host | 2 vCPU, 4 GiB RAM | 4 vCPU, 8 GiB RAM | Minimum from the measured use (amd64, on an 8 GiB VM): the containers held at most 1.65 GiB, and the VM with its OS at most 2.2 GiB, at rest and under light load; arm64 alike. Recommended derived: no realistic load or agent profiles on Compose |
-| **Kubernetes**, the umbrella chart | one node: 4 vCPU, 6 GiB RAM with the overrides in [Kubernetes](#kubernetes); more than 8 GiB on the chart's defaults | 4 vCPU, 8 GiB RAM per node, with those overrides | Measured (amd64, one k3s node on an 8 GiB VM; arm64 alike), at rest and under light load: on the chart's defaults the 8 GiB VM kept less than 1 GiB available. Per pod in [Kubernetes](#kubernetes) |
+| **Kubernetes**, the umbrella chart | one node: 4 vCPU, 6 GiB RAM | 4 vCPU, 8 GiB RAM per node | Measured (amd64, one k3s node on an 8 GiB VM; arm64 alike), at rest and under light load with two api replicas, which the chart's defaults keep since #3110: the VM used 4.0 GiB. The current defaults themselves were measured at rest on arm64. Per pod in [Kubernetes](#kubernetes) |
 
 Give every control-plane node 64 GiB of disk or more for about 1M devices,
 and plan for more memory with very large DNS groups (250k records and up).
@@ -295,15 +295,17 @@ the api, worker and PostgreSQL limits from the node's RAM (see
 [`APPLIANCE.md`](APPLIANCE.md)). On another cluster the chart's defaults in
 `values.yaml` apply.
 
-**With the chart's defaults,** measured on one k3s 1.36 node with
-metrics-server, installed with `helm install` and only the image tag set.
-Working set per pod, as `kubectl top` reports it and as the autoscaler reads
-it:
+**With the chart's defaults of the 2026-10-28 nightly,** measured on one k3s
+1.36 node with metrics-server, installed with `helm install` and only the
+image tag set. The chart's api and worker defaults have since been sized from
+these figures (#3110), so the second column gives the defaults measured and,
+after the arrow, the chart's own since. Working set per pod, as `kubectl top`
+reports it and as the autoscaler reads it:
 
 | Pod | Chart default, request / limit | amd64: at rest, MiB | amd64: light load, MiB p50 / max | amd64: CPU at rest / light load, millicores per pod | arm64: at rest / light load, MiB p50 |
 |---|---|---|---|---|---|
-| api (one uvicorn process) | 256Mi / 512Mi | 305 | 355 / 367 (372 / 373 on 2 replicas) | 3 / 23 (3 / 100 on 2 replicas) | 295 / 344 |
-| worker (four processes) | 256Mi / 1Gi | 768 at the start, 905 and 941 two hours later | 837 / 888 | 53 / 57 | 774 / 834 |
+| api (one uvicorn process) | 256Mi / 512Mi → 512Mi / 1Gi, CPU request 100m → 200m | 305 | 355 / 367 (372 / 373 on 2 replicas) | 3 / 23 (3 / 100 on 2 replicas) | 295 / 344 |
+| worker (four processes) | 256Mi / 1Gi → 256Mi / 2Gi | 768 at the start, 905 and 941 two hours later | 837 / 888 | 53 / 57 | 774 / 834 |
 | beat | 128Mi / 256Mi | 181 | 182 / 182 | 6 / 6 | 173 / 173 |
 | PostgreSQL | 256Mi / 1Gi | 73 | 327 / 400 | 20 / 40 | 73 / 324 |
 | Redis | 64Mi / 512Mi | 5 | 6 / 6 | 6 / 6 | 16 / 16 |
@@ -311,12 +313,13 @@ it:
 | CoreDNS, metrics-server, the local-path provisioner | | 42 | 45 | 6 / 6 | 59 / 69 |
 
 The node (pods, k3s and containerd) used 6.5 GiB at rest after the load with
-the defaults, and 3.5 GiB with two api replicas (amd64; 6.5 and 3.7 GiB on
-arm64). With its OS, the 8 GiB amd64 VM used 7.0 GiB on the defaults, which
+those defaults, and 3.5 GiB with two api replicas (amd64; 6.5 and 3.7 GiB on
+arm64). With its OS, the 8 GiB amd64 VM used 7.0 GiB on those defaults, which
 left 0.73 GiB available at the worst sample, under the 1 GiB the rule asks,
-and 4.0 GiB with two api replicas. Three things the defaults do:
+and 4.0 GiB with two api replicas. Three things those defaults did, all
+changed since:
 
-- **The api autoscaler runs 10 replicas at rest.** Its memory target is 80 %
+- **The api autoscaler ran 10 replicas at rest.** Its memory target was 80 %
   of a 256Mi request, about 205 MiB, and one api process holds about 305 MiB
   as soon as it has started, on amd64 and arm64 alike. It went from 2 to 10
   replicas within three minutes of the install, with no traffic, and stayed
@@ -325,39 +328,42 @@ and 4.0 GiB with two api replicas. Three things the defaults do:
   (#3110). Each holds its own database pool: PostgreSQL saw 46 connections
   under the light load, against the measured build's `max_connections` of
   100; the chart now sizes `max_connections` from the pools and the
-  autoscaler's maximum (#2955).
-- **The worker runs close to its 1Gi limit.** Its four processes grow for
+  autoscaler's maximum (#2955). Since #3110 the autoscaler scales on CPU
+  alone (memory is opt-in), and an idle install stays at 2 replicas.
+- **The worker ran close to its 1Gi limit.** Its four processes grow for
   about the first hour, then level off near the limit. On amd64, two hours
   after the install (20 minutes of it under the light load), the two worker
   pods held 0.87 and 0.91 GiB of their own memory, up by under 10 MiB in the
   last half hour, and peaked 25 MiB under the limit, with no OOM kill and no
   restart. On arm64 they reached the limit about 40 minutes after the
   install, and the kernel kept them under it by reclaiming page cache (no OOM
-  kill in 47 minutes). Either way about 0.1 GiB is left for a burst of work,
-  hence the `2Gi` below.
-- **The api's 512Mi limit leaves little room.** One api process taking all of
+  kill in 47 minutes). Either way about 0.1 GiB was left for a burst of work,
+  hence the chart's `2Gi` since #3110.
+- **The api's 512Mi limit left little room.** One api process taking all of
   the light load (on Compose) peaked at 405 MiB on amd64 and 469 MiB on
-  arm64. On the appliance it held 0.4 to 0.85 GiB under the API suite.
+  arm64. On the appliance it held 0.4 to 0.85 GiB under the API suite. Since
+  #3110 the api requests 512Mi and is limited to 1Gi.
 
-Until the chart's defaults change, set:
+Since #3110 the chart's defaults are an api request of 200m and 512Mi with a
+1Gi limit, a worker limit of 2Gi, and the autoscaler on CPU alone: 70 % of
+the 200m request is 140m a pod, above the 100m each of two api pods used
+under the light load (amd64). A memory target is opt-in
+(`api.autoscaling.targetMemoryUtilizationPercentage`); keep it at 73 % or more
+of the 512Mi request, above what each api pod held here at rest and under the
+light load (373 MiB at most, on two replicas, amd64; 366 on arm64).
 
-```yaml
-api:
-  resources:
-    requests: { memory: 512Mi }
-    limits:   { memory: 1Gi }
-worker:
-  resources:
-    limits: { memory: 2Gi }
-```
+Measured with these defaults on arm64 (Docker Desktop, one k3s 1.36.5 node
+with metrics-server, `helm install` with only the image tag set, at rest
+only): the autoscaler held 2 api replicas for the 19 minutes sampled, each
+api pod at 292 to 303 MiB (57 to 59 % of its request) and the node at 3.1 to
+3.9 GiB, against 5.6 to 6.0 GiB at rest with the old defaults' 10 replicas
+on the same node.
 
-With a 512Mi request the autoscaler's memory target is about 410 MiB, above
-what each api pod held here at rest and under the light load (373 MiB at
-most, on two replicas, amd64; 366 on arm64). Or set
-`api.autoscaling.enabled: false` and `api.replicas` to the count you want.
-Once the autoscaler has scaled the api, `helm upgrade` with Helm 4 stops on a
-conflict over the Deployment's `replicas` until you add `--force-conflicts`
-(#3111).
+An existing release takes these defaults with `helm upgrade
+--reset-then-reuse-values`; `--reuse-values` keeps the old ones. Since #3111
+the chart renders no api replica count while the autoscaler is on, so
+`helm upgrade` with Helm 4 no longer stops on a conflict over the
+Deployment's `replicas`.
 
 **Measured on the appliance,** RSS in MiB across every shape:
 
@@ -369,8 +375,8 @@ conflict over the Deployment's `replicas` until you add `--force-conflicts`
 | PostgreSQL | 256Mi / 1Gi | not readable from RSS (shared buffers count once per backend). The appliance gives it 1.3 GiB or more |
 | Redis | 64Mi / 512Mi | 23 to 70 at p50 |
 
-The api's resident memory there was above the default 512Mi limit in nearly
-every shape, hence the `1Gi` above. Instead of a `2Gi` worker you can run two
+The api's resident memory there was above the old 512Mi default limit in
+nearly every shape, hence the chart's `1Gi` (#3110). Instead of a `2Gi` worker you can run two
 worker processes (`worker.concurrency: 2`), as the appliance does on nodes of
 12 GiB or less. Per node, plan as for the appliance: its figures include k3s
 itself (0.6 to 0.9 GiB; 0.55 GiB for the k3s server on the arm64 node).

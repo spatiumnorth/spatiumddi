@@ -60,6 +60,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_credential_problem
 from app.core.ssrf import SSRFBlockedError, assert_safe_target
 from app.services.backup.targets.base import (
@@ -69,7 +70,6 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     UnsupportedOperationError,
-    describe_exc,
     safe_filename,
     safe_url,
     scrub_url,

@@ -88,10 +88,12 @@ generator's view alone.
 Three things shape those numbers, and all three are the appliance's job,
 not the operator's:
 
-- The chart's default api limit (512Mi) cannot build the agent config
-  bundle for a group of this size, and the default worker limit (1Gi with
-  four prefork processes) is OOM-killed under lease/DDNS churn long before
-  the VM runs short. The supervisor therefore sizes both from the node's
+- The chart's default limits (api 1Gi, worker 2Gi since #3110) are sized
+  for everyday use, not for this load. At the older defaults the api
+  (512Mi) could not build the agent config bundle for a group of this
+  size, and the worker (1Gi with four prefork processes) was OOM-killed
+  under lease/DDNS churn long before the VM ran short. The supervisor
+  therefore sizes both from the node's
   RAM — api = ½ RAM (1–8 GiB), worker = ⅖ RAM (1–16 GiB, but never more
   than the api and Postgres leave), two worker processes on nodes of 12 GiB
   or less — and writes them into the `spatium-control` HelmChartConfig,
