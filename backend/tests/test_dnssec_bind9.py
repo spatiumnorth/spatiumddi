@@ -223,3 +223,45 @@ async def test_rollover_requires_signed_zone(client: AsyncClient, db_session: As
         json={"key_tag": 12345},
     )
     assert r.status_code == 409
+
+
+async def test_nsec3_iterations_above_zero_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """BIND 9.20 refuses ``nsec3param iterations`` > 0 and rejects the whole
+    named.conf over it (#3153), so the API must not store one."""
+    token = await _admin(db_session)
+    h = {"Authorization": f"Bearer {token}"}
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": "it151", "nsec3": True, "nsec3_iterations": 151},
+    )
+    assert r.status_code == 422, r.text
+    assert "BIND 9.20" in r.text
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": "salty", "nsec3": True, "nsec3_salt_length": 256},
+    )
+    assert r.status_code == 422, r.text
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": "ok3", "nsec3": True, "nsec3_iterations": 0, "nsec3_salt_length": 8},
+    )
+    assert r.status_code == 201, r.text
+    r = await client.put(
+        f"/api/v1/dns/dnssec-policies/{r.json()['id']}",
+        headers=h,
+        json={"nsec3_iterations": 5},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_stored_nonzero_iterations_render_as_zero() -> None:
+    """A row saved before the API refused it must not reach named."""
+    from app.services.dns.named_conf_validation import effective_nsec3_iterations
+
+    assert effective_nsec3_iterations("p", 151) == 0
+    assert effective_nsec3_iterations("p", 0) == 0
