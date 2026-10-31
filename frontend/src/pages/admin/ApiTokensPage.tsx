@@ -34,6 +34,7 @@ import {
 } from "@/lib/enrolment";
 import { QrCode } from "@/components/QrCode";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Modal } from "@/components/ui/modal";
 
 const inputCls =
@@ -382,7 +383,13 @@ function CreateTokenModal({
 // CAMERA-readable, so it is strictly easier to capture over a shoulder — or
 // from a screen-share — than the masked string beside it.
 
-function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
+function EnrolmentQr({
+  token,
+  onReveal,
+}: {
+  token: ApiTokenCreated;
+  onReveal?: () => void;
+}) {
   const [shown, setShown] = useState(false);
   const [mode, setMode] = useState<"enrol" | "token">("enrol");
   const [conn, setConn] = useState<EnrolmentConnection>(() =>
@@ -436,7 +443,10 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
     return (
       <button
         type="button"
-        onClick={() => setShown(true)}
+        onClick={() => {
+          setShown(true);
+          onReveal?.();
+        }}
         className="flex w-full items-center justify-center gap-2 rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
       >
         <QrCodeIcon className="h-3.5 w-3.5" />
@@ -601,10 +611,22 @@ export function RevealTokenModal({
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
   const [visible, setVisible] = useState(false);
+  // The token is shown once. Closing without ever having copied or revealed
+  // it loses it for good (#3222), so Done / Esc / X ask first unless one of
+  // those happened. A failed copy deliberately does NOT count; the
+  // fallback reveal below is automatic, not something the operator did.
+  const [hasToken, setHasToken] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+
+  function requestClose() {
+    if (hasToken) onClose();
+    else setConfirmClose(true);
+  }
 
   async function copy() {
     const ok = await copyToClipboard(token.token);
     if (ok) {
+      setHasToken(true);
       setCopied(true);
       setCopyFailed(false);
       setTimeout(() => setCopied(false), 2000);
@@ -617,70 +639,86 @@ export function RevealTokenModal({
   }
 
   return (
-    <Modal title={`Token "${token.name}" — copy now`} onClose={onClose}>
-      <div className="space-y-4">
-        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          This is the <strong>only time</strong> the raw token is visible.
-          SpatiumDDI stores only a hash — if you lose this value, delete the
-          token and create a new one.
-        </div>
-        {copyFailed && (
-          <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
-            Automatic copy failed (browser blocked the clipboard API — usually
-            because the page is served over plain HTTP on a non-localhost host).
-            The token is now visible below — select it manually and copy with{" "}
-            <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>C</kbd>.
+    <>
+      <Modal title={`Token "${token.name}" — copy now`} onClose={requestClose}>
+        <div className="space-y-4">
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            This is the <strong>only time</strong> the raw token is visible.
+            SpatiumDDI stores only a hash — if you lose this value, delete the
+            token and create a new one.
           </div>
-        )}
-        <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
-          {/* The raw token is carried only by the revealed view (and the copy
+          {copyFailed && (
+            <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+              Automatic copy failed (browser blocked the clipboard API — usually
+              because the page is served over plain HTTP on a non-localhost
+              host). The token is now visible below — select it manually and
+              copy with <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>C</kbd>.
+            </div>
+          )}
+          <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
+            {/* The raw token is carried only by the revealed view (and the copy
               action). While masked, no attribute — title, aria-* or data-* —
               names it, so a hover tooltip or an accessibility tree read
               cannot surface it. */}
-          <code
-            className="flex-1 truncate"
-            title={visible ? token.token : undefined}
-          >
-            {visible ? token.token : "•".repeat(40)}
-          </code>
-          <button
-            type="button"
-            onClick={() => setVisible((v) => !v)}
-            className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
-            title={visible ? "Hide" : "Reveal"}
-          >
-            {visible ? (
-              <EyeOff className="h-3.5 w-3.5" />
-            ) : (
-              <Eye className="h-3.5 w-3.5" />
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={copy}
-            className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
-            title="Copy to clipboard"
-          >
-            <Copy className="h-3.5 w-3.5" />
-          </button>
+            <code
+              className="flex-1 truncate"
+              title={visible ? token.token : undefined}
+            >
+              {visible ? token.token : "•".repeat(40)}
+            </code>
+            <button
+              type="button"
+              onClick={() => {
+                if (!visible) setHasToken(true);
+                setVisible((v) => !v);
+              }}
+              className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
+              title={visible ? "Hide" : "Reveal"}
+            >
+              {visible ? (
+                <EyeOff className="h-3.5 w-3.5" />
+              ) : (
+                <Eye className="h-3.5 w-3.5" />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={copy}
+              className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
+              title="Copy to clipboard"
+            >
+              <Copy className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Use as a Bearer token:{" "}
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
+              Authorization: Bearer {token.prefix}…
+            </code>
+          </p>
+          <EnrolmentQr token={token} onReveal={() => setHasToken(true)} />
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              onClick={requestClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              {copied ? "Copied — Done" : "I've copied it — Done"}
+            </button>
+          </div>
         </div>
-        <p className="text-xs text-muted-foreground">
-          Use as a Bearer token:{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-            Authorization: Bearer {token.prefix}…
-          </code>
-        </p>
-        <EnrolmentQr token={token} />
-        <div className="flex justify-end gap-2 pt-1">
-          <button
-            onClick={onClose}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
-          >
-            {copied ? "Copied — Done" : "I've copied it — Done"}
-          </button>
-        </div>
-      </div>
-    </Modal>
+      </Modal>
+      <ConfirmModal
+        open={confirmClose}
+        title="Close without copying?"
+        message="You haven't copied or revealed this token. It won't be shown again — close anyway?"
+        cancelLabel="Go back"
+        confirmLabel="Close without copying"
+        tone="destructive"
+        autoFocusCancel
+        onConfirm={onClose}
+        onClose={() => setConfirmClose(false)}
+      />
+    </>
   );
 }
 
