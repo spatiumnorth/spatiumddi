@@ -505,9 +505,11 @@ function GroupDetailView({
               >
                 More than two Kea members: HA runs between the members that have
                 an HA Peer URL, and {group.ha_sidelined_members!.join(", ")}{" "}
-                {group.ha_sidelined_members!.length > 1 ? "serve" : "serves"} no
-                scopes until it has one (Edit server → HA Peer URL), so nothing
-                hands out the same pool uncoordinated.
+                {group.ha_sidelined_members!.length > 1
+                  ? "serve no scopes until each has one"
+                  : "serves no scopes until it has one"}{" "}
+                (Edit server → HA Peer URL), so nothing hands out the same pool
+                uncoordinated.
                 {group.ha_autofill_skipped_reason ===
                   "more_than_two_kea_members" &&
                   " Not filled automatically: a third Kea member joins as an HA backup, and roles follow server order, so it could take the primary role from the existing pair."}

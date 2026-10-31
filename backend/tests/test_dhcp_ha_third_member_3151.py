@@ -201,3 +201,54 @@ async def test_firewall_opens_the_pair_to_each_other_only(db_session: AsyncSessi
     assert await dhcp_ha_firewall_inputs(db_session, a) == (8000, ["10.0.0.12/32"])
     # The sidelined member has no HA listener to open.
     assert await dhcp_ha_firewall_inputs(db_session, c) == (None, [])
+
+
+@pytest.mark.asyncio
+async def test_a_third_member_joining_leaves_the_pairs_bundles_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """The pair's ETag does not move when a URL-less third member joins, so
+    neither peer re-renders and Kea never reloads its HA hook; the joiner's
+    bundle carries nothing to serve. Then a URL on the joiner makes it an HA
+    peer and it serves the scopes again."""
+    grp = await _group(db_session, mode="load-balancing")
+    pair = [
+        await _kea(db_session, grp, "dhcp-a", "http://10.0.0.11:8000/"),
+        await _kea(db_session, grp, "dhcp-b", "http://10.0.0.12:8000/"),
+    ]
+    await _scope_with_pool(db_session, grp)
+    before = {m.name: (await build_config_bundle(db_session, m)).etag for m in pair}
+
+    third = await _kea(db_session, grp, "dhcp-c", "")
+    await db_session.refresh(grp, ["servers"])
+    after = {m.name: (await build_config_bundle(db_session, m)).etag for m in pair}
+    assert after == before
+    sidelined = await build_config_bundle(db_session, third)
+    assert sidelined.failover is None and sidelined.scopes == ()
+
+    third.ha_peer_url = "http://10.0.0.13:8000/"
+    await db_session.flush()
+    joined = await build_config_bundle(db_session, third)
+    assert joined.failover is not None
+    # Roles follow server-id order (#2963), so which one is ``backup`` depends
+    # on the ids; what matters is that all three are now in the relationship.
+    assert {p["name"] for p in joined.failover.peers} == {"dhcp-a", "dhcp-b", "dhcp-c"}
+    assert len(joined.scopes) == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_group_never_sidelines(db_session: AsyncSession) -> None:
+    """``standalone`` renders no HA (#2969), so nothing is sidelined there: a
+    three-member standalone group with mixed URLs keeps every member serving."""
+    grp = await _group(db_session, mode="standalone")
+    members = [
+        await _kea(db_session, grp, "dhcp-a", "http://10.0.0.11:8000/"),
+        await _kea(db_session, grp, "dhcp-b", "http://10.0.0.12:8000/"),
+        await _kea(db_session, grp, "dhcp-c", ""),
+    ]
+    await _scope_with_pool(db_session, grp)
+    await db_session.refresh(grp, ["servers"])
+    for m in members:
+        bundle = await build_config_bundle(db_session, m)
+        assert bundle.failover is None
+        assert len(bundle.scopes) == 1
