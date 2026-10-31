@@ -83,6 +83,7 @@ from app.services.dns.ddns import (
     resolve_effective_ddns,
     resolve_effective_ddns_for_block,
 )
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.dns.sync_check import (
     address_own_forward_zone_id,
     forward_zone_ids_in_order,
@@ -2405,16 +2406,6 @@ async def _purge_withdrawn_aliases(db: AsyncSession, ip_ids: list[uuid.UUID]) ->
         )
         .execution_options(include_deleted=True, synchronize_session=False)
     )
-
-
-async def purge_trashed_address_records(db: AsyncSession, ip_ids: list[uuid.UUID]) -> None:
-    """Drop the trashed auto records of addresses being deleted for good, so a
-    later zone restore cannot publish a record owned by nothing (#3186)."""
-    from app.services.dns.record_ops import (  # noqa: PLC0415
-        purge_trashed_address_records as _purge,
-    )
-
-    await _purge(db, ip_ids)
 
 
 def _invalidate_ip_dns_cache(rec: DNSRecord, ip: IPAddress | None) -> None:
@@ -7793,6 +7784,8 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
         .scalars()
         .all()
     )
+    # #3186 — their records a zone deleted earlier took into its batch go too.
+    await purge_trashed_address_records(db, [row.id for row in rows])
     revoked = 0
     for row in rows:
         try:

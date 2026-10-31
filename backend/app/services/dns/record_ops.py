@@ -2102,12 +2102,18 @@ async def purge_trashed_address_records(
     """Hard-delete the trashed auto-generated records bound to these addresses
     (spatiumddi#3186).
 
-    Called where an address is deleted for good (single, bulk, orphan purge),
-    after its live records were withdrawn. A record already in the trash —
-    e.g. riding the batch of a zone deleted before the address — is not being
-    served, so it is only deleted: left behind, the address's delete nulls its
-    ``ip_address_id`` (SET NULL) and the zone's restore would publish a record
-    owned by nothing. Hand-made records are untouched. Returns the row count.
+    Called wherever an address row is deleted for good, before that delete
+    flushes: the single / bulk permanent delete and the orphan purge, and the
+    DHCP lease and reservation mirrors' teardown (lease expiry, release, purge,
+    orphan sweep, subnet delete; static mirror removal). A record already in
+    the trash — e.g. riding the batch of a zone deleted before the address —
+    is not being served, so it is only deleted: left behind, the address's
+    delete nulls its ``ip_address_id`` (SET NULL) and the zone's restore would
+    publish a record owned by nothing.
+
+    Hand-made records are untouched, as in :func:`retract_address_records`:
+    an operator's record is theirs, and keeps its place with
+    ``ip_address_id`` null. Returns the row count.
     """
     ids = list(address_ids)
     total = 0
