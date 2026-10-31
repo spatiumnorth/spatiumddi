@@ -304,7 +304,7 @@ them:
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job, a regular Job named per revision (`<release>-migrate-r<revision>`), not a Helm hook |
 | `migrate.annotations` | `{}` | Annotations on the Job object (not its pod). For GitOps, see below |
-| `migrate.nodeSelector` / `.tolerations` / `.affinity` | unset (follows `api.*`) | #3207 — placement of the migrate Job's pod. Unset runs it where the api runs, with `global.controlPlaneNodeSelector` merged into the selector. `{}` / `[]` opt out of the api's values |
+| `migrate.nodeSelector` / `.tolerations` / `.affinity` | unset (follows `api.*`) | #3207 — placement of the migrate Job's pod. Unset runs it where the api runs: `api.nodeSelector`, `api.tolerations` and `api.affinity.nodeAffinity` (not the api's pod anti-affinity, which would keep the Job off the api's nodes), with `global.controlPlaneNodeSelector` merged into the selector. `{}` / `[]` opt out of the api's values |
 | `initContainers.resources` | requests `10m` / `32Mi`, limit `256Mi` memory | #3208 — resources of every `wait-for-postgres` / `wait-for-migrate` init container |
 | `postgresql.cnpg.enablePDB` | unset (auto) | #3204 — `kind: cnpg`. Unset enables the primary PodDisruptionBudget only when `instances > 1`, so a single instance can be drained; an explicit `true` / `false` wins |
 | `postgresql.affinity.nodeAffinity` | `{}` | #3205 — `kind: cnpg`: rendered into the Cluster's `spec.affinity.nodeAffinity` (prefer a node without hard-pinning it with `nodeSelector`). Standalone: `postgresql.affinity` is the pod's whole affinity |
@@ -357,9 +357,13 @@ The DNS and DHCP agent StatefulSet, Service and headless Service are named
 `dns-<flavor>-<name>` / `dhcp-<flavor>-<name>` by default, without the release
 fullname every other object carries, so two releases in one namespace collide.
 `dnsAgents.prefixWithFullname` / `dhcpAgents.prefixWithFullname` (default
-`false`) name them `<fullname>-dns-<flavor>-<name>` instead (truncated to 52
-characters; `fullnameOverride` applies). The default is expected to flip in a
-later release.
+`false`) name them `<fullname>-dns-<flavor>-<name>` instead (`fullnameOverride`
+applies). A name longer than 52 characters keeps its first 43 and gains a
+hash of the full name (`-1a2b3c4d`), so servers whose names differ only past
+the cut stay distinct. The render fails if two servers would still share a
+name, or if the release name (or `fullnameOverride`) does not start with a
+lowercase letter, which a Service name needs. The default is expected to flip
+in a later release.
 
 Do not flip it on a live install casually. A StatefulSet cannot be renamed:
 Helm deletes the old one and creates a new one with **new PVCs**

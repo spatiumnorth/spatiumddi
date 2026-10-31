@@ -52,10 +52,17 @@ spec:
       {{- end }}
       restartPolicy: OnFailure
       {{- /* #3207 — place the Job where the api runs unless told otherwise;
-             null follows the api, {} / [] opt out of it. */}}
+             null follows the api, {} / [] opt out of it. Following the api
+             takes only its NODE affinity: ``api.affinity``'s podAffinity /
+             podAntiAffinity describe the api pods' relation to each other
+             (a hard anti-affinity naming the api's labels is the usual
+             one), and copied onto the Job they would keep it off every node
+             running an api pod, which under hard anti-affinity is every
+             eligible node, while those api pods wait in wait-for-migrate
+             for it. */}}
       {{- $nodeSel := ternary .Values.api.nodeSelector .Values.migrate.nodeSelector (kindIs "invalid" .Values.migrate.nodeSelector) }}
       {{- $tols := ternary .Values.api.tolerations .Values.migrate.tolerations (kindIs "invalid" .Values.migrate.tolerations) }}
-      {{- $aff := ternary .Values.api.affinity .Values.migrate.affinity (kindIs "invalid" .Values.migrate.affinity) }}
+      {{- $aff := ternary (pick (.Values.api.affinity | default dict) "nodeAffinity") .Values.migrate.affinity (kindIs "invalid" .Values.migrate.affinity) }}
       {{- with (include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" $nodeSel) .) | trim) }}
       {{- . | nindent 6 }}
       {{- end }}

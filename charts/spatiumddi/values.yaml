@@ -703,7 +703,9 @@ migrate:
   # #3207 — placement of the Job's pod. UNSET (null) follows the api, so the
   # Job runs where the api runs and is kept off the nodes the rest of the
   # release is kept off: ``api.nodeSelector`` / ``api.tolerations`` /
-  # ``api.affinity``, with ``global.controlPlaneNodeSelector`` merged into the
+  # ``api.affinity.nodeAffinity`` (not the api's pod (anti-)affinity, which
+  # is about api pods and would keep the Job off the api's nodes), with
+  # ``global.controlPlaneNodeSelector`` merged into the
   # selector as for every control-plane workload. Set to ``{}`` / ``[]`` to
   # place the Job with no selector / toleration / affinity of its own (the
   # global selector still applies to the selector).
@@ -1166,18 +1168,20 @@ dnsAgents:
   # #3209 — name the StatefulSet / Service / headless Service
   # ``<release fullname>-dns-<flavor>-<name>`` like every other object in the
   # chart (and honour ``fullnameOverride``), so two releases in one namespace
-  # do not collide. FALSE keeps today's ``dns-<flavor>-<name>``. Changing it on
+  # do not collide (a name over 52 characters is cut to 43 plus a hash of the
+  # whole, so it stays unique). FALSE keeps today's ``dns-<flavor>-<name>``. Changing it on
   # a live install is NOT an in-place rename: the old StatefulSet is deleted
   # and a new one created, with NEW PVCs (``<claim>-<new name>-0``) and a new
   # pod name, which is the server's registered identity — the agent registers
-  # as a fresh server. Set it on a new install, or migrate (see
+  # as a fresh server. Set it on a new install (see
   # docs/deployment/KUBERNETES.md, "Naming of agent objects"). The default is
   # expected to flip in a later release.
   prefixWithFullname: false
   # #3206 — StorageClass of both volume claims (agent-state, dns-state).
   # Unset uses the cluster's default class. Per server: ``servers[].storageClass``.
   # Changing it on a live StatefulSet is refused by Kubernetes (claim templates
-  # are immutable): delete the StatefulSet with ``--cascade=orphan`` first.
+  # are immutable), and existing PVCs keep the class they were created with:
+  # it applies to claims created after it is set.
   storageClass: ""
   # Per-driver image overrides (issue #127). Each key matches a
   # ``servers[].flavor`` value; missing keys fall back to

@@ -249,7 +249,8 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 Service are named `dns-<flavor>-<name>` (DHCP: `dhcp-<flavor>-<name>`), without
 the release fullname, so two releases in one namespace collide. Set
 `dnsAgents.prefixWithFullname: true` (and `dhcpAgents.prefixWithFullname`) to
-get `<fullname>-dns-<flavor>-<name>`. It defaults to `false` because a
+get `<fullname>-dns-<flavor>-<name>` (a name over 52 characters is cut to 43
+plus a hash of the whole, so it stays unique). It defaults to `false` because a
 StatefulSet cannot be renamed: changing it on a live install deletes the old
 StatefulSet and creates a new one with **new PVCs** and a new pod name (the
 server's registered identity), so the agent registers again as a new server.
@@ -259,8 +260,9 @@ Set it at install time; the default is expected to flip in a later release.
 chart's preferred one-per-node anti-affinity, so you can *prefer* a node
 without pinning it; `dnsAgents.storageClass` / `dhcpAgents.storageClass` (and
 `servers[].storageClass`) set the class of both volume claims, which otherwise
-use the cluster's default StorageClass. Claim templates are immutable: to
-change the class of a live StatefulSet, delete it with `--cascade=orphan` first.
+use the cluster's default StorageClass. Set it before the first install: claim
+templates are immutable, so Kubernetes refuses the change on a live
+StatefulSet, and a PVC that already exists keeps the class it was created with.
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
 > `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
@@ -295,7 +297,8 @@ Alembic is idempotent, so re-running the migrate Job is always safe.
 
 **Placement (#3207).** The Job's pod follows the api: `migrate.nodeSelector`,
 `migrate.tolerations` and `migrate.affinity` default to unset, meaning
-`api.nodeSelector` / `api.tolerations` / `api.affinity`, with
+`api.nodeSelector` / `api.tolerations` / `api.affinity.nodeAffinity` (the
+api's pod anti-affinity is about api pods and is not copied), with
 `global.controlPlaneNodeSelector` merged into the selector as for every
 control-plane workload. Set one to `{}` / `[]` to give the Job none of the api's
 values. The `wait-for-postgres` / `wait-for-migrate` init containers carry

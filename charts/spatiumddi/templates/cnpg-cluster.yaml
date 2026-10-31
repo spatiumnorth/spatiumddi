@@ -85,14 +85,14 @@ spec:
   # upgrade (#1313). ``keep`` only keeps it, and the database with it,
   # through a Helm-driven delete.
 
-  # #296 Phase A — PDB on by default (set in values.yaml). Suspended
-  # during a rolling-upgrade node's maintenance window — the api-side
-  # orchestrator stamps + clears
+  # #296 Phase A — PDB on whenever there is a replica (see #3204 below).
+  # Suspended during a rolling-upgrade node's maintenance window — the
+  # api-side orchestrator stamps + clears
   # ``spec.nodeMaintenanceWindow.inProgress``. Outside the upgrade flow
   # the PDB prevents accidental simultaneous primary eviction (e.g. a
   # manual ``kubectl drain`` of two nodes at once). Sprig's ``| default``
-  # treats ``false`` as falsy and would emit ``true``, so we read the
-  # value directly and require the user to set it in values.yaml.
+  # treats ``false`` as falsy and would emit ``true``, so unset is told
+  # apart from an explicit ``false`` with ``kindIs "invalid"`` (null).
   {{- /* #3204: unset (null) means "on when there is a replica": a single
          instance has nothing to fail over to, and its PDB allows 0
          disruptions, so ``kubectl drain`` of the node could never evict it.

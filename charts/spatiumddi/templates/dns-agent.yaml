@@ -1,5 +1,7 @@
 {{- if .Values.dnsAgents.enabled }}
 {{- $root := . -}}
+{{- /* #3209 — fail on two servers rendering one object name. */ -}}
+{{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dnsAgents.image.tag | default .Chart.AppVersion -}}
 {{- $secretName := .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) -}}
 {{- if and (not .Values.dnsAgents.agentKey.existingSecret) .Values.dnsAgents.agentKey.value }}

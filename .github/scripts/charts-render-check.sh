@@ -1116,6 +1116,98 @@ else
     failures=$((failures + 1))
 fi
 
+# #3204-#3209 — the single-instance k8s placement + naming fixes. One render
+# carries every new value so kubeconform checks it (the CNPG Cluster's
+# spec.affinity.nodeAffinity included), then grep assertions on the shapes.
+UMBRELLA_PLACEMENT=(
+    --set postgresql.kind=cnpg --set postgresql.cnpg.instances=1
+    --set-json 'postgresql.affinity={"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"preference":{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["node-a"]}]}}]}}'
+    --set-json 'api.affinity={"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"pool","operator":"In","values":["cp"]}]}]}},"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":{"app.kubernetes.io/component":"api"}},"topologyKey":"kubernetes.io/hostname"}}]}}'
+    --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x
+    --set dnsAgents.prefixWithFullname=true --set dnsAgents.storageClass=slow
+    --set-json 'dnsAgents.servers=[{"name":"ns1","storageClass":"fast","affinity":{"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":50,"preference":{"matchExpressions":[{"key":"zone","operator":"In","values":["a"]}]}}]}}},{"name":"a-very-long-server-name-number-one-xx1"},{"name":"a-very-long-server-name-number-one-xx2"}]'
+    --set dhcpAgents.enabled=true --set dhcpAgents.agentKey.value=x --set dhcpAgents.prefixWithFullname=true
+    --set-json 'dhcpAgents.servers=[{"name":"d1","nodeSelector":{"pool":"edge"},"tolerations":[{"key":"edge","operator":"Exists"}]}]'
+)
+render umbrella-placement "$UMBRELLA" "${UMBRELLA_PLACEMENT[@]}"
+python3 - "$OUT/umbrella-placement.yaml" <<'PY' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+bad = []
+cl = next(d for d in docs if d["kind"] == "Cluster")
+if cl["spec"].get("enablePDB") is not False:
+    bad.append("#3204: one CNPG instance with enablePDB unset must render enablePDB: false")
+if "preferredDuringSchedulingIgnoredDuringExecution" not in (cl["spec"]["affinity"].get("nodeAffinity") or {}):
+    bad.append("#3205: postgresql.affinity.nodeAffinity missing from the Cluster's spec.affinity")
+job = next(d for d in docs if d["kind"] == "Job" and "-migrate-" in d["metadata"]["name"])
+aff = job["spec"]["template"]["spec"].get("affinity") or {}
+if "nodeAffinity" not in aff:
+    bad.append("#3207: the migrate Job did not follow api.affinity.nodeAffinity")
+if "podAntiAffinity" in aff or "podAffinity" in aff:
+    bad.append("#3207: the migrate Job copied the api's pod (anti-)affinity, which keeps it off the api's nodes")
+sts = {d["metadata"]["name"]: d for d in docs if d["kind"] == "StatefulSet"
+       and d["spec"]["template"]["metadata"]["labels"].get("app.kubernetes.io/component") in ("dns-agent", "dhcp-agent")}
+names = sorted(sts)
+if len(names) != 4:
+    bad.append(f"#3209: expected 4 distinct agent StatefulSets, got {names}")
+for n, d in sts.items():
+    if len(n) > 52:
+        bad.append(f"#3209: agent name {n} is {len(n)} > 52 characters")
+    if not n.startswith("umbrella-placement-spatiumddi-"):
+        bad.append(f"#3209: agent name {n} is not prefixed with the release fullname")
+    spec = d["spec"]["template"]["spec"]
+    if d["spec"]["serviceName"] != n + "-headless":
+        bad.append(f"#3209: {n} serviceName {d['spec']['serviceName']}")
+    if "podAntiAffinity" not in spec.get("affinity", {}):
+        bad.append(f"#3206: {n} lost the chart's one-per-node anti-affinity")
+    want = "fast" if n.endswith("-ns1") else ("slow" if "dns" in n else None)
+    for c in d["spec"]["volumeClaimTemplates"]:
+        if c["spec"].get("storageClassName") != want:
+            bad.append(f"#3206: {n} claim {c['metadata']['name']} storageClassName {c['spec'].get('storageClassName')} != {want}")
+    if n.endswith("-ns1") and "nodeAffinity" not in spec["affinity"]:
+        bad.append(f"#3206: {n} lost its own nodeAffinity")
+    if "dhcp" in n and (spec.get("nodeSelector") != {"pool": "edge"} or not spec.get("tolerations")):
+        bad.append(f"#3206: {n} did not carry its nodeSelector / tolerations")
+svcs = [d["metadata"]["name"] for d in docs if d["kind"] == "Service"]
+if len(svcs) != len(set(svcs)):
+    bad.append(f"#3209: duplicate Service names {svcs}")
+for b in bad:
+    print("   FAIL:", b, file=sys.stderr)
+if not bad:
+    print("   ok: #3204-#3209 placement / naming shapes")
+sys.exit(1 if bad else 0)
+PY
+for case in "1:false:unset" "1:true:true" "1:false:false" "3:true:unset" "3:true:true" "3:false:false"; do
+    IFS=: read -r inst want set <<<"$case"
+    args=(--set postgresql.kind=cnpg --set "postgresql.cnpg.instances=$inst")
+    [ "$set" = unset ] || args+=(--set "postgresql.cnpg.enablePDB=$set")
+    got="$(helm template pdb "$UMBRELLA" --kube-version "$K8S_VERSION" "${args[@]}" | sed -n 's/^  enablePDB: //p')"
+    if [ "$got" = "$want" ]; then
+        echo "   ok: #3204 instances=$inst enablePDB=$set renders $got"
+    else
+        echo "   FAIL: #3204 instances=$inst enablePDB=$set rendered '$got', want $want" >&2
+        failures=$((failures + 1))
+    fi
+done
+neg3209() { # label expected-message [helm args...]
+    local label="$1" msg="$2"; shift 2
+    local rel="${REL:-neg}"
+    if out="$(helm template "$rel" "$UMBRELLA" --kube-version "$K8S_VERSION" \
+            --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x "$@" 2>&1)"; then
+        echo "   FAIL: #3209 $label rendered" >&2; failures=$((failures + 1))
+    elif printf '%s' "$out" | grep -q "$msg"; then
+        echo "   ok: #3209 $label refused"
+    else
+        echo "   FAIL: #3209 $label failed for another reason:" >&2
+        printf '%s\n' "$out" | tail -3 >&2; failures=$((failures + 1))
+    fi
+}
+echo "── negative controls: agent object names (#3209)"
+neg3209 "two servers with one name" "server names must be unique" \
+    --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1"}]'
+REL=1dev neg3209 "a prefixed name starting with a digit" "must start with a lowercase letter" \
+    --set dnsAgents.prefixWithFullname=true --set-json 'dnsAgents.servers=[{"name":"ns1"}]'
+
 # #1550 — no render above sets frontend.controlPlaneVIP, so the
 # frontend's LoadBalancer shape is exercised here, together with the
 # appliance all-on render (DNS VIPs + DHCP relay VIP). --require so

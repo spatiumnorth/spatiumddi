@@ -1,5 +1,7 @@
 {{- if .Values.dhcpAgents.enabled }}
 {{- $root := . -}}
+{{- /* #3209 — fail on two servers rendering one object name. */ -}}
+{{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dhcpAgents.image.tag | default .Chart.AppVersion -}}
 {{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
 {{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}

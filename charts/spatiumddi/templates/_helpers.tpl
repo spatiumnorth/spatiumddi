@@ -235,15 +235,65 @@ Off (the default) it is ``instance`` unchanged: renaming a StatefulSet
 recreates it, and through the claim-template names its PVCs, so the new
 naming is opt-in for an existing install. On, it is prefixed with the release
 fullname like every other object in the chart (which honours
-``fullnameOverride``). Truncated to 52 characters: the longest suffix added
+``fullnameOverride``). Capped at 52 characters: the longest suffix added
 to it is ``-headless`` (9) and Kubernetes caps a Service name at 63; a
 StatefulSet's pods and ControllerRevision labels need the same headroom.
+
+A name over 52 is NOT plainly truncated: two servers that differ only past
+the cut (``...-ns1`` / ``...-ns2``), or every agent under a long
+``fullnameOverride``, would come out identical and Helm would apply one
+object over the other. It keeps the first 43 characters and appends ``-``
+plus 8 hex characters of the full name's sha256, so distinct full names stay
+distinct and the result is stable across renders. A name that fits is used
+as is.
+
+The Service must be a DNS-1035 label, which starts with a letter. The
+fullname follows the release name, and Helm accepts a release named
+``1dev``, so a prefixed name starting with anything else fails the render
+here, naming the fix, instead of at the API server on the first Service.
 */}}
 {{- define "spatiumddi.agentObjectName" -}}
 {{- if .prefix -}}
-{{- printf "%s-%s" (include "spatiumddi.fullname" .root) .instance | trunc 52 | trimSuffix "-" -}}
+{{- $full := printf "%s-%s" (include "spatiumddi.fullname" .root) .instance -}}
+{{- if not (regexMatch "^[a-z]" $full) -}}
+{{- fail (printf "agent object name %q (dnsAgents/dhcpAgents.prefixWithFullname) must start with a lowercase letter to be a valid Service name (DNS-1035); use a release name or fullnameOverride that starts with one, or leave prefixWithFullname false" $full) -}}
+{{- end -}}
+{{- if le (len $full) 52 -}}
+{{- $full -}}
+{{- else -}}
+{{- printf "%s-%s" ($full | trunc 43 | trimSuffix "-") ($full | sha256sum | trunc 8) -}}
+{{- end -}}
 {{- else -}}
 {{- .instance -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3209 — refuse two agent servers that would render the same object name.
+Helm does not: the later StatefulSet and Services silently replace the
+earlier ones, so one configured server never runs. Covers both agent kinds,
+since a fullname-prefixed DNS and DHCP name share one namespace of objects.
+Called from dns-agent.yaml and dhcp-agent.yaml; ``.`` is the chart root.
+*/}}
+{{- define "spatiumddi.agentNamesUnique" -}}
+{{- $seen := dict -}}
+{{- if .Values.dnsAgents.enabled -}}
+{{- range .Values.dnsAgents.servers -}}
+{{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dns-%s-%s" (.flavor | default "bind9") .name) "prefix" $.Values.dnsAgents.prefixWithFullname) -}}
+{{- if hasKey $seen $n -}}
+{{- fail (printf "dnsAgents server %q renders object name %q, already used by server %q; server names must be unique" .name $n (get $seen $n)) -}}
+{{- end -}}
+{{- $_ := set $seen $n .name -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.dhcpAgents.enabled -}}
+{{- range .Values.dhcpAgents.servers -}}
+{{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dhcp-%s-%s" (.flavor | default "kea") .name) "prefix" $.Values.dhcpAgents.prefixWithFullname) -}}
+{{- if hasKey $seen $n -}}
+{{- fail (printf "dhcpAgents server %q renders object name %q, already used by server %q; server names must be unique" .name $n (get $seen $n)) -}}
+{{- end -}}
+{{- $_ := set $seen $n .name -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
