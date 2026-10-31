@@ -127,6 +127,9 @@ def slot_cli(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_SLOT_VERSIONS_FILE", tmp_path / "slot-versions.json")
     monkeypatch.setattr(module, "_SLOT_IMAGE_TAGS_FILE", tmp_path / "slot-image-tags.json")
     monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    # Never read the machine's real ESP: on a CI runner /boot/efi/grub can
+    # exist and be unreadable to the test user (EACCES).
+    monkeypatch.setattr(module, "GRUBENV", tmp_path / "grubenv")
     return module
 
 
@@ -612,3 +615,14 @@ def test_firstboot_syncs_the_mirror_esp_after_committing_a_trial_boot() -> None:
     sync = code.find("/usr/local/bin/spatiumddi-esp-sync", commit)
     assert sync != -1, "the commit must be followed by an ESP sync"
     assert sync < code.index("else", commit), "only on a successful commit"
+
+
+def test_an_unreadable_grubenv_directory_reads_as_the_default(slot_cli, monkeypatch) -> None:
+    """Path.exists() raises on EACCES; the reader must answer slot_a instead."""
+
+    class _Denied:
+        def exists(self) -> bool:
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(slot_cli, "GRUBENV", _Denied())
+    assert slot_cli._read_grubenv_default() == "slot_a"

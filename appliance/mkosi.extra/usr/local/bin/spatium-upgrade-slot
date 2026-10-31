@@ -1727,7 +1727,12 @@ GRUBENV = Path("/boot/efi/grub/grubenv")
 def _read_grubenv_default() -> str:
     """Return current saved_entry from grubenv (e.g. 'slot_a'). Falls
     back to 'slot_a' if grubenv is missing or unparseable."""
-    if not GRUBENV.exists():
+    try:
+        if not GRUBENV.exists():
+            return "slot_a"
+    except OSError:
+        # EACCES on an ESP directory we cannot traverse: same answer as
+        # missing. Path.exists() only swallows ENOENT-class errors.
         return "slot_a"
     try:
         proc = subprocess.run(
