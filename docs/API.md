@@ -404,11 +404,18 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   `read`, `ipam:write`, `dns:write`, `dhcp:write`, `agent`. An empty
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
-  scopes returns `401 "Token scope insufficient for this request"`.
+  scopes returns `403 "Token scope insufficient for this request"` (the
+  credential is valid, so it is not a 401; invalid, revoked and expired tokens
+  stay 401).
   Path prefixes match on a whole segment: `dns:write` covers
   `/api/v1/dns/...` but not `/api/v1/dnsbl/...` or `/api/v1/dns-threat/...`.
   `read` permits only safe methods (`GET` / `HEAD` / `OPTIONS`) — plus
-  a JSON-RPC `POST` to the read-only MCP endpoint.
+  a JSON-RPC `POST` to the read-only MCP endpoint, plus the POST routes
+  that only read (a filter or preview body, no mutation, no outbound probe):
+  those carry the `@read_only_post` marker from `api_token_scopes.py`
+  (the `/logs/*` queries, `/tools/mac-vendor`, and the side-effect-free
+  previews / validations). The set is pinned by
+  `tests/test_token_read_only_post_3223.py`.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
   specific `subnet` or `dns_zone` instance with an
   `{action, resource_type, resource_id}` triple (issue #374). At
@@ -701,8 +708,8 @@ Common status codes across the surface:
 | Status | Meaning |
 |---|---|
 | `400 Bad Request` | Semantically invalid input (e.g. wrong current password) |
-| `401 Unauthorized` | Missing / invalid / expired credential, or insufficient token scope |
-| `403 Forbidden` | Authenticated but not permitted (RBAC denial, superadmin-only, disabled account, forced password change) |
+| `401 Unauthorized` | Missing / invalid / revoked / expired credential |
+| `403 Forbidden` | Authenticated but not permitted (RBAC denial, insufficient API-token scope, superadmin-only, disabled account, forced password change) |
 | `404 Not Found` | Resource doesn't exist **or** its feature module is disabled |
 | `409 Conflict` | Uniqueness / overlap / collision conflict, or a delete refused because rows still reference the target |
 | `413 Content Too Large` | The request body is over the API's body cap (see below) |

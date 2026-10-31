@@ -64,6 +64,7 @@ from app.models.ot import (
     OTDevice,
     OTZone,
 )
+from app.services.api_token_scopes import read_only_post
 from app.services.ot.importer import (
     MAX_IMPORT_ROWS,
     OTImportError,
@@ -1012,6 +1013,7 @@ def _rows_out(plan: list[PlannedRow]) -> list[OTDeviceImportRow]:
 
 
 @router.post("/devices/import/preview", response_model=OTDeviceImportPreviewResponse)
+@read_only_post
 async def import_preview(
     body: OTDeviceImportRequest, db: DB, user: CurrentUser
 ) -> OTDeviceImportPreviewResponse:

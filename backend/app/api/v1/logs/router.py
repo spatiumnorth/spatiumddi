@@ -38,6 +38,7 @@ from app.drivers.dns import AGENTLESS_DRIVERS as DNS_AGENTLESS
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
+from app.services.api_token_scopes import read_only_post
 from app.services.feature_modules import get_enabled_modules, require_module
 from app.services.logs.agent_logs import (
     InvalidLogFilter,
@@ -298,6 +299,7 @@ async def _resolve_server(db: DB, server_kind: str, server_id: uuid.UUID) -> tup
 
 
 @router.post("/query", response_model=LogQueryResponse, dependencies=[_WINRM_READ])
+@read_only_post
 async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     """Run a filtered ``Get-WinEvent`` against the named server and return
     matching rows.
@@ -362,6 +364,7 @@ async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     response_model=DhcpAuditResponse,
     dependencies=[_WINRM_READ, Depends(require_module("core.dhcp"))],
 )
+@read_only_post
 async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
     """Read + parse a Windows DHCP server's audit log for the given day.
 
@@ -580,6 +583,7 @@ class DNSQueryLogResponse(BaseModel):
     dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
 @honours_token_binding
+@read_only_post
 async def query_dns_queries(
     body: DNSQueryLogRequest, db: DB, current_user: CurrentUser
 ) -> DNSQueryLogResponse:
@@ -689,6 +693,7 @@ def _rows(pairs: list[tuple[str, int]]) -> list[DNSQueryAnalyticsRow]:
     response_model=DNSQueryAnalyticsResponse,
     dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
+@read_only_post
 async def query_dns_analytics(
     body: DNSQueryAnalyticsRequest, db: DB, current_user: CurrentUser
 ) -> DNSQueryAnalyticsResponse:
@@ -769,6 +774,7 @@ class DHCPActivityLogResponse(BaseModel):
     dependencies=[_AGENT_READ, Depends(require_module("core.dhcp"))],
 )
 @honours_token_binding
+@read_only_post
 async def query_dhcp_activity(
     body: DHCPActivityLogRequest, db: DB, current_user: CurrentUser
 ) -> DHCPActivityLogResponse:
