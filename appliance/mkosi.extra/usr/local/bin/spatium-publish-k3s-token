@@ -42,7 +42,9 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         tmp="$(mktemp "$SIDECAR.XXXXXX" 2>/dev/null)" || { sleep 3; continue; }
         if tr -d '\r\n' < "$TOKEN_FILE" > "$tmp" 2>/dev/null; then
             chmod 0644 "$tmp"
-            mv -f "$tmp" "$SIDECAR"
+            # -T: a directory (or a link to one) planted at the sidecar's
+            # name fails the rename instead of receiving the token.
+            mv -fT "$tmp" "$SIDECAR" || rm -f "$tmp"
         else
             rm -f "$tmp"
         fi

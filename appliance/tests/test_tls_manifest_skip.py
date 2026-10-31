@@ -369,6 +369,9 @@ def test_a_leave_starts_k3s_with_the_manifest_unskipped(tmp_path: Path) -> None:
     release_state = tmp_path / "release-state"
     aside = release_state / "manifests-joined-aside"
     aside.mkdir(parents=True)
+    # What the runner leaves there itself: writable by nobody else (the leave
+    # restores only from such a directory).
+    aside.chmod(0o755)
     for name in (MANIFEST, f"{MANIFEST}.skip", "spatium-bootstrap.yaml"):
         (aside / name).write_text("# aside\n")
     (release_state / "cluster-leave-pending").write_text(f"{LEAVE_CONFIRM}\n")

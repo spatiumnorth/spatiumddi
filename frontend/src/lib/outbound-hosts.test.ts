@@ -147,7 +147,9 @@ function hostsInUi(): Map<string, Set<string>> {
   return found;
 }
 
-describe("outbound hosts in the Web UI (#1353)", () => {
+// These walk the whole source tree: about 2.5 s alone, but past vitest's
+// default 5 s under the full parallel run (#3165).
+describe("outbound hosts in the Web UI (#1353)", { timeout: 30_000 }, () => {
   it("documents every hostname the UI names in docs/PRIVACY.md", () => {
     const privacy = readFileSync(PRIVACY, "utf-8");
     const missing = [...hostsInUi()]

@@ -37,6 +37,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -280,6 +281,32 @@ def cmd_status(_args) -> int:
 _PROGRESS_FILE = Path("/var/lib/spatiumddi/release-state/slot-upgrade.progress")
 
 
+def _write_state_file(target: Path, text: str, *, durable: bool = False) -> None:
+    """Replace a sidecar in release-state with ``text``, mode 0644.
+
+    The api and the supervisor can create names in release-state and this
+    runs as root, so a FIXED temp name (``<name>.new``) could be a symlink
+    planted there, and opening it for write would create or truncate any
+    host file. mkstemp creates a fresh name with O_EXCL, which never follows
+    a symlink, and the rename replaces whatever is at the target's name.
+    ``durable``: fsync the file before the rename (#1747)."""
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with open(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
+        os.replace(name, target)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass  # already renamed into place: nothing left to remove
+        raise
+
+
 def _write_progress(step: str, pct: int | None = None, detail: str = "") -> None:
     """Atomically write the progress sidecar. Best-effort — never let a
     progress-write failure abort the upgrade itself."""
@@ -296,12 +323,7 @@ def _write_progress(step: str, pct: int | None = None, detail: str = "") -> None
         # #1747 — temp + fsync + rename + directory fsync. Without the
         # fsyncs a power loss can leave the renamed file length-extended and
         # unwritten, i.e. NUL bytes the supervisor then ships upward.
-        tmp = _PROGRESS_FILE.with_name(_PROGRESS_FILE.name + ".new")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp.replace(_PROGRESS_FILE)
+        _write_state_file(_PROGRESS_FILE, payload, durable=True)
         dfd = os.open(_PROGRESS_FILE.parent, os.O_RDONLY)
         try:
             os.fsync(dfd)
@@ -1380,13 +1402,11 @@ def sync_slot_versions() -> dict[str, str]:
 
 
 def _write_sidecar(path: Path, data: dict[str, str]) -> None:
-    """Atomic JSON write (.new + rename); a failure warns and never raises —
+    """Atomic JSON write (fresh temp + rename); a failure warns and never raises —
     the readers degrade gracefully when a sidecar is missing."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".new")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-        tmp.replace(path)
+        _write_state_file(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
     except OSError as exc:
         print(f"WARN: couldn't write {path}: {exc}", file=sys.stderr)
 

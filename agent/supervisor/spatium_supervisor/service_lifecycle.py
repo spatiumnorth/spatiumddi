@@ -90,8 +90,8 @@ SUPERVISED_SERVICES: tuple[str, ...] = (
 log = structlog.get_logger(__name__)
 
 # Baked-chart path the build-time script writes (#183 Phase 3).
-# Sibling to /usr/lib/spatiumddi/images/*.tar.zst — same lifecycle
-# (slot-baked at build, mounted via mkosi.extra/ copy).
+# Slot-baked at build time (mkosi.extra/ copy), like the image tarballs
+# under /var/lib/rancher/k3s/agent/images/.
 _BAKED_CHART_TARBALL = Path("/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz")
 
 # HelmChart CR name + namespaces. Single chart per appliance — one

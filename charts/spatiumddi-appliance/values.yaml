@@ -5,7 +5,7 @@
 # subset to ``true`` based on the SpatiumApplianceRole spec.
 #
 # All container images come from the slot's containerd content store
-# (preloaded at firstboot from /usr/lib/spatiumddi/images/*.tar.zst).
+# (imported by k3s from /var/lib/rancher/k3s/agent/images/*.tar.zst).
 # imagePullPolicy is ``Never`` everywhere — air-gap means no registry
 # lookup at runtime, ever.
 

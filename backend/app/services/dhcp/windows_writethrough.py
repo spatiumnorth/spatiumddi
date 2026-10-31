@@ -111,6 +111,7 @@ from app.services.dhcp.cloud_writethrough import (
     push_cloud_scope_upsert,
 )
 from app.services.dhcp.normalize import norm_ip, norm_mac
+from app.services.dhcp.option_validation import canonical_domain_options
 from app.services.dhcp.windows_failover import (
     Holder,
     ScopeServing,
@@ -600,7 +601,7 @@ async def push_scope_upsert(
                 description=scope.description or "",
                 lease_seconds=int(scope.lease_time or 86400),
                 is_active=bool(scope.is_active),
-                options=scope.options or {},
+                options=canonical_domain_options(scope.options),
                 create_if_missing=create_if_missing,
             )
         except Exception as exc:  # noqa: BLE001 — surface the error

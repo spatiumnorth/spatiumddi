@@ -101,7 +101,11 @@ refusal_reason() {  # $1 = path
 quarantine() {  # $1 = path, $2 = reason
     local dest
     dest="$1.rejected.$(date +%s)"
-    if mv -f -- "$1" "$dest" 2>/dev/null; then
+    # -T: the destination name is predictable and sits in a directory the
+    # writers of triggers can create names in. Without it, a directory (or a
+    # symlink to one) planted there would receive the trigger instead of the
+    # rename failing, i.e. root would move it wherever that link points.
+    if mv -fT -- "$1" "$dest" 2>/dev/null; then
         log "REJECTED $1: $2 — moved to $dest"
     elif rm -f -- "$1" 2>/dev/null; then
         log "REJECTED $1: $2 — could not rename, removed"
