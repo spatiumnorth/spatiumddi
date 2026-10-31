@@ -48,7 +48,14 @@ PROGRESS="${SPATIUM_SLOT_PROGRESS:-/var/lib/spatiumddi/release-state/slot-upgrad
 # 0666 until GHSA-h2j9-qrg7-grfw, which let any local account forge the
 # upgrade status the Fleet UI shows.
 SIDECAR_GID="${SPATIUM_HOST_GID:-2770}"
+#
+# Only a regular file this script owns is re-moded: chgrp and chmod follow a
+# symlink, and a file at that name that is not root's (atomic_write failed,
+# and a pod put something there) could be swapped for one between the check
+# and the chmod. A root-owned file in the sticky directory cannot be.
 publish_sidecar() {  # $1 = path
+    [ -f "$1" ] && [ ! -L "$1" ] || return 0
+    [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ] || return 0
     chgrp "$SIDECAR_GID" "$1" 2>/dev/null || true
     chmod 0660 "$1" 2>/dev/null || true
 }
@@ -70,14 +77,18 @@ atomic_write() {  # $1 = target path, $2 = content (a newline is appended)
     local target="$1" tmp
     tmp=$(mktemp "${target}.XXXXXX") || return 1
     # mktemp makes 0600; keep the target's mode + group (the supervisor reads
-    # these as a different user), else the world-readable default.
-    if [ -e "$target" ]; then
+    # these as a different user), else the world-readable default. The api
+    # and the supervisor can create names in release-state and this runs as
+    # root, so the target may be a symlink planted there: its referent is not
+    # consulted, and the rename (-T) replaces whatever is at the name rather
+    # than moving the file into a directory a link points at.
+    if [ -f "$target" ] && [ ! -L "$target" ]; then
         chmod --reference="$target" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
         chgrp --reference="$target" "$tmp" 2>/dev/null || true
     else
         chmod 0644 "$tmp" 2>/dev/null || true
     fi
-    if printf '%s\n' "$2" > "$tmp" && fsync_path "$tmp" && mv -f "$tmp" "$target"; then
+    if printf '%s\n' "$2" > "$tmp" && fsync_path "$tmp" && mv -fT "$tmp" "$target"; then
         fsync_path "$(dirname "$target")"
     else
         rm -f "$tmp" 2>/dev/null || true
@@ -179,7 +190,7 @@ fail() {  # $1 = human reason
     atomic_write "${TRIGGER}.state" "failed $(date -Iseconds)"
     publish_sidecar "${TRIGGER}.state"
     write_progress "failed" "$1"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
     exit 1
 }
 
@@ -202,7 +213,7 @@ on_exit() {
             atomic_write "${TRIGGER}.state" "failed $(date -Iseconds)"
     publish_sidecar "${TRIGGER}.state"
             write_progress "failed" "runner exited (rc=$rc) without completing"
-            [ -f "$TRIGGER" ] && mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
+            [ -f "$TRIGGER" ] && mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
         fi
     fi
     # #1747 — every exit from the apply region (done, fail, abrupt) gets the
@@ -239,7 +250,7 @@ done < <(tail -n +2 "$TRIGGER")
 
 if [ -z "$IMAGE_SRC" ]; then
     echo "  ERROR: trigger file empty, aborting"
-    mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+    mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
     exit 1
 fi
 
@@ -249,7 +260,7 @@ case "$IMAGE_SRC" in
     https://*|http://*|/*)  ;;
     *)
         echo "  ERROR: image src must be http(s):// or absolute path: $IMAGE_SRC"
-        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
         exit 1
         ;;
 esac
@@ -258,7 +269,7 @@ if [ -n "$CHECKSUM_SRC" ]; then
         https://*|http://*|/*)  ;;
         *)
             echo "  ERROR: checksum src must be http(s):// or absolute path: $CHECKSUM_SRC"
-            mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+            mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
             exit 1
             ;;
     esac
@@ -267,7 +278,7 @@ if [ -n "$EXPECTED_SHA256" ]; then
     case "$EXPECTED_SHA256" in
         *[!0-9a-fA-F]*)
             echo "  ERROR: sha256 directive is not hex: $EXPECTED_SHA256"
-            mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+            mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
             exit 1
             ;;
     esac
@@ -288,7 +299,7 @@ if [ -n "$INSECURE" ] && [ -z "$EXPECTED_SHA256" ]; then
     echo "  ERROR: insecure-tls requires an out-of-band 'sha256=<hex>'"
     echo "         directive — a 'checksum=' sidecar over the same"
     echo "         unverified channel provides no real protection."
-    mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+    mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
     exit 1
 fi
 
@@ -333,7 +344,7 @@ if [ "$apply_rc" -eq 0 ]; then
         # Parity with every other terminal mv: never let a rename race
         # (e.g. supervisor already reaped the trigger) abort under set -e
         # after the correct terminal state is already on disk (#421).
-        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)" 2>/dev/null || true
+        mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)" 2>/dev/null || true
     else
         fail "set-next-boot failed (image is written but next-boot not armed)"
     fi
