@@ -176,7 +176,9 @@ def test_a_stop_while_waiting_for_a_slot_switch_never_reboots(tmp_path: Path) ->
     _wait_for(lambda: (tmp_path / "show.log").exists())
     started = time.monotonic()
     proc.terminate()
-    assert proc.wait(20) == 1
+    # Non-zero, not exactly 1: #3162 makes a cancel end by the signal it was
+    # stopped with. Either way the caller reads "no reboot".
+    assert proc.wait(20) != 0
     assert time.monotonic() - started < 10
     assert "systemctl reboot" not in _calls(log)
 
@@ -522,7 +524,9 @@ def test_a_stop_during_the_grace_never_reboots(tmp_path: Path) -> None:
     time.sleep(0.3)
     started = time.monotonic()
     proc.terminate()
-    assert proc.wait(20) == 1
+    # Non-zero, not exactly 1: #3162 makes a cancel end by the signal it was
+    # stopped with. Either way the caller reads "no reboot".
+    assert proc.wait(20) != 0
     assert time.monotonic() - started < 10
     assert "systemctl reboot" not in _calls(log)
     assert not (tmp_path / "marker").exists()

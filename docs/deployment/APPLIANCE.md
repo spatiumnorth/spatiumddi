@@ -3624,9 +3624,15 @@ The installer also places the tarballs on root_A's own filesystem
 (under the `/var` mountpoint, so they stay hidden at runtime), which is
 what lets a rollback to a node's original slot restore them; an install
 that cannot fit them fails rather than leave a partial set. Nodes
-installed before that change carry none on root_A. The copy cannot help
-a node that falls back on its own after a failed trial boot; recovery by
-hand for those is in
+installed before that change carry none on root_A. Nothing is copied
+when GRUB falls back on its own after a failed trial boot, so the slot
+it falls back to runs with the *other* slot's tarballs in that
+directory (an upgrade's trial leaves the new slot's set, a "boot this
+slot next" the old slot's). That slot's pods keep running, but its
+images are no longer pinned and a later cluster join on it rebuilds the
+store without them; the next upgrade puts a matching set back. A tarball
+only the newer slot ships also stays in the directory after a switch;
+it is imported but harmless. Recovery by hand is in
 [Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback).
 Across a
 Kubernetes *minor* the revert is not a rollback at all, and the

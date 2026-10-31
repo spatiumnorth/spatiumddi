@@ -4661,6 +4661,7 @@ EOF
                 done
               }
 
+        echo "XXX"; echo "60"; echo "Keeping the container images on the first slot..."; echo "XXX"
         _keep_images_in_root_slot || exit 1
 
         echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"

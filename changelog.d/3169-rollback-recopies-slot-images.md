@@ -6,8 +6,9 @@
   upgraded to. A rollback, a Fleet "set default" to the other slot, or a
   "boot this slot next" now copies the target slot's own tarballs into that
   directory first, stamped with the current time so k3s re-imports them (it
-  skips a same-size file with an older timestamp). The images are in
-  containerd before the reboot, so the rolled-back slot's pods no longer come
+  skips a same-size file with an older timestamp). The running k3s imports
+  them straight away, and the target slot's k3s imports any it had not
+  finished when the node rebooted, so the rolled-back slot's pods no longer come
   up `ErrImageNeverPull` on a node whose image store was wiped by a cluster
   join, promote or demote, or trimmed by image garbage collection. A reboot
   requested while that copy runs (about 1 GB) waits for it, up to 15 minutes,

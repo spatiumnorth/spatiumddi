@@ -6088,8 +6088,13 @@ def do_slot_rollback(console: Console, state: "DashboardState", saved) -> None:
         return
     # #3169 — set-next-boot to the other slot first re-copies that slot's
     # baked image tarballs (~1 GB+) into k3s's images dir; 30 s killed it
-    # mid-copy, before grub-reboot ever ran.
-    _run_recovery_cmd(console, saved, "Slot rollback", cmd, timeout=900)
+    # mid-copy, before grub-reboot ever ran. The output is only shown once
+    # the command ends, so the title says why the screen sits still.
+    _run_recovery_cmd(
+        console, saved,
+        "Slot rollback (copying the slot's container images can take a few minutes)",
+        cmd, timeout=900,
+    )
     state.flash("Slot change queued — press F5 to reboot to apply", ttl=8)
 
 
