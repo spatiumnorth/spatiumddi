@@ -4360,6 +4360,8 @@ function ZoneDetailView({
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
     // #2529 — the keyboard path must honour the same grant as the button.
+    // The ? sheet lists the key under ADD_DNS_RECORD.requires, which must
+    // name this same grant (#3167).
     if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
