@@ -16,4 +16,6 @@
   filesystem shrunk into the array with `resize2fs`, then checked with
   `e2fsck` before the bootloader is pointed at it. `rollback` now also
   copies the boot config to the second disk's ESP, as the other slot
-  commands already did. Single-disk appliances are unchanged.
+  commands already did, and so does firstboot when it commits a trial
+  boot, so the second disk no longer boots the slot just upgraded away
+  from if the first disk fails. Single-disk appliances are unchanged.

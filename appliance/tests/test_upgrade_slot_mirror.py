@@ -268,7 +268,7 @@ def test_a_member_kicked_out_of_a_degraded_array_does_not_hide_the_slot(
     slot_cli, host
 ) -> None:
     host(_without_array(MIRROR, "vdb5"), ROOT_A_FS)
-    active, inactive = slot_cli.detect_active_inactive()
+    _active, inactive = slot_cli.detect_active_inactive()
     assert inactive["device"] == "/dev/md127"
     assert inactive["members"] == "/dev/vda5"
 
@@ -508,3 +508,17 @@ def test_firstboot_resolves_both_slot_readers_through_the_helper() -> None:
     assert "lsblk -no PARTLABEL" not in code
     assert code.count('root_dev_partlabel "$root_dev"') == 2
 
+
+def test_firstboot_syncs_the_mirror_esp_after_committing_a_trial_boot() -> None:
+    """Found on a real mirrored VM: firstboot's commit wrote saved_entry to
+    the primary ESP only, and `spatiumddi-esp-sync --check` then reported
+    grub/grubenv drifted — losing the primary disk would boot the slot just
+    upgraded away from."""
+    src = (BIN / "spatiumddi-firstboot").read_text(encoding="utf-8")
+    m = re.search(r"^commit_slot_if_healthy\(\) \{$.*?^\}$", src, re.MULTILINE | re.DOTALL)
+    assert m, "commit_slot_if_healthy() not found"
+    code = "\n".join(ln.split("#", 1)[0] for ln in m.group(0).splitlines())
+    commit = code.index("grub-set-default")
+    sync = code.find("/usr/local/bin/spatiumddi-esp-sync", commit)
+    assert sync != -1, "the commit must be followed by an ESP sync"
+    assert sync < code.index("else", commit), "only on a successful commit"

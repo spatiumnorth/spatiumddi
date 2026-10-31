@@ -2486,7 +2486,7 @@ leaves the survivor booting the **old kernel from a stale menu** — a
 mirror that protected the data and lost the appliance. So
 `spatiumddi-esp-sync` is called from `spatium-install`,
 `spatium-upgrade-slot apply`, `set-next-boot`, `set-default` and
-`rollback`, and is
+`rollback`, and from firstboot when it commits a trial boot, and is
 a no-op on a single-disk box so every caller can invoke it
 unconditionally. `spatiumddi-esp-sync --check` reports drift without
 changing anything.

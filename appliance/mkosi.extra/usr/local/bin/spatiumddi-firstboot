@@ -2328,6 +2328,14 @@ commit_slot_if_healthy() {
     echo "  k3s reports Ready — committing $current_slot as the new default."
     if grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
         >> "$LOG" 2>&1; then
+        # #3172 — grubenv lives on the ESP, which a mirrored install (#999)
+        # does not mirror: without this the second disk's ESP keeps the OLD
+        # default, and losing the primary disk boots the slot just upgraded
+        # away from. A no-op on a single disk; never fatal, the commit stands.
+        if [ -x /usr/local/bin/spatiumddi-esp-sync ]; then
+            /usr/local/bin/spatiumddi-esp-sync >> "$LOG" 2>&1 \
+                || echo "  WARN: spatiumddi-esp-sync failed — the mirror's ESP still names the old default" >> "$LOG"
+        fi
         # #441 — the upgrade is now durable. Kick off a version-aware image
         # prune to drop releases OLDER than the two slots (keeps BOTH slots
         # bootable for rollback + the running set). Fired async via systemd
