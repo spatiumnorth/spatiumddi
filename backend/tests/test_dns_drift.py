@@ -23,6 +23,14 @@ class _FakeDriver:
         return list(self._records)
 
 
+def _settle(zone: DNSZone) -> None:
+    """Date the zone's last change past ``SERIAL_GRACE`` (#3198), so a missing
+    record reads as the server's fault rather than a change in flight."""
+    from datetime import UTC, datetime, timedelta
+
+    zone.modified_at = datetime.now(UTC) - timedelta(seconds=600)
+
+
 async def _group_server_zone(
     db: AsyncSession, *, server_name: str, zone_name: str
 ) -> tuple[DNSServerGroup, DNSServer, DNSZone]:
@@ -65,6 +73,7 @@ async def test_zone_drift_categorises(db_session: AsyncSession, monkeypatch: Any
             DNSRecord(zone_id=zone.id, name="mail", record_type="A", value="10.0.0.2", ttl=300),
         ]
     )
+    _settle(zone)
     await db_session.commit()
 
     # Live server: www in sync, a rogue record added directly on the host,
@@ -287,6 +296,7 @@ async def test_zone_drift_reports_mx_priority_only_difference(
             priority=10,
         )
     )
+    _settle(zone)
     await db_session.commit()
 
     # Same name, type and target on the wire — only the preference changed.
@@ -541,7 +551,7 @@ async def test_serial_below_target_is_behind_even_with_every_record_present(
     assert "below the zone's 5" in (s.reason or "")
 
 
-async def test_serial_below_target_within_the_grace_window_is_not_flagged(
+async def test_serial_below_target_within_the_grace_window_is_syncing_not_behind(
     db_session: AsyncSession, monkeypatch: Any
 ) -> None:
     group, server, zone = await _group_server_zone(
@@ -551,7 +561,7 @@ async def test_serial_below_target_within_the_grace_window_is_not_flagged(
     await _with_state(db_session, server, zone, current=4, target=5, age_s=5)
     live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
     s = await _one(db_session, group, zone, live, monkeypatch)
-    assert s.status == "ok"
+    assert s.status == "syncing"
 
 
 async def test_complete_and_at_target_is_ok(db_session: AsyncSession, monkeypatch: Any) -> None:
@@ -564,6 +574,83 @@ async def test_complete_and_at_target_is_ok(db_session: AsyncSession, monkeypatc
     s = await _one(db_session, group, zone, live, monkeypatch)
     assert s.status == "ok"
     assert s.reason is None
+
+
+async def test_serial_ahead_of_target_is_not_behind(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """An inline-signed BIND9 zone serves the signed copy's serial, which
+    signing moves past ours on its own (#2835): ahead is not behind."""
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="signed.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=2026103103, target=2026103101)
+    live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
+    s = await _one(db_session, group, zone, live, monkeypatch)
+    assert s.status == "ok"
+    assert s.reason is None
+
+
+async def test_serial_wrapped_below_target_is_behind(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """RFC 1982: 4294967295 is BEFORE 5 once the serial wrapped."""
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="wrap.example.com."
+    )
+    await _with_state(db_session, server, zone, current=2**32 - 1, target=5)
+    s = await _one(db_session, group, zone, [], monkeypatch)
+    assert s.status == "behind"
+
+
+async def test_record_missing_while_the_change_is_in_flight_is_syncing(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """A record saved a moment ago, on a server that has not reached the serial
+    carrying it yet, is a change on its way — not a server that is behind."""
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="inflight.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=4, target=5, age_s=5)
+    s = await _one(db_session, group, zone, [], monkeypatch)
+    assert s.status == "syncing"
+    assert "has not caught up" in (s.reason or "")
+
+
+async def test_record_missing_at_the_target_serial_is_behind_at_once(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """A server that reports the serial carrying the change and still lacks
+    the record applied it without it: no grace."""
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="applied.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=5, target=5, age_s=5)
+    s = await _one(db_session, group, zone, [], monkeypatch)
+    assert s.status == "behind"
+
+
+async def test_missing_view_scoped_record_is_not_behind(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """An unviewed zone's view-scoped record is served to its view only, so a
+    transfer may not return it: that is no evidence the server is behind."""
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="scoped.example.com."
+    )
+    view = DNSView(group_id=group.id, name="internal")
+    db_session.add(view)
+    await db_session.flush()
+    db_session.add(
+        DNSRecord(zone_id=zone.id, name="int", record_type="A", value="10.0.0.7", view_id=view.id)
+    )
+    await _with_state(db_session, server, zone, current=5, target=5)
+    s = await _one(db_session, group, zone, [], monkeypatch)
+    assert s.status == "drift"
+    assert "DNS views" in (s.reason or "")
 
 
 async def test_extra_records_only_is_drift_not_ok(

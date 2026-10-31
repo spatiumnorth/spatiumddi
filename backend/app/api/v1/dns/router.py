@@ -6077,10 +6077,11 @@ class ServerDriftEntry(BaseModel):
     server_id: str
     server_name: str
     driver: str
-    # "ok" | "behind" | "drift" | "error" | "unsupported" — see ServerDrift.
-    status: Literal["ok", "behind", "drift", "error", "unsupported"]
+    # "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported" — see
+    # ServerDrift.
+    status: Literal["ok", "syncing", "behind", "drift", "error", "unsupported"]
     error: str | None = None
-    # Why a transferred server is "behind" / "drift" (#3198).
+    # Why a transferred server is "syncing" / "behind" / "drift" (#3198).
     reason: str | None = None
     current_serial: int | None = None
     target_serial: int = 0

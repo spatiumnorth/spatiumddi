@@ -97,4 +97,44 @@ describe("DriftView server status", () => {
     expect(await screen.findByText("Unknown")).toBeTruthy();
     expect(screen.queryByText("In sync")).toBeNull();
   });
+
+  it("says Syncing, not Behind or In sync, for a change still in flight", async () => {
+    show(
+      server({
+        status: "syncing",
+        reason:
+          "the zone changed 5s ago and this server has not caught up yet; re-run the report in a minute",
+        current_serial: 2026103103,
+        drift_count: 1,
+        missing_on_server: [
+          { name: "a", record_type: "A", value: "10.0.0.1", ttl: 300 },
+        ],
+      }),
+    );
+    expect(await screen.findByText("Syncing")).toBeTruthy();
+    expect(screen.queryByText("Behind")).toBeNull();
+    expect(screen.queryByText("In sync")).toBeNull();
+    expect(screen.queryByText(/match the database/)).toBeNull();
+    expect(
+      screen.getByText(/1 server still applying a recent change/),
+    ).toBeTruthy();
+    expect(screen.getByText(/has not caught up yet/)).toBeTruthy();
+  });
+
+  it("shows the reason for drift rather than claiming everything is served", async () => {
+    show(
+      server({
+        status: "drift",
+        reason:
+          "1 saved record not returned, which DNS views can explain (see the report's warnings)",
+        drift_count: 1,
+        missing_on_server: [
+          { name: "a", record_type: "A", value: "10.0.0.1", ttl: 300 },
+        ],
+      }),
+    );
+    expect(await screen.findByText(/1 drifted/)).toBeTruthy();
+    expect(screen.getByText(/DNS views can explain/)).toBeTruthy();
+    expect(screen.queryByText(/Everything saved is being served/)).toBeNull();
+  });
 });

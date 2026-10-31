@@ -49,6 +49,7 @@ const ROW_CAP = 50;
 function isTransferred(server: ZoneDriftServer) {
   return (
     server.status === "ok" ||
+    server.status === "syncing" ||
     server.status === "behind" ||
     server.status === "drift"
   );
@@ -72,6 +73,12 @@ function statusChip(server: ZoneDriftServer) {
       cls: "bg-rose-500/15 text-rose-600 dark:text-rose-400",
       icon: AlertTriangle,
       label: "Behind",
+    };
+  if (server.status === "syncing")
+    return {
+      cls: "bg-sky-500/15 text-sky-600 dark:text-sky-400",
+      icon: RefreshCw,
+      label: "Syncing",
     };
   if (server.status === "drift" || server.drift_count > 0)
     return {
@@ -226,7 +233,7 @@ function ServerCard({ server }: { server: ZoneDriftServer }) {
                 ? "This driver can't pull live records, so drift can't be computed for it."
                 : "The zone could not be pulled from this server. Check that it's reachable and that AXFR from the control plane is permitted.")}
           </p>
-        ) : server.status === "ok" ? (
+        ) : server.status === "ok" && server.drift_count === 0 ? (
           <p className="text-xs text-muted-foreground">
             Every record in SpatiumDDI is being served, nothing extra is present
             on the host, and the server is at the zone's serial.
@@ -240,11 +247,17 @@ function ServerCard({ server }: { server: ZoneDriftServer }) {
                 database, not merely different — check its config apply status.
               </p>
             )}
+            {server.status === "syncing" && (
+              <p className="text-xs text-sky-600 dark:text-sky-400">
+                This server is still applying a recent change
+                {server.reason ? `: ${server.reason}` : ""}.
+              </p>
+            )}
             {server.status === "drift" && (
               <p className="text-xs text-amber-600 dark:text-amber-400">
-                Everything saved is being served, but the host also serves
-                records SpatiumDDI does not hold — typically a manual change on
-                the host.
+                {server.reason
+                  ? `The server is not behind, but the records differ: ${server.reason}.`
+                  : "The server is not behind, but the host serves records SpatiumDDI does not hold — typically a manual change on the host."}
               </p>
             )}
             {server.extra_on_server.length > 0 && (
@@ -282,7 +295,11 @@ export function DriftView({
 
   const servers = data?.servers ?? [];
   const comparable = servers.filter(isTransferred);
-  const drifted = comparable.filter((s) => s.status !== "ok");
+  // A server still applying a fresh change has not drifted.
+  const drifted = comparable.filter(
+    (s) => s.status !== "ok" && s.status !== "syncing",
+  );
+  const syncing = comparable.filter((s) => s.status === "syncing");
   const failed = servers.filter((s) => s.status === "error");
 
   return (
@@ -345,13 +362,20 @@ export function DriftView({
                 {drifted.length} of {comparable.length} comparable server
                 {comparable.length === 1 ? "" : "s"} drifted
               </span>
-            ) : comparable.length > 0 ? (
+            ) : comparable.length > 0 && syncing.length === 0 ? (
               <span className="inline-flex items-center gap-1.5 rounded bg-emerald-500/15 px-2 py-1 font-medium text-emerald-600 dark:text-emerald-400">
                 <CheckCircle2 className="h-3.5 w-3.5" />
                 All {comparable.length} comparable server
                 {comparable.length === 1 ? "" : "s"} match the database
               </span>
             ) : null}
+            {syncing.length > 0 && (
+              <span className="inline-flex items-center gap-1.5 rounded bg-sky-500/15 px-2 py-1 font-medium text-sky-600 dark:text-sky-400">
+                <RefreshCw className="h-3.5 w-3.5" />
+                {syncing.length} server{syncing.length === 1 ? "" : "s"} still
+                applying a recent change
+              </span>
+            )}
             {failed.length > 0 && (
               <span className="inline-flex items-center gap-1.5 rounded bg-rose-500/15 px-2 py-1 font-medium text-rose-600 dark:text-rose-400">
                 <AlertTriangle className="h-3.5 w-3.5" />
