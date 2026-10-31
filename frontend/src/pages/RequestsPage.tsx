@@ -242,7 +242,11 @@ function ResourcePicker({
   }
 
   return (
-    <div className="relative">
+    <div
+      className="relative"
+      // An Esc on an option reached with Tab is the list's too (#3157).
+      onKeyDown={(e) => closePopupOnEscape(e, open, () => setOpen(false))}
+    >
       <input
         className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
         placeholder="Type to search…"
