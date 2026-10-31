@@ -1,0 +1,3 @@
+### Fixed
+
+- **The first admin password change on a fresh Kubernetes or Compose install is held to the shipped password policy (#3203).** Before the `platform_settings` row existed, the Change Password page showed, and the server enforced, only "at least 8 characters" instead of the shipped 12 characters with uppercase, lowercase and a digit. A missing row now falls back to the column defaults, read from the model so the two cannot drift. The same fallback applies to the account-lockout policy and the idle-session timeout, which also differed from the defaults the row gets once it exists (no idle timeout instead of 60 minutes).

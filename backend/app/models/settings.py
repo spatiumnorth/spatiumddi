@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -1205,3 +1206,17 @@ class BrandingAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # instead of sitting behind a stale browser cache.
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+def platform_setting_default(name: str) -> Any:
+    """The shipped default of one ``PlatformSettings`` column.
+
+    The singleton row is created lazily, so on a fresh install the first
+    requests (the forced first-login password change among them) run with no
+    row at all. A fallback for "no row" must therefore be the column default,
+    and reading it from the mapped column keeps the two from drifting (#3203).
+    """
+    default = PlatformSettings.__table__.c[name].default
+    if default is None or not default.is_scalar:
+        raise LookupError(f"PlatformSettings.{name} has no scalar default")
+    return default.arg
