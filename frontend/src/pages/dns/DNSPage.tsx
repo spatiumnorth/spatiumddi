@@ -130,6 +130,7 @@ import {
   type DNSGroupSyncResult,
   type ResolverPreset,
 } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   DNS_TTL_MAX,
@@ -7451,16 +7452,17 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   });
   // Certificate picker for the DoT/DoH listeners (issue #50). Shares the
   // appliance cert store with the web UI cert + the ACME client, so the
-  // operator issues once and points both at it. Non-admins get a 403 here;
-  // the select just falls back to "— none —" rather than erroring the page.
-  const { data: certs } = useQuery({
+  // operator issues once and points both at it. Reading it takes ``read`` on
+  // ``certificate_store`` (#3067); a 403 is said under the picker rather than
+  // shown as an empty store.
+  const { data: certs, error: certsError } = useQuery({
     queryKey: ["appliance-tls-certs"],
     queryFn: () => applianceTlsApi.list(),
     retry: false,
   });
-  // #3045 — where that store is managed. Web UI Certificate is an entry in
-  // Appliance → Fleet's side list, and Fleet shows it only on an
-  // appliance-hosted control plane; Docker / Kubernetes reach it by API.
+  // #3045 — where that store is managed: Appliance → Fleet, where the entry is
+  // "Web UI Certificate" on an appliance and "TLS certificates" on Docker /
+  // Kubernetes (#3061 made the store reachable on every install type).
   const { data: versionInfo } = useQuery({
     queryKey: ["version"],
     queryFn: versionApi.get,
@@ -8291,28 +8293,28 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             ))}
           </select>
         </Field>
+        {isRefused(certsError) && (
+          <p className="text-xs text-muted-foreground">
+            You don't have permission to see the TLS certificate store, so the
+            certificates in it are not listed here. Seeing them takes read on
+            the <code>certificate_store</code> permission (the built-in DNS
+            Editor role has it); ask an administrator.
+          </p>
+        )}
         <p className="text-xs text-muted-foreground">
-          {applianceMode ? (
-            <>
-              Managed under{" "}
-              <Link to="/appliance?tab=tls" className="underline">
-                Appliance → Fleet → Web UI Certificate
-              </Link>{" "}
-              — upload one, or issue it from Let's Encrypt with the built-in
-              ACME client.
-            </>
-          ) : (
-            <>
-              This control plane runs on Docker or Kubernetes, which has no
-              certificate page: upload one with{" "}
-              <code>POST /api/v1/appliance/tls/upload</code>, or issue it from
-              Let's Encrypt with <code>POST /api/v1/appliance/acme/issue</code>,
-              and it is listed here.
-            </>
-          )}{" "}
-          Renewals are picked up automatically. A listener with no usable
-          certificate is skipped and the server stays Do53-only rather than
-          failing to start.
+          Managed under{" "}
+          <Link
+            to="/appliance?tab=tls"
+            className="text-primary hover:underline"
+          >
+            {applianceMode
+              ? "Appliance → Fleet → Web UI Certificate"
+              : "Appliance → Fleet → TLS certificates"}
+          </Link>{" "}
+          — upload one, or issue it from Let's Encrypt with the built-in ACME
+          client. Renewals are picked up automatically. A listener with no
+          usable certificate is skipped and the server stays Do53-only rather
+          than failing to start.
         </p>
 
         <div className="flex items-center justify-between border-t pt-3">

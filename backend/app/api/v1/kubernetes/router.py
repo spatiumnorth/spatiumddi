@@ -32,6 +32,7 @@ from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.celery_dispatch import dispatch
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_credential_problem, header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
@@ -316,12 +317,14 @@ async def _probe_cluster(
         return TestConnectionResponse(
             ok=False, message=f"HTTP {exc.response.status_code} from apiserver"
         )
-    except httpx.ConnectError as exc:
-        return TestConnectionResponse(ok=False, message=f"Could not reach apiserver: {exc}")
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        return TestConnectionResponse(
+            ok=False, message=f"Could not reach apiserver: {describe_exc(exc)}"
+        )
     except ssl.SSLError as exc:
         return TestConnectionResponse(ok=False, message=f"TLS error: {exc}")
     except Exception as exc:  # noqa: BLE001 — surface anything else verbatim
-        return TestConnectionResponse(ok=False, message=str(exc))
+        return TestConnectionResponse(ok=False, message=describe_exc(exc))
     finally:
         if ca_file is not None:
             tempfile.TemporaryFile().close()
@@ -430,7 +433,7 @@ async def _detect_cidrs(
                             "manage pod IPs out-of-band. Enter the pod CIDR manually."
                         )
             except httpx.HTTPError as exc:
-                messages.append(f"Pod CIDR probe failed: {exc}")
+                messages.append(f"Pod CIDR probe failed: {describe_exc(exc)}")
 
             # ── Service CIDR from ServiceCIDR resource ────────────────
             sc_paths = [
@@ -443,7 +446,7 @@ async def _detect_cidrs(
                 try:
                     resp = await client.get(path, params={"limit": "50"})
                 except httpx.HTTPError as exc:
-                    messages.append(f"Service CIDR probe ({version}) failed: {exc}")
+                    messages.append(f"Service CIDR probe ({version}) failed: {describe_exc(exc)}")
                     continue
                 if resp.status_code == 404:
                     continue
@@ -477,11 +480,11 @@ async def _detect_cidrs(
                     "enter the service CIDR manually."
                 )
 
-    except httpx.ConnectError as exc:
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
         return DetectCIDRsResponse(
             pod_cidr=None,
             service_cidr=None,
-            messages=[f"Could not reach apiserver: {exc}"],
+            messages=[f"Could not reach apiserver: {describe_exc(exc)}"],
         )
     except ssl.SSLError as exc:
         return DetectCIDRsResponse(
@@ -492,7 +495,7 @@ async def _detect_cidrs(
     except Exception as exc:  # noqa: BLE001 — honour "never raises" (#1913)
         # e.g. httpx refusing to build the client from a header value it
         # cannot encode; keep whatever was detected before the failure.
-        messages.append(f"Detection failed: {exc}")
+        messages.append(f"Detection failed: {describe_exc(exc)}")
 
     return DetectCIDRsResponse(
         pod_cidr=pod_cidr,
