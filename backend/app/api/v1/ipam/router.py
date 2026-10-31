@@ -83,6 +83,7 @@ from app.services.dns.ddns import (
     resolve_effective_ddns,
     resolve_effective_ddns_for_block,
 )
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.dns.sync_check import (
     address_own_forward_zone_id,
     forward_zone_ids_in_order,
@@ -7783,6 +7784,8 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
         .scalars()
         .all()
     )
+    # #3186 — their records a zone deleted earlier took into its batch go too.
+    await purge_trashed_address_records(db, [row.id for row in rows])
     revoked = 0
     for row in rows:
         try:
@@ -10880,6 +10883,7 @@ async def delete_address(
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
         await _purge_withdrawn_aliases(db, [ip.id])
+        await purge_trashed_address_records(db, [ip.id])
         db.add(
             _audit(
                 current_user,
@@ -10975,6 +10979,7 @@ async def purge_orphans(
 
     # The aliases these orphans withdrew go with them (#2604).
     await _purge_withdrawn_aliases(db, [ip.id for ip in rows])
+    await purge_trashed_address_records(db, [ip.id for ip in rows])
     for ip in rows:
         # Best-effort DNS teardown (the FK would null it, but be explicit).
         try:
@@ -12494,6 +12499,7 @@ async def bulk_delete_addresses(
     if body.permanent:
         # Aliases an orphan among them withdrew go with it (#2604).
         await _purge_withdrawn_aliases(db, [ip.id for ip in to_delete])
+        await purge_trashed_address_records(db, [ip.id for ip in to_delete])
     for ip in to_delete:
         if not body.permanent:
             # Withdrawn, not deleted, so the row's Restore brings them back (#2604).

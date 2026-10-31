@@ -2096,6 +2096,41 @@ async def _queue_record_deletes(
     return wake, len(by_zone)
 
 
+async def purge_trashed_address_records(
+    db: AsyncSession, address_ids: Collection[uuid.UUID]
+) -> int:
+    """Hard-delete the trashed auto-generated records bound to these addresses
+    (spatiumddi#3186).
+
+    Called wherever an address row is deleted for good, before that delete
+    flushes: the single / bulk permanent delete and the orphan purge, and the
+    DHCP lease and reservation mirrors' teardown (lease expiry, release, purge,
+    orphan sweep, subnet delete; static mirror removal). A record already in
+    the trash — e.g. riding the batch of a zone deleted before the address —
+    is not being served, so it is only deleted: left behind, the address's
+    delete nulls its ``ip_address_id`` (SET NULL) and the zone's restore would
+    publish a record owned by nothing.
+
+    Hand-made records are untouched, as in :func:`retract_address_records`:
+    an operator's record is theirs, and keeps its place with
+    ``ip_address_id`` null. Returns the row count.
+    """
+    ids = list(address_ids)
+    total = 0
+    for start in range(0, len(ids), _RETRACT_CHUNK):
+        res = await db.execute(
+            sa_delete(DNSRecord)
+            .where(
+                DNSRecord.deleted_at.is_not(None),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_address_id.in_(ids[start : start + _RETRACT_CHUNK]),
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+        total += int(getattr(res, "rowcount", 0) or 0)
+    return total
+
+
 async def retract_address_records(
     db: AsyncSession, subnet_ids: Collection[uuid.UUID]
 ) -> tuple[int, set[uuid.UUID]]:
