@@ -50,6 +50,23 @@
 
 set -euo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/syslog-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/syslog-config-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/syslog-status
@@ -95,11 +112,11 @@ restart_and_status() {
     fi
     sleep 1
     if systemctl is-active --quiet rsyslog.service; then
-        echo "forwarding" > "$STATUS_SIDECAR"
+        echo "forwarding" | state_write "$STATUS_SIDECAR"
         echo "  ✓ rsyslog active — status: forwarding"
         return 0
     fi
-    echo "unreachable" > "$STATUS_SIDECAR"
+    echo "unreachable" | state_write "$STATUS_SIDECAR"
     echo "  ✗ rsyslog not active after restart — status: unreachable"
     return 1
 }
@@ -119,9 +136,9 @@ case "$MARKER" in
     enabled)
         if ! command -v rsyslogd >/dev/null 2>&1; then
             echo "  ✗ rsyslogd binary not found — is rsyslog installed?"
-            echo "unreachable" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "unreachable" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
 
@@ -159,9 +176,9 @@ print("staged", len(data), "CA file(s)")
 PYEOF
             then
                 echo "  ✗ failed to stage CA PEMs from trigger blob"
-                echo "unreachable" > "$STATUS_SIDECAR"
-                echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-                mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+                echo "unreachable" | state_write "$STATUS_SIDECAR"
+                echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+                mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
                 exit 1
             fi
         fi
@@ -175,9 +192,9 @@ PYEOF
         if ! rsyslogd -N1 -f "$TMP_BODY" >/tmp/spatium-rsyslog-validate.log 2>&1; then
             echo "  ✗ rsyslogd -N1 failed for staged config:"
             sed 's/^/      /' /tmp/spatium-rsyslog-validate.log
-            echo "unreachable" > "$STATUS_SIDECAR"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "unreachable" | state_write "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         echo "  ✓ rsyslogd -N1 passed"
@@ -188,12 +205,12 @@ PYEOF
         install -o root -g root -m 0644 "$TMP_BODY" "$ETC_CONF"
 
         if restart_and_status; then
-            echo "$HASH" > "$HASH_SIDECAR"
-            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+            echo "$HASH" | state_write "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         else
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         ;;
@@ -203,16 +220,16 @@ PYEOF
         rm -f "$ETC_CONF"
         clear_ca_dir
         systemctl restart rsyslog.service >/dev/null 2>&1 || true
-        echo "disabled" > "$STATUS_SIDECAR"
-        : > "$HASH_SIDECAR"
+        echo "disabled" | state_write "$STATUS_SIDECAR"
+        state_write "$HASH_SIDECAR" </dev/null
         echo "  ✓ forward config removed, rsyslog restarted, status: disabled"
-        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         ;;
     *)
         echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
-        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
         exit 1
         ;;
 esac

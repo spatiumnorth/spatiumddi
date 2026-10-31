@@ -59,6 +59,7 @@ from app.services.dhcp.device_policy import (
 from app.services.dhcp.ha_members import kea_ha_members
 from app.services.dhcp.ha_peer_auth import current_peer_credential
 from app.services.dhcp.option_validation import (
+    canonical_domain_options,
     options_for_family,
     phone_options_loadable,
     vendor_class_match_renderable,
@@ -341,7 +342,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 name=p.name or "",
                 class_restriction=p.class_restriction,
                 lease_time_override=p.lease_time_override,
-                options_override=p.options_override or None,
+                options_override=canonical_domain_options(p.options_override) or None,
                 pd_prefix=getattr(p, "pd_prefix", None),
                 delegated_length=getattr(p, "delegated_length", None),
                 excluded_prefix=getattr(p, "excluded_prefix", None),
@@ -354,7 +355,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 mac_address=str(s.mac_address),
                 hostname=s.hostname or "",
                 client_id=s.client_id,
-                options_override=s.options_override or None,
+                options_override=canonical_domain_options(s.options_override) or None,
                 duid=getattr(s, "duid", None),
             )
             for s in sc.statics
@@ -369,7 +370,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                     _with_location_options(
                         location_erls,
                         subnet,
-                        dict(sc.options or {}),
+                        canonical_domain_options(sc.options),
                         address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                     ),
                     subnet,
@@ -752,7 +753,7 @@ async def _assemble_device_policy_classes(
             DevicePolicyClassDef(
                 name=policy.class_name,
                 match_expression=compiled.expression,
-                options=dict(policy.options or {}),
+                options=canonical_domain_options(policy.options),
                 lease_time=policy.lease_time,
             )
         )
@@ -795,7 +796,7 @@ def _with_v6_domain_search(
 
 def _client_class_def(c: DHCPClientClass) -> ClientClassDef:
     """A client class with the options each daemon gets (#1229, #1295)."""
-    options = dict(c.options or {})
+    options = canonical_domain_options(c.options)
     family = c.address_family or "ipv4"
     if family == "dual":
         v4, v6 = options_for_family(options, "ipv4"), options_for_family(options, "ipv6")
