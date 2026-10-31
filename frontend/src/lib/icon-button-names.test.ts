@@ -42,8 +42,11 @@ import ts from "typescript";
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NAMING = new Set(["aria-label", "aria-labelledby", "title"]);
 const BUTTONS = new Set(["button", "Button", "HeaderButton"]);
-// A spread of a permission gate gives a title only while denied (#3160).
-const GATE_SPREAD = /gate/i;
+// A spread of a permission gate gives a title only while denied (#3160):
+// `permissionGate(...)`, `dhcpGate(...)`, `writeGate`. Matched as a whole
+// identifier, so a spread that merely contains the letters (`navigateProps`,
+// `aggregate`) is still assumed to carry a name.
+const GATE_SPREAD = /(?:^|\W)(?:gate|\w*Gate)\b/;
 
 /**
  * Unnamed icon-only buttons another open change fixes, by file. Each entry
@@ -169,6 +172,10 @@ describe("icon-only buttons", () => {
     ],
     ["a text expression", "<button><X />{label}</button>"],
     ["a spread", "<button {...props}><X /></button>"],
+    [
+      "a spread whose name only contains 'gate'",
+      "<button {...navigateProps}><X /></button>",
+    ],
     [
       "a name plus a gate spread",
       "<button aria-label='Edit x' {...permissionGate(ok, why)}><Pencil /></button>",

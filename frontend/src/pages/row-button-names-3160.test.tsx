@@ -14,6 +14,9 @@ import type { ReactNode } from "react";
 
 type Answer = (...args: unknown[]) => unknown;
 const answers: Record<string, Record<string, Answer>> = {};
+// Whether the signed-in user may press the row's buttons. The gate adds a
+// `title` (the refusal reason) only when they may not.
+const perm = { allowed: true };
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -45,8 +48,8 @@ vi.mock("@/hooks/usePermissions", async () => {
   return {
     ...actual,
     usePermissions: () => ({
-      can: () => true,
-      isSuperadmin: true,
+      can: () => perm.allowed,
+      isSuperadmin: perm.allowed,
       isLoading: false,
     }),
   };
@@ -62,6 +65,7 @@ const { IPAMTemplatesPage } = await import("@/pages/admin/IPAMTemplatesPage");
 
 afterEach(() => {
   cleanup();
+  perm.allowed = true;
   for (const k of Object.keys(answers)) delete answers[k];
 });
 
@@ -129,6 +133,37 @@ describe("row Edit / Delete buttons are named for their item", () => {
     expect(
       screen.getByRole("button", { name: "Delete client class VOIP" }),
     ).toBeTruthy();
+  });
+
+  it("keeps the name for a user the gate refuses", async () => {
+    perm.allowed = false;
+    answers.dhcpApi = {
+      listClientClasses: async () => [
+        {
+          id: "c1",
+          group_id: "g1",
+          name: "VOIP",
+          description: "",
+          match_expression: "x",
+          address_family: "ipv4",
+          options: {},
+          created_at: STAMP,
+          modified_at: STAMP,
+        },
+      ],
+    };
+    show(<ClientClassesTab groupId="g1" />);
+    const edit = (await screen.findByRole("button", {
+      name: "Edit client class VOIP",
+    })) as HTMLButtonElement;
+    const del = screen.getByRole("button", {
+      name: "Delete client class VOIP",
+    }) as HTMLButtonElement;
+    // Disabled, with the refusal reason as the tooltip, and still named.
+    expect(edit.disabled).toBe(true);
+    expect(edit.title).toMatch(/^Requires write permission/);
+    expect(del.disabled).toBe(true);
+    expect(del.title).toMatch(/^Requires delete permission/);
   });
 
   it("DHCP option templates", async () => {
