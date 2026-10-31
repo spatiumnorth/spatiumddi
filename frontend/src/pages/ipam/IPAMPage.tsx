@@ -91,6 +91,7 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -17160,7 +17161,12 @@ export function IPAMPage() {
   return (
     <div className="flex h-full">
       {/* ── Left tree panel ── */}
-      <div className="flex w-72 flex-shrink-0 flex-col border-r">
+      <ResizablePane
+        storageKey="ipam"
+        defaultWidth={288}
+        label="Resize IP spaces tree"
+        className="flex flex-col border-r"
+      >
         <div className="flex h-12 items-center justify-between border-b px-3">
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
@@ -17361,7 +17367,7 @@ export function IPAMPage() {
               </p>
             )}
         </div>
-      </div>
+      </ResizablePane>
 
       {/* ── Right detail panel ── */}
       <div className="flex flex-1 flex-col overflow-hidden">

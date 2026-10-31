@@ -130,6 +130,7 @@ import {
   type DNSGroupSyncResult,
   type ResolverPreset,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
@@ -12351,7 +12352,12 @@ export function DNSPage() {
   return (
     <div className="flex h-full overflow-hidden">
       {/* ── Sidebar ── */}
-      <div className="w-72 flex-shrink-0 flex flex-col border-r bg-card">
+      <ResizablePane
+        storageKey="dns"
+        defaultWidth={288}
+        label="Resize DNS server groups tree"
+        className="flex flex-col border-r bg-card"
+      >
         <div className="flex items-center justify-between px-4 py-3 border-b">
           <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             DNS Server Groups
@@ -12473,7 +12479,7 @@ export function DNSPage() {
             );
           })}
         </div>
-      </div>
+      </ResizablePane>
 
       {/* ── Main panel ── */}
       <div className="flex-1 overflow-hidden">
