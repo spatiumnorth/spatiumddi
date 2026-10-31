@@ -22,7 +22,10 @@
  *   - an icon chosen in an expression (`{busy ? <Loader2 /> : <X />}`) or
  *     wrapped in a lowercase element (`<span><X /></span>`) is not seen;
  *   - a button with a spread (`{...props}`) is assumed named, since the
- *     spread may carry `aria-label`;
+ *     spread may carry `aria-label`. The one exception is a permission
+ *     gate (`{...permissionGate(...)}`, `{...dhcpGate(...)}`, `{...writeGate}`):
+ *     it sets a `title` only while the control is DENIED, so a user who
+ *     may press the button gets no name from it (#3160);
  *   - `aria-labelledby` is taken on trust: the id it names is not checked;
  *   - other clickable shapes (`role="button"` on a div, a link drawn as an
  *     icon) are not scanned.
@@ -39,6 +42,8 @@ import ts from "typescript";
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NAMING = new Set(["aria-label", "aria-labelledby", "title"]);
 const BUTTONS = new Set(["button", "Button", "HeaderButton"]);
+// A spread of a permission gate gives a title only while denied (#3160).
+const GATE_SPREAD = /gate/i;
 
 /**
  * Unnamed icon-only buttons another open change fixes, by file. Each entry
@@ -71,7 +76,8 @@ function unnamedIconButtons(fileName: string, code: string): number[] {
       const props = n.openingElement.attributes.properties;
       const named = props.some(
         (a) =>
-          ts.isJsxSpreadAttribute(a) ||
+          (ts.isJsxSpreadAttribute(a) &&
+            !GATE_SPREAD.test(a.expression.getText())) ||
           (ts.isJsxAttribute(a) && NAMING.has(a.name.getText())),
       );
       let content = false;
@@ -136,6 +142,14 @@ describe("icon-only buttons", () => {
     ],
     ["an <svg>", "<button><svg><path d='M0 0' /></svg></button>"],
     ["a Button component", "<Button variant='ghost'><Trash2 /></Button>"],
+    [
+      "only a permission-gate spread",
+      "<button {...permissionGate(ok, why)}><Pencil /></button>",
+    ],
+    [
+      "only a gate identifier spread",
+      "<button onClick={f} {...writeGate}><Trash2 /></button>",
+    ],
     ["aria-hidden but no name", "<button aria-hidden='true'><X /></button>"],
   ])("flags an unnamed button holding %s", (_, jsx) => {
     expect(unnamedIconButtons("f.tsx", `const a = (${jsx});`)).toEqual([1]);
@@ -155,6 +169,10 @@ describe("icon-only buttons", () => {
     ],
     ["a text expression", "<button><X />{label}</button>"],
     ["a spread", "<button {...props}><X /></button>"],
+    [
+      "a name plus a gate spread",
+      "<button aria-label='Edit x' {...permissionGate(ok, why)}><Pencil /></button>",
+    ],
     ["a component with text", "<button><Kbd>Esc</Kbd></button>"],
   ])("passes a button named by %s", (_, jsx) => {
     expect(unnamedIconButtons("f.tsx", `const a = (${jsx});`)).toEqual([]);
