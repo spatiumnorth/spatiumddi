@@ -104,6 +104,76 @@ describe("Restore the others (#1960)", () => {
   });
 });
 
+describe("a restore that leaves rows behind (#3187)", () => {
+  it("says which rows stayed in the Trash and why, instead of closing", async () => {
+    list.mockResolvedValue({ items: [entry(2)], total: 1 });
+    restore.mockResolvedValue({
+      batch_id: "b-1",
+      restored: 1,
+      skipped: [
+        {
+          type: "dns_record",
+          id: "r-2",
+          display: "cn.example.test. CNAME",
+          reason: "cn.example.test is an A record, so it can hold no CNAME",
+        },
+      ],
+      held_back: [],
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await screen.findByText(/left in the Trash/);
+    expect(screen.getByText(/cn\.example\.test\. CNAME — /)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+  });
+});
+
+describe("a zone restore that holds records back (#3188)", () => {
+  it("names the held subnet and the server's reason", async () => {
+    list.mockResolvedValue({ items: [entry(3)], total: 1 });
+    restore.mockResolvedValue({
+      batch_id: "b-1",
+      restored: 1,
+      skipped: [],
+      held_back: [
+        {
+          type: "subnet",
+          id: "s-1",
+          display: "2 IPAM records of 10.198.136.0/24 (name)",
+          reason:
+            "subnet 10.198.136.0/24 (name) is in the Trash — its records stay there with it and come back when it is restored",
+        },
+      ],
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await screen.findByText(/left in the Trash/);
+    expect(
+      screen.getByText(/2 IPAM records of 10\.198\.136\.0\/24 \(name\) — /),
+    ).toBeTruthy();
+  });
+});
+
 describe("a parent still in the Trash (#1957)", () => {
   it("offers to restore the parent first, then restores this row", async () => {
     list.mockResolvedValue({ items: [entry(1)], total: 1 });

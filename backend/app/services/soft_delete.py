@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -46,6 +46,7 @@ from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
+from app.services.dns.cname_conflict import describe_cname_conflict
 
 # Types the trash UI browses, and that ``restore_row`` /
 # ``permanent_delete_from_trash`` accept as an addressable target. Cascade-only
@@ -457,6 +458,82 @@ async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.
     }
 
 
+def _live_cname_clash_join() -> tuple[Any, Any, Any]:
+    """``(batch row alias, live row alias, join condition)`` for the CNAME rule (#3187).
+
+    The set-based form of ``cname_conflict.find_cname_conflict``, the rule the
+    record API applies on create and update: two rows meet at a name when they
+    share a zone, the owner name (case-insensitively) and an overlapping view
+    (a row with no view renders in every view), and one of them is a CNAME.
+    The live side is the table's default-filtered rows, so the Trash blocks
+    nothing; the batch side is the rows being restored.
+    """
+    live = aliased(DNSRecord)
+    batch = aliased(DNSRecord)
+    cond = and_(
+        live.deleted_at.is_(None),
+        live.zone_id == batch.zone_id,
+        func.lower(live.name) == func.lower(batch.name),
+        or_(live.view_id.is_(None), batch.view_id.is_(None), live.view_id == batch.view_id),
+        or_(func.upper(live.record_type) == "CNAME", func.upper(batch.record_type) == "CNAME"),
+        live.id != batch.id,
+    )
+    return batch, live, cond
+
+
+def _live_cname_clash_exists() -> Any:
+    """``EXISTS`` a live row the ``DNSRecord`` row cannot share its name with."""
+    live = aliased(DNSRecord)
+    return (
+        select(live.id)
+        .where(
+            live.deleted_at.is_(None),
+            live.zone_id == DNSRecord.zone_id,
+            func.lower(live.name) == func.lower(DNSRecord.name),
+            or_(
+                live.view_id.is_(None),
+                DNSRecord.view_id.is_(None),
+                live.view_id == DNSRecord.view_id,
+            ),
+            or_(
+                func.upper(live.record_type) == "CNAME",
+                func.upper(DNSRecord.record_type) == "CNAME",
+            ),
+            live.id != DNSRecord.id,
+        )
+        .exists()
+    )
+
+
+async def _record_cname_conflicts(
+    db: AsyncSession, batch_id: uuid.UUID
+) -> dict[uuid.UUID, tuple[str, str]]:
+    """The batch's records that would put a CNAME beside other data (#3187).
+
+    Restore ran only the identical-twin rule, so a CNAME came back beside an A
+    created meanwhile (or an A beside a new CNAME): a state the record API
+    refuses with a 409 and that BIND and PowerDNS both refuse to load, which
+    holds back every later change to the zone. Returns
+    ``{record id: (label, reason)}`` with the create path's own message.
+    """
+    batch, live, cond = _live_cname_clash_join()
+    stmt: Any = (
+        select(batch, live)
+        .join(live, cond)
+        .where(batch.deletion_batch_id == batch_id)
+        .order_by(live.created_at)
+        .execution_options(include_deleted=True)
+    )
+    found: dict[uuid.UUID, tuple[str, str]] = {}
+    for rec, other in (await db.execute(stmt)).tuples():
+        if rec.id not in found:
+            found[rec.id] = (
+                _record_label(rec.fqdn, rec.record_type),
+                describe_cname_conflict(rec.record_type, rec.fqdn, other),
+            )
+    return found
+
+
 async def _record_parent_conflicts(
     db: AsyncSession, batch_id: uuid.UUID
 ) -> dict[uuid.UUID, tuple[str, str, DNSZone]]:
@@ -662,8 +739,16 @@ async def restore_batch(
     result = RestoreResult()
     record_conflicts: dict[uuid.UUID, str] = {}
     record_parent_conflicts: dict[uuid.UUID, str] = {}
+    record_cname_conflicts: dict[uuid.UUID, str] = {}
     if conflict_check is not None:
         record_conflicts = await _record_conflicts(db, batch_id)
+        for rid, (label, reason) in (await _record_cname_conflicts(db, batch_id)).items():
+            if rid in record_conflicts:
+                continue  # already refused as a twin
+            record_cname_conflicts[rid] = reason
+            result.conflicts.append(
+                {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
+            )
         result.conflicts.extend(
             {
                 "type": "dns_record",
@@ -728,7 +813,9 @@ async def restore_batch(
     result.restored.extend(
         r
         for r in records.scalars().all()
-        if r.id not in record_conflicts and r.id not in record_parent_conflicts
+        if r.id not in record_conflicts
+        and r.id not in record_parent_conflicts
+        and r.id not in record_cname_conflicts
     )
 
     if result.conflicts and not skip_conflicts:
@@ -749,6 +836,9 @@ async def restore_batch(
         # "evaluate" walks only the identity map, so a record already loaded
         # in this session does not keep reading as trashed after the UPDATE.
         sync = "evaluate"
+        if record_cname_conflicts:
+            where.append(~_live_cname_clash_exists())
+            sync = "fetch"
         if record_conflicts:
             # Only with skip_conflicts. The duplicates are excluded by the same
             # predicate that found them, not by a list of ids, which on a large
