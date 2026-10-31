@@ -244,7 +244,9 @@ def _polled(tag: str, structural: str, *signed: str) -> dict[str, Any]:
     }
 
 
-def test_key_cleanup_resumes_after_a_recovered_config(tmp_path: Path, monkeypatch) -> None:
+def test_key_cleanup_resumes_after_a_recovered_config(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A failed apply clears the prune set. Undoing the bad change leaves the
     live structure unchanged, so the poll takes the recovery path and no
     structural apply follows: cleanup must still resume from that poll."""
