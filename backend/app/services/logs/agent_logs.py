@@ -40,6 +40,7 @@ from app.models.auth import User
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer, DNSServerGroup
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
+from app.services.logs.ip_filter import InvalidLogFilter, ip_filter_clause, mac_filter_clause
 from app.services.search.ranking import like_pattern
 
 # Drivers backed by an in-container agent that ships its daemon's log lines
@@ -231,7 +232,9 @@ async def search_dns_queries(
     if qtype:
         stmt = stmt.where(DNSQueryLogEntry.qtype == qtype.strip().upper())
     if client_ip:
-        stmt = stmt.where(DNSQueryLogEntry.client_ip == client_ip)
+        stmt = stmt.where(
+            ip_filter_clause(DNSQueryLogEntry.client_ip, client_ip, field="client_ip")
+        )
     if view:
         stmt = stmt.where(DNSQueryLogEntry.view == view)
     if rcode:
@@ -346,9 +349,9 @@ async def search_dhcp_activity(
     if code:
         stmt = stmt.where(DHCPLogEntry.code == code.strip().upper())
     if mac_address:
-        stmt = stmt.where(DHCPLogEntry.mac_address == mac_address.strip().lower())
+        stmt = stmt.where(mac_filter_clause(DHCPLogEntry.mac_address, mac_address))
     if ip_address:
-        stmt = stmt.where(DHCPLogEntry.ip_address == ip_address.strip())
+        stmt = stmt.where(ip_filter_clause(DHCPLogEntry.ip_address, ip_address, field="ip_address"))
     if q:
         stmt = stmt.where(DHCPLogEntry.raw.ilike(like_pattern(q.strip()), escape="\\"))
     stmt = stmt.order_by(DHCPLogEntry.ts.desc(), DHCPLogEntry.id.desc()).limit(limit)
@@ -360,6 +363,7 @@ __all__ = [
     "DNS_AGENT_DRIVERS",
     "RCODE_UNKNOWN",
     "DNSQueryAnalytics",
+    "InvalidLogFilter",
     "LogScopeError",
     "LogServer",
     "can_read_log_server",
