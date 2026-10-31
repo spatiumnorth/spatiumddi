@@ -1005,3 +1005,34 @@ Args: the root context.
 {{- end -}}
 {{- toYaml $res -}}
 {{- end }}
+
+{{/*
+#3206 follow-up — refuse an in-place storageClass adoption on a live agent
+StatefulSet with the fix in the message, instead of the API server's
+"updates to statefulset spec for fields other than ... are forbidden".
+volumeClaimTemplates are immutable, so setting dnsAgents/dhcpAgents
+.storageClass (or servers[].storageClass) on an existing install can only be
+applied after the StatefulSet is deleted with --cascade=orphan.
+
+Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>).
+Fires only when this render SETS a class and the live object has a claim
+template whose class is absent or different. An install that never set a
+class renders no storageClassName and never reaches the comparison. `lookup`
+returns an empty map under `helm template` and in Argo CD's render, so this
+only ever fires for a real `helm install/upgrade` against a cluster; those
+render paths get the static NOTES.txt pointer instead. A storage SIZE change
+is the same immutability but is not checked here: the API server normalises
+quantities (1024Mi reads back as 1Gi), so a string compare could refuse a
+render that changes nothing.
+*/}}
+{{- define "spatiumddi.checkAgentClaimClass" -}}
+{{- if .class -}}
+{{- $live := lookup "apps/v1" "StatefulSet" .root.Release.Namespace .name -}}
+{{- range $t := (dig "spec" "volumeClaimTemplates" (list) $live) -}}
+{{- $old := dig "spec" "storageClassName" "" $t -}}
+{{- if ne $old $.class -}}
+{{- fail (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q. Kubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete the StatefulSet without deleting its pod or PVCs, then upgrade again:\n  kubectl delete sts %s -n %s --cascade=orphan\nExisting PVCs keep their old class; only new claims get %q. See the chart README, \"Adopting storageClass on an existing install\"." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class $.name $.root.Release.Namespace $.class) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

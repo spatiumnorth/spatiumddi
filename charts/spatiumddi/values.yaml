@@ -1180,8 +1180,10 @@ dnsAgents:
   # #3206 — StorageClass of both volume claims (agent-state, dns-state).
   # Unset uses the cluster's default class. Per server: ``servers[].storageClass``.
   # Changing it on a live StatefulSet is refused by Kubernetes (claim templates
-  # are immutable), and existing PVCs keep the class they were created with:
-  # it applies to claims created after it is set.
+  # are immutable): run ``kubectl delete sts <name> --cascade=orphan`` first
+  # (pod and PVCs survive); ``helm upgrade`` says so. Existing PVCs keep the
+  # class they were created with; it applies to claims created after it is set.
+  # See README "Adopting storageClass on an existing install".
   storageClass: ""
   # Per-driver image overrides (issue #127). Each key matches a
   # ``servers[].flavor`` value; missing keys fall back to
@@ -1288,7 +1290,8 @@ dhcpAgents:
   # StatefulSet with new PVCs and a new pod name (the server's identity).
   prefixWithFullname: false
   # #3206 — StorageClass of both volume claims; unset = the cluster default.
-  # Per server: ``servers[].storageClass``.
+  # Per server: ``servers[].storageClass``. On an existing install see README
+  # "Adopting storageClass on an existing install" (orphan-delete the sts first).
   storageClass: ""
   agentKey:
     existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY

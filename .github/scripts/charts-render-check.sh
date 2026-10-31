@@ -1208,6 +1208,29 @@ neg3209 "two servers with one name" "server names must be unique" \
 REL=1dev neg3209 "a prefixed name starting with a digit" "must start with a lowercase letter" \
     --set dnsAgents.prefixWithFullname=true --set-json 'dnsAgents.servers=[{"name":"ns1"}]'
 
+# #3206 follow-up — adopting storageClass on a live StatefulSet is refused by
+# helm via `lookup`, which is empty without a cluster. So here we can only pin
+# the half that must never regress: with no cluster (helm template, Argo CD)
+# setting a class renders, and NOTES carries the static pointer only then.
+echo "── storageClass adoption: renders without a cluster, NOTES pointer (#3206)"
+# NOTES.txt is not a manifest, so `helm template --show-only` cannot select it;
+# a client-side dry-run install needs no cluster and prints it.
+sc_notes() { helm install sc "$UMBRELLA" --dry-run=client "$@" 2>&1 | sed -n '/^NOTES:/,$p'; }
+if ! helm template sc "$UMBRELLA" --kube-version "$K8S_VERSION" --set dnsAgents.enabled=true \
+        --set dnsAgents.agentKey.value=x --set dnsAgents.storageClass=slow --set dhcpAgents.enabled=true \
+        --set dhcpAgents.storageClass=slow >/dev/null 2>/tmp/sc-render.err; then
+    echo "   FAIL: #3206 storageClass set did not render without a cluster:" >&2
+    tail -3 /tmp/sc-render.err >&2; failures=$((failures + 1))
+elif ! sc_out="$(sc_notes --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x --set dnsAgents.storageClass=slow)" \
+        || ! printf '%s' "$sc_out" | grep -q "Adopting storageClass on an existing install"; then
+    echo "   FAIL: #3206 NOTES lacks the storageClass pointer when one is set" >&2; failures=$((failures + 1))
+elif sc_out="$(sc_notes --set dnsAgents.enabled=true --set dnsAgents.agentKey.value=x)" \
+        && printf '%s' "$sc_out" | grep -q "Adopting storageClass"; then
+    echo "   FAIL: #3206 NOTES shows the storageClass pointer with none set" >&2; failures=$((failures + 1))
+else
+    echo "   ok: #3206 storageClass renders offline; NOTES pointer only when set"
+fi
+
 # #1550 — no render above sets frontend.controlPlaneVIP, so the
 # frontend's LoadBalancer shape is exercised here, together with the
 # appliance all-on render (DNS VIPs + DHCP relay VIP). --require so

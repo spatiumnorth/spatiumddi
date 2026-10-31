@@ -21,6 +21,7 @@ stringData:
 {{- $flavor := $server.flavor | default "kea" -}}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dhcp-%s-%s" $flavor $server.name) "prefix" $root.Values.dhcpAgents.prefixWithFullname) -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dhcpAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

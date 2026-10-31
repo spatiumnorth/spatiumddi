@@ -328,13 +328,13 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumnorth/dns-technitium` | Per-flavor image override |
 | `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
 | `dnsAgents.prefixWithFullname` | `false` | #3209 — name the StatefulSet and Services `<fullname>-dns-<flavor>-<name>` instead of `dns-<flavor>-<name>`. Flipping it on a live install recreates the StatefulSet with new PVCs; see [upgrade note](#agent-object-names-3209) |
-| `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass` |
+| `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
 | `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
-| `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass` |
+| `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dhcpAgents.servers` | `[]` |  |
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
@@ -343,13 +343,48 @@ Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send
 to UDP/67 only, so use LoadBalancer or `hostNetwork` for those),
-`hostNetwork` (DHCP only), `resources`, `storageClass`, `nodeSelector`,
+`hostNetwork` (DHCP only), `resources`, `storageClass` (on an existing install, [read this first](#adopting-storageclass-on-an-existing-install)), `nodeSelector`,
 `tolerations` and `affinity` (#3206: merged with the chart's preferred
 one-agent-per-node anti-affinity; only a `podAntiAffinity` of your own
 replaces it). Agents only *prefer* separate nodes,
 so after a node drain an agent can reschedule next to another one and stay
 there. Pin each server to a node (`nodeSelector: { kubernetes.io/hostname:
 node-a }`) to keep one agent per node behind a shared address.
+
+### Adopting `storageClass` on an existing install
+
+Setting `dnsAgents.storageClass`, `dhcpAgents.storageClass` or a server's
+`storageClass` (#3206) on a release that is already running changes the agent
+StatefulSet's `spec.volumeClaimTemplates[].spec.storageClassName`. Kubernetes
+does not allow that: only `replicas`, `ordinals`, `template`, `updateStrategy`,
+`revisionHistoryLimit`, `persistentVolumeClaimRetentionPolicy` and
+`minReadySeconds` of a StatefulSet can be updated. The upgrade or sync is
+refused with `StatefulSet.apps "<name>" is invalid: spec: Forbidden: updates to
+statefulset spec for fields other than ... are forbidden`. This happens even
+when the class you set is the cluster default. Changing a claim's storage size
+(`servers[].storage.*`) is refused for the same reason.
+
+Delete the StatefulSet object **without** its pod or PVCs, then upgrade or sync
+again; the new StatefulSet adopts the running pod and the existing claims:
+
+```bash
+kubectl delete sts <name> -n <namespace> --cascade=orphan
+helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi --reuse-values ...   # your usual command
+```
+
+With Argo CD, run the same `kubectl delete sts ... --cascade=orphan`, then sync
+the application. `Replace=true` and `ServerSideApply=true` do not help: the
+field is immutable either way.
+
+On a real `helm install` / `helm upgrade` against a cluster, the chart looks up
+the live StatefulSet and stops with a message carrying this exact command
+before sending anything. `helm template` and Argo CD render without cluster
+access, so they cannot detect it; they print a note in `NOTES.txt` instead.
+
+This does not move any data. Existing PVCs keep the class they were created
+with; only claims created afterwards (a new replica, a new server) get the new
+class. Moving an agent's data to another class needs new claims and a copy of the
+data, which this procedure does not do.
 
 ### Agent object names (#3209)
 

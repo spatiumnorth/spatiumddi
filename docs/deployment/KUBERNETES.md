@@ -263,6 +263,10 @@ without pinning it; `dnsAgents.storageClass` / `dhcpAgents.storageClass` (and
 use the cluster's default StorageClass. Set it before the first install: claim
 templates are immutable, so Kubernetes refuses the change on a live
 StatefulSet, and a PVC that already exists keeps the class it was created with.
+On an existing install, `kubectl delete sts <name> -n <ns> --cascade=orphan`
+(pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
+with that command when it detects the change. See the chart README,
+[Adopting `storageClass` on an existing install](../../charts/spatiumddi/README.md#adopting-storageclass-on-an-existing-install).
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
 > `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed

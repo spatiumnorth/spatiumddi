@@ -61,4 +61,12 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 {{- end }}
 {{- end }}
 
+{{- $scSet := false }}
+{{- if .Values.dnsAgents.enabled }}{{ if .Values.dnsAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dnsAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
+{{- if .Values.dhcpAgents.enabled }}{{ if .Values.dhcpAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dhcpAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
+{{- if $scSet }}
+
+Note: a storageClass on an existing agent StatefulSet cannot be updated in place (Kubernetes forbids it). On an upgrade or Argo CD sync that fails, delete the StatefulSet with --cascade=orphan and sync again; see "Adopting storageClass on an existing install" in the chart README.
+{{- end }}
+
 Docs: https://www.spatiumddi.com/
