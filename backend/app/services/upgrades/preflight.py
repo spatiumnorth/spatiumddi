@@ -1123,13 +1123,14 @@ async def check_kea_ha_version_skew() -> PreflightResult:
       never assumed to be one.
     * **Only *real* HA pairs.** HA is not "≥ 2 Kea members" — that is half the
       condition. ``_resolve_failover`` in ``services/dhcp/config_bundle.py``
-      renders the HA hook only when there are ≥ 2 Kea members AND every one of
-      them carries a non-empty ``ha_peer_url``; without a URL a peer cannot be
-      reached for heartbeats or lease updates, so no HA relationship exists and
-      there is nothing for an upgrade to disrupt. The predicate is evaluated
-      over EVERY Kea member of the group, as the renderer does — not over the
-      appliance members alone, which would miss a pair whose partner is a
-      docker agent and invent one where a third, URL-less member suppresses HA.
+      renders the HA hook only for Kea members that carry a non-empty
+      ``ha_peer_url``, and only when at least two do; without a URL a peer
+      cannot be reached for heartbeats or lease updates, so it is not in the
+      relationship (a URL-less member beside a pair is sidelined, #3151) and
+      there is nothing for an upgrade to disrupt on it. The predicate is
+      evaluated over EVERY Kea member of the group, as the renderer does — not
+      over the appliance members alone, which would miss a pair whose partner
+      is a docker agent.
 
     A pair with a member off the appliance fleet is still reported, and that
     member is named: this run upgrades only the appliance side, so converging
@@ -1176,17 +1177,20 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     for r in rows:
         by_group.setdefault(r["group_name"], []).append(dict(r))
 
-    # Mirror _resolve_failover exactly: ≥ 2 Kea members AND every member has a
-    # peer URL. Anything else renders no HA hook, so there is no HA to disrupt.
+    # Mirror _resolve_failover exactly (``services/dhcp/ha_members``): the HA
+    # participants are the Kea members with a peer URL, and HA renders only
+    # when there are ≥ 2 of them. A URL-less member beside them is sidelined
+    # (#3151) — not in the relationship, so its version does not matter here.
     # Then keep only the pairs this run touches: at least one appliance member.
-    ha_groups = {
-        name: members
-        for name, members in by_group.items()
-        if members[0]["group_mode"] in HA_MODES
-        and len(members) >= 2
-        and all(m["ha_peer_url"] for m in members)
-        and any(m["on_appliance"] for m in members)
-    }
+    ha_groups: dict[str, list[dict[str, Any]]] = {}
+    for name, members in by_group.items():
+        participants = [m for m in members if m["ha_peer_url"]]
+        if (
+            members[0]["group_mode"] in HA_MODES
+            and len(participants) >= 2
+            and any(m["on_appliance"] for m in participants)
+        ):
+            ha_groups[name] = participants
     if not ha_groups:
         return PreflightResult(
             name="kea_ha_version_skew",
