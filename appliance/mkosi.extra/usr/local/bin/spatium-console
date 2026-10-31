@@ -6086,7 +6086,10 @@ def do_slot_rollback(console: Console, state: "DashboardState", saved) -> None:
         cmd = ["spatium-upgrade-slot", "set-next-boot", other]
     if not confirm_modal(console, q):
         return
-    _run_recovery_cmd(console, saved, "Slot rollback", cmd, timeout=30)
+    # #3169 — set-next-boot to the other slot first re-copies that slot's
+    # baked image tarballs (~1 GB+) into k3s's images dir; 30 s killed it
+    # mid-copy, before grub-reboot ever ran.
+    _run_recovery_cmd(console, saved, "Slot rollback", cmd, timeout=900)
     state.flash("Slot change queued — press F5 to reboot to apply", ttl=8)
 
 

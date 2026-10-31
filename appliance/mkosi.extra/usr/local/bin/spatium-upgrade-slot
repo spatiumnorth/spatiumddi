@@ -1010,13 +1010,21 @@ def cmd_apply(args) -> int:
 _PART_SUFFIX = ".part"
 
 
-def _install_atomically(src: Path, final: Path) -> None:
+def _install_atomically(src: Path, final: Path, *, fresh_mtime: bool = False) -> None:
     """Copy ``src`` to ``final`` so no reader ever sees a partial ``final``:
     copy (content + mtime, like ``copy2``) to a hidden ``.part`` sibling,
-    fsync it, then rename it over ``final`` (#1630)."""
+    fsync it, then rename it over ``final`` (#1630).
+
+    ``fresh_mtime`` stamps the copy with the current time instead of the
+    source's (#3169). It is set BEFORE the rename, so the watcher sees the
+    file once, under its real name, already carrying the new mtime — a
+    ``utime`` after the rename would be a second event and a second import.
+    """
     tmp = final.with_name(f".{final.name}{_PART_SUFFIX}")
     try:
         shutil.copy2(src, tmp)
+        if fresh_mtime:
+            os.utime(tmp, None)
         with open(tmp, "rb") as fh:
             os.fsync(fh.fileno())
         os.replace(tmp, final)
@@ -1025,10 +1033,27 @@ def _install_atomically(src: Path, final: Path) -> None:
         raise
 
 
-def _refresh_baked_images(target_dev: str) -> None:
+def _refresh_baked_images(target_dev: str, *, fresh_mtime: bool = False) -> int | None:
     """Copy the new slot's baked image tarballs to the persistent /var
     partition's k3s airgap-images dir. See cmd_apply for the
     architecture background.
+
+    Returns how many tarballs were copied, or None when the refresh could
+    not run (mount failure, a slot with no baked tarballs, copy error).
+
+    #3169 — ``fresh_mtime`` is the slot-SWITCH mode (rollback, set-default
+    or set-next-boot to the other slot). k3s's import cache re-imports a
+    tarball only when its size differs or its mtime is AFTER the cached one
+    (k3s ``pkg/agent/containerd/watcher.go``). The versionless names mean
+    the older slot's tarball usually replaces a newer one, so with the
+    source's mtime an equal-size file would be skipped and the target slot
+    would boot depending on containerd still holding its images. A fresh
+    mtime makes the running k3s re-import the target's set within seconds,
+    before the reboot, and the target's own k3s finds a cache that matches.
+    In that mode a tarball already identical to the target's (same size and
+    mtime — placed by copy2 from that very slot, as an apply does just
+    before ``set-next-boot``) is left alone: re-copying it would only make
+    the running k3s import the set a second time.
 
     #1630 — each tarball lands atomically (``_install_atomically``). The
     old slot's k3s keeps running through the apply and its image watcher
@@ -1056,19 +1081,26 @@ def _refresh_baked_images(target_dev: str) -> None:
         ).returncode
         if rc != 0:
             print(f"  WARN: couldn't mount {target_dev} to refresh baked images")
-            return
+            return None
         try:
             src = mountpoint / "var/lib/rancher/k3s/agent/images"
             if not src.is_dir():
                 print(f"  WARN: no baked-image dir at {src}")
-                return
+                return None
+            tarballs = sorted(src.glob("*.tar.zst"))
+            if not tarballs:
+                print(f"  WARN: no baked tarballs in {src}")
+                return None
             dest.mkdir(parents=True, exist_ok=True)
             # A copy an earlier apply was killed in the middle of.
             for stale in dest.glob(f".*{_PART_SUFFIX}"):
                 stale.unlink(missing_ok=True)
             copied = 0
-            for tarball in sorted(src.glob("*.tar.zst")):
-                _install_atomically(tarball, dest / tarball.name)
+            for tarball in tarballs:
+                final = dest / tarball.name
+                if fresh_mtime and _same_file_stat(tarball, final):
+                    continue
+                _install_atomically(tarball, final, fresh_mtime=fresh_mtime)
                 copied += 1
             # The renames must survive the reboot that follows the apply.
             dir_fd = os.open(dest, os.O_RDONLY)
@@ -1077,10 +1109,60 @@ def _refresh_baked_images(target_dev: str) -> None:
             finally:
                 os.close(dir_fd)
             print(f"  refreshed {copied} baked tarballs → {dest}")
+            return copied
         finally:
             subprocess.run(["umount", str(mountpoint)], check=False)
     except OSError as exc:
         print(f"  WARN: baked-image refresh skipped ({exc})", file=sys.stderr)
+        return None
+
+
+def _same_file_stat(src: Path, dest: Path) -> bool:
+    """True when ``dest`` has ``src``'s size and mtime — the key k3s's
+    import cache uses, and what ``copy2`` from ``src`` leaves behind."""
+    try:
+        a, b = src.stat(), dest.stat()
+    except OSError:
+        return False
+    return a.st_size == b.st_size and a.st_mtime_ns == b.st_mtime_ns
+
+
+def _recopy_slot_images_for_switch(target: dict[str, str]) -> None:
+    """Before a rollback / set-default / set-next-boot flips GRUB to another
+    slot, put THAT slot's baked tarballs in k3s's images dir (#3169).
+
+    /var/lib/rancher/k3s/agent/images is shared by both slots and holds the
+    set of whichever slot an upgrade last wrote; each slot's own copy sits
+    on its rootfs, hidden under the /var mount once it boots. Without this
+    a rolled-back slot imports nothing on boot and its pods
+    (``imagePullPolicy: Never``) start only if containerd kept its images —
+    which a cluster join/promote/demote on the newer slot (store wipe) or
+    kubelet image GC can have undone: ErrImageNeverPull.
+
+    Warn-and-continue on failure, deliberately. Rollback is the emergency
+    path, and a failed copy leaves the node exactly where it was before
+    this fix (each tarball lands atomically, so nothing is half-written):
+    the target slot then boots on whatever containerd still holds, which
+    is often everything. Refusing the GRUB flip would block an operator
+    backing out of a broken release over a missing tarball, which is
+    strictly worse. So the failure is logged loudly, with what it means
+    and how to recover, and the switch goes ahead.
+    """
+    label = target.get("partlabel", "?")
+    print(f"Re-copying {label}'s baked image tarballs into k3s's images dir (#3169)")
+    copied = _refresh_baked_images(target["device"], fresh_mtime=True)
+    if copied is None:
+        print(
+            f"  WARNING: could not re-copy {label}'s baked images (see the WARN above).\n"
+            f"  The switch continues. When {label} boots, its pods start only if\n"
+            f"  containerd still holds its images. If they come up\n"
+            f"  ErrImageNeverPull: mount {target['device']} read-only, copy its\n"
+            f"  var/lib/rancher/k3s/agent/images/*.tar.zst into\n"
+            f"  /var/lib/rancher/k3s/agent/images/, touch them, restart k3s.",
+            file=sys.stderr,
+        )
+    elif copied == 0:
+        print(f"  {label}'s tarballs are already in place — nothing to re-import")
 
 
 def _parent_disk(part_dev: str) -> str:
@@ -1449,6 +1531,11 @@ def _read_grubenv_default() -> str:
     return "slot_a"
 
 
+def _slot_entry(partlabel: str) -> str:
+    """The GRUB menu entry (``slot_a`` / ``slot_b``) for a root partlabel."""
+    return "slot_a" if partlabel == "root_a" else "slot_b"
+
+
 def cmd_set_next_boot(args) -> int:
     """Set the inactive slot as the next boot's default — ONE SHOT.
 
@@ -1462,6 +1549,10 @@ def cmd_set_next_boot(args) -> int:
     new slot via `grub-set-default` once /health/live confirms the
     upgraded slot is healthy. Without that commit, even a successful
     boot reverts to the previous slot on next reboot.
+
+    #3169 — when the target is NOT the running slot, its baked image
+    tarballs are re-copied first, as ``rollback`` does. Straight after an
+    ``apply`` they are already in place, so the upgrade path copies nothing.
     """
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
@@ -1483,6 +1574,12 @@ def cmd_set_next_boot(args) -> int:
         target = "slot_b"
     else:
         target = "slot_a"
+
+    # #3169 — booting the other slot: give k3s that slot's tarballs first.
+    # Right after an apply (the upgrade runner's set-next-boot) they are
+    # already there and this copies nothing.
+    if _slot_entry(active["partlabel"]) != target:
+        _recopy_slot_images_for_switch(inactive)
 
     print(f"Setting next-boot to {target} (one-shot — will auto-revert if boot fails)")
     try:
@@ -1513,6 +1610,10 @@ def cmd_rollback(_args) -> int:
     so every future boot uses the new slot until another rollback or
     upgrade. Use this when you want to permanently revert to a known-
     good previous slot, not just try it once.
+
+    #3169 — first re-copies the target slot's baked image tarballs into
+    k3s's shared images dir, so the slot can rebuild its images on boot
+    whatever happened to containerd since it last ran.
     """
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
@@ -1524,6 +1625,7 @@ def cmd_rollback(_args) -> int:
         return 2
     active, inactive = pair
     target = "slot_a" if inactive["partlabel"] == "root_a" else "slot_b"
+    _recopy_slot_images_for_switch(inactive)
     print(f"Committing rollback: default boot → {target} ({inactive['device']})")
     try:
         subprocess.run(
@@ -1555,6 +1657,9 @@ def cmd_set_default(args) -> int:
 
     grub-set-default writes ``saved_entry`` to grubenv — survives
     reboots until another set-default / rollback / upgrade rewrites it.
+
+    #3169 — when the target is NOT the running slot, its baked image
+    tarballs are re-copied first, as ``rollback`` does.
     """
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
@@ -1571,6 +1676,18 @@ def cmd_set_default(args) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # #3169 — a durable switch to the OTHER slot re-copies its tarballs.
+    # Committing the running slot (a trial boot) copies nothing.
+    pair = detect_active_inactive()
+    if pair is None:
+        print(
+            "  WARNING: couldn't detect A/B slots — not re-copying baked images "
+            "(#3169); the GRUB default is still set",
+            file=sys.stderr,
+        )
+    elif _slot_entry(pair[0]["partlabel"]) != target:
+        _recopy_slot_images_for_switch(pair[1])
 
     print(f"Setting durable default boot to {target}")
     try:
