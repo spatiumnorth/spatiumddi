@@ -453,7 +453,9 @@ export function AsnDetailPage() {
               </pre>
             ) : (
               <p className="text-xs text-muted-foreground">
-                No raw WHOIS data — run Refresh WHOIS to populate.
+                {asn.kind === "private"
+                  ? "No raw WHOIS data — a private ASN has no public WHOIS."
+                  : "No raw WHOIS data — run Refresh WHOIS to populate."}
               </p>
             )}
           </div>

@@ -293,13 +293,9 @@ Default ruleset (enforced, cannot be deleted):
 ### 2.4 Users and Groups (Platform-Level)
 
 Separate from IP-range-scoped permissions — this section manages:
-- Local user accounts (create, edit, enable/disable, reset password, force MFA)
+- Local user accounts (create, edit, enable/disable, reset password). Users enrol their own MFA from the Account page; there is no per-user "require MFA" switch
 - Local groups (create, manage membership)
-- LDAP / OIDC sync configuration:
-  - Which LDAP OUs to sync groups from
-  - Group attribute mapping
-  - Sync interval
-  - Manual "Sync Now" trigger
+- External auth provider group mapping (LDAP, OIDC, SAML, RADIUS, TACACS+): each provider carries group mappings (external group → SpatiumDDI group). There is no directory sync job, interval or "Sync Now": a user's groups are replaced from the mappings at each sign-in (see [AUTH.md](AUTH.md))
 - Last login per user
 - Active sessions (with revoke capability)
 
@@ -308,20 +304,22 @@ Separate from IP-range-scoped permissions — this section manages:
 ```
 APIToken
   id, name, description
-  token_hash: str        -- only hash stored; token shown once on creation
-  scope: enum(global, user)
-  user_id (FK, nullable) -- if user-scoped
-  permissions: JSONB     -- optional restriction (e.g., read-only, specific resource types)
+  token_hash: str        -- only the sha256 hash is stored; token shown once on creation
+  prefix: str            -- short identifier shown in the UI
+  scope: str            -- always "user" today (see below)
+  user_id (FK)           -- the owning user; the token acts as that user
+  scopes: list[str]      -- coarse scopes (below); empty = no scope restriction
+  resource_grants: list  -- optional binding to specific subnets / DNS zones
+  allowed_paths, permissions: JSONB -- reserved columns, not set or read today
   expires_at: timestamp (nullable)
   last_used_at: timestamp
   created_by_user_id, created_at
   is_active: bool
 ```
 
-- **Global tokens**: used for automation, CI/CD, Terraform providers — permissions are explicit
-- **User tokens**: scoped to the creating user's permission set — cannot exceed user's own rights
-- Tokens are displayed once on creation (PBKDF2 hash stored)
-- Tokens can be scoped to specific API paths (e.g., `/api/v1/ipam/*` only)
+- **User tokens** are the only kind the build issues: a token acts as its owning user and cannot exceed that user's rights. A token with no owner (a "global" token) is refused with 401 "Global-scope API tokens are not yet supported"; use a dedicated service user for automation, CI/CD and Terraform instead
+- Tokens are displayed once on creation (sha256 hash stored)
+- Instead of typing API paths, the create dialog offers five fixed scopes, each a family of routes: `read` (read-only), `ipam:write` (`/ipam/*`, `/vlans/*`, `/vrfs/*`, `/network-devices/*`), `dns:write`, `dhcp:write` and `agent`. A token may also be bound to specific subnets or DNS zones (`resource_grants`; the create dialog binds one)
 
 ### 2.6 Syslog / Log Forwarding
 
@@ -342,12 +340,9 @@ Multiple syslog targets can be configured simultaneously (e.g., local Loki + rem
 
 ### 2.7 Audit Log and Data Retention
 
-- Retention period (default: 365 days)
-- Export audit log: date range → CSV or JSON download
-- Archive to S3-compatible storage (optional)
 - Audit log is append-only — no update or delete capability, even for superadmin; DB triggers refuse both, and the `audit_log_immutable` conformity check fails if either trigger is dropped or disabled (tamper-evident, not tamper-proof — the DB owner can still remove them)
 - Fields logged on every mutation: user, timestamp, source IP, action, resource, old value, new value
-- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which runs at least once every 7 days, and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to a week between an edit to an old row and its alert. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
+- **Tamper evidence (#73, #2286).** Every row is hash-chained to the one before it. The `audit_chain_verify` task runs nightly at 02:00 UTC and opens a critical `audit-chain-broken` alert on a break. It walks the chain in pages of 5,000 rows and records how far it verified in `audit_chain_checkpoint`, so a nightly run checks only the rows added since the last one. **Trade-off:** a nightly run trusts every row at or below that checkpoint, so an edit to an older row is found at the next *full* pass, which starts on the first nightly run after the last full pass is more than 7 days old (so roughly every eighth night, and later if nightly runs fail), and also whenever the checkpointed row is missing or no longer carries the recorded hash (a restore, a rewritten row) or the recorded full-pass time lies in the future. So expect up to about eight days between an edit to an old row and its alert, plus however long the full pass takes. `GET /api/v1/audit/integrity` walks the whole chain on demand (`max_rows` caps it; a capped check answers `partial: true` with `rows_checked` and the `first_seq` / `last_seq` it walked). The chain is not keyed: it detects edits made without recomputing the hashes, not a writer with database access who recomputes them. Forward the audit log off-box (audit forwarding) for evidence such a writer cannot reach.
 **Audit log.** The audit log is append-only: nothing deletes from it,
 not even a superadmin, and no task prunes it, so it has no retention
 setting. Every mutation records the user, timestamp, source IP, action,
@@ -977,10 +972,11 @@ link would not send, so the page fetches each file through its API client and
 shows it inline rather than linking it for a new tab. Nothing is inlined into
 the JS bundle.
 
-That is about the **content**. The version number itself is also served by
-other unauthenticated surfaces that predate this page (for example
-`GET /api/v1/version`, which the installer probe and the mobile client use);
-those are separate decisions and are not changed here.
+That is about the **content**. The version number is a separate decision,
+made on its own route: `GET /api/v1/version`, which the installer probe and
+the mobile client use, answers everyone, but since #2935 an anonymous caller
+gets `version: "restricted"` and only a signed-in caller sees the release (see
+[API.md](../API.md) §7.2).
 
 A `make dev` or `npm run dev` session has none of these files, and the page
 says "not available in this build" rather than show an empty list. Agent images

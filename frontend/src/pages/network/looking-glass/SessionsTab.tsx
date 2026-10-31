@@ -23,6 +23,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Field, errMsg, humanDuration, humanTime, inputCls } from "../_shared";
 import { PeerDetailModal } from "./PeerDetailModal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // Established = green, the transitional FSM states = amber, Idle = rose.
 // Exported so PeerDetailModal's header chip reuses the exact same
@@ -64,7 +65,19 @@ export function SessionsTab({
   onViewRoutes: (peerId: string) => void;
 }) {
   const qc = useQueryClient();
+  // #3104 — peers sit under the router's 'bgp_lg_peer' gate; a read-only
+  // user is offered no write on them.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "bgp_lg_peer"),
+    "Requires write permission on BGP peers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "bgp_lg_peer"),
+    "Requires delete permission on BGP peers",
+  );
   const [deleteTarget, setDeleteTarget] = useState<BGPLGPeer | null>(null);
+  const [deleteErr, setDeleteErr] = useState<string | null>(null);
   const [viewingPeerId, setViewingPeerId] = useState<string | null>(null);
 
   // Session-state rows are live telemetry — poll modestly so a flap shows up
@@ -93,6 +106,8 @@ export function SessionsTab({
 
   const deleteM = useMutation({
     mutationFn: (id: string) => lookingGlassApi.deletePeer(id),
+    onMutate: () => setDeleteErr(null),
+    onError: (e) => setDeleteErr(errMsg(e, "Failed to delete peer.")),
     onSuccess: () => {
       setDeleteTarget(null);
       void qc.invalidateQueries({ queryKey: ["bgp-lg-sessions"] });
@@ -227,6 +242,7 @@ export function SessionsTab({
                           title="Edit peer"
                           className="rounded p-1 hover:bg-muted"
                           onClick={() => onEdit(peer)}
+                          {...writeGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -235,6 +251,7 @@ export function SessionsTab({
                           title="Delete peer"
                           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                           onClick={() => setDeleteTarget(peer)}
+                          {...deleteGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -252,14 +269,24 @@ export function SessionsTab({
         open={!!deleteTarget}
         title="Delete peer"
         message={
-          deleteTarget
-            ? `Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`
-            : ""
+          deleteTarget ? (
+            <>
+              {`Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`}
+              {deleteErr && (
+                <span className="mt-2 block text-destructive">{deleteErr}</span>
+              )}
+            </>
+          ) : (
+            ""
+          )
         }
         confirmLabel="Delete"
         tone="destructive"
         loading={deleteM.isPending}
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null);
+          setDeleteErr(null);
+        }}
         onConfirm={() => deleteTarget && deleteM.mutate(deleteTarget.id)}
       />
 

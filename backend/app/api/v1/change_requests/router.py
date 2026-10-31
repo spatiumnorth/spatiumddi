@@ -564,9 +564,11 @@ async def approve_request(
     5. The operation's ``preview()`` re-runs under the approver. If it
        refuses (target gone / now non-empty / synthesised), the operation
        does NOT execute and the row ends ``failed`` with the reason (200,
-       #2911). If it still succeeds but its scope differs from what the
-       approver reviewed, the approve answers 409 and the row stays
-       ``pending``: the requester can cancel and re-submit.
+       #2911). A refusal about the approver — a target that exists but
+       they cannot reach — answers 403 and the row stays ``pending`` for
+       another approver (#2934). If it still succeeds but its scope
+       differs from what the approver reviewed, the approve answers 409 and
+       the row stays ``pending``: the requester can cancel and re-submit.
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
        in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx

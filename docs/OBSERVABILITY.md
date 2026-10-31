@@ -720,7 +720,16 @@ spatiumddi_api_request_duration_seconds{method, path_template} (histogram)
 spatiumddi_api_active_requests (gauge)
 ```
 
-Plus two counters declared but not yet wired to a call site (read zero):
+The DNS agent config long-poll (#1111) adds three counters, labelled
+`family="dns"` (the DHCP long-poll does not count yet):
+
+```
+spatiumddi_agent_bundle_served_total{family, outcome}   # full / not_modified / client_gone
+spatiumddi_agent_bundle_inline_renders_total{family}
+spatiumddi_agent_bundle_inline_failures_total{family}
+```
+
+Plus two counters declared but not yet wired to a call site (no samples):
 
 ```
 spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oidc
@@ -1094,7 +1103,15 @@ running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The
 conformity evaluator follows the same rules.
 
-Rule types shipped today:
+Rule types described on this page. The build has 73 (`RULE_TYPES` in
+`backend/app/services/alerts.py`) and 41 of them have a row below.
+`GET /api/v1/alerts/rule-types` lists every type whose feature module is
+enabled, with its parameters, and some are documented on their own feature page
+instead (for example `dhcp_pool_exhaustion` in DHCP.md, `stale_ip_count` in
+IPAM.md). Among those with no row below are `tls_cert_expiring` and the other
+`tls_cert_*` rules, `secret_expiring`, `new_mac_seen`, `rogue_dhcp`,
+`restore_drill_failed`, `schema_behind_head` and the `dns_*_suspected`
+threat-analytics rules.
 
 | Type | Fires when |
 |---|---|
@@ -1119,6 +1136,7 @@ Rule types shipped today:
 | `appliance_disk_usage` | An appliance's `/var` data partition is filling (#2240). Subject is the **appliance**. `/var` holds Postgres, the container images and the logs. Reads the `host_disk_partitions` every supervisor already reports inside `cluster_health` (#402), the reading behind the Cluster overview's node cards and the upgrade pre-flight's headroom check, so there is no new collector, field or migration. **Warning** at `threshold_percent` (default 80); **critical** at a fixed 87% used, whatever the threshold. The two do not share a knob on purpose: `/var` is ext4 with the default 5% reserved for root, and the supervisor counts that reserve as free (`blocks - bfree`), so in those terms the kubelet's `nodefs.available<5%` (`eviction-hard` in the appliance's k3s config) and `image-gc-high-threshold=95` both begin at about 89.8% used, where the kubelet starts evicting pods, the control plane's among them. The critical sits a few points before that line rather than on it: the evaluator runs every 60 s on 30 s heartbeats, so a critical on the line would arrive after the first evictions. A seven-node cluster loaded towards a million devices filled `/var` (23 GiB of a 40 GiB disk) to 88 to 91% on every node with no alert raised. Only `/var` is judged: the root slot is a read-only image and the ESP a fixed boot partition. A supervisor that reports no usable `/var` never matches (UNKNOWN, not healthy). A reading that **disappears**, or one older than 10 minutes (the node stopped heartbeating; `appliance_heartbeat_stale` reports that), opens nothing new and holds an open event at its severity rather than resolving it. Revoked and unapproved appliances are skipped. Auto-resolves when usage drops below the threshold. Seeded **enabled** at 80% at startup, like the other infrastructure rules: disable it rather than delete it, because a deleted seeded rule is created again at the next restart. |
 | `agent_spool_trimmed` | A DNS or DHCP agent's durable push spool (#1077) hit its size cap (`AGENT_SPOOL_MAX_BYTES`, default 256 MiB) during a control-plane outage and discarded its **oldest** queued batches — part of the outage's logs, metrics or lease events will never arrive. Subject is `agent` with a `dns_server:<id>` / `dhcp_server:<id>` subject id, the same shape as `agent_config_rejected`. Reads the `spool_status` the heartbeat stored; no probing. Fires while the reported `last_trim_at` is within the last 24 h and auto-resolves after that (trim counters are cumulative, so there is no "recovered" report to key off). **Critical** when `lease_events` were among the streams trimmed — Kea lease events are the only way the control plane learns about agent-managed leases, so a trimmed one is a lease with no IPAM mirror and no DDNS record until the client renews or the agent's lease snapshot reconciles it; **warning** otherwise. NULL (an agent too old to report a spool, or an agentless driver) never matches. Seeded **enabled**. |
 | `dns_agent_duplicate_instance` | Two live DNS agent processes share one server identity (#2044) — usually a cloned VM or a copied agent state directory that kept the same `agent_id`. The control plane serves only the most recent process and answers the other's config polls with `409`; the refused agent keeps serving a configuration that no longer changes while heartbeating normally. Subject is `agent` with a `dns_server:<id>` subject id. Reads the duplicate-episode columns the config long-poll writes when it refuses a poll; no probing. Fires once refusals have gone on for 2 minutes (so an overlapping rollout's old pod, refused once before it exits, does not) and auto-resolves 10 minutes after the last one. A replacement agent, whose predecessor never polls again, is never refused. Warning. Seeded **enabled**, once, by migration `f4c2a8e61b93` (not at startup), so deleting it is final. |
+| `dhcp_agent_duplicate_instance` | Two live DHCP agent processes share one server identity (#3143) — usually a cloned Kea VM or a copied agent state directory that kept the same `agent_id`. Same rules as `dns_agent_duplicate_instance`: the control plane serves only the most recent process and answers the other's config polls and registrations with `409`, mints it no token and never rotates one for it, so the owner's token stays valid; the refused agent keeps Kea on a configuration that no longer changes while heartbeating normally. Subject is `agent` with a `dhcp_server:<id>` subject id. Reads the duplicate-episode columns the long-poll and registration write when they refuse; no probing. Fires once refusals have gone on for 2 minutes and auto-resolves 10 minutes after the last one. Kea HA peers have their own identities and are never refused. Warning. Seeded **enabled**, once, by migration `833ee80c8c6b` (not at startup), so deleting it is final. |
 | `dns_blocklist_feed_stale` | An enabled feed-sourced blocklist whose refresh has not **succeeded** within 3 x its `update_interval_hours` (#2313). Judged from `last_success_at` (`last_synced_at` also moves on failure); a feed that never succeeded is measured from its creation. Servers keep enforcing the entries the list last had. Subject is `dns_blocklist`. **Warning**. Skips manual-only (interval 0) and disabled lists; assignment to a group is not a condition. The message carries a fixed reason, never the stored fetch error or any URL. Auto-resolves on the next good refresh. Seeded **enabled**. |
 | `dns_pool_health_stale` | An enabled DNS pool with at least one enabled member whose health verdict (`last_check_at`) is older than 3 x the pool's check interval (floor 30 s, the health-check task's own cadence) (#2312). Pools **fail open**: a member last seen healthy is still rendered, so a stopped dispatcher leaves a member that died since in the answer set. Subject is `dns_pool`, one event per pool. **Warning**. Auto-resolves when the pool is checked again. Every alert rule is evaluated by the Celery worker, so a stopped worker stops the health checks AND this alert; a stopped worker is reported by the platform health components `celery-workers` / `celery-beat` instead. Seeded **enabled**. |
 | `dnssec_multi_signer` | A DNSSEC-signed zone whose server group has more than one agent DNS server (BIND9 / PowerDNS / Technitium — **disabled servers count**, since a disabled agent still receives and serves the bundle) (#1762). Each server signs with keys it generated, so the zone is served with several DNSKEY sets against the one DS published at the parent, and validating resolvers SERVFAIL on whichever server it does not match. Signing and every operator server-add are refused on such a group; this rule covers what cannot be refused — zones signed before the rule, and an agent that auto-registered (`AGENT_GROUP`) into a signed group. Subject is `dns_zone`. **Critical**. Auto-resolves when the zone is unsigned or the group is back to one server. Seeded **enabled**. |
@@ -1227,40 +1245,53 @@ automatically. MCP: `find_bgp_hijacks` / `count_bgp_hijacks` /
 
 ### 9.2 Prometheus alerting rules (external)
 
-Reference Prometheus alerting rules for the `spatiumddi_*` metrics
-(a perf-testing Prometheus config already lives under
-`perf/dashboards/prometheus/`):
+The control plane's `/metrics` registry declares eight `spatiumddi_*` series
+(beside the client library's standard `process_*` and `python_*`). Six carry
+samples today; the two `auth` counters are declared but nothing increments
+them yet, so they carry no samples, and the agent-bundle counters only ever
+see `family="dns"`:
 
-| Alert | Condition | Severity |
+| Series | Type | Labels |
 |---|---|---|
-| `DHCPServerOffline` | `dhcp_server_status == 0` for 2m | critical |
-| `DHCPSyncStale` | `time() - dhcp_sync_last_success > 900` | warning |
-| `DHCPPoolNearExhaustion` | `pool_utilization > 90` | warning |
-| `DNSServerOffline` | `dns_server_status == 0` for 2m | critical |
-| `SubnetNearExhaustion` | `subnet_utilization > 90` | warning |
-| `SubnetExhausted` | `subnet_utilization > 99` | critical |
-| `APIHighErrorRate` | `rate(requests[5m]{status=~"5.."})/rate(requests[5m]) > 0.05` | warning |
-| `DBReplicationLag` | `replication_lag > 30` | warning |
-| `CeleryQueueBacklog` | `queue_length > 100` for 5m | warning |
-| `BackupFailed` | Checked via Celery task failure metric | critical |
+| `spatiumddi_api_requests_total` | counter | `method`, `path_template`, `status_code` |
+| `spatiumddi_api_request_duration_seconds` | histogram | `method`, `path_template` |
+| `spatiumddi_api_active_requests` | gauge | |
+| `spatiumddi_auth_login_total` | counter (no samples yet) | `method`, `result` |
+| `spatiumddi_auth_token_usage_total` | counter (no samples yet) | `scope` |
+| `spatiumddi_agent_bundle_served_total` | counter | `family`, `outcome` |
+| `spatiumddi_agent_bundle_inline_renders_total` | counter | `family` |
+| `spatiumddi_agent_bundle_inline_failures_total` | counter | `family` |
+
+For example, an API error-rate alert is
+`sum(rate(spatiumddi_api_requests_total{status_code=~"5.."}[5m])) / sum(rate(spatiumddi_api_requests_total[5m])) > 0.05`
+(a perf-testing Prometheus config already lives under
+`perf/dashboards/prometheus/`).
+
+**Planned, not emitted yet.** There are no Prometheus series for DHCP / DNS
+server status, DHCP sync age, pool or subnet utilization, database
+replication lag, Celery queue length or task failures, so the usual rules
+over them (server offline, pool near exhaustion, replication lag, queue
+backlog, failed backups) cannot be written against `/metrics` today. Use
+the in-product alert rules above (`server_unreachable`, `subnet_utilization`,
+`dhcp_pool_exhaustion`, `backup_failed`, ...) for those conditions. Exporting
+them as series is tracked in
+[#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146) and
+[#1267](https://github.com/spatiumnorth/spatiumddi/issues/1267).
 
 
 ## DNS Agent Telemetry
 
 See [`docs/deployment/DNS_AGENT.md`](deployment/DNS_AGENT.md) §4 for the full protocol.
 
-### Metrics (scraped from the control plane)
+### Metrics
 
-| Metric | Type | Labels | Purpose |
-|---|---|---|---|
-| `spatium_dns_agent_up` | gauge | `server_id`, `flavor` | 1 if last heartbeat within 90s |
-| `spatium_dns_agent_config_lag_seconds` | gauge | `server_id` | Age of the applied config etag |
-| `spatium_dns_zone_serial` | gauge | `server_id`, `zone` | Last reported SOA serial |
-| `spatium_dns_failed_ops_total` | counter | `server_id` | RecordOps that exhausted retries |
-| `spatium_dns_agent_token_rotations_total` | counter | `server_id` | JWT rotations per server |
-
-Agents are egress-only and do **not** expose a scrape endpoint — all metrics
-are derived from the heartbeat body on the control plane.
+The control plane emits no per-agent Prometheus series yet (no agent-up,
+config-lag, zone-serial, failed-op or token-rotation metric). The same facts
+are on the server row in the console and in the API: heartbeat age and
+status, the applied config etag and apply status, per-server zone serials
+(`DNSServerZoneState`) and queued record ops. Agents are egress-only and do
+**not** expose a scrape endpoint; the control plane derives everything from
+the heartbeat body. Agent-level series are part of #2146.
 
 ### Logs
 
@@ -1269,6 +1300,4 @@ Agent logs are structured JSON (non-negotiable #7) and include the canonical
 
 - `dns_agent_registered` — bootstrap complete
 - `dns_agent_token_rotated` — JWT rotation
-- `dns_agent_config_applied` — new config etag applied
-- `dns_agent_op_failed` — RecordOp failed (attempt <= 5)
 - `dns_agent_stale_sweep` — control-plane Celery task marked servers unreachable

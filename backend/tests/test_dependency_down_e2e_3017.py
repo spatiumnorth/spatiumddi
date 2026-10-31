@@ -188,13 +188,15 @@ async def test_an_unreachable_host_from_outside_the_driver_is_not_a_database_503
     async def outbound() -> None:
         raise OSError(errno.EHOSTUNREACH, "No route to host")
 
+    # Restore the route list exactly: include_router may append an entry with
+    # no ``path`` (an included-router wrapper), so filtering on path would
+    # leave the route behind for every later test that walks app.routes (#3145).
+    routes_before = list(app.router.routes)
     app.include_router(router)
     try:
         r = await raw_client.get("/__t3017/outbound")
     finally:
-        app.router.routes[:] = [
-            rt for rt in app.router.routes if getattr(rt, "path", "") != "/__t3017/outbound"
-        ]
+        app.router.routes[:] = routes_before
     assert r.status_code == 500
 
 

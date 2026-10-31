@@ -38,6 +38,7 @@ from .canonical import (
     ImportedReservation,
     ImportedScope,
     ImportPreview,
+    pool_problem,
 )
 from .options import coerce_option_value, isc_option_to_canonical, normalise_mac
 
@@ -244,6 +245,8 @@ def _parse_ranges(body: list[_Stmt]) -> tuple[list[ImportedPool], list[str]]:
             pool = _range_to_pool(st)
             if pool is not None:
                 pools.append(pool)
+            else:
+                warnings.append(_no_address_warning(st))
         elif kw == "pool" and st.children is not None:
             class_restriction = None
             for sub in st.children:
@@ -262,20 +265,44 @@ def _parse_ranges(body: list[_Stmt]) -> tuple[list[ImportedPool], list[str]]:
                     pool = _range_to_pool(sub, class_restriction=class_restriction)
                     if pool is not None:
                         pools.append(pool)
+                    else:
+                        warnings.append(_no_address_warning(sub))
     return pools, warnings
+
+
+def _no_address_warning(st: _Stmt) -> str:
+    # A range with no address in it is dropped; say so rather than leave
+    # the operator to find the missing pool after the commit (#3097).
+    text = " ".join(t.value for t in st.parts)
+    return f"Range {text!r} not imported: no address in it."
 
 
 def _range_to_pool(st: _Stmt, *, class_restriction: str | None = None) -> ImportedPool | None:
     # range [dynamic-bootp|dynamic|static] <start> [<end>];
+    # range6 <start> <end>; | range6 <prefix/len> [temporary];
     ips = [
         p.value
         for p in st.parts[1:]
-        if p.kind == "word" and p.value.lower() not in ("dynamic-bootp", "dynamic", "static")
+        if p.kind == "word"
+        and p.value.lower() not in ("dynamic-bootp", "dynamic", "static", "temporary")
     ]
     if not ips:
         return None
     start_ip = ips[0]
     end_ip = ips[1] if len(ips) > 1 else ips[0]
+    if len(ips) == 1 and "/" in start_ip:
+        try:
+            net = ipaddress.ip_network(start_ip, strict=False)
+        except ValueError:
+            pass  # left as is; the subnet check names it in a warning
+        else:
+            start_ip, end_ip = str(net[0]), str(net[-1])
+    # dhcpd takes a range written high-to-low as the same range (#3037).
+    try:
+        if ipaddress.ip_address(start_ip) > ipaddress.ip_address(end_ip):
+            start_ip, end_ip = end_ip, start_ip
+    except (ValueError, TypeError):
+        pass  # not addresses, or mixed families; the subnet check names it
     return ImportedPool(
         start_ip=start_ip, end_ip=end_ip, pool_type="dynamic", class_restriction=class_restriction
     )
@@ -338,6 +365,14 @@ def _build_scope(
     body = st.children or []
     options, lease_time, min_lt, max_lt, opt_warnings = _parse_options_and_leases(body)
     pools, range_warnings = _parse_ranges(body)
+    kept: list[ImportedPool] = []
+    for pool in pools:
+        problem = pool_problem(pool.start_ip, pool.end_ip, cidr)
+        if problem is None:
+            kept.append(pool)
+        else:
+            range_warnings.append(f"Range {pool.start_ip} {pool.end_ip} not imported: {problem}.")
+    pools = kept
 
     # host reservations declared directly inside the subnet block
     inline_res: list[ImportedReservation] = []

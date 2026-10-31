@@ -825,7 +825,7 @@ Supported input formats:
 
 Import behavior:
 - **Dry run first**: always show a preview table of what will be created/updated before committing
-- **Conflict handling**: `skip` / `update` / `error` on existing networks (selectable per import)
+- **Conflict handling**: `skip` / `overwrite` / `fail` on existing networks (selectable per import)
 - **Parent detection**: automatically places imported subnets under the correct block in the hierarchy
 - **Custom fields**: mapped by column name / JSON key
 
@@ -1919,8 +1919,9 @@ Three IP enrichment columns landed in `2026.04.26-1` via migration
 
 ### ✅ 15.15 Subnet operations — find-free / split / merge
 
-Three preview-then-commit endpoints, all with typed-CIDR
-confirmation gates and pg advisory locks held through commit:
+Three endpoints. Find free is a read that mutates nothing; split and
+merge are preview-then-commit, with typed-CIDR confirmation gates and pg
+advisory locks held through commit:
 
 - `POST /ipam/spaces/{id}/find-free` — walks the IPBlock tree for
   unallocated CIDRs of the requested prefix length. Optional
@@ -1930,8 +1931,8 @@ confirmation gates and pg advisory locks held through commit:
   the subnet would hold) and the filter compares against it.
   "Create subnet here" files the subnet under the block the row names
   (which may be a child of the searched block).
-  pre-restricts to that block) and a `min_free_addresses` filter. Opened from a block, the dialog's
-  title, hint and empty state say it searches that block, not the space.
+  Opened from a block, the dialog's title, hint and empty state say it
+  searches that block, not the space.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
@@ -2043,7 +2044,8 @@ WAN IP, a peer's NAT endpoint).
   on either side).
 - **Per-subnet listing** — `GET /ipam/nat-mappings/by-subnet/{id}`
   uses Postgres `inet <<= cidr` containment to find every mapping
-  whose internal IP falls inside a subnet's CIDR.
+  whose internal or external IP falls inside a subnet's CIDR, plus
+  every hide-NAT mapping pinned to the subnet as its source (#2617).
 
 UI: clicking the NAT badge on an IP row opens a modal listing
 every mapping for that IP; new "NAT" tab on the subnet detail

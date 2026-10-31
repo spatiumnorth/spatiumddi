@@ -45,6 +45,7 @@ from typing import Any
 import structlog
 
 from app.config import settings
+from app.core import shutdown as _shutdown
 from app.core.redis_client import make_async_redis
 
 logger = structlog.get_logger(__name__)
@@ -263,6 +264,7 @@ class WakeResult(StrEnum):
     WAKE = "wake"  # a real wake message arrived → re-check now
     TIMEOUT = "timeout"  # tick elapsed with no wake → re-check anyway
     UNAVAILABLE = "unavailable"  # Redis error → degraded to poll fallback
+    SHUTDOWN = "shutdown"  # this api process is stopping (#3015) → answer now
 
 
 class WakeSubscription:
@@ -283,8 +285,11 @@ class WakeSubscription:
         message, TIMEOUT when the tick elapses, UNAVAILABLE (after a
         fallback sleep) on any Redis error so the caller keeps looping
         at the old cadence."""
+        if _shutdown.shutdown_requested():
+            return WakeResult.SHUTDOWN
         if self.degraded or self._pubsub is None:
-            await asyncio.sleep(min(timeout, LONGPOLL_POLL_INTERVAL_FALLBACK))
+            if await _shutdown.sleep_or_shutdown(min(timeout, LONGPOLL_POLL_INTERVAL_FALLBACK)):
+                return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -293,16 +298,47 @@ class WakeSubscription:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return WakeResult.TIMEOUT
-                msg = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=remaining
-                )
+                msg, ended = await self._read_or_shutdown(remaining)
+                if ended:
+                    return WakeResult.SHUTDOWN
                 if msg is not None and msg.get("type") == "message":
                     return WakeResult.WAKE
         except Exception as exc:  # noqa: BLE001 — degrade to poll, never fail the poll
             logger.warning("agent_wake_wait_failed", error=str(exc))
             self.degraded = True
-            await asyncio.sleep(LONGPOLL_POLL_INTERVAL_FALLBACK)
+            if await _shutdown.sleep_or_shutdown(LONGPOLL_POLL_INTERVAL_FALLBACK):
+                return WakeResult.SHUTDOWN
             return WakeResult.UNAVAILABLE
+
+    async def _read_or_shutdown(self, timeout: float) -> tuple[Any, bool]:
+        """One pub/sub read of up to ``timeout``, raced against api shutdown
+        (#3015). Returns ``(message_or_None, shutdown_won)``.
+
+        A race rather than a short read in a loop: a parked poll then costs
+        one timer per wake tick instead of several wakeups a second, which
+        matters with a whole fleet parked on one pod. When shutdown wins the
+        read is cancelled, possibly mid-frame, so the subscription is marked
+        degraded and never read again — it is torn down with the request
+        anyway (``wake_subscription`` owns a dedicated connection).
+        """
+        read = asyncio.ensure_future(
+            self._pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
+        )
+        stop = _shutdown.shutdown_future()
+        try:
+            await asyncio.wait({read, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            _shutdown.discard(stop)
+            if not read.done():
+                read.cancel()
+                self.degraded = True
+                try:
+                    await read
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001 — abandoned read
+                    pass
+        if read.cancelled():
+            return None, True
+        return read.result(), False
 
 
 @asynccontextmanager

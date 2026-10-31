@@ -33,6 +33,19 @@ until every node reports the target, then moves them once (mzac's call on
   and a pod template that changes rolls those pods whatever their image:
   holding the tag alone still rolled the control plane mid-run, on the old
   image, and shut down the worker the drive runs on.
+* A HelmChartConfig holds values, not the chart, and the seed's firstboot
+  renders the control chart from its new slot: a release whose chart
+  changed the api, worker or beat pod template rolled them mid-run all
+  the same (#2865). So while these pins are on, that firstboot keeps the
+  chart back (``spatium-control.yaml.held`` beside the control manifest),
+  and its ``spatium-control-release`` runner releases it once the control
+  chart's pins are gone: at the flip, whichever release drives the run,
+  or when :func:`release_lingering_hold` ends a failed run's hold. The
+  bootstrap pin comes off before the control pins, so the chart goes in
+  after the last of them: one roll, onto the new chart, tag and version.
+  The bootstrap chart (the supervisor DaemonSet, the CNPG operator) is held
+  the same way, as ``spatium-bootstrap.yaml.held``, and released first,
+  when its ``global.imageTag`` pin is off (#3022).
 * The appliance chart cannot be pinned that way (the seed's supervisor
   rewrites that HelmChartConfig whole on every heartbeat), so the hold goes
   to the supervisors instead. Every member's heartbeat carries it
@@ -530,7 +543,10 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
     for), removes every pin (removes the keys: a pin left set to the target
     would outlive the run and stop a later per-node upgrade's firstboot
     from moving the control plane), marks the hold released, which frees
-    the supervisors to write the appliance chart, and wakes them.
+    the supervisors to write the appliance chart, and wakes them. On the
+    seed, the control chart its firstboot held back while the pins were on
+    goes in once they are gone (``spatium-control-release``, #2865): that
+    release is the control plane's roll.
     Idempotent: a drive redelivered mid-flip keeps the first snapshot."""
     record = record_of(run)
     flip_rec = dict(record.get("flip") or {})
@@ -645,8 +661,10 @@ async def release_lingering_hold(db: AsyncSession) -> dict[str, str] | None:
     (or takes every node back): with every node on one version there is
     nothing left to hold, and a hold kept for ever would leave the control
     plane on the old tag. Whichever version it is, the charts then follow
-    the nodes: the seed's firstboot has rendered its own. A run still in
-    flight is never touched: its drive owns the hold."""
+    the nodes: the seed's firstboot has rendered its own, and a control
+    chart it held back while the hold was on goes in once the pins are
+    gone (#2865). A run still in flight is never touched: its drive owns
+    the hold."""
     run = await _newest_hold_run(db)
     if run is None:
         return None

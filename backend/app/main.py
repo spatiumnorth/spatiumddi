@@ -229,8 +229,10 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "DNS Editor": (
         "Create, edit and delete DNS zones, records, views and ACLs, and the "
-        "entries and exceptions of existing blocklists; read every DNS surface. "
-        "Infrastructure stays superadmin-only: server groups, servers and "
+        "entries and exceptions of existing blocklists; manage the TLS "
+        "certificate store DoT / DoH / DoQ serve from (upload, CSR, Let's "
+        "Encrypt, delete — not activating one as the Web UI certificate); "
+        "read every DNS surface. Infrastructure stays superadmin-only: server groups, servers and "
         "their options, TSIG keys, DNSSEC signing and policies, dynamic-update "
         "ACLs, blocklist subscriptions and assignments, GSLB pools (their "
         "health checks probe the network), zone moves and the importers.",
@@ -239,6 +241,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dns_zone"},
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
+            {"action": "admin", "resource_type": "certificate_store"},
             {"action": "read", "resource_type": "manage_dns_pools"},
             {"action": "read", "resource_type": "alert"},
         ],
@@ -307,9 +310,17 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "read", "resource_type": "conformity"},
             {"action": "read", "resource_type": "audit_log"},
+            # The spaces and blocks a subnet sits in: until #3058 any IPAM
+            # read opened them, and the IPAM tree starts there.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "ip_block"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "tls_cert"},
             {"action": "read", "resource_type": "alert"},
@@ -317,15 +328,24 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "Compliance Editor": (
         "Full CRUD on conformity policies (issue #106) plus read on the "
-        "underlying resources (subnets / IPs / zones / scopes) so the "
+        "underlying resources (spaces / blocks / subnets / IPs / zones / "
+        "scopes) so the "
         "compliance team can author + tune policies without touching "
         "operational config.",
         [
             {"action": "admin", "resource_type": "conformity"},
             {"action": "read", "resource_type": "audit_log"},
+            # The spaces and blocks a subnet sits in: until #3058 any IPAM
+            # read opened them, and the IPAM tree starts there.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "ip_block"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
+            # The group a zone sits in and the records it holds: until #3073
+            # any DNS read opened them, and the DNS tree starts at the group.
+            {"action": "read", "resource_type": "dns_group"},
             {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
             {"action": "read", "resource_type": "alert"},
         ],
@@ -341,9 +361,12 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "MetalLB, the kube-api CIDRs and pairing codes. Intended for ops "
         "staff who manage a node's lifecycle without superadmin over the "
         "DDI data plane. Granted ``admin`` on resource_type=appliance; "
-        "superadmin always bypasses anyway.",
+        "superadmin always bypasses anyway. Also granted ``admin`` on "
+        "resource_type=certificate_store, which the TLS store's routes now "
+        "check (#3067) — ``admin`` on ``appliance`` still opens them too.",
         [
             {"action": "admin", "resource_type": "appliance"},
+            {"action": "admin", "resource_type": "certificate_store"},
             {"action": "read", "resource_type": "alert"},
         ],
     ),
@@ -430,6 +453,13 @@ def _log_backup_section_catalog_gap() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
+    # #3015 — startup runs inside uvicorn's Server.capture_signals, so its
+    # SIGTERM handler is installed by now: wrap it so long-polls end the
+    # moment a stop begins rather than after uvicorn's graceful-shutdown cut.
+    from app.core import shutdown as _shutdown  # noqa: PLC0415
+
+    _shutdown.reset()
+    _shutdown.install_signal_hook()
     logger.info("startup", service="api", version=settings.version, debug=settings.debug)
     await _seed_default_admin()
     await _seed_builtin_roles()
@@ -648,7 +678,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
     # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
     # is inserted once by migration f4c2a8e61b93, so an operator who deletes
-    # it keeps it deleted (the #2138 pattern).
+    # it keeps it deleted (the #2138 pattern). Its DHCP twin,
+    # ``dhcp_agent_duplicate_instance`` (#3143), is seeded the same way, by
+    # migration 833ee80c8c6b.
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
@@ -981,6 +1013,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pcap_orphan_task: asyncio.Task[None] = asyncio.create_task(_pcap_orphan_loop())
 
     yield
+    _shutdown.request_shutdown()
 
     if cert_reconcile_task is not None:
         cert_reconcile_task.cancel()

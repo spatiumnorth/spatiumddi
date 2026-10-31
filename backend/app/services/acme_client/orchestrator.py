@@ -437,15 +437,24 @@ async def _store_certificate(
 
     Idempotent on the order's stable name: a re-run for the same order
     updates the existing row in place rather than colliding on the
-    unique ``name``. The row is made the sole active cert; the api deploys
-    it to nginx on the wake published here (#1895).
+    unique ``name``. A fresh issue makes the row the sole active cert; the
+    api deploys it to nginx on the wake published here (#1895) — unless the
+    order was placed with ``activate_on_issue`` false (#3067), which stores
+    the cert for DoT / DoH / DoQ and leaves the Web UI cert alone.
+
+    A renewal (the beat task points ``order.certificate_id`` at the cert it
+    renews, #3061) rewrites that row in place and leaves ``is_active`` as it
+    was: a DNS group's ``tls_certificate_id`` keeps naming the live material,
+    and renewing a DoT-only cert does not make it the Web UI cert.
     """
     info = parse_pem_certificate(chain_pem)
     name = f"letsencrypt-{order.id}"
 
     row = None
+    renewing = False
     if order.certificate_id is not None:
         row = await db.get(ApplianceCertificate, order.certificate_id)
+        renewing = row is not None
     if row is None:
         # Re-run with no prior cert pointer — look up by our stable name.
         row = (
@@ -480,7 +489,8 @@ async def _store_certificate(
         row.valid_to = info.valid_to
     await db.flush()
 
-    await _make_sole_active(db, row)
+    if not renewing and order.activate_on_issue:
+        await _make_sole_active(db, row)
     # Audit the serving-cert swap (non-negotiable #4). This runs off the
     # request thread in the Celery worker, so there is no operator actor —
     # record it as a system action (mirrors the scheduled-task audit
@@ -490,7 +500,7 @@ async def _store_certificate(
             user_id=None,
             user_display_name="system",
             auth_source="system",
-            action="activate",
+            action="renew" if renewing else "activate",
             resource_type="appliance_certificate",
             resource_id=str(row.id),
             resource_display=row.name,

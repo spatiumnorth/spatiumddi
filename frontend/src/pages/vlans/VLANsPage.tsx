@@ -18,6 +18,7 @@ import {
   type VLAN,
   type Subnet,
   type SubnetRole,
+  formatApiError,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -352,10 +353,7 @@ function RouterDetail({
       onDeleted();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete router";
-      setDeleteError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setDeleteError(formatApiError(err, "Failed to delete router"));
     },
   });
 
@@ -650,10 +648,7 @@ function VLANDetail({
       onDeleted();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete VLAN";
-      setDeleteError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setDeleteError(formatApiError(err, "Failed to delete VLAN"));
     },
   });
 
@@ -916,10 +911,7 @@ function RouterFormModal({
         notes,
       });
     } catch (e: unknown) {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(e, "Failed to save"));
     } finally {
       setSubmitting(false);
     }
@@ -1094,10 +1086,7 @@ function VLANFormModal({
     try {
       await onSubmit({ vlan_id: n, name: name.trim(), description });
     } catch (e: unknown) {
-      const msg =
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(formatApiError(e, "Failed to save"));
     } finally {
       setSubmitting(false);
     }

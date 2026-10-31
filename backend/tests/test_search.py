@@ -27,6 +27,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import Group, Role, User
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ownership import Site
 from app.services import feature_modules
 from app.services.search import execute
 from app.services.search.providers import PROVIDERS, _mac_normalized_sql
@@ -769,3 +770,173 @@ async def test_a_grant_scoped_to_one_subnet_finds_that_subnet_and_no_other(
         subnets = {x["id"] for x in r.json()["results"] if x["type"] == "subnet"}
         assert subnets == {str(mine.id)}, q
         assert str(other.id) not in subnets
+
+
+async def _found(client: AsyncClient, token: str, q: str, rtype: str) -> set[str]:
+    r = await client.get("/api/v1/search", headers=_hdr(token), params={"q": q})
+    assert r.status_code == 200
+    return {x["id"] for x in r.json()["results"] if x["type"] == rtype}
+
+
+async def test_a_grant_scoped_to_one_block_finds_that_block_and_nothing_above_it(
+    client: AsyncClient, db_session
+):
+    """#3134: the holder of read on ONE block found nothing: the block
+    provider asked for a type-level read. It now finds its block and no other,
+    and the space holding it stays out of the results (the grant names the
+    block, not the space)."""
+    space = await _space(db_session, "scoped3134")
+    mine = (await _subnet(db_session, space, "10.78.0.0/24")).block_id
+    other = (await _subnet(db_session, space, "10.79.0.0/24")).block_id
+    _, token = await _user(
+        db_session,
+        permissions=[{"action": "read", "resource_type": "ip_block", "resource_id": str(mine)}],
+    )
+    await db_session.flush()
+
+    assert await _found(client, token, "10.78.0.0/16", "block") == {str(mine)}
+    assert await _found(client, token, "blk-", "block") == {str(mine)}
+    assert str(other) not in await _found(client, token, "10.79.0.0/16", "block")
+    assert await _found(client, token, "scoped3134", "space") == set()
+
+
+async def test_a_grant_scoped_to_one_space_or_site_finds_that_row_and_no_other(
+    client: AsyncClient, db_session
+):
+    """#3134: the same for one IP space and one site."""
+    mine = await _space(db_session, "own3134")
+    other = await _space(db_session, "own3134")
+    site = Site(name=f"own3134-{uuid.uuid4().hex[:6]}")
+    other_site = Site(name=f"own3134-{uuid.uuid4().hex[:6]}")
+    db_session.add_all([site, other_site])
+    await db_session.flush()
+    _, token = await _user(
+        db_session,
+        permissions=[
+            {"action": "read", "resource_type": "ip_space", "resource_id": str(mine.id)},
+            {"action": "read", "resource_type": "site", "resource_id": str(site.id)},
+        ],
+    )
+    await db_session.flush()
+
+    assert await _found(client, token, "own3134", "space") == {str(mine.id)}
+    assert await _found(client, token, "own3134", "site") == {str(site.id)}
+    assert str(other.id) not in await _found(client, token, other.name, "space")
+    assert await _found(client, token, "own3134", "block") == set()
+
+
+async def test_a_type_level_block_read_still_finds_every_block(client: AsyncClient, db_session):
+    space = await _space(db_session, "all3134")
+    a = (await _subnet(db_session, space, "10.80.0.0/24")).block_id
+    b = (await _subnet(db_session, space, "10.81.0.0/24")).block_id
+    _, token = await _user(
+        db_session,
+        permissions=[
+            {"action": "read", "resource_type": "ip_block", "resource_id": None},
+            # A scoped grant alongside does not narrow the type-level one.
+            {"action": "read", "resource_type": "ip_block", "resource_id": str(a)},
+        ],
+    )
+    await db_session.flush()
+
+    assert {str(a), str(b)} <= await _found(client, token, "blk-", "block")
+
+
+async def test_a_scoped_grant_reaches_nothing_inside_or_above_its_item(
+    client: AsyncClient, db_session
+):
+    """#3134: a grant names its item and nothing else. Every IPAM row that
+    shares the query (the space above, a child block, a subnet and an address
+    inside) stays out of a block-scoped holder's results, and a space-scoped
+    holder finds the space and none of the rows inside it."""
+    from app.models.ipam import CustomFieldDefinition
+
+    db_session.add(
+        CustomFieldDefinition(
+            resource_type="ip_block",
+            name="team",
+            label="Team",
+            field_type="text",
+            is_searchable=True,
+        )
+    )
+    space = await _space(db_session, "leak3134")
+    subnet = await _subnet(db_session, space, "10.82.0.0/24", name="leak3134-sn")
+    mine = await db_session.get(IPBlock, subnet.block_id)
+    mine.name = "leak3134-mine"
+    mine.custom_fields = {"team": "leak3134"}
+    child = IPBlock(
+        space_id=space.id,
+        parent_block_id=mine.id,
+        network=ipaddress.ip_network("10.82.0.0/20"),
+        name="leak3134-child",
+        description="",
+        custom_fields={"team": "leak3134"},
+    )
+    db_session.add(child)
+    await _address(db_session, subnet, "10.82.0.5", hostname="leak3134-host")
+    await db_session.flush()
+
+    # Type-level read on subnets and addresses runs the custom-field pass,
+    # which emits block rows of its own: they are narrowed like the block
+    # provider's.
+    _, block_token = await _user(
+        db_session,
+        permissions=[
+            {"action": "read", "resource_type": "ip_block", "resource_id": str(mine.id)},
+        ],
+    )
+    _, space_token = await _user(
+        db_session,
+        permissions=[
+            {"action": "read", "resource_type": "ip_space", "resource_id": str(space.id)},
+        ],
+    )
+    _, cf_token = await _user(
+        db_session,
+        permissions=[
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "read", "resource_type": "ip_block", "resource_id": str(mine.id)},
+        ],
+    )
+    await db_session.flush()
+
+    for q in ("leak3134", "10.82.0.5", "10.82.0.0/24"):
+        r = await client.get("/api/v1/search", headers=_hdr(block_token), params={"q": q})
+        assert r.status_code == 200
+        got = {(x["type"], x["id"]) for x in r.json()["results"]}
+        assert got <= {("block", str(mine.id))}, (q, got)
+
+        r = await client.get("/api/v1/search", headers=_hdr(space_token), params={"q": q})
+        got = {(x["type"], x["id"]) for x in r.json()["results"]}
+        assert got <= {("space", str(space.id))}, (q, got)
+
+    assert await _found(client, block_token, "leak3134", "block") == {str(mine.id)}
+    assert await _found(client, space_token, "leak3134", "space") == {str(space.id)}
+    assert await _found(client, cf_token, "leak3134", "block") == {str(mine.id)}
+
+
+async def test_a_resource_scoped_token_does_not_widen_the_instance_scoped_gate(db_session):
+    """#3134: the instance-scoped providers are admitted on the same coarse
+    gate their list route makes, which a resource-scoped API token (#374)
+    narrows. A token bound to one subnet, owned by a user with type-level
+    reads, runs the subnet provider and none of block / space / site."""
+    from app.services.search import visible_providers
+
+    user, _ = await _user(
+        db_session,
+        permissions=[
+            {"action": "read", "resource_type": rt}
+            for rt in ("subnet", "ip_block", "ip_space", "site")
+        ],
+    )
+    await db_session.refresh(user, ["groups"])
+    space = await _space(db_session)
+    subnet = await _subnet(db_session, space, "10.83.0.0/24")
+    user._api_token_resource_grants = [  # type: ignore[attr-defined]
+        {"action": "read", "resource_type": "subnet", "resource_id": str(subnet.id)}
+    ]
+
+    types = {p.type for p in await visible_providers(db_session, user)}
+    assert "subnet" in types
+    assert not types & {"block", "space", "site"}

@@ -40,6 +40,8 @@ from typing import Any
 
 import httpx
 
+from app.core.exc_text import describe_exc
+
 from .canonical import (
     ImportedRecord,
     ImportedSOA,
@@ -360,7 +362,7 @@ async def parse_powerdns_server(
             resp = await client.get(zones_url)
         except httpx.HTTPError as exc:
             raise PowerDNSImportError(
-                f"Could not reach PowerDNS API at {zones_url!r}: {exc}"
+                f"Could not reach PowerDNS API at {zones_url!r}: {describe_exc(exc)}"
             ) from exc
         if resp.status_code == 401:
             raise PowerDNSImportError(
@@ -430,7 +432,7 @@ async def parse_powerdns_server(
                         view_name=None,
                         forwarders=[],
                         skipped_record_types={},
-                        parse_warnings=[f"Failed to fetch full zone payload: {exc}"],
+                        parse_warnings=[f"Failed to fetch full zone payload: {describe_exc(exc)}"],
                     )
                 )
                 continue
@@ -480,7 +482,7 @@ async def test_powerdns_connection(
         try:
             resp = await client.get(url)
         except httpx.HTTPError as exc:
-            raise PowerDNSImportError(f"Could not reach {url!r}: {exc}") from exc
+            raise PowerDNSImportError(f"Could not reach {url!r}: {describe_exc(exc)}") from exc
         if resp.status_code == 401:
             raise PowerDNSImportError("PowerDNS rejected the API key (HTTP 401)")
         if resp.status_code == 404:

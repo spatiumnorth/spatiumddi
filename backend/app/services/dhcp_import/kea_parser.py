@@ -39,6 +39,7 @@ from .canonical import (
     ImportedReservation,
     ImportedScope,
     ImportPreview,
+    pool_problem,
 )
 from .options import coerce_option_value, kea_option_to_canonical, normalise_mac
 
@@ -145,14 +146,19 @@ def _parse_option_data(raw: list[dict[str, Any]] | None, *, address_family: str)
 
 def _parse_pool(entry: dict[str, Any]) -> ImportedPool | None:
     """Kea pool: ``{"pool": "10.0.0.10 - 10.0.0.100"}`` or
-    ``{"pool": "10.0.0.0/25"}``."""
+    ``{"pool": "10.0.0.0/25"}``.
+
+    Kea removes every space from the string, then splits at the dash, so
+    ``a-b`` and ``a - b`` are the same range. Returns None when the
+    string is not a range (or CIDR, or single address) at all; the caller
+    turns that into a preview warning.
+    """
     raw = entry.get("pool")
     if not raw or not isinstance(raw, str):
         return None
-    raw = raw.strip()
-    if " - " in raw or " -" in raw or "- " in raw:
-        start, _, end = raw.partition("-")
-        start_ip, end_ip = start.strip(), end.strip()
+    raw = "".join(raw.split())
+    if "-" in raw:
+        start_ip, _, end_ip = raw.partition("-")
     elif "/" in raw:
         try:
             net = ipaddress.ip_network(raw, strict=False)
@@ -221,8 +227,20 @@ def _parse_subnet(
     for p in entry.get("pools") or []:
         if isinstance(p, dict):
             pool = _parse_pool(p)
-            if pool is not None:
+            problem = (
+                "not a valid address range"
+                if pool is None
+                else pool_problem(pool.start_ip, pool.end_ip, canonical)
+            )
+            if problem is not None:
+                parse_warnings.append(f"Pool {p.get('pool')!r} not imported: {problem}.")
+            elif pool is not None:
                 pools.append(pool)
+        else:
+            # Kea wants each pool as an object with a "pool" key; a bare
+            # string or number is not one, and dropping it silently would
+            # leave the operator no notice of the missing range (#3097).
+            parse_warnings.append(f"Pool {p!r} not imported: not a pool object.")
 
     reservations: list[ImportedReservation] = []
     skipped_duid = 0

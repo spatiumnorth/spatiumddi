@@ -27,6 +27,7 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.update_nulls import changed_keys, snapshot
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
@@ -40,6 +41,7 @@ from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.agents.spool_status import SpoolStatus
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
@@ -185,6 +187,19 @@ HA_STATE_DESCRIPTION = (
 )
 
 
+def _duplicate_agent_fields(s: DHCPServer) -> dict[str, Any]:
+    """#3143 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -265,6 +280,16 @@ class ServerResponse(BaseModel):
     # (``container_oom.daemon_reported_by``), the same reading the alert's
     # wording uses.
     daemon_reported_by: Literal["agent", "supervisor"] | None = None
+    # #3143 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served. Derived
+    # (``instance_ownership.duplicate_active``), as the
+    # ``dhcp_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -342,6 +367,7 @@ class ServerResponse(BaseModel):
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
             daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -694,6 +720,7 @@ async def update_server(
         refusal = await server_join_refusal(db, s, target_group)
         if refusal is not None:
             raise HTTPException(status_code=422, detail=refusal)
+    before = snapshot(s, changes)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -833,7 +860,7 @@ async def update_server(
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=audit_payload,
     )
     await db.commit()

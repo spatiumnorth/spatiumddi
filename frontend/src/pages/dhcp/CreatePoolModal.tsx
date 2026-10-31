@@ -1,17 +1,39 @@
 import { useState } from "react";
+import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
-export function CreatePoolModal({
-  pool,
-  scope,
-  onClose,
-}: {
+type CreatePoolModalProps = {
   pool?: DHCPPool;
   scope: DHCPScope;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the pool fresh on open (#3091): the row the page holds comes from
+// a cached list, and the form is seeded once. A pool has no read of its own,
+// so it is looked up in its scope's list.
+export function CreatePoolModal(props: CreatePoolModalProps) {
+  const fresh = useFreshRow(props.pool, async () =>
+    (await dhcpApi.listPools(props.scope.id)).find(
+      (p) => p.id === props.pool!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Pool"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <PoolModalForm {...props} pool={fresh.row} />;
+}
+
+function PoolModalForm({ pool, scope, onClose }: CreatePoolModalProps) {
   const qc = useQueryClient();
   const editing = !!pool;
   const [name, setName] = useState(pool?.name ?? "");
@@ -58,7 +80,7 @@ export function CreatePoolModal({
   });
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const data: Partial<DHCPPool> = isPd
         ? {
             name,
@@ -82,9 +104,26 @@ export function CreatePoolModal({
               ? { lease_time_override: null }
               : {}),
           };
-      return editing
-        ? dhcpApi.updatePool(scope.id, pool!.id, data)
-        : dhcpApi.createPool(scope.id, data);
+      if (!editing) return dhcpApi.createPool(scope.id, data);
+      // Send only what changed (#3091), so a Save that touches nothing leaves
+      // the pool as it is, and an edit cannot write back a range or class
+      // another surface has since changed.
+      const diff = changedFields(
+        {
+          name: pool!.name,
+          start_ip: pool!.start_ip,
+          end_ip: pool!.end_ip,
+          pool_type: pool!.pool_type,
+          class_restriction: pool!.class_restriction ?? null,
+          lease_time_override: pool!.lease_time_override ?? null,
+          pd_prefix: pool!.pd_prefix ?? null,
+          delegated_length: pool!.delegated_length ?? null,
+          excluded_prefix: pool!.excluded_prefix ?? null,
+        },
+        data,
+      );
+      if (Object.keys(diff).length === 0) return pool!;
+      return dhcpApi.updatePool(scope.id, pool!.id, diff);
     },
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["dhcp-pools", scope.id] });

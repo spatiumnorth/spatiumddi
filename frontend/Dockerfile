@@ -79,6 +79,10 @@ COPY frontend/15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.e
 # Renders FRONTEND_TRUSTED_PROXY_CIDRS into nginx's set_real_ip_from lines + the
 # X-Forwarded-Proto trust map (#1868). Unset = trust no proxy.
 COPY frontend/16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.envsh
+# Renders the ``listen [::]`` lines + the resolver's ``ipv6=off`` from whether the
+# container has IPv6 at all (#2308), so one image serves IPv4-only, dual-stack
+# and IPv6-only clusters.
+COPY frontend/17-ipv6.envsh /docker-entrypoint.d/17-ipv6.envsh
 # Reloads nginx in place when the mounted TLS certificate changes, so a new
 # Web UI certificate never needs the frontend pods replaced (#1173). Without a
 # mounted certificate (Docker Compose) it exits and watches nothing.

@@ -108,7 +108,7 @@ for the "no DHCPOFFER" diagnosis flow.
 This is the most granular part of the DHCP model. Within a **subnet**, you can define:
 - Multiple **pools** with different behaviors (dynamic, reserved, excluded)
 - **Static assignments** (fixed IPs by MAC address)
-- **Pool-level DHCP options** that override subnet defaults
+- **Pool-level DHCP options** that override subnet defaults (set through the API as `options_override`; the console's New Pool dialog has no options field)
 
 ### Hierarchy
 
@@ -473,9 +473,9 @@ errors.
 |---|---|---|---|
 | Infrastructure | 10.1.2.1–10.1.2.20 | excluded | Gateways, servers — never DHCP |
 | Static Only | 10.1.2.21–10.1.2.50 | reserved | Printers with static assignments |
-| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, short lease, option 150 |
+| VoIP Phones | 10.1.2.51–10.1.2.100 | dynamic | Class: VoIP, option 150 (by API) |
 | Workstations | 10.1.2.101–10.1.2.200 | dynamic | Standard lease, all defaults |
-| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, 2h lease, no internal DNS |
+| Guest WiFi | 10.1.2.201–10.1.2.240 | dynamic | Class: Guest, options by API (no internal DNS) |
 | Management | 10.1.2.241–10.1.2.254 | excluded | Network equipment |
 
 ---
@@ -515,8 +515,8 @@ empty.
 **Prerequisite — create a scope for the subnet.** A scope lives on a DHCP
 **server group** that has at least one Kea member (DHCP is group-centric —
 scopes / pools / statics / classes all belong to the group). Create it from
-**IPAM → the subnet → "DHCP Pools" tab → Create Scope**, or from
-**DHCP → the server group → Scopes tab → New Scope**. A dynamic pool is optional;
+**IPAM → the subnet → DHCP tab → Create Scope**, or from
+**DHCP → the server group → Scopes tab → "+ Serve leases on subnet…"** (pick the subnet). A dynamic pool is optional;
 the scope alone is enough to emit the `subnet4` block that reservations hang off.
 
 **Create the reservation — two equivalent paths:**
@@ -525,7 +525,7 @@ the scope alone is enough to emit the `subnet4` block that reservations hang off
 New static assignment**. Pick the scope (a picker appears when the group has
 more than one), then enter the MAC + IP + hostname and save. Edit and Delete
 live on the per-row right-click menu. Creating / editing / deleting a
-reservation requires a **superadmin**.
+reservation requires `write` / `delete` on `dhcp_static` (the built-in DHCP Editor role holds `admin` on it).
 
 *From IPAM (at allocation time):*
 
@@ -572,7 +572,7 @@ Assignments** tab lists every reservation across the group's scopes.
   statics endpoints enforce. Without the grant the IPAM write still succeeds
   but the reservation is left untouched and the response carries the
   permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
-  still requires a superadmin, as above.
+  takes the same `dhcp_static` grants, as above.
 - **Deleting the address follows the same rule.** Deleting an IPAM row (or
   purging orphans) removes the reservations linked to it, on the DHCP server
   too, so it needs `delete` on `dhcp_static`. Without it the delete is
@@ -1393,6 +1393,38 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
    events, activity log, metrics — in order, then reconciles leases from a
    full Kea snapshot (see *Push spool* below, #1077)
 
+**When a second agent process claims the same server
+([#3143](https://github.com/spatiumnorth/spatiumddi/issues/3143)):**
+A cloned Kea VM, or two agent containers given one state directory, keeps
+the same `agent_id`, so both authenticate as one server. Before #3143 they
+shared the server's one token: each registration or token rotation made
+the other's token stale, and the pair traded `401 Stale token` and
+re-registrations forever while the server row flapped between them. The
+DHCP agent now names its process (`X-Spatium-Agent-Instance`, a random id
+per process, not persisted) on every config poll, heartbeat and
+registration, and the control plane applies the DNS agent's rules
+(see [DNS_AGENT.md §2, *Duplicate agent processes*](../deployment/DNS_AGENT.md#duplicate-agent-processes)):
+1. Only the newest process is served. A process the server has never seen
+   takes over at once, so replacing or restarting an agent is unchanged.
+2. The one it displaced, if it polls or registers again while the owner is
+   still polling, is answered `409` with
+   `X-Spatium-Duplicate-Agent-Instance: 1`. No token is minted, and its
+   heartbeats never rotate the token, so the owner keeps a working one.
+3. The refused agent logs `sync_duplicate_agent_instance` (or
+   `register_duplicate_agent_instance`), **keeps Kea serving the config it
+   already has**, and asks again every 30 s. If the owner stops polling for
+   5 minutes, it takes the server back by itself.
+4. Refusals that last over 2 minutes show a **Duplicate agent** chip on the
+   server row and detail, with the address the refused agent polled from,
+   set `duplicate_agent` on the `list_dhcp_servers` MCP tool, and raise the
+   default-on `dhcp_agent_duplicate_instance` alert ("Two DHCP agents on one
+   server"). All clear 10 minutes after the extra agent stops.
+
+Kea HA pairs are not affected: each peer has its own `agent_id`. An agent
+older than #3143 sends no process id and registers and polls exactly as
+before. To fix a duplicate, stop the extra agent, or clear its state
+directory so it registers as a server of its own.
+
 ### Cache Format
 
 Cached config is stored in a structured JSON file:
@@ -1523,22 +1555,17 @@ the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 ### Push (IPAM → DHCP Server)
 Triggered by:
 - Scope/pool/static assignment create/update/delete
-- Manual "Force Sync" from UI
-- Scheduled full sync (default: every 5 minutes)
+- Manual "Force Sync" from UI (every server except Windows DHCP)
 
-The push is **diff-based** — only changed objects are sent, not a full config replacement. This prevents unnecessary DHCP server disruption.
+There is no scheduled full push. Kea agents long-poll the control plane for the whole config bundle by ETag, so any change that alters the rendered config reaches them within seconds; the agent applies the bundle it gets rather than a diff.
 
 ### Pull (DHCP Server → IPAM)
 Triggered by:
 - Lease events (real-time via webhook or Kea hook)
-- Scheduled lease dump pull (fallback)
-- Manual "Import Leases" from UI
+- Scheduled lease pull for agentless servers (Windows DHCP, FortiGate), gated by **Settings → DHCP Lease Sync**
+- Manual **Sync Leases** on a Windows DHCP server's detail page (other servers show Force Sync instead)
 
-### Reconciliation Report
-Available from the admin UI: compares IPAM DB state vs. live DHCP server state and flags:
-- IPs in DHCP scope but not in IPAM
-- Static assignments in DHCP not in IPAM
-- Scopes in DHCP not known to IPAM
+There is no DHCP reconciliation report in the console or the API; drift between IPAM and a live DHCP server is not reported as a diff.
 
 ---
 

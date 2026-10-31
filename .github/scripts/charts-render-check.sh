@@ -60,6 +60,22 @@
 #                      dedicated pass asserting the appliance's api / worker /
 #                      frontend retire first at one replica too, where the
 #                      blocking term rides on the OUTGOING pods (#1541).
+#   hpa-replicas     — every render, plus --require passes, a control and
+#                      negative controls: a workload an autoscaler scales
+#                      renders no ``spec.replicas`` (#3111), while the
+#                      appliance's api (autoscaler off) keeps its count. Helm
+#                      4 applies server-side, so a rendered count made helm an
+#                      owner of the field the autoscaler writes, and every
+#                      ``helm upgrade`` failed on it once the autoscaler had
+#                      scaled.
+#   footprint        — dedicated pass over the default render, an opt-in
+#                      render and negative controls: the api autoscaler aims at
+#                      least at one api pod's measured use and scales on CPU
+#                      alone unless memory is asked for, and the api's request
+#                      and the api and worker limits hold what they were
+#                      measured to use (#3110). At 80 % of the old 256Mi
+#                      request one idle api process sat above the memory
+#                      target, and every default install ran 10 replicas.
 #   template-stable  — dedicated pass over the appliance renders at one replica
 #                      and at three: the frontend's pod template must be the
 #                      same in both (#2450). The first promotion only raises
@@ -88,6 +104,13 @@
 #                      included (#2878), and the supervisor's namespace Role
 #                      grants what its re-clone of a stuck instance needs,
 #                      pods/log get + pods patch (#2132).
+#   cnpg-node-local  — dedicated umbrella render with the appliance's CNPG
+#                      values, a --require pass over it and over the HA render,
+#                      and negative controls: the appliance's instance pods take
+#                      the API server from their own node (``status.hostIP``,
+#                      port 6443) and the umbrella default sets neither
+#                      variable (#3021). A primary whose API connection landed
+#                      on a lost node was restarted by its own liveness probe.
 #   bind9 memory     — the appliance dns-bind9 container takes its memory from
 #                      ``dnsBind9.memory`` (sized from node RAM by the
 #                      supervisor, #2223) and an explicit memory in
@@ -201,6 +224,10 @@ render() { # name chart [helm --set args...]
     # wedges once replicas == nodes.
     python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" "$file" \
         || failures=$((failures + 1))
+    # #3111 — an autoscaled workload must leave spec.replicas to the
+    # autoscaler, or helm upgrade fails on it under server-side apply.
+    python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -307,12 +334,15 @@ render umbrella-appliance-mirror "$UMBRELLA" \
 # demote replaces still carry the 3-node required term, which keeps a
 # surged pod off the only node for good — so api and worker must retire
 # first at one replica as well as at three.
+# #3111 — and the api autoscaler off, as firstboot renders it: the appliance's
+# api count is its control-plane size (``api.replicas``), which helm sets.
 APPLIANCE_CP_HARD=(
     --set api.podAntiAffinity=hard
     --set worker.podAntiAffinity=hard
     --set frontend.podAntiAffinity=hard
     --set frontend.hostNetwork=true
     --set api.service.trafficDistribution=PreferSameNode
+    --set api.autoscaling.enabled=false
 )
 for n in 1 3; do
     render "umbrella-appliance-cp-$n" "$UMBRELLA" "${APPLIANCE_CP_HARD[@]}" \
@@ -361,6 +391,139 @@ neg1805() { # label manifest [chart-api-node-local.py flags...]
 }
 neg1805 "the default render read as the appliance's" "$OUT/umbrella-defaults.yaml" --require
 neg1805 "an appliance render read as the default" "$OUT/umbrella-appliance-cp-3.yaml" \
+    --require --absent
+
+# #3111 — the autoscaler alone sets the api's replica count. The default render
+# (a BYO-Kubernetes install, autoscaler on) and the all-on render must leave
+# ``spec.replicas`` off the api Deployment; the appliance's values turn the
+# autoscaler off, and there helm keeps rendering ``api.replicas``, at one
+# replica and at three. --require so no pass can succeed by rendering no
+# autoscaler at all.
+echo "── api replicas: the autoscaler's while it is on, api.replicas while it is off (umbrella, #3111)"
+python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" --require \
+    "$OUT/umbrella-defaults.yaml" "$OUT/umbrella-all-on.yaml" || failures=$((failures + 1))
+for n in 1 3; do
+    python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" --replicas "api=$n" \
+        "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
+done
+# Negative controls: the default render as it was before #3111 (``replicas: 2``
+# beside the autoscaler) and an appliance api that lost its count must each be
+# refused, naming #3111, or the passes above could be reading renders they
+# cannot parse.
+echo "── negative controls: the #3111 guard must refuse each wrong render"
+api_replicas() { # source-render out-file set|drop
+    python3 - "$@" <<'PYEOF'
+import sys, yaml
+src, dst, how = sys.argv[1:4]
+docs = [d for d in yaml.safe_load_all(open(src)) if d]
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["labels"].get("app.kubernetes.io/component") == "api":
+        if how == "set":
+            d["spec"]["replicas"] = 2
+        else:
+            d["spec"].pop("replicas", None)
+with open(dst, "w") as fh:
+    yaml.safe_dump_all(docs, fh)
+PYEOF
+}
+neg3111() { # label manifest [chart-hpa-replicas.py flags...]
+    local label="$1" file="$2"; shift 2
+    local out rc
+    out="$(python3 "$ROOT/.github/scripts/chart-hpa-replicas.py" "$@" "$file" 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#3111"; then
+        echo "   ok: $label refused by the #3111 guard"
+    else
+        echo "   FAIL: expected the #3111 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+api_replicas "$OUT/umbrella-defaults.yaml" "$OUT/neg-hpa-replicas-set.yaml" set
+api_replicas "$OUT/umbrella-appliance-cp-3.yaml" "$OUT/neg-hpa-replicas-dropped.yaml" drop
+neg3111 "an autoscaled api rendering replicas: 2" "$OUT/neg-hpa-replicas-set.yaml" --require
+neg3111 "an appliance api without its count" "$OUT/neg-hpa-replicas-dropped.yaml" --replicas api=3
+
+# #3110 — the chart's default sizing holds what the api and the worker were
+# measured to use (docs/deployment/SIZING.md, Kubernetes): the api autoscaler
+# aims at least at one api pod's use at rest and under light load, and by
+# default scales on CPU alone (memory is opt-in); the api's memory request
+# holds its working set; the api and worker limits leave the sizing guide's
+# headroom. On the default render only: the appliance sizes the limits from
+# the node's RAM. --require so the pass cannot succeed on a render with no api.
+echo "── api and worker sizing hold their measured use (umbrella, #3110)"
+python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require \
+    --expect-metrics cpu "$OUT/umbrella-defaults.yaml" || failures=$((failures + 1))
+# The opt-in memory metric renders, and at the 512Mi request 80 % aims above
+# that use.
+helm template hpa-memory "$UMBRELLA" --kube-version "$K8S_VERSION" \
+    --set api.autoscaling.targetMemoryUtilizationPercentage=80 \
+    | python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require \
+        --expect-metrics cpu,memory - || failures=$((failures + 1))
+# Negative controls: each value as the chart shipped it before #3110 must be
+# refused by its own rule, or the passes above could be reading renders they
+# cannot parse. Decided on the guard's message, not its exit status alone.
+echo "── negative controls: the #3110 guard must refuse the pre-#3110 sizing"
+neg3110() { # label expected-message [helm --set args...]
+    local label="$1" expect="$2"; shift 2
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" "$@" \
+        | python3 "$ROOT/.github/scripts/chart-control-plane-footprint.py" --require - 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$expect"; then
+        echo "   ok: $label refused by the #3110 guard"
+    else
+        echo "   FAIL: expected the #3110 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg3110 "a memory target at 80 % of a 256Mi request" \
+    "aims memory at 80 % of 256Mi = 205 MiB" \
+    --set api.resources.requests.memory=256Mi \
+    --set api.autoscaling.targetMemoryUtilizationPercentage=80
+neg3110 "a 256Mi api memory request" "the api's memory request is 256Mi" \
+    --set api.resources.requests.memory=256Mi
+neg3110 "a CPU target at 70 % of 100m" "aims CPU at 70 % of 100m = 70m" \
+    --set api.resources.requests.cpu=100m
+neg3110 "a 512Mi api memory limit" "the api's memory limit is 512Mi" \
+    --set api.resources.limits.memory=512Mi
+neg3110 "a 1Gi worker memory limit" "the worker's memory limit is 1Gi" \
+    --set worker.resources.limits.memory=1Gi
+
+# #3021 — the CNPG instance pods reach the API server on their own node, which
+# the appliance sets (firstboot's HelmChart and the supervisor's
+# HelmChartConfig, ``postgresql.cnpg.nodeLocalApiServer.enabled``). The
+# umbrella default (a BYO-Kubernetes install, whose nodes need not serve the
+# API on their own address) keeps the kubernetes Service, as before #3021: the
+# HA render above must set neither variable, the appliance's values both.
+# --require on each, so neither can pass by rendering no Cluster at all.
+UMBRELLA_APPLIANCE_CNPG=(
+    "${UMBRELLA_HA[@]}"
+    --set postgresql.cnpg.nodeLocalApiServer.enabled=true
+)
+render umbrella-appliance-cnpg "$UMBRELLA" "${UMBRELLA_APPLIANCE_CNPG[@]}"
+echo "── CNPG instances: the kubernetes Service by default, the node's own API server on the appliance (umbrella, #3021)"
+python3 "$ROOT/.github/scripts/chart-cnpg-node-local-api.py" --require --absent \
+    "$OUT/umbrella-ha.yaml" || failures=$((failures + 1))
+python3 "$ROOT/.github/scripts/chart-cnpg-node-local-api.py" --require \
+    "$OUT/umbrella-appliance-cnpg.yaml" || failures=$((failures + 1))
+echo "── negative controls: the #3021 guard must refuse each wrong render"
+neg3021() { # label manifest [chart-cnpg-node-local-api.py flags...]
+    local label="$1" file="$2"; shift 2
+    local out rc
+    out="$(python3 "$ROOT/.github/scripts/chart-cnpg-node-local-api.py" "$@" "$file" 2>&1)" \
+        && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "#3021"; then
+        echo "   ok: $label refused by the #3021 guard"
+    else
+        echo "   FAIL: expected the #3021 guard to refuse $label (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg3021 "the default render read as the appliance's" "$OUT/umbrella-ha.yaml" --require
+neg3021 "an appliance render read as the default" "$OUT/umbrella-appliance-cnpg.yaml" \
     --require --absent
 # #2450 — the first promotion takes the appliance's frontend from one replica
 # to the node count, and the supervisor's overrides change nothing else in its
@@ -560,7 +723,8 @@ else
     failures=$((failures + 1))
 fi
 POSTURE_ARGS=""
-coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
+coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}" \
+    "${UMBRELLA_APPLIANCE_CNPG[@]}"
 
 # #1553 — the dns-agent template must REFUSE encrypted-transport ports a
 # flavor cannot serve (DoQ on anything but Technitium; DoT/DoH on

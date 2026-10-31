@@ -64,6 +64,10 @@ The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footp
 | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
 | **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 32 GiB SSD |
 
+Measured memory, CPU and disk for these roles and for a three-node control
+plane, the minimums, and how to measure your own install are in
+[`SIZING.md`](SIZING.md).
+
 **Measured floors (single node, 2026-09).** The recommendation above was
 tested against a fixed load rather than guessed: a single-node control
 plane serving one agent-based DNS group of **250k A records (+250k PTR)**
@@ -84,10 +88,12 @@ generator's view alone.
 Three things shape those numbers, and all three are the appliance's job,
 not the operator's:
 
-- The chart's default api limit (512Mi) cannot build the agent config
-  bundle for a group of this size, and the default worker limit (1Gi with
-  four prefork processes) is OOM-killed under lease/DDNS churn long before
-  the VM runs short. The supervisor therefore sizes both from the node's
+- The chart's default limits (api 1Gi, worker 2Gi since #3110) are sized
+  for everyday use, not for this load. At the older defaults the api
+  (512Mi) could not build the agent config bundle for a group of this
+  size, and the worker (1Gi with four prefork processes) was OOM-killed
+  under lease/DDNS churn long before the VM ran short. The supervisor
+  therefore sizes both from the node's
   RAM — api = ½ RAM (1–8 GiB), worker = ⅖ RAM (1–16 GiB, but never more
   than the api and Postgres leave), two worker processes on nodes of 12 GiB
   or less — and writes them into the `spatium-control` HelmChartConfig,
@@ -172,7 +178,12 @@ recommendation (4 vCPU / 8 GiB); the members carry the same api / worker /
 Postgres / Redis replicas. Measured on `main` (2026-09-03): three 6.5 GiB /
 4 vCPU nodes formed cleanly and kept every api replica and every k3s
 server up through the same 250k-record / 20k-device load and a kill-leader
-drill (0 k3s restarts, at most one api restart).
+drill (0 k3s restarts, at most one api restart). Measured again on 1.0
+pre-release builds (October 2026): a first node of 4 vCPU / 8 GiB with two
+of 2 vCPU / 6 GiB ran the realistic load, the HA drills and a rolling
+upgrade with no OOM kill, using at most 4.4 GiB on any node. Give every node
+48 GiB of disk: a slot upgrade followed by a rolling upgrade took `/var` on
+40 GiB disks to the 80% disk warning. See [`SIZING.md`](SIZING.md).
 
 **Data disk for large installs (#2240).** Everything that grows with the data lives on `/var`: the Postgres volumes, etcd, the container images and the logs. `/var` is what the disk has left after about 17 GiB of fixed partitions (`spatium-install`: the boot partitions, a 256 MiB state partition and two 8 GiB root slots), so a 40 GiB disk gives 23 GiB of `/var` and a 64 GiB disk 47 GiB. On a seven-node test cluster with 40 GiB disks and every node serving DNS, `/var` reached 88 to 91% on every node at about 1.5M records (about 770,000 devices, an A record and its PTR each), growing about 2 GB an hour per node while records were added at 80 to 190 a second. With the disks grown online to 64 GiB, `/var` read 43 to 45%, and the cluster went on to store 1M devices (2M records). So **for about 1M devices, give every control-plane node a disk of 64 GiB or more**: the 40 GiB above goes with the load the floors were measured at (250k A records and their PTRs). Leave room beyond that for Postgres WAL. After a failover, a primary that still holds replication slots for standbys that cannot follow keeps every WAL segment, and on 64 GiB disks one node's `/var` reached 87% with 26 GB of WAL against 3.3 GB of data (#2317). The default-on `appliance_disk_usage` alert watches `/var` on every node: a warning at 80% and critical at 87%, a few points before the kubelet starts evicting pods at about 90%. Those figures count the 5% that ext4 keeps for root as free, so `df` shows a few points more (see [`OBSERVABILITY.md`](../OBSERVABILITY.md)).
 
@@ -1676,7 +1687,7 @@ Surfacing: a fresh `blocked` verdict renders in bold red on the console identity
 The Talos-style console got a wave of usability fixes:
 
 - F9 / Diag chip removed (handler was a no-op). *(Later, #556) F9 is repurposed to **Cancel pending reboot** — shown only while a reboot is queued; it stops the reboot service mid-grace and removes the trigger, aborting a web-UI / Fleet reboot from the physical console. The Slot-box indicator reads `REBOOT pending — F5 now · F9 cancel`.*
-- *(#2974)* **Every operator-initiated reboot or power-off hands the PostgreSQL primary off first.** The web-UI reboot (`spatiumddi-reboot.service`) and the console's F5 / F6 (`spatium-power-action@reboot|poweroff.service`, started without waiting, so the dashboard keeps rendering and a console restart cannot kill the run) all go through `spatium-power-action`, which runs `spatium-reboot-handoff --before-reboot` (as the Fleet reboot does, #2849) and then `systemctl reboot` / `poweroff`. On the node holding the primary that adds up to a few minutes, bounded: the handoff is capped at 240 s and the reboot goes on whatever it did. The Slot box reads `REBOOT under way — handing off DB primary · F9 cancel` meanwhile, and F9 stops it and uncordons the node. The node stays cordoned through the reboot and uncordons itself at its next boot (`spatiumddi-reboot-handoff.service`); **a node powered off for good stays cordoned in the cluster** until it is booted again or removed from the cluster.
+- *(#2974)* **Every operator-initiated reboot or power-off hands the PostgreSQL primary off first.** The web-UI reboot (`spatiumddi-reboot.service`) and the console's F5 / F6 (`spatium-power-action@reboot|poweroff.service`, started without waiting, so the dashboard keeps rendering and a console restart cannot kill the run) all go through `spatium-power-action`, which runs `spatium-reboot-handoff --before-reboot` (as the Fleet reboot does, #2849) and then `systemctl reboot` / `poweroff`. On the node holding the primary that adds up to a few minutes, bounded: the handoff is capped at 240 s and the reboot goes on whatever it did. The Slot box reads `REBOOT under way — handing off DB primary · F9 cancel` meanwhile (just `REBOOT under way · F9 cancel` on a one-node install, which has no primary to hand off; the console's run holds a 10 s grace first, `SPATIUM_POWER_ACTION_GRACE_S`, so the web UI sees it under way), and F9 stops it and uncordons the node. The node stays cordoned through the reboot and uncordons itself at its next boot (`spatiumddi-reboot-handoff.service`); **a node powered off for good stays cordoned in the cluster** until it is booted again or removed from the cluster. *(#3008)* The Fleet reboot (`spatiumddi-reboot-agent`) now runs the same wrapper after its 5 s grace, so it gets the same banner and F9 cancel. While the wrapper runs it holds an `flock` on the release-state directory, which `GET /api/v1/appliance/system/info` reports as `reboot_in_progress` (with `node`, the node whose api pod answered): the web UI's Reboot button stays disabled through the handoff. `reboot_in_progress` also reads a pending web-UI or Fleet trigger, the Fleet agent's `reboot-fleet-grace` marker (held from taking its trigger until it exits, so the console's F9 can cancel a Fleet reboot during its grace too), and `power-action-issued`, which the wrapper writes just before `systemctl reboot` stamped with the host's boot id, so the flag holds until the node is actually down and clears itself with the reboot.
 - Control-plane reachability chip (#556, appliance role only) — a ≤ 2 s TCP probe of `CONTROL_PLANE_URL`, fanned out in the data-tier pool so it overlaps the kubectl forks. Rendered on the header identity row so an operator can distinguish "network-partitioned" from "unapproved" (which `pairing_status` alone can't). Off on the control-plane role (empty URL).
 - Live-log noise filter — Python traceback frames, caret indicators, systemd restart-counter spam dropped before they hit the renderer; `--since` window 10 min → 2 min so crash spam clears 5× faster.
 - CPU usage 92 % → 1.4 % — Rich Live had its background `auto_refresh` thread + main loop both rendering at 4 Hz. Fixed with `auto_refresh=False` + main-loop tick 0.25 s → 0.5 s.
@@ -1699,7 +1710,7 @@ By default the appliance boots quietly (`loglevel=3` — only kernel errors reac
 - **`text_console`** — verbose boot, then a standard getty login (`spatium-console=off`) instead of the cockpit — boot looks like a regular Linux server end-to-end.
 
 - **Mechanism.** Backed by `platform_settings.console_mode` (Literal-validated to the three values; migration `a7c3e9f1b405` adds it, backfills from the old `verbose_boot` flag — `True` → `text_console` — then drops `verbose_boot`). It rides the same host-config plane as timezone / NTP / SNMP (PlatformSettings → supervisor heartbeat `console_mode` → `maybe_fire_console_mode` → host runner). Because the kernel cmdline lives in `grub.cfg` (not a file the running OS re-reads), the runner flips a **grubenv variable** (`spatium_verbose`) that a `0` / `1` / `2` conditional in the per-slot menuentries reads (rendered by #395's `spatium-grub-render`). The mode → grubenv map keeps `dashboard = 0` + `text_console = 1` so pre-#393 grubenv values still resolve fail-closed; `verbose_dashboard = 2` is the new branch. grubenv lives on the shared ESP, so the setting **survives A/B slot upgrades + rollbacks + the /etc overlay** verbatim.
-- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot.
+- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot. On a multi-node control plane that tab links to Fleet instead, because the local reboot acts on whichever node answers the request and is refused there (#3011); reboot each node from its Fleet drilldown.
 - **`text_console` gets a real login.** `getty@tty1` is gated on `spatium-console=off` (the mirror of the dashboard's gate) and enabled into `getty.target.wants`, so the dashboard and getty are mutually exclusive by their opposite conditions and `text_console` lands a standard agetty login. (A unit-load-time `Conflicts=getty` leak that left `text_console` with *no* login was fixed in #393 / #394 — see CHANGELOG.)
 - **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` + the dashboard. The always-present GRUB verbose-boot menuentry remains the zero-config one-shot fallback (drops the loglevel cap for a single boot, selectable from the boot menu with no reinstall).
 
@@ -3842,7 +3853,7 @@ the operator installing a CA anywhere:
    is sent to a server that does not hold the pinned key. The hostname does
    not have to match, so an IP works. The supervisor logs the fingerprint as
    `supervisor.tls.pinned_on_first_contact`; it should match the one shown
-   under **Appliance → TLS** on the control plane. If it does not, something
+   under **Appliance → Fleet → Web UI Certificate** on the control plane. If it does not, something
    intercepted the connection.
 2. **Rotation goes through the appliance CA.** The Web UI certificate changes
    in normal operation: a self-signed one is re-minted when a member joins or
@@ -3872,7 +3883,8 @@ unconditionally, and nothing was pinned in its place).
 **Limit, stated plainly.** Trust on first use is as good as the first
 contact. An attacker on the path at pairing time who also substitutes the CA
 certificate the supervisor receives at approval is not caught automatically;
-comparing the logged fingerprint with **Appliance → TLS** is the check.
+comparing the logged fingerprint with **Appliance → Fleet → Web UI
+Certificate** is the check.
 
 **The role pods use the same pin (#1281).** On an off-cluster appliance the
 DNS, DHCP and looking-glass pods reach the control plane at the same external
