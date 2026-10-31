@@ -352,3 +352,48 @@ def test_resolve_dump_format_ignores_format_version() -> None:
     assert resolve({"format_version": 1}, names_plain) == "plain"
     assert resolve({"format_version": 2}, names_custom) == "custom"
     assert resolve({}, {"manifest.json"}) is None
+
+
+# ── #2222: a destination archive's format is readable before restore ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exclude_secrets", "expected_format"), [(True, "plain"), (False, "custom")]
+)
+async def test_destination_archive_preview_reports_the_dump_format(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    stub_pg_dump: None,
+    tmp_path,
+    exclude_secrets: bool,
+    expected_format: str,
+) -> None:
+    headers = await _superadmin(db_session)
+    data = await _build(db_session, exclude_secrets=exclude_secrets)
+    name = "spatiumddi-backup-20260101-000000.zip"
+    (tmp_path / name).write_bytes(data)
+    target = BackupTarget(
+        name="t2222",
+        kind="local_volume",
+        config={"path": str(tmp_path)},
+        passphrase_encrypted=b"x",
+    )
+    db_session.add(target)
+    await db_session.flush()
+
+    resp = await client.get(
+        f"/api/v1/backup/targets/{target.id}/archives/{name}/manifest-preview",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["dump_format"] == expected_format
+    assert body["selective_restore_supported"] is (expected_format == "custom")
+    assert body["restorable"] is True
+
+    missing = await client.get(
+        f"/api/v1/backup/targets/{target.id}/archives/spatiumddi-backup-20260101-000001.zip/manifest-preview",
+        headers=headers,
+    )
+    assert missing.status_code in (404, 502), missing.text

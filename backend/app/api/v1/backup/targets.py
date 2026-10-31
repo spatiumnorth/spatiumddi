@@ -986,6 +986,55 @@ async def download_target_archive(
     )
 
 
+@router.get("/{target_id}/archives/{filename}/manifest-preview")
+async def preview_target_archive_manifest(
+    target_id: uuid.UUID,
+    filename: str,
+    db: DB,
+    current_user: SuperAdmin,
+) -> dict[str, Any]:
+    """The manifest preview (``POST /backup/manifest-preview``) for an
+    archive already stored at this destination (#2222).
+
+    The destination's Restore-from-archive modal lists archives without
+    their manifest, so it could not tell a plain-SQL archive (which a
+    selective restore refuses) from a custom-format one until the restore
+    was refused. The modal calls this once, for the archive the operator
+    picked, so the whole listing never has to be downloaded. A zip's
+    central directory is at the end, so the archive is fetched under the
+    same size cap as a download; nothing is inflated and nothing applied.
+    """
+    from app.services.backup.archive import (  # noqa: PLC0415
+        BackupArchiveError,
+        manifest_preview_payload,
+    )
+
+    row = await db.get(BackupTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="backup target not found")
+    driver = get_destination(row.kind)
+    safe_name = _archive_name(filename)
+    try:
+        plain_config = decrypt_config_secrets(driver, row.config)
+        await _enforce_declared_size(driver, plain_config, safe_name)
+        archive_bytes = await driver.download(
+            config=plain_config, filename=safe_name, max_bytes=MAX_ARCHIVE_BYTES
+        )
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ArchiveTooLargeError as exc:
+        raise _too_large(exc) from exc
+    except UnsupportedOperationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BackupDestinationError as exc:
+        raise await _archive_miss(db, row, safe_name, exc) from exc
+    _enforce_download_size(len(archive_bytes), filename=safe_name)
+    try:
+        return manifest_preview_payload(archive_bytes)
+    except BackupArchiveError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class RestoreFromArchiveBody(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     passphrase: str = Field(..., min_length=8, max_length=512)
