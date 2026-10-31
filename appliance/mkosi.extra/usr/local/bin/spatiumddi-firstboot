@@ -71,6 +71,12 @@ METALLB_CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-metallb.tgz
 K3S_MANIFESTS_DIR=/var/lib/rancher/k3s/server/manifests
 BOOTSTRAP_MANIFEST="$K3S_MANIFESTS_DIR/spatium-bootstrap.yaml"
 CONTROL_MANIFEST="$K3S_MANIFESTS_DIR/spatium-control.yaml"
+# #2865: where firstboot holds the control chart back during a cluster Rolling
+# Upgrade, and the runner that releases it (see control_hold_state).
+CONTROL_MANIFEST_HELD="${CONTROL_MANIFEST}.held"
+# #3022: the same for the bootstrap chart.
+BOOTSTRAP_MANIFEST_HELD="${BOOTSTRAP_MANIFEST}.held"
+CONTROL_RELEASE_UNIT=spatiumddi-control-release.service
 # #1448 — the Secret that carries SECRET_KEY + the /metrics token, created by
 # ensure_app_key_secret and NOT owned by Helm, so no helm uninstall can delete
 # it. APP_KEY_STAMP records that it exists, for the one path that cannot ask
@@ -149,8 +155,9 @@ retire_inactive_swapfile() {
     return 0
 }
 
-# Sourced by the unit tests to reach the helpers above without running any of
-# the boot-time side effects below. Mirrors spatium-cluster-join's guard.
+# Sourced by the unit tests, and by spatium-control-release (#2865), to reach
+# the helpers above without running any of the boot-time side effects below.
+# Mirrors spatium-cluster-join's guard.
 if [ "${SPATIUM_FIRSTBOOT_LIB:-}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -1476,6 +1483,25 @@ if node_is_cluster_member; then
     BOOTSTRAP_ROLE="joined-member"
 fi
 
+# #3022 — a bootstrap chart the render below stages as
+# $BOOTSTRAP_MANIFEST_HELD is placed (or held, with its runner started) by
+# release_bootstrap_manifest once k3s answers. Should this script end before it
+# gets there (set -e, a kill at TimeoutStartSec), the staged chart would sit
+# held until the next boot with nothing to release it, while the cluster ran
+# the old one: so on exit it goes through the same gate, or, before that gate
+# is defined, live, as before #3022. Armed only when a chart is staged, and
+# disarmed once the readyz path has released it.
+# shellcheck disable=SC2329  # invoked through the EXIT trap below
+_release_staged_bootstrap_on_exit() {
+    [ -f "$BOOTSTRAP_MANIFEST_HELD" ] || return 0
+    if command -v release_bootstrap_manifest >/dev/null 2>&1; then
+        release_bootstrap_manifest || true
+    else
+        chmod 0600 "$BOOTSTRAP_MANIFEST_HELD" || true
+        mv -f "$BOOTSTRAP_MANIFEST_HELD" "$BOOTSTRAP_MANIFEST" || true
+    fi
+}
+
 case "$BOOTSTRAP_ROLE" in
     joined-member)
         echo "Joined cluster member — skipping bootstrap manifest render; the seed's releases govern this cluster."
@@ -1576,8 +1602,24 @@ case "$BOOTSTRAP_ROLE" in
                 echo "---"
                 _render_appliance_helmchart "$CHART_B64" "true" "$role_pods_enabled" "false" "true"
             } > "$tmp"
-            mv "$tmp" "$BOOTSTRAP_MANIFEST"
-            chmod 0600 "$BOOTSTRAP_MANIFEST"
+            chmod 0600 "$tmp"
+            # #3022: a chart that differs from the one the cluster runs waits
+            # as ${BOOTSTRAP_MANIFEST}.held until release_bootstrap_manifest
+            # has read whether a Rolling Upgrade's hold is on, which wants an
+            # apiserver this render runs too early for. A first install has
+            # none to differ from: it goes in at once (#992), as does a
+            # render-only run (#1866), which has no k3s to ask.
+            if [ -f "$BOOTSTRAP_MANIFEST" ] && ! cmp -s "$tmp" "$BOOTSTRAP_MANIFEST" \
+                    && [ "${SPATIUM_FIRSTBOOT_RENDER_ONLY:-}" != "1" ]; then
+                mv "$tmp" "$BOOTSTRAP_MANIFEST_HELD"
+            else
+                mv "$tmp" "$BOOTSTRAP_MANIFEST"
+                rm -f "$BOOTSTRAP_MANIFEST_HELD"
+            fi
+            if [ -f "$BOOTSTRAP_MANIFEST_HELD" ]; then
+                trap _release_staged_bootstrap_on_exit EXIT
+                trap 'exit 143' TERM
+            fi
         else
             echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy."
             rm -f "$BOOTSTRAP_MANIFEST"
@@ -1899,9 +1941,153 @@ pin_control_failure_policy() {
     return 0
 }
 
+# ── #2865: the control chart a cluster Rolling Upgrade holds back ───────────
+# A cluster Rolling Upgrade holds the shared image tags until every node runs
+# the target (#1710), and the control chart's applianceVersion with them
+# (#2176), so that the seed's boot onto its new slot does not roll the control
+# plane mid-run. That hold is a HelmChartConfig over VALUES (backend/app/
+# services/upgrades/shared_tags.py): it cannot hold the chart itself, and the
+# seed's firstboot renders the control chart from its NEW slot. A release whose
+# chart changed the api, worker or beat pod template therefore rolled them on
+# the held image as the seed booted, with the worker that drives the run, and
+# the run waited on its Lease (seen live on three nodes: the worker rolled 12
+# minutes before the run moved the tags).
+# The bootstrap chart has the same two halves (#3022): the hold pins its
+# global.imageTag, and the seed's firstboot wrote the chart live from its new
+# slot, so a changed supervisor DaemonSet or CNPG operator pod template rolled
+# mid-run too, the operator while the database primary may be moving. The
+# render stages a chart that differs from the live one as
+# ${BOOTSTRAP_MANIFEST}.held, release_bootstrap_manifest holds it or places it
+# by the same test, and the same runner releases it before the control chart,
+# the order the pins come off.
+#
+# So while a run's hold is on, release_control_manifest keeps this boot's
+# control chart back as ${CONTROL_MANIFEST}.held (k3s applies *.yaml, *.yml
+# and *.json only, which the .deferred staging relies on too) and leaves the
+# release the cluster runs as it is, chart and values. spatium-control-release
+# (spatiumddi-control-release.service, which the gate starts) releases it
+# through the same gate once nothing pins the control chart to another
+# version: at the run's flip, whichever release drives the run (the first
+# upgrade into this release is driven, and flipped, by the release before it),
+# or, for a run that failed or was aborted, when its hold is released
+# (release_lingering_hold). A new run's Start pins the same values again, and
+# the chart stays held.
+
+# $1 = a rendered manifest, $2 = park | release, $3 = control (default) |
+# bootstrap, the chart $1 is (#3022). Prints "held <tag>", "free" or
+# "unknown", from the two HelmChartConfigs the hold pins:
+#   park     a run's hold is on: spatium-bootstrap's global.imageTag and
+#            spatium-control's image.tag pinned to the SAME tag (only
+#            shared_tags.ensure_hold writes that pair; chart_bump writes
+#            image.tag alone, to the new tag), and that tag is not the one $1
+#            deploys. A node booted back into the held version releases its
+#            chart: that is the chart the control plane runs.
+#   release  the chart's own pins: for control, spatium-control still pins
+#            image.tag or applianceVersion to a value $1 does not carry; for
+#            bootstrap, spatium-bootstrap still pins global.imageTag to one.
+#            The flip takes the bootstrap pin off first and the control pins
+#            in one later write, so waiting on the control pins makes the
+#            release ONE helm revision: the new chart, the new tag and the
+#            new version together.
+# "unknown" when the apiserver does not answer or a document does not parse.
+control_hold_state() {
+    local manifest="$1" mode="$2" chart="${3:-control}" configs
+    if ! configs=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get helmchartconfig spatium-bootstrap spatium-control --ignore-not-found \
+            -o json 2>/dev/null); then
+        echo unknown
+        return 0
+    fi
+    python3 -c '
+import json
+import sys
+
+import yaml
+
+
+def dig(doc, path):
+    for key in path:
+        if not isinstance(doc, dict) or key not in doc:
+            return None
+        doc = doc[key]
+    return None if doc is None else str(doc)
+
+
+try:
+    own = None
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for part in yaml.safe_load_all(fh):
+            if isinstance(part, dict) and part.get("kind") == "HelmChart":
+                own = yaml.safe_load(part["spec"]["valuesContent"])
+    raw = sys.argv[3].strip()
+    doc = json.loads(raw) if raw else {}
+    if doc.get("kind") == "List":
+        items = doc.get("items") or []
+    else:
+        items = [doc] if doc else []
+    pins = {}
+    for item in items:
+        name = (item.get("metadata") or {}).get("name")
+        pins[name] = yaml.safe_load((item.get("spec") or {}).get("valuesContent") or "")
+except Exception:
+    print("unknown")
+    sys.exit(0)
+bootstrap = sys.argv[4] == "bootstrap"
+tag = dig(own, ("global", "imageTag") if bootstrap else ("image", "tag"))
+version = None if bootstrap else dig(own, ("applianceVersion",))
+bootstrap_tag = dig(pins.get("spatium-bootstrap"), ("global", "imageTag"))
+control_tag = dig(pins.get("spatium-control"), ("image", "tag"))
+control_version = dig(pins.get("spatium-control"), ("applianceVersion",))
+if not tag:
+    print("unknown")
+elif sys.argv[2] == "park":
+    held = bootstrap_tag is not None and bootstrap_tag == control_tag and control_tag != tag
+    print("held %s" % control_tag if held else "free")
+elif bootstrap:
+    print("held %s" % bootstrap_tag if bootstrap_tag is not None and bootstrap_tag != tag else "free")
+else:
+    tag_pinned = control_tag is not None and control_tag != tag
+    version_pinned = control_version is not None and control_version != version
+    print("held %s" % (control_tag or control_version) if tag_pinned or version_pinned else "free")
+' "$manifest" "$mode" "$configs" "$chart" 2>/dev/null || echo unknown
+}
+
+# 0 while helm-controller runs the install Job of spatium-$1 (control, the
+# default, or bootstrap). Removing the hold's pins changes the chart's values,
+# which starts one, and a chart released while it runs has helm-controller
+# replace that Job mid-upgrade. spatium-control-release takes this with the
+# gate, and waits on it (a bounded while) before it releases the chart it held
+# back.
+control_helm_job_active() {
+    local active
+    active=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get job "helm-install-spatium-${1:-control}" --ignore-not-found \
+            -o 'jsonpath={.status.active}' 2>/dev/null) || return 1
+    [ -n "$active" ] && [ "$active" != 0 ]
+}
+
 release_control_manifest() {
-    local deferred="${CONTROL_MANIFEST}.deferred"
+    local deferred="${1:-${CONTROL_MANIFEST}.deferred}" hold
     [ -f "$deferred" ] || return 0
+    # #2865: held back while a cluster Rolling Upgrade's hold is on (see
+    # control_hold_state). A hold that cannot be read is no hold, and a held
+    # chart whose runner cannot be started is released now: either way as
+    # before #2865, which at worst is the mid-run roll this prevents.
+    hold=$(control_hold_state "$deferred" park)
+    case "$hold" in
+        "held "*)
+            if [ "$deferred" != "$CONTROL_MANIFEST_HELD" ]; then
+                mv -f "$deferred" "$CONTROL_MANIFEST_HELD"
+                chmod 0600 "$CONTROL_MANIFEST_HELD"
+                deferred="$CONTROL_MANIFEST_HELD"
+            fi
+            if systemctl start --no-block "$CONTROL_RELEASE_UNIT" >/dev/null 2>&1; then
+                echo "A cluster Rolling Upgrade holds the control plane at ${hold#* }: this release's control chart is held back as $CONTROL_MANIFEST_HELD until the run's hold ends (#2865)."
+                return 0
+            fi
+            echo "WARN: could not start $CONTROL_RELEASE_UNIT; releasing the held control chart now (#2865)." >&2
+            ;;
+    esac
     if ! /usr/local/bin/k3s kubectl get priorityclass spatium-control-plane \
             >/dev/null 2>&1; then
         echo "WARN: PriorityClass spatium-control-plane is absent, or the apiserver could not be reached." >&2
@@ -1918,7 +2104,32 @@ release_control_manifest() {
     sizing_patch=$(control_sizing_patch "$deferred")
     mv -f "$deferred" "$CONTROL_MANIFEST"
     chmod 0600 "$CONTROL_MANIFEST"
+    # #2865: a chart an earlier boot held back is superseded by this one.
+    rm -f "$CONTROL_MANIFEST_HELD"
     apply_control_sizing_patch "$CONTROL_MANIFEST" "$sizing_patch"
+}
+
+# #3022: the bootstrap chart this boot's render staged as
+# $BOOTSTRAP_MANIFEST_HELD goes live, or stays held while a cluster Rolling
+# Upgrade's hold is on, by the test release_control_manifest applies to the
+# control chart; spatium-control-release releases it when nothing pins
+# global.imageTag to another value. Unreadable hold, or a runner that cannot be
+# started: live, as before #3022.
+release_bootstrap_manifest() {
+    local held="${1:-$BOOTSTRAP_MANIFEST_HELD}" hold
+    [ -f "$held" ] || return 0
+    hold=$(control_hold_state "$held" park bootstrap)
+    case "$hold" in
+        "held "*)
+            if systemctl start --no-block "$CONTROL_RELEASE_UNIT" >/dev/null 2>&1; then
+                echo "A cluster Rolling Upgrade holds the supervisor and the CNPG operator at ${hold#* }: this release's bootstrap chart is held back as $held until the run's hold ends (#3022)."
+                return 0
+            fi
+            echo "WARN: could not start $CONTROL_RELEASE_UNIT; releasing the held bootstrap chart now (#3022)." >&2
+            ;;
+    esac
+    chmod 0600 "$held"
+    mv -f "$held" "$BOOTSTRAP_MANIFEST"
 }
 
 # #554 — is this a TRIAL boot (running slot != durable default)? Blocking
@@ -1949,6 +2160,7 @@ if [ -x /usr/local/bin/spatium-host-migrate ]; then
         echo "ERROR: host-migration reconcile failed." >&2
         # Still release any deferred control manifest so the control plane
         # comes up regardless.
+        release_bootstrap_manifest || true
         release_control_manifest || true
         if is_trial_boot; then
             # Trial boot: a bad grub render risks the next reboot, so do NOT
@@ -2398,6 +2610,10 @@ if [ "$ready" = 1 ]; then
     date -Iseconds > "$STAMP"
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
+    # #3022 — the bootstrap chart this boot staged goes live, or stays held,
+    # before the control chart's own release below.
+    release_bootstrap_manifest || true
+    trap - EXIT TERM
     # #1299 — first, while this boot's control chart is still held back.
     pin_control_failure_policy
     place_deferred_tls_manifest
@@ -2445,5 +2661,6 @@ fi
 if [ -f "${CONTROL_MANIFEST}.deferred" ] && [ ! -f "$APP_KEY_STAMP" ]; then
     _strip_control_app_secret "${CONTROL_MANIFEST}.deferred"
 fi
+release_bootstrap_manifest || true
 release_control_manifest || true
 exit 1
