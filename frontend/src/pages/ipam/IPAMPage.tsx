@@ -4552,8 +4552,8 @@ const NEEDS_ADDRESS_DELETE =
 const NEEDS_DNS_SYNC =
   "Requires read permission on subnets and IP addresses, and write permission on subnets";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
-const NEEDS_BLOCK_DELETE = "Requires delete permission on this IP block";
-const NEEDS_SPACE_DELETE = "Requires delete permission on this IP space";
+const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
+const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
 const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 
 // The IPAM router's gate: an address delete and the multi-row deletes (Bulk
@@ -11960,8 +11960,9 @@ function EditSpaceModalForm({
   onClose,
   onDeleted,
 }: EditSpaceModalProps) {
-  // The dialog opens for a holder of write on this one space; Delete needs its own grant.
-  const canDeleteSpace = usePermissions().can("delete", "ip_space", space.id);
+  // The dialog opens for a holder of write on this one space, but the server
+  // asks delete over every IP space (no id), so a grant on one space is not enough.
+  const canDeleteSpace = usePermissions().can("delete", "ip_space");
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -12791,8 +12792,9 @@ function EditBlockModalForm({
   onClose,
   onDeleted,
 }: EditBlockModalProps) {
-  // The dialog opens for a holder of write on this one block; Delete needs its own grant.
-  const canDeleteBlock = usePermissions().can("delete", "ip_block", block.id);
+  // The dialog opens for a holder of write on this one block, but the server
+  // asks delete over every IP block (no id), so a grant on one block is not enough.
+  const canDeleteBlock = usePermissions().can("delete", "ip_block");
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
   const [description, setDescription] = useState(block.description ?? "");
@@ -17400,7 +17402,16 @@ export function IPAMPage() {
               const sp = spaces?.find(
                 (s: IPSpace) => s.id === selectedBlock.space_id,
               );
-              if (sp) selectSpace(sp);
+              if (sp) {
+                selectSpace(sp);
+                return;
+              }
+              // The spaces list was refused: there is no space page to go
+              // to, so leave the block (a deleted block's dialog closes).
+              setSelectedBlock(null);
+              setSelectedSubnet(null);
+              setSelectedSpace(null);
+              setSearchParams({}, { replace: true });
             }}
             onSelectBlock={selectBlock}
             onSelectSubnet={selectSubnet}

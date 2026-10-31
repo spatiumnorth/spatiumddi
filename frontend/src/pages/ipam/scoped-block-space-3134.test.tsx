@@ -114,7 +114,11 @@ function mount(ui: React.ReactNode, url = "/") {
 
 const settle = () => new Promise((r) => setTimeout(r, 50));
 
-function blockScoped(writeId = "blk-x", extra: string[] = []) {
+function blockScoped(
+  writeId = "blk-x",
+  typeLevel: string[] = [],
+  scoped: string[] = [],
+) {
   answers.authApi = {
     myPermissions: () =>
       Promise.resolve({
@@ -122,10 +126,15 @@ function blockScoped(writeId = "blk-x", extra: string[] = []) {
         grants: [
           { action: "read", resource_type: "ip_block", resource_id: "blk-x" },
           { action: "write", resource_type: "ip_block", resource_id: writeId },
-          ...extra.map((a) => ({
+          ...scoped.map((a) => ({
             action: a,
             resource_type: "ip_block",
             resource_id: "blk-x",
+          })),
+          ...typeLevel.map((a) => ({
+            action: a,
+            resource_type: "ip_block",
+            resource_id: null,
           })),
         ],
       }),
@@ -205,29 +214,59 @@ describe("the Danger zone of the Edit block dialog", () => {
     const del = await openDanger("Edit", "Delete this block…");
     await settle();
     expect(del.disabled).toBe(true);
-    expect(del.title).toBe("Requires delete permission on this IP block");
+    expect(del.title).toBe("Requires delete permission on IP blocks");
   });
 
-  it("stays enabled for a holder with a delete grant on the block", async () => {
+  it("stays disabled for a delete grant scoped to that one block (the server asks for every block)", async () => {
+    blockScoped("blk-x", [], ["delete"]);
+    mount(<IPAMPage />, "/ipam?block=blk-x");
+    const del = await openDanger("Edit", "Delete this block…");
+    await settle();
+    expect(del.disabled).toBe(true);
+    expect(del.title).toBe("Requires delete permission on IP blocks");
+  });
+
+  it("is enabled for a holder with delete over every block", async () => {
     blockScoped("blk-x", ["delete"]);
     mount(<IPAMPage />, "/ipam?block=blk-x");
     const del = await openDanger("Edit", "Delete this block…");
     await settle();
     expect(del.disabled).toBe(false);
   });
+
+  it("closes the Move to Trash dialog after a delete although the spaces list is refused", async () => {
+    blockScoped("blk-x", ["delete"]);
+    answers.ipamApi.deleteBlock = () => Promise.resolve(undefined);
+    mount(<IPAMPage />, "/ipam?block=blk-x");
+    const del = await openDanger("Edit", "Delete this block…");
+    await waitFor(() => expect(del.disabled).toBe(false));
+    fireEvent.click(del);
+    fireEvent.click(await screen.findByText("Continue"));
+    fireEvent.click(await screen.findByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
+    await waitFor(() => expect(screen.queryByRole("checkbox")).toBeNull());
+    expect(screen.queryByText("Edit")).toBeNull();
+  });
 });
 
 describe("a grant scoped to one space", () => {
-  function spaceScoped(extra: string[] = []) {
+  function spaceScoped(typeLevel: string[] = [], scoped: string[] = []) {
     answers.authApi = {
       myPermissions: () =>
         Promise.resolve({
           is_superadmin: false,
-          grants: ["read", "write", ...extra].map((action) => ({
-            action,
-            resource_type: "ip_space",
-            resource_id: "sp-x",
-          })),
+          grants: [
+            ...["read", "write", ...scoped].map((action) => ({
+              action,
+              resource_type: "ip_space",
+              resource_id: "sp-x",
+            })),
+            ...typeLevel.map((action) => ({
+              action,
+              resource_type: "ip_space",
+              resource_id: null,
+            })),
+          ],
         }),
     };
     answers.ipamApi = {
@@ -244,10 +283,19 @@ describe("a grant scoped to one space", () => {
     const del = await openDanger("Edit Space", "Delete this IP space…");
     await settle();
     expect(del.disabled).toBe(true);
-    expect(del.title).toBe("Requires delete permission on this IP space");
+    expect(del.title).toBe("Requires delete permission on IP spaces");
   });
 
-  it("keeps it enabled with a delete grant on the space", async () => {
+  it("keeps it disabled for a delete grant scoped to that one space", async () => {
+    spaceScoped([], ["delete"]);
+    mount(<IPAMPage />, "/ipam?space=sp-x");
+    const del = await openDanger("Edit Space", "Delete this IP space…");
+    await settle();
+    expect(del.disabled).toBe(true);
+    expect(del.title).toBe("Requires delete permission on IP spaces");
+  });
+
+  it("enables it with delete over every space", async () => {
     spaceScoped(["delete"]);
     mount(<IPAMPage />, "/ipam?space=sp-x");
     const del = await openDanger("Edit Space", "Delete this IP space…");
