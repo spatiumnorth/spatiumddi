@@ -214,6 +214,7 @@ function OverviewTab({ overlay }: { overlay: OverlayRead }) {
     enabled: !!overlay.customer_id,
     queryKey: ["customer", overlay.customer_id],
     queryFn: () => customersApi.get(overlay.customer_id!),
+    retry: false,
   });
   return (
     <div className="space-y-4">
@@ -229,7 +230,8 @@ function OverviewTab({ overlay }: { overlay: OverlayRead }) {
         </Card>
         <Card label="Customer">
           {overlay.customer_id
-            ? customerQ.data?.name || "Loading…"
+            ? customerQ.data?.name ||
+              (customerQ.isError ? "(customer in Trash)" : "Loading…")
             : "Internal / unattributed"}
         </Card>
         <Card label="Sites">{overlay.site_count}</Card>

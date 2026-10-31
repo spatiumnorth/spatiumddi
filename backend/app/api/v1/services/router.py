@@ -506,7 +506,9 @@ async def update_service(
         raise HTTPException(
             status_code=422, detail=f"status must be one of {sorted(SERVICE_STATUSES)}"
         )
-    if body.customer_id is not None:
+    # An unchanged reference to a customer now in the Trash is kept (#3192):
+    # the delete leaves it pointing there, and the edit form sends it back.
+    if body.customer_id is not None and body.customer_id != row.customer_id:
         await _check_customer(db, body.customer_id)
     if body.kind is not None and body.kind != row.kind:
         await _enforce_l3vpn_invariants_on_kind_change(db, row, body.kind)

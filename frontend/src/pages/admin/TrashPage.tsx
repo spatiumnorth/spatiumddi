@@ -235,7 +235,7 @@ function purgeScope(entry: TrashEntry): string {
     case "dhcp_scope":
       return ` Its pools and static assignments are removed with it.`;
     case "customer":
-      return ` Subnets, zones, overlays and other rows that name it are left with no customer.`;
+      return ` Subnets, zones, overlays and other rows that name it are left with no customer. A customer that a service still names cannot be purged until that service is gone.`;
     default:
       return "";
   }

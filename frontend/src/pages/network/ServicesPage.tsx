@@ -889,6 +889,11 @@ function ServiceEditorModal({
               onChange={(e) => setCustomerId(e.target.value)}
             >
               <option value="">— select —</option>
+              {customerId &&
+                customersQ.isSuccess &&
+                !customers.some((c) => c.id === customerId) && (
+                  <option value={customerId}>(customer in Trash)</option>
+                )}
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
