@@ -1304,7 +1304,7 @@ function LookingGlassHealthCard() {
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
     staleTime: 30_000,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: moduleOn,
   });
 
@@ -1603,13 +1603,13 @@ export function DashboardPage() {
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
     enabled: kubernetesEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: dockerHosts = [] } = useQuery<DockerHost[]>({
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
     enabled: dockerEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: tailscaleTenants = [] } = useQuery<TailscaleTenant[]>({
     queryKey: ["tailscale-tenants"],
@@ -1626,49 +1626,49 @@ export function DashboardPage() {
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: opnsenseRouters = [] } = useQuery<OPNsenseRouter[]>({
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
     enabled: opnsenseEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: panosFirewalls = [] } = useQuery<PANOSFirewall[]>({
     queryKey: ["panos-firewalls"],
     queryFn: panosApi.list,
     enabled: panosEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: fortinetFirewalls = [] } = useQuery<FortinetFirewall[]>({
     queryKey: ["fortinet-firewalls"],
     queryFn: fortinetApi.list,
     enabled: fortinetEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: merakiOrgs = [] } = useQuery<MerakiOrg[]>({
     queryKey: ["meraki-orgs"],
     queryFn: merakiApi.list,
     enabled: merakiEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: cloudEndpoints = [] } = useQuery<CloudEndpoint[]>({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
     enabled: cloudEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: unifiControllers = [] } = useQuery<UnifiController[]>({
     queryKey: ["unifi-controllers"],
     queryFn: unifiApi.listControllers,
     enabled: unifiEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   // Platform health — covers api / postgres / redis / celery workers /
@@ -4445,13 +4445,13 @@ function ConformityPanel() {
   const summaryQ = useQuery<ConformitySummary>({
     queryKey: ["conformity-summary"],
     queryFn: () => conformityApi.summary(),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     enabled: moduleOn,
   });
   const failingQ = useQuery<ConformityResult[]>({
     queryKey: ["conformity-results", "fail-recent"],
     queryFn: () => conformityApi.listResults({ status: "fail", limit: 20 }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     enabled: moduleOn,
   });
 
@@ -5006,7 +5006,7 @@ function IntegrationsDashboardTabPanel() {
   const { data, isLoading, isError } = useQuery<IntegrationsDashboardSummary>({
     queryKey: ["dashboards", "integrations"],
     queryFn: () => dashboardsApi.integrationsSummary(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   if (isError) {
