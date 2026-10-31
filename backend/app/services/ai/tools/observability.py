@@ -50,6 +50,7 @@ from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.logs.agent_logs import (
+    InvalidLogFilter,
     LogScopeError,
     resolve_dhcp_log_servers,
     resolve_dns_log_servers,
@@ -83,7 +84,9 @@ class QueryDNSQueryLogArgs(BaseModel):
     qtype: str | None = Field(
         default=None, description="Filter by record type (A, AAAA, MX, TXT, …)."
     )
-    client_ip: str | None = Field(default=None, description="Filter by client IP (exact match).")
+    client_ip: str | None = Field(
+        default=None, description="Client IP: whole address, CIDR, or leading part (e.g. 10.1.)."
+    )
     view: str | None = Field(default=None, description="Filter by DNS view (split-horizon name).")
     server_id: uuid.UUID | None = Field(default=None, description="Only this DNS server.")
     group_id: uuid.UUID | None = Field(
@@ -127,16 +130,19 @@ async def query_dns_query_log(
     except LogScopeError as exc:
         return [{"result": exc.detail}]
     names = {s.id: s.name for s in servers}
-    rows = await search_dns_queries(
-        db,
-        list(names),
-        since=_since_default(args.since_hours),
-        qname_contains=args.qname_contains,
-        qtype=args.qtype,
-        client_ip=args.client_ip,
-        view=args.view,
-        limit=args.limit,
-    )
+    try:
+        rows = await search_dns_queries(
+            db,
+            list(names),
+            since=_since_default(args.since_hours),
+            qname_contains=args.qname_contains,
+            qtype=args.qtype,
+            client_ip=args.client_ip,
+            view=args.view,
+            limit=args.limit,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat() if r.ts else None,
@@ -168,7 +174,9 @@ class QueryDHCPActivityLogArgs(BaseModel):
     mac_address: str | None = Field(
         default=None, description="Filter by MAC address (exact match)."
     )
-    ip_address: str | None = Field(default=None, description="Filter by IP address (exact match).")
+    ip_address: str | None = Field(
+        default=None, description="IP: whole address, CIDR, or leading part (e.g. 10.1.)."
+    )
     server_id: uuid.UUID | None = Field(default=None, description="Only this DHCP server.")
     group_id: uuid.UUID | None = Field(
         default=None,
@@ -206,16 +214,19 @@ async def query_dhcp_activity_log(
     except LogScopeError as exc:
         return [{"result": exc.detail}]
     names = {s.id: s.name for s in servers}
-    rows = await search_dhcp_activity(
-        db,
-        list(names),
-        since=_since_default(args.since_hours),
-        severity=args.severity,
-        code=args.code,
-        mac_address=args.mac_address,
-        ip_address=args.ip_address,
-        limit=args.limit,
-    )
+    try:
+        rows = await search_dhcp_activity(
+            db,
+            list(names),
+            since=_since_default(args.since_hours),
+            severity=args.severity,
+            code=args.code,
+            mac_address=args.mac_address,
+            ip_address=args.ip_address,
+            limit=args.limit,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat() if r.ts else None,
