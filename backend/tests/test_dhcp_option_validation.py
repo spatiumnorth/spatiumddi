@@ -480,3 +480,155 @@ async def test_a_kea_scope_refuses_opt_nn_on_every_write_path(
         resp = await getattr(client, method)(url, headers=h, json=body)
         assert resp.status_code == 422, (url, resp.text)
         assert "use code:252" in str(resp.json()["detail"]), (url, resp.text)
+
+
+# ── #2924: the domain options are stored and served in DNS form ──────────────
+
+
+def test_domain_options_take_validate_fqdns_dns_form() -> None:
+    from app.services.dhcp.option_validation import canonical_domain_options, normalize_options
+
+    got = normalize_options(
+        {"domain-name": "Cafe-é.example.test.", "domain-search": ["Cafe-é.test.", "XP.Test."]}
+    )
+    assert got["domain-name"] == "xn--cafe--fsa.example.test"
+    assert got["domain-search"] == ["xn--cafe--fsa.test", "xp.test"]
+    # the list form of the editor, and a comma-separated string, both normalise
+    listed = normalize_options([{"code": 15, "name": "domain-name", "value": "A.Test."}])
+    assert listed["domain-name"] == "a.test"
+    assert canonical_domain_options({"domain-search": "A.Test., B.Test"})["domain-search"] == (
+        "a.test, b.test"
+    )
+    # idempotent; other options and unusable values are untouched (positive controls)
+    again = canonical_domain_options(got)
+    assert again == got
+    odd = {"domain-name": "bad name!", "routers": ["192.0.2.1"], "mtu": 1500}
+    assert canonical_domain_options(odd) == odd
+
+
+def test_canonical_domain_options_is_all_or_nothing_per_value() -> None:
+    """A value with one entry ``validate_fqdn`` refuses is left whole (#2924).
+
+    Rewriting only the valid entries would make a grandfathered value compare
+    unequal to its round trip, and the scope update validates every option that
+    changed — so an unrelated edit would start answering 422.
+    """
+    from app.services.dhcp.option_validation import canonical_domain_options
+
+    mixed = {"domain-search": ["Bad Name", "Upper.COM"]}
+    assert canonical_domain_options(mixed) == mixed
+    mixed_str = {"domain-search": "Upper.COM, bad name"}
+    assert canonical_domain_options(mixed_str) == mixed_str
+    # a non-string entry also leaves the list whole
+    assert canonical_domain_options({"domain-search": ["A.Test", 7]}) == {
+        "domain-search": ["A.Test", 7]
+    }
+    # a rewrite the write check would refuse is not made: two names in the
+    # scalar domain-name option stay as stored rather than reading as changed
+    two = {"domain-name": ["Upper.COM", "Other.COM"]}
+    assert canonical_domain_options(two) == two
+    # positive controls: a one-element list, already-punycoded, uppercase A-label,
+    # empty values
+    assert canonical_domain_options({"domain-name": ["Upper.COM."]}) == {
+        "domain-name": ["upper.com"]
+    }
+    assert canonical_domain_options({"domain-name": "XN--CAFE--FSA.Example.Test"}) == {
+        "domain-name": "xn--cafe--fsa.example.test"
+    }
+    assert canonical_domain_options({"domain-name": "", "domain-search": []}) == {
+        "domain-name": "",
+        "domain-search": [],
+    }
+
+
+def test_canonical_domain_options_covers_the_windows_raw_spelling() -> None:
+    """``opt-15`` / ``opt-119`` reach a Windows server as options 15 / 119."""
+    from app.services.dhcp.option_validation import canonical_domain_options
+
+    got = canonical_domain_options({"opt-15": "Cafe-é.Test.", "opt-119": ["A.Test."]})
+    assert got == {"opt-15": "xn--cafe--fsa.test", "opt-119": ["a.test"]}
+    # an unrelated raw code is untouched
+    assert canonical_domain_options({"opt-252": "Http://X"}) == {"opt-252": "Http://X"}
+
+
+async def test_scope_domain_options_are_stored_in_dns_form(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _headers(db_session)
+    subnet, grp = await _subnet_and_group(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet.id}/dhcp-scopes",
+        headers=h,
+        json={
+            "group_id": str(grp.id),
+            "options": {"domain-name": "Cafe-é.example.test.", "domain-search": ["Cafe-é.test."]},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    got = (await client.get(f"/api/v1/dhcp/scopes/{resp.json()['id']}", headers=h)).json()
+    opts = {o["name"]: o["value"] for o in got["options"]}
+    assert opts["domain-name"] == "xn--cafe--fsa.example.test"
+    assert opts["domain-search"] == ["xn--cafe--fsa.test"]
+
+
+async def test_a_legacy_row_renders_in_dns_form_with_a_stable_etag(
+    db_session: AsyncSession,
+) -> None:
+    """A row stored before #2924 is served in DNS form, the bundle ETag is
+    stable across builds, and rewriting the row into DNS form does not move it
+    again — the upgrade shifts the ETag once, then it holds."""
+    from app.services.dhcp.config_bundle import build_config_bundle
+
+    subnet, grp = await _subnet_and_group(db_session)
+    legacy = DHCPScope(
+        subnet_id=subnet.id,
+        group_id=grp.id,
+        name="legacy",
+        options={"domain-name": "Cafe-é.example.test.", "domain-search": ["XP.Test.", "B.test"]},
+    )
+    srv = DHCPServer(
+        name=f"s-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host="127.0.0.1",
+        port=67,
+        server_group_id=grp.id,
+    )
+    db_session.add_all([legacy, srv])
+    await db_session.commit()
+
+    first = await build_config_bundle(db_session, srv)
+    (sc,) = [s for s in first.scopes if s.options]
+    assert sc.options["domain-name"] == "xn--cafe--fsa.example.test"
+    assert sc.options["domain-search"] == ["xp.test", "b.test"]
+    second = await build_config_bundle(db_session, srv)
+    assert second.etag == first.etag
+
+    legacy.options = {
+        "domain-name": "xn--cafe--fsa.example.test",
+        "domain-search": ["xp.test", "b.test"],
+    }
+    await db_session.commit()
+    rewritten = await build_config_bundle(db_session, srv)
+    assert rewritten.etag == first.etag
+
+
+async def test_a_grandfathered_mixed_search_list_does_not_block_an_unrelated_edit(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _headers(db_session)
+    subnet, grp = await _subnet_and_group(db_session)
+    stored = {"domain-search": ["Bad Name", "Upper.COM"]}
+    scope = DHCPScope(subnet_id=subnet.id, group_id=grp.id, name="old", options=dict(stored))
+    db_session.add(scope)
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/v1/dhcp/scopes/{scope.id}",
+        headers=h,
+        json={"name": "renamed", "options": dict(stored)},
+    )
+    assert resp.status_code == 200, resp.text
+    opts = {o["name"]: o["value"] for o in resp.json()["options"]}
+    assert opts["domain-search"] == ["Bad Name", "Upper.COM"]
