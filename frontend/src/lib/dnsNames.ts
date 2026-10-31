@@ -170,3 +170,47 @@ export function confirmsZone(typed: string, zoneName: string): boolean {
   const norm = (s: string) => s.trim().replace(/\.$/, "").toLowerCase();
   return typed.trim() !== "" && norm(typed) === norm(zoneName);
 }
+
+/** An IPv6 address written out in full (eight 4-digit hextets), or null when
+ *  it is not one this can expand (an embedded IPv4 tail, a malformed value). */
+function expandIpv6(ip: string): string | null {
+  const dblIdx = ip.indexOf("::");
+  let hextets: string[];
+  if (dblIdx === -1) {
+    hextets = ip.split(":");
+  } else {
+    const left = ip.slice(0, dblIdx).split(":").filter(Boolean);
+    const right = ip
+      .slice(dblIdx + 2)
+      .split(":")
+      .filter(Boolean);
+    const fill = 8 - left.length - right.length;
+    if (fill < 0) return null;
+    hextets = [...left, ...Array(fill).fill("0"), ...right];
+  }
+  if (hextets.length !== 8) return null;
+  if (!hextets.every((h) => /^[0-9A-Fa-f]{1,4}$/.test(h))) return null;
+  return hextets.map((h) => h.padStart(4, "0")).join(":");
+}
+
+/** The owner name of the PTR record for `ip` (#3210): `22.0.168.192.in-addr.arpa`
+ *  for IPv4, the nibble form under `ip6.arpa` for IPv6. Null when `ip` is
+ *  neither. Mirror of `ipaddress.ip_address(ip).reverse_pointer`. */
+export function reversePointerName(ip: string): string | null {
+  if (ip.includes(":")) {
+    const full = expandIpv6(ip);
+    if (full === null) return null;
+    return (
+      full.replace(/:/g, "").toLowerCase().split("").reverse().join(".") +
+      ".ip6.arpa"
+    );
+  }
+  const octets = ip.split(".");
+  if (
+    octets.length !== 4 ||
+    !octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)
+  ) {
+    return null;
+  }
+  return `${octets.reverse().join(".")}.in-addr.arpa`;
+}

@@ -112,6 +112,7 @@ import {
   hostnameError,
   nameInZoneError,
   parseTtlInput,
+  reversePointerName,
   summarizeZoneNames,
   zoneKindForName,
 } from "@/lib/dnsNames";
@@ -7388,7 +7389,7 @@ export function SubnetDetail({
       {confirmPurgeAddr && (
         <ConfirmDeleteModal
           title="Permanently Delete"
-          message={`Permanently delete ${confirmPurgeAddr.address}? This cannot be undone.`}
+          message={`Permanently delete ${addressWithHost(confirmPurgeAddr)}? This cannot be undone.`}
           confirmLabel="Delete Forever"
           onConfirm={() => purgeAddr.mutate(confirmPurgeAddr.id)}
           onClose={() => setConfirmPurgeAddr(null)}
@@ -11425,7 +11426,7 @@ export function BulkDeleteAddressesModal({
                 <li key={a.id}>
                   <span className="font-mono">{a.address}</span>
                   {h && (
-                    <span className="font-mono text-muted-foreground">
+                    <span className="break-all font-mono text-muted-foreground">
                       {" "}
                       ({h})
                     </span>
@@ -11621,7 +11622,7 @@ function ConfirmDeleteModal({
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">{message}</p>
+        <p className="break-words text-sm text-muted-foreground">{message}</p>
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -11644,15 +11645,30 @@ function ConfirmDeleteModal({
 
 const RECORDS_SHOWN = 5;
 
+/** "192.168.0.22 (printer-3.corp.example.com)", or the bare IP when the row
+ *  carries no name — how a delete confirmation names the address (#3210). */
+function addressWithHost(a: {
+  address: string;
+  hostname?: string | null;
+  fqdn?: string | null;
+}): string {
+  const host = a.fqdn || a.hostname;
+  return host ? `${a.address} (${host})` : a.address;
+}
+
 /** The DNS records a delete takes with it, by name and type, capped (#3210).
  *  Says so when the list could not be read; says nothing when there are none,
  *  so an address without records keeps the dialog's older wording. */
 function RecordsNote({
   records,
+  extraZones = 0,
   loading,
   error,
 }: {
   records: string[];
+  // Additional zones the host record is also published into; the row
+  // carries only their ids, so they are counted rather than named.
+  extraZones?: number;
   loading: boolean;
   error: unknown;
 }) {
@@ -11674,11 +11690,18 @@ function RecordsNote({
       {shown.map((r, i) => (
         <span key={r}>
           {i > 0 && ", "}
-          <code>{r}</code>
+          <code className="break-all">{r}</code>
         </span>
       ))}
       {more > 0 && (
         <span className="text-muted-foreground"> and {more} more</span>
+      )}
+      {extraZones > 0 && (
+        <span className="text-muted-foreground">
+          {" "}
+          (the host record also in {extraZones} additional zone
+          {extraZones === 1 ? "" : "s"})
+        </span>
       )}
     </p>
   );
@@ -11715,15 +11738,24 @@ export function DeleteOrOrphanModal({
     retry: false,
   });
   const records: string[] = [];
-  if (address.dns_record_id && host) {
+  // A delete retracts every record IPAM published for the row: the host
+  // record, its PTR, any copy in an additional zone, and the aliases.
+  const published = !!address.dns_record_id && !!host;
+  if (published) {
     records.push(`${host} ${address.address.includes(":") ? "AAAA" : "A"}`);
   }
-  for (const a of aliasesQ.data ?? []) {
-    records.push(`${a.name} ${a.record_type}`);
+  const ptr = reversePointerName(address.address);
+  if (published && address.reverse_zone_id && ptr) {
+    records.push(`${ptr} PTR`);
   }
+  for (const a of aliasesQ.data ?? []) {
+    records.push(`${(a.fqdn || a.name).replace(/\.$/, "")} ${a.record_type}`);
+  }
+  const extraZones = published ? (address.extra_zone_ids?.length ?? 0) : 0;
   const recordsNote = (
     <RecordsNote
       records={records}
+      extraZones={extraZones}
       loading={hasAliases && aliasesQ.isLoading}
       error={hasAliases ? aliasesQ.error : null}
     />
@@ -11737,7 +11769,7 @@ export function DeleteOrOrphanModal({
           {host && (
             <>
               {" "}
-              (<span className="font-mono font-medium">{host}</span>)
+              (<span className="break-all font-mono font-medium">{host}</span>)
             </>
           )}
           ?

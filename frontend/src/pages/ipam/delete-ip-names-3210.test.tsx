@@ -9,6 +9,8 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { IPAddress } from "@/lib/api";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const listAliases = vi.fn();
 
@@ -123,6 +125,78 @@ describe("Delete IP Address names the host and records (#3210)", () => {
     );
     expect(screen.getByText("Delete Permanently")).toBeTruthy();
     expect(screen.getByText("Mark as Orphan")).toBeTruthy();
+  });
+});
+
+describe("Delete IP Address lists every record the delete retracts (#3210)", () => {
+  it("names aliases by FQDN and lists the PTR and additional zones", async () => {
+    listAliases.mockResolvedValue([
+      {
+        id: "a",
+        name: "p3",
+        record_type: "CNAME",
+        value: "",
+        zone_id: "",
+        fqdn: "p3.corp.example.com.",
+      },
+    ]);
+    show({
+      hostname: "printer-3",
+      fqdn: "printer-3.corp.example.com",
+      dns_record_id: "r1",
+      reverse_zone_id: "z-rev",
+      extra_zone_ids: ["z2", "z3"],
+      alias_count: 1,
+    });
+    await waitFor(() =>
+      expect(screen.getAllByText("p3.corp.example.com CNAME")).toHaveLength(2),
+    );
+    expect(screen.getAllByText("22.0.168.192.in-addr.arpa PTR")).toHaveLength(
+      2,
+    );
+    expect(
+      screen.getAllByText(/host record also in 2 additional zones/),
+    ).toHaveLength(2);
+  });
+
+  it("uses AAAA and an ip6.arpa PTR for an IPv6 address", () => {
+    show({
+      address: "2001:db8::1",
+      hostname: "v6",
+      fqdn: "v6.example.com",
+      dns_record_id: "r1",
+      reverse_zone_id: "z-rev",
+      alias_count: 0,
+    });
+    expect(screen.getAllByText("v6.example.com AAAA")).toHaveLength(2);
+    expect(
+      screen.getAllByText(
+        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa PTR",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("lists no host record or PTR for a row with no published record", () => {
+    show({ hostname: "h", reverse_zone_id: "z-rev", alias_count: 0 });
+    expect(screen.queryByText(/DNS records:/)).toBeNull();
+  });
+
+  it("does not let a long FQDN widen the dialog", () => {
+    const long = `${"a".repeat(60)}.${"b".repeat(60)}.example.com`;
+    show({ hostname: "a", fqdn: long, dns_record_id: "r1", alias_count: 0 });
+    expect(screen.getByText(long).className).toContain("break-all");
+    for (const el of screen.getAllByText(`${long} A`)) {
+      expect(el.className).toContain("break-all");
+    }
+  });
+});
+
+describe("Permanently Delete names the host (#3210)", () => {
+  it("names the FQDN in the orphan purge confirmation", () => {
+    const src = readFileSync(join(__dirname, "IPAMPage.tsx"), "utf8");
+    expect(src).toMatch(
+      /message=\{`Permanently delete \$\{addressWithHost\(confirmPurgeAddr\)\}\?/,
+    );
   });
 });
 
