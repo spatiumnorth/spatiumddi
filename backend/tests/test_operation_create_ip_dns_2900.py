@@ -161,6 +161,8 @@ async def test_approved_portal_request_creates_a_record(
         permissions=[
             {"action": "write", "resource_type": "provisioning_request"},
             {"action": "read", "resource_type": "provisioning_request"},
+            # Submit refuses a subnet the requester cannot read.
+            {"action": "read", "resource_type": "subnet"},
         ],
     )
     grp = Group(name=f"g-{uuid.uuid4().hex[:6]}")

@@ -104,6 +104,14 @@ class Operation:
     # (e.g. archiving your own chat session) that gate on ownership
     # inside their own apply rather than on a coarse RBAC permission.
     required_permission: tuple[str, str] | None = None
+    # Types on which a grant of ``required_permission``'s action ALSO passes
+    # ``enforce_operation_permission`` when it is scoped to one instance, the
+    # way the REST twin's router gate admits a subnet-scoped writer or an
+    # address-set delegate (#3058, #103). Only for an operation whose own
+    # apply then enforces the per-resource gate on the instance it acts on
+    # (``create_ip_address`` → ``_require_address_writable``): without that
+    # gate, a grant on one subnet would reach every subnet.
+    scoped_grant_types: tuple[str, ...] = ()
     # The gate for operations whose REST equivalent is superadmin-only
     # (webhooks, DNSSEC sign/unsign, zone update ACL, SNMP/NTP/syslog
     # settings, the importers, alert rules, temporary access, service
@@ -140,12 +148,21 @@ class PreviewResult:
     already landed resolves cleanly instead of stranding ``pending`` / failing
     (#62 concurrent break-glass). Defaults False so no existing op changes
     behaviour.
+
+    ``forbidden_detail`` (only with ``ok=False``) marks a refusal that is
+    about the CALLER, not the target: the resource exists, but this caller
+    can neither read nor act on it, so ``detail`` answers it like an unknown
+    id. ``forbidden_detail`` is the permission refusal the operation's REST
+    twin gives that caller. The approve spine raises it as a 403 and leaves
+    the request pending for an approver who can reach the target, instead of
+    failing the request as if the target were gone (#2934).
     """
 
     ok: bool
     detail: str
     preview_text: str = ""
     idempotent: bool = False
+    forbidden_detail: str | None = None
 
 
 _OPERATIONS: dict[str, Operation] = {}
@@ -193,6 +210,7 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
     ``archive_session``, which check ownership inside their own apply).
     """
     from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        has_any_grant_for,
         is_effective_superadmin,
         user_has_permission,
     )
@@ -206,8 +224,133 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
     if op.required_permission is None:
         return
     action, resource_type = op.required_permission
-    if not user_has_permission(user, action, resource_type):
-        raise OperationPermissionError(action, resource_type)
+    if user_has_permission(user, action, resource_type):
+        return
+    # An instance-scoped grant on a ``scoped_grant_types`` type passes here as
+    # it passes the REST twin's router gate; the apply's per-resource gate
+    # decides whether it reaches the instance named.
+    if any(has_any_grant_for(user, action, rt) for rt in op.scoped_grant_types):
+        return
+    raise OperationPermissionError(action, resource_type)
+
+
+# ── Target resources: read visibility + per-resource apply gates ───────────
+#
+# ``enforce_operation_permission`` checks the operation's type-wide grant.
+# Some REST twins additionally gate on the specific resource the request names
+# (an address needs write on its subnet or on an address set covering it), so
+# the operations that create into such a resource repeat that gate inside
+# their own apply, under the APPLYING user: the approver of a portal request
+# or the owner of a Copilot proposal.
+#
+# Previews name the resource they act on (subnet CIDR, zone name, scope name),
+# so they answer for a resource the caller can neither read nor act on exactly
+# as they answer for an unknown id. ``TARGET_NOT_FOUND`` holds those answers,
+# one per ``x-resource`` type, so a preview and the request portal's submit
+# check cannot word them differently.
+
+TARGET_NOT_FOUND: dict[str, str] = {
+    "subnet": "Subnet {id} not found",
+    "ip_block": "Block {id} not found",
+    "dns_zone": "Zone {id} not found.",
+    "dhcp_scope": "DHCP scope {id} not found.",
+}
+
+
+def target_not_found_detail(resource_type: str, resource_id: object) -> str:
+    """The unknown-id answer for an ``x-resource`` reference."""
+    template = TARGET_NOT_FOUND.get(resource_type, "{type} {id} not found")
+    return template.format(type=resource_type, id=resource_id)
+
+
+def hidden_target_preview(
+    resource_type: str, resource_id: object, refusal: OperationPermissionError
+) -> PreviewResult:
+    """A preview's answer for a target the caller can neither read nor act on.
+
+    ``detail`` is the unknown-id answer, so a preview names nothing the caller
+    could not read. ``forbidden_detail`` carries ``refusal``, the REST twin's
+    permission answer, so an approve re-preview refuses THIS approver (403,
+    request still pending) rather than failing the request as if the target
+    were gone. A target that does not exist is a plain not-found preview.
+    """
+    return PreviewResult(
+        ok=False,
+        detail=target_not_found_detail(resource_type, resource_id),
+        forbidden_detail=str(refusal),
+    )
+
+
+def resource_reference_fields(args_model: type[BaseModel]) -> list[tuple[str, str]]:
+    """``(field name, resource_type)`` for every ``x-resource`` field (#759)."""
+    out: list[tuple[str, str]] = []
+    for name, info in args_model.model_fields.items():
+        extra = info.json_schema_extra
+        if isinstance(extra, dict):
+            rtype = extra.get("x-resource")
+            if isinstance(rtype, str):
+                out.append((name, rtype))
+    return out
+
+
+def _can_read_target(user: User, resource_type: str, resource_id: object) -> bool:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    return user_has_permission(user, "read", resource_type, str(resource_id))
+
+
+def unreadable_target_detail(user: User, op: Operation, args: BaseModel) -> str | None:
+    """The unknown-id answer for the first referenced resource ``user`` cannot
+    read, or ``None`` when every one is readable. Superadmin reads everything."""
+    for field_name, rtype in resource_reference_fields(op.args_model):
+        value = getattr(args, field_name, None)
+        if value is None:
+            continue
+        if not _can_read_target(user, rtype, value):
+            return target_not_found_detail(rtype, value)
+    return None
+
+
+async def _user_can_write_address(
+    db: AsyncSession,
+    user: User,
+    subnet: Subnet,
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """The REST address create's gate (``POST /subnets/{id}/addresses``): an
+    API token bound to another resource is refused; otherwise write on the
+    subnet, or write on an address set of that subnet covering ``addr``
+    (#103)."""
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        token_scope_allows,
+        user_has_permission,
+    )
+    from app.services.ipam.address_set_gate import (  # noqa: PLC0415
+        load_writable_set_ranges,
+        user_can_write_ip,
+    )
+
+    if not token_scope_allows(user, "subnet", subnet.id):
+        return False
+    subnet_writable = user_has_permission(user, "write", "subnet", subnet.id)
+    if subnet_writable:
+        return True
+    set_ranges = await load_writable_set_ranges(db, user, subnet.id)
+    return user_can_write_ip(user, int(addr), subnet_writable, set_ranges)
+
+
+async def _require_address_writable(
+    db: AsyncSession,
+    user: User,
+    subnet: Subnet,
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> None:
+    if not await _user_can_write_address(db, user, subnet, addr):
+        raise OperationPermissionError(
+            "write",
+            "subnet",
+            f"No write permission on subnet or any address set covering {addr}",
+        )
 
 
 def expires_at_default() -> datetime:
@@ -280,14 +423,29 @@ class CreateIPAddressArgs(BaseModel):
 async def _preview_create_ip_address(
     db: AsyncSession, user: User, args: CreateIPAddressArgs
 ) -> PreviewResult:
-    # Resolve the subnet so the preview can name it.
+    # Resolve the subnet so the preview can name it. A subnet the caller can
+    # neither read nor create this address in is answered as an unknown one.
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:
-        return PreviewResult(ok=False, detail=f"Subnet {args.subnet_id} not found")
+        return PreviewResult(ok=False, detail=target_not_found_detail("subnet", args.subnet_id))
 
     try:
         addr_obj = ipaddress.ip_address(args.address)
     except ValueError:
+        addr_obj = None
+    if not _can_read_target(user, "subnet", subnet.id) and (
+        addr_obj is None or not await _user_can_write_address(db, user, subnet, addr_obj)
+    ):
+        return hidden_target_preview(
+            "subnet",
+            args.subnet_id,
+            OperationPermissionError(
+                "write",
+                "subnet",
+                f"No write permission on subnet or any address set covering {args.address}",
+            ),
+        )
+    if addr_obj is None:
         return PreviewResult(ok=False, detail=f"Invalid IP address: {args.address!r}")
 
     try:
@@ -392,6 +550,12 @@ async def _apply_create_ip_address(
         addr_obj = ipaddress.ip_address(args.address)
     except ValueError as exc:
         raise ValueError(f"Invalid IP address: {args.address!r}") from exc
+
+    # The REST create's per-resource gate, for every address (named or not):
+    # write on this subnet, or on an address set covering the address. The
+    # check above admits a grant scoped to ANY subnet or address set
+    # (``scoped_grant_types``), so this is the gate that holds it to this one.
+    await _require_address_writable(db, user, subnet, addr_obj)
 
     net = ipaddress.ip_network(str(subnet.network), strict=False)
     if addr_obj not in net:
@@ -1755,9 +1919,19 @@ def _carve_candidate(
 async def _preview_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> PreviewResult:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
     block = await db.get(IPBlock, args.block_id)
+    # A block the caller can neither read nor carve from (the REST allocate's
+    # type-wide ``write subnet``) is answered as an unknown one.
     if block is None:
-        return PreviewResult(ok=False, detail=f"Block {args.block_id} not found")
+        return PreviewResult(ok=False, detail=target_not_found_detail("ip_block", args.block_id))
+    if not (
+        _can_read_target(user, "ip_block", block.id) or user_has_permission(user, "write", "subnet")
+    ):
+        return hidden_target_preview(
+            "ip_block", args.block_id, OperationPermissionError("write", "subnet")
+        )
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
     family_max = 32 if block_net.version == 4 else 128
@@ -1872,8 +2046,12 @@ register(
         validate_submit=_validate_submit_create_ip_address,
         category="ipam",
         # The REST address write needs ``write`` on the subnet that owns the
-        # address (#3058); the apply path delegates to that handler.
+        # address (#3058); the apply path delegates to that handler. Its router
+        # gate also admits a writer scoped to one subnet or an address-set
+        # delegate (#103), so this does too, and the apply's
+        # ``_require_address_writable`` holds either to its own subnet / set.
         required_permission=("write", "subnet"),
+        scoped_grant_types=("subnet", "address_set"),
     )
 )
 
@@ -2174,6 +2352,29 @@ class CreateDNSRecordArgs(BaseModel):
         return v
 
 
+def _user_can_write_zone_records(user: User, zone_id: object) -> bool:
+    """The REST record create's gate: type-wide ``write dns_record`` (the
+    operation's declared permission), and an API token, if any, bound to this
+    zone."""
+    from app.core.permissions import (  # noqa: PLC0415 — avoid cycle
+        token_scope_allows,
+        user_has_permission,
+    )
+
+    return user_has_permission(user, "write", "dns_record") and token_scope_allows(
+        user, "dns_zone", str(zone_id)
+    )
+
+
+def _zone_records_refusal(user: User, zone_id: object) -> OperationPermissionError:
+    """Why :func:`_user_can_write_zone_records` refused ``user`` this zone."""
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if not user_has_permission(user, "write", "dns_record"):
+        return OperationPermissionError("write", "dns_record")
+    return OperationPermissionError("write", "dns_zone", "API token is not scoped to this DNS zone")
+
+
 async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> PreviewResult:
@@ -2208,8 +2409,15 @@ async def _preview_create_dns_record(
             )
 
     zone = await db.get(DNSZone, args.zone_id)
+    # A zone the caller can neither read nor create records in (the REST
+    # create's type-wide record write, narrowed by a zone-bound API token) is
+    # answered as an unknown one.
     if zone is None:
-        return PreviewResult(ok=False, detail=f"Zone {args.zone_id} not found.")
+        return PreviewResult(ok=False, detail=target_not_found_detail("dns_zone", args.zone_id))
+    if not (
+        _can_read_target(user, "dns_zone", zone.id) or _user_can_write_zone_records(user, zone.id)
+    ):
+        return hidden_target_preview("dns_zone", args.zone_id, _zone_records_refusal(user, zone.id))
     if getattr(zone, "deleted_at", None) is not None:
         return PreviewResult(ok=False, detail=f"Zone {args.zone_id} is deleted.")
     # #2653 — the REST create's refusal; the reconciler would revert the row.
@@ -2346,6 +2554,9 @@ async def _apply_create_dns_record(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         raise ValueError(f"Zone {args.zone_id} not found.")
+    # The REST create refuses an API token bound to another zone.
+    if not _user_can_write_zone_records(user, zone.id):
+        raise _zone_records_refusal(user, zone.id)
     # #2653 — a zone trashed (or taken over by an integration) between
     # propose and apply must not receive records.
     if getattr(zone, "deleted_at", None) is not None:
@@ -3051,12 +3262,22 @@ class CreateDHCPStaticArgs(BaseModel):
 async def _preview_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> PreviewResult:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
     from app.models.ipam import Subnet
 
     scope = await db.get(DHCPScope, args.scope_id)
+    # A scope the caller can neither read nor add reservations to (the REST
+    # create's type-wide ``write dhcp_static``) is answered as an unknown one.
     if scope is None:
-        return PreviewResult(ok=False, detail=f"DHCP scope {args.scope_id} not found.")
+        return PreviewResult(ok=False, detail=target_not_found_detail("dhcp_scope", args.scope_id))
+    if not (
+        _can_read_target(user, "dhcp_scope", scope.id)
+        or user_has_permission(user, "write", "dhcp_static")
+    ):
+        return hidden_target_preview(
+            "dhcp_scope", args.scope_id, OperationPermissionError("write", "dhcp_static")
+        )
 
     # #923: the CIDR is on the related Subnet, not on DHCPScope — the scope
     # carries only ``subnet_id``. Reading ``scope.subnet`` raised
@@ -4891,6 +5112,10 @@ async def _preview_approve_change_request(
     except Exception as exc:  # noqa: BLE001
         return PreviewResult(ok=False, detail=f"Stored args no longer validate: {exc}")
     inner = await op.preview(db, user, inner_args)
+    if not inner.ok and inner.forbidden_detail is not None:
+        # The target exists but this approver cannot reach it: the approval
+        # would be refused (403) and the request left pending, not stale.
+        return PreviewResult(ok=False, detail=inner.forbidden_detail)
     if not inner.ok:
         return PreviewResult(ok=False, detail=f"Stale change request: {inner.detail}")
     preview_text = (

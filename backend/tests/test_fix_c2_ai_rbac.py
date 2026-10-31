@@ -192,8 +192,9 @@ async def test_apply_proposal_403_for_unprivileged_owner(db_session: AsyncSessio
 
 @pytest.mark.asyncio
 async def test_apply_proposal_succeeds_for_authorized_writer(db_session: AsyncSession) -> None:
-    """A user granted ('write','subnet') — the same grant the REST
-    address write requires (#3058) — can apply the proposal and the row lands."""
+    """A user granted ('write','subnet') — the grant the REST address write
+    requires (#3058), which also passes the REST create's per-resource gate
+    on that subnet (#2934) — can apply the proposal and the row lands."""
     subnet = await _subnet(db_session)
     writer = await _user(
         db_session,

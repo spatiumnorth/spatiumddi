@@ -151,6 +151,11 @@ describe("a delete the approval queue took", () => {
   it("Edit Space says it was submitted and does not report it deleted", async () => {
     const deleteSpace = vi.fn(() => QUEUED);
     const space = { id: "sp-1", name: "s" } as IPSpace;
+    // The Danger-zone Delete is gated on delete on this item (#3134); this
+    // test is about what the delete does, so sign in as a superadmin.
+    answers.authApi = {
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    };
     answers.ipamApi = { deleteSpace, getSpace: () => Promise.resolve(space) };
     const onDeleted = vi.fn();
     open(
@@ -168,6 +173,11 @@ describe("a delete the approval queue took", () => {
       space_id: "sp-1",
       network: "10.0.0.0/8",
     } as IPBlock;
+    // The Danger-zone Delete is gated on delete on this item (#3134); this
+    // test is about what the delete does, so sign in as a superadmin.
+    answers.authApi = {
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    };
     answers.ipamApi = { deleteBlock, getBlock: () => Promise.resolve(block) };
     const onDeleted = vi.fn();
     open(
