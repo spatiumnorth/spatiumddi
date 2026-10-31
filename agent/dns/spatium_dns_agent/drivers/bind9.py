@@ -1624,8 +1624,19 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
         )
         if p.get("nsec3"):
             optout = "yes" if p.get("nsec3_optout") else "no"
+            # BIND 9.20 accepts only 0 (#3153); an older control plane may
+            # still ship a stored value, and named-checkconf would reject the
+            # whole config over it.
+            iterations = int(p.get("nsec3_iterations", 0) or 0)
+            if iterations != 0:
+                log.warning(
+                    "dnssec_policy_nsec3_iterations_clamped",
+                    policy=name,
+                    stored=iterations,
+                )
+                iterations = 0
             block += (
-                f"    nsec3param iterations {int(p.get('nsec3_iterations', 0))} "
+                f"    nsec3param iterations {iterations} "
                 f"optout {optout} salt-length {int(p.get('nsec3_salt_length', 0))};\n"
             )
         block += "};\n"
@@ -3679,7 +3690,15 @@ class Bind9Driver(DriverBase):
             # ``res.stderr or res.stdout``, inverted because these two tools
             # disagree about which stream diagnostics belong on.
             detail = (res.stdout or "").strip() or (res.stderr or "").strip()
-            raise RuntimeError(f"named-checkconf failed: {detail or 'no output'}")
+            if not detail:
+                # Nothing on either stream (#3153): say what ran and how it
+                # ended, so the report is never just "no output". A negative
+                # code is a signal.
+                detail = (
+                    f"no output (exit status {res.returncode}, "
+                    f"command: named-checkconf {check_conf})"
+                )
+            raise RuntimeError(f"named-checkconf failed: {detail}")
         self._check_zone_files(new_dir)
 
     def _check_zone_files(self, new_dir: Path) -> None:
