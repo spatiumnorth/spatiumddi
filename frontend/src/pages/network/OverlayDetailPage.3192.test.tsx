@@ -10,6 +10,9 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
+// What GET /customers/{id} answers in each case; set by the test.
+let customerStatus = 404;
+
 const OVERLAY = {
   id: "o1",
   name: "Branch mesh",
@@ -42,8 +45,8 @@ vi.mock("@/lib/api", async () => {
                   ? async () => OVERLAY
                   : name === "customersApi" && method === "get"
                     ? async () => {
-                        throw Object.assign(new Error("404"), {
-                          response: { status: 404 },
+                        throw Object.assign(new Error(`${customerStatus}`), {
+                          response: { status: customerStatus },
                         });
                       }
                     : pending,
@@ -58,24 +61,48 @@ const { OverlayDetailPage } = await import("./OverlayDetailPage");
 
 afterEach(cleanup);
 
+function renderPage() {
+  const qc = new QueryClient();
+  render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={["/network/overlays/o1"]}>
+        <Routes>
+          <Route path="/network/overlays/:id" element={<OverlayDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
 describe("OverlayDetailPage customer card (#3192)", () => {
-  it("says the customer is in the Trash when it cannot be fetched", async () => {
-    const qc = new QueryClient();
-    render(
-      <QueryClientProvider client={qc}>
-        <MemoryRouter initialEntries={["/network/overlays/o1"]}>
-          <Routes>
-            <Route
-              path="/network/overlays/:id"
-              element={<OverlayDetailPage />}
-            />
-          </Routes>
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
+  it("says the customer is in the Trash when the server answers 404", async () => {
+    customerStatus = 404;
+    renderPage();
     await waitFor(() =>
       expect(screen.getByText("(customer in Trash)")).toBeTruthy(),
     );
     expect(screen.queryByText("Loading…")).toBeNull();
   });
+
+  it("does not call a refused read a customer in the Trash", async () => {
+    customerStatus = 403;
+    renderPage();
+    await waitFor(() =>
+      expect(
+        screen.getByText("(no permission to see the customer)"),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByText("(customer in Trash)")).toBeNull();
+  });
+
+  it("does not call a server error a customer in the Trash", async () => {
+    customerStatus = 500;
+    renderPage();
+    await waitFor(
+      () =>
+        expect(screen.getByText("(couldn't load the customer)")).toBeTruthy(),
+      { timeout: 8000 },
+    );
+    expect(screen.queryByText("(customer in Trash)")).toBeNull();
+  }, 15000);
 });

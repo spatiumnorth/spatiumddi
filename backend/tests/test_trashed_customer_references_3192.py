@@ -133,3 +133,47 @@ async def test_purge_refused_names_the_service(
     r = await client.delete(f"/api/v1/admin/trash/customer/{s['cust']['id']}", headers=h)
     assert r.status_code == 409, r.text
     assert s["svc"]["name"] in r.json()["detail"]
+
+
+async def test_update_omitting_customer_id_behaves_like_unchanged(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A PUT that leaves ``customer_id`` out keeps the trashed customer and saves."""
+    h = await _admin(db_session)
+    s = await _setup(client, h)
+    cid = s["cust"]["id"]
+    for url in (
+        f"/api/v1/services/{s['svc']['id']}",
+        f"/api/v1/overlays/{s['ovl']['id']}",
+        f"/api/v1/circuits/{s['ckt']['id']}",
+    ):
+        r = await client.put(url, json={"notes": "omitted"}, headers=h)
+        assert r.status_code == 200, (url, r.text)
+        assert r.json()["customer_id"] == cid, url
+
+
+async def test_service_explicit_null_customer_is_refused_not_500(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A service must have a customer: an explicit null is a 422, never a 500."""
+    h = await _admin(db_session)
+    s = await _setup(client, h)
+    r = await client.put(
+        f"/api/v1/services/{s['svc']['id']}", json={"customer_id": None}, headers=h
+    )
+    assert r.status_code == 422, r.text
+    r = await client.get(f"/api/v1/services/{s['svc']['id']}", headers=h)
+    assert r.json()["customer_id"] == s["cust"]["id"]
+
+
+async def test_overlay_explicit_null_customer_clears(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An overlay's customer is optional: an explicit null clears it."""
+    h = await _admin(db_session)
+    s = await _setup(client, h)
+    r = await client.put(
+        f"/api/v1/overlays/{s['ovl']['id']}", json={"customer_id": None}, headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["customer_id"] is None

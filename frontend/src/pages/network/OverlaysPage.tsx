@@ -19,7 +19,10 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
-import { CustomerChip } from "@/components/ownership/pickers";
+import {
+  CustomerChip,
+  MissingCustomerOption,
+} from "@/components/ownership/pickers";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
@@ -120,7 +123,7 @@ function KindBadge({ kind }: { kind: OverlayKind }) {
 
 // ── Editor modal ───────────────────────────────────────────────────
 
-function OverlayEditorModal({
+export function OverlayEditorModal({
   existing,
   onClose,
 }: {
@@ -223,11 +226,7 @@ function OverlayEditorModal({
             onChange={(e) => setCustomerId(e.target.value || null)}
           >
             <option value="">— None —</option>
-            {customerId &&
-              customersQ.isSuccess &&
-              !customers.some((c) => c.id === customerId) && (
-                <option value={customerId}>(customer in Trash)</option>
-              )}
+            <MissingCustomerOption customerId={customerId} list={customersQ} />
             {customers.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
