@@ -5280,6 +5280,13 @@ def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) ->
         return
     console.clear()
     console.print(f"\n\n[bold yellow]Cancelling pending {noun}…[/bold yellow]\n")
+    # #3162 — whether this cancel can have met a switchover: a note is only
+    # this run's when the wrapper was running as we stopped it, or was written
+    # since. Anything else is left from an earlier run stopped some other way
+    # (a manual ``systemctl stop``), which a cancel during the web-UI or Fleet
+    # grace (no wrapper yet) must not report.
+    wrapper_running = power_action_in_progress() is not None
+    stop_started = time.time()
     # Stop both reboot services — one owns the web-UI path, the other the
     # fleet path; only one is active, and stopping the idle one is a no-op.
     # #2974 — and the console's own F5 / F6 runs; stopping one mid-handoff
@@ -5315,13 +5322,23 @@ def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) ->
     # the handoff had already asked CloudNativePG to switch the primary over,
     # which cannot be taken back. Say so, or the API outage that follows reads
     # as a fault of the cancel.
-    switchover = POWER_ACTION_SWITCHOVER.exists()
+    try:
+        noted_at: float | None = POWER_ACTION_SWITCHOVER.stat().st_mtime
+    except OSError:
+        noted_at = None
+    # 1 s of slack: file times come from the kernel's coarse clock, a few ms
+    # behind time.time(); a note from an earlier run is far older than that.
+    switchover = noted_at is not None and (
+        wrapper_running or noted_at >= stop_started - 1.0)
     if switchover:
+        # Not "and is uncordoned": --undo leaves a cordon it did not set, and
+        # can run out of time; the wrapper's log says which.
         console.print(
             "[yellow]The PostgreSQL primary handoff had already begun: "
             "CloudNativePG completes the switchover it started, so the API "
             "pauses for a few seconds while the primary moves to another node. "
-            "This node stays up and is uncordoned.[/yellow]\n")
+            "This node stays up.[/yellow]\n")
+    if noted_at is not None:
         try:
             POWER_ACTION_SWITCHOVER.unlink()
         except OSError:

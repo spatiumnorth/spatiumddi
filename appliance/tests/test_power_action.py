@@ -340,6 +340,8 @@ def _console(state: Path, boot_id: Path, run) -> dict:
         def sleep(_s):
             return None
 
+        time = staticmethod(time.time)
+
     ns: dict = {"Path": Path, "os": os, "subprocess": _Sub, "time": _Time,
                 "confirm_modal": lambda _c, _q: True}
     mod = ast.Module(body=body, type_ignores=[])
@@ -579,9 +581,10 @@ def test_a_flash_is_drawn_once_even_when_the_redraw_is_late() -> None:
 # ---- #3162: a cancel after the handoff asked for the switchover ---------------
 
 def test_a_cancelled_power_action_ends_by_the_signal_not_as_a_failure(tmp_path: Path) -> None:
-    """systemd counts a stop by SIGTERM as clean and an exit 1 as failed: the
-    console's F9 left spatium-power-action@reboot.service "failed" (#3162). A
-    caller (the Fleet agent) still reads a non-zero status: no reboot."""
+    """An exit 1 left spatium-power-action@reboot.service "failed" after the
+    console's F9 (#3162). Death by the stop's signal is clean only because the
+    units list it in SuccessExitStatus= (see the unit test below). A caller
+    (the Fleet agent) still reads a non-zero status: no reboot."""
     proc, log = _run(tmp_path, "reboot", handoff="hang")
     _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
     proc.terminate()
@@ -693,3 +696,79 @@ def test_the_console_reads_the_note_the_wrapper_keeps() -> None:
     text = SCRIPT.read_text()
     assert 'MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"' in text
     assert 'SWITCHOVER="${SPATIUM_POWER_ACTION_SWITCHOVER:-${MARKER}-switchover}"' in text
+
+
+def _cancel_with_note(tmp_path: Path, *, note_age_s: float, wrapper_running: bool):
+    """F9 with a switchover note already on disk before the stop (the stop
+    itself writes nothing)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    (state / "reboot-pending").write_text("x")
+    note = tmp_path / "switchover"
+    note.write_text("spatium/pg pg-1\n")
+    old = time.time() - note_age_s
+    os.utime(note, (old, old))
+    con = _console(state, boot, lambda argv: None)
+    con["POWER_ACTION_SWITCHOVER"] = note
+    if wrapper_running:
+        marker = tmp_path / "power-action-marker"
+        marker.write_text(f"{os.getpid()} reboot\n")  # a live pid
+        con["POWER_ACTION_MARKER"] = marker
+    dash, fc = _FlashRecorder(), _FakeConsole()
+    con["do_cancel_reboot"](fc, dash)
+    return note, dash, fc
+
+
+def test_the_console_cancel_ignores_a_note_left_by_an_earlier_run(tmp_path: Path) -> None:
+    """#3162 validation — a run stopped some other way (a manual systemctl stop)
+    keeps its note; F9 on a later web-UI / Fleet reboot still in its grace (no
+    wrapper yet, so nothing removed it) must not report that old switchover."""
+    note, dash, fc = _cancel_with_note(tmp_path, note_age_s=3600, wrapper_running=False)
+    assert not any("switchover" in line for line in fc.out), fc.out
+    assert dash.flashes[-1] == "Reboot cancelled"
+    assert not note.exists()
+
+
+def test_the_console_cancel_reports_the_running_wrappers_note(tmp_path: Path) -> None:
+    """The handoff noted the switchover a while before F9: the wrapper was
+    running when it was stopped, so the note is this run's."""
+    note, dash, fc = _cancel_with_note(tmp_path, note_age_s=60, wrapper_running=True)
+    assert any("completes the switchover it started" in line for line in fc.out), fc.out
+    assert "switchover" in dash.flashes[-1]
+    assert not note.exists()
+
+
+def test_the_console_cancel_does_not_claim_the_node_is_uncordoned(tmp_path: Path) -> None:
+    """--undo leaves a cordon it did not set (an operator's, an upgrade's) and
+    can run out of time on a slow API, so the console promises only that the
+    node stays up."""
+    _, _, fc = _cancel_with_note(tmp_path, note_age_s=1, wrapper_running=True)
+    assert any("This node stays up." in line for line in fc.out), fc.out
+    assert not any("uncordoned" in line for line in fc.out), fc.out
+
+
+_UNITS = EXTRA / "etc" / "systemd" / "system"
+
+
+@pytest.mark.parametrize("unit", [
+    "spatium-power-action@.service",
+    "spatiumddi-reboot.service",
+    "spatiumddi-reboot-agent.service",
+])
+def test_a_cancelled_run_leaves_its_unit_inactive_not_failed(unit: str) -> None:
+    """#3162 validation — for Type=oneshot, systemd counts the main process
+    dying by SIGTERM / SIGINT / SIGHUP as a FAILURE (result 'signal'): only
+    Type=simple and friends treat those as clean. Ending by the stop's signal
+    therefore leaves the unit failed just as the old exit 1 did, unless the
+    unit lists the signals in SuccessExitStatus= (checked on systemd 257)."""
+    lines = [ln.strip() for ln in (_UNITS / unit).read_text().splitlines()]
+    assert "Type=oneshot" in lines
+    listed: set[str] = set()
+    for ln in lines:
+        if ln.startswith("SuccessExitStatus="):
+            listed |= set(ln.split("=", 1)[1].split())
+    assert {"TERM", "INT", "HUP"} <= listed, listed
+    # a failed systemctl reboot (exit 1) must still fail the unit
+    assert "1" not in listed

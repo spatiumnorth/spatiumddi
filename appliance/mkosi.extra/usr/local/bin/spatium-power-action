@@ -25,9 +25,11 @@
 # good stays cordoned in the cluster until it is removed from it.
 #
 # A stop before systemctl is a cancel, not a failure (#3162): the wrapper then
-# ends by the signal it was stopped with, which systemd counts as a clean stop
-# (the unit is inactive, not failed) and which a caller still reads as "no
-# reboot" (a non-zero status). A failed systemctl stays exit 1.
+# ends by the signal it was stopped with, which the units running it list in
+# SuccessExitStatus= (a Type=oneshot unit otherwise counts it as failed, as it
+# did the old exit 1), so the unit is left inactive, not failed, while a
+# caller still reads "no reboot" (a non-zero status). A failed systemctl
+# stays exit 1.
 #
 # The handoff's request to CloudNativePG cannot be taken back (#3162): its
 # cordon makes CNPG switch the primary over, and a switchover CNPG has begun
@@ -147,9 +149,11 @@ on_signal() {
     fi
     clear_marker
     log "$ACTION cancelled"
-    # #3162 — end by the signal itself, not exit 1: systemd counts a stop by
-    # SIGTERM / SIGINT / SIGHUP as clean, so a cancel no longer leaves the
+    # #3162 — end by the signal itself, not exit 1: the units list SIGTERM /
+    # SIGINT / SIGHUP in SuccessExitStatus=, so a cancel no longer leaves the
     # unit failed, while a caller still reads a non-zero status (no reboot).
+    # The cleanup above has finished: the traps are reset first so the signal
+    # is not caught again. `exit 1` is reached only when it is ignored.
     trap - TERM INT HUP
     kill -s "$sig" "$$"
     exit 1
