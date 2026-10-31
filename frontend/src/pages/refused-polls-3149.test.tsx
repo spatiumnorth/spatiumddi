@@ -13,6 +13,8 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const calls = new Map<string, number>();
+// Per-test answers that replace the default 403 for a read.
+const overrides = new Map<string, () => Promise<unknown>>();
 
 const denied = () =>
   Promise.reject({
@@ -69,6 +71,8 @@ vi.mock("@/lib/api", async () => {
                 if (k === "authApi.myPermissions")
                   return Promise.resolve({ is_superadmin: false, grants: [] });
                 if (k === "settingsApi.get") return Promise.resolve(SETTINGS);
+                const o = overrides.get(k);
+                if (o) return o();
                 return REFUSED.has(k) ? denied() : pending();
               };
             },
@@ -90,6 +94,7 @@ const { SessionsTab } =
 
 beforeEach(() => {
   calls.clear();
+  overrides.clear();
   localStorage.clear();
   vi.useFakeTimers();
 });
@@ -131,12 +136,42 @@ describe("refused reads are not polled (#3149)", () => {
       "unifiApi.listControllers",
       "lookingGlassApi.getDashboardSummary",
     ]);
+    expect(document.body.textContent).toContain(
+      "You don't have permission to see Looking Glass data",
+    );
+    expect(document.body.textContent).not.toContain(
+      "Failed to load Looking Glass data",
+    );
   });
 
   it("Dashboard Integrations tab", async () => {
     localStorage.setItem("dashboard-tab", "integrations");
     await held(<DashboardPage />, 95_000);
     expectAskedOnce(["dashboardsApi.integrationsSummary"]);
+    expect(document.body.textContent).toContain(
+      "You don't have permission to see integration health",
+    );
+  });
+
+  it("a read that failed for another reason is still polled, and not called a permission", async () => {
+    const unavailable = () =>
+      Promise.reject({
+        response: { status: 503, data: { detail: "Service Unavailable" } },
+      });
+    overrides.set("dashboardsApi.integrationsSummary", unavailable);
+    overrides.set("pcapApi.listCaptures", unavailable);
+    localStorage.setItem("dashboard-tab", "integrations");
+    await held(<DashboardPage />, 95_000);
+    expect(calls.get("dashboardsApi.integrationsSummary")).toBeGreaterThan(1);
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Couldn't load integration health");
+    expect(text).not.toMatch(/permission|role may not/i);
+    cleanup();
+    await held(<PacketCapturePage />, 30_000);
+    expect(calls.get("pcapApi.listCaptures")).toBeGreaterThan(1);
+    expect(document.body.textContent).toContain(
+      "Couldn't load packet captures",
+    );
   });
 
   it("Dashboard Conformity tab", async () => {

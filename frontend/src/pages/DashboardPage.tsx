@@ -1300,7 +1300,7 @@ function SubnetDecomCard() {
 function LookingGlassHealthCard() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.looking_glass");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
     staleTime: 30_000,
@@ -1328,9 +1328,10 @@ function LookingGlassHealthCard() {
       );
     }
     if (isError) {
+      // A refusal is said to be one, not "Failed to load" (#3149).
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load Looking Glass data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="Looking Glass data" />
         </p>
       );
     }
@@ -5003,17 +5004,19 @@ function NetworkKpi({
 // Overview tab (the legacy one is per-target chips, this one is the
 // rollup-driven tab body).
 function IntegrationsDashboardTabPanel() {
-  const { data, isLoading, isError } = useQuery<IntegrationsDashboardSummary>({
-    queryKey: ["dashboards", "integrations"],
-    queryFn: () => dashboardsApi.integrationsSummary(),
-    refetchInterval: pollUnlessRefused(30_000),
-  });
+  const { data, isLoading, isError, error } =
+    useQuery<IntegrationsDashboardSummary>({
+      queryKey: ["dashboards", "integrations"],
+      queryFn: () => dashboardsApi.integrationsSummary(),
+      refetchInterval: pollUnlessRefused(30_000),
+    });
 
+  // A refusal says so; any other failure says the read failed, never that
+  // the role may lack access (#3149).
   if (isError) {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
-        Integration health is unavailable. Your role may not include read access
-        to any integration.
+        <ListReadError error={error} what="integration health" />
       </div>
     );
   }
