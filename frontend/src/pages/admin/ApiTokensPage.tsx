@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -34,7 +34,7 @@ import {
 } from "@/lib/enrolment";
 import { QrCode } from "@/components/QrCode";
 import { cn, zebraBodyCls } from "@/lib/utils";
-import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
 
 const inputCls =
@@ -615,18 +615,18 @@ export function RevealTokenModal({
   // it loses it for good (#3222), so Done / Esc / X ask first unless one of
   // those happened. A failed copy deliberately does NOT count; the
   // fallback reveal below is automatic, not something the operator did.
-  const [hasToken, setHasToken] = useState(false);
-  const [confirmClose, setConfirmClose] = useState(false);
-
-  function requestClose() {
-    if (hasToken) onClose();
-    else setConfirmClose(true);
-  }
+  const tokenValues = useMemo(() => [token.token], [token.token]);
+  const guard = useSecretCloseGuard({
+    onClose,
+    secrets: tokenValues,
+    noun: "token",
+    revealable: true,
+  });
 
   async function copy() {
     const ok = await copyToClipboard(token.token);
     if (ok) {
-      setHasToken(true);
+      guard.markTaken();
       setCopied(true);
       setCopyFailed(false);
       setTimeout(() => setCopied(false), 2000);
@@ -640,8 +640,11 @@ export function RevealTokenModal({
 
   return (
     <>
-      <Modal title={`Token "${token.name}" — copy now`} onClose={requestClose}>
-        <div className="space-y-4">
+      <Modal
+        title={`Token "${token.name}" — copy now`}
+        onClose={guard.requestClose}
+      >
+        <div className="space-y-4" {...guard.copyProps}>
           <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
             This is the <strong>only time</strong> the raw token is visible.
             SpatiumDDI stores only a hash — if you lose this value, delete the
@@ -669,7 +672,7 @@ export function RevealTokenModal({
             <button
               type="button"
               onClick={() => {
-                if (!visible) setHasToken(true);
+                if (!visible) guard.markTaken();
                 setVisible((v) => !v);
               }}
               className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
@@ -696,10 +699,10 @@ export function RevealTokenModal({
               Authorization: Bearer {token.prefix}…
             </code>
           </p>
-          <EnrolmentQr token={token} onReveal={() => setHasToken(true)} />
+          <EnrolmentQr token={token} onReveal={guard.markTaken} />
           <div className="flex justify-end gap-2 pt-1">
             <button
-              onClick={requestClose}
+              onClick={guard.requestClose}
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
             >
               {copied ? "Copied — Done" : "I've copied it — Done"}
@@ -707,17 +710,7 @@ export function RevealTokenModal({
           </div>
         </div>
       </Modal>
-      <ConfirmModal
-        open={confirmClose}
-        title="Close without copying?"
-        message="You haven't copied or revealed this token. It won't be shown again — close anyway?"
-        cancelLabel="Go back"
-        confirmLabel="Close without copying"
-        tone="destructive"
-        autoFocusCancel
-        onConfirm={onClose}
-        onClose={() => setConfirmClose(false)}
-      />
+      {guard.confirm}
     </>
   );
 }
