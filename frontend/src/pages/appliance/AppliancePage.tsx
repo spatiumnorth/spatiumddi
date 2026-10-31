@@ -12,7 +12,7 @@ import {
   Wrench,
 } from "lucide-react";
 
-import { applianceApi } from "@/lib/api";
+import { applianceApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import { FleetTab } from "./FleetTab";
@@ -165,11 +165,27 @@ export function AppliancePage() {
     staleTime: 5 * 60 * 1000,
   });
 
+  // #3067 — what kind of install this is comes from the public `/version`.
+  // `/appliance/info` needs read on `appliance`, so a caller who reaches
+  // this page for the certificate store alone (a DNS Editor following the
+  // DoT / DoH card's link) gets 403 there; reading that refusal as "not an
+  // appliance" put the whole page in its Docker / Kubernetes form.
+  // `undefined` until `/version` answers: neither form's copy is shown.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 5 * 60 * 1000,
+  });
+  const deploymentIsAppliance = versionInfo?.appliance_mode;
+  const isApplianceHost = deploymentIsAppliance === true;
+
   // On docker / k8s control planes, hide every tab that only makes
   // sense for a local-appliance host. The page still ships Releases +
   // OS Versions so operators with appliance *agents* (registered
-  // against this docker/k8s control plane) can manage them.
-  const isApplianceHost = !!info?.appliance_mode;
+  // against this docker/k8s control plane) can manage them. Host tabs
+  // also need `/appliance/info` to be readable: a caller without read on
+  // `appliance` could open them and be refused everything inside.
+  const showHostTabs = isApplianceHost && !!info?.appliance_mode;
   const { enabled: moduleEnabled } = useFeatureModules();
   // Fleet pinned first; every other visible tab sorted alphabetically
   // by label (case-insensitive). See the comment on TABS above. Module-gated
@@ -177,8 +193,7 @@ export function AppliancePage() {
   // #14 tab-level gate (the /appliance parent stays always-visible).
   const visibleTabs = TABS.filter(
     (t) =>
-      (!t.selfOnly || isApplianceHost) &&
-      (!t.module || moduleEnabled(t.module)),
+      (!t.selfOnly || showHostTabs) && (!t.module || moduleEnabled(t.module)),
   ).sort((a, b) => {
     if (a.key === "fleet") return -1;
     if (b.key === "fleet") return 1;
@@ -265,7 +280,7 @@ export function AppliancePage() {
               {info.appliance_hostname}
             </span>
           )}
-          {!isApplianceHost && (
+          {deploymentIsAppliance === false && (
             <span
               className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
               title="This control plane is running on Docker or Kubernetes. Host-level tabs (Cluster, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
@@ -275,7 +290,7 @@ export function AppliancePage() {
           )}
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          {isApplianceHost ? (
+          {deploymentIsAppliance === undefined ? null : isApplianceHost ? (
             <>
               Manage the SpatiumDDI OS appliance — fleet, firewall, cluster,
               logs, host network, and lifecycle. Releases, rolling OS upgrades,

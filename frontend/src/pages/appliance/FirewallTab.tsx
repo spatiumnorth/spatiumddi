@@ -52,6 +52,8 @@ import { WebUIAccessCard } from "@/components/WebUIAccessCard";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -232,7 +234,7 @@ function recentlySeen(iso: string | null | undefined): boolean {
   return Number.isFinite(t) && Date.now() - t < 120_000;
 }
 
-function FirewallLogsSection() {
+export function FirewallLogsSection() {
   const qc = useQueryClient();
   const applianceGate = useApplianceAdminGate();
   const { data: enf } = useQuery({
@@ -244,10 +246,11 @@ function FirewallLogsSection() {
     onSuccess: (d) => qc.setQueryData(["firewall", "enforcement"], d),
   });
 
-  const { data: appliances } = useQuery({
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance", "fleet", "fw-logs"],
     queryFn: applianceApprovalApi.list,
-    refetchInterval: 30_000,
+    // #3106 — a refused list is not asked again every 30 s.
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const online = useMemo(
     () =>
@@ -371,7 +374,14 @@ function FirewallLogsSection() {
           className="rounded-md border bg-background px-2 py-1 text-sm"
         >
           {online.length === 0 && (
-            <option value="">No online appliances</option>
+            <option value="">
+              {/* #3107 — a refused list is not "no appliances". */}
+              {appliancesError
+                ? isRefused(appliancesError)
+                  ? "Appliance list not permitted"
+                  : "Couldn't load appliances"
+                : "No online appliances"}
+            </option>
           )}
           {online.map((a) => (
             <option key={a.id} value={a.id}>
@@ -379,6 +389,13 @@ function FirewallLogsSection() {
             </option>
           ))}
         </select>
+        {appliancesError && (
+          <ListReadError
+            error={appliancesError}
+            what="the appliance list"
+            className="text-xs"
+          />
+        )}
         <button
           type="button"
           onClick={() => setPaused((p) => !p)}
@@ -596,7 +613,11 @@ function PoliciesSection() {
   // #1342 — every appliance action takes `admin` on `appliance`.
   const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
-  const { data: policies, isLoading } = useQuery({
+  const {
+    data: policies,
+    isLoading,
+    error: policiesError,
+  } = useQuery({
     queryKey: ["firewall", "policies"],
     queryFn: () => firewallApi.listPolicies(),
   });
@@ -772,8 +793,11 @@ function PoliciesSection() {
                     colSpan={5}
                     className="px-3 py-6 text-center text-muted-foreground"
                   >
-                    No policies yet. The builtin role policies seed on first
-                    migrate; create a fleet baseline or appliance override here.
+                    <ListEmpty error={policiesError} what="firewall policies">
+                      No policies yet. The builtin role policies seed on first
+                      migrate; create a fleet baseline or appliance override
+                      here.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -1244,7 +1268,11 @@ function RuleEditorModal({
 function AliasesSection() {
   const qc = useQueryClient();
   const applianceGate = useApplianceAdminGate();
-  const { data: aliases, isLoading } = useQuery({
+  const {
+    data: aliases,
+    isLoading,
+    error: aliasesError,
+  } = useQuery({
     queryKey: ["firewall", "aliases"],
     queryFn: firewallApi.listAliases,
   });
@@ -1314,7 +1342,9 @@ function AliasesSection() {
                     colSpan={4}
                     className="px-3 py-6 text-center text-muted-foreground"
                   >
-                    No aliases yet.
+                    <ListEmpty error={aliasesError} what="firewall aliases">
+                      No aliases yet.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
@@ -1439,7 +1469,7 @@ const LAYER_LABELS: { key: string; label: string }[] = [
 ];
 
 function EffectiveSection() {
-  const { data: appliances } = useQuery({
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance", "appliances"],
     queryFn: applianceApprovalApi.list,
   });
@@ -1477,6 +1507,13 @@ function EffectiveSection() {
             </option>
           ))}
         </select>
+        {appliancesError && (
+          <ListReadError
+            error={appliancesError}
+            what="the appliance list"
+            className="text-xs"
+          />
+        )}
         {applianceId && (
           <button
             type="button"
@@ -1567,7 +1604,7 @@ function EffectiveSection() {
 // ── Staged-preview diff viewer (Phase 4b) ───────────────────────────
 
 function PreviewSection() {
-  const { data: appliances } = useQuery({
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance", "appliances"],
     queryFn: applianceApprovalApi.list,
   });
@@ -1602,6 +1639,13 @@ function PreviewSection() {
             </option>
           ))}
         </select>
+        {appliancesError && (
+          <ListReadError
+            error={appliancesError}
+            what="the appliance list"
+            className="text-xs"
+          />
+        )}
         <button
           type="button"
           disabled={!applianceId || preview.isPending}

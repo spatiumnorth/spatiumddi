@@ -222,7 +222,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # every grace period that stops this image: 30 s in k8s/base, the chart and the
 # compose files' api ``stop_grace_period`` (Docker's own default is 10 s, so
 # compose sets it). tests/test_api_graceful_shutdown.py pins the ordering.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers", "--timeout-graceful-shutdown", "20"]
+# ``python -m spatium_uvicorn`` is uvicorn's own CLI with the default bind
+# address changed from one IPv4 literal to every address family the container
+# has (#2308) — IPv4-only, dual-stack and IPv6-only clusters all work. ``--host``
+# is deliberately absent; API_BIND_HOST (or --host) pins one. Full story in
+# spatium_uvicorn.py: ``--host ::`` is IPv6-only under uvicorn, not dual-stack.
+CMD ["python", "-m", "spatium_uvicorn", "app.main:app", "--port", "8000", "--workers", "1", "--no-proxy-headers", "--timeout-graceful-shutdown", "20"]
 
 
 # ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────

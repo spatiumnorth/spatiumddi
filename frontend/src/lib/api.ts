@@ -205,6 +205,24 @@ export const api = createClient();
  * site in the app.
  */
 export function formatApiError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, false);
+}
+
+/**
+ * formatApiError for a form dialog: also drops the "Value error, " pydantic
+ * puts in front of a validator's message (#2435, #3041), which names nothing
+ * the reader can act on. Only a 422 entry's own `msg` is trimmed, and only at
+ * its start, so the same words inside a real message are left alone.
+ */
+export function formatDialogError(err: unknown, fallback = "Error"): string {
+  return formatError(err, fallback, true);
+}
+
+function formatError(
+  err: unknown,
+  fallback: string,
+  stripPydanticPrefix: boolean,
+): string {
   const anyErr = err as {
     response?: { data?: { detail?: unknown } };
     message?: string;
@@ -220,7 +238,12 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
         const loc = Array.isArray(rec.loc)
           ? rec.loc.filter((s) => s !== "body").join(".")
           : "";
-        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(e);
+        const msg =
+          typeof rec.msg === "string"
+            ? stripPydanticPrefix
+              ? rec.msg.replace(/^Value error, /, "")
+              : rec.msg
+            : JSON.stringify(e);
         return loc ? `${loc}: ${msg}` : msg;
       })
       .filter(Boolean);
@@ -232,11 +255,24 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
     //   {"field": "match_clients", "value": "10.0.0.300", "message": "…"}
     // Without this the operator was shown the raw JSON, which buries the
     // one sentence that tells them what to fix.
-    const rec = detail as { message?: unknown; field?: unknown };
+    const rec = detail as {
+      message?: unknown;
+      field?: unknown;
+      errors?: unknown;
+    };
     if (typeof rec.message === "string" && rec.message.trim()) {
       return typeof rec.field === "string" && rec.field
         ? `${rec.field}: ${rec.message}`
         : rec.message;
+    }
+    // The password policy's refusal (#3040): `{reason: "password_policy",
+    // errors: ["Password must be at least 12 characters", ...]}`. The same
+    // list ChangePasswordPage reads via parsePasswordError.
+    if (Array.isArray(rec.errors)) {
+      const msgs = rec.errors.filter(
+        (e): e is string => typeof e === "string" && !!e.trim(),
+      );
+      if (msgs.length) return msgs.join("; ");
     }
     // Unexpected shape — stringify defensively so we never render an object.
     try {
@@ -1487,6 +1523,8 @@ export const ipamApi = {
         params: spaceId ? { space_id: spaceId } : undefined,
       })
       .then((r) => r.data),
+  getBlock: (id: string) =>
+    api.get<IPBlock>(`/ipam/blocks/${id}`).then((r) => r.data),
   createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
@@ -1895,6 +1933,8 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
       .then((r) => r.data),
+  getAddress: (id: string) =>
+    api.get<IPAddress>(`/ipam/addresses/${id}`).then((r) => r.data),
   updateAddress: (
     id: string,
     data: Partial<IPAddress> & {
@@ -3693,6 +3733,8 @@ export interface SearchResponse {
   total: number;
   results: SearchResult[];
   searched_types: SearchTypeInfo[];
+  /** True when `total` is a floor — a type hit the server's fetch cap. */
+  total_capped?: boolean;
 }
 
 export const searchApi = {
@@ -5547,6 +5589,11 @@ export interface DaemonStateFields {
   daemon_reason: string | null;
   daemon_status_since: string | null;
   daemon_not_serving: boolean | null;
+  /** #2962 — who reported the current not-`ok` state: the agent itself, or
+   * the appliance's supervisor from the kubelet's container state (the agent
+   * died with its container, or has gone silent). Null on `ok` / never
+   * reported. Optional: an older server omits it, which reads as `agent`. */
+  daemon_reported_by?: "agent" | "supervisor" | null;
 }
 
 export interface DNSServer {
@@ -7243,6 +7290,11 @@ export interface CloudDNSServerOption {
   has_credentials: boolean;
 }
 
+// The client defaults to application/json, which axios honours by turning a
+// FormData into JSON (a File becomes {}). The import previews read form
+// fields, so they must say multipart (#3038).
+const MULTIPART = { headers: { "Content-Type": "multipart/form-data" } };
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -7254,7 +7306,7 @@ export const dnsImportApi = {
     fd.append("target_group_id", target_group_id);
     if (target_view_id) fd.append("target_view_id", target_view_id);
     return api
-      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   bind9Commit: (body: {
@@ -7527,7 +7579,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   keaCommit: (body: DHCPImportCommitBody) =>
@@ -7542,7 +7594,7 @@ export const dhcpImportApi = {
     fd.append("target_group_id", target_group_id);
     if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
     return api
-      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd, MULTIPART)
       .then((r) => r.data);
   },
   iscCommit: (body: DHCPImportCommitBody) =>
@@ -8496,6 +8548,18 @@ export interface DHCPServerGroup {
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
+  /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
+   *  of two or more. HA does not render while this is non-empty. Empty for a
+   *  standalone group. Optional so fixtures predating it still type-check. */
+  ha_peer_urls_missing?: string[];
+  /** #2963 — why the control plane did not derive the missing URL(s):
+   *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
+   *  becomes a Kea backup and can take over the primary role, so it is left
+   *  to the operator). Null when it is derivable or nothing is missing. */
+  ha_autofill_skipped_reason?:
+    | "bridged_network_mode"
+    | "more_than_two_kea_members"
+    | null;
   // Member servers (rolled up by the /server-groups response).
   servers: DHCPServerGroupMember[];
   created_at: string;
@@ -8552,6 +8616,14 @@ export interface DHCPServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #3143 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -10024,7 +10096,8 @@ export interface DHCPMACBlock {
   id: string;
   group_id: string;
   mac_address: string;
-  reason: DHCPMACBlockReason;
+  // One of DHCPMACBlockReason, or the free text New Devices stored (#3083).
+  reason: string;
   description: string;
   enabled: boolean;
   expires_at: string | null;
@@ -10040,7 +10113,7 @@ export interface DHCPMACBlock {
 
 export interface DHCPMACBlockWrite {
   mac_address?: string;
-  reason?: DHCPMACBlockReason;
+  reason?: string;
   description?: string;
   enabled?: boolean;
   expires_at?: string | null;
@@ -12408,6 +12481,8 @@ export interface AcmeOrder {
   last_error: string | null;
   // True when the operator opted into solving unmanaged domains by hand.
   allow_manual: boolean;
+  // #3067 — whether a successful issue makes the cert the Web UI cert.
+  activate: boolean;
   // Populated while a manual order is "processing" — the TXT records the
   // operator must add. Empty for fully-managed orders.
   manual_challenges: AcmeManualChallenge[];
@@ -12422,6 +12497,9 @@ export interface AcmeIssueRequest {
   // dns-01 only — let an unmanaged domain be solved by an operator-pasted
   // TXT (the order goes "processing" with manual_challenges populated).
   allow_manual?: boolean;
+  // #3067 — make the issued cert the Web UI certificate (the API default).
+  // Needs admin on appliance; a certificate-store-only caller sends false.
+  activate?: boolean;
 }
 
 // Well-known Let's Encrypt directory endpoints surfaced as form
@@ -12612,6 +12690,10 @@ export interface MetalLBConfig {
   // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
   dns_vip?: string;
   dhcp_relay_vip?: string;
+  // #2899 — DHCP server groups the relay VIP fronts that are still in
+  // direct (raw socket) mode. Relays landing on the node announcing the
+  // VIP get no answer from them. Read-only; not sent on PUT.
+  dhcp_relay_vip_direct_groups?: string[];
   // issue #566 decision D1 — BGP mode. Layered on top of the same
   // MetalLB install; requires `enabled: true`. bgp_advertisements is
   // auto-derived server-side when omitted (see the backend cross-field
@@ -14250,8 +14332,16 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
+  reboot_in_progress?: boolean;
+  // #3008 — the node the reboot fields describe (the api pod's own node);
+  // null off-appliance.
+  node?: string | null;
   appliance_version: string | null;
   appliance_mode: boolean;
+  /** #3011 — false on a multi-node control plane: the local reboot acts on
+   *  whichever node answers, so Fleet's per-appliance reboot is the path. */
+  reboot_available: boolean;
+  reboot_unavailable_reason: string | null;
 }
 
 export const applianceSystemApi = {

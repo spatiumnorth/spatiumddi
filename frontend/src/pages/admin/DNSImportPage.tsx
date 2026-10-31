@@ -257,9 +257,7 @@ function BindTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -279,9 +277,7 @@ function BindTab() {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -424,9 +420,7 @@ function WindowsDNSTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -446,9 +440,7 @@ function WindowsDNSTab() {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -771,9 +763,7 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -793,9 +783,7 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -1083,9 +1071,7 @@ function PowerDNSTab() {
       setState((s) => ({ ...s, testInfo: info, error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, testInfo: null, error: detail }));
     },
   });
@@ -1119,9 +1105,7 @@ function PowerDNSTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -1141,9 +1125,7 @@ function PowerDNSTab() {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -1438,9 +1420,7 @@ function TechnitiumTab() {
       setState((s) => ({ ...s, testInfo: info, error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, testInfo: null, error: detail }));
     },
   });
@@ -1473,9 +1453,7 @@ function TechnitiumTab() {
       }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -1495,9 +1473,7 @@ function TechnitiumTab() {
       setState((s) => ({ ...s, result, phase: "result", error: null }));
     },
     onError: (err: unknown) => {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? formatApiError(err);
+      const detail = formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -2000,6 +1976,18 @@ export function PreviewPanel({
                         <div className="mt-0.5 text-[10px] text-muted-foreground">
                           view <span className="font-mono">{z.view_name}</span>
                         </div>
+                      )}
+                      {/* #3097: the "warnings" pill said a zone had notes
+                          and never what they were. */}
+                      {z.parse_warnings.length > 0 && (
+                        <ul
+                          aria-label={`Notes for ${z.name}`}
+                          className="mt-1 max-w-md list-disc space-y-0.5 pl-4 font-sans text-[11px] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-400"
+                        >
+                          {z.parse_warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
                       )}
                     </td>
                     <td className="px-3 py-2 align-top">

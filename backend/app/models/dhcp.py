@@ -47,6 +47,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # ── Server Group / Server ────────────────────────────────────────────────────
 
 
+# Only these group modes render a Kea HA relationship (#2969). Kea refuses
+# ``"mode": "standalone"`` in libdhcp_ha, which rejects the whole config.
+HA_MODES = frozenset({"hot-standby", "load-balancing"})
+
+
 class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Logical cluster of DHCP servers. Primary configuration container.
 
@@ -352,6 +357,32 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # ── #3143 which agent PROCESS owns this server identity ──
+    #
+    # The DHCP side of #2044 / #2219, same columns and rules as ``DNSServer``.
+    # A DHCP agent names its process on every config poll, heartbeat and
+    # registration (``X-Spatium-Agent-Instance``); only the owner is served
+    # (``services.agents.instance_ownership.claim_poll``). A displaced
+    # instance that polls or registers again while the owner is live is a
+    # SECOND live agent on one identity (a cloned Kea VM, two containers on one
+    # state dir) and is refused with 409, so the two stop staling each other's
+    # token. NULL = no agent that sends an instance id has polled yet.
+    agent_instance: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_instance_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    agent_instances_displaced: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # The current duplicate episode, read through
+    # ``instance_ownership.duplicate_active`` by the server row and the
+    # ``dhcp_agent_duplicate_instance`` alert.
+    duplicate_agent_first_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    duplicate_agent_last_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    duplicate_agent_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
 
     # Per-server maintenance mode (issue #182). Same shape as on
     # ``DNSServer`` — see that class for the design notes. Pausing a

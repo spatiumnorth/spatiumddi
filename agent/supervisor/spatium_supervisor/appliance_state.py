@@ -589,6 +589,11 @@ _REBOOT_TRIGGER_FILE = Path(
 _REBOOT_FIRED_BOOT_MARKER = Path(
     "/var/lib/spatiumddi-host/release-state/reboot-fleet-fired-boot"
 )
+# #3008 — written by the console's F9 ("<boot_id>\n") when it cancels a
+# reboot. The heartbeat reports it so the control plane retires the request.
+_REBOOT_CANCEL_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-cancelled"
+)
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
 # failed apply (which renames the trigger to ``.failed.<ts>`` and would
@@ -889,6 +894,49 @@ _HOST_PATCHES_LEDGER = Path(
 )
 
 
+_NIGHTLY_INSTALLED_RE = re.compile(
+    r"^0\.0\.0-nightly-(\d{4})(\d{2})(\d{2})(?:\+[0-9A-Za-z.-]+)?$"
+)
+_NIGHTLY_DAY_RE = re.compile(
+    r"^(?:nightly-(\d{4})\.?(\d{2})\.?(\d{2})|0\.0\.0-nightly-(\d{4})(\d{2})(\d{2}))$"
+)
+
+
+def _night(match: re.Match[str] | None) -> tuple[int, int, int] | None:
+    if match is None:
+        return None
+    y, m, d = (int(g) for g in match.groups() if g is not None)
+    try:
+        datetime(y, m, d)
+    except ValueError:
+        return None
+    return (y, m, d)
+
+
+def installed_is_target(installed: str | None, target: str | None) -> bool:
+    """#3026 — is the booted slot already the build ``target`` names?
+
+    A release installs under its own tag, and a full nightly version
+    (``0.0.0-nightly-YYYYMMDD+<sha>``) names one build: equal strings. A
+    nightly's tag is ``nightly-YYYY.MM.DD`` (or ``nightly-YYYYMMDD``, or the
+    version with no ``+<sha>``), which names a night, so any build of that
+    night matches. A string compare never matched it, so a finished nightly
+    upgrade was fired again over the rollback slot.
+
+    A copy of ``app.core.versions.is_installed_target`` (separate package);
+    the backend's ``test_nightly_upgrade_cleared_3026.py`` loads this module
+    and runs both over the same cases, so they cannot drift.
+    """
+    installed = (installed or "").strip()
+    target = (target or "").strip()
+    if not installed or not target:
+        return False
+    if installed == target:
+        return True
+    night = _night(_NIGHTLY_INSTALLED_RE.match(installed))
+    return night is not None and night == _night(_NIGHTLY_DAY_RE.match(target))
+
+
 def maybe_fire_fleet_upgrade(
     desired_version: str | None,
     desired_url: str | None,
@@ -950,7 +998,9 @@ def maybe_fire_fleet_upgrade(
         )
         return False
     installed = read_installed_version()
-    if installed and installed == desired_version:
+    # Never fire a target the booted slot already is: the write goes to the
+    # INACTIVE slot, i.e. the only rollback (#3026).
+    if installed_is_target(installed, desired_version):
         return False
     # Fire-once: skip if we already wrote a trigger for this exact
     # desired-state (same URL incl. nonce).
@@ -1681,6 +1731,54 @@ def read_boot_id() -> str | None:
     return value or None
 
 
+def read_reboot_cancel() -> str | None:
+    """#3008 — the boot id a reboot was cancelled in from the console, or None.
+    Only a cancel from THIS boot counts."""
+    try:
+        boot = _REBOOT_CANCEL_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return boot if boot and boot == read_boot_id() else None
+
+
+def _clear_reboot_cancel() -> None:
+    """Empty the cancel marker in place. The console writes it as root in the
+    sticky release-state dir, so this process can never unlink or rename over
+    it; the console publishes it 0660 to the dir's shared gid so it can be
+    truncated, and an empty marker reads as no cancel. ``O_NOFOLLOW`` so a
+    name planted by another writer of the dir is never followed."""
+    try:
+        fd = os.open(_REBOOT_CANCEL_MARKER, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    except OSError:
+        return
+    os.close(fd)
+
+
+def ack_reboot_cancel(sent: str | None, reboot_requested: bool | None) -> None:
+    """#3008 — retire the console's cancel once the control plane has.
+
+    ``sent`` is the boot id THIS heartbeat reported (None when it reported
+    none), ``reboot_requested`` what the response said (None when it said
+    nothing). Only a response that carried the report AND answers that no
+    reboot is requested proves the request is retired; then the cancel marker
+    is emptied and the once-per-boot fire marker dropped, so a new Fleet
+    request in this boot can fire. Anything else — an older api that ignores
+    the report, a boot-id mismatch, a cancel written while the heartbeat was in
+    flight — keeps both: the fire marker is what stops the request still on
+    the row from rebooting the node the operator just cancelled."""
+    if not sent or reboot_requested is not False:
+        return
+    if read_reboot_cancel() != sent:
+        return
+    _clear_reboot_cancel()
+    try:
+        _REBOOT_FIRED_BOOT_MARKER.unlink()
+    except OSError:
+        # Absent (a console-started reboot was cancelled, nothing was fired)
+        # or not ours to remove: nothing to re-arm either way.
+        pass
+
+
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
     """Phase 8f-8 — write the reboot trigger when the control plane
     has stamped ``reboot_requested=True`` on the server row.
@@ -1725,6 +1823,9 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
         tmp.replace(_REBOOT_TRIGGER_FILE)
         if boot_id:
             _REBOOT_FIRED_BOOT_MARKER.write_text(boot_id + "\n", encoding="utf-8")
+        # #3008 — a cancel made before this fire is not a cancel of it:
+        # reported on, it would have the control plane retire this request.
+        _clear_reboot_cancel()
         return True
     except OSError:
         return False
@@ -4728,6 +4829,8 @@ def collect() -> dict[str, object]:
         # different boot, instead of on a 15 s stopwatch that could expire
         # before the request was ever delivered.
         "boot_id": read_boot_id() if is_appliance else None,
+        # #3008 — a console F9 cancelled a reboot in this boot.
+        "reboot_cancelled_boot_id": read_reboot_cancel() if is_appliance else None,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
         # #386 Part C — full upgrade status for the Fleet UI.

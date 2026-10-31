@@ -2372,8 +2372,9 @@ _API_CPU_MAX = 4
 # so a pool saturated by load cannot fail the probe: one more connection per
 # api pod, held open at idle.
 #
-# ``max_connections`` is the chart's 200 until the budget passes it (from
-# five nodes with four worker processes, seven with two), then the budget, so a pool is never refused a connection it was sized for
+# ``max_connections`` is the appliance's floor of 200 until the budget passes
+# it (from five nodes with four worker processes, seven with two), then the
+# budget, so a pool is never refused a connection it was sized for
 # (``tests/test_postgres_connection_budget_2156.py`` holds that). It moves
 # with the memory limit, so it costs no restart of its own.
 _API_DB_POOL_SIZE = 10
@@ -2388,7 +2389,10 @@ _PROBE_DB_CONN_PER_API_POD = 1
 _PG_CONN_RESERVE = 10
 _PG_BACKEND_BASE_MIB = 14
 _PG_FIXED_MIB = 256
-# charts/spatiumddi/values.yaml: postgresql.cnpg.parameters.max_connections.
+# The appliance's floor: charts/spatiumddi/values.yaml's pre-#2955 200. The
+# chart now derives max_connections (and the memory limit) from its own pools
+# when the value is empty, so the appliance always writes one; keeping 200
+# below the crossing means an existing appliance does not roll.
 _PG_CHART_MAX_CONNECTIONS = 200
 
 
@@ -2491,7 +2495,7 @@ def control_plane_sizing(mem_total_mib: int, cp_size: int = 1) -> dict[str, int]
         "shared_buffers": shared_buffers_mb,
         "concurrency": concurrency,
         "postgres_connections": connections,
-        # The chart's 200 until the budget passes it (#2156, #2782).
+        # The appliance floor of 200 until the budget passes it (#2156, #2782).
         "max_connections": max(_PG_CHART_MAX_CONNECTIONS, connections),
         # CloudNativePG refuses a Cluster whose memory request is below
         # shared_buffers (Postgres reads MB as MiB, so the two compare one
@@ -2880,8 +2884,17 @@ def apply_control_plane_overrides(
             # with the instance count (both live under ``postgresql``; the merge
             # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
             # count is the Cluster's own, as the supervisor's patch left it.
+            # #3021 — and the instance pods reach the API server on their own
+            # node (every control-plane node is a k3s server): through the
+            # kubernetes Service, the loss of the node whose API server held
+            # the primary's connection restarted the primary.
             "postgresql": _deep_merge(
-                {"cnpg": {"instances": cnpg_instances if cnpg_instances else cp_size}},
+                {
+                    "cnpg": {
+                        "instances": cnpg_instances if cnpg_instances else cp_size,
+                        "nodeLocalApiServer": {"enabled": True},
+                    }
+                },
                 sized.get("postgresql", {}),
             ),
             # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only

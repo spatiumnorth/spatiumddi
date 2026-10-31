@@ -1,0 +1,164 @@
+#!/bin/sh
+# spatium-control-release: release the control and bootstrap charts a cluster
+# Rolling Upgrade's hold kept back (#2865, #3022).
+#
+# While a Rolling Upgrade's hold is on, spatiumddi-firstboot keeps the control
+# chart its boot rendered back as spatium-control.yaml.held, and the bootstrap
+# chart (the supervisor DaemonSet, the CNPG operator) as
+# spatium-bootstrap.yaml.held, instead of letting k3s roll them mid-run onto
+# the new charts on the held image, and starts this runner (see
+# control_hold_state there). For each chart the runner waits until nothing pins
+# it to another version, and for the run of its release that removing the pins
+# started in helm-controller to end, then releases it through firstboot's own
+# gate, release_control_manifest (the PriorityClass guard, #983, and the sizing
+# reconcile, #1210) or release_bootstrap_manifest, so the control plane rolls
+# ONCE: the new chart, the new image tag and the new version together. The
+# bootstrap chart goes first, and the control chart not before it is out: the
+# order the pins come off.
+#
+# The pins come off at the run's flip, whichever release drives the run (the
+# first upgrade into this release is driven, and flipped, by the release
+# before it), and, for a run that failed or was aborted, when the beat task
+# releases its hold (release_lingering_hold). A new run's Start pins the same
+# values again: the chart stays held, and the gate starts this runner again if
+# it had ended.
+#
+# Only spatiumddi-firstboot starts it (spatiumddi-control-release.service has
+# no [Install]). A reboot runs firstboot again, which renders the chart again
+# and holds it back or releases it.
+set -eu
+
+FIRSTBOOT="${SPATIUM_FIRSTBOOT:-/usr/local/bin/spatiumddi-firstboot}"
+POLL_S="${SPATIUM_CONTROL_RELEASE_POLL_S:-10}"
+
+log() { printf '[control-release] %s\n' "$*"; }
+
+# firstboot's globals and node_is_cluster_member, without its boot-time side
+# effects: the guard its unit tests source it through.
+SPATIUM_FIRSTBOOT_LIB=1
+# shellcheck source=/dev/null
+. "$FIRSTBOOT"
+
+# The gate itself, and the helpers it calls, are defined further down, below
+# firstboot's SPATIUM_FIRSTBOOT_RENDER_ONLY guard (they call k3s, which nothing
+# above that guard may: #1866). Their definitions are taken from the same file
+# the way its unit tests take them: each runs from its "name() {" line to the
+# first "}" in column 0. So the chart is released by the very gate firstboot
+# releases it by, the PriorityClass guard (#983) and the sizing reconcile
+# (#1210) with it.
+for fn in _strip_control_priority_class control_sizing_patch \
+        apply_control_sizing_patch control_hold_state control_helm_job_active \
+        release_control_manifest release_bootstrap_manifest; do
+    def=$(sed -n "/^$fn() {\$/,/^}\$/p" "$FIRSTBOOT")
+    if [ -z "$def" ]; then
+        log "$FIRSTBOOT defines no $fn(): a held chart cannot be released"
+        exit 1
+    fi
+    eval "$def"
+done
+
+export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+
+# #590: the seed's releases govern a cluster, and a joined member places none.
+if node_is_cluster_member; then
+    log "joined cluster member: not releasing $CONTROL_MANIFEST_HELD or $BOOTSTRAP_MANIFEST_HELD into the seed's cluster"
+    exit 0
+fi
+
+# Polls the release waits, once the hold has ended, for helm-controller's run
+# of the chart's release that the removal of the pins started.
+JOB_WAIT_POLLS="${SPATIUM_CONTROL_RELEASE_JOB_WAIT_POLLS:-30}"
+# #3022: polls the control chart waits, after this runner released the
+# bootstrap chart, before it looks for the helm-install-spatium-bootstrap Job
+# that release starts. A manifest reaches helm-controller through k3s's
+# deployer, which reads the manifests dir on its own interval (unlike the pins,
+# a HelmChartConfig write it sees at once), so the Job may not exist yet on the
+# next poll.
+SETTLE_POLLS="${SPATIUM_CONTROL_RELEASE_SETTLE_POLLS:-3}"
+
+# shellcheck disable=SC2034  # read and written by step() through eval
+last_bootstrap="" free_bootstrap=0 last_control="" free_control=0
+
+# $1 = bootstrap | control, $2 = the held chart, $3 = the gate that releases it.
+step() {
+    local name="$1" held="$2" gate="$3" last free state
+    eval "last=\$last_$name free=\$free_$name"
+    state=$(control_hold_state "$held" release "$name")
+    if [ "$state" != free ]; then
+        free=0
+        if [ "$state" != "$last" ]; then
+            log "waiting for the Rolling Upgrade's hold to end ($name: $state)"
+            last="$state"
+        fi
+    else
+        free=$((free + 1))
+        # The first read that finds the pins gone gives helm-controller a poll
+        # to start the Job their removal starts; the release then waits for
+        # that Job to end, for JOB_WAIT_POLLS polls at most.
+        if [ "$free" -eq 1 ]; then
+            log "the Rolling Upgrade's hold has ended ($name)"
+        elif [ "$free" -le "$JOB_WAIT_POLLS" ] && control_helm_job_active "$name"; then
+            if [ "$last" != job ]; then
+                log "waiting for helm-controller's run of spatium-$name to end"
+                last=job
+            fi
+        # #3022: nor does the control chart go in while spatium-bootstrap's
+        # own run is on (the CNPG operator whose webhook admits the control
+        # chart's Cluster may be rolling), even for a runner restarted after
+        # it released the bootstrap chart, which kept no count of it.
+        elif [ "$name" = control ] && [ "$free" -le "$JOB_WAIT_POLLS" ] \
+                && control_helm_job_active bootstrap; then
+            if [ "$last" != bootstrap-job ]; then
+                log "waiting for helm-controller's run of spatium-bootstrap to end before releasing $held"
+                last=bootstrap-job
+            fi
+        else
+            log "releasing $held"
+            # The gate reads the hold again: a new run's Start that pinned it
+            # in between keeps the chart held, and this loop goes on waiting.
+            # As in firstboot, a release that fails is not fatal: it is tried
+            # again.
+            "$gate" "$held" \
+                || log "WARN: the release of $held failed; trying again in ${POLL_S}s"
+            last="" free=0
+        fi
+    fi
+    eval "last_$name=\$last free_$name=\$free"
+}
+
+# Polls since this runner released the bootstrap chart; 0 once the control
+# chart no longer waits on that release.
+bootstrap_settle=0
+
+# 0 while the control chart waits on the bootstrap chart this runner released:
+# SETTLE_POLLS polls for its Job to appear, then while it runs, JOB_WAIT_POLLS
+# polls at most in all, as the release of either chart waits on its own Job.
+bootstrap_settling() {
+    [ "$bootstrap_settle" -gt 0 ] || return 1
+    if [ "$bootstrap_settle" -le "$SETTLE_POLLS" ] \
+            || { [ "$bootstrap_settle" -le "$JOB_WAIT_POLLS" ] && control_helm_job_active bootstrap; }; then
+        [ "$bootstrap_settle" -eq 1 ] \
+            && log "waiting for helm-controller's run of the released spatium-bootstrap before the control chart"
+        bootstrap_settle=$((bootstrap_settle + 1))
+        return 0
+    fi
+    bootstrap_settle=0
+    return 1
+}
+
+while [ -f "$BOOTSTRAP_MANIFEST_HELD" ] || [ -f "$CONTROL_MANIFEST_HELD" ]; do
+    # The bootstrap chart's pin comes off first, and its chart goes in first:
+    # the control chart waits until it is out, and until helm-controller's run
+    # of it has ended.
+    if [ -f "$BOOTSTRAP_MANIFEST_HELD" ]; then
+        step bootstrap "$BOOTSTRAP_MANIFEST_HELD" release_bootstrap_manifest
+        [ -f "$BOOTSTRAP_MANIFEST_HELD" ] || bootstrap_settle=1
+    elif [ -f "$CONTROL_MANIFEST_HELD" ] && bootstrap_settling; then
+        :
+    elif [ -f "$CONTROL_MANIFEST_HELD" ]; then
+        step control "$CONTROL_MANIFEST_HELD" release_control_manifest
+    fi
+    [ -f "$BOOTSTRAP_MANIFEST_HELD" ] || [ -f "$CONTROL_MANIFEST_HELD" ] || break
+    sleep "$POLL_S"
+done
+log "no chart held back"

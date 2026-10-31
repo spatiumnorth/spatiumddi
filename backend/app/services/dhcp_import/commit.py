@@ -30,6 +30,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import validate_optional_hostname
@@ -45,9 +46,10 @@ from app.models.dhcp import (
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.class_refs import reserved_name_reason
 from app.services.dhcp.option_spelling import group_raw_codes
-from app.services.dhcp.option_validation import rekey_raw_options
+from app.services.dhcp.option_validation import canonical_domain_options, rekey_raw_options
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 from app.services.import_savepoint import entity_savepoint
+from app.services.ipam.resize import _total_ips
 
 from .canonical import (
     ConflictAction,
@@ -55,6 +57,7 @@ from .canonical import (
     ImportPreview,
     ImportSource,
     ScopeConflict,
+    pool_problem,
 )
 
 logger = structlog.get_logger(__name__)
@@ -143,8 +146,46 @@ def drop_unservable_hostnames(scopes: list[ImportedScope]) -> list[str]:
     return warnings
 
 
+def drop_invalid_pools(scopes: list[ImportedScope]) -> list[str]:
+    """Remove every pool that is not a range of its scope's subnet (#3037).
+
+    The parsers already drop these with a parse warning; this runs again on
+    the commit, which takes the plan the client sends back rather than the
+    parser's, and on a source whose parser does not check (Windows). The
+    scope is still imported, as with every other per-item drop here, and
+    each dropped pool is named in the returned warnings.
+    """
+    warnings: list[str] = []
+    for scope in scopes:
+        kept = []
+        for pool in scope.pools:
+            problem = pool_problem(pool.start_ip, pool.end_ip, scope.subnet_cidr)
+            if problem is None:
+                kept.append(pool)
+            else:
+                warnings.append(
+                    f"{scope.subnet_cidr}: pool {pool.start_ip!r} - {pool.end_ip!r} "
+                    f"not imported: {problem}"
+                )
+        scope.pools = kept
+    return warnings
+
+
 def _canonical_cidr(raw: str) -> str:
     return str(ipaddress.ip_network(raw, strict=False))
+
+
+def _scope_error(exc: Exception) -> str:
+    """Operator-facing reason a scope failed. A statement error's own text
+    (a driver error, or a bind value SQLAlchemy could not process) carries
+    the SQL statement and bound values, so it never goes out."""
+    if isinstance(exc, StatementError):
+        logger.warning("dhcp_import_scope_db_error", error=str(exc.orig))
+        return (
+            "the database refused this scope's data (a value is not valid for its "
+            "column); check the scope's pools, reservations and options"
+        )
+    return str(exc)
 
 
 async def _find_subnet(db: AsyncSession, cidr: str, space_id: uuid.UUID | None) -> Subnet | None:
@@ -296,7 +337,7 @@ async def _create_subnet(
         network=cidr,
         name="",
         kind="multicast" if is_multicast else "unicast",
-        total_ips=net.num_addresses,
+        total_ips=_total_ips(net),
         utilization_percent=0.0,
         allocated_ips=0,
     )
@@ -324,7 +365,7 @@ def _scope_kwargs(
         lease_time=parsed.lease_time,
         min_lease_time=parsed.min_lease_time,
         max_lease_time=parsed.max_lease_time,
-        options=dict(parsed.options or {}),
+        options=canonical_domain_options(parsed.options),
         ddns_enabled=parsed.ddns_enabled,
         ddns_hostname_policy=parsed.ddns_hostname_policy or "client",
         import_source=source,
@@ -436,7 +477,7 @@ async def _commit_one_scope(
                 mac_address=r.mac_address,
                 hostname=r.hostname or "",
                 client_id=r.client_id,
-                options_override=dict(r.options) if r.options else None,
+                options_override=canonical_domain_options(r.options) if r.options else None,
                 import_source=source,
                 imported_at=now,
             )
@@ -526,7 +567,7 @@ async def _commit_client_classes(
                     match_expression=cc.match_expression or "",
                     description=cc.description or "",
                     address_family=cc.address_family or "ipv4",
-                    options=dict(cc.options or {}),
+                    options=canonical_domain_options(cc.options),
                     import_source=source,
                     imported_at=now,
                 )
@@ -588,6 +629,7 @@ async def commit_import(
     results: list[CommitScopeResult] = []
     warnings = list(preview.warnings)
     warnings.extend(drop_unservable_hostnames(preview.scopes))
+    warnings.extend(drop_invalid_pools(preview.scopes))
 
     # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
     # importer keeps an unmapped option as ``opt-NN``), whatever the target
@@ -640,7 +682,7 @@ async def commit_import(
             result = CommitScopeResult(
                 subnet_cidr=cidr,
                 action_taken="failed",
-                error=str(exc),
+                error=_scope_error(exc),
             )
         results.append(result)
 

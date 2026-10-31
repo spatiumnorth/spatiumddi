@@ -1090,6 +1090,17 @@ _PLACEHOLDER_NS_ADDRESS = "127.0.0.1"
 # Sidecar in the rendered tree naming the zones given the placeholder glue.
 PLACEHOLDER_GLUE_FILE = "placeholder-glue.json"
 _PLACEHOLDER_RNAME_LABEL = "admin"
+# The placeholder of a zone whose own name holds a label that is not a host name,
+# such as Active Directory's ``_msdcs.<forest root>`` (#3003). Every name inside
+# that zone carries the label, and BIND's default check-names for a primary zone
+# refuses an SOA MNAME, an NS target or an A owner that is not a host name, and an
+# SOA RNAME whose domain part is not: ``ns1.<zone>``, its glue and ``admin.<zone>``
+# made named refuse the zone, so it was never served. Such a zone's placeholder
+# lives outside it: ``invalid.``, the name RFC 6761 reserves never to resolve, as
+# the catalog zone's apex already uses it (``_write_catalog_zone_file``). A name
+# server outside the zone needs no glue.
+_PLACEHOLDER_OUTSIDE = "invalid."
+_PLACEHOLDER_OUTSIDE_RNAME = "invalid."
 
 # Characters a master-file name cannot carry unescaped. The same set as the
 # control plane's ``contains_zonefile_unsafe`` (backend app/core/dns_names.py),
@@ -1141,6 +1152,26 @@ def _is_host_name(absolute: str) -> bool:
     return all(_HOST_LABEL_RE.match(label) for label in body.split("."))
 
 
+_MAILBOX_LOCAL_RE = re.compile(r"^[\x21-\x7e]+$")
+
+
+def _is_mailbox_name(absolute: str) -> bool:
+    """Whether absolute ``absolute`` is a usable SOA RNAME: the control
+    plane's ``admin_email_error`` rule (backend ``app/core/dns_names.py``).
+    BIND's check-names reads the RNAME as a mailbox — a local part of any
+    printable ASCII, then host-name labels — and refuses the whole zone when
+    it is not one; a row stored before #2916 with
+    ``hostmaster.under_score.…`` kept the zone from ever being served. At
+    least two labels, as for the Primary NS."""
+    body = absolute[:-1] if absolute.endswith(".") else absolute
+    if not body or len(body) > 253 or "." not in body:
+        return False
+    local, _, domain = body.partition(".")
+    if len(local) > 63 or not _MAILBOX_LOCAL_RE.match(local):
+        return False
+    return all(_HOST_LABEL_RE.match(label) for label in domain.split("."))
+
+
 def _zone_file_name(value: str, origin: str) -> str:
     """How BIND reads ``value`` written into the file of zone ``origin``:
     absolute when it ends in a dot, the apex for ``@`` or nothing, otherwise
@@ -1156,6 +1187,16 @@ def _inside(name: str, origin: str) -> bool:
     """Whether absolute ``name`` is the apex ``origin`` or below it."""
     n, o = name.lower(), origin.lower()
     return n == o or n.endswith("." + o)
+
+
+def _labels_are_host_names(origin: str) -> bool:
+    """Whether every label of absolute ``origin`` is a host-name label, so that
+    a name the agent invents inside the zone is one check-names accepts (#3003).
+    The zone API allows an underscore in a zone's name (``_msdcs``,
+    ``_domainkey``); a host-name label does not. Not ``_is_host_name``: a
+    one-label zone (``lan.``) qualifies, since ``ns1.lan.`` is a host name."""
+    body = origin.removesuffix(".")
+    return not body or all(_HOST_LABEL_RE.match(label) for label in body.split("."))
 
 
 class ZoneApex(NamedTuple):
@@ -1186,10 +1227,13 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     3. Otherwise the placeholder ``ns1.<zone>``, glued to 127.0.0.1 unless the
        zone holds an address for ``ns1`` itself. That glue sends every
        resolver that follows the zone's own NS set to loopback, so it is noted
-       for a warning.
+       for a warning. A zone whose own name is not a host name (``_msdcs.…``)
+       gets ``invalid.`` instead, outside it and with no glue, also noted: no
+       name inside it is one BIND's check-names accepts (#3003).
 
     The SOA MNAME is ``primary_ns``, else the first declared NS, else the
-    placeholder; the RNAME is ``admin_email``, else ``admin.<zone>``. Before
+    placeholder; the RNAME is ``admin_email``, else ``admin.<zone>``, or
+    ``invalid.`` for a zone whose own name is not a host name. Before
     this, every zone got the placeholder SOA, NS and glue whatever it held:
     ``primary_ns`` and ``admin_email`` never reached the agent, and a zone's own
     NS records were served beside ``ns1.<zone>``.
@@ -1212,11 +1256,18 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     if primary_ns is not None and not _is_host_name(primary_ns):
         primary_ns = None  # reported below as an unusable field, then healed
     admin = _absolute_name(zone.get("admin_email"))
+    if admin is not None and not _is_mailbox_name(admin):
+        admin = None  # reported below as an unusable field, then healed
     for field, parsed in (("primary_ns", primary_ns), ("admin_email", admin)):
         if parsed is None and str(zone.get(field) or "").strip():
             notes.append(("unusable_field", f"{field}={zone.get(field)!r}"))
 
-    placeholder = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
+    if _labels_are_host_names(origin):
+        placeholder = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
+        rname_fallback = f"{_PLACEHOLDER_RNAME_LABEL}.{origin}"
+    else:
+        placeholder = _PLACEHOLDER_OUTSIDE
+        rname_fallback = _PLACEHOLDER_OUTSIDE_RNAME
     apex_ns: tuple[str, ...]
     if declared_ns:
         apex_ns = ()
@@ -1231,10 +1282,14 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
             notes.append(("unaddressed_primary_ns", primary_ns))
         apex_ns = (placeholder,)
         ns_set = [placeholder]
+        if not _inside(placeholder, origin):
+            notes.append(("placeholder_outside", placeholder))
 
     ns_lower = {n.lower() for n in ns_set}
     placeholder_glue = (
-        placeholder.lower() in ns_lower and placeholder.lower() not in addressed
+        _inside(placeholder, origin)
+        and placeholder.lower() in ns_lower
+        and placeholder.lower() not in addressed
     )
     if placeholder_glue:
         notes.append(("placeholder", placeholder))
@@ -1244,7 +1299,7 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
             notes.append(("unaddressed_ns", n))
 
     mname = primary_ns or (declared_ns[0] if declared_ns else placeholder)
-    rname = admin or f"{_PLACEHOLDER_RNAME_LABEL}.{origin}"
+    rname = admin or rname_fallback
     return ZoneApex(mname, rname, apex_ns, placeholder_glue, tuple(notes))
 
 
@@ -1294,6 +1349,19 @@ _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
             "zone), or add NS records at the apex."
         ),
     ),
+    "placeholder_outside": (
+        "bind9_zone_apex_ns_never_resolves",
+        (
+            "These zones name no name server of their own (no Primary NS, no "
+            "NS record at the apex), and their own names hold a label that is "
+            "not a host name (an underscore, as in _msdcs), so no name inside "
+            "them is one BIND accepts as a name server (check-names). They are "
+            "served with the SOA primary name and NS invalid., a name that "
+            "never resolves (RFC 6761), so a resolver that follows a zone's own "
+            "NS set finds no server. Set the zone's Primary NS to a host name "
+            "outside the zone, or add NS records at the apex naming one."
+        ),
+    ),
     "unaddressed_primary_ns": (
         "bind9_zone_primary_ns_has_no_address",
         (
@@ -1340,7 +1408,8 @@ def _log_apex_notes(notes: list[tuple[str, str, str]]) -> None:
     """
     by_kind: dict[str, set[str]] = {}
     for zname, kind, detail in notes:
-        entry = zname if kind == "placeholder" else f"{zname} ({detail})"
+        placeholder = kind in ("placeholder", "placeholder_outside")
+        entry = zname if placeholder else f"{zname} ({detail})"
         by_kind.setdefault(kind, set()).add(entry)
     for kind, entries in by_kind.items():
         event, text = _APEX_NOTE_LOG[kind]

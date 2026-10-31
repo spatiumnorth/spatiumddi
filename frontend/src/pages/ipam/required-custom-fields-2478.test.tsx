@@ -231,15 +231,17 @@ describe("a Required custom field is required by the dialogs (#2478)", () => {
       allocated_ips: 0,
       total_ips: 65536,
     } as unknown as IPBlock;
-    open(<EditBlockModal block={block} onClose={() => {}} />);
+    answer("ipamApi", "getBlock", () => Promise.resolve(block));
+    const onClose = vi.fn();
+    open(<EditBlockModal block={block} onClose={onClose} />);
     const select = await findControl<HTMLSelectElement>("Tier *");
     expect(select.value).toBe("");
     await press("Save");
-    await waitFor(() => expect(updateBlock).toHaveBeenCalledTimes(1));
-    expect(
-      (updateBlock.mock.calls[0][1] as { custom_fields: unknown })
-        .custom_fields,
-    ).toEqual({});
+    // Not refused: the dialog closes with no error. An edit sends only what
+    // changed (#3091) and nothing did, so nothing is sent.
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(screen.queryByText(/Required custom field/)).toBeNull();
+    expect(updateBlock).not.toHaveBeenCalled();
   });
 
   it("Edit IP Block refuses to blank a Required field it holds", async () => {
@@ -261,6 +263,7 @@ describe("a Required custom field is required by the dialogs (#2478)", () => {
       allocated_ips: 0,
       total_ips: 65536,
     } as unknown as IPBlock;
+    answer("ipamApi", "getBlock", () => Promise.resolve(block));
     open(<EditBlockModal block={block} onClose={() => {}} />);
     const select = await findControl<HTMLSelectElement>("Tier *");
     expect(select.value).toBe("gold");

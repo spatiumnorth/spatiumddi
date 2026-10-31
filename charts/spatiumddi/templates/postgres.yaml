@@ -49,6 +49,12 @@ spec:
         - name: postgresql
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          # #2955 — max_connections from the configured api / worker pools
+          # (helper ``spatiumddi.postgresMaxConnections``); an explicit
+          # ``postgresql.maxConnections`` wins. Changing it restarts Postgres.
+          args:
+            - -c
+            - max_connections={{ .Values.postgresql.maxConnections | default (include "spatiumddi.postgresMaxConnections" .) }}
           ports:
             - name: postgres
               containerPort: 5432
@@ -86,8 +92,9 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
+          # #2955 — the memory limit holds the derived max_connections.
           resources:
-            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+            {{- include "spatiumddi.postgresResources" . | nindent 12 }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.postgresql.nodeSelector) .) | nindent 6 }}
       {{- with .Values.postgresql.tolerations }}
       tolerations:

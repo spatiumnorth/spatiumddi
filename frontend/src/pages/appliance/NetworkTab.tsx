@@ -21,6 +21,9 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { usePermissions } from "@/hooks/usePermissions";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 
 /**
  * Phase 4f — Network & Host info (read-mostly MVP).
@@ -39,7 +42,7 @@ export function NetworkTab() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "system", "info"],
     queryFn: applianceSystemApi.info,
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
 
   return (
@@ -334,13 +337,20 @@ function VipChangeNoticeModal({
 // patches the HelmCharts so the frontend Service floats on the VIP.
 function MetalLBConfigCard() {
   const qc = useQueryClient();
-  const { data, isLoading } = useQuery({
+  // #3105 — both the read and the save of the MetalLB settings take admin on
+  // appliance AND a superadmin; a Viewer is not offered a form over a read it
+  // would be refused, and the read is not made for it at all.
+  const { isSuperadmin, isLoading: permsLoading } = usePermissions();
+  const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "metallb"],
     queryFn: applianceApprovalApi.getMetalLBConfig,
     staleTime: 30_000,
+    enabled: isSuperadmin,
     // Poll so the live status (controller / speaker readiness, VIP
-    // claim) updates as MetalLB pods schedule after a save.
-    refetchInterval: 10_000,
+    // claim) updates as MetalLB pods schedule after a save. #3106 — a
+    // refusal is not asked again: it does not heal, and every one is a
+    // denied audit row.
+    refetchInterval: pollUnlessRefused(10_000),
   });
 
   const [enabled, setEnabled] = useState(false);
@@ -444,6 +454,23 @@ function MetalLBConfigCard() {
   const allReady =
     controllerReady && speakersTotal > 0 && speakersReady === speakersTotal;
   const statusTone = !data?.enabled ? "zinc" : allReady ? "emerald" : "amber";
+
+  if (!isSuperadmin || isRefused(error)) {
+    return (
+      <section className="rounded-lg border bg-card p-4 shadow-sm">
+        <h3 className="text-sm font-semibold">Control-plane VIP (MetalLB)</h3>
+        <p className="mt-2 text-xs text-muted-foreground">
+          {permsLoading ? (
+            "Loading…"
+          ) : isRefused(error) ? (
+            <ListReadError error={error} what="the MetalLB settings" />
+          ) : (
+            "Viewing or changing the control-plane VIP is restricted to superadmins."
+          )}
+        </p>
+      </section>
+    );
+  }
 
   return (
     <>
@@ -615,10 +642,30 @@ function MetalLBConfigCard() {
                     />
                     <span className="text-[11px] text-muted-foreground">
                       Stabilises a DHCP relay's <code>forward-to</code> target
-                      so it outlives a single Kea node. Kea keeps{" "}
-                      <code>hostNetwork</code>:67 for direct-attached broadcast
-                      — this VIP only fronts the relay→server unicast forward.
+                      so it outlives a single Kea node. Every DHCP server group
+                      it fronts must use <strong>relay</strong> client
+                      reachability: in direct mode, relays landing on the node
+                      that announces the VIP get no answer. A group that also
+                      serves directly attached clients needs direct mode, so
+                      point its relays at each node's own address instead.
                     </span>
+                    {(data?.dhcp_relay_vip_direct_groups ?? []).length > 0 && (
+                      <div
+                        role="alert"
+                        className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                      >
+                        In direct mode behind this VIP:{" "}
+                        <span className="font-medium break-all">
+                          {(data?.dhcp_relay_vip_direct_groups ?? []).join(
+                            ", ",
+                          )}
+                        </span>
+                        . Relays whose traffic lands on the node announcing the
+                        VIP get no answer from these groups, and no packet
+                        counter shows it. Set each group's client reachability
+                        to relay under DHCP → Server groups, or clear this VIP.
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

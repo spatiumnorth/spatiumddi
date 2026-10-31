@@ -84,7 +84,8 @@ async def test_dns_series_needs_dns_read_not_dhcp_read(
         await client.get("/api/v1/metrics/dhcp/timeseries", headers=dhcp_reader)
     ).status_code == 200
 
-    dns_reader = await _headers(db_session, permissions=_grant("read", "dns_zone"))
+    # Server traffic is a server-group read, as the /dns server routes are (#3073).
+    dns_reader = await _headers(db_session, permissions=_grant("read", "dns_group"))
     assert (
         await client.get("/api/v1/metrics/dns/timeseries", headers=dns_reader)
     ).status_code == 200

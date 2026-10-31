@@ -28,9 +28,11 @@ from app.api.v1.dhcp._failover_schemas import (
     GroupFailoverResponse,
 )
 from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
-from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.agent_wake import appliance_channel, collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPServerGroup
+from app.core.update_nulls import changed_keys, snapshot
+from app.models.appliance import Appliance
+from app.models.dhcp import HA_MODES, DHCPServerGroup
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteGroupArgs
 from app.services.appliance.group_names import (
@@ -40,6 +42,12 @@ from app.services.appliance.group_names import (
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
 from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
+from app.services.dhcp.ha_peer_autofill import HA_GROUP_MODES, autofill_skipped_reason
+from app.services.dhcp.relay_vip import (
+    group_ids_behind_relay_vip,
+    load_relay_vip,
+    refusal_for_groups,
+)
 from app.services.dhcp.windows_failover_report import group_failover_report
 
 router = APIRouter(
@@ -161,6 +169,17 @@ class GroupResponse(BaseModel):
     # Computed: count of Kea servers currently in the group. ≥ 2 means
     # the group renders the libdhcp_ha.so hook on every peer.
     kea_member_count: int = 0
+    # #2963 - names of Kea members with no ``ha_peer_url`` in an HA-mode group
+    # of two or more: HA is NOT rendered while this is non-empty. Empty
+    # otherwise, including for a ``standalone`` group (no HA wanted).
+    ha_peer_urls_missing: list[str] = []
+    # #2963 - when ``ha_peer_urls_missing`` is non-empty, why the control plane
+    # did not derive the URL: ``bridged_network_mode`` or
+    # ``more_than_two_kea_members`` (a 3rd+ member would become a Kea backup
+    # and can reshuffle the pair's roles, so that is left to the operator).
+    # None when the URL is derivable (an appliance member will be filled at its
+    # next join) or nothing is missing.
+    ha_autofill_skipped_reason: str | None = None
     # Member servers rolled up so the UI can render a group detail page
     # without a second round-trip. Empty when nothing's registered.
     servers: list[ServerSummary] = []
@@ -194,8 +213,17 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         kea_thread_pool_size=g.kea_thread_pool_size,
         kea_packet_logging=g.kea_packet_logging,
         kea_member_count=len(kea),
+        ha_peer_urls_missing=(
+            sorted(s.name for s in kea if not s.ha_peer_url)
+            if len(kea) >= 2 and g.mode in HA_GROUP_MODES
+            else []
+        ),
+        ha_autofill_skipped_reason=(
+            autofill_skipped_reason(g, len(kea)) if any(not s.ha_peer_url for s in kea) else None
+        ),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
-        ha_peer_auth_active=len(kea) >= 2
+        ha_peer_auth_active=g.mode in HA_MODES
+        and len(kea) >= 2
         and all(s.ha_peer_url for s in kea)
         and peer_auth_ready(g, kea),
         servers=[
@@ -490,8 +518,26 @@ async def update_group(
         problem = group_name_problem("dhcp", new_name)
         if problem is not None:
             raise HTTPException(status_code=422, detail=problem)
+    was_ha = g.mode in HA_MODES
+    # #2899 — a group behind the MetalLB relay VIP cannot read raw sockets:
+    # relays whose flows land on the node announcing the VIP would get no
+    # answer. Only on a change to ``direct``, so re-saving is never refused.
+    if changes.get("dhcp_socket_mode") == "direct" and g.dhcp_socket_mode != "direct":
+        vip = await load_relay_vip(db)
+        if vip and g.id in await group_ids_behind_relay_vip(db):
+            raise HTTPException(status_code=422, detail=refusal_for_groups(vip, [g.name]))
+    before = snapshot(g, changes)
     for k, v in changes.items():
         setattr(g, k, v)
+    # #2969 — the HA listener firewall rule (#1167) follows the mode too, and
+    # it rides the supervisor heartbeat, not the DHCP bundle. A mode change
+    # into or out of HA wakes each appliance serving this group so the rule
+    # opens (or closes) with the hook instead of a heartbeat interval later.
+    if (g.mode in HA_MODES) != was_ha:
+        for appliance_id in (
+            await db.execute(select(Appliance.id).where(Appliance.assigned_dhcp_group_id == g.id))
+        ).scalars():
+            collect_wake(appliance_channel(appliance_id))
     # HA tuning (mode / heartbeat / delays / auto-failover), the Kea socket
     # mode (#365) and the packet-worker pool size (#980) all render into
     # every member's bundle, so wake the group channel — the bundle ETag
@@ -504,7 +550,7 @@ async def update_group(
         resource_type="dhcp_server_group",
         resource_id=str(g.id),
         resource_display=g.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
     await db.commit()

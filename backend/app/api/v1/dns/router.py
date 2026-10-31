@@ -58,6 +58,7 @@ from app.core.agent_wake import (
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
+    admin_email_error,
     bind_check_names_error,
     primary_ns_error,
     record_value_error,
@@ -68,11 +69,12 @@ from app.core.dns_names import (
 from app.core.permissions import (
     _token_grants_for,
     is_effective_superadmin,
-    require_any_permission,
-    require_any_resource_permission,
+    refuse_and_audit,
     require_permission,
+    require_route_types,
     token_scope_allows,
     token_scoped_resource_ids,
+    type_level_allows,
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
@@ -100,7 +102,6 @@ from app.models.dns import (
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
-    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSBlockList,
@@ -119,6 +120,7 @@ from app.models.dns import (
     dns_blocklist_view_assoc,
     dnssec_algorithm_name,
 )
+from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
@@ -127,6 +129,7 @@ from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
 )
+from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns import dnssec_signers, technitium_api_scope
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
@@ -166,6 +169,12 @@ from app.services.dns.named_conf_validation import (
     validate_update_acl_entry,
     validate_view_name,
     validate_zone_forwarders,
+)
+from app.services.dns.new_object_defaults import (
+    DNSSEC_VALIDATION_MODES,
+    ZONE_TYPES,
+    default_zone_ttl,
+    load_dns_defaults,
 )
 from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_identity import describe_identical, find_identical_record
@@ -268,32 +277,155 @@ from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
 
-# Router-level RBAC: GET=read, POST/PUT/PATCH=write, DELETE=delete. The DNS
-# router covers server groups, servers, views, ACLs, zones and records, so a
-# user with `admin` on any of (dns_group, dns_zone, dns_record) passes the
-# router gate. Handlers that need finer scoping (e.g. "record write permitted
-# only when dns_zone permits write") can do inline checks with
-# `user_has_permission`.
+# Router-level RBAC: GET=read, POST/PUT/PATCH=write, DELETE=delete, on EVERY
+# type the route serves (#3073). Until then the gate admitted a type-level
+# grant on ANY of (dns_group, dns_zone, dns_record), so a role holding only
+# ``{read, dns_record}`` listed every group, server and zone. Server groups,
+# servers, their options, views, ACLs and TSIG keys are ``dns_group``; zones
+# (and zone-level settings: DNSSEC, update ACLs, moves) ``dns_zone``; records
+# ``dns_record``. A route whose answer carries several types needs each of
+# them. A route missing from this map admits nobody;
+# ``tests/test_dns_route_types.py`` fails until it is classified.
+_G = ("dns_group",)
+_Z = ("dns_zone",)
+_R = ("dns_record",)
+_DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
+    # server groups
+    "GET /groups": _G,
+    "POST /groups": _G,
+    "GET /groups/{group_id}": _G,
+    "PUT /groups/{group_id}": _G,
+    "DELETE /groups/{group_id}": _G,
+    "POST /groups/{group_id}/group-tsig-key/rotate": _G,
+    "POST /groups/{group_id}/sync-with-servers": _G,
+    "GET /groups/{group_id}/dynamic-update-caps": _G,
+    # servers
+    "GET /groups/{group_id}/servers": _G,
+    "POST /groups/{group_id}/servers": _G,
+    "PUT /groups/{group_id}/servers/{server_id}": _G,
+    "DELETE /groups/{group_id}/servers/{server_id}": _G,
+    "POST /groups/{group_id}/servers/{server_id}/approve": _G,
+    "POST /groups/{group_id}/servers/{server_id}/pause": _G,
+    "POST /groups/{group_id}/servers/{server_id}/resume": _G,
+    "POST /groups/{group_id}/servers/{server_id}/test-connection": _G,
+    "POST /groups/{group_id}/servers/{server_id}/pull-zones-from-server": _G,
+    "POST /groups/{group_id}/servers/{server_id}/sync-from-server": _G,
+    "POST /test-windows-credentials": _G,
+    "GET /servers/{server_id}/recent-events": _G,
+    "GET /servers/{server_id}/rendered-config": _G,
+    "GET /servers/{server_id}/rndc-status": _G,
+    # a server's view of every zone in its group, and its queued record ops
+    "GET /servers/{server_id}/zone-state": ("dns_group", "dns_zone"),
+    "GET /servers/{server_id}/pending-ops": ("dns_group", "dns_record"),
+    "POST /servers/{server_id}/apply-record": _R,
+    # options, forwarders, trust anchors, DNSSEC policies
+    "GET /groups/{group_id}/options": _G,
+    "PUT /groups/{group_id}/options": _G,
+    "POST /groups/{group_id}/options/trust-anchors": _G,
+    "DELETE /groups/{group_id}/options/trust-anchors/{anchor_id}": _G,
+    "GET /forwarder-presets": _G,
+    "GET /dnssec-policies": _G,
+    "POST /dnssec-policies": _G,
+    "PUT /dnssec-policies/{policy_id}": _G,
+    "DELETE /dnssec-policies/{policy_id}": _G,
+    # ACLs, TSIG keys, views
+    "GET /groups/{group_id}/acls": _G,
+    "POST /groups/{group_id}/acls": _G,
+    "PUT /groups/{group_id}/acls/{acl_id}": _G,
+    "DELETE /groups/{group_id}/acls/{acl_id}": _G,
+    "GET /groups/{group_id}/tsig-keys/generate-secret": _G,
+    "GET /groups/{group_id}/tsig-keys": _G,
+    "POST /groups/{group_id}/tsig-keys": _G,
+    "GET /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "PUT /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "POST /groups/{group_id}/tsig-keys/{key_id}/rotate": _G,
+    "DELETE /groups/{group_id}/tsig-keys/{key_id}": _G,
+    "GET /groups/{group_id}/views": _G,
+    "POST /groups/{group_id}/views": _G,
+    "PUT /groups/{group_id}/views/{view_id}": _G,
+    "DELETE /groups/{group_id}/views/{view_id}": _G,
+    # zones
+    "GET /groups/{group_id}/zones": _Z,
+    "POST /groups/{group_id}/zones": _Z,
+    "POST /groups/{group_id}/zones/from-template": _Z,
+    "GET /groups/{group_id}/zones/{zone_id}": _Z,
+    "PUT /groups/{group_id}/zones/{zone_id}": _Z,
+    "DELETE /groups/{group_id}/zones/{zone_id}": _Z,
+    # a zone's state on each server of its group (server names and hosts),
+    # and its update ACL, which names the group's TSIG keys
+    "GET /groups/{group_id}/zones/{zone_id}/server-state": ("dns_zone", "dns_group"),
+    "GET /groups/{group_id}/zones/{zone_id}/update-acl": ("dns_zone", "dns_group"),
+    "PUT /groups/{group_id}/zones/{zone_id}/update-acl": _Z,
+    "GET /groups/{group_id}/zones/{zone_id}/dnssec/info": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/sign": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/unsign": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/rollover": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/move/preview": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/move/commit": _Z,
+    "GET /zone-templates": _Z,
+    "GET /tld-registry": _Z,
+    "GET /tld-registry/classify": _Z,
+    "POST /tld-registry/refresh": _Z,
+    # zones with their records: exports, the live-vs-DB diff (reported per
+    # server, so it carries the group's servers too), and delegation, which
+    # reads and writes NS + glue records in the parent zone
+    "GET /groups/{group_id}/zones/export": ("dns_zone", "dns_record"),
+    "GET /groups/{group_id}/zones/{zone_id}/export": ("dns_zone", "dns_record"),
+    "GET /groups/{group_id}/zones/{zone_id}/drift": ("dns_zone", "dns_record", "dns_group"),
+    "GET /groups/{group_id}/zones/{zone_id}/delegation-preview": ("dns_zone", "dns_record"),
+    "POST /groups/{group_id}/zones/{zone_id}/delegate-from-parent": ("dns_zone", "dns_record"),
+    # records
+    "GET /groups/{group_id}/records": _R,
+    "GET /groups/{group_id}/zones/{zone_id}/records": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/records": _R,
+    "PUT /groups/{group_id}/zones/{zone_id}/records/{record_id}": _R,
+    "DELETE /groups/{group_id}/zones/{zone_id}/records/{record_id}": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/records/bulk-delete": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/records/bulk-create": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/preview": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/commit": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/sync-with-server": _R,
+    "GET /groups/{group_id}/zones/{zone_id}/import/template": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit": _R,
+}
+_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns")
+
 # The upload routes here check the login from the request headers before
 # the multipart body is read (app.api.pre_body_auth, #2780).
 router = APIRouter(
     route_class=PreBodyAuthUploadRoute,
-    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))],
+    dependencies=[Depends(_DNS_GATE)],
 )
+
 
 # The router gate takes the action from the HTTP method, so a POST asks for
 # ``write``. A POST that answers with the zone's existing records (an import
 # preview / commit, a sync-with-server) also needs what a GET of those records
-# needs: ``read`` on any of the three types, as the export and record list ask.
-_DNS_RECORDS_READ = require_any_permission(
-    ("read", "dns_group"), ("read", "dns_zone"), ("read", "dns_record")
-)
+# needs: ``read`` on ``dns_record``, as the record list asks.
+async def _dns_records_read(request: Request, current_user: CurrentUser, db: DB) -> Any:
+    if not type_level_allows(current_user, "read", "dns_record"):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="read",
+            resource_type="dns_record",
+            resource_id="",
+            resource_display="dns_record:*",
+            reason="permission denied (read on dns_record)",
+            detail="Permission denied: need 'read' on 'dns_record'",
+        )
+    return current_user
+
+
+_dns_records_read.spatium_requires = ("exact", [("read", "dns_record")])  # type: ignore[attr-defined]
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
 # don't also need a schema edit to be accepted on create/update.
 VALID_DRIVERS = frozenset(_DNS_DRIVERS.keys())
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
-VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
+VALID_ZONE_TYPES = set(ZONE_TYPES)
 VALID_RECORD_TYPES = {
     "A",
     "AAAA",
@@ -362,7 +494,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
     "dnssec_rollover": frozenset({"bind9"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
-VALID_DNSSEC = {"auto", "yes", "no"}
+VALID_DNSSEC = set(DNSSEC_VALIDATION_MODES)
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only", "primary-only"}
 VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # Upstream forwarding transport (issue #50). No "https" member: BIND has no
@@ -399,7 +531,9 @@ class ServerGroupCreate(BaseModel):
     description: str = ""
     group_type: str = "internal"
     default_view: str | None = None
-    is_recursive: bool = True
+    # #3087 — omitted ⇒ Settings → DNS "Recursive by Default" (resolved in
+    # the create handler; an explicit value always wins).
+    is_recursive: bool | None = None
     # BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
     # ≥2-server BIND9 groups.
     catalog_zones_enabled: bool = False
@@ -717,6 +851,13 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2962 — who the current not-``ok`` daemon state came from: ``agent``
+    # (its own heartbeat) or ``supervisor`` (the appliance's supervisor, from
+    # the kubelet's container state, when the agent died with its container
+    # or has gone silent). ``null`` on ``ok`` or never reported. Derived
+    # (``container_oom.daemon_reported_by``), the same reading the alert's
+    # wording uses.
+    daemon_reported_by: Literal["agent", "supervisor"] | None = None
     # #2044 — a second live agent process is polling as this server (a cloned
     # VM or a copied state dir keeps the agent_id) and is being refused: only
     # the most recent process is served record ops. Derived
@@ -796,6 +937,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
             **_duplicate_agent_fields(s),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
@@ -1302,11 +1444,17 @@ def _validate_zone_forward_tls_hostname(v: str | None) -> str | None:
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
+    # Stays "primary" when omitted (#3087): Settings' Default Zone Type is a
+    # pre-selection for the Add Zone form only.  A forward / secondary / stub
+    # zone needs fields (forwarders, masters) a bare create never carries, so
+    # defaulting the API's type to it would turn an omitted type into a 422.
     zone_type: str = "primary"
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
+    # #3087 — omitted ⇒ Settings → DNS "Default Zone TTL" (resolved in the
+    # create handler; an explicit value, including 0, always wins).
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1918,8 +2066,23 @@ def _enforce_bind_check_names(
 
 
 @router.get("/groups", response_model=list[ServerGroupResponse])
-async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
-    result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
+async def list_groups(db: DB, current_user: CurrentUser) -> list[ServerGroupResponse]:
+    stmt = select(DNSServerGroup).order_by(DNSServerGroup.name)
+    # A zone-bound API token lists only the groups its zones sit in (#3073),
+    # as ``token_path_scope`` holds it to them on every ``{group_id}`` route.
+    # A ``dns_group`` grant of the token's own admits the groups it names.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    token_group_ids = token_scoped_resource_ids(current_user, "dns_group")
+    if token_zone_ids is not None and token_group_ids is not None:
+        stmt = stmt.where(
+            or_(
+                DNSServerGroup.id.in_(
+                    select(DNSZone.group_id).where(DNSZone.id.in_(token_zone_ids))
+                ),
+                DNSServerGroup.id.in_(_uuids_of(token_group_ids)),
+            )
+        )
+    result = await db.execute(stmt)
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
     warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
@@ -1934,12 +2097,16 @@ async def create_group(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A server group with that name already exists")
 
-    group = DNSServerGroup(**body.model_dump())
+    defaults = await load_dns_defaults(db)
+    group_fields = body.model_dump()
+    if body.is_recursive is None:
+        group_fields["is_recursive"] = defaults.recursive
+    group = DNSServerGroup(**group_fields)
     db.add(group)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
-    # Auto-create default options
-    options = DNSServerOptions(group=group)
+    # Auto-create default options (#3087: DNSSEC validation from Settings)
+    options = DNSServerOptions(group=group, dnssec_validation=defaults.dnssec_validation)
     db.add(options)
 
     db.add(
@@ -3181,6 +3348,8 @@ async def _sync_single_server(
     zones_imported: list[str] = []
     zones_skipped_system: list[str] = []
     if import_new_zones and new_zones:
+        # The server reports no zone TTL; the stored default fills the gap (#3087).
+        pull_ttl = await default_zone_ttl(db, group_id)
         for name in new_zones:
             if _is_system_zone_name(name):
                 zones_skipped_system.append(name)
@@ -3202,7 +3371,7 @@ async def _sync_single_server(
                 name=name if name.endswith(".") else name + ".",
                 zone_type="primary",
                 kind=kind,
-                ttl=3600,
+                ttl=pull_ttl,
                 refresh=ZONE_DEFAULT_REFRESH,
                 retry=ZONE_DEFAULT_RETRY,
                 expire=ZONE_DEFAULT_EXPIRE,
@@ -3611,7 +3780,8 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
             raise HTTPException(
                 422,
                 "A TLS certificate is required to enable DoT, DoH or DoQ. "
-                "Upload or issue one under Appliance → Web UI Certificate first.",
+                "Upload or issue one through "
+                f"{certificate_store_location(settings.appliance_mode)} first.",
             )
         cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
         if cert is None:
@@ -5637,12 +5807,18 @@ async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: CurrentUser
 ) -> ZoneResponse:
     await _require_group(group_id, db)
-    _refuse_superadmin_zone_fields(current_user, body.model_dump(), None)
-    await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
+    await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
+    # #3087 — an omitted TTL takes Settings → DNS "Default Zone TTL". Resolved
+    # before the gates so they judge the value the zone will actually carry.
+    zone_fields = body.model_dump()
+    if zone_fields["ttl"] is None:
+        zone_fields["ttl"] = await default_zone_ttl(db, group_id)
+    _refuse_superadmin_zone_fields(current_user, zone_fields, None)
+    await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
-    await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
+    await _check_zone_forward_transport(group_id, zone_fields, None, db)
     if await zone_name_taken(db, group_id, body.view_id, body.name):
         raise HTTPException(
             status_code=409,
@@ -5656,7 +5832,7 @@ async def create_zone(
     if body.dnssec_enabled:
         await _check_driver_gated_operation("dnssec_sign", group_id, db)
 
-    payload = body.model_dump()
+    payload = zone_fields
     payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
     guard = await RenderGuard.capture(db, group_id, [body.name])
     zone = DNSZone(group_id=group_id, **payload)
@@ -6443,6 +6619,14 @@ async def update_zone(
         ns_err = primary_ns_error(changes["primary_ns"])
         if ns_err is not None:
             raise HTTPException(status_code=422, detail=f"Primary NS (primary_ns) {ns_err}")
+    # #2916 — the same for the Admin Email (SOA RNAME), checked by BIND too.
+    if "admin_email" in changes and (changes["admin_email"] or "") != (zone.admin_email or ""):
+        mail_err = admin_email_error(changes["admin_email"])
+        if mail_err is not None:
+            raise HTTPException(status_code=422, detail=f"Admin Email (admin_email) {mail_err}")
+    # #2917 — a changed view must be a view of this zone's own server group.
+    if changes.get("view_id") is not None and changes["view_id"] != zone.view_id:
+        await _enforce_zone_view_in_group(db, zone.group_id, changes["view_id"])
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -7802,8 +7986,25 @@ class FromTemplateRequest(BaseModel):
 
     @field_validator("zone_name")
     @classmethod
-    def ensure_trailing_dot(cls, v: str) -> str:
-        return v if v.endswith(".") else v + "."
+    def validate_zone_name(cls, v: str) -> str:
+        # #2915 — the rule zone create applies (ZoneCreate.validate_zone_name).
+        return validate_fqdn(v, field="zone name") + "."
+
+    @field_validator("zone_type")
+    @classmethod
+    def validate_zone_type(cls, v: str) -> str:
+        if v not in VALID_ZONE_TYPES:
+            raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
+        # A template writes records, which only a primary zone serves. A
+        # secondary / stub zone also needs masters this request cannot carry
+        # (zone create refuses one without, #336), and a forward zone holds
+        # no records at all.
+        if v != "primary":
+            raise ValueError(
+                "zone_type must be 'primary': a template writes records, which "
+                "only a primary zone serves"
+            )
+        return v
 
     @model_validator(mode="after")
     def kind_follows_name(self) -> FromTemplateRequest:
@@ -7862,6 +8063,53 @@ async def create_zone_from_template(
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
+    await _enforce_zone_view_in_group(db, group_id, body.view_id)  # #2917
+
+    # #2915 — every record the template would write goes through the record
+    # API's rules before anything is written or pushed.
+    record_payloads = materialize(template, body.zone_name, body.params)
+    probe_zone = DNSZone(group_id=group_id, name=body.zone_name)  # never added
+    for r in record_payloads:
+        if r["record_type"] not in VALID_RECORD_TYPES:
+            # Catalog-author bug — refuse rather than write garbage records.
+            raise HTTPException(
+                status_code=500,
+                detail=f"Template {body.template_id} produced invalid record type {r['record_type']}",
+            )
+        try:
+            checked = RecordCreate(
+                name=r["name"],
+                record_type=r["record_type"],
+                value=r["value"],
+                ttl=r["ttl"],
+                priority=r["priority"],
+                weight=r["weight"],
+                port=r["port"],
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_validation_message(exc)) from exc
+        await _check_driver_gated_record_type(checked.record_type, group_id, db)
+        checked.priority, checked.weight, checked.port = _normalize_record_struct_fields(
+            checked.record_type, checked.priority, checked.weight, checked.port
+        )
+        _validate_address_record_value(
+            checked.record_type,
+            checked.value,
+            priority=checked.priority,
+            weight=checked.weight,
+            port=checked.port,
+            origin=body.zone_name,
+        )
+        await _enforce_absolute_target(db, probe_zone, checked.record_type, checked.value)
+        owner = f"{checked.name}.{body.zone_name}" if checked.name != "@" else body.zone_name
+        _enforce_bind_check_names(checked.record_type, owner, checked.value, body.zone_name)
+        r.update(
+            name=checked.name,
+            priority=checked.priority,
+            weight=checked.weight,
+            port=checked.port,
+        )
+
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -7892,6 +8140,7 @@ async def create_zone_from_template(
         name=body.zone_name,
         zone_type=body.zone_type,
         kind=body.kind,
+        ttl=await default_zone_ttl(db, group_id),  # #3087
     )
     db.add(zone)
     await guard.check(db, f"create zone {body.zone_name!r}")  # #2275
@@ -7900,13 +8149,6 @@ async def create_zone_from_template(
 
     created_records: list[DNSRecord] = []
     for r in record_payloads:
-        if r["record_type"] not in VALID_RECORD_TYPES:
-            # Catalog-author bug — refuse rather than write garbage records.
-            raise HTTPException(
-                status_code=500,
-                detail=f"Template {body.template_id} produced invalid record type {r['record_type']}",
-            )
-        await _check_driver_gated_record_type(r["record_type"], group_id, db)
         fqdn = (f"{r['name']}.{zone.name}" if r["name"] != "@" else zone.name).rstrip(".") + "."
         rec = DNSRecord(
             zone_id=zone.id,
@@ -8555,6 +8797,29 @@ async def _refuse_cname_conflict(
     if other is not None:
         raise HTTPException(
             status.HTTP_409_CONFLICT, describe_cname_conflict(record_type, fqdn, other)
+        )
+
+
+async def _enforce_zone_view_in_group(
+    db: DB, group_id: uuid.UUID, view_id: uuid.UUID | None
+) -> None:
+    """422 a zone ``view_id`` that is not a view of the zone's own group (#2917).
+
+    The record API's rule (``_enforce_views_in_zone_group``) for the zone paths:
+    a zone pinned to another group's view renders in none of this group's views,
+    so it is never served while the server row still reads ok.
+    """
+    if view_id is None:
+        return
+    found = (
+        await db.execute(
+            select(DNSView.id).where(DNSView.group_id == group_id, DNSView.id == view_id)
+        )
+    ).scalar_one_or_none()
+    if found is None:
+        raise HTTPException(
+            status_code=422,
+            detail="view_id does not name a view in this zone's server group",
         )
 
 
@@ -9754,7 +10019,7 @@ async def _queue_import_ops(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
-    dependencies=[Depends(_DNS_RECORDS_READ)],
+    dependencies=[Depends(_dns_records_read)],
 )
 async def import_zone_preview(
     group_id: uuid.UUID,
@@ -9797,7 +10062,7 @@ async def import_zone_preview(
     response_model=ImportCommitResponse,
     dependencies=[
         Depends(require_permission("write", "dns_record")),
-        Depends(_DNS_RECORDS_READ),
+        Depends(_dns_records_read),
     ],
 )
 async def import_zone_commit(
@@ -10039,7 +10304,7 @@ class SyncWithServerResponse(BaseModel):
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/sync-with-server",
     response_model=SyncWithServerResponse,
-    dependencies=[Depends(_DNS_RECORDS_READ)],
+    dependencies=[Depends(_dns_records_read)],
 )
 async def sync_zone_with_server_endpoint(
     group_id: uuid.UUID,
@@ -10466,7 +10731,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
     response_model=SheetImportPreviewResponse,
-    dependencies=[Depends(_DNS_RECORDS_READ)],
+    dependencies=[Depends(_dns_records_read)],
 )
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
@@ -10524,7 +10789,7 @@ async def import_zone_spreadsheet_preview(
     response_model=SheetImportCommitResponse,
     dependencies=[
         Depends(require_permission("write", "dns_record")),
-        Depends(_DNS_RECORDS_READ),
+        Depends(_dns_records_read),
     ],
 )
 async def import_zone_spreadsheet_commit(
@@ -10769,6 +11034,17 @@ def _enforce_zone_token_scope(user: Any, zone_id: uuid.UUID) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API token is not scoped to this DNS zone",
         )
+
+
+def _uuids_of(ids: set[str]) -> list[uuid.UUID]:
+    """The ids that parse as UUIDs; a malformed grant id matches nothing."""
+    out: list[uuid.UUID] = []
+    for raw in ids:
+        try:
+            out.append(uuid.UUID(raw))
+        except ValueError:
+            continue  # a malformed grant id names no group
+    return out
 
 
 def _zone_token_id_filter(user: Any) -> set[uuid.UUID] | None:

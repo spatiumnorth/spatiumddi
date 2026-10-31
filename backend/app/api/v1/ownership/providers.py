@@ -23,14 +23,30 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.asn import ASN
 from app.models.circuit import Circuit
 from app.models.ownership import PROVIDER_KINDS, Provider
 
 router = APIRouter(
     tags=["providers"],
-    dependencies=[Depends(require_resource_permission("provider"))],
+    dependencies=[
+        Depends(
+            require_resource_permission(
+                "provider",
+                # A grant scoped to one provider (#3039) reaches that row's detail
+                # and edit and the list, which narrows to the granted rows.
+                instance_routes=(
+                    "provider",
+                    "GET /",
+                    frozenset({"GET /{provider_id}"}),
+                    frozenset({"PUT /{provider_id}"}),
+                ),
+                instance_param="provider_id",
+                prefix="/providers",
+            )
+        )
+    ],
 )
 
 
@@ -96,7 +112,7 @@ class ProviderBulkDelete(BaseModel):
 @router.get("", response_model=ProviderListResponse)
 async def list_providers(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     kind: ProviderKind | None = Query(default=None),
@@ -115,6 +131,15 @@ async def list_providers(
                 Provider.name.ilike(needle),
                 Provider.account_number.ilike(needle),
                 Provider.contact_email.ilike(needle),
+            )
+        )
+    # A caller admitted only by grants scoped to individual rows (#3039) sees
+    # those rows and no others.
+    if not user_has_permission(user, "read", "provider"):
+        ids = (await db.execute(select(Provider.id))).scalars().all()
+        stmt = stmt.where(
+            Provider.id.in_(
+                [i for i in ids if user_has_permission(user, "read", "provider", str(i))]
             )
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
@@ -194,6 +219,16 @@ async def update_provider(
             raise HTTPException(
                 status_code=409, detail=f"Provider named {changes['name']!r} already exists"
             )
+    # A grant scoped to this provider (#3039) does not reach the ASN it points at.
+    if (
+        "default_asn_id" in changes
+        and changes["default_asn_id"] != row.default_asn_id
+        and not user_has_permission(user, "write", "provider")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Permission denied: changing 'default_asn_id' needs 'write' on 'provider'",
+        )
     if "default_asn_id" in changes:
         await _check_default_asn(db, changes["default_asn_id"])
 

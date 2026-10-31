@@ -100,11 +100,7 @@ function ProviderEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -252,6 +248,14 @@ export function ProvidersPage() {
     perms.can("delete", "provider"),
     "Requires delete permission on providers",
   );
+  // A row's Edit asks what PUT /providers/{id} asks, which takes a grant
+  // scoped to that one provider (#3039, #3134); New and Delete stay
+  // type-level, as their routes do.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "provider", id),
+      "Requires write permission on providers",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<ProviderKind | "">("");
@@ -512,7 +516,7 @@ export function ProvidersPage() {
                         title="Edit"
                         onClick={() => setEditing(p)}
                         className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                        {...writeGate}
+                        {...editGate(p.id)}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>

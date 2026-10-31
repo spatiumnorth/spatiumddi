@@ -84,11 +84,16 @@ def test_the_connection_budget_at_one_three_and_nine_nodes(
 
 
 def _chart_max_connections() -> int:
+    """The floor the appliance keeps. Since #2955 the chart derives
+    ``max_connections`` from its own pools when the value is empty (its
+    default), so the appliance must always set one: its floor is the chart's
+    pre-#2955 200, kept so an appliance under the crossing does not roll."""
     for parent in Path(__file__).resolve().parents:
         values = parent / "charts" / "spatiumddi" / "values.yaml"
         if values.is_file():
             doc = yaml.safe_load(values.read_text(encoding="utf-8"))
-            return int(doc["postgresql"]["cnpg"]["parameters"]["max_connections"])
+            assert doc["postgresql"]["cnpg"]["parameters"]["max_connections"] in ("", None)
+            return 200
     raise AssertionError("could not find charts/spatiumddi/values.yaml")
 
 
@@ -96,9 +101,9 @@ def _chart_max_connections() -> int:
 @pytest.mark.parametrize("mem_mib", [8192, 24576])  # two and four worker processes
 def test_max_connections_always_covers_the_budget(cp_size: int, mem_mib: int) -> None:
     """A pool sized past max_connections is refused at the database. With the
-    #2782 hooks and the #2944 probe the budget passes the chart's 200 from
-    five nodes (four worker processes) or seven (two), so the supervisor writes the budget there and
-    the chart's own value below it."""
+    #2782 hooks and the #2944 probe the budget passes the appliance's floor
+    of 200 from five nodes (four worker processes) or seven (two), so the
+    supervisor writes the budget there and the floor below it."""
     assert _chart_max_connections() == k8s_api._PG_CHART_MAX_CONNECTIONS
     s = k8s_api.control_plane_sizing(mem_mib, cp_size)
     assert s["max_connections"] >= s["postgres_connections"]
