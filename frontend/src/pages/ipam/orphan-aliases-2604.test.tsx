@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DeleteOrOrphanModal } from "./IPAMPage";
 import type { IPAddress } from "@/lib/api";
 
@@ -23,17 +24,20 @@ const address = {
   id: "00000000-0000-0000-0000-000000000001",
   address: "10.98.3.21",
   status: "allocated",
+  alias_count: 0,
 } as unknown as IPAddress;
 
 describe("Mark as Orphan and the address's DNS aliases (#2604)", () => {
   it("says the aliases leave the zone and come back on restore", () => {
     render(
-      <DeleteOrOrphanModal
-        address={address}
-        onOrphan={() => {}}
-        onPurge={() => {}}
-        onClose={() => {}}
-      />,
+      <QueryClientProvider client={new QueryClient()}>
+        <DeleteOrOrphanModal
+          address={address}
+          onOrphan={() => {}}
+          onPurge={() => {}}
+          onClose={() => {}}
+        />
+      </QueryClientProvider>,
     );
     const option = screen.getByText("Mark as Orphan (reversible)")
       .parentElement as HTMLElement;

@@ -7409,6 +7409,7 @@ export function SubnetDetail({
       {showBulkDelete && (
         <BulkDeleteAddressesModal
           ipIds={[...selectedIpIds]}
+          addresses={addresses}
           subnetId={subnet.id}
           onClose={() => setShowBulkDelete(false)}
           onDone={() => {
@@ -11339,13 +11340,23 @@ function BulkEditAddressesModal({
   );
 }
 
-function BulkDeleteAddressesModal({
+export function BulkDeleteAddressesModal({
   ipIds,
+  addresses,
   subnetId,
   onClose,
   onDone,
 }: {
   ipIds: string[];
+  // The rows behind ipIds that the page has loaded, so the dialog can name
+  // them (#3210); ids with no loaded row are counted, not named.
+  addresses?: {
+    id: string;
+    address: string;
+    hostname?: string | null;
+    fqdn?: string | null;
+    alias_count?: number;
+  }[];
   // Absent for a cross-subnet selection from the global IP search (#520).
   subnetId?: string;
   onClose: () => void;
@@ -11354,6 +11365,9 @@ function BulkDeleteAddressesModal({
   const qc = useQueryClient();
   const [permanent, setPermanent] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const chosen = (addresses ?? []).filter((a) => ipIds.includes(a.id));
+  const named = chosen.slice(0, RECORDS_SHOWN);
+  const unnamed = ipIds.length - named.length;
 
   const mutation = useMutation({
     mutationFn: () => ipamApi.bulkDeleteAddresses({ ip_ids: ipIds, permanent }),
@@ -11403,6 +11417,34 @@ function BulkDeleteAddressesModal({
             </>
           )}
         </p>
+        {named.length > 0 && (
+          <ul className="space-y-0.5 text-xs" aria-label="Selected addresses">
+            {named.map((a) => {
+              const h = a.fqdn || a.hostname;
+              return (
+                <li key={a.id}>
+                  <span className="font-mono">{a.address}</span>
+                  {h && (
+                    <span className="font-mono text-muted-foreground">
+                      {" "}
+                      ({h})
+                    </span>
+                  )}
+                  {(a.alias_count ?? 0) > 0 && (
+                    <span className="text-muted-foreground">
+                      {" "}
+                      + {a.alias_count} alias
+                      {a.alias_count === 1 ? "" : "es"}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+            {unnamed > 0 && (
+              <li className="text-muted-foreground">and {unnamed} more</li>
+            )}
+          </ul>
+        )}
         <label className="flex items-center gap-2 text-xs">
           <input
             type="checkbox"
@@ -11600,6 +11642,48 @@ function ConfirmDeleteModal({
   );
 }
 
+const RECORDS_SHOWN = 5;
+
+/** The DNS records a delete takes with it, by name and type, capped (#3210).
+ *  Says so when the list could not be read; says nothing when there are none,
+ *  so an address without records keeps the dialog's older wording. */
+function RecordsNote({
+  records,
+  loading,
+  error,
+}: {
+  records: string[];
+  loading: boolean;
+  error: unknown;
+}) {
+  if (loading) return null;
+  if (error) {
+    return (
+      <p className="mt-1 text-xs text-muted-foreground">
+        <ListReadError error={error} what="this address's DNS aliases" /> Its
+        records may still be removed with it.
+      </p>
+    );
+  }
+  if (records.length === 0) return null;
+  const shown = records.slice(0, RECORDS_SHOWN);
+  const more = records.length - shown.length;
+  return (
+    <p className="mt-1 text-xs">
+      <span className="text-muted-foreground">DNS records: </span>
+      {shown.map((r, i) => (
+        <span key={r}>
+          {i > 0 && ", "}
+          <code>{r}</code>
+        </span>
+      ))}
+      {more > 0 && (
+        <span className="text-muted-foreground"> and {more} more</span>
+      )}
+    </p>
+  );
+}
+
 /** Delete-an-allocated-IP flow: two choices in one modal — mark as orphan
  * (amber, reversible; DNS / DHCP cascades still happen but the IPAM row
  * stays so the address can be restored) or permanently delete (red, irreversible).
@@ -11619,12 +11703,44 @@ export function DeleteOrOrphanModal({
   isOrphanPending?: boolean;
   isPurgePending?: boolean;
 }) {
+  // #3210 — name the host and the records the consequence touches. The
+  // primary record is known from the row; aliases need a read, which may
+  // fail or be refused without the dialog losing its choices.
+  const host = address.fqdn || address.hostname || "";
+  const hasAliases = address.alias_count !== 0;
+  const aliasesQ = useQuery({
+    queryKey: ["address-aliases", address.id],
+    queryFn: () => ipamApi.listAliases(address.id),
+    enabled: hasAliases,
+    retry: false,
+  });
+  const records: string[] = [];
+  if (address.dns_record_id && host) {
+    records.push(`${host} ${address.address.includes(":") ? "AAAA" : "A"}`);
+  }
+  for (const a of aliasesQ.data ?? []) {
+    records.push(`${a.name} ${a.record_type}`);
+  }
+  const recordsNote = (
+    <RecordsNote
+      records={records}
+      loading={hasAliases && aliasesQ.isLoading}
+      error={hasAliases ? aliasesQ.error : null}
+    />
+  );
   return (
     <Modal title="Delete IP Address" onClose={onClose}>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">
           What should happen to{" "}
-          <span className="font-mono font-medium">{address.address}</span>?
+          <span className="font-mono font-medium">{address.address}</span>
+          {host && (
+            <>
+              {" "}
+              (<span className="font-mono font-medium">{host}</span>)
+            </>
+          )}
+          ?
         </p>
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
           <div className="text-xs font-medium text-amber-700 dark:text-amber-400">
@@ -11637,6 +11753,7 @@ export function DeleteOrOrphanModal({
             restore or permanently delete it later from the orphans view;
             restoring it publishes its DNS records and aliases again.
           </p>
+          {recordsNote}
         </div>
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
           <div className="text-xs font-medium text-destructive">
@@ -11647,6 +11764,7 @@ export function DeleteOrOrphanModal({
             assignments tied to this IP are also cascaded. There's no undo —
             skip the orphan state entirely.
           </p>
+          {recordsNote}
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <button
@@ -16859,6 +16977,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
       {showBulkDelete && (
         <BulkDeleteAddressesModal
           ipIds={[...selected]}
+          addresses={items}
           onClose={() => setShowBulkDelete(false)}
           onDone={() => {
             setShowBulkDelete(false);
