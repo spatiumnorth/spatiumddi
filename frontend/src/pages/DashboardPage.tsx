@@ -4434,7 +4434,7 @@ function ComplianceKpi({
 //
 // The companion Compliance tab covers the static + reactive picture
 // (classification roll-up + audit-log change events).
-function ConformityPanel() {
+export function ConformityPanel() {
   const { enabled, ready } = useFeatureModules();
   const moduleEnabled = enabled("compliance.conformity");
   // Gate queries on ``ready`` so they wait for the real module state; show the
@@ -4476,6 +4476,19 @@ function ConformityPanel() {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground">
         Conformity module is disabled — enable it under Features & Integrations.
+      </div>
+    );
+  }
+
+  // A refused or failed conformity read is not "0 frameworks, nothing
+  // failing" (#3148): say so instead of drawing zeros over it.
+  if (summaryQ.isError && !summaryQ.data) {
+    return (
+      <div
+        role="alert"
+        className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={summaryQ.error} what="conformity results" />
       </div>
     );
   }
@@ -4655,6 +4668,10 @@ function ConformityPanel() {
         {failingQ.isLoading ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
             Loading…
+          </div>
+        ) : failingQ.isError ? (
+          <div className="px-4 py-6 text-center text-xs">
+            <ListReadError error={failingQ.error} what="failing results" />
           </div>
         ) : (failingQ.data ?? []).length === 0 ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">

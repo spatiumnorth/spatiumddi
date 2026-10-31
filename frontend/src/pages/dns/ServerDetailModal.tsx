@@ -1042,24 +1042,28 @@ function StatsTab({ serverId }: { serverId: string }) {
           />
         </p>
       )}
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        <AnalyticsCard
-          title="Top qnames"
-          rows={analytics.data?.top_qnames ?? []}
-          isLoading={analytics.isLoading}
-        />
-        <AnalyticsCard
-          title="Top clients"
-          rows={analytics.data?.top_clients ?? []}
-          isLoading={analytics.isLoading}
-        />
-        <AnalyticsCard
-          title="qtype distribution"
-          rows={analytics.data?.qtype_distribution ?? []}
-          isLoading={analytics.isLoading}
-          spanFull
-        />
-      </div>
+      {/* The cards would read "No data in window." over a refused read
+          (#3148): withhold them, the sentence above says why. */}
+      {!isRefused(analytics.error) && (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <AnalyticsCard
+            title="Top qnames"
+            rows={analytics.data?.top_qnames ?? []}
+            isLoading={analytics.isLoading}
+          />
+          <AnalyticsCard
+            title="Top clients"
+            rows={analytics.data?.top_clients ?? []}
+            isLoading={analytics.isLoading}
+          />
+          <AnalyticsCard
+            title="qtype distribution"
+            rows={analytics.data?.qtype_distribution ?? []}
+            isLoading={analytics.isLoading}
+            spanFull
+          />
+        </div>
+      )}
       {analytics.data && (
         <p className="text-[11px] text-muted-foreground">
           Top-N rollups computed against the parsed BIND9 query log (24&nbsp;h
