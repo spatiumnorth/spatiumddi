@@ -112,7 +112,9 @@ export function ConfirmModal({
               disabled={loading}
             />
             {passwordError && (
-              <p className="text-xs text-destructive">{passwordError}</p>
+              <p role="alert" className="text-xs text-destructive">
+                {passwordError}
+              </p>
             )}
           </div>
         )}
