@@ -255,6 +255,10 @@ def switch_rig(rig: Rig, monkeypatch) -> Rig:
     monkeypatch.setattr(rig.mod, "detect_active_inactive", lambda: (dict(ACTIVE), dict(INACTIVE)))
     monkeypatch.setattr(rig.mod, "_sync_mirror_esp", lambda: None)
     monkeypatch.setattr(rig.mod, "_read_grubenv_default", lambda: "slot_a")
+    # The target slot's release file (#1026 arch check): same arch as the host.
+    monkeypatch.setattr(rig.mod, "host_architecture", lambda: "amd64")
+    rig.target_release = {"APPLIANCE_VERSION": "2026.10.02-1", "APPLIANCE_ARCH": "amd64"}
+    monkeypatch.setattr(rig.mod, "slot_release_fields", lambda slot: rig.target_release)
     for name, body in ROLLBACK_SET.items():
         p = rig.src / name
         p.write_bytes(body)
@@ -368,3 +372,37 @@ def test_a_failed_copy_warns_loudly_and_still_rolls_back(switch_rig: Rig, capsys
     assert not list(switch_rig.dest.glob(".*.part"))
     tools = [c[0] for c in switch_rig.commands]
     assert tools[-1] == "grub-set-default", f"the rollback was blocked by a failed copy: {tools}"
+
+
+def test_a_target_slot_of_another_architecture_is_not_copied(switch_rig: Rig, capsys) -> None:
+    # #1026 — an apply refused at the arch gate leaves the other arch's rootfs
+    # in the inactive slot. Its tarballs must not reach the RUNNING k3s, which
+    # would import them and could re-point a shared tag at the wrong arch.
+    switch_rig.target_release = {"APPLIANCE_VERSION": "2026.10.02-1", "APPLIANCE_ARCH": "arm64"}
+    before = {p.name: p.read_bytes() for p in switch_rig.dest.iterdir()}
+
+    assert switch_rig.mod.cmd_rollback(types.SimpleNamespace()) == 0
+
+    assert not switch_rig.writes, "a wrong-architecture slot's tarballs were copied"
+    assert {p.name: p.read_bytes() for p in switch_rig.dest.iterdir()} == before
+    assert "holds an arm64 image and this node is amd64" in capsys.readouterr().err
+    assert [c[0] for c in switch_rig.commands] == ["grub-set-default"]
+
+
+def test_a_target_slot_with_no_release_arch_is_still_copied(switch_rig: Rig) -> None:
+    # Unlabelled (older) slots are amd64 in fact; unknown never blocks.
+    switch_rig.target_release = {}
+    assert switch_rig.mod.cmd_rollback(types.SimpleNamespace()) == 0
+    assert {dst.name for _, dst in switch_rig.renames} == set(ROLLBACK_SET)
+
+
+def test_an_apply_of_a_slot_without_tarballs_still_clears_a_killed_copy(rig: Rig) -> None:
+    # The apply path must keep removing a .part a killed apply left, whether or
+    # not the new slot carries tarballs (#1630 cleanup, unchanged by #3169).
+    rig.dest.mkdir(parents=True)
+    leftover = rig.dest / ".dns-bind9.tar.zst.part"
+    leftover.write_bytes(b"half a tarball")
+
+    assert rig.mod._refresh_baked_images("/dev/vda5") is None
+
+    assert not leftover.exists(), "a .part file from an earlier, killed apply is still in the images dir"

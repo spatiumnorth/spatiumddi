@@ -67,6 +67,17 @@ BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 # otherwise be issued within a second of the console's confirm).
 GRACE_S="${SPATIUM_POWER_ACTION_GRACE_S:-0}"
 case "$GRACE_S" in ''|*[!0-9]*) GRACE_S=0 ;; esac
+# #3169 — a slot switch (rollback / set-default / set-next-boot to the other
+# slot) first copies that slot's baked image tarballs into k3s's images dir,
+# about 1 GB, and only then flips GRUB. A reboot that lands mid-copy stops the
+# runner before GRUB is flipped, and the node comes back on the SAME slot with
+# the switch never made — the Fleet "Boot once, then Reboot" sequence did
+# exactly that, since both triggers can arrive in one heartbeat. So a running
+# slot-switch unit is waited for, up to SLOT_WAIT_CAP_S; past the cap the
+# action goes on, as with the handoff.
+SLOT_UNITS="${SPATIUM_POWER_ACTION_SLOT_UNITS-spatiumddi-slot-rollback.service spatiumddi-slot-set-default.service spatiumddi-slot-set-next-boot.service}"
+SLOT_WAIT_CAP_S="${SPATIUM_POWER_ACTION_SLOT_WAIT_CAP_S:-900}"
+case "$SLOT_WAIT_CAP_S" in ''|*[!0-9]*) SLOT_WAIT_CAP_S=900 ;; esac
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -101,6 +112,31 @@ state_write() {
     fi
     rm -f -- "$_tmp"
     return 1
+}
+
+# Prints the slot-switch units still running (a oneshot is "activating"
+# while its ExecStart runs); nothing when there are none.
+busy_slot_units() {
+    local _u _state
+    for _u in $SLOT_UNITS; do
+        _state="$(systemctl show -p ActiveState --value "$_u" 2>/dev/null)"
+        case "$_state" in
+            activating|deactivating) printf ' %s' "$_u" ;;
+        esac
+    done
+}
+
+wait_for_slot_switch() {
+    local _waited=0 _busy
+    while _busy="$(busy_slot_units)"; [ -n "$_busy" ]; do
+        if [ "$_waited" -ge "$SLOT_WAIT_CAP_S" ]; then
+            log "a slot switch is still running after ${SLOT_WAIT_CAP_S} s:${_busy}; going on with $ACTION"
+            return 0
+        fi
+        [ "$_waited" = 0 ] && log "waiting for a slot switch to finish before $ACTION:${_busy}"
+        sleep 2
+        _waited=$((_waited + 2))
+    done
 }
 
 child=""
@@ -140,6 +176,14 @@ if [ "$GRACE_S" -gt 0 ]; then
     log "$ACTION in ${GRACE_S}s (a stop cancels it)"
     # In the background and waited for, so a stop is acted on at once.
     sleep "$GRACE_S" 9>&- &
+    child=$!
+    wait "$child"
+    child=""
+fi
+
+if [ -n "$SLOT_UNITS" ]; then
+    # In the background and waited for, so a stop is acted on at once.
+    wait_for_slot_switch 9>&- &
     child=$!
     wait "$child"
     child=""

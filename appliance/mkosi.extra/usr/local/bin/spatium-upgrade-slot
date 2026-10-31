@@ -1087,14 +1087,14 @@ def _refresh_baked_images(target_dev: str, *, fresh_mtime: bool = False) -> int 
             if not src.is_dir():
                 print(f"  WARN: no baked-image dir at {src}")
                 return None
-            tarballs = sorted(src.glob("*.tar.zst"))
-            if not tarballs:
-                print(f"  WARN: no baked tarballs in {src}")
-                return None
             dest.mkdir(parents=True, exist_ok=True)
             # A copy an earlier apply was killed in the middle of.
             for stale in dest.glob(f".*{_PART_SUFFIX}"):
                 stale.unlink(missing_ok=True)
+            tarballs = sorted(src.glob("*.tar.zst"))
+            if not tarballs:
+                print(f"  WARN: no baked tarballs in {src}")
+                return None
             copied = 0
             for tarball in tarballs:
                 final = dest / tarball.name
@@ -1149,6 +1149,23 @@ def _recopy_slot_images_for_switch(target: dict[str, str]) -> None:
     and how to recover, and the switch goes ahead.
     """
     label = target.get("partlabel", "?")
+    # #1026 — an apply refused at the architecture gate leaves the other
+    # arch's rootfs in the inactive slot ("a spare: the next apply
+    # overwrites it"). Copying ITS tarballs here would have the RUNNING
+    # k3s import them, and a tag they share with the running set would
+    # then name the wrong architecture for this node's next pod restart.
+    # Skip the copy; the switch itself is not this function's to refuse.
+    host_arch = host_architecture()
+    if host_arch:
+        slot_arch = (slot_release_fields(target) or {}).get("APPLIANCE_ARCH") or None
+        if slot_arch and slot_arch != host_arch:
+            print(
+                f"  WARNING: {label} holds an {slot_arch} image and this node is "
+                f"{host_arch} — NOT copying its baked images into k3s's images dir "
+                f"(#1026). {label} will not boot on this node.",
+                file=sys.stderr,
+            )
+            return
     print(f"Re-copying {label}'s baked image tarballs into k3s's images dir (#3169)")
     copied = _refresh_baked_images(target["device"], fresh_mtime=True)
     if copied is None:
