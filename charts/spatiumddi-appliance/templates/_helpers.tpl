@@ -37,7 +37,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
 
 {{/* Image-resolution helper. Air-gap forces pullPolicy: Never; the
      bytes live in containerd's content store already (preloaded at
-     firstboot from /usr/lib/spatiumddi/images/*.tar.zst). */}}
+     by k3s from /var/lib/rancher/k3s/agent/images/*.tar.zst). */}}
 {{- define "spatiumddi-appliance.imageRef" -}}
 {{- $repo := required "image.repository required" .repository -}}
 {{- $tag := default $.global.imageTag .tag -}}
