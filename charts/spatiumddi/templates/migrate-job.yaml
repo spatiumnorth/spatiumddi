@@ -51,6 +51,22 @@ spec:
           type: {{ . }}
       {{- end }}
       restartPolicy: OnFailure
+      {{- /* #3207 — place the Job where the api runs unless told otherwise;
+             null follows the api, {} / [] opt out of it. */}}
+      {{- $nodeSel := ternary .Values.api.nodeSelector .Values.migrate.nodeSelector (kindIs "invalid" .Values.migrate.nodeSelector) }}
+      {{- $tols := ternary .Values.api.tolerations .Values.migrate.tolerations (kindIs "invalid" .Values.migrate.tolerations) }}
+      {{- $aff := ternary .Values.api.affinity .Values.migrate.affinity (kindIs "invalid" .Values.migrate.affinity) }}
+      {{- with (include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" $nodeSel) .) | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      {{- with $tols }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $aff }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

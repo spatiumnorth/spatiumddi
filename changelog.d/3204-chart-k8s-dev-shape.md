@@ -1,0 +1,9 @@
+### Fixed
+
+- **Helm chart fixes from a single-instance Kubernetes install (#3204, #3205, #3206, #3207, #3208, #3209).**
+  - A CNPG install with `instances: 1` no longer creates a PodDisruptionBudget that makes its node undrainable: `postgresql.cnpg.enablePDB` is now unset by default and means "on when there is a replica"; an explicit `true` / `false` still wins.
+  - `postgresql.affinity.nodeAffinity` is passed into the CNPG Cluster's `spec.affinity.nodeAffinity`, so Postgres can prefer a node without being hard-pinned to it.
+  - DNS and DHCP agents gain `servers[].affinity` (merged with the chart's one-per-node anti-affinity, not replacing it) and `storageClass` (`dnsAgents.storageClass` / `dhcpAgents.storageClass`, with a per-server override) for both volume claims. DHCP servers also gain `nodeSelector` and `tolerations`. Unset renders what it did before.
+  - The migrate Job takes `migrate.nodeSelector` / `tolerations` / `affinity`, defaulting to the api's, with `global.controlPlaneNodeSelector` merged in, so it no longer lands on nodes the rest of the release avoids.
+  - The `wait-for-postgres` / `wait-for-migrate` / Redis sentinel `render-config` init containers carry resources (`initContainers.resources`, default requests `10m` / `32Mi`, limit `256Mi`), so a namespace LimitRange or a resources-on-every-container policy accepts them. The charts-lint pod-posture check now fails an init container without resources.
+  - New opt-in `dnsAgents.prefixWithFullname` / `dhcpAgents.prefixWithFullname` name the agent StatefulSet and Services with the release fullname like every other object. The default keeps today's names, because renaming a StatefulSet recreates it with new volumes and a new server identity; see the chart README's upgrade note.

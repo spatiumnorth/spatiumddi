@@ -227,6 +227,61 @@ affinity:
 {{- end -}}
 
 {{/*
+Object name of one agent server's StatefulSet / Service / headless Service
+(#3209). Pass ``root`` (the chart root), ``instance`` (``dns-bind9-ns1``) and
+``prefix`` (``<kind>Agents.prefixWithFullname``).
+
+Off (the default) it is ``instance`` unchanged: renaming a StatefulSet
+recreates it, and through the claim-template names its PVCs, so the new
+naming is opt-in for an existing install. On, it is prefixed with the release
+fullname like every other object in the chart (which honours
+``fullnameOverride``). Truncated to 52 characters: the longest suffix added
+to it is ``-headless`` (9) and Kubernetes caps a Service name at 63; a
+StatefulSet's pods and ControllerRevision labels need the same headroom.
+*/}}
+{{- define "spatiumddi.agentObjectName" -}}
+{{- if .prefix -}}
+{{- printf "%s-%s" (include "spatiumddi.fullname" .root) .instance | trunc 52 | trimSuffix "-" -}}
+{{- else -}}
+{{- .instance -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+``affinity:`` block of a DNS / DHCP agent pod (#3206). The chart's own
+preferred one-agent-per-node anti-affinity is MERGED into the per-server
+``affinity`` rather than replaced by it, so an operator who adds
+``nodeAffinity`` keeps the spread; only a ``podAntiAffinity`` of their own
+wins (an explicit opt-out). With no per-server ``affinity`` the block is the
+literal the templates always rendered.
+
+  {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
+*/}}
+{{- define "spatiumddi.agentAffinity" -}}
+{{- $override := default (dict) .override -}}
+{{- $label := dict "app.kubernetes.io/name" (include "spatiumddi.name" .root) "app.kubernetes.io/component" .component -}}
+affinity:
+{{- if $override }}
+  {{- $merged := deepCopy $override -}}
+  {{- if not (hasKey $merged "podAntiAffinity") -}}
+    {{- $term := dict "labelSelector" (dict "matchLabels" $label) "topologyKey" "kubernetes.io/hostname" -}}
+    {{- $_ := set $merged "podAntiAffinity" (dict "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term))) -}}
+  {{- end }}
+  {{- toYaml $merged | nindent 2 }}
+{{- else }}
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "spatiumddi.name" .root }}
+              app.kubernetes.io/component: {{ .component }}
+          topologyKey: kubernetes.io/hostname
+{{- end }}
+{{- end -}}
+
+{{/*
 Name of the chart-owned secret carrying SECRET_KEY.
 */}}
 {{- define "spatiumddi.appSecretName" -}}
@@ -533,6 +588,15 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
 {{- end -}}
 
 {{/*
+#3208 — resources of the ``wait-for-*`` init containers (``initContainers.
+resources``). ``alembic`` in the wait-for-migrate loop imports the whole app's
+model tree, so the memory limit leaves room for that.
+*/}}
+{{- define "spatiumddi.initContainerResources" -}}
+{{- toYaml (default (dict "requests" (dict "cpu" "10m" "memory" "32Mi") "limits" (dict "memory" "256Mi")) (.Values.initContainers).resources) -}}
+{{- end -}}
+
+{{/*
 Init container that blocks until the bundled / external Postgres is
 accepting connections. Used by the migrate Job. ``pg_isready`` ships in
 the api image (postgresql-client-16, see backend/Dockerfile).
@@ -559,6 +623,8 @@ the api image (postgresql-client-16, see backend/Dockerfile).
       value: {{ include "spatiumddi.postgresUser" . | quote }}
     - name: PGDATABASE
       value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+  resources:
+    {{- include "spatiumddi.initContainerResources" . | nindent 4 }}
 {{- end -}}
 
 {{/*
@@ -616,6 +682,8 @@ URL comes from commonEnv.
       done
   env:
     {{- include "spatiumddi.commonEnv" . | nindent 4 }}
+  resources:
+    {{- include "spatiumddi.initContainerResources" . | nindent 4 }}
 {{- end -}}
 
 {{/*

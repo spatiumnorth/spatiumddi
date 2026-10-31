@@ -27,7 +27,8 @@
 #                      that tests the wrong values path renders no
 #                      ``resources:`` block and passes the three gates above.
 #   pod-posture      — every render: each pod template carries a seccomp
-#                      profile, and (where the render opts in) a
+#                      profile, every init container declares resources
+#                      (#3208), and (where the render opts in) a
 #                      PriorityClass (#983). Same failure mode as the line
 #                      above — a workload added without either one runs
 #                      perfectly well, just unprotected and unranked.
@@ -1017,7 +1018,9 @@ python3 "$ROOT/.github/scripts/chart-webhooks-fail-open.py" "$OUT/metallb-all-on
 # pod-securityContext knob, so no values override can supply a profile.
 # Exempting them by name is strictly better than not rendering the chart,
 # which is how their missing priority class and BestEffort QoS survived #965.
-POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner"
+# The same subchart gives its four ``cp-*`` init containers no resources knob
+# either (#3208), so the init-resources check exempts frr-k8s by name too.
+POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner --allow-no-init-resources frr-k8s"
 # One peer, because the API refuses BGP mode without one: without it this
 # render held no BGPPeer at all, so the CR every BGP appliance carries was
 # never schema-checked.
@@ -1079,6 +1082,36 @@ if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "HA peer listener"; t
     echo "   ok: tcpSocket readiness on port 8000 refused by the #1589 guard"
 else
     echo "   FAIL: expected the #1589 readiness guard to refuse a tcpSocket probe on port 8000 (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #3208 — an init container without resources must fail the pod-posture gate.
+# Grep the message, not just the exit code: a bare non-zero could come from
+# anything.
+echo "── negative control: an init container without resources must fail (#3208)"
+cat > "$OUT/neg-init-resources.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neg-init
+spec:
+  template:
+    spec:
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: wait-for-thing
+          image: busybox
+      containers:
+        - name: main
+          image: busybox
+YAML
+neg_out="$(python3 "$ROOT/.github/scripts/chart-pod-posture.py" "$OUT/neg-init-resources.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "init container wait-for-thing has no resources"; then
+    echo "   ok: resource-less init container refused by the #3208 guard"
+else
+    echo "   FAIL: expected the pod-posture gate to refuse an init container without resources (rc=$neg_rc)" >&2
     printf '%s\n' "$neg_out" | tail -5 >&2
     failures=$((failures + 1))
 fi

@@ -304,6 +304,10 @@ them:
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job, a regular Job named per revision (`<release>-migrate-r<revision>`), not a Helm hook |
 | `migrate.annotations` | `{}` | Annotations on the Job object (not its pod). For GitOps, see below |
+| `migrate.nodeSelector` / `.tolerations` / `.affinity` | unset (follows `api.*`) | #3207 — placement of the migrate Job's pod. Unset runs it where the api runs, with `global.controlPlaneNodeSelector` merged into the selector. `{}` / `[]` opt out of the api's values |
+| `initContainers.resources` | requests `10m` / `32Mi`, limit `256Mi` memory | #3208 — resources of every `wait-for-postgres` / `wait-for-migrate` init container |
+| `postgresql.cnpg.enablePDB` | unset (auto) | #3204 — `kind: cnpg`. Unset enables the primary PodDisruptionBudget only when `instances > 1`, so a single instance can be drained; an explicit `true` / `false` wins |
+| `postgresql.affinity.nodeAffinity` | `{}` | #3205 — `kind: cnpg`: rendered into the Cluster's `spec.affinity.nodeAffinity` (prefer a node without hard-pinning it with `nodeSelector`). Standalone: `postgresql.affinity` is the pod's whole affinity |
 | `ingress.*` | disabled |  |
 
 ### Dependencies
@@ -323,10 +327,14 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumnorth/dns-powerdns` | Per-flavor image override (issue #127) |
 | `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumnorth/dns-technitium` | Per-flavor image override |
 | `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
+| `dnsAgents.prefixWithFullname` | `false` | #3209 — name the StatefulSet and Services `<fullname>-dns-<flavor>-<name>` instead of `dns-<flavor>-<name>`. Flipping it on a live install recreates the StatefulSet with new PVCs; see [upgrade note](#agent-object-names-3209) |
+| `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass` |
 | `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
+| `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
+| `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass` |
 | `dhcpAgents.servers` | `[]` |  |
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
@@ -335,11 +343,31 @@ Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send
 to UDP/67 only, so use LoadBalancer or `hostNetwork` for those),
-`hostNetwork` (DHCP only), `resources`, and, on DNS servers,
-`nodeSelector` and `tolerations`. DNS agents only *prefer* separate nodes,
+`hostNetwork` (DHCP only), `resources`, `storageClass`, `nodeSelector`,
+`tolerations` and `affinity` (#3206: merged with the chart's preferred
+one-agent-per-node anti-affinity; only a `podAntiAffinity` of your own
+replaces it). Agents only *prefer* separate nodes,
 so after a node drain an agent can reschedule next to another one and stay
 there. Pin each server to a node (`nodeSelector: { kubernetes.io/hostname:
 node-a }`) to keep one agent per node behind a shared address.
+
+### Agent object names (#3209)
+
+The DNS and DHCP agent StatefulSet, Service and headless Service are named
+`dns-<flavor>-<name>` / `dhcp-<flavor>-<name>` by default, without the release
+fullname every other object carries, so two releases in one namespace collide.
+`dnsAgents.prefixWithFullname` / `dhcpAgents.prefixWithFullname` (default
+`false`) name them `<fullname>-dns-<flavor>-<name>` instead (truncated to 52
+characters; `fullnameOverride` applies). The default is expected to flip in a
+later release.
+
+Do not flip it on a live install casually. A StatefulSet cannot be renamed:
+Helm deletes the old one and creates a new one with **new PVCs**
+(`<claim>-<new name>-0`) and a new pod name, which is the server's registered
+identity, so the agent registers as a new server (the old row stays until you
+delete it, and the agent's local state starts empty). To keep the data, leave
+it `false`. For a new install, or one you are happy to rebuild, set it `true`
+from the start.
 
 ## Upgrade
 
