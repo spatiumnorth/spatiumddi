@@ -15999,6 +15999,8 @@ export interface TrashRestoreResponse {
   batch_id: string;
   restored: number;
   skipped: { type: string; id: string; display: string; reason: string }[];
+  // Rows that stayed in the Trash on purpose (a subnet's records, #2732).
+  held_back?: { type: string; id: string; display: string; reason: string }[];
 }
 
 export const trashApi = {
