@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -259,9 +260,33 @@ async def test_nsec3_iterations_above_zero_refused(
     assert r.status_code == 422, r.text
 
 
-def test_stored_nonzero_iterations_render_as_zero() -> None:
-    """A row saved before the API refused it must not reach named."""
-    from app.services.dns.named_conf_validation import effective_nsec3_iterations
+async def test_stored_nonzero_iterations_ship_as_zero(db_session: AsyncSession) -> None:
+    """A row saved before the API refused it must not reach named (#3153).
 
-    assert effective_nsec3_iterations("p", 151) == 0
-    assert effective_nsec3_iterations("p", 0) == 0
+    The agent bundle ships 0, and its ETag is the one a policy stored with 0
+    gives, so the hash is taken over the clamped value and an agent that
+    applied it does not see a change that is not there.
+    """
+    from app.services.dns.agent_config import render_bundle_body
+
+    grp = await _group_with_driver(db_session, "bind9")
+    server = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == grp.id))
+    ).scalar_one()
+    pol = DNSSECPolicy(name="old151", nsec3=True, nsec3_iterations=151, nsec3_salt_length=8)
+    db_session.add(pol)
+    await db_session.flush()
+    zone = await _zone_row(db_session, grp)
+    zone.dnssec_enabled = True
+    zone.dnssec_policy_id = pol.id
+    await db_session.commit()
+
+    stored = await render_bundle_body(db_session, server)
+    shipped = [p for p in stored.body["dnssec_policies"] if p["name"] == "old151"]
+    assert [p["nsec3_iterations"] for p in shipped] == [0]
+
+    pol.nsec3_iterations = 0
+    await db_session.commit()
+    zero = await render_bundle_body(db_session, server)
+    assert zero.etag == stored.etag
+    assert zero.body["structural_etag"] == stored.body["structural_etag"]
