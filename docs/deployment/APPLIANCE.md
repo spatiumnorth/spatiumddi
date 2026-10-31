@@ -3620,9 +3620,13 @@ removes them). A rollback, a set-default to the other slot and a
 into that directory with a fresh mtime, so k3s re-imports them before the
 reboot ([#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169)).
 The copy is about 1 GB, and a reboot requested meanwhile waits for it.
-It cannot help a slot the installer laid down, which carries no tarballs
-of its own, nor a node that falls back on its own after a failed trial
-boot; recovery by hand for those is in
+The installer also places the tarballs on root_A's own filesystem
+(under the `/var` mountpoint, so they stay hidden at runtime), which is
+what lets a rollback to a node's original slot restore them; an install
+that cannot fit them fails rather than leave a partial set. Nodes
+installed before that change carry none on root_A. The copy cannot help
+a node that falls back on its own after a failed trial boot; recovery by
+hand for those is in
 [Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback).
 Across a
 Kubernetes *minor* the revert is not a rollback at all, and the

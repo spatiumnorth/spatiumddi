@@ -13,8 +13,10 @@
   requested while that copy runs (about 1 GB) waits for it, up to 15 minutes,
   instead of cutting it off before the switch is made, and the console's
   slot-rollback action now allows 15 minutes instead of 30 seconds. A slot
-  holding another architecture's image is not copied. A slot laid down by the
-  installer carries no tarballs of its own, so switching back to a node's
-  original slot still cannot restore them: the switch goes ahead, the log says
-  so, and `docs/TROUBLESHOOTING.md` has the recovery. An upgrade still copies
+  holding another architecture's image is not copied. The installer
+  now also keeps the tarballs on the first slot's own filesystem (an install
+  that cannot fit them fails instead of leaving a partial set), so switching
+  back to a node's original slot restores them too; a node installed before
+  this still carries none there, the switch goes ahead, the log says so, and
+  `docs/TROUBLESHOOTING.md` has the recovery. An upgrade still copies
   the new slot's images once, as before.

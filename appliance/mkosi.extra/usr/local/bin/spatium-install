@@ -4155,6 +4155,69 @@ _copy_live_root() {
     return "$_rc"
 }
 
+# #3169 — keep the baked image tarballs on root_A's OWN filesystem too.
+#
+# do_install mounts /var at $MOUNT/var BEFORE _copy_live_root, so rsync
+# lands the live root's var/lib/rancher/k3s/agent/images on the /var
+# partition and root_A's own copy of that directory stays an empty
+# mountpoint subdir. A slot written by `spatium-upgrade-slot` carries the
+# set in its filesystem (build-slot-image.sh excludes nothing there), and a
+# later rollback re-copies it from there; without this, the node's ORIGINAL
+# slot has nothing to re-copy from and rolls back to a set-less slot.
+#
+# The raw root is reached through a NON-recursive bind mount of $MOUNT
+# (plain --bind does not carry the /var submount along), so the files land
+# on root_A underneath the mountpoint. They stay hidden at runtime, exactly
+# like a slot image's. The source is the live root itself, not $MOUNT/var,
+# so the KEEP_VAR reinstall (whose /var holds an older set) is covered.
+#
+# Fails the install loudly rather than leave a truncated set: a half-set on
+# the slot is worse than none, because a rollback would trust it.
+#
+# LIVE_ROOT_SRC / MOUNT are parameters so the tests can run this against stubs.
+_keep_images_in_root_slot() {
+    local _rel="var/lib/rancher/k3s/agent/images"
+    local _src="${LIVE_ROOT_SRC:-/}"
+    _src="${_src%/}/$_rel"
+    if [ ! -d "$_src" ] || ! ls "$_src"/*.tar.zst >/dev/null 2>&1; then
+        log "No baked image tarballs in the live root ($_src) - root_A keeps none of its own (#3169)"
+        return 0
+    fi
+    local _raw _need _avail _n=0 _f
+    _raw=$(mktemp -d /tmp/spatium-rootA-raw.XXXXXX)
+    if ! mount --bind "$MOUNT" "$_raw" >> "$INSTALL_LOG" 2>&1; then
+        rmdir "$_raw" 2>/dev/null || true
+        log "FATAL: could not bind-mount root_A to place its baked images (#3169)"
+        return 1
+    fi
+    local _dest="$_raw/$_rel" _rc=0
+    _need=$(du -sb "$_src" | cut -f1)
+    _avail=$(df -B1 --output=avail "$_raw" | tail -n 1 | tr -d ' ')
+    if [ "${_avail:-0}" -lt $(( _need + 134217728 )) ]; then
+        log "FATAL: root_A has $((_avail / 1048576)) MiB free; its baked images need $((_need / 1048576)) MiB plus headroom (#3169)"
+        _rc=1
+    else
+        mkdir -p "$_dest" && cp -a "$_src"/. "$_dest"/ >> "$INSTALL_LOG" 2>&1 || _rc=1
+        if [ "$_rc" -eq 0 ]; then
+            for _f in "$_src"/*.tar.zst; do
+                _n=$((_n + 1))
+                if [ "$(stat -c %s "$_f")" != "$(stat -c %s "$_dest/${_f##*/}" 2>/dev/null)" ]; then
+                    log "FATAL: ${_f##*/} on root_A does not match the live root's copy (#3169)"
+                    _rc=1
+                fi
+            done
+        fi
+        if [ "$_rc" -ne 0 ]; then
+            # Never leave a partial set where a rollback would trust it.
+            rm -rf "$_dest"
+        fi
+    fi
+    umount "$_raw" >> "$INSTALL_LOG" 2>&1 || log "WARN: could not unmount $_raw"
+    rmdir "$_raw" 2>/dev/null || true
+    [ "$_rc" -eq 0 ] && log "Kept $_n baked image tarballs on root_A's own filesystem (#3169)"
+    return "$_rc"
+}
+
 do_install() {
     # #1026 — refuse an unbootable architecture/firmware pairing before
     # the disk is touched. Both the wizard and the headless preseed path
@@ -4597,6 +4660,8 @@ EOF
                     printf 'XXX\n%d\nCopying root filesystem... %d%%\nXXX\n' "$_g" "$_pct"
                 done
               }
+
+        _keep_images_in_root_slot || exit 1
 
         echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"
         # IMPORTANT: fstab + /etc/hostname need to land on the
