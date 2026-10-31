@@ -115,6 +115,7 @@ from app.services.ipam.hygiene import (
     DEFAULT_STALE_RESERVATION_DAYS,
     build_hygiene_report,
 )
+from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_placeholders import create_placeholder_rows, has_boundary_rows
 from app.services.ipam.utilization import (
@@ -2225,18 +2226,6 @@ async def _create_alias_records(
         db.add(rec)
         await db.flush()
         await _enqueue_dns_op(db, zone, "create", name, rtype, value, None)
-
-
-# #2604 — the namespace of the deletion batch an orphaned address's aliases
-# are withdrawn under. One batch id per address, derived rather than stored,
-# so the restore finds exactly the aliases the orphan withdrew (and not one
-# the operator trashed by hand) with no column to carry it.
-_ORPHAN_ALIAS_BATCH_NS = uuid.UUID("5b0f3c2e-8a41-4d6e-9f27-2604a11a5e00")
-
-
-def orphan_alias_batch_id(ip_id: uuid.UUID) -> uuid.UUID:
-    """The ``deletion_batch_id`` Mark as Orphan stamps on the address's aliases."""
-    return uuid.uuid5(_ORPHAN_ALIAS_BATCH_NS, str(ip_id))
 
 
 async def _withdraw_aliases_for_orphan(db: AsyncSession, user: Any, ip: IPAddress) -> int:

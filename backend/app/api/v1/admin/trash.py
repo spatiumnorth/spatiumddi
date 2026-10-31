@@ -38,7 +38,11 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
-from app.services.ipam.orphan_aliases import refusal_reason, withdrawn_for_an_orphan
+from app.services.ipam.orphan_aliases import (
+    is_withdrawn_alias,
+    refusal_reason,
+    withdrawn_alias_owners,
+)
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -379,6 +383,7 @@ async def list_trash(
     # so one trashed 250k-record zone meant 250k ORM objects per load, plus
     # a COUNT per batch per model. One UNION of light column selects now,
     # and the batch sizes for the page's rows only.
+    withdrawn = await withdrawn_alias_owners(db) if "dns_record" in types_to_query else {}
     branches = []
     for resource_type in types_to_query:
         model = TYPE_TO_MODEL[resource_type]
@@ -391,10 +396,10 @@ async def list_trash(
             model.deleted_by_user_id.label("deleted_by_user_id"),
             model.deletion_batch_id.label("deletion_batch_id"),
         ).where(model.deleted_at.is_not(None))
-        if model is DNSRecord:
+        if model is DNSRecord and withdrawn:
             # #3189 — an orphan's withdrawn aliases follow the address, not
             # the Trash: restored or purged with it, never alone.
-            branch = branch.where(~withdrawn_for_an_orphan())
+            branch = branch.where(~is_withdrawn_alias(withdrawn))
         if since is not None:
             branch = branch.where(model.deleted_at >= since)
         if until is not None:
@@ -582,17 +587,11 @@ async def restore_row(
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
 
     if isinstance(target, DNSRecord):
-        held = (
-            await db.execute(
-                select(DNSRecord.id)
-                .where(DNSRecord.id == target.id, withdrawn_for_an_orphan())
-                .execution_options(include_deleted=True)
-            )
-        ).first()
-        if held is not None:
+        orphan_address = (await withdrawn_alias_owners(db, [target.id])).get(target.id)
+        if orphan_address is not None:
             raise HTTPException(
                 status_code=409,
-                detail=f"Cannot restore {_row_label(target)}: {refusal_reason()}.",
+                detail=f"Cannot restore {_row_label(target)}: {refusal_reason(orphan_address)}.",
             )
 
     batch_id = target.deletion_batch_id
@@ -774,17 +773,11 @@ async def permanent_delete_from_trash(
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
 
     if isinstance(target, DNSRecord):
-        held = (
-            await db.execute(
-                select(DNSRecord.id)
-                .where(DNSRecord.id == target.id, withdrawn_for_an_orphan())
-                .execution_options(include_deleted=True)
-            )
-        ).first()
-        if held is not None:
+        orphan_address = (await withdrawn_alias_owners(db, [target.id])).get(target.id)
+        if orphan_address is not None:
             raise HTTPException(
                 status_code=409,
-                detail=f"Cannot permanently delete {_row_label(target)}: {refusal_reason()}.",
+                detail=f"Cannot permanently delete {_row_label(target)}: {refusal_reason(orphan_address)}.",
             )
 
     label = _row_label(target)

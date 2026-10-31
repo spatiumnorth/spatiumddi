@@ -8,10 +8,13 @@ orphan the Trash neither lists them nor acts on them.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.tasks.trash_purge import _purge_dns_records
 from tests.test_ipam_alias_cname_exclusive_2080 import _setup
 from tests.test_ipam_orphan_aliases_2604 import (
     _alias_names,
@@ -54,6 +57,8 @@ async def test_restore_of_a_withdrawn_alias_is_refused(
     r = await client.post(f"/api/v1/admin/trash/dns_record/{rows[0].id}/restore", headers=headers)
     assert r.status_code == 409, r.text
     assert "orphan" in r.text
+    # The refusal names the address the alias follows.
+    assert "10.98.5.22" in r.json()["detail"]
     await db_session.rollback()
     assert await _live_zone(db_session, zone_id) == []
     assert await _alias_names(client, headers, ip_id) == []
@@ -115,3 +120,54 @@ async def test_a_hand_trashed_record_still_restores(
     assert str(rec.id) in await _trash_ids(client, headers)
     r = await client.post(f"/api/v1/admin/trash/dns_record/{rec.id}/restore", headers=headers)
     assert r.status_code == 200, r.text
+
+
+async def _hand_trashed_then_orphaned(  # type: ignore[no-untyped-def]
+    client: AsyncClient, db: AsyncSession, addr: str
+):
+    """An alias the operator trashed by hand while the address was live, after
+    which the address was marked as orphan. It is not one the orphan withdrew:
+    the address's Restore does not bring it back (#2604 restores the orphan
+    batch only), so it must stay an ordinary Trash row."""
+    headers, sid, zone = await _setup(client, db)
+    ip_id = await _aliased(client, headers, sid, addr)
+    rows = await _all_alias_rows(db, ip_id)
+    hand = next(r for r in rows if r.name == "www")
+    d = await client.delete(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{hand.zone_id}/records/{hand.id}",
+        headers=headers,
+    )
+    assert d.status_code in (200, 204), d.text
+    o = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert o.status_code == 204, o.text
+    withdrawn = next(r for r in rows if r.name == "ftp")
+    return headers, ip_id, hand.id, withdrawn.id
+
+
+@pytest.mark.asyncio
+async def test_an_alias_trashed_by_hand_before_the_orphan_stays_a_trash_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers, _ip, hand_id, withdrawn_id = await _hand_trashed_then_orphaned(
+        client, db_session, "10.98.5.27"
+    )
+    listed = await _trash_ids(client, headers)
+    assert str(hand_id) in listed
+    assert str(withdrawn_id) not in listed
+    r = await client.delete(f"/api/v1/admin/trash/dns_record/{hand_id}", headers=headers)
+    assert r.status_code == 204, r.text
+
+
+@pytest.mark.asyncio
+async def test_retention_purge_holds_only_what_the_orphan_withdrew(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _headers, ip_id, hand_id, withdrawn_id = await _hand_trashed_then_orphaned(
+        client, db_session, "10.98.5.28"
+    )
+    # A cutoff past every stamp: anything not held back would go.
+    await _purge_dns_records(db_session, datetime.now(UTC) + timedelta(days=1), set())
+    await db_session.commit()
+    left = {r.id for r in await _all_alias_rows(db_session, ip_id)}
+    assert withdrawn_id in left
+    assert hand_id not in left
