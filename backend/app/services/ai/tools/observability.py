@@ -172,7 +172,8 @@ class QueryDHCPActivityLogArgs(BaseModel):
         default=None, description="Filter by Kea log code (e.g. DHCP4_LEASE_ALLOC)."
     )
     mac_address: str | None = Field(
-        default=None, description="Filter by MAC address (exact match)."
+        default=None,
+        description="MAC: whole address or leading part, any separator (e.g. aa:bb or aabb).",
     )
     ip_address: str | None = Field(
         default=None, description="IP: whole address, CIDR, or leading part (e.g. 10.1.)."

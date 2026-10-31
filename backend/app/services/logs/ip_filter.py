@@ -6,10 +6,13 @@ The log tables keep ``client_ip`` / ``ip_address`` as ``inet`` and
 that sends a request per keystroke answered a generic 422 until the operator
 had typed a whole address. These helpers accept what an operator really types:
 
-* a whole address -> exact match (compared as ``inet`` / ``macaddr``, so the
-  column's index still serves it);
+* a whole address -> exact match (compared as ``inet`` / ``macaddr``, so an
+  index on the column can serve it);
 * a CIDR (IP only) -> containment, ``col <<= cidr``;
-* a partial address -> prefix match on the column's text form.
+* a partial address -> prefix match on the column's text form. This is
+  "starts with" as typed, so ``10.1`` also matches ``10.10.x`` and
+  ``10.100.x``; typing ``10.1.`` narrows it. It cannot use an index, so it
+  relies on the callers' time window and row limit to stay bounded.
 
 Anything that cannot be part of an address raises :class:`InvalidLogFilter`,
 whose message names the field, so the caller answers a clear 422.
@@ -44,7 +47,14 @@ def ip_filter_clause(column: Any, value: str, *, field: str = "client_ip") -> An
     """SQL clause matching ``column`` (an ``inet``) against what was typed."""
     text = value.strip()
     expected = "an IP address, CIDR or address prefix"
-    if not text:
+    if text.endswith("/"):
+        # ``10.0.0.0/`` is a CIDR half-typed; match the address part until
+        # the prefix length arrives rather than refusing a keystroke.
+        text = text[:-1].rstrip()
+    if not text or "%" in text:
+        # ``%`` is only legal in an IPv6 zone id (``fe80::1%eth0``), which
+        # Python accepts and Postgres ``inet`` does not, so it would reach
+        # the generic data-error 422 instead of this one.
         raise InvalidLogFilter(field, expected)
     if "/" in text:
         try:

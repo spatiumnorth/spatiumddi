@@ -69,11 +69,32 @@ async def test_dns_partial_full_cidr_and_v6(client: AsyncClient, db_session: Asy
     assert await _dns_ips(client, token, "fd00::1") == {"fd00::1"}
 
 
-async def test_dns_percent_is_literal(client: AsyncClient, db_session: AsyncSession) -> None:
+async def test_dns_percent_and_zone_id_name_the_field(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # ``%`` can never be part of a stored address. It is refused with the
+    # field-naming 422 rather than read as a LIKE wildcard; ``fe80::1%eth0``
+    # parses in Python but not as ``inet``, so before the guard it reached
+    # the generic data-error 422 this issue is about.
     token = await _dns_rows(db_session)
-    r = await client.post("/api/v1/logs/dns-queries", json={"client_ip": "1%"}, headers=_h(token))
-    assert r.status_code == 422
-    assert r.json()["detail"].startswith("client_ip:")
+    for value in ("1%", "fe80::1%eth0", "fe80::%eth0/64"):
+        r = await client.post(
+            "/api/v1/logs/dns-queries", json={"client_ip": value}, headers=_h(token)
+        )
+        assert r.status_code == 422, (value, r.text)
+        assert r.json()["detail"].startswith("client_ip: not"), value
+
+
+async def test_dns_half_typed_cidr_and_starts_with(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _dns_rows(db_session)
+    # The keystroke between the address and the prefix length.
+    assert await _dns_ips(client, token, "192.168.0.4/") == {"192.168.0.4"}
+    assert await _dns_ips(client, token, "192.168./") == {"192.168.0.4", "192.168.1.9"}
+    # Prefix match is "starts with" on the text, so 192.168.1 would also
+    # match 192.168.10-19.x; the trailing dot narrows it.
+    assert await _dns_ips(client, token, " 192.168.1. ") == {"192.168.1.9"}
 
 
 async def test_dns_junk_names_the_field(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -169,6 +190,27 @@ async def test_copilot_tool_answers_junk_as_text(db_session: AsyncSession) -> No
     assert out and out[0]["result"].startswith("client_ip: not")
     out = await query_dns_query_log(db_session, user, QueryDNSQueryLogArgs(client_ip="127"))
     assert not any("result" in r and "not an" in str(r["result"]) for r in out)
+
+
+async def test_other_copilot_tools_answer_junk_as_text(db_session: AsyncSession) -> None:
+    from app.services.ai.tools.dns import FindDNSQueriesArgs, find_dns_queries
+    from app.services.ai.tools.dns_threat import FindRPZHitsArgs, find_rpz_hits
+    from app.services.ai.tools.observability import (
+        QueryDHCPActivityLogArgs,
+        query_dhcp_activity_log,
+    )
+
+    user, _ = await _make_user(db_session, username=f"o{uuid.uuid4().hex[:6]}")
+    await _make_bind9_server(db_session)
+    await _dhcp_rows(db_session)
+    out = await find_dns_queries(db_session, user, FindDNSQueriesArgs(client_ip="fe80::1%eth0"))
+    assert out[0]["result"].startswith("client_ip: not")
+    out = await find_rpz_hits(db_session, user, FindRPZHitsArgs(client_ip="abc xyz"))
+    assert out[0]["result"].startswith("client_ip: not")
+    out = await query_dhcp_activity_log(
+        db_session, user, QueryDHCPActivityLogArgs(mac_address="zz")
+    )
+    assert out[0]["result"].startswith("mac_address: not")
 
 
 _ = DNSServer
