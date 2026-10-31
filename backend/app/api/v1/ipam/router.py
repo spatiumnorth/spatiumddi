@@ -2407,6 +2407,16 @@ async def _purge_withdrawn_aliases(db: AsyncSession, ip_ids: list[uuid.UUID]) ->
     )
 
 
+async def purge_trashed_address_records(db: AsyncSession, ip_ids: list[uuid.UUID]) -> None:
+    """Drop the trashed auto records of addresses being deleted for good, so a
+    later zone restore cannot publish a record owned by nothing (#3186)."""
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        purge_trashed_address_records as _purge,
+    )
+
+    await _purge(db, ip_ids)
+
+
 def _invalidate_ip_dns_cache(rec: DNSRecord, ip: IPAddress | None) -> None:
     """Clear the IP's cached DNS-linkage fields when a record is deleted
     by the sync-reconcile stale-delete path.
@@ -10880,6 +10890,7 @@ async def delete_address(
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
         await _purge_withdrawn_aliases(db, [ip.id])
+        await purge_trashed_address_records(db, [ip.id])
         db.add(
             _audit(
                 current_user,
@@ -10975,6 +10986,7 @@ async def purge_orphans(
 
     # The aliases these orphans withdrew go with them (#2604).
     await _purge_withdrawn_aliases(db, [ip.id for ip in rows])
+    await purge_trashed_address_records(db, [ip.id for ip in rows])
     for ip in rows:
         # Best-effort DNS teardown (the FK would null it, but be explicit).
         try:
@@ -12494,6 +12506,7 @@ async def bulk_delete_addresses(
     if body.permanent:
         # Aliases an orphan among them withdrew go with it (#2604).
         await _purge_withdrawn_aliases(db, [ip.id for ip in to_delete])
+        await purge_trashed_address_records(db, [ip.id for ip in to_delete])
     for ip in to_delete:
         if not body.permanent:
             # Withdrawn, not deleted, so the row's Restore brings them back (#2604).
