@@ -45,8 +45,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.models.dhcp import HA_MODES, DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPServer, DHCPServerGroup
 from app.services.appliance.ownership import hostname_is_unambiguous, hostname_sql, norm_host
+from app.services.dhcp.ha_members import kea_ha_members
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -110,11 +111,13 @@ async def dhcp_ha_firewall_inputs(
             .options(selectinload(DHCPServerGroup.servers))
         )
     ).scalar_one_or_none()
-    if group is None or group.mode not in HA_MODES:
+    if group is None:
         return None, []
-    kea = sorted((s for s in group.servers if s.driver == "kea"), key=lambda s: str(s.id))
-    # Same readiness rule as _resolve_failover: no HA hook renders otherwise.
-    if len(kea) < 2 or any(not s.ha_peer_url for s in kea):
+    # Same rule as _resolve_failover: only the HA participants (members with a
+    # peer URL, when at least two have one) render the hook. A sidelined
+    # URL-less member (#3151) has no listener, and is no partner to open to.
+    kea = kea_ha_members(group.mode, group.servers).participants
+    if not kea:
         return None, []
     claim_by_host = (
         appliance.state == APPLIANCE_STATE_APPROVED
