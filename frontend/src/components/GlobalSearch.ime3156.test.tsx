@@ -24,6 +24,10 @@ vi.mock("@/lib/api", async () => {
       ...actual.authApi,
       myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
     },
+    tagsApi: {
+      ...actual.tagsApi,
+      listKeys: () => Promise.resolve({ keys: ["env", "site"] }),
+    },
     searchApi: {
       search: () =>
         Promise.resolve({
@@ -54,6 +58,7 @@ vi.mock("@/hooks/useFeatureModules", () => ({
 }));
 
 const { GlobalSearch } = await import("@/components/GlobalSearch");
+const { TagFilterChips } = await import("@/components/TagFilterChips");
 
 afterEach(cleanup);
 
@@ -98,5 +103,27 @@ describe("palette Esc and IME composition (#3156)", () => {
     fireEvent.keyDown(box, { key: "Escape", isComposing: true, keyCode: 229 });
     fireEvent.keyDown(box, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Search" })).toBeNull();
+  });
+
+  it("leaves the tag filter's draft and list alone on a composing Esc", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <TagFilterChips value={[]} onChange={() => {}} />
+      </QueryClientProvider>,
+    );
+    const box = screen.getByPlaceholderText(
+      /Filter by tag/,
+    ) as HTMLInputElement;
+    fireEvent.focus(box);
+    fireEvent.change(box, { target: { value: "en" } });
+    await screen.findByText("env");
+    fireEvent.keyDown(box, { key: "Escape", isComposing: true, keyCode: 229 });
+    expect(box.value).toBe("en");
+    expect(screen.queryByText("env")).not.toBeNull();
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(box.value).toBe("");
   });
 });
