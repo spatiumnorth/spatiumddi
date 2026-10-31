@@ -390,6 +390,9 @@ async def test_apply_refuses_a_newline_value_built_without_validation(
 REQUESTER_PERMS = [
     {"action": "write", "resource_type": "provisioning_request"},
     {"action": "read", "resource_type": "provisioning_request"},
+    # Submit refuses a target the requester cannot read.
+    {"action": "read", "resource_type": "dns_zone"},
+    {"action": "read", "resource_type": "subnet"},
 ]
 
 

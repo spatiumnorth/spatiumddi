@@ -12473,6 +12473,8 @@ export interface AcmeOrder {
   last_error: string | null;
   // True when the operator opted into solving unmanaged domains by hand.
   allow_manual: boolean;
+  // #3067 — whether a successful issue makes the cert the Web UI cert.
+  activate: boolean;
   // Populated while a manual order is "processing" — the TXT records the
   // operator must add. Empty for fully-managed orders.
   manual_challenges: AcmeManualChallenge[];
@@ -12487,6 +12489,9 @@ export interface AcmeIssueRequest {
   // dns-01 only — let an unmanaged domain be solved by an operator-pasted
   // TXT (the order goes "processing" with manual_challenges populated).
   allow_manual?: boolean;
+  // #3067 — make the issued cert the Web UI certificate (the API default).
+  // Needs admin on appliance; a certificate-store-only caller sends false.
+  activate?: boolean;
 }
 
 // Well-known Let's Encrypt directory endpoints surfaced as form
