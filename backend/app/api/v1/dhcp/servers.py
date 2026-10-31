@@ -41,6 +41,7 @@ from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.agents.spool_status import SpoolStatus
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
@@ -186,6 +187,19 @@ HA_STATE_DESCRIPTION = (
 )
 
 
+def _duplicate_agent_fields(s: DHCPServer) -> dict[str, Any]:
+    """#3143 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -266,6 +280,16 @@ class ServerResponse(BaseModel):
     # (``container_oom.daemon_reported_by``), the same reading the alert's
     # wording uses.
     daemon_reported_by: Literal["agent", "supervisor"] | None = None
+    # #3143 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served. Derived
+    # (``instance_ownership.duplicate_active``), as the
+    # ``dhcp_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -343,6 +367,7 @@ class ServerResponse(BaseModel):
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
             daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             created_at=s.created_at,
             modified_at=s.modified_at,
         )

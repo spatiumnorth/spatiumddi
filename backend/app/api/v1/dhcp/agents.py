@@ -17,11 +17,13 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, PendingRollbackError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
@@ -55,6 +57,15 @@ from app.services.agents.ingest_receipt import (
     IngestAck,
     claim_batch,
     duplicate_response,
+)
+from app.services.agents.instance_ownership import (
+    AGENT_INSTANCE_HEADER,
+    claim_poll,
+    duplicate_instance_response,
+    is_displaced,
+    is_refused,
+    parse_agent_instance,
+    refuse_registration,
 )
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
@@ -490,12 +501,27 @@ def _reraise_if_database_gone(exc: Exception) -> None:
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
-@router.post("/register", response_model=AgentRegisterResponse)
+@router.post(
+    "/register",
+    response_model=AgentRegisterResponse,
+    responses={
+        409: {
+            "description": (
+                "#3143 — another live agent process owns this server identity; "
+                "this one is its refused duplicate (header "
+                "X-Spatium-Duplicate-Agent-Instance). No token is minted."
+            )
+        }
+    },
+)
 async def agent_register(
+    request: Request,
     body: AgentRegisterRequest,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
-) -> AgentRegisterResponse:
+    # #3143 — the registering process, as on its polls and heartbeats.
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+) -> AgentRegisterResponse | JSONResponse:
     """Bootstrap registration — PSK → per-server JWT."""
     # #1068 — registration is the one agent call that CREATES a server
     # row, so it is the one that can undo the refuse-while-populated
@@ -520,6 +546,30 @@ async def agent_register(
                 "Integrations page."
             ),
         )
+    server: DHCPServer | None = None
+    if body.agent_id:
+        try:
+            aid = uuid.UUID(body.agent_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
+        res = await db.execute(select(DHCPServer).where(DHCPServer.agent_id == aid))
+        server = res.scalar_one_or_none()
+        # #3143 (the DHCP side of #2219) — the refused half of a duplicate
+        # pair is refused here too. Registering would mint it a token and
+        # overwrite the server's one token hash, staling the owner's; the
+        # owner then re-registers, staling this one's, and the pair trade
+        # re-registrations forever. Before anything is written (the group
+        # auto-create below included), so a refusal changes nothing but the
+        # duplicate episode the server chip and alert read.
+        if server is not None and await refuse_registration(
+            db,
+            server,
+            parse_agent_instance(agent_instance),
+            kind="dhcp",
+            client_ip=request.client.host if request.client is not None else None,
+        ):
+            return duplicate_instance_response("DHCP", server.name)
+
     group: DHCPServerGroup | None = None
     if body.group_name:
         res = await db.execute(
@@ -534,14 +584,6 @@ async def agent_register(
             db.add(group)
             await db.flush()
 
-    server: DHCPServer | None = None
-    if body.agent_id:
-        try:
-            aid = uuid.UUID(body.agent_id)
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
-        res = await db.execute(select(DHCPServer).where(DHCPServer.agent_id == aid))
-        server = res.scalar_one_or_none()
     if server is None:
         res = await db.execute(select(DHCPServer).where(DHCPServer.name == body.hostname))
         server = res.scalar_one_or_none()
@@ -636,16 +678,35 @@ async def agent_register(
 
 @router.get("/config")
 async def agent_config_longpoll(
+    request: Request,
     db: DB,
     response: Response,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> Any:
-    """Long-poll for config changes. Returns 304 if unchanged, bundle JSON otherwise."""
+    """Long-poll for config changes. Returns 304 if unchanged, bundle JSON otherwise.
+
+    #3143 — one agent process owns the server at a time
+    (``instance_ownership.claim_poll``, the DNS #2044 rules): a new process
+    takes over at once, the one it displaced is refused with 409 if it polls
+    again while the owner is live, and a poll whose process lost ownership
+    while it waited returns nothing. A poll that names no process (an older
+    agent) is served exactly as before.
+    """
     server, _payload = auth
+    instance = parse_agent_instance(agent_instance)
     if not server.agent_approved:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
+    if instance is not None and not await claim_poll(
+        db,
+        server,
+        instance,
+        kind="dhcp",
+        client_ip=request.client.host if request.client is not None else None,
+    ):
+        return duplicate_instance_response("DHCP", server.name)
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     async with wake_subscription(dhcp_wake_channels(server)) as wake:
@@ -671,6 +732,12 @@ async def agent_config_longpoll(
             # collections, which repopulates them; the server row it is handed
             # rather than re-selecting, so it is refreshed here.
             await refresh_agent_server(db, server)
+            if instance is not None and server.agent_instance not in (None, instance):
+                # #3143 — another agent process took the server over while
+                # this poll waited: a replacement (this poll is the departed
+                # agent's leftover) or a second live agent. Either way it must
+                # not ship ops; the new owner's polls do.
+                return duplicate_instance_response("DHCP", server.name)
             bundle = await build_config_bundle(db, server)
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
             # mix below so a Settings → Appliance → SNMP change wakes the
@@ -1090,18 +1157,11 @@ async def agent_config_longpoll(
                 deadline = asyncio.get_running_loop().time()
 
 
-@router.post("/heartbeat", response_model=AgentHeartbeatResponse)
-async def agent_heartbeat(
-    request: Request,
-    body: AgentHeartbeatRequest,
-    db: DB,
-    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> AgentHeartbeatResponse:
-    server, payload = auth
-    now = datetime.now(UTC)
-    server.agent_last_seen = now
-    server.last_health_check_at = now
-    server.status = "active"
+async def _apply_heartbeat_reports(
+    request: Request, body: AgentHeartbeatRequest, db: AsyncSession, server: DHCPServer
+) -> None:
+    """What a heartbeat reports about the agent's host, daemon, config and
+    spool — written only for the process that owns the server (#3143)."""
     # Capture the source IP so the operator can identify which host
     # the agent is on — the operator-set ``host`` column may not
     # match the real machine in NAT / distributed deployments.
@@ -1188,6 +1248,30 @@ async def agent_heartbeat(
         now=min(daemon_stamp, now_utc),
     )
 
+
+@router.post("/heartbeat", response_model=AgentHeartbeatResponse)
+async def agent_heartbeat(
+    request: Request,
+    body: AgentHeartbeatRequest,
+    db: DB,
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> AgentHeartbeatResponse:
+    server, payload = auth
+    now = datetime.now(UTC)
+    instance = parse_agent_instance(agent_instance)
+    # #3143 — a process the owner displaced (the refused half of two live
+    # agents on one identity, #2044's DHCP side) still heartbeats. Its
+    # liveness and acks count; what it reports about its daemon, config,
+    # spool and host describes a process that is not being served, so it
+    # stays off the row.
+    displaced = is_displaced(server, instance)
+    server.agent_last_seen = now
+    server.last_health_check_at = now
+    server.status = "active"
+    if not displaced:
+        await _apply_heartbeat_reports(request, body, db, server)
+
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
         result = ack.get("result", "error")
@@ -1201,7 +1285,11 @@ async def agent_heartbeat(
 
     rotated_token = None
     rotated_exp = None
-    if needs_rotation(payload):
+    # #3143 (the DHCP side of #2219) — not for the refused half of a duplicate
+    # pair: its new token's hash would replace the owner's and stale it. Its
+    # token runs out instead, and the re-registration that follows is refused
+    # until the owner stops.
+    if needs_rotation(payload) and not is_refused(server, instance, now):
         rotated_token, rotated_exp = mint_agent_token(
             server_id=str(server.id),
             agent_id=str(server.agent_id),

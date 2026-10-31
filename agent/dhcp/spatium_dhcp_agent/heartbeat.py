@@ -17,6 +17,7 @@ from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .ha_tls import AGENT_CAPABILITIES
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch
 from .spool import SpoolManager
 
@@ -151,7 +152,7 @@ class HeartbeatClient:
                 resp = c.post(
                     "/api/v1/dhcp/agents/heartbeat",
                     json=body,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    headers=self._auth_headers(),
                 )
                 if (
                     resp.status_code == 422
@@ -166,7 +167,7 @@ class HeartbeatClient:
                     resp = c.post(
                         "/api/v1/dhcp/agents/heartbeat",
                         json=body,
-                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                        headers=self._auth_headers(),
                     )
                 if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
                     log.warning("heartbeat_spool_field_unsupported")
@@ -175,7 +176,7 @@ class HeartbeatClient:
                     resp = c.post(
                         "/api/v1/dhcp/agents/heartbeat",
                         json=body,
-                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                        headers=self._auth_headers(),
                     )
             if resp.status_code == 200:
                 data = resp.json()
@@ -194,6 +195,15 @@ class HeartbeatClient:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:
             log.warning("heartbeat_http_error", error=str(e))
+
+    def _auth_headers(self) -> dict[str, str]:
+        # #3143 — the process id, so the control plane can keep a displaced
+        # process's daemon / config reports off the server row and skip its
+        # token rotation.
+        return {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
 
     def run(self) -> None:
         while not self._stop.is_set():

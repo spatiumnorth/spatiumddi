@@ -305,6 +305,11 @@ _DNS_OP_FAILED_WINDOW = timedelta(hours=24)
 # the latest in the last ten — and auto-resolves ten minutes after the other
 # process stops polling.
 RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE = "dns_agent_duplicate_instance"
+# Issue #3143 — the DHCP side of #2044: two live DHCP agent processes on one
+# server identity (a cloned Kea VM, two containers on one state dir). Same
+# rules (``services.agents.instance_ownership``), same subject shape
+# (``dhcp_server:<id>``), same fire / auto-resolve windows.
+RULE_TYPE_DHCP_AGENT_DUPLICATE_INSTANCE = "dhcp_agent_duplicate_instance"
 
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
@@ -774,6 +779,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
+        RULE_TYPE_DHCP_AGENT_DUPLICATE_INSTANCE,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
         RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
@@ -4189,6 +4195,50 @@ async def _matching_dns_agent_duplicate_instance_subjects(
             "minutes after the other agent stops polling."
         )
         matches.append((f"dns_server:{row.id}", f"{row.name} (DNS)", message, None))
+    return matches
+
+
+async def _matching_dhcp_agent_duplicate_instance_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dhcp_agent_duplicate_instance`` — every DHCP server a second live
+    agent process is polling as (#3143). Reads the episode columns the config
+    long-poll and registration write when they refuse one; no probing."""
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.services.agents.instance_ownership import (  # noqa: PLC0415
+        DUPLICATE_WINDOW,
+        duplicate_active,
+    )
+
+    now = now or datetime.now(UTC)
+    rows = (
+        (
+            await db.execute(
+                select(DHCPServer).where(
+                    DHCPServer.duplicate_agent_last_at >= now - DUPLICATE_WINDOW
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for row in rows:
+        if not duplicate_active(row, now):
+            continue
+        where = f" from {row.duplicate_agent_ip}" if row.duplicate_agent_ip else ""
+        message = (
+            f"Two DHCP agent processes are polling as server '{row.name}' at once. "
+            f"Only the most recent one is served; the other{where} is refused and "
+            "keeps answering from its last cached configuration, so scope changes "
+            "never reach it. Usually a cloned VM or a copied agent state directory "
+            "that kept the same agent_id: stop the extra agent, or clear its state "
+            "directory so it registers as a server of its own. Auto-resolves ten "
+            "minutes after the other agent stops polling."
+        )
+        matches.append((f"dhcp_server:{row.id}", f"{row.name} (DHCP)", message, None))
     return matches
 
 
@@ -8385,6 +8435,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE:
                 duplicates = await _matching_dns_agent_duplicate_instance_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in duplicates]
+                # Same prefixed subject as the other agent rules.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_DHCP_AGENT_DUPLICATE_INSTANCE:
+                dhcp_dups = await _matching_dhcp_agent_duplicate_instance_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in dhcp_dups]
                 # Same prefixed subject as the other agent rules.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED:

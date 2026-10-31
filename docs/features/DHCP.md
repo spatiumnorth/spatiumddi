@@ -1393,6 +1393,38 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
    events, activity log, metrics — in order, then reconciles leases from a
    full Kea snapshot (see *Push spool* below, #1077)
 
+**When a second agent process claims the same server
+([#3143](https://github.com/spatiumnorth/spatiumddi/issues/3143)):**
+A cloned Kea VM, or two agent containers given one state directory, keeps
+the same `agent_id`, so both authenticate as one server. Before #3143 they
+shared the server's one token: each registration or token rotation made
+the other's token stale, and the pair traded `401 Stale token` and
+re-registrations forever while the server row flapped between them. The
+DHCP agent now names its process (`X-Spatium-Agent-Instance`, a random id
+per process, not persisted) on every config poll, heartbeat and
+registration, and the control plane applies the DNS agent's rules
+(see [DNS_AGENT.md §2, *Duplicate agent processes*](../deployment/DNS_AGENT.md#duplicate-agent-processes)):
+1. Only the newest process is served. A process the server has never seen
+   takes over at once, so replacing or restarting an agent is unchanged.
+2. The one it displaced, if it polls or registers again while the owner is
+   still polling, is answered `409` with
+   `X-Spatium-Duplicate-Agent-Instance: 1`. No token is minted, and its
+   heartbeats never rotate the token, so the owner keeps a working one.
+3. The refused agent logs `sync_duplicate_agent_instance` (or
+   `register_duplicate_agent_instance`), **keeps Kea serving the config it
+   already has**, and asks again every 30 s. If the owner stops polling for
+   5 minutes, it takes the server back by itself.
+4. Refusals that last over 2 minutes show a **Duplicate agent** chip on the
+   server row and detail, with the address the refused agent polled from,
+   set `duplicate_agent` on the `list_dhcp_servers` MCP tool, and raise the
+   default-on `dhcp_agent_duplicate_instance` alert ("Two DHCP agents on one
+   server"). All clear 10 minutes after the extra agent stops.
+
+Kea HA pairs are not affected: each peer has its own `agent_id`. An agent
+older than #3143 sends no process id and registers and polls exactly as
+before. To fix a duplicate, stop the extra agent, or clear its state
+directory so it registers as a server of its own.
+
 ### Cache Format
 
 Cached config is stored in a structured JSON file:
