@@ -174,6 +174,34 @@ describe("a zone restore that holds records back (#3188)", () => {
   });
 });
 
+describe("a restore that leaves nothing behind", () => {
+  it("still closes the dialog", async () => {
+    list.mockResolvedValue({ items: [entry(2)], total: 1 });
+    restore.mockResolvedValue({
+      batch_id: "b-1",
+      restored: 2,
+      skipped: [],
+      held_back: [],
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() =>
+      expect(screen.queryByText("Restore from trash?")).toBeNull(),
+    );
+    expect(screen.queryByText(/left in the Trash/)).toBeNull();
+  });
+});
+
 describe("a parent still in the Trash (#1957)", () => {
   it("offers to restore the parent first, then restores this row", async () => {
     list.mockResolvedValue({ items: [entry(1)], total: 1 });

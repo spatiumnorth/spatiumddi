@@ -727,10 +727,11 @@ async def restore_batch(
     record delete (#963) needs, where the rows are independent siblings and one
     hand-made duplicate must not pin the other N in the trash forever.
 
-    Records are checked set-based by ``_record_conflicts`` whenever
-    ``conflict_check`` is given, not by ``conflict_check`` itself, and the
-    records of a zone restored in the same batch are un-stamped by one UPDATE
-    per zone rather than loaded (#1389). Records whose zone is not in the batch
+    Records are checked set-based by ``_record_conflicts`` and, for the CNAME
+    rule, ``_record_cname_conflicts`` (#3187) whenever ``conflict_check`` is
+    given, not by ``conflict_check`` itself, and the records of a zone
+    restored in the same batch are un-stamped by one UPDATE per zone rather
+    than loaded (#1389). Records whose zone is not in the batch
     (a #963 bulk record delete) are still loaded: the caller re-pushes them to
     agentless providers. Every other type keeps the per-row path, where the
     conflict rules are richer and the batches small.

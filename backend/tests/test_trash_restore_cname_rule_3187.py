@@ -252,3 +252,100 @@ async def test_a_bulk_batch_restores_the_rest_and_holds_the_clash_back(
     rows = await _all(db_session, zone.id)
     assert rows[ok_id].deleted_at is None
     assert rows[cname_id].deleted_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trashed_in_view", [True, False])
+async def test_a_record_with_no_view_clashes_with_every_view(
+    client: AsyncClient, db_session: AsyncSession, trashed_in_view: bool
+) -> None:
+    """A row with no view renders in every view, so it meets a view-scoped row
+    at its name from either side, as on create (``views_overlap``)."""
+    headers = await _admin(db_session)
+    zone = await _zone(db_session)
+    view = DNSView(group_id=zone.group_id, name="internal")
+    db_session.add(view)
+    await db_session.flush()
+    cname = _rec(
+        zone, "cn", "CNAME", "t.example.test.", view_id=view.id if trashed_in_view else None
+    )
+    cname_id = cname.id
+    db_session.add(cname)
+    await db_session.commit()
+    await _delete(client, headers, zone, cname_id)
+    db_session.add(
+        _rec(zone, "cn", "A", "192.0.2.31", view_id=None if trashed_in_view else view.id)
+    )
+    await db_session.commit()
+
+    resp = await client.post(f"/api/v1/admin/trash/dns_record/{cname_id}/restore", headers=headers)
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_restore_is_refused_when_its_host_record_would_clash(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The issue's fourth path: a subnet's IPAM host record comes back at a name
+    a CNAME took meanwhile. The subnet's batch is a cascade, so it is refused
+    whole, as the identical-twin rule refuses it, and nothing is restored."""
+    from app.models.ipam import IPBlock, IPSpace, Subnet  # noqa: PLC0415
+
+    headers = await _admin(db_session)
+    zone = await _zone(db_session)
+    space = IPSpace(name=f"sp3187-{uuid.uuid4().hex[:8]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.87.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.commit()
+    resp = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "block_id": str(block.id),
+            "network": "10.87.5.0/24",
+            "dns_group_id": str(zone.group_id),
+            "dns_zone_id": str(zone.id),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["id"]
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/addresses",
+        headers=headers,
+        json={"address": "10.87.5.50", "hostname": "host50"},
+    )
+    assert resp.status_code == 201, resp.text
+
+    resp = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    resp = await client.post(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/records",
+        headers=headers,
+        json={"name": "host50", "record_type": "CNAME", "value": "elsewhere.example.test."},
+    )
+    assert resp.status_code == 201, resp.text
+
+    resp = await client.post(f"/api/v1/admin/trash/subnet/{sid}/restore", headers=headers)
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["skip_conflicts_allowed"] is False
+    [conflict] = detail["conflicts"]
+    assert conflict["display"].startswith(f"host50.{zone.name.rstrip('.')}")
+    assert conflict["display"].endswith(" A")
+    assert "is a CNAME to" in conflict["reason"]
+
+    db_session.expire_all()
+    rows = (await _all(db_session, zone.id)).values()
+    live = {(r.name, r.record_type) for r in rows if r.deleted_at is None}
+    assert live == {("host50", "CNAME")}
+    gone = (
+        await db_session.execute(
+            select(Subnet.deleted_at)
+            .where(Subnet.id == uuid.UUID(sid))
+            .execution_options(include_deleted=True, populate_existing=True)
+        )
+    ).scalar_one()
+    assert gone is not None

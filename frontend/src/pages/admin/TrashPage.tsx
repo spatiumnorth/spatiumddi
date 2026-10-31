@@ -186,9 +186,11 @@ function ConfirmRestoreModal({
         )}
         {leftBehind && (
           <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
+            {/* No row count: one held-back entry stands for all of a
+                subnet's records ("2 IPAM records of …"), so counting entries
+                would understate what stayed behind (#3188). */}
             <p className="font-medium">
-              Restored, but {leftBehind.length} row
-              {leftBehind.length === 1 ? " was" : "s were"} left in the Trash:
+              Restored, but these were left in the Trash:
             </p>
             <ul className="mt-1 list-disc pl-4">
               {leftBehind.map((l) => (
