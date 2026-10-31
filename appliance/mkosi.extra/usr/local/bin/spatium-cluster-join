@@ -38,6 +38,23 @@
 
 set -uo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 MODE="${1:-}"
 
 # Every path below defaults to its production appliance location and can
@@ -195,7 +212,7 @@ clean_k3s_runtime() {
 # State sidecar the supervisor reads (state<TAB>reason). Keep the
 # vocabulary in lock-step with the supervisor's appliance_state.py:
 #   joining | ready | leaving | left | failed
-write_state() { printf '%s\t%s\n' "$1" "${2:-}" > "$STATE"; }
+write_state() { printf '%s\t%s\n' "$1" "${2:-}" | state_write "$STATE"; }
 
 require_appliance() {
     # Strict appliance + k3s gate — these host paths only exist on a
@@ -216,8 +233,15 @@ require_appliance() {
 # (agent/images/) so the fresh (re)start stays offline-capable.
 backup_and_wipe_identity() {
     local suffix="$1" bak e n
-    bak="$IDENTITY_BAK_ROOT.$suffix.$(date +%s)"
-    mkdir -p "$bak"
+    # A fresh directory (mktemp -d: created exclusively, 0700 root), not a
+    # predictable name: the api and the supervisor can create names in
+    # release-state, so ``mkdir -p`` would accept a directory one of them
+    # made, or a symlink to one, and the cluster CA keys and etcd below
+    # would be moved into it — and restored from it on a rollback.
+    bak=$(mktemp -d "$IDENTITY_BAK_ROOT.$suffix.$(date +%s).XXXXXX") || {
+        log "could not create an identity backup directory — identity left in place"
+        return 1
+    }
     # Server cluster state — etcd db + the cluster CA/TLS + creds + the
     # self-generated cluster tokens. The TLS dir is the load-bearing one
     # for "k3s thinks it already owns a cluster"; the token files are the
@@ -422,6 +446,32 @@ _drop_backup_image_stores() {
         rm -f "$d/agent-images-cache.json" 2>/dev/null || true
         log "dropped the image store from identity backup $d (the baked tarballs re-import it)"
     done
+}
+
+# MANIFESTS_ASIDE has a fixed name in release-state, where the api and the
+# supervisor can create names. Whatever is parked there goes back into
+# k3s's auto-deploy directory, which applies it with cluster-admin rights, so
+# it is only ever used while it is a real directory this script's uid owns
+# and nobody else can write: a directory (or symlink) another writer put at
+# that name would decide what the cluster applies.
+_aside_dir_trusted() {
+    [ -d "$MANIFESTS_ASIDE" ] && [ ! -L "$MANIFESTS_ASIDE" ] || return 1
+    [ "$(stat -c %u -- "$MANIFESTS_ASIDE" 2>/dev/null)" = "$(id -u)" ] || return 1
+    # Not writable by group or other.
+    local mode
+    mode=$(stat -c %a -- "$MANIFESTS_ASIDE" 2>/dev/null) || return 1
+    (( (8#$mode & 8#022) == 0 ))
+}
+# Make MANIFESTS_ASIDE usable: keep it when trusted, else remove what is at
+# the name (rm does not follow a symlink) and create it 0700. A name re-taken
+# between the two makes mkdir fail, and the caller refuses to go on.
+_aside_dir_ready() {
+    _aside_dir_trusted && return 0
+    if [ -e "$MANIFESTS_ASIDE" ] || [ -L "$MANIFESTS_ASIDE" ]; then
+        log "removing $MANIFESTS_ASIDE: not a directory only this runner can write"
+        rm -rf -- "$MANIFESTS_ASIDE" || return 1
+    fi
+    mkdir -m 0700 -- "$MANIFESTS_ASIDE"
 }
 
 # Restore a cluster identity captured by backup_and_wipe_identity (used
@@ -675,7 +725,7 @@ do_join() {
     # stray / accidental trigger file can't fire the destructive wipe.
     if [ "$confirm" != "$JOIN_CONFIRM" ]; then
         log "join trigger missing confirmation marker (got: '${confirm:-<empty>}') — refusing, not touching k3s"
-        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.rejected.$(date +%s)" || true
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.rejected.$(date +%s)" || true
         exit 0
     fi
 
@@ -691,13 +741,13 @@ do_join() {
     if ! printf '%s' "$server_url" | grep -qE '^https://[]A-Za-z0-9._:[-]+:6443$'; then
         log "invalid server_url ($server_url) — refusing join"
         write_state failed "invalid server_url"
-        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
     if [ -z "$join_token" ]; then
         log "empty join token — refusing join"
         write_state failed "empty join token"
-        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
 
@@ -720,12 +770,19 @@ do_join() {
             log "JOIN ok — node is Ready as a control-plane member (re-drive, no wipe)"
             _drop_backup_image_stores
             write_state ready "$server_url"
-            mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
+            mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
             exit 0
         fi
         log "JOIN re-drive: still a member of $server_url's etcd but not Ready within ${JOINED_READY_TIMEOUT}s — membership kept, nothing wiped"
         write_state failed "still a member of the seed's etcd but not Ready within ${JOINED_READY_TIMEOUT}s — membership kept; Fleet -> Replace this node if the seed is gone"
-        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
+
+    if ls "$K3S_MANIFESTS"/spatium-*.yaml* >/dev/null 2>&1 && ! _aside_dir_ready; then
+        log "cannot set this node's bootstrap manifests aside safely ($MANIFESTS_ASIDE) — refusing join, not touching k3s"
+        write_state failed "could not prepare $MANIFESTS_ASIDE"
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
 
@@ -766,8 +823,7 @@ do_join() {
     # join interrupted mid-stage would then have this node place a manifest
     # into the SEED's cluster on a later boot — for the TLS Secret that is
     # the #590 overwrite of the cluster's shared cert with a throwaway one.
-    if ls "$K3S_MANIFESTS"/spatium-*.yaml* >/dev/null 2>&1; then
-        mkdir -p "$MANIFESTS_ASIDE"
+    if ls "$K3S_MANIFESTS"/spatium-*.yaml* >/dev/null 2>&1 && _aside_dir_ready; then
         mv -f "$K3S_MANIFESTS"/spatium-*.yaml* "$MANIFESTS_ASIDE/" || true
         log "moved local bootstrap manifests aside → $MANIFESTS_ASIDE"
     fi
@@ -814,7 +870,7 @@ EOF
         # sidecar empty and the row `joining` (#2049).
         _drop_backup_image_stores
         write_state ready "$server_url"
-        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
         exit 0
     fi
 
@@ -837,12 +893,12 @@ EOF
             log "JOIN ok — node is Ready as a control-plane member (within the joined budget)"
             _drop_backup_image_stores
             write_state ready "$server_url"
-            mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
+            mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
             exit 0
         fi
         log "JOIN not Ready within $((READY_TIMEOUT + JOINED_READY_TIMEOUT))s but this node is a member of the seed's etcd — NOT rolling back: a standalone etcd on this peer URL would leave the seed a voter short of quorum for good (#1052). k3s stays up as a member; a re-driven join will not wipe it, and Fleet -> Replace evicts it cleanly if the seed is gone."
         write_state failed "registered with the seed's etcd but not Ready within $((READY_TIMEOUT + JOINED_READY_TIMEOUT))s — membership kept, nothing wiped; a retry re-drives without wiping, or Fleet -> Replace this node if the seed is gone"
-        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
         exit 1
     fi
 
@@ -866,14 +922,14 @@ EOF
     # (do_leave) restores them once the node really is standalone again.
     if [ "$was_member" = "1" ]; then
         log "NOT restoring local bootstrap manifests — this node was already a cluster member, and its manifests would overwrite the seed's releases in the shared cluster (left in $MANIFESTS_ASIDE)"
-    elif [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml* >/dev/null 2>&1; then
+    elif _aside_dir_trusted && ls "$MANIFESTS_ASIDE"/*.yaml* >/dev/null 2>&1; then
         mv -f "$MANIFESTS_ASIDE"/*.yaml* "$K3S_MANIFESTS/" || true
         log "restored local bootstrap manifests"
     fi
     clean_k3s_runtime
     systemctl start k3s || true
     write_state failed "$reason"
-    mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+    mv -fT "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
     exit 1
 }
 
@@ -886,7 +942,7 @@ do_leave() {
     confirm="$(sed -n '1p' "$LEAVE_TRIGGER" | tr -d '\r\n')"
     if [ "$confirm" != "$LEAVE_CONFIRM" ]; then
         log "leave trigger missing confirmation marker (got: '${confirm:-<empty>}') — refusing, not touching k3s"
-        mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.rejected.$(date +%s)" || true
+        mv -fT "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.rejected.$(date +%s)" || true
         exit 0
     fi
     # #2049 — before anything below writes to /var (see do_join).
@@ -919,7 +975,7 @@ do_leave() {
             log "LEAVE refused — this node's etcd member removal was not confirmed (rc=$rc); not wiping"
             systemctl start k3s || true
             write_state failed "leave refused: this node's etcd member removal was not confirmed by the cluster, so the node was not reset (see etcd-evict.log)"
-            mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
+            mv -fT "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
             exit 1
             ;;
     esac
@@ -939,7 +995,7 @@ do_leave() {
     backup_and_wipe_identity pre-leave >/dev/null
     # Restore this node's own bootstrap manifests so the standalone
     # node redeploys its supervisor / control plane.
-    if [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml* >/dev/null 2>&1; then
+    if _aside_dir_trusted && ls "$MANIFESTS_ASIDE"/*.yaml* >/dev/null 2>&1; then
         mv -f "$MANIFESTS_ASIDE"/*.yaml* "$K3S_MANIFESTS/" || true
         log "restored local bootstrap manifests"
     fi
@@ -964,12 +1020,12 @@ do_leave() {
         log "LEAVE ok — node is a standalone single-node cluster again"
         _drop_backup_image_stores
         write_state left ""
-        mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.done.$(date +%s)" || true
+        mv -fT "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.done.$(date +%s)" || true
         exit 0
     fi
     log "LEAVE failed — k3s did not come Ready within $((READY_TIMEOUT + LEAVE_READY_TIMEOUT))s; manual recovery needed"
     write_state failed "leave failed; k3s not Ready"
-    mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
+    mv -fT "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
     exit 1
 }
 

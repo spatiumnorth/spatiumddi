@@ -77,6 +77,23 @@
 
 set -euo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/snmp-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/snmp-config-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/snmp-status
@@ -132,12 +149,12 @@ restore_previous() {
         sleep 2
         if systemctl is-active --quiet snmpd; then
             echo "  ✓ snmpd is back up on the previous config"
-            echo "running" > "$STATUS_SIDECAR"
+            echo "running" | state_write "$STATUS_SIDECAR"
             return 0
         fi
         echo "  ✗ snmpd did not come back up on the previous config"
     fi
-    echo "stopped" > "$STATUS_SIDECAR"
+    echo "stopped" | state_write "$STATUS_SIDECAR"
 }
 
 # ── --boot: start what the operator enabled, once the overlay is up ──
@@ -164,7 +181,7 @@ if [ "${1:-}" = "--boot" ]; then
         echo "  SNMP is not configured on; nothing to start"
         # Never leave a stale "running" behind for a daemon nobody wants.
         if [ -f "$STATUS_SIDECAR" ] && ! systemctl is-active --quiet snmpd; then
-            echo "stopped" > "$STATUS_SIDECAR"
+            echo "stopped" | state_write "$STATUS_SIDECAR"
         fi
         exit 0
     fi
@@ -178,11 +195,11 @@ if [ "${1:-}" = "--boot" ]; then
     fi
     if systemctl is-active --quiet snmpd; then
         echo "  ✓ snmpd is active"
-        echo "running" > "$STATUS_SIDECAR"
+        echo "running" | state_write "$STATUS_SIDECAR"
     else
         echo "  ✗ snmpd is not running"
         systemctl status snmpd --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
-        echo "stopped" > "$STATUS_SIDECAR"
+        echo "stopped" | state_write "$STATUS_SIDECAR"
     fi
     exit 0
 fi
@@ -219,8 +236,8 @@ case "$MARKER" in
     enabled)
         if ! command -v snmpd >/dev/null 2>&1; then
             echo "  ✗ snmpd binary not found — is net-snmp installed?"
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         # net-snmp has NO config-test flag: ``snmpd -t`` takes a
@@ -296,8 +313,8 @@ case "$MARKER" in
             echo "  ✗ snmpd rejected the staged config ($reject_reason):"
             grep -E ': line [0-9]+: (Error|Warning)|endpoint|Exiting' \
                 "$SNMP_VALIDATE_LOG" 2>/dev/null | sed 's/^/      /' || true
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         if [ "$probe_alive" = 1 ]; then
@@ -344,8 +361,8 @@ case "$MARKER" in
         if ! systemctl enable --now snmpd; then
             echo "  ✗ systemctl enable --now snmpd failed"
             restore_previous
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         # Brief wait + active-state probe. systemctl returns 0 the
@@ -376,16 +393,16 @@ udp dport 161 accept
 EOF
             chmod 0644 "$NFT_DROPIN"
             nft_reload
-            echo "running" > "$STATUS_SIDECAR"
-            echo "$HASH" > "$HASH_SIDECAR"
-            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+            echo "running" | state_write "$STATUS_SIDECAR"
+            echo "$HASH" | state_write "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         else
             echo "  ✗ snmpd not active after start"
             systemctl status snmpd --no-pager | sed 's/^/      /' || true
             restore_previous
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+            mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
         ;;
@@ -405,16 +422,16 @@ EOF
             rm -f "$NFT_DROPIN"
             nft_reload
         fi
-        echo "stopped" > "$STATUS_SIDECAR"
-        : > "$HASH_SIDECAR"
+        echo "stopped" | state_write "$STATUS_SIDECAR"
+        state_write "$HASH_SIDECAR" </dev/null
         echo "  ✓ snmpd stopped + disabled, config stubbed, firewall closed"
-        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        echo "done $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         ;;
     *)
         echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
-        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        echo "failed $(date -Iseconds)" | state_write "${TRIGGER}.state"
+        mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
         exit 1
         ;;
 esac
