@@ -33,7 +33,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
-- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
+- **SpatiumDDI container images** as zst tarballs at `/var/lib/rancher/k3s/agent/images/`, the k3s airgap directory; k3s imports them into its containerd store when it starts. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
 - **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. `APPLIANCE_VERSION` joins them from a value of its own, `applianceVersion`: it is re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback, and on a multi-node cluster it is the seed's, since only the seed renders this manifest. It is not a `sharedEnv` entry because a cluster Rolling Upgrade holds it with `image.tag` until every node runs the target (#2176): a HelmChartConfig can pin a single value but replaces a list whole, so as an entry the seed's boot onto its new slot rolled the api, worker and beat mid-run. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
@@ -1572,7 +1572,7 @@ The fix:
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
 - **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. (The mTLS *verifier* middleware lands in a follow-up — the cert pipeline is in place; heartbeat + poll endpoints currently auth via session-token.)
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
-- **Baked-in container images**. Every container image needed for any install role is baked into the OS rootfs at release time at `/usr/lib/spatiumddi/images/*.tar.zst`. First boot loads them into the local docker daemon; subsequent boots never reach out to ghcr.io. Air-gapped installs are first-class.
+- **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
 
 ### Fleet management surface
@@ -2811,7 +2811,7 @@ runner PATCHes each HelmChart CR's `spec.set.image.tag` with the
 new release tag. helm-controller picks up the change and runs
 `helm upgrade` against the chart in `/usr/lib/spatiumddi/charts/`
 — which pulls images from the local containerd image store (already
-loaded from `/usr/lib/spatiumddi/images/*.tar.zst` at firstboot).
+imported by k3s from `/var/lib/rancher/k3s/agent/images/*.tar.zst`).
 Pod rollouts happen with the chart's existing strategies
 (RollingUpdate for non-hostNetwork pods; Recreate for frontend
 when hostNetwork is on). No host reboot needed. Pre-#183 this
@@ -3610,9 +3610,18 @@ the step failure itself had (#1542).
 **Rolling back, and why a Kubernetes minor is different (#974).**
 
 For a same-minor release an **A/B slot revert is a rollback**: boot the
-previous slot and the node is as it was. Across a Kubernetes *minor* it
-is not, and the difference is easy to miss because the slot machinery
-behaves identically.
+previous slot and the node is as it was, with one exception, the node's
+container images. k3s imports its image tarballs from the shared `/var`,
+which holds the newest upgraded slot's set, so a rolled-back slot can
+come up with pods in `ErrImageNeverPull` if containerd no longer holds
+its images (a cluster join on the newer slot, or kubelet image GC,
+removes them). Recovery by hand is in
+[Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback);
+the permanent fix is tracked in
+[#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169). Across a
+Kubernetes *minor* the revert is not a rollback at all, and the
+difference is easy to miss because the slot machinery behaves
+identically.
 
 The k3s datastore (`/var/lib/rancher/k3s`) lives on the persistent
 `/var`, **outside the A/B slot**. Booting a slot that carries the older
