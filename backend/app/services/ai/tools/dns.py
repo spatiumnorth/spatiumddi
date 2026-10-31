@@ -1225,6 +1225,12 @@ class FindZoneDriftArgs(BaseModel):
         "change made directly on the host), 'missing on the server' (DB "
         "rows the server isn't serving), and in-sync — plus a sample of the "
         "drifting records. A value change shows as a missing+extra pair. "
+        "Each server's `status` is 'ok' only when the zone transferred, "
+        "nothing is missing or extra and it is at the zone's serial; "
+        "'behind' = transferred but saved records are missing or the server "
+        "is below the zone's serial; 'drift' = complete but carries records "
+        "SpatiumDDI does not hold; 'error' / 'unsupported' = the transfer "
+        "failed or cannot be done (no diff). `reason` says why. "
         "Use to answer 'is example.com drifting?' or 'did someone edit "
         "records directly on the BIND9 host?'. Read-only."
     ),
@@ -1255,6 +1261,9 @@ async def find_dns_zone_drift(
                 "driver": s.driver,
                 "status": s.status,
                 "error": s.error,
+                "reason": s.reason,
+                "current_serial": s.current_serial,
+                "target_serial": s.target_serial,
                 "in_sync": s.in_sync,
                 "drift_count": s.drift_count,
                 "extra_on_server": [

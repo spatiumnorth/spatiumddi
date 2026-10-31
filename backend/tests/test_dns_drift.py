@@ -79,7 +79,9 @@ async def test_zone_drift_categorises(db_session: AsyncSession, monkeypatch: Any
     assert report.db_record_count == 2
     assert len(report.servers) == 1
     s = report.servers[0]
-    assert s.status == "ok"
+    assert (
+        s.status == "behind"
+    )  # a record missing + one extra: not serving the zone as saved (#3198)
     assert s.in_sync == 1  # www matches
     assert {(r.name, r.value) for r in s.extra_on_server} == {("rogue", "10.0.0.9")}
     assert {(r.name, r.value) for r in s.missing_on_server} == {("mail", "10.0.0.2")}
@@ -293,7 +295,7 @@ async def test_zone_drift_reports_mx_priority_only_difference(
 
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
     (s,) = report.servers
-    assert s.status == "ok"
+    assert s.status == "behind"  # transferred; a different-priority MX is missing + extra (#3198)
     assert s.in_sync == 0
     assert [(r.record_type, r.priority) for r in s.extra_on_server] == [("MX", 20)]
     assert [(r.record_type, r.priority) for r in s.missing_on_server] == [("MX", 10)]
@@ -481,3 +483,117 @@ async def test_stored_apex_ns_is_not_reported_missing(
     assert [(r.name, r.record_type) for r in s.missing_on_server] == [("sub", "NS")]
     assert s.extra_on_server == []
     assert s.in_sync == 1
+
+
+# ── #3198 — "ok" means transferred AND serving the zone as saved ──────────────
+
+
+async def _with_state(
+    db: AsyncSession,
+    server: DNSServer,
+    zone: DNSZone,
+    *,
+    current: int,
+    target: int,
+    age_s: int = 600,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from app.models.dns import DNSServerZoneState
+
+    zone.last_serial = target
+    zone.modified_at = datetime.now(UTC) - timedelta(seconds=age_s)
+    db.add(DNSServerZoneState(server_id=server.id, zone_id=zone.id, current_serial=current))
+    await db.commit()
+
+
+async def _one(db: AsyncSession, group: DNSServerGroup, zone: DNSZone, live: list[RecordData], mp):
+    mp.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver(live))
+    report = await drift_mod.compute_zone_drift(db, group_id=group.id, zone=zone)
+    return report.servers[0]
+
+
+async def test_transfer_ok_but_records_missing_is_behind(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="behind.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=5, target=5)
+    s = await _one(db_session, group, zone, [], monkeypatch)
+    assert s.status == "behind"
+    assert "1 saved record not being served" in (s.reason or "")
+
+
+async def test_serial_below_target_is_behind_even_with_every_record_present(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="serial.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=4, target=5)
+    live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
+    s = await _one(db_session, group, zone, live, monkeypatch)
+    assert s.status == "behind"
+    assert (s.current_serial, s.target_serial) == (4, 5)
+    assert "below the zone's 5" in (s.reason or "")
+
+
+async def test_serial_below_target_within_the_grace_window_is_not_flagged(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="fresh.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=4, target=5, age_s=5)
+    live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
+    s = await _one(db_session, group, zone, live, monkeypatch)
+    assert s.status == "ok"
+
+
+async def test_complete_and_at_target_is_ok(db_session: AsyncSession, monkeypatch: Any) -> None:
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="ok.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=5, target=5)
+    live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
+    s = await _one(db_session, group, zone, live, monkeypatch)
+    assert s.status == "ok"
+    assert s.reason is None
+
+
+async def test_extra_records_only_is_drift_not_ok(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="extra.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await _with_state(db_session, server, zone, current=5, target=5)
+    live = [
+        RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        RecordData(name="rogue", record_type="A", value="10.0.0.9", ttl=300),
+    ]
+    s = await _one(db_session, group, zone, live, monkeypatch)
+    assert s.status == "drift"
+
+
+async def test_transfer_failure_stays_error_not_behind(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="err.example.com."
+    )
+    await _with_state(db_session, server, zone, current=1, target=5)
+
+    class _Boom:
+        async def pull_zone_records(self, *a: Any, **k: Any) -> list[RecordData]:
+            raise RuntimeError("AXFR refused")
+
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _Boom())
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    assert report.servers[0].status == "error"

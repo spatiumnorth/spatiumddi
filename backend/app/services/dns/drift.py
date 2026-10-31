@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -27,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
 from app.drivers.dns.base import RecordData, TsigKey
-from app.models.dns import DNSRecord, DNSServer, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerZoneState, DNSZone
 from app.services.dns.pull_from_server import (
     _key,
     targets_are_relative,
@@ -49,6 +50,34 @@ from app.services.dns.tsig import (
 
 logger = structlog.get_logger(__name__)
 
+# #3198 — how long a server may sit below the zone's serial before the report
+# calls it behind. A save bumps the serial and wakes the agents at once (Redis
+# wake, 12 s safety tick), and an apply is a render + validate + reload, so a
+# server catching up is normally done well inside this. 120 s is ten safety
+# ticks: past it the server has had many chances to converge and has not, which
+# is a fact about the server rather than a change still in flight.
+SERIAL_GRACE = timedelta(seconds=120)
+
+
+def zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
+    """Whether a server's reported serial for ``zone`` reads as in sync.
+
+    A primary zone is in sync when the server serves our serial
+    (``last_serial``). A secondary / stub zone's serial is its primary's, not
+    ours to number, so it is never compared with ``last_serial`` (0 for a
+    secondary): a server that holds the zone is in sync. That is how BIND9
+    secondaries have always read — the BIND9 agent reports the bundle's serial,
+    0, which equals the target 0 — and it is kept for every driver that does
+    not read back what it serves. PowerDNS reports the serial it serves, so a
+    secondary there is in sync once it has transferred (a transferred zone
+    never serves 0) and not before: at 0 it holds no data and answers REFUSED
+    (#1967)."""
+    if (zone.zone_type or "primary") in ("secondary", "stub"):
+        if driver == "powerdns":
+            return current != 0
+        return current == target
+    return current == target
+
 
 @dataclass
 class DriftRecord:
@@ -68,8 +97,21 @@ class ServerDrift:
     server_id: str
     server_name: str
     driver: str
-    status: str  # "ok" | "error" | "unsupported"
+    # "ok" — transferred, nothing missing or extra, at the target serial.
+    # "behind" — transferred, but the server is not serving the zone as saved
+    # (a saved record is missing, or it sits below the target serial).
+    # "drift" — transferred and complete, but carries records SpatiumDDI does
+    # not hold (a manual change on the host).
+    # "error" / "unsupported" — the transfer failed / cannot be done; the
+    # counts mean nothing. Anything else must be read as NOT ok (#3198).
+    status: str
     error: str | None = None
+    # What put the server in "behind" / "drift", operator-readable.
+    reason: str | None = None
+    # The server's reported serial (None = it has not reported) and the
+    # zone's target.
+    current_serial: int | None = None
+    target_serial: int = 0
     in_sync: int = 0
     extra_on_server: list[DriftRecord] = field(default_factory=list)
     missing_on_server: list[DriftRecord] = field(default_factory=list)
@@ -137,6 +179,69 @@ def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
         weight=getattr(r, "weight", None),
         port=getattr(r, "port", None),
     )
+
+
+# Statuses of a server whose zone was actually read: the diff is meaningful.
+TRANSFERRED = frozenset({"ok", "behind", "drift"})
+
+
+async def _classify_transferred(
+    db: AsyncSession,
+    zone: DNSZone,
+    servers: list[DNSServer],
+    entries: list[ServerDrift],
+) -> None:
+    """Turn "the transfer worked" into "and the server is serving the zone"
+    (#3198). The per-server status used to mean only the former, so a server
+    that had stopped applying the zone read ``ok``.
+    """
+    # Re-read what this uses: the report is read-only, and a commit between
+    # loading the zone and here must not leave these lazy-loading (async IO).
+    await db.refresh(zone, ["last_serial", "modified_at", "zone_type"])
+    target = int(zone.last_serial or 0)
+    states = {
+        st.server_id: st
+        for st in (
+            await db.execute(
+                select(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    modified = zone.modified_at
+    settled = modified is None or datetime.now(UTC) - modified > SERIAL_GRACE
+    by_id = {str(s.id): s for s in servers}
+    for e in entries:
+        if e.status != "ok":
+            continue
+        e.target_serial = target
+        st = states.get(uuid.UUID(e.server_id))
+        if st is not None:
+            e.current_serial = int(st.current_serial)
+        reasons: list[str] = []
+        if e.missing_on_server:
+            n = len(e.missing_on_server)
+            reasons.append(f"{n} saved record{'' if n == 1 else 's'} not being served")
+        if (
+            e.current_serial is not None
+            and settled
+            and not zone_state_in_sync(zone, e.current_serial, target, by_id[e.server_id].driver)
+        ):
+            reasons.append(
+                f"serving serial {e.current_serial}, below the zone's {target}"
+                if e.current_serial < target
+                else f"serving serial {e.current_serial}, not the zone's {target}"
+            )
+        if reasons:
+            e.status = "behind"
+            e.reason = "; ".join(reasons)
+        elif e.extra_on_server:
+            n = len(e.extra_on_server)
+            e.status = "drift"
+            e.reason = (
+                f"{n} record{' is' if n == 1 else 's are'} served that SpatiumDDI does not hold"
+            )
 
 
 async def compute_zone_drift(
@@ -279,6 +384,7 @@ async def compute_zone_drift(
     # only touches the driver (network), never the shared AsyncSession, and
     # isolates its own failures, so gather() is safe. Order is preserved.
     report.servers = list(await asyncio.gather(*(_drift_for_server(s) for s in servers)))
+    await _classify_transferred(db, zone, servers, report.servers)
 
     # Split-horizon caveats. A zone that belongs to a view has one copy per
     # view it lives in, and an AXFR names only the zone. A transfer addressed
@@ -292,7 +398,7 @@ async def compute_zone_drift(
         unaddressed = [
             s.server_name
             for s in report.servers
-            if s.status == "ok" and not view_addressed.get(s.server_id, False)
+            if s.status in TRANSFERRED and not view_addressed.get(s.server_id, False)
         ]
         if unaddressed:
             report.warnings.append(
