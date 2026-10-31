@@ -101,9 +101,20 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-REQUESTER_PERMS = [
+# The built-in Requester role's grants, as handed out to a department.
+BARE_REQUESTER_PERMS = [
     {"action": "write", "resource_type": "provisioning_request"},
     {"action": "read", "resource_type": "provisioning_request"},
+]
+# A requester who can also read the resources a request names: submit refuses
+# a payload naming a resource the requester cannot read, answering it like an
+# unknown id, so the read grant is what makes a target requestable.
+REQUESTER_PERMS = [
+    *BARE_REQUESTER_PERMS,
+    {"action": "read", "resource_type": "subnet"},
+    {"action": "read", "resource_type": "ip_block"},
+    {"action": "read", "resource_type": "dns_zone"},
+    {"action": "read", "resource_type": "dhcp_scope"},
 ]
 # An approver who can decide AND holds the underlying op permission.
 APPROVER_PERMS = [
@@ -516,7 +527,10 @@ async def test_admin_grant_confers_submit(client: AsyncClient, db_session: Async
     _, token = await _user(
         db_session,
         name="adm",
-        permissions=[{"action": "admin", "resource_type": "provisioning_request"}],
+        permissions=[
+            {"action": "admin", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "ip_block"},
+        ],
     )
     out = await _submit_subnet_request(client, token, block)
     assert out["status"] == 201, out
