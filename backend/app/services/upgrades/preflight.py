@@ -61,7 +61,12 @@ import structlog
 from sqlalchemy import select, text
 
 from app.config import settings
-from app.core.versions import canonical_version, includes_release, parse_release
+from app.core.versions import (
+    canonical_version,
+    includes_release,
+    is_installed_target,
+    parse_release,
+)
 from app.db import AsyncSessionLocal
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -69,7 +74,7 @@ from app.models.appliance import (
     Appliance,
     ApplianceUpgradeImage,
 )
-from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dhcp import HA_MODES, DHCPServer, DHCPServerGroup
 from app.models.dns import DNSServer
 from app.services.appliance import var_disk
 from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
@@ -497,9 +502,15 @@ async def check_node_disk_headroom(
     on_target: list[str] = []
     if target_version:
         on_target = sorted(
-            r.hostname or str(r.id) for r in rows if r.installed_appliance_version == target_version
+            r.hostname or str(r.id)
+            for r in rows
+            if is_installed_target(r.installed_appliance_version, target_version)
         )
-        rows = [r for r in rows if r.installed_appliance_version != target_version]
+        rows = [
+            r
+            for r in rows
+            if not is_installed_target(r.installed_appliance_version, target_version)
+        ]
     result = judge_node_disk_headroom(rows, need_bytes=need, now=datetime.now(UTC))
     detail = {**result.detail, "on_target": on_target} if target_version else result.detail
     if missing and result.level != "fail":
@@ -1138,6 +1149,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                     await db.execute(
                         select(
                             DHCPServerGroup.name.label("group_name"),
+                            DHCPServerGroup.mode.label("group_mode"),
                             DHCPServer.name.label("server_name"),
                             DHCPServer.kea_version.label("kea_version"),
                             DHCPServer.ha_peer_url.label("ha_peer_url"),
@@ -1170,7 +1182,8 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     ha_groups = {
         name: members
         for name, members in by_group.items()
-        if len(members) >= 2
+        if members[0]["group_mode"] in HA_MODES
+        and len(members) >= 2
         and all(m["ha_peer_url"] for m in members)
         and any(m["on_appliance"] for m in members)
     }

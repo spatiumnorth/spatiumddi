@@ -825,7 +825,7 @@ Supported input formats:
 
 Import behavior:
 - **Dry run first**: always show a preview table of what will be created/updated before committing
-- **Conflict handling**: `skip` / `update` / `error` on existing networks (selectable per import)
+- **Conflict handling**: `skip` / `overwrite` / `fail` on existing networks (selectable per import)
 - **Parent detection**: automatically places imported subnets under the correct block in the hierarchy
 - **Custom fields**: mapped by column name / JSON key
 
@@ -1051,8 +1051,8 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 
 ## 9. Utilization Tracking
 
-- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule)
-- `IPBlock.utilization_percent` is computed by rolling up child subnet utilization
+- `Subnet.utilization_percent` is computed and stored (updated on every IP change + on schedule). It is `allocated_ips / total_ips` over the subnet's **usable** addresses: an IPv4 subnet shorter than /31 leaves its network and broadcast addresses out of both figures, so a full /29 reads 6 / 6, 100% (#2411). An IPv6 subnet keeps its whole range, so its `network` placeholder row counts.
+- `IPBlock.utilization_percent` is the share of the block's **whole CIDR** in use (#2982). `total_ips` is the CIDR size (clamped to 2^63 - 1 for huge IPv6 blocks). `allocated_ips` rolls up every descendant subnet's `allocated_ips` **plus that subnet's non-usable addresses** — network and broadcast for IPv4 below /31, the network address for IPv6 below /127, nothing for /31, /32, /127 and /128 — each counted once even when a row already sits on it. So a /30 block holding one full /30 subnet reads 4 / 4, 100%, while the subnet itself reads 2 / 2. A block is clamped to its CIDR size and never reads over 100%. Both counters are rewritten on every write under the block and by the hourly `recount_ipam_utilization` sweep.
 - Alerts are configured in the notification system when utilization exceeds thresholds (default: warn at 80%, critical at 95%)
 
 ---
@@ -1919,8 +1919,9 @@ Three IP enrichment columns landed in `2026.04.26-1` via migration
 
 ### ✅ 15.15 Subnet operations — find-free / split / merge
 
-Three preview-then-commit endpoints, all with typed-CIDR
-confirmation gates and pg advisory locks held through commit:
+Three endpoints. Find free is a read that mutates nothing; split and
+merge are preview-then-commit, with typed-CIDR confirmation gates and pg
+advisory locks held through commit:
 
 - `POST /ipam/spaces/{id}/find-free` — walks the IPBlock tree for
   unallocated CIDRs of the requested prefix length. Optional
@@ -1930,8 +1931,8 @@ confirmation gates and pg advisory locks held through commit:
   the subnet would hold) and the filter compares against it.
   "Create subnet here" files the subnet under the block the row names
   (which may be a child of the searched block).
-  pre-restricts to that block) and a `min_free_addresses` filter. Opened from a block, the dialog's
-  title, hint and empty state say it searches that block, not the space.
+  Opened from a block, the dialog's title, hint and empty state say it
+  searches that block, not the space.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
@@ -2043,7 +2044,8 @@ WAN IP, a peer's NAT endpoint).
   on either side).
 - **Per-subnet listing** — `GET /ipam/nat-mappings/by-subnet/{id}`
   uses Postgres `inet <<= cidr` containment to find every mapping
-  whose internal IP falls inside a subnet's CIDR.
+  whose internal or external IP falls inside a subnet's CIDR, plus
+  every hide-NAT mapping pinned to the subnet as its source (#2617).
 
 UI: clicking the NAT badge on an IP row opens a modal listing
 every mapping for that IP; new "NAT" tab on the subnet detail

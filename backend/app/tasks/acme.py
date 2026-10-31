@@ -4,7 +4,8 @@
   ``POST /api/v1/appliance/acme/issue`` can fire-and-forget the (slow,
   network-bound) DNS-01 issuance flow off the request thread.
 * :func:`renew_due_certificates` (Phase 2) is the 12 h beat task that
-  re-issues active Let's Encrypt Web-UI certs nearing expiry.
+  re-issues Let's Encrypt certs nearing expiry: the active Web-UI cert
+  and any cert a DNS group's DoT / DoH listener serves (#3061).
 * :func:`sweep_stale_acme_txt_records` is the hourly beat task that runs
   the stale-TXT janitor (#1530) — it previously had no caller at all.
 
@@ -24,7 +25,7 @@ from typing import Any
 
 import httpx
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
@@ -85,7 +86,12 @@ async def _run(order_id: str, *, final_attempt: bool = False) -> str:
     max_retries=2,
 )
 def renew_due_certificates(self: object) -> str:  # type: ignore[type-arg]
-    """Beat task: re-issue active LE Web-UI certs within the renewal window.
+    """Beat task: re-issue LE certs in use within the renewal window.
+
+    "In use" is the active Web-UI cert, or a cert a DNS group's DoT / DoH
+    listener points at (#3061) — off an appliance nothing is "active" in a
+    meaningful sense, and a second issue deactivates the first, so keying on
+    ``is_active`` alone left every DoT cert but the newest to expire.
 
     Idempotent + advisory-locked. Creates a fresh ACMEOrder per due cert
     reusing THAT cert's issuance shape (#1529 — the challenge type,
@@ -102,6 +108,7 @@ def renew_due_certificates(self: object) -> str:  # type: ignore[type-arg]
 async def _renew() -> str:
     from app.models.acme_client import ACMEClientAccount, ACMEOrder
     from app.models.appliance import CERT_SOURCE_LETSENCRYPT, ApplianceCertificate
+    from app.models.dns import DNSServerOptions
     from app.models.settings import PlatformSettings
 
     async with task_session() as db:
@@ -130,7 +137,14 @@ async def _renew() -> str:
                 await db.execute(
                     select(ApplianceCertificate).where(
                         ApplianceCertificate.source == CERT_SOURCE_LETSENCRYPT,
-                        ApplianceCertificate.is_active.is_(True),
+                        or_(
+                            ApplianceCertificate.is_active.is_(True),
+                            ApplianceCertificate.id.in_(
+                                select(DNSServerOptions.tls_certificate_id).where(
+                                    DNSServerOptions.tls_certificate_id.is_not(None)
+                                )
+                            ),
+                        ),
                         ApplianceCertificate.valid_to.is_not(None),
                         ApplianceCertificate.valid_to <= cutoff,
                     )
@@ -183,6 +197,10 @@ async def _renew() -> str:
                 allow_manual = False  # fully managed — plain dns-01 renewal
             if frozenset(domains) in inflight_domainsets:
                 continue  # already being (re)issued
+            # #3061 — point the order at the cert it renews, so the
+            # orchestrator rewrites THAT row in place: a DNS group's
+            # ``tls_certificate_id`` keeps naming the live material, and a
+            # DoT-only cert is not promoted to the Web UI cert on renewal.
             order = ACMEOrder(
                 account_id=account.id,
                 domains=domains,
@@ -190,6 +208,11 @@ async def _renew() -> str:
                 dns_provider=dns_provider,
                 status="pending",
                 allow_manual=False,
+                certificate_id=cert.id,
+                # #3067 — a renewal never promotes a cert to the Web UI
+                # cert; if the row vanishes mid-order the fallback creates a
+                # fresh one, which must not take over nginx either.
+                activate_on_issue=False,
             )
             db.add(order)
             await db.flush()

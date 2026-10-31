@@ -282,6 +282,8 @@ describe("DNS: Delete Server Group", () => {
       listGroups: async () => [DNS_GROUP],
       listZones: async () => [],
       listViews: async () => [],
+      listAcls: async () => [],
+      listTSIGKeys: async () => [],
       listServers: async () => [],
       ...extra,
     };

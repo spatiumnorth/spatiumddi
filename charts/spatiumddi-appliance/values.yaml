@@ -320,7 +320,8 @@ dhcpKea:
   # MetalLB pool so a DHCP relay's ``forward-to`` target can outlive a
   # single Kea node. Kea KEEPS hostNetwork:67 — this VIP does NOT replace
   # client-facing broadcast reach (operators still run a relay per VLAN);
-  # it only stabilises the relay→server unicast forward. Must fall inside
+  # it only stabilises the relay→server unicast forward. Every DHCP group
+  # behind it must use dhcp_socket_mode=relay (#2899). Must fall inside
   # the MetalLB pool. Requires ``metallb.enabled: true``.
   relayVIP: ""
   # MetalLB pool the relay VIP draws from. Empty → falls back to the

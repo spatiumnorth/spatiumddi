@@ -407,6 +407,65 @@ def primary_ns_error(value: str | None) -> str | None:
     return None
 
 
+# BIND's ``dns_name_ismailbox``: the first label of an SOA RNAME (the
+# mailbox's local part) may hold any printable ASCII character but a space;
+# only the labels after it are held to the host-name rule. Measured against
+# named-checkzone 9.20: ``admin+dns``, ``dns_admin`` and ``a!b`` load, while
+# ``hostmaster.under_score.example.com.`` is refused (check-names).
+_MAILBOX_LOCAL_RE = re.compile(r"^[\x21-\x7e]+\Z")
+
+
+def admin_email_error(value: str | None) -> str | None:
+    """Why *value* cannot be a zone's Admin Email (the SOA RNAME), or None.
+
+    The RNAME is a mailbox in domain-name form (``hostmaster.example.com.``,
+    the first label being the local part). BIND's check-names reads it as a
+    mailbox: the local part is any printable ASCII (``admin+dns``,
+    ``dns_admin``), and every label after it must be a host name label. One
+    that is not makes BIND refuse the whole zone, so the group never serves
+    it (#2916). Like the Primary NS (:func:`primary_ns_error`), a single label
+    would be read as a name at the root, so it is refused. Characters a
+    master file cannot carry unescaped (``@``, ``\\``, ``;`` …) are refused
+    by :func:`contains_zonefile_unsafe` too, so a local part holding a dot
+    cannot be written. Empty means "not set" and is allowed.
+    """
+    if value is None or value == "":
+        return None
+    if contains_zonefile_unsafe(value):
+        return (
+            "must be a mailbox in domain-name form such as hostmaster.example.com. "
+            "(no whitespace, control characters, or zone-file syntax such as '@')"
+        )
+    body = value[:-1] if value.endswith(".") else value
+    if not body or "." not in body:
+        return (
+            "must be a mailbox in domain-name form such as hostmaster.example.com. "
+            "(a single label such as 'hostmaster' would be read as a name at the root)"
+        )
+    if len(body) > MAX_NAME_LEN:
+        return f"exceeds {MAX_NAME_LEN} characters"
+    for i, label in enumerate(body.split(".")):
+        if not label:
+            return "contains an empty label"
+        if len(label) > MAX_LABEL_LEN:
+            return f"label '{label[:20]}…' exceeds {MAX_LABEL_LEN} characters"
+        if not label.isascii():
+            return (
+                f"label '{label}' is not ASCII; write an internationalised domain "
+                "in its xn-- form"
+            )
+        if i == 0:
+            if not _MAILBOX_LOCAL_RE.match(label):
+                return f"mailbox name '{label}' holds a character BIND does not accept"
+        elif not _HOST_LABEL_RE.match(label):
+            return (
+                f"label '{label}' is not a host name label: letters, digits and "
+                "hyphens only, with no leading or trailing hyphen (RFC 1123). "
+                "BIND refuses a zone whose SOA mailbox domain is not a host name"
+            )
+    return None
+
+
 def _zone_absolute(name: str, origin: str) -> str:
     """*name* the way a zone file whose ``$ORIGIN`` is *origin* reads it.
 
@@ -521,7 +580,11 @@ def bind_check_names_error(
         target = tokens[-1]
     elif rtype in BIND_SERVICE_BINDING_TYPES:
         # ServiceMode only: an AliasMode (priority 0) target is not checked.
-        if len(tokens) < 2 or not tokens[0].isdigit() or int(tokens[0]) == 0:
+        if (
+            len(tokens) < 2
+            or not (tokens[0].isascii() and tokens[0].isdigit())
+            or int(tokens[0]) == 0
+        ):
             return None
         target = tokens[1]
     elif rtype == "PTR" and _is_reverse_mapping(_zone_absolute(owner, origin)):
@@ -691,6 +754,31 @@ def validate_optional_hostname(v: str | None, *, field: str = "hostname") -> str
     if v.strip() == "":
         return ""
     return validate_hostname(v, field=field)
+
+
+def host_in_zone_error(hostname: str, zone_name: str, *, field: str = "hostname") -> str | None:
+    """Why an address's host record ``<hostname>.<zone_name>`` cannot be published.
+
+    The IPAM -> DNS publish path's one rule for the full owner name: the
+    253-character limit (``name_in_zone_error``) and the record API's own
+    check-names rule for an A / AAAA owner (``bind_check_names_error``), which
+    walks the zone's labels as well as the host's. A zone named with an
+    underscore label takes TXT / SRV but no host record, and BIND refuses the
+    zone whole if one is written (#2918). The rule holds for the default-gateway
+    placeholder (``gateway``) too: it publishes no forward record, but its PTR
+    names ``gateway.<zone>``, and BIND's check-names refuses a reverse zone
+    whose PTR target is not a host name just as it refuses the forward zone.
+    """
+    err = name_in_zone_error(hostname, zone_name, field=field)
+    if err is not None:
+        return err
+    host = hostname.strip().rstrip(".")
+    zone = zone_name.strip().rstrip(".")
+    if not host or not zone:
+        return None
+    # The owner absolute (root dot): a relative one has the origin appended
+    # again, which the message would then quote doubled.
+    return bind_check_names_error("A", f"{host}.{zone}.", None, origin=zone, check_target=False)
 
 
 def publishable_host_owner_error(hostname: str | None) -> str | None:

@@ -49,6 +49,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
@@ -58,7 +59,6 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     check_size,
-    describe_exc,
     safe_filename,
     safe_url,
     scrub_url,
@@ -308,7 +308,7 @@ class WebDAVDestination(BackupDestination):
                             f"{scrub_url(body, target)[:300]}"
                         )
                     length = resp.headers.get("content-length")
-                    if length and length.isdigit():
+                    if length and length.isascii() and length.isdigit():
                         check_size(name, int(length), max_bytes)
                     out = bytearray()
                     async for chunk in resp.aiter_bytes():

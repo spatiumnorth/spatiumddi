@@ -43,7 +43,7 @@ from app.core.safe_fetch import (
     has_masked_credentials,
     mask_url_credentials,
 )
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSBlockList,
@@ -1192,6 +1192,7 @@ async def update_blocklist(
         "feed_entries_are_wildcard" in changes
         and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard
     )
+    before = snapshot(bl, changes)
     for k, v in changes.items():
         setattr(bl, k, v)
 
@@ -1231,7 +1232,7 @@ async def update_blocklist(
             "dns_blocklist",
             str(bl.id),
             bl.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
         )
     )
     await db.commit()

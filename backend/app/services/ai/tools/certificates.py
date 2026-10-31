@@ -19,6 +19,9 @@ Three tools land here:
   secret. Default-disabled (off-prem CA context + auth material
   adjacency); operators opt in via the Tool Catalog.
 
+Each takes ``read`` on ``certificate_store`` (or on ``appliance``), the
+grant the store's own REST reads take (#3067).
+
 Read-only. The matching ``propose_*`` issuance write (model proposes
 "issue a cert for X via Let's Encrypt", operator clicks Apply) is
 deferred — issuance is irreversible at the CA (the serial is logged)
@@ -39,10 +42,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import is_effective_superadmin
+from app.core.permissions import RESOURCE_TYPE_APPLIANCE, RESOURCE_TYPE_CERTIFICATE_STORE
 from app.models.appliance import ApplianceCertificate
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
+
+# #3067 — the same grant the store's REST reads take
+# (``require_certificate_store("read")``): ``read`` on ``certificate_store``,
+# or the ``read`` on ``appliance`` those routes accepted before.
+_STORE_READ = ("read", (RESOURCE_TYPE_CERTIFICATE_STORE, RESOURCE_TYPE_APPLIANCE))
 
 
 def _cert_to_dict(row: ApplianceCertificate) -> dict[str, Any]:
@@ -89,7 +97,7 @@ class FindCertificatesArgs(BaseModel):
 
 @register_tool(
     name="find_certificates",
-    permission=("read", "appliance"),
+    permission=_STORE_READ,
     description=(
         "List the appliance Web UI TLS certificates. Each row carries "
         "the operator label (name), source (uploaded / csr / letsencrypt "
@@ -146,7 +154,7 @@ class CountCertificatesExpiringArgs(BaseModel):
 
 @register_tool(
     name="count_certificates_expiring",
-    permission=("read", "appliance"),
+    permission=_STORE_READ,
     description=(
         "Count appliance Web UI TLS certificates whose validity expires "
         "within N days of now (default 30). Counts only the active cert "
@@ -203,10 +211,10 @@ class GetACMEAccountArgs(BaseModel):
 
 @register_tool(
     name="get_acme_account",
-    permission="superadmin",
+    permission=_STORE_READ,
     description=(
         "Read the embedded ACME client account configured for Let's "
-        "Encrypt issuance (superadmin only). Returns the CA directory "
+        "Encrypt issuance. Returns the CA directory "
         "URL, the CA-assigned account URL (NULL until first issuance), "
         "the contact email, the EAB key id, and an ``eab_hmac_set`` "
         "boolean — the account key and EAB HMAC secret are NEVER "
@@ -219,20 +227,15 @@ class GetACMEAccountArgs(BaseModel):
     category="admin",
     # Default-disabled (NN #13): the surface sits next to ACME account
     # auth material (account key + EAB HMAC). We never return the
-    # secrets, but the conservative default is opt-in + superadmin-gated.
+    # secrets, but the conservative default is opt-in. The permission is the
+    # one ``GET /appliance/acme/account`` takes, which returns the same
+    # fields (#3067 — it used to be superadmin-only here and not there).
     default_enabled=False,
     module="security.certificates",
 )
 async def get_acme_account(
     db: AsyncSession, user: User, args: GetACMEAccountArgs
 ) -> dict[str, Any]:
-    if not is_effective_superadmin(user):
-        return {
-            "error": (
-                "The ACME account surface is restricted to superadmin "
-                "users. Ask your platform admin to run the query."
-            )
-        }
     # Lazy import — keeps the ACME client model out of the tool-registry
     # import path for installs that never touch ACME.
     from app.models.acme_client import ACMEClientAccount  # noqa: PLC0415

@@ -29,6 +29,7 @@ import {
   type SiteKind,
   type SiteRead,
   type SiteUpdate,
+  formatApiError,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSessionState } from "@/lib/useSessionState";
@@ -137,11 +138,7 @@ function SiteEditorModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Save failed");
+      setError(formatApiError(e, "Save failed"));
     },
   });
 
@@ -308,11 +305,7 @@ function MoveSiteModal({
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Move failed");
+      setError(formatApiError(e, "Move failed"));
     },
   });
 
@@ -428,6 +421,13 @@ function SiteTreeRow({
     perms.can("delete", "site"),
     "Requires delete permission on sites",
   );
+  // Edit asks what PUT /sites/{id} asks, which takes a grant scoped to this
+  // one site (#3039, #3134). Move and drag re-parent it, which a scoped
+  // holder may not, so they stay on the type-level write.
+  const editGate = permissionGate(
+    perms.can("write", "site", site.id),
+    "Requires write permission on sites",
+  );
   const kids = childrenByParent.get(site.id) ?? [];
   const hasKids = kids.length > 0;
   const isExpanded = expanded.has(site.id);
@@ -529,7 +529,7 @@ function SiteTreeRow({
             title="Edit"
             onClick={() => onEdit(site)}
             className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-            {...writeGate}
+            {...editGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
@@ -625,11 +625,7 @@ function SiteTreeView({
     mutationFn: ({ id, parentId }: { id: string; parentId: string | null }) =>
       sitesApi.update(id, { parent_site_id: parentId }),
     onError: (e: unknown) => {
-      const err = e as {
-        message?: string;
-        response?: { data?: { detail?: string } };
-      };
-      setError(err?.response?.data?.detail ?? err?.message ?? "Move failed");
+      setError(formatApiError(e, "Move failed"));
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ["sites"] }),
   });
@@ -723,6 +719,13 @@ export function SitesPage() {
     perms.can("delete", "site"),
     "Requires delete permission on sites",
   );
+  // A row's Edit takes a grant scoped to that one site (#3039, #3134); Move
+  // re-parents it and stays type-level, like New and Delete.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "site", id),
+      "Requires write permission on sites",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<SiteKind | "">("");
@@ -790,13 +793,7 @@ export function SitesPage() {
   // points at the site (#2298); show the server's reason, don't swallow it.
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const onDeleteError = (e: unknown) => {
-    const err = e as {
-      response?: { data?: { detail?: string } };
-      message?: string;
-    };
-    setDeleteError(
-      err?.response?.data?.detail ?? err?.message ?? "Delete failed",
-    );
+    setDeleteError(formatApiError(e, "Delete failed"));
   };
 
   const bulkDelete = useMutation({
@@ -1065,7 +1062,7 @@ export function SitesPage() {
                         title="Edit"
                         onClick={() => setEditing(s)}
                         className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                        {...writeGate}
+                        {...editGate(s.id)}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>

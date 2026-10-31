@@ -73,6 +73,7 @@ from typing import Any
 
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
@@ -82,7 +83,6 @@ from app.services.backup.targets.base import (
     DestinationConfigError,
     RetentionLockedError,
     check_size,
-    describe_exc,
     read_capped,
     safe_filename,
 )

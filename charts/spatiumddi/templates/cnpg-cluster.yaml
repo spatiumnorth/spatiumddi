@@ -113,10 +113,32 @@ spec:
   # sessions never end on their own. Rendered at every instance count, so
   # a Cluster already carries it when a demote leaves it one instance.
   smartShutdownTimeout: {{ .Values.postgresql.cnpg.smartShutdownTimeout }}
+  {{- if .Values.postgresql.cnpg.nodeLocalApiServer.enabled }}
+
+  # #3021: the instance pods reach the API server on their own node (see
+  # values.yaml). The kubernetes Service sends the primary's one long-lived
+  # API connection to any node's API server; when that node was the one
+  # lost, the primary's liveness isolation check failed on the replica on
+  # it and kubelet restarted the primary although it had lost no peer it
+  # needed. CNPG hands ``env`` to the instance pods; an explicit variable
+  # outranks the one kubelet injects for the kubernetes Service.
+  env:
+    - name: KUBERNETES_SERVICE_HOST
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    - name: KUBERNETES_SERVICE_PORT
+      value: {{ .Values.postgresql.cnpg.nodeLocalApiServer.port | default 6443 | quote }}
+  {{- end }}
 
   postgresql:
     parameters:
-      {{- toYaml .Values.postgresql.cnpg.parameters | nindent 6 }}
+      {{- /* #2955 — an empty max_connections is derived from the pools. */}}
+      {{- $params := deepCopy .Values.postgresql.cnpg.parameters }}
+      {{- if not $params.max_connections }}
+      {{- $_ := set $params "max_connections" (include "spatiumddi.postgresMaxConnections" . | trim) }}
+      {{- end }}
+      {{- toYaml $params | nindent 6 }}
 
   bootstrap:
     initdb:
@@ -154,8 +176,9 @@ spec:
     storageClass: {{ . | quote }}
     {{- end }}
 
+  # #2955 — the memory limit holds the derived max_connections.
   resources:
-    {{- toYaml .Values.postgresql.resources | nindent 4 }}
+    {{- include "spatiumddi.postgresResources" . | nindent 4 }}
 
   {{- /* CNPG nests nodeSelector + tolerations + pod anti-affinity under
          spec.affinity. Inline the standard control-plane label merge from

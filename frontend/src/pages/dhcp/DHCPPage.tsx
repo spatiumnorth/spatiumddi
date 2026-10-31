@@ -60,6 +60,7 @@ import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
@@ -495,6 +496,22 @@ function GroupDetailView({
             {group.description && (
               <p className="mt-1 text-xs text-muted-foreground">
                 {group.description}
+              </p>
+            )}
+            {(group.ha_peer_urls_missing?.length ?? 0) > 0 && (
+              <p
+                className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+                data-testid="ha-peer-urls-missing"
+              >
+                HA is not running: no HA Peer URL on{" "}
+                {group.ha_peer_urls_missing!.join(", ")}. Set it on each server
+                (Edit server → HA Peer URL), e.g.{" "}
+                <span className="font-mono">http://&lt;host&gt;:8000/</span>.
+                {group.ha_autofill_skipped_reason ===
+                  "more_than_two_kea_members" &&
+                  " Not filled automatically: a third Kea member joins as an HA backup, and roles follow server order, so it could take the primary role from the existing pair."}
+                {group.ha_autofill_skipped_reason === "bridged_network_mode" &&
+                  " Not filled automatically: in bridged mode the node address is not where Kea listens."}
               </p>
             )}
           </div>
@@ -1165,6 +1182,7 @@ function GroupServersList({
                       <ConfigApplyChip server={s} />
                       <SpoolChip server={s} />
                       <DaemonStateChip server={s} />
+                      <DuplicateAgentChip server={s} kind="DHCP" />
                     </div>
                     <p className="text-xs text-muted-foreground truncate">
                       <span className="font-mono">
@@ -1282,6 +1300,7 @@ function ScopeDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
   notice,
 }: {
   scope: DHCPScope;
@@ -1289,6 +1308,9 @@ function ScopeDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  // #3113 — the server's reason when it refuses the delete (a Windows
+  // failover scope answers 409 with the step to take first).
+  error?: string | null;
   // #62 two-person approval queue "Submitted for approval" message.
   notice?: string | null;
 }) {
@@ -1326,12 +1348,13 @@ function ScopeDeleteModal({
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
+      error={error}
       notice={notice}
     />
   );
 }
 
-function ServerScopesTab({ groupId }: { groupId: string }) {
+export function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // #1339, #1861 — scope create / edit take write and delete takes delete on
   // ``dhcp_scope`` (scopes.py).
@@ -1356,6 +1379,20 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
         : Promise.resolve([]),
     enabled: !!groupId,
   });
+  // #3118 — the tag filter narrows the list, never what the group serves:
+  // the count line, the empty line and the subnet picker read the unfiltered
+  // set. Same key as the filtered query when no chip is set, so one fetch.
+  const unfilteredQ = useQuery({
+    queryKey: ["dhcp-scopes-group", groupId, []],
+    queryFn: () =>
+      groupId ? dhcpApi.listScopesByGroup(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
+  });
+  // Until the unfiltered list has loaded, which subnets the group serves is
+  // unknown: the picker then offers none rather than every subnet. A server
+  // with no group serves nothing, and its query never runs.
+  const unfilteredScopes = groupId ? unfilteredQ.data : [];
+  const unfilteredCount = unfilteredScopes?.length;
   const subnetById = new Map(subnets.map((s) => [s.id, s]));
   // #1110 — how the group's Windows members serve each scope. The column
   // only appears on a group that has Windows members.
@@ -1407,8 +1444,15 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
       />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} on this
-          group.
+          {tagFilters.length === 0
+            ? `${allScopes.length} scope${allScopes.length !== 1 ? "s" : ""} on this group.`
+            : unfilteredCount === undefined
+              ? allScopes.length === 1
+                ? "1 scope matches the tag filter."
+                : `${allScopes.length} scopes match the tag filter.`
+              : unfilteredCount === 1
+                ? `${allScopes.length} of 1 scope matches the tag filter.`
+                : `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`}
         </p>
         <div className="flex items-center gap-2">
           <select
@@ -1422,8 +1466,17 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
             {...dhcpGate("write", "dhcp_scope")}
           >
             <option value="">+ Serve leases on subnet…</option>
-            {subnets
-              .filter((s) => !allScopes.some((sc) => sc.subnet_id === s.id))
+            {unfilteredScopes === undefined && (
+              <option value="" disabled>
+                {unfilteredQ.isError
+                  ? "Could not load the group's scopes"
+                  : "Loading the group's scopes…"}
+              </option>
+            )}
+            {(unfilteredScopes === undefined ? [] : subnets)
+              .filter(
+                (s) => !unfilteredScopes?.some((sc) => sc.subnet_id === s.id),
+              )
               .map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.network}
@@ -1436,7 +1489,9 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
       <div className="rounded-lg border">
         {allScopes.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            No scopes on this server.
+            {tagFilters.length > 0 && unfilteredCount !== 0
+              ? "No scopes match the current tag filter."
+              : "No scopes on this server."}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -1603,6 +1658,11 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
             delMut.reset();
           }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
           notice={delScopeNotice}
         />
       )}
@@ -2050,7 +2110,7 @@ export function ServerPoolsOrStaticsTab({
   );
 }
 
-function ClientClassesTab({ groupId }: { groupId: string }) {
+export function ClientClassesTab({ groupId }: { groupId: string }) {
   // #1339, #1861 — each write takes the tab's own resource permission, with
   // the HTTP method's action (``delete`` for a delete).
   const dhcpGate = useDhcpGate();
@@ -2172,8 +2232,16 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
           title="Delete Client Class"
           description={`Delete class "${del.name}"?`}
           onConfirm={() => delMut.mutate(del.id)}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
@@ -2878,16 +2946,18 @@ function ServerDetailView({
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
     },
     onError: (e) => {
-      const err = e as {
-        response?: { status?: number; data?: { detail?: string } };
-      };
-      const detail = err?.response?.data?.detail;
-      if (err?.response?.status === 409) {
+      const response = (e as { response?: { status?: number } })?.response;
+      if (response?.status === 409) {
+        // The response alone, so a 409 without a detail still names the
+        // conflict instead of axios's "Request failed with status code 409".
         setAdoptConflict(
-          detail ?? "A DHCP server already exists on the interface.",
+          formatApiError(
+            { response },
+            "A DHCP server already exists on the interface.",
+          ),
         );
       } else {
-        setSyncBanner(detail ?? "Force sync failed");
+        setSyncBanner(formatApiError(e, "Force sync failed"));
       }
     },
   });
@@ -2962,11 +3032,7 @@ function ServerDetailView({
         );
       setSyncBanner(parts.join(" · "));
     },
-    onError: (e) =>
-      setSyncBanner(
-        (e as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Sync leases failed",
-      ),
+    onError: (e) => setSyncBanner(formatApiError(e, "Sync leases failed")),
   });
   const approveMut = useMutation({
     mutationFn: () => dhcpApi.approveServer(server.id),
@@ -3516,10 +3582,7 @@ export function DHCPPage() {
     },
   });
   const deleteGroupError =
-    deleteGroupMut.error &&
-    (((deleteGroupMut.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroupMut.error));
+    deleteGroupMut.error && formatApiError(deleteGroupMut.error);
   const deleteServerMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {

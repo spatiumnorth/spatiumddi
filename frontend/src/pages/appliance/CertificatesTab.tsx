@@ -31,11 +31,21 @@ import {
   type CSRKeyType,
   type CertificateSource,
   formatApiError,
+  versionApi,
 } from "@/lib/api";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { NEEDS_APPLIANCE_ADMIN } from "@/hooks/useApplianceAdmin";
+
+/** #3067 — the store's own permission. Each store route also accepts the
+ *  `appliance` grant it took before (`admin` for a write or delete). */
+const NEEDS_STORE_WRITE =
+  "Requires write permission on the TLS certificate store (certificate_store)";
+const NEEDS_STORE_DELETE =
+  "Requires delete permission on the TLS certificate store (certificate_store)";
 
 /**
  * Phase 4b.1 + 4b.3 — Web UI Certificate management tab.
@@ -58,6 +68,22 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
  */
 export function CertificatesTab() {
   const qc = useQueryClient();
+  // #3061 — off-appliance (Docker Compose / Kubernetes) the store is the
+  // same, but there is no appliance nginx to activate a cert on, so the
+  // activation controls and the Active badge go away.
+  //
+  // #3067 — which install this is comes from the public `/version`, never
+  // from `/appliance/info`: that needs read on `appliance`, and a
+  // store-only caller (a DNS Editor) gets 403 there. Reading the refusal as
+  // "not an appliance" hid the served cert's Active badge and enabled its
+  // Delete. Until `/version` answers, treat the install as an appliance:
+  // an unknown answer must never unlock the served certificate.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 5 * 60 * 1000,
+  });
+  const isApplianceHost = versionInfo?.appliance_mode !== false;
   const [uploadOpen, setUploadOpen] = useState(false);
   const [csrOpen, setCsrOpen] = useState(false);
   const [acmeOpen, setAcmeOpen] = useState(false);
@@ -75,6 +101,21 @@ export function CertificatesTab() {
   // feature module; hide the Issue button (and its modal) when it's off.
   const { enabled: moduleEnabled } = useFeatureModules();
   const acmeModuleOn = moduleEnabled("security.certificates");
+
+  // #3067 — what the store's routes check. Making a cert the Web UI cert
+  // (Activate, "Activate immediately", or an ACME issue that activates)
+  // deploys it to nginx and stays on `admin` on `appliance`.
+  const { can } = usePermissions();
+  const applianceAdmin = can("admin", "appliance");
+  const canActivate = isApplianceHost && applianceAdmin;
+  const writeGate = permissionGate(
+    applianceAdmin || can("write", "certificate_store"),
+    NEEDS_STORE_WRITE,
+  );
+  const deleteGate = permissionGate(
+    applianceAdmin || can("delete", "certificate_store"),
+    NEEDS_STORE_DELETE,
+  );
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "tls"],
@@ -102,14 +143,25 @@ export function CertificatesTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <ShieldCheck className="h-4 w-4 text-muted-foreground" />
-            Web UI Certificate
+            {isApplianceHost ? "Web UI Certificate" : "TLS certificates"}
           </h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            The certificate nginx serves on the appliance's HTTPS frontend.
-            Upload a PEM cert + private key from an existing CA, or generate a
-            CSR locally (key stays on the server) and bring back the signed
-            cert. Activating a certificate makes nginx serve it.
-          </p>
+          {isApplianceHost ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              The certificate nginx serves on the appliance's HTTPS frontend.
+              Upload a PEM cert + private key from an existing CA, or generate a
+              CSR locally (key stays on the server) and bring back the signed
+              cert. Activating a certificate makes nginx serve it.
+            </p>
+          ) : (
+            <p className="mt-1 text-xs text-muted-foreground">
+              The certificate store. DNS server groups pick a certificate from
+              here for DNS-over-TLS / DNS-over-HTTPS / DNS-over-QUIC. Upload a
+              PEM cert + private key, generate a CSR locally (key stays on the
+              server), or issue one with Let's Encrypt. This install does not
+              terminate TLS itself, so certificates here are not served as a Web
+              UI certificate; put one on your own reverse proxy or ingress.
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-2">
           {acmeModuleOn && (
@@ -117,6 +169,7 @@ export function CertificatesTab() {
               icon={ShieldCheck}
               onClick={() => setAcmeOpen(true)}
               title="Request a CA-trusted cert from Let's Encrypt via DNS-01"
+              {...writeGate}
             >
               Issue via Let's Encrypt
             </HeaderButton>
@@ -124,7 +177,8 @@ export function CertificatesTab() {
           <button
             type="button"
             onClick={() => setCsrOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+            {...writeGate}
+            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           >
             <FilePlus2 className="h-3.5 w-3.5" />
             Generate CSR
@@ -132,7 +186,8 @@ export function CertificatesTab() {
           <button
             type="button"
             onClick={() => setUploadOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+            {...writeGate}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Plus className="h-3.5 w-3.5" />
             Upload certificate
@@ -153,13 +208,17 @@ export function CertificatesTab() {
           Loading…
         </div>
       ) : !data || data.length === 0 ? (
-        <EmptyState />
+        <EmptyState isApplianceHost={isApplianceHost} />
       ) : (
         <div className="space-y-3">
           {data.map((cert) => (
             <CertificateCard
               key={cert.id}
               cert={cert}
+              isApplianceHost={isApplianceHost}
+              canActivate={applianceAdmin}
+              writeGate={writeGate}
+              deleteGate={deleteGate}
               onActivate={() => activate.mutate(cert.id)}
               onDelete={() => setDeleteTarget(cert)}
               onViewCsr={() => setCsrViewing(cert)}
@@ -172,6 +231,7 @@ export function CertificatesTab() {
 
       {uploadOpen && (
         <UploadCertificateModal
+          canActivate={canActivate}
           onClose={() => setUploadOpen(false)}
           onSuccess={() => {
             setUploadOpen(false);
@@ -207,6 +267,7 @@ export function CertificatesTab() {
 
       {importTarget && (
         <ImportSignedCertModal
+          canActivate={canActivate}
           cert={importTarget}
           onClose={() => setImportTarget(null)}
           onSuccess={() => {
@@ -218,6 +279,8 @@ export function CertificatesTab() {
 
       {acmeOpen && (
         <AcmeIssueModal
+          isApplianceHost={isApplianceHost}
+          canActivate={canActivate}
           onClose={() => setAcmeOpen(false)}
           onIssued={() => {
             setAcmeOpen(false);
@@ -263,16 +326,15 @@ export function CertificatesTab() {
   );
 }
 
-function EmptyState() {
+function EmptyState({ isApplianceHost }: { isApplianceHost: boolean }) {
   return (
     <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center">
       <ShieldCheck className="mx-auto h-8 w-8 text-muted-foreground/50" />
       <h3 className="mt-3 text-sm font-medium">No certificates yet</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Use the buttons above to upload an existing cert + key, or generate a
-        CSR so a CA can sign a fresh cert for this appliance. Until you activate
-        something, nginx serves the self-signed default the appliance generated
-        on first boot.
+        {isApplianceHost
+          ? "Use the buttons above to upload an existing cert + key, or generate a CSR so a CA can sign a fresh cert for this appliance. Until you activate something, nginx serves the self-signed default the appliance generated on first boot."
+          : "Use the buttons above to upload an existing cert + key, generate a CSR so a CA can sign one, or issue one with Let's Encrypt."}
       </p>
     </div>
   );
@@ -285,7 +347,15 @@ function CertificateCard({
   onViewCsr,
   onPasteCert,
   activating,
+  isApplianceHost,
+  canActivate,
+  writeGate,
+  deleteGate,
 }: {
+  isApplianceHost: boolean;
+  canActivate: boolean;
+  writeGate: { disabled?: boolean; title?: string };
+  deleteGate: { disabled?: boolean; title?: string };
   cert: ApplianceCertificate;
   onActivate: () => void;
   onDelete: () => void;
@@ -320,7 +390,7 @@ function CertificateCard({
   return (
     <div
       className={`rounded-lg border bg-card p-4 shadow-sm ${
-        cert.is_active
+        isApplianceHost && cert.is_active
           ? "ring-1 ring-primary/40"
           : cert.pending
             ? "ring-1 ring-amber-500/30 bg-amber-500/[0.03]"
@@ -331,7 +401,7 @@ function CertificateCard({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="truncate text-sm font-semibold">{cert.name}</h3>
-            {cert.is_active && (
+            {isApplianceHost && cert.is_active && (
               <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary">
                 <CheckCircle2 className="h-3 w-3" />
                 Active
@@ -405,6 +475,7 @@ function CertificateCard({
               <button
                 type="button"
                 onClick={onPasteCert}
+                {...writeGate}
                 className="inline-flex items-center gap-1 rounded-md border bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
               >
                 <Upload className="h-3 w-3" />
@@ -412,18 +483,23 @@ function CertificateCard({
               </button>
             </>
           ) : (
+            isApplianceHost &&
             !cert.is_active && (
               <button
                 type="button"
                 onClick={onActivate}
                 disabled={
-                  activating || (expiresInDays !== null && expiresInDays < 0)
+                  !canActivate ||
+                  activating ||
+                  (expiresInDays !== null && expiresInDays < 0)
                 }
-                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                 title={
-                  expiresInDays !== null && expiresInDays < 0
-                    ? "Cannot activate an expired certificate"
-                    : "Make this the cert nginx serves"
+                  !canActivate
+                    ? NEEDS_APPLIANCE_ADMIN
+                    : expiresInDays !== null && expiresInDays < 0
+                      ? "Cannot activate an expired certificate"
+                      : "Make this the cert nginx serves"
                 }
               >
                 <CheckCircle2 className="h-3 w-3" />
@@ -434,12 +510,14 @@ function CertificateCard({
           <button
             type="button"
             onClick={onDelete}
-            disabled={cert.is_active}
+            disabled={
+              (isApplianceHost && cert.is_active) || deleteGate.disabled
+            }
             className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
             title={
-              cert.is_active
+              isApplianceHost && cert.is_active
                 ? "Activate a different certificate first"
-                : "Delete this certificate"
+                : (deleteGate.title ?? "Delete this certificate")
             }
           >
             <Trash2 className="h-3 w-3" />
@@ -499,9 +577,13 @@ function Field({
 // ── Upload modal (4b.1) ─────────────────────────────────────────────
 
 function UploadCertificateModal({
+  canActivate,
   onClose,
   onSuccess,
 }: {
+  /** Appliance host AND `admin` on `appliance` (#3067): only then can the
+   *  upload also make it the Web UI certificate. */
+  canActivate: boolean;
   onClose: () => void;
   onSuccess: () => void;
 }) {
@@ -529,7 +611,7 @@ function UploadCertificateModal({
             cert_pem: certPem,
             key_pem: keyPem,
             notes: notes.trim() || null,
-            activate,
+            activate: canActivate && activate,
           });
         }}
         className="space-y-3"
@@ -571,15 +653,17 @@ function UploadCertificateModal({
           placeholder="optional — e.g. 'Renewal script in cron'"
         />
 
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={activate}
-            onChange={(e) => setActivate(e.target.checked)}
-            className="rounded border-input"
-          />
-          Activate immediately
-        </label>
+        {canActivate && (
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={activate}
+              onChange={(e) => setActivate(e.target.checked)}
+              className="rounded border-input"
+            />
+            Activate immediately
+          </label>
+        )}
 
         {error && <ErrorBanner message={error} />}
 
@@ -866,10 +950,12 @@ function ViewCsrModal({
 // ── Import signed cert modal (4b.3) ─────────────────────────────────
 
 function ImportSignedCertModal({
+  canActivate,
   cert,
   onClose,
   onSuccess,
 }: {
+  canActivate: boolean;
   cert: ApplianceCertificate;
   onClose: () => void;
   onSuccess: () => void;
@@ -895,7 +981,10 @@ function ImportSignedCertModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError(null);
-          importIt.mutate({ cert_pem: certPem, activate });
+          importIt.mutate({
+            cert_pem: certPem,
+            activate: canActivate && activate,
+          });
         }}
         className="space-y-3"
       >
@@ -924,15 +1013,17 @@ function ImportSignedCertModal({
           hint="Paste the full chain — leaf + intermediates."
         />
 
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={activate}
-            onChange={(e) => setActivate(e.target.checked)}
-            className="rounded border-input"
-          />
-          Activate immediately
-        </label>
+        {canActivate && (
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={activate}
+              onChange={(e) => setActivate(e.target.checked)}
+              className="rounded border-input"
+            />
+            Activate immediately
+          </label>
+        )}
 
         {error && <ErrorBanner message={error} />}
 
@@ -1152,13 +1243,13 @@ const ACME_CHALLENGE_OPTIONS: {
   {
     value: "http-01",
     label: "HTTP-01 (CA fetches a token over port 80/443)",
-    hint: "No DNS needed — the appliance must be reachable on port 80/443 at each requested name.",
+    hint: "No DNS needed — SpatiumDDI must be reachable on port 80/443 at each requested name.",
   },
   {
     value: "tls-alpn-01",
     label: "TLS-ALPN-01",
     disabled: true,
-    disabledReason: "Not supported on this appliance (nginx terminates TLS).",
+    disabledReason: "Not supported (nginx terminates TLS).",
   },
 ];
 
@@ -1171,9 +1262,15 @@ const ACME_CHALLENGE_OPTIONS: {
  * hostname + any control-plane host IPs.
  */
 function AcmeIssueModal({
+  isApplianceHost,
+  canActivate,
   onClose,
   onIssued,
 }: {
+  isApplianceHost: boolean;
+  /** Appliance host AND `admin` on `appliance` (#3067). Without it the
+   *  issued cert is stored for DoT / DoH / DoQ and not activated. */
+  canActivate: boolean;
   onClose: () => void;
   onIssued: () => void;
 }) {
@@ -1188,14 +1285,20 @@ function AcmeIssueModal({
     queryFn: applianceAcmeApi.getAccount,
   });
 
-  // Prefill sources for the Domains tab.
+  // Prefill sources for the Domains tab. Both read the appliance itself,
+  // so a certificate-store-only caller (#3067) skips them rather than
+  // sending two requests it is known to be refused.
+  const { can } = usePermissions();
+  const prefill = isApplianceHost && can("read", "appliance");
   const infoQuery = useQuery({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
+    enabled: prefill,
   });
   const systemQuery = useQuery({
     queryKey: ["appliance", "system-info"],
     queryFn: applianceSystemApi.info,
+    enabled: prefill,
   });
 
   // Account form state.
@@ -1327,6 +1430,9 @@ function AcmeIssueModal({
         challenge_type: challengeType,
         // allow_manual only matters for dns-01; harmless to omit otherwise.
         allow_manual: challengeType === "dns-01" ? allowManual : undefined,
+        // #3067 — activating takes over the Web UI certificate, which needs
+        // `admin` on `appliance`; off an appliance nothing serves it.
+        activate: canActivate,
       });
     } catch {
       // onError handlers already surfaced the message.
@@ -1342,8 +1448,12 @@ function AcmeIssueModal({
           SpatiumDDI requests a CA-trusted certificate from Let's Encrypt and
           proves domain control via DNS-01 (over SpatiumDDI-managed or
           cloud-hosted zones, with a manual-TXT fallback) or HTTP-01. When the
-          order completes the issued cert is stored and activated automatically,
-          and active certs auto-renew ~30 days before they expire.
+          order completes the issued cert is stored{" "}
+          {canActivate
+            ? "and activated automatically. The active cert, and any a DNS group serves for DoT / DoH, auto-renew ~30 days before they expire."
+            : isApplianceHost
+              ? "in the certificate store, ready to pick for DoT / DoH. It is not made the Web UI certificate: that needs admin permission on the appliance. A cert a DNS group serves auto-renews ~30 days before it expires."
+              : "in the certificate store, ready to pick for DoT / DoH. A cert a DNS group serves auto-renews ~30 days before it expires."}
         </p>
 
         <ModalTabs
@@ -1518,7 +1628,9 @@ function AcmeIssueModal({
                 <span className="font-mono">
                   http(s)://&lt;domain&gt;/.well-known/acme-challenge/…
                 </span>{" "}
-                — the appliance must be reachable on port 80/443 at that name.
+                {isApplianceHost
+                  ? "— the appliance must be reachable on port 80/443 at that name."
+                  : "— that name must reach this install's frontend on port 80/443. Behind your own reverse proxy or ingress, forward /.well-known/acme-challenge/ to it as well."}
               </p>
             )}
 
@@ -1798,11 +1910,7 @@ function ErrorBanner({ message }: { message: string }) {
 }
 
 function extractError(err: unknown): string {
-  const e = err as {
-    response?: { data?: { detail?: string } };
-    message?: string;
-  };
-  return e.response?.data?.detail ?? e.message ?? "request failed";
+  return formatApiError(err, "request failed");
 }
 
 function fmtDate(s: string): string {

@@ -20,14 +20,30 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.dns import DNSPool, DNSPoolMember
 from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ownership import SITE_KINDS, Site
 
 router = APIRouter(
     tags=["sites"],
-    dependencies=[Depends(require_resource_permission("site"))],
+    dependencies=[
+        Depends(
+            require_resource_permission(
+                "site",
+                # A grant scoped to one site (#3039) reaches that row's detail
+                # and edit and the list, which narrows to the granted rows.
+                instance_routes=(
+                    "site",
+                    "GET /",
+                    frozenset({"GET /{site_id}"}),
+                    frozenset({"PUT /{site_id}"}),
+                ),
+                instance_param="site_id",
+                prefix="/sites",
+            )
+        )
+    ],
 )
 
 
@@ -113,7 +129,7 @@ class SiteBulkDelete(BaseModel):
 @router.get("", response_model=SiteListResponse)
 async def list_sites(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     kind: SiteKind | None = Query(default=None),
@@ -135,6 +151,13 @@ async def list_sites(
         needle = f"%{search.strip()}%"
         stmt = stmt.where(
             or_(Site.name.ilike(needle), Site.code.ilike(needle), Site.region.ilike(needle))
+        )
+    # A caller admitted only by grants scoped to individual rows (#3039) sees
+    # those rows and no others.
+    if not user_has_permission(user, "read", "site"):
+        ids = (await db.execute(select(Site.id))).scalars().all()
+        stmt = stmt.where(
+            Site.id.in_([i for i in ids if user_has_permission(user, "read", "site", str(i))])
         )
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     stmt = stmt.order_by(Site.name.asc()).limit(limit).offset(offset)
@@ -232,6 +255,17 @@ async def update_site(site_id: uuid.UUID, body: SiteUpdate, db: DB, user: Curren
         raise HTTPException(status_code=404, detail="Site not found")
 
     changes = body.model_dump(exclude_unset=True)
+    # A grant scoped to this site (#3039) names this site, not another one to
+    # hang it under: re-parenting needs the type-level write.
+    if (
+        "parent_site_id" in changes
+        and changes["parent_site_id"] != row.parent_site_id
+        and not user_has_permission(user, "write", "site")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Permission denied: changing 'parent_site_id' needs 'write' on 'site'",
+        )
     if "parent_site_id" in changes:
         await _validate_parent(db, changes["parent_site_id"], site_id)
     for k, v in changes.items():

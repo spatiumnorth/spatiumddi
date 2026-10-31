@@ -102,13 +102,18 @@ const confirmButton = (dialog: HTMLElement) =>
 describe("IPAM delete confirmations", () => {
   it("Edit Space → Danger zone: says the space goes to Trash, and sends the Trash delete", async () => {
     const deleteSpace = vi.fn(() => Promise.resolve({}));
-    answers.ipamApi = { deleteSpace };
     const space = { id: "sp-1", name: "retiring-space" } as IPSpace;
+    // The Danger-zone Delete is gated on delete on this item (#3134); this
+    // test is about what the delete does, so sign in as a superadmin.
+    answers.authApi = {
+      myPermissions: () => Promise.resolve({ is_superadmin: true, grants: [] }),
+    };
+    answers.ipamApi = { deleteSpace, getSpace: () => Promise.resolve(space) };
     open(
       <EditSpaceModal space={space} onClose={() => {}} onDeleted={() => {}} />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
     const danger = words(topDialog());
     fireEvent.click(
       screen.getByRole("button", { name: /^Delete this IP space/ }),

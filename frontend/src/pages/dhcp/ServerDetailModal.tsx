@@ -38,7 +38,9 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
+import { syncCard } from "@/lib/dhcp-sync-label";
 import { haPillTitle } from "@/lib/dhcpHa";
 import {
   dhcpApi,
@@ -272,6 +274,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
   // Kea agents send heartbeats; their ``agent_last_seen`` is the right
   // liveness signal. Windows DHCP is polled, so ``last_sync_at`` is
   // meaningful. Fall back to whichever exists.
+  const sync = syncCard(server);
   const seenAt =
     server.driver === "kea"
       ? (server.agent_last_seen ?? server.last_sync_at)
@@ -285,6 +288,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
       <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
+        <DuplicateAgentChip server={server} kind="DHCP" />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <InfoCard label="Status" value={server.status}>
@@ -294,7 +298,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
           </span>
         </InfoCard>
         <InfoCard label="Last heartbeat" value={fmtRelative(seenAt)} />
-        <InfoCard label="Last sync" value={fmtRelative(server.last_sync_at)} />
+        <InfoCard label={sync.label} value={fmtRelative(sync.at)} />
         <InfoCard
           label="Last seen IP"
           value={server.last_seen_ip ?? "—"}
@@ -835,10 +839,11 @@ function StatsTab({ serverId }: { serverId: string }) {
       nak: b.nak,
       decline: b.decline,
       release: b.release,
-      // #980 — DROPPED is socket_drop ALONE, and an unmeasured bucket stays
-      // null so Recharts breaks the line there: a gap where nobody looked,
-      // not a zero. See lib/dhcp-loss.ts for why receive_drop is excluded
-      // and why the coalesce matters.
+      // #980 / #2889 — DROPPED is socket_drop + queue_evicted, never
+      // receive_drop, and an unmeasured bucket stays null so Recharts breaks
+      // the line there: a gap where nobody looked, not a zero. See
+      // lib/dhcp-loss.ts for why receive_drop is excluded and why the
+      // coalesce matters.
       dropped: bucketLoss(b),
     }));
   }, [data, withDate]);
@@ -899,7 +904,14 @@ function StatsTab({ serverId }: { serverId: string }) {
               ) : loss.total > 0 ? (
                 <span
                   className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-medium text-rose-600"
-                  title="Packets the kernel discarded before the server could read them — its receive buffer filled. Most often the node is short of CPU: Kea answers 100% of what it reads, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC."
+                  title={
+                    "Packets the kernel discarded before the server could read them — its receive buffer filled — plus DHCPv4 requests the server read and then evicted from its full packet queue during a burst" +
+                    (loss.evicted > 0 ? ` (${loss.evicted} of these)` : "") +
+                    ". Most often the node is short of CPU for the load's bursts: Kea answers 100% of what it processes, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC." +
+                    (loss.evictionMeasured
+                      ? ""
+                      : " Queue evictions are not measured on this server (its agent has no raw-socket capability, or predates the counter).")
+                  }
                 >
                   {loss.total} dropped
                 </span>

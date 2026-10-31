@@ -1299,40 +1299,148 @@ def _age_seconds(iso: str) -> float | None:
     return secs if secs > 0 else 0.0
 
 
-# P0.1 — RST recency/rate verdict. A fresh-install box churns ~5-8
-# restarts during boot (coredns/CNPG/api wait on each other); the old
-# raw ``>5 → bold red`` painted that healthy 25-minute-old box as "eight
-# things on fire". Instead gate red on a RECENT restart: a pod that's
-# restarted >=3 times AND last restarted <5 min ago is genuinely
-# flapping; one that restarted 6× during boot but has been quiet for 25
-# min is amber (worth a glance, not an alarm). >10 lifetime restarts is a
-# red backstop regardless of recency — that many is never benign.
-_RST_RECENT_S = 300.0    # last restart within 5 min → "recent"
-_RST_FLAP_MIN = 3        # restarts at/above this + recent → flapping
-_RST_LIFETIME_RED = 10   # lifetime restarts at/above this → red backstop
+# P0.1 / #2928 — RST verdict from WINDOWED restart deltas. The lifetime
+# ``restartCount`` is monotonic and every node reboot bumps every pod's by
+# one, so a verdict keyed on it (the old >=10 backstop, or ">=3 and last
+# restart <5 min ago") painted a healthy box red for the life of the pod.
+# The console is a long-running process, so it keeps its own baseline
+# (``CounterWatch``) and judges the INCREASE inside a window: >=3 in
+# the window is flapping (red), 1-2 is amber, none is quiet. The first
+# sample is the baseline, so boot churn from before the console started —
+# including a node reboot, which restarts the console too — never counts
+# as flapping. The lifetime total stays visible, dim, in the RST column.
+#
+# The console is NOT always long-lived: systemd restarts it every time an
+# operator logs out of the F1 login (and on any crash), which resets the
+# baseline. So a pod whose LAST restart (``RestartedAt``) is inside the
+# window is floored at 1 — "it restarted at least once in the last 15 min"
+# is a fact the pod status states outright, needing no history. That floor
+# can only ever reach amber, never red (the count before it is unknown), and
+# it ages out with the window, so it cannot pin the way a lifetime count did.
+_RST_WINDOW_S = 900.0    # restart increase is judged over the last 15 min
+_RST_FLAP_MIN = 3        # increase at/above this inside the window → red
+_ETCD_FAIL_WINDOW_S = 600.0  # any etcd proposals_failed increase in 10 min
+# A restart stamped this far in the FUTURE is still treated as just-now
+# (ordinary multi-node clock skew); further than that is ignored, so a node
+# whose clock runs ahead cannot hold the amber floor past the window.
+_RST_SKEW_TOLERANCE_S = 60.0
 
 
-def _rst_verdict(restarts: int, restarted_at: str, k8s_state: str = "") -> str:
-    """Classify a pod's restart history as ``red`` (flapping now /
-    pathological lifetime count / currently broken), ``amber`` (has
-    restarted but quiet), or ``quiet`` (zero restarts). Reused by
+class CounterWatch:
+    """In-memory baseline for monotonic counters, keyed by an arbitrary
+    string, judged on a monotonic clock (injectable for tests) so an NTP
+    step cannot stretch or collapse the window.
+
+    Per key a deque of ``(timestamp, value)`` CHANGE points: an observation
+    equal to the newest stored value is not appended, so memory is bounded
+    by how often the counter moves, not by the refresh cadence. The oldest
+    entry is the baseline — the newest change at/before ``now - window``,
+    or the first sample while the history is shorter than the window (a
+    console up for 2 min judges 2 min).
+
+    ``increase`` is the sum of the positive steps after the baseline. A
+    step DOWN is a counter reset — a StatefulSet pod recreated under the
+    same name restarts its ``restartCount`` at 0; k3s / etcd restarting
+    resets ``proposals_failed`` — and counts as 0: it becomes the new
+    baseline for the steps after it, while increases before it that are
+    still inside the window keep counting. (Subtracting from the first
+    sample instead reads ``8 -> 0 -> 3`` as no increase at all.)
+
+    Keys not observed for longer than the window are forgotten, so a pod
+    that is gone is dropped, but one failed ``cluster_pods`` cycle (which
+    returns ``[]``) does not wipe every baseline."""
+
+    def __init__(self, window_s: float, clock=time.monotonic) -> None:
+        self.window_s = window_s
+        self._clock = clock
+        self._samples: dict[str, deque] = {}
+        self._last_seen: dict[str, float] = {}
+
+    def observe(self, key: str, value: int, now: float | None = None) -> int:
+        """Record ``value`` for ``key`` and return its increase in-window."""
+        if now is None:
+            now = self._clock()
+        self._last_seen[key] = now
+        dq = self._samples.setdefault(key, deque())
+        if not dq or dq[-1][1] != value:
+            dq.append((now, value))
+        cutoff = now - self.window_s
+        # Keep exactly one change point at/before the cutoff: the baseline.
+        while len(dq) > 1 and dq[1][0] <= cutoff:
+            dq.popleft()
+        increase = 0
+        prev = dq[0][1]
+        for _, v in list(dq)[1:]:
+            if v > prev:
+                increase += v - prev
+            prev = v
+        self._forget_stale(cutoff)
+        return increase
+
+    def _forget_stale(self, cutoff: float) -> None:
+        for key in [k for k, t in self._last_seen.items() if t < cutoff]:
+            del self._last_seen[key]
+            self._samples.pop(key, None)
+
+    def keys(self) -> set[str]:
+        return set(self._samples)
+
+
+def _pod_key(row: dict) -> str:
+    return f"{row.get('Namespace') or ''}/{row.get('Names') or ''}"
+
+
+def _restarted_within_window(restarted_at: str) -> bool:
+    """True when the pod's last restart (``RestartedAt``, wall clock from
+    the kubelet) is inside the restart window. Unparseable / blank → False;
+    a timestamp more than ``_RST_SKEW_TOLERANCE_S`` in the future → False."""
+    if not restarted_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(restarted_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    try:
+        age = (datetime.now(ts.tzinfo) - ts).total_seconds()
+    except TypeError:
+        return False
+    return -_RST_SKEW_TOLERANCE_S <= age < _RST_WINDOW_S
+
+
+def stamp_recent_restarts(watch: CounterWatch, rows: list[dict],
+                          now: float | None = None) -> None:
+    """Record each pod's restart count and stamp ``RstRecent`` (the
+    in-window increase, floored at 1 when ``RestartedAt`` is in-window) on
+    its row. A recreated pod with a new name starts a fresh baseline; one
+    recreated under the SAME name reads as a counter reset (see
+    ``CounterWatch``)."""
+    for row in rows:
+        restarts = int(row.get("Restarts") or 0)
+        recent = watch.observe(_pod_key(row), restarts, now)
+        if recent == 0 and restarts > 0 and _restarted_within_window(
+            row.get("RestartedAt") or ""
+        ):
+            recent = 1
+        row["RstRecent"] = recent
+
+
+def _rst_verdict(recent_restarts: int, k8s_state: str = "") -> str:
+    """Classify a pod as ``red`` (flapping in the window / currently
+    broken), ``amber`` (restarted in the window, below the flap floor) or
+    ``quiet``. ``recent_restarts`` is the windowed increase
+    (``row["RstRecent"]``), not the lifetime count. Reused by
     ``render_services`` for the RST column colour and by
     ``overall_verdict`` for the header rollup."""
     # A pod sitting in a broken/waiting state (CrashLoopBackOff …) is red
-    # regardless of timestamp: ``RestartedAt`` is only populated once a
-    # restarted container is RUNNING again, so a pod stuck waiting would
-    # otherwise under-colour to amber. (Empty ``k8s_state`` never matches.)
+    # regardless of the counters: a pod stuck waiting has few observed
+    # increases. (Empty ``k8s_state`` never matches.)
     if k8s_state in _POD_RED_STATES:
         return "red"
-    if restarts <= 0:
-        return "quiet"
-    if restarts >= _RST_LIFETIME_RED:
+    if recent_restarts >= _RST_FLAP_MIN:
         return "red"
-    age = _age_seconds(restarted_at)
-    recent = age is not None and age < _RST_RECENT_S
-    if restarts >= _RST_FLAP_MIN and recent:
-        return "red"
-    return "amber"
+    if recent_restarts > 0:
+        return "amber"
+    return "quiet"
 
 
 # P0.2 — STATE column composer. The column is 16 chars wide
@@ -1721,8 +1829,10 @@ def detect_slot_info() -> tuple[str, str] | None:
         future boots will land on; differs from current during a
         TRIAL boot before spatiumddi-firstboot commits via
         grub-set-default after /health/live passes).
-    Cached for the life of the process — neither value changes at
-    runtime under normal operation."""
+    ``current`` never changes while we run, so it is cached for the life of
+    the process. ``durable`` DOES: the console starts before
+    ``spatiumddi-firstboot`` commits a trial boot with ``grub-set-default``,
+    so the 5 s data tier re-reads it via ``refresh_durable_slot()`` (#3026)."""
     cmdline = ""
     try:
         cmdline = Path("/proc/cmdline").read_text()
@@ -1790,6 +1900,20 @@ def slot_info() -> tuple[str, str] | None:
     return _SLOT_INFO_CACHE  # type: ignore[return-value]
 
 
+def refresh_durable_slot(saved_entry: str | None) -> None:
+    """#3026 — fold a freshly-read grubenv ``saved_entry`` into the cached slot
+    info. Only ``durable`` is replaced; ``current`` (the slot we booted from)
+    is static. ``None`` (grubenv unreadable) keeps the last known value so a
+    transient probe failure cannot flip the verdict; ``""`` (readable, no
+    saved_entry) is stored as-is, matching ``detect_slot_info()``."""
+    global _SLOT_INFO_CACHE
+    cached = _SLOT_INFO_CACHE
+    if cached is _UNPROBED or cached is None or saved_entry is None:
+        return
+    current, _old = cached  # type: ignore[misc]
+    _SLOT_INFO_CACHE = (current, saved_entry)
+
+
 # P0.8 — per-slot installed versions, written by ``spatium-upgrade-slot
 # sync-versions`` on every boot + at the end of every apply. On the host
 # the supervisor's ``/var/lib/spatiumddi-host/release-state/`` resolves to
@@ -1812,17 +1936,9 @@ def read_slot_versions() -> tuple[str | None, str | None]:
     return (a if isinstance(a, str) else None), (b if isinstance(b, str) else None)
 
 
-def read_grub_next_entry() -> str | None:
-    """Read grubenv's one-shot ``next_entry`` — set by
-    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
-    different slot than the durable default (a queued trial boot). Cleared
-    by grub on the next boot. ``None`` when unset / unreadable.
-
-    Unlike ``detect_slot_info()``'s ``saved_entry`` read (process-lifetime
-    cached because the slot we booted from never changes mid-run),
-    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, so this
-    must be read fresh on the 5 s data tier — never cached for the process
-    lifetime."""
+def read_grubenv() -> dict[str, str] | None:
+    """``grub-editenv list`` as a dict, or ``None`` when unreadable. One
+    subprocess — call it on the 5 s data tier only, never the render path."""
     try:
         out = subprocess.run(
             ["grub-editenv", "/boot/efi/grub/grubenv", "list"],
@@ -1831,11 +1947,26 @@ def read_grub_next_entry() -> str | None:
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired, OSError):
         return None
+    env: dict[str, str] = {}
     for line in out.splitlines():
-        if line.startswith("next_entry="):
-            val = line.split("=", 1)[1].strip()
-            return val or None
-    return None
+        key, sep, val = line.partition("=")
+        if sep:
+            env[key] = val.strip()
+    return env
+
+
+def read_grub_next_entry() -> str | None:
+    """Read grubenv's one-shot ``next_entry`` — set by
+    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
+    different slot than the durable default (a queued trial boot). Cleared
+    by grub on the next boot. ``None`` when unset / unreadable.
+
+    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, and
+    ``saved_entry`` is moved by firstboot after the console started (#3026),
+    so both are read fresh on the 5 s data tier — never cached for the
+    process lifetime."""
+    env = read_grubenv()
+    return (env.get("next_entry") or None) if env else None
 
 
 def appliance_version_string(env: dict[str, str]) -> str:
@@ -2433,10 +2564,7 @@ def _pod_sort_priority(row: dict) -> int:
     state = row.get("K8sState") or ""
     if (
         state in _POD_RED_STATES
-        or _rst_verdict(
-            int(row.get("Restarts") or 0), row.get("RestartedAt") or "", state
-        )
-        == "red"
+        or _rst_verdict(int(row.get("RstRecent") or 0), state) == "red"
     ):
         return 0
     if state in _POD_PENDING_STATES:
@@ -2607,10 +2735,9 @@ def overall_verdict(
     # concern. Name it (short name) so the chip is actionable.
     for row in visible_pods(state.ps_rows):
         k8s_state = row.get("K8sState") or ""
-        restarts = int(row.get("Restarts") or 0)
         if k8s_state in _POD_RED_STATES:
             return ("CRITICAL", f"{_short_pod_name(row.get('Names') or '')} {k8s_state}")
-        if _rst_verdict(restarts, row.get("RestartedAt") or "") == "red":
+        if _rst_verdict(int(row.get("RstRecent") or 0)) == "red":
             return ("CRITICAL", f"{_short_pod_name(row.get('Names') or '')} flapping")
     failing = list(hh.get("failing") or [])  # type: ignore[arg-type]
     if failing:
@@ -2645,8 +2772,10 @@ def overall_verdict(
     retrying = list(hh.get("retrying") or [])  # type: ignore[arg-type]
     if retrying:
         return ("DEGRADED", f"host config retrying: {retrying[0]}")
-    # Phase 2 INC 3 — etcd write failures (any node count).
-    if int(state.etcd.get("proposals_failed", 0) or 0) > 0:
+    # Phase 2 INC 3 / #2928 — etcd write failures (any node count). The
+    # counter is lifetime-monotonic, so only an INCREASE inside the window
+    # counts (the first sample is the baseline).
+    if state.etcd_failed_recent > 0:
         return ("DEGRADED", "etcd write failures")
     # Phase 2 INC 4 — /health/ready reports db/schema/redis. Only fires when
     # the fetch actually returned a non-ok status (empty dict = no api_ip /
@@ -2703,8 +2832,9 @@ def render_header(
     spinner is derived live from mono_t so its rotation animates at the
     render cadence — that's the one thing operators want jittery (visible
     "alive" indicator). The verdict title chip + border colour (P0.3) are
-    unchanged. No subprocess on this path: ``slot_info()`` is process-cached
-    and ``supervisor_watchdog_status()`` is a file-stat — both already lived
+    unchanged. No subprocess on this path: ``slot_info()`` is a memory read
+    (its durable half is refreshed on the 5 s tier) and
+    ``supervisor_watchdog_status()`` is a file-stat — both already lived
     here pre-Phase-2 and feed only the verdict roll-up.
     """
     env = state.env
@@ -3154,15 +3284,15 @@ def render_services(
             rn, rm = 0, 0
         ready_style = "dim" if (rm and rn >= rm) else "yellow"
 
-        # RESTARTS — P0.1 recency/rate gate (see ``_rst_verdict``):
-        # dim at 0, amber when restarted-but-quiet, bold red only when
-        # flapping NOW (>=3 restarts, last one <5 min ago) or past the
-        # >10 lifetime backstop. Kills the fresh-install "everything's
-        # red" false alarm.
+        # RESTARTS — #2928 windowed gate (see ``_rst_verdict``): the number
+        # shown is the lifetime total, coloured by the INCREASE in the
+        # last 15 min — dim when none, amber for 1-2, bold red for >=3.
         restarts = int(row.get("Restarts") or 0)
         restarted_at = row.get("RestartedAt") or ""
         rst_text = str(restarts) if restarts else "·"
-        rst_verdict = _rst_verdict(restarts, restarted_at, row.get("K8sState") or "")
+        rst_verdict = _rst_verdict(
+            int(row.get("RstRecent") or 0), row.get("K8sState") or ""
+        )
         rst_style = (
             "dim" if rst_verdict == "quiet"
             else "bold red" if rst_verdict == "red"
@@ -3363,11 +3493,64 @@ def reboot_pending() -> bool:
     Surfacing either warns the on-console operator that the box is about
     to go offline — and that pressing F5 lets them ack it gracefully
     rather than have the machine vanish mid-keystroke. Plain
-    ``exists()`` checks (no subprocess)."""
+    ``exists()`` checks (no subprocess).
+
+    #3008 — the fleet runner renames its trigger BEFORE its 5 s grace, and
+    the wrapper's marker only exists once the grace is over, so the grace
+    itself is the runner's own marker (``fleet_reboot_in_grace``); without
+    it F9 answered "No reboot is currently pending" and the node rebooted."""
     return (
         (_RELEASE_STATE_DIR / "reboot-pending-fleet").exists()
         or (_RELEASE_STATE_DIR / "reboot-pending").exists()
+        or fleet_reboot_in_grace()
+        or power_action_in_progress() is not None
     )
+
+
+#: #3008 — spatiumddi-reboot-agent writes "<pid> <boot_id>" here from taking
+#: the fleet trigger until it exits (its grace, then the wrapper's run).
+FLEET_GRACE_MARKER = _RELEASE_STATE_DIR / "reboot-fleet-grace"
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+
+
+def fleet_reboot_in_grace() -> bool:
+    """#3008 — True while the fleet reboot runner holds its grace marker. A
+    marker whose process is gone (a runner killed outright) or that was
+    written in another boot counts for nothing. Two small reads, no
+    subprocess."""
+    try:
+        pid, boot = FLEET_GRACE_MARKER.read_text().split()[:2]
+    except (OSError, ValueError):
+        return False
+    try:
+        current = BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        current = ""
+    if current and boot != current:
+        return False
+    return pid.isdigit() and os.path.exists(f"/proc/{pid}")
+
+
+#: #2974 — spatium-power-action writes "<pid> <action>" here while it runs
+#: (the handoff of the PostgreSQL primary, then systemctl). /run is a tmpfs.
+POWER_ACTION_MARKER = Path("/run/spatium-power-action")
+
+
+def power_action_in_progress() -> str | None:
+    """#2974 — "reboot" or "poweroff" while spatium-power-action runs (from
+    the web UI or F5 / F6), else None. The web-UI unit renames its trigger
+    before the handoff, so without this the console would show nothing
+    pending for the up to few minutes the handoff takes, and F9 would say
+    there is nothing to cancel. A marker whose process is gone (a wrapper
+    killed outright) counts as nothing under way. One small read, no
+    subprocess."""
+    try:
+        pid, action = POWER_ACTION_MARKER.read_text().split()[:2]
+    except (OSError, ValueError):
+        return None
+    if not pid.isdigit() or action not in ("reboot", "poweroff"):
+        return None
+    return action if os.path.exists(f"/proc/{pid}") else None
 
 
 def upgrade_status() -> tuple[str, str] | None:
@@ -4074,7 +4257,7 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
 # ── Phase 2 KPI ribbon (§4) ────────────────────────────────────────────
 # A row of fixed-height (3 body + 2 border = 5) stat boxes placed in the
 # ``kpi`` Layout. Every box reads state.* ONLY (the few file-stats here —
-# slot_info() process-cached, reboot_pending()/upgrade_status() stat the
+# slot_info() a memory read, reboot_pending()/upgrade_status() stat the
 # release-state dir — already rode the PHASE-1 header render path, so this
 # is no regression). Each box is rendered through ``_kpi_safe`` so a single
 # malformed value degrades to a dim "n/a" box rather than blanking the frame.
@@ -4183,8 +4366,9 @@ def render_kpi_etcd(state: "DashboardState") -> Panel:
     e = state.etcd
     has_leader = e.get("has_leader", 0) == 1
     prop_fail = int(e.get("proposals_failed", 0) or 0)
+    recent_fail = state.etcd_failed_recent
     db = float(e.get("db_in_use", 0) or 0)
-    border = "green" if (has_leader and prop_fail == 0) else "bold red"
+    border = "green" if (has_leader and recent_fail == 0) else "bold red"
     row1 = Text()
     row1.append("leader ", style="dim")
     row1.append("●", style="green") if has_leader else row1.append("NO LEADER", style="bold red")
@@ -4193,7 +4377,8 @@ def render_kpi_etcd(state: "DashboardState") -> Panel:
     row2.append_text(_heat_bar(db, 2 * 2**30, 6))
     row3 = Text()
     row3.append("prop-fail ", style="dim")
-    row3.append(str(prop_fail), style="green" if prop_fail == 0 else "bold red")
+    # Lifetime total stays visible (dim); only a recent increase alarms.
+    row3.append(str(prop_fail), style="bold red" if recent_fail else "dim")
     return _kpi_box("[bold]etcd[/bold]", [row1, row2, row3], border)
 
 
@@ -4310,6 +4495,16 @@ def render_kpi_slot(state: "DashboardState") -> Panel:
         elif step:
             t.append(f" · {step}", style="dim")
         rows.append(t)
+        border = "yellow"
+    elif (power := power_action_in_progress()) is not None:
+        # #2974 — the handoff of the PostgreSQL primary runs first (up to a
+        # few minutes on the primary's node); F9 still cancels it. #3008 — a
+        # one-node install has no primary to hand off, so it is named only on
+        # a multi-node cluster.
+        what = "REBOOT" if power == "reboot" else "POWER-OFF"
+        handoff = " — handing off DB primary" if len(state.nodes) > 1 else ""
+        rows.append(Text(f"{what} under way{handoff} · F9 cancel",
+                         style="bold bright_yellow"))
         border = "yellow"
     elif reboot_pending():
         # #556 — F5 acks (reboots now), F9 aborts the queued reboot.
@@ -4475,7 +4670,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
                             overflow=pods_overflow)
         )
         layout["log"].update(render_log(state.tail, log_h))
-        layout["footer"].update(render_footer(state.status_message, state.role))
+        layout["footer"].update(render_footer(state.status_for_draw(), state.role))
         return layout
 
     # ── WIDE / MEDIUM tree (§2) ─────────────────────────────────────────
@@ -4535,7 +4730,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # Log — full-width bottom row (§2). It absorbs the flex remainder so it
     # can never be the thing that clips.
     layout["log"].update(render_log(state.tail, log_h))
-    layout["footer"].update(render_footer(state.status_message, state.role))
+    layout["footer"].update(render_footer(state.status_for_draw(), state.role))
     return layout
 
 
@@ -4573,13 +4768,14 @@ class DashboardState:
         }
         # P0.8 — per-slot versions + grubenv next_entry. These change at
         # RUNTIME (an apply restamps versions; a Fleet trial-boot sets
-        # next_entry), so unlike slot_info()'s process-lifetime cache
+        # next_entry), so unlike the static half of slot_info()
         # they're refreshed on the 5 s data tier.
         self.slot_a_version: str | None = None
         self.slot_b_version: str | None = None
         self.slot_next_entry: str | None = None
         self.status_message = ""
         self.status_expires = 0.0
+        self.status_ttl = 0.0
         self.pending_action: str | None = None
         self.term_size = (80, 24)
         self.lock = threading.Lock()
@@ -4608,6 +4804,12 @@ class DashboardState:
         # INC 3 (etcd) + INC 4 (api/cnpg/node-parse) populate them. Adding
         # the fields now keeps the INC 2 placeholder boxes AttributeError-free.
         self.etcd: dict = {}
+        # #2928 — windowed baselines so lifetime counters don't pin the
+        # verdict. Pod restarts are stamped onto each ps_row as
+        # ``RstRecent``; etcd's is ``etcd_failed_recent``.
+        self.restart_watch = CounterWatch(_RST_WINDOW_S)
+        self.etcd_watch = CounterWatch(_ETCD_FAIL_WINDOW_S)
+        self.etcd_failed_recent: int = 0
         self.cnpg: dict = {}
         self.api_ready: dict = {}
         self.api_ip: str | None = None
@@ -4705,11 +4907,16 @@ class DashboardState:
                     else None
                 )
                 self.ps_rows = f_pods.result()
+                stamp_recent_restarts(self.restart_watch, self.ps_rows)
                 self.nodes = f_nodes.result()
                 _summary = f_summary.result()
                 _svc = f_svc.result()
                 self.k3s_state = f_k3s.result()
                 self.etcd = f_etcd.result() or self.etcd
+                if "proposals_failed" in self.etcd:
+                    self.etcd_failed_recent = self.etcd_watch.observe(
+                        "etcd", int(self.etcd["proposals_failed"] or 0)
+                    )
                 self.cp_reachable = f_cp.result() if f_cp else None
             self._set_node_pct(node_stats_from_summary(_summary))
             # INC 9 — cluster-wide Top-pods on a multi-node cluster; a
@@ -4748,7 +4955,16 @@ class DashboardState:
             # (one subprocess, fine at 5 s). Cached so the render path
             # never touches disk / grub for these runtime-changing values.
             self.slot_a_version, self.slot_b_version = read_slot_versions()
-            self.slot_next_entry = read_grub_next_entry()
+            _grub = read_grubenv()
+            self.slot_next_entry = ((_grub or {}).get("next_entry")) or None
+            # #3026 — saved_entry moves when firstboot commits a trial boot,
+            # after this process started; keep the verdict in step. A
+            # readable grubenv with no saved_entry is "no durable default"
+            # (what detect_slot_info() reports); only an UNREADABLE one
+            # (None) keeps the last value.
+            refresh_durable_slot(
+                _grub.get("saved_entry", "") if _grub is not None else None
+            )
             try:
                 self.env = read_env()
             except Exception:
@@ -4767,8 +4983,23 @@ class DashboardState:
             self.status_expires = 0.0
 
     def flash(self, msg: str, ttl: float = 3.0) -> None:
+        # #3101 — the clock starts at the first frame that draws it (see
+        # status_for_draw), not here: on a loaded node the next redraw can
+        # come several seconds later, and a flash timed from the call could
+        # expire before it was ever drawn.
         self.status_message = msg
-        self.status_expires = time.time() + ttl
+        self.status_ttl = ttl
+        self.status_expires = 0.0
+
+    def status_for_draw(self) -> str:
+        """The footer's flash text. A flash is always drawn at least once and
+        then lasts its ttl from that first draw."""
+        if self.status_message and not self.status_expires:
+            self.status_expires = time.time() + self.status_ttl
+        elif self.status_expires and time.time() > self.status_expires:
+            self.status_message = ""
+            self.status_expires = 0.0
+        return self.status_message
 
     def set_action(self, action: str) -> None:
         with self.lock:
@@ -4923,56 +5154,144 @@ def do_login(tty_path: str) -> None:
         os.execvp("login", ["login"])
 
 
-def do_reboot(console: Console) -> None:
+# #2974 — reboot / poweroff go through one wrapper, spatium-power-action,
+# that hands the PostgreSQL primary off to another node first (as the web-UI
+# and Fleet reboots do). It runs as a systemd unit, started without waiting:
+# the handoff can take a few minutes, during which the dashboard keeps
+# rendering (the banner shows it under way, F9 cancels it), and the run
+# belongs to systemd, so a console restart cannot kill it mid-handoff and
+# leave the node cordoned with no reboot.
+POWER_ACTION_UNIT = "spatium-power-action@{}.service"
+
+
+def _start_power_action(console: Console, state: "DashboardState | None", action: str,
+                        label: str) -> None:
+    unit = POWER_ACTION_UNIT.format(action)
+    try:
+        res = subprocess.run(["systemctl", "start", "--no-block", unit],
+                             capture_output=True, text=True, timeout=15,
+                             check=False)
+        ok, why = res.returncode == 0, (res.stderr or res.stdout).strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        ok, why = False, str(exc)
+    if ok:
+        # #3008 — the handoff runs only on a multi-node control plane (and
+        # there only on the node holding the primary); a one-node install
+        # has no primary to hand off.
+        if state is not None and len(state.nodes) > 1:
+            msg = (f"{label}: the database primary is handed off first if this "
+                   "node holds it (up to a few minutes) · F9 cancels")
+        else:
+            msg = f"{label} · F9 cancels"
+    else:
+        msg = f"{label} could not be started: {why.splitlines()[-1] if why else 'no output'}"
+    if state is not None:
+        state.flash(msg, ttl=20 if ok else 10)
+    else:
+        console.print(f"\n\n[bold yellow]{msg}[/bold yellow]\n")
+
+
+def do_reboot(console: Console, state: "DashboardState | None" = None) -> None:
     if confirm_modal(console, "Reboot the appliance now?"):
-        console.clear()
-        console.print("\n\n[bold yellow]Rebooting…[/bold yellow]\n")
-        subprocess.run(["systemctl", "reboot"], check=False)
+        _start_power_action(console, state, "reboot", "Rebooting")
 
 
-def do_shutdown(console: Console) -> None:
+def do_shutdown(console: Console, state: "DashboardState | None" = None) -> None:
     if confirm_modal(console, "Power off the appliance now?"):
-        console.clear()
-        console.print("\n\n[bold yellow]Powering off…[/bold yellow]\n")
-        subprocess.run(["systemctl", "poweroff"], check=False)
+        _start_power_action(console, state, "poweroff", "Powering off")
 
 
-def do_cancel_reboot(console: Console) -> None:
+#: #3008 — "<boot_id>" of the boot a reboot was cancelled in. The supervisor
+#: reports it on its next heartbeat, so the control plane retires the Fleet
+#: request (``reboot_requested``) at once instead of at its 900 s give-up, and
+#: then empties it. Written under a fresh name and renamed into place: the api
+#: and the supervisor can create names in this directory and this runs as root.
+#: Published 0660 to the directory's shared gid: the directory is sticky, so the
+#: unprivileged supervisor can never unlink a root-owned file in it, only
+#: truncate one it may write — without that the marker outlived its ack and was
+#: reported on every heartbeat for the rest of the boot.
+REBOOT_CANCEL_MARKER = _RELEASE_STATE_DIR / "reboot-cancelled"
+
+
+def _record_reboot_cancel() -> None:
+    try:
+        boot = BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        return
+    if not boot:
+        return
+    tmp = REBOOT_CANCEL_MARKER.with_name(f".reboot-cancelled.{os.getpid()}")
+    try:
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            os.fchown(fh.fileno(), -1, _RELEASE_STATE_DIR.stat().st_gid)
+            os.fchmod(fh.fileno(), 0o660)
+            fh.write(boot + "\n")
+        os.replace(tmp, REBOOT_CANCEL_MARKER)
+    except OSError:
+        # Best effort: without it the control plane retires the request on
+        # its own give-up, as before.
+        try:
+            tmp.unlink()
+        except OSError:
+            # The temp file may never have been created; nothing to clean up.
+            pass
+
+
+def do_cancel_reboot(console: Console, state: "DashboardState | None" = None) -> None:
     """#556 — abort a queued reboot from the physical console.
 
     A queued reboot runs a systemd service that *sleeps* for a grace
     window before ``systemctl reboot`` — 10 s for the web-UI path
     (``spatiumddi-reboot.service``, which sleeps then renames the
     trigger, so ``reboot-pending`` stays visible for the whole window)
-    and 5 s for the fleet path (``spatiumddi-reboot-agent.service``).
+    and 5 s for the fleet path (``spatiumddi-reboot-agent.service``, which
+    renames its trigger first and holds ``reboot-fleet-grace`` instead, #3008).
     Cancelling = ``systemctl stop`` that service mid-grace (kills the
     sleep before the reboot ExecStart) + remove the trigger so the edge-
     triggered ``.path`` unit has nothing to re-fire on.
 
-    Best-effort: if the grace already elapsed there's nothing to stop and
-    the box reboots anyway — same as before this key existed. Stopping an
-    inactive unit is a harmless no-op."""
+    #2974 — the web-UI unit, the fleet unit (#3008) and the console's
+    F5 / F6 unit then hand the PostgreSQL primary off before
+    ``systemctl reboot`` (up to a few minutes); stopping them during that
+    makes ``spatium-power-action`` undo the handoff's cordon, and nothing
+    reboots.
+
+    Best-effort: if ``systemctl reboot`` has already been issued there's
+    nothing to stop and the box reboots anyway — same as before this key
+    existed. Stopping an inactive unit is a harmless no-op."""
     if not reboot_pending():
         console.clear()
         console.print("\n\n[dim]No reboot is currently pending.[/dim]\n")
         time.sleep(1.5)
         return
-    if not confirm_modal(console, "Cancel the pending reboot?"):
+    # #3101 — name what is actually pending; only a console / web-UI power
+    # run (the marker) can be a power-off.
+    noun = "power-off" if power_action_in_progress() == "poweroff" else "reboot"
+    if not confirm_modal(console, f"Cancel the pending {noun}?"):
         return
     console.clear()
-    console.print("\n\n[bold yellow]Cancelling pending reboot…[/bold yellow]\n")
+    console.print(f"\n\n[bold yellow]Cancelling pending {noun}…[/bold yellow]\n")
     # Stop both reboot services — one owns the web-UI path, the other the
     # fleet path; only one is active, and stopping the idle one is a no-op.
+    # #2974 — and the console's own F5 / F6 runs; stopping one mid-handoff
+    # makes spatium-power-action undo the handoff's cordon.
     subprocess.run(
         ["systemctl", "stop",
-         "spatiumddi-reboot.service", "spatiumddi-reboot-agent.service"],
+         "spatiumddi-reboot.service", "spatiumddi-reboot-agent.service",
+         POWER_ACTION_UNIT.format("reboot"), POWER_ACTION_UNIT.format("poweroff")],
         check=False,
     )
     # Remove the trigger(s) so reboot_pending() clears and the .path units
     # (edge-triggered on PathChanged, not level-triggered) have nothing to
     # re-fire on. The services rename the trigger to .done as part of their
     # run; unlink the live form if the service was stopped before it did.
-    for name in ("reboot-pending", "reboot-pending-fleet"):
+    # #3008 — and the fleet runner's grace marker, which the runner removes
+    # itself when stopped; this covers one that was killed outright. The
+    # supervisor writes a fleet trigger at most once per boot (#1446), so a
+    # cancelled Fleet reboot is not fired again before the next boot.
+    for name in ("reboot-pending", "reboot-pending-fleet", "reboot-fleet-grace"):
         try:
             (_RELEASE_STATE_DIR / name).unlink()
         except FileNotFoundError:
@@ -4983,7 +5302,12 @@ def do_cancel_reboot(console: Console) -> None:
             # Non-fatal — the service is already stopped, so the reboot is
             # cancelled regardless of whether the trigger file lingers.
             console.print(f"[dim](left {name}: {exc})[/dim]")
-    console.print("[green]Reboot cancelled.[/green]\n")
+    _record_reboot_cancel()
+    console.print(f"[green]{noun.capitalize()} cancelled.[/green]\n")
+    if state is not None:
+        # F5 / F6 set a 20 s "Rebooting · F9 cancels" flash; without this it
+        # outlived the cancel and the footer went on announcing the reboot.
+        state.flash(f"{noun.capitalize()} cancelled", ttl=5)
     time.sleep(1.5)
 
 
@@ -5618,11 +5942,15 @@ def _render_health_screen(
         reason = r.get("LastExitReason") or ""
         code = r.get("LastExitCode")
         le = (reason + (f" ({code})" if code not in (None, "") else "")) or "—"
-        ststyle = "bold red" if st8 in _POD_RED_STATES else ("yellow" if rc else "dim")
+        # #2928 — colour by the WINDOWED increase, like the Pods panel: the
+        # lifetime count is listed (dim when quiet) but never alarms alone.
+        rv = _rst_verdict(int(r.get("RstRecent") or 0), st8)
+        rst_style = "bold red" if rv == "red" else ("yellow" if rv == "amber" else "dim")
+        ststyle = "bold red" if st8 in _POD_RED_STATES else rst_style
         pods_tbl.add_row(
             Text(_short_pod_name(r.get("Names") or "")[:30]),
             Text(st8, style=ststyle),
-            Text(str(rc), style="yellow" if rc else "dim"),
+            Text(str(rc), style=rst_style),
             Text(le, style="dim"),
         )
     console.print(Panel(
@@ -6139,11 +6467,11 @@ def main() -> int:
                                     _prepare_tty_for_subprocess(args.tty)
                                     do_login(args.tty)  # noreturn
                                 elif action == "reboot":
-                                    do_reboot(console)
+                                    do_reboot(console, state)
                                 elif action == "shutdown":
-                                    do_shutdown(console)
+                                    do_shutdown(console, state)
                                 elif action == "cancel_reboot":
-                                    do_cancel_reboot(console)
+                                    do_cancel_reboot(console, state)
                                 elif action == "monitor":
                                     do_monitor(console, args.tty)
                                 elif action == "containers":

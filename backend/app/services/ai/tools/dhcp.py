@@ -30,6 +30,7 @@ from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.normalize import canonical_duid
@@ -46,7 +47,9 @@ class ListDHCPServersArgs(BaseModel):
     permission=("read", "dhcp_server"),
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, driver, operational status, and HA state. "
+        "includes name, group, driver, operational status, HA state, and "
+        "whether two agent processes are polling as it at once "
+        "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
         "and DHCPv6 scopes on an HA group are served by each member "
         "independently, with no lease coordination."
@@ -80,6 +83,10 @@ async def list_dhcp_servers(
             "driver": s.driver,
             "status": s.status,
             "ha_state": s.ha_state,
+            # #3143 — a second live agent process polls as this server and is
+            # being refused (the one the row's alert and chip read).
+            "duplicate_agent": duplicate_agent_active(s),
+            "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
         }
         for s in rows
     ]
@@ -999,10 +1006,13 @@ class FindDHCPServerStatsArgs(BaseModel):
         "window. Use for 'how busy is server X?' and 'is server X dropping "
         "packets?'. socket_drop counts packets the kernel dropped before the "
         "server could read them (its receive buffer filled — the node is "
-        "short of CPU); receive_drop counts packets the server read and then "
-        "discarded. Either may be null, meaning the agent did not measure it "
-        "(too old, or cannot read /proc/net/udp) — null is NOT zero, and must "
-        "not be reported as 'no packets were dropped'."
+        "short of CPU); queue_evicted counts DHCPv4 requests the server read "
+        "and then discarded from its full packet queue during a burst, which "
+        "no server-side counter records; receive_drop counts packets the "
+        "server read and then discarded. Any may be null, meaning the agent "
+        "did not measure it (too old, no raw-socket capability, a v6-only "
+        "server) — null is NOT zero, and must not be reported as 'no packets "
+        "were dropped'."
     ),
     args_model=FindDHCPServerStatsArgs,
     category="dhcp",
@@ -1049,6 +1059,7 @@ async def find_dhcp_server_stats(
                 # null rather than as a zero it would summarise as healthy.
                 func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
                 func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+                func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
             )
             .where(DHCPMetricSample.server_id == sid)
             .where(DHCPMetricSample.bucket_at >= since)
@@ -1081,13 +1092,22 @@ async def find_dhcp_server_stats(
             "socket_drop": (
                 None if totals_row.socket_drop is None else int(totals_row.socket_drop)
             ),
+            # #2889 — its own null: measured independently of socket_drop
+            # (it needs a raw socket and a kea-dhcp4), so ``measured`` above
+            # does not vouch for it.
+            "queue_evicted": (
+                None if totals_row.queue_evicted is None else int(totals_row.queue_evicted)
+            ),
             "receive_drop": (
                 None if totals_row.receive_drop is None else int(totals_row.receive_drop)
             ),
             "measured": totals_row.socket_drop is not None,
             "note": (
-                "socket_drop is lost traffic; receive_drop also counts deliberate "
-                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a fault"
+                "socket_drop and queue_evicted are lost traffic (the kernel "
+                "dropped it before the server read it; the server read it and "
+                "its full queue evicted it). receive_drop also counts deliberate "
+                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a "
+                "fault"
             ),
         },
     }

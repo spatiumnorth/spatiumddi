@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.models.change_request import ChangeRequest
+from app.services.ai.operations import unreadable_target_detail
 from app.services.approvals.service import create_change_request
 from app.services.requests.catalog import resolve_operation
 
@@ -91,6 +92,15 @@ async def submit_request(
             detail=f"Invalid request payload — {problems}",
         ) from exc
 
+    # The requester must be able to READ every resource the payload names
+    # (the same per-resource check the request form's picker applies). One
+    # they cannot read is answered exactly like an id that does not exist, so
+    # submitting is no way to learn what a resource is called, or that it
+    # exists. Superadmin reads everything.
+    hidden = unreadable_target_detail(user, op, parsed)
+    if hidden is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=hidden)
+
     # Run the operation's read-only preview under the REQUESTER's identity.
     # Two things fall out of that: the approver gets a concrete description of
     # what approving will do, and the request is implicitly scoped to what the
@@ -102,6 +112,13 @@ async def submit_request(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=preview.detail,
         )
+
+    # Refuse what the REST create would refuse (#2903): the preview is shared
+    # with the copilot and only hints at conflicts, so the portal runs the
+    # operation's own submit check, whose 4xx reaches the requester as-is and
+    # queues nothing.
+    if op.validate_submit is not None:
+        await op.validate_submit(db, user, parsed)
 
     # Length is enforced HERE rather than only on the request schema so every
     # caller gets the same rule + the same readable message — the HTTP body

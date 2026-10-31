@@ -23,10 +23,9 @@ const PAGE_SIZE = 200;
 // operator knows to run it again for the remainder.
 const BULK_CAP = 5000;
 
-// The route's own coarse gate (#2521): write on any of the IPAM resource
-// types. A hand-picked or all-matching deprecate rewrites address rows.
-const DEPRECATE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
-const DEPRECATE_DENIED = "Requires write permission on IPAM addresses";
+// The route's gate (#2521, #3058): write on subnets, which own the address
+// rows a hand-picked or all-matching deprecate rewrites.
+const DEPRECATE_DENIED = "Requires write permission on subnets";
 
 const inputCls =
   "rounded-md border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring";
@@ -42,7 +41,7 @@ export function StaleIPReportPage() {
   const qc = useQueryClient();
   const perms = usePermissions();
   const deprecateGate = permissionGate(
-    DEPRECATE_TYPES.some((t) => perms.can("write", t)),
+    perms.can("write", "subnet"),
     DEPRECATE_DENIED,
   );
   const [staleDays, setStaleDays] = useState(90);

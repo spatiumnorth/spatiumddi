@@ -154,7 +154,8 @@ docs/PRIVACY.md
 # the application root rather than under /api/, so without one it falls through
 # to the SPA `location /` and a PBX asking where a phone is gets index.html
 # with a 200 — unreachable in production while every backend test passes.
-# Editing either must therefore run the suite that contains that assertion.
+# `test_acme_client.py` (#3061) asserts the same of the ACME http-01 challenge
+# location. Editing either must therefore run the suite that contains that assertion.
 frontend/default.conf.template
 
 # test_frontend_proxy_trust.py (#1868) executes the FRONTEND_TRUSTED_PROXY_CIDRS renderer
@@ -162,6 +163,8 @@ frontend/default.conf.template
 # templates goes through the trust map rather than overwriting an outer
 # proxy's value with $scheme.
 frontend/16-trusted-proxies.envsh
+# test_frontend_ipv6_2308.py (#2308) executes the IPv6 renderer the same templates use.
+frontend/17-ipv6.envsh
 charts/spatiumddi/templates/frontend-tls-config.yaml
 
 # test_ipam_bulk_allocate_template_vectors_2071.py (#2071) runs the server's
@@ -169,6 +172,12 @@ charts/spatiumddi/templates/frontend-tls-config.yaml
 # tested against; editing them must run the backend half, or the two sides
 # could disagree with only the frontend job noticing.
 frontend/src/lib/bulk-allocate-template.vectors.json
+
+# test_grant_vocabulary_covers_routes_3119.py (#3119) checks that the grant
+# vocabulary the role editor offers holds every resource type the routes,
+# copilot tools and search providers check. Dropping a type there is a
+# frontend-only edit, so without this the backend half would not run on it.
+frontend/src/lib/permissionVocabulary.ts
 
 # test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
 # watcher, and checks the Dockerfile copies it in and the chart's frontend
@@ -182,3 +191,11 @@ charts/spatiumddi/templates/frontend.yaml
 # broker grace that stays bounded, and the two must agree.
 charts/spatiumddi/templates/worker.yaml
 k8s/base/worker.yaml
+
+# test_api_graceful_shutdown.py (#2944) pins uvicorn's graceful-shutdown
+# timeout below every grace period that stops the api: the manifests, the chart
+# template and the compose files.
+charts/spatiumddi/templates/api.yaml
+k8s/base/api.yaml
+docker-compose.yml
+docker-compose.dev.yml

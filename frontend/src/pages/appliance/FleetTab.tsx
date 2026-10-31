@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -785,6 +786,13 @@ export function FleetTab({
     staleTime: 60_000,
   });
   const isSuperadmin = me?.is_superadmin ?? false;
+  // #3067 — the certificate store is the one Fleet section a non-superadmin
+  // can use: its routes take `certificate_store` (or the `appliance` read
+  // they took before), so a DNS Editor managing DoT / DoH / DoQ certs lands
+  // here from the DNS options card's link.
+  const { can } = usePermissions();
+  const canReadCertStore =
+    can("read", "certificate_store") || can("read", "appliance");
 
   const { data, isLoading, isFetching, refetch, error } = useQuery({
     queryKey: ["appliance", "fleet"],
@@ -957,8 +965,13 @@ export function FleetTab({
         response?: { status?: number; data?: { detail?: string } };
       };
       if (e?.response?.status === 403) {
+        // The response alone, so a 403 without a detail still says why
+        // instead of axios's "Request failed with status code 403".
         setDeletePwError(
-          e.response.data?.detail || "Current password incorrect.",
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setDeletePwError("Delete failed. Try again.");
@@ -1007,7 +1020,10 @@ export function FleetTab({
       };
       if (e?.response?.status === 403) {
         setPermanentDeletePwError(
-          e.response.data?.detail || "Current password incorrect.",
+          formatApiError(
+            { response: e.response },
+            "Current password incorrect.",
+          ),
         );
       } else {
         setPermanentDeletePwError("Permanent delete failed. Try again.");
@@ -1057,7 +1073,7 @@ export function FleetTab({
 
   if (!isSuperadmin) {
     return (
-      <div className="mx-auto max-w-4xl">
+      <div className="mx-auto max-w-4xl space-y-6">
         <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
           <div className="flex items-start gap-2">
             <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700 dark:text-amber-400" />
@@ -1074,6 +1090,7 @@ export function FleetTab({
             </div>
           </div>
         </div>
+        {canReadCertStore && <CertificatesTab />}
       </div>
     );
   }
@@ -1136,17 +1153,16 @@ export function FleetTab({
           summary: "GitHub import or air-gap .raw.xz upload.",
         },
         // #404 — Web UI Certificate moved here from a top-level tab.
-        // Appliance-host only (a docker/k8s control plane has no local cert
-        // to manage).
-        ...(isApplianceHost
-          ? [
-              {
-                key: "web-ui-certificate" as const,
-                label: "Web UI Certificate",
-                summary: "TLS upload / CSR / Let's Encrypt.",
-              },
-            ]
-          : []),
+        // #3061 — the certificate store is on every install type (DoT / DoH
+        // pick from it); only the Web UI activation is appliance-specific, so
+        // off-appliance the entry is the store-only view.
+        {
+          key: "web-ui-certificate" as const,
+          label: isApplianceHost ? "Web UI Certificate" : "TLS certificates",
+          summary: isApplianceHost
+            ? "TLS upload / CSR / Let's Encrypt."
+            : "Certificate store: upload / CSR / Let's Encrypt.",
+        },
       ],
     },
     {
@@ -1297,9 +1313,7 @@ export function FleetTab({
           )}
 
           {/* #404 — Web UI Certificate, moved from a top-level tab. */}
-          {view === "web-ui-certificate" && isApplianceHost && (
-            <CertificatesTab />
-          )}
+          {view === "web-ui-certificate" && <CertificatesTab />}
 
           {view === "lldp" && (
             <div>
@@ -3188,8 +3202,7 @@ function StorageActionModal({
       // The FastAPI detail, not axios's "Request failed with status code
       // 422" — which is what `err.message` always is and never what the
       // operator needs (the #1009 lesson).
-      const ax = e as { response?: { data?: { detail?: string } } };
-      setError(ax.response?.data?.detail ?? "The action could not be run.");
+      setError(formatApiError(e, "The action could not be run."));
     },
   });
 
@@ -3396,9 +3409,7 @@ function MountDiskModal({
       // Matched on the FastAPI detail, never on err.message — on an
       // AxiosError that is always "Request failed with status code 422"
       // and never the reason (#1009).
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
-      setError(detail ?? "Could not mount the disk.");
+      setError(formatApiError(err, "Could not mount the disk."));
     },
   });
 
@@ -3508,10 +3519,11 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
     // never on err.message, which on an AxiosError is always "Request
     // failed with status code N" (#1009).
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
-        ?.response?.data?.detail;
       setEjectError(
-        detail ?? "Could not eject the disk. It may still be mounted.",
+        formatApiError(
+          err,
+          "Could not eject the disk. It may still be mounted.",
+        ),
       );
     },
   });

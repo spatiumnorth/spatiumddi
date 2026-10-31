@@ -8,7 +8,10 @@
 ## Prerequisites
 
 - Docker Engine 25+ and Docker Compose v2.20+
-- 2 GB RAM minimum (4 GB recommended)
+- 2 vCPU and 4 GiB RAM minimum, 4 vCPU and 8 GiB recommended. The containers
+  held 1.3 GiB at rest and at most 1.65 GiB under light load, and the host with
+  its OS used at most 2.2 GiB (measured on amd64; arm64 alike); the
+  recommendation is derived: see [`SIZING.md`](SIZING.md#docker-compose)
 - Ports 8077 (frontend, `HTTP_PORT`) and optionally 8000 (API direct access, `API_PORT`) free on the host
 
 ---
@@ -402,7 +405,7 @@ docker compose -f docker-compose.agent-dhcp.yml up -d
 docker compose -f docker-compose.agent-dhcp.yml --profile dhcp-ha up -d
 ```
 
-For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` to **its own** HA listener URL (`http://<that VM's address>:8000/`). Each server's URL goes into every peer's `peers` list, which is how the partner reaches it. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
+For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` (only appliance-hosted members are ever filled automatically) to **its own** HA listener URL (`http://<that VM's address>:8000/`). Each server's URL goes into every peer's `peers` list, which is how the partner reaches it. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
 
 #### Optional: passive DHCP fingerprinting
 

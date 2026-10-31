@@ -8,7 +8,15 @@ metadata:
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
+  {{- /* #3111: while the autoscaler is on (the default) it alone sets the count.
+         Helm 4 applies server-side, and a rendered count made helm an owner of
+         the field the autoscaler writes through the scale subresource: once it
+         had scaled, every helm upgrade failed on .spec.replicas (and under Helm
+         3 each upgrade reset the count to api.replicas). With the autoscaler off
+         (the appliance) helm sets it from api.replicas, as before. */}}
+  {{- if not .Values.api.autoscaling.enabled }}
   replicas: {{ .Values.api.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
@@ -42,6 +50,8 @@ spec:
           - {{ .Values.api.applianceHostMounts.hostGroupGid }}
         {{- end }}
       {{- end }}
+      # #2944 — the image's uvicorn runs --timeout-graceful-shutdown 20, below
+      # this, so lifespan shutdown (engine dispose) runs before the SIGKILL.
       terminationGracePeriodSeconds: 30
       {{- if .Values.api.serviceAccount.enabled }}
       # Phase 11 wave 4 (#183) — the api uses kubeapi for two things
@@ -369,10 +379,15 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+    {{- /* #3110: memory only when asked for. A process's memory does not fall as
+           replicas are added, so a passed memory target holds the autoscaler at
+           maxReplicas (see api.autoscaling in values.yaml). */}}
+    {{- with .Values.api.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: {{ .Values.api.autoscaling.targetMemoryUtilizationPercentage }}
+          averageUtilization: {{ . }}
+    {{- end }}
 {{- end }}

@@ -25,6 +25,8 @@ from .commit import (
     CommitScopeResult,
     commit_import,
     detect_conflicts,
+    drop_invalid_pools,
+    drop_unservable_hostnames,
 )
 from .isc_dhcp_parser import IscImportError, parse_isc_config
 from .kea_parser import KeaImportError, parse_kea_config
@@ -46,6 +48,8 @@ __all__ = [
     "WindowsDHCPImportError",
     "commit_import",
     "detect_conflicts",
+    "drop_invalid_pools",
+    "drop_unservable_hostnames",
     "parse_isc_config",
     "parse_kea_config",
     "parse_windows_dhcp_server",

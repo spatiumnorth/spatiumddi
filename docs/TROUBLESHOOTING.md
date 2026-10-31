@@ -302,7 +302,8 @@ permanent (hard) delete path, which refuses unless you either:
   WinRM remove-scope, agent-based Kea gets its bundle ETag bumped — so
   no lease is orphaned on a running server.
 
-System placeholder rows (the `.0` network and `.255` broadcast) and
+System placeholder rows (the `.0` network and `.255` broadcast, and the reserved
+"Gateway" row while it is still untouched) and
 DHCP-lease mirrored rows (`auto_from_lease=True`) do **not** count as
 blockers — they're cleaned up automatically on delete.
 

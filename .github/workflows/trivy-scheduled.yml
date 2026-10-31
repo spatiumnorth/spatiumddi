@@ -66,7 +66,7 @@ jobs:
 
           # One spec per shipped image: name|dockerfile|context|target
           # Contexts mirror release.yml: the agent images build from the repo
-          # root, backend from ./backend, frontend from ./frontend. Targets:
+          # root (the frontend too, #2895), backend from ./backend. Targets:
           # backend is pinned to ``runtime`` — the documented production stage
           # (backend/Dockerfile); its final ``dev`` stage only layers test
           # tooling on top, which we don't ship-scan. frontend's last stage is
@@ -82,7 +82,7 @@ jobs:
             "supervisor|agent/supervisor/images/supervisor/Dockerfile|.|"
             "looking-glass|agent/looking-glass/images/gobgp/Dockerfile|.|"
             "backend|backend/Dockerfile|./backend|runtime"
-            "frontend|frontend/Dockerfile|./frontend|"
+            "frontend|frontend/Dockerfile|.|"
           )
 
           # Shared Trivy cache so the vuln DB downloads once for the whole

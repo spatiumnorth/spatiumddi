@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { humanTime } from "../network/_shared";
 import { primaryNsError } from "@/lib/primary-ns";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import {
@@ -80,6 +80,8 @@ import {
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -101,7 +103,9 @@ import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   applianceTlsApi,
+  versionApi,
   dnsApi,
+  settingsApi,
   dnsBlocklistApi,
   ipamApi,
   domainsApi,
@@ -126,6 +130,7 @@ import {
   type DNSGroupSyncResult,
   type ResolverPreset,
 } from "@/lib/api";
+import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   DNS_TTL_MAX,
@@ -170,15 +175,13 @@ import {
 } from "@/lib/approvalQueue";
 
 // #1338 — a read-only user is offered no DNS write it would be refused.
-// The DNS router admits a write (a delete) on any of its three resource
-// types (dns/router.py, ``require_any_resource_permission``); record writes
-// need nothing more. #1861 — zone writes also take ``dns_zone``, view and
-// ACL writes ``dns_group``, a zone-file import ``dns_record``, and blocklist
-// entry / exception writes ``dns_blocklist``, each with the HTTP method's
-// action (``delete`` for a delete). Server groups, servers, server options,
-// TSIG keys, DNSSEC, dynamic-update ACLs, zone moves, blocklist
-// subscriptions and pools stay superadmin-only. The controls ask the same.
-const DNS_RESOURCES = ["dns_group", "dns_zone", "dns_record"];
+// Each DNS route needs the HTTP method's action on the type it serves
+// (dns/router.py ``_DNS_ROUTE_TYPES``, #3073): record writes ``dns_record``,
+// zone writes ``dns_zone``, view and ACL writes ``dns_group`` (#1861), and
+// blocklist entry / exception writes ``dns_blocklist`` (``delete`` for a
+// delete). Server groups, servers, server options, TSIG keys, DNSSEC,
+// dynamic-update ACLs, zone moves, blocklist subscriptions and pools stay
+// superadmin-only. The controls ask the same.
 const NEEDS_DNS_WRITE = "Requires write permission on DNS records";
 const NEEDS_DNS_DELETE = "Requires delete permission on DNS records";
 const NEEDS_RECORD_WRITE = NEEDS_DNS_WRITE;
@@ -194,8 +197,8 @@ function useDnsGrants() {
   return {
     isSuperadmin: perms.isSuperadmin,
     can: perms.can,
-    canWriteRecords: DNS_RESOURCES.some((t) => perms.can("write", t)),
-    canDeleteRecords: DNS_RESOURCES.some((t) => perms.can("delete", t)),
+    canWriteRecords: perms.can("write", "dns_record"),
+    canDeleteRecords: perms.can("delete", "dns_record"),
   };
 }
 
@@ -634,7 +637,7 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
  *  never sends a delete it knows will be refused. The server's refusal stays
  *  the backstop and its reason shows in the dialog. What a delete still takes
  *  is the group's zones already in Trash, for good. */
-function DeleteDNSGroupModal({
+export function DeleteDNSGroupModal({
   group,
   onConfirm,
   onClose,
@@ -657,6 +660,36 @@ function DeleteDNSGroupModal({
     queryKey: ["dns-zones", group.id],
     queryFn: () => dnsApi.listZones(group.id),
   });
+  // What else a delete destroys (#3112): the group's views, ACLs and TSIG keys
+  // go with it by FK cascade and none of it goes to Trash. Counted from the
+  // lists the group's tabs already read; one that fails to load is named
+  // without a number.
+  const configQs = [
+    {
+      one: "view",
+      many: "views",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "views", group.id],
+        queryFn: () => dnsApi.listViews(group.id),
+      }),
+    },
+    {
+      one: "ACL",
+      many: "ACLs",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "acls", group.id],
+        queryFn: () => dnsApi.listAcls(group.id),
+      }),
+    },
+    {
+      one: "TSIG key",
+      many: "TSIG keys",
+      q: useQuery({
+        queryKey: ["dns-group-delete-count", "tsig-keys", group.id],
+        queryFn: () => dnsApi.listTSIGKeys(group.id),
+      }),
+    },
+  ];
   const title = "Delete Server Group";
 
   if (serversQ.isPending || zonesQ.isPending) {
@@ -699,11 +732,33 @@ function DeleteDNSGroupModal({
       </Modal>
     );
   }
+  // Only the delete path needs the configuration counts.
+  if (configQs.some(({ q }) => q.isPending)) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" holds…
+        </p>
+      </Modal>
+    );
+  }
+  const held = configQs
+    .map(({ one, many, q }) => ({ one, many, count: q.data?.length ?? null }))
+    .filter((k) => k.count === null || k.count > 0)
+    .map((k) =>
+      k.count === null
+        ? `its ${k.many}`
+        : `${k.count} ${k.count === 1 ? k.one : k.many}`,
+    );
+  const config =
+    held.length > 0
+      ? ` The group's own configuration is deleted with it, none of it into Trash: ${held.join(", ")}.`
+      : "";
   return (
     <ConfirmDestroyModal
       title={title}
-      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records, and can no longer be restored.`}
-      checkLabel={`I understand the group "${group.name}" and its zones in Trash will be deleted for good.`}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records and pools, and can no longer be restored.${config} Its server options go too. None of this can be restored.`}
+      checkLabel={`I understand the group "${group.name}", its zones in Trash and its views, ACLs, TSIG keys and options will be deleted for good.`}
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
@@ -1098,7 +1153,7 @@ function patchCachedRow(
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
-function GroupModal({
+export function GroupModal({
   group,
   onClose,
 }: {
@@ -1109,7 +1164,21 @@ function GroupModal({
   const [name, setName] = useState(group?.name ?? "");
   const [description, setDescription] = useState(group?.description ?? "");
   const [groupType, setGroupType] = useState(group?.group_type ?? "internal");
-  const [isRecursive, setIsRecursive] = useState(group?.is_recursive ?? true);
+  // #3087 — a new group starts from Settings → DNS "Recursive by Default"
+  // until the operator ticks the box; an existing group shows its own value.
+  const { data: dnsDefaults } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    enabled: !group,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const [pickedRecursive, setPickedRecursive] = useState<boolean | null>(
+    group?.is_recursive ?? null,
+  );
+  const isRecursive =
+    pickedRecursive ?? dnsDefaults?.dns_recursive_by_default ?? true;
+  const setIsRecursive = (v: boolean) => setPickedRecursive(v);
   // BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
   // ≥2-server BIND9 groups, and BIND 9.18+ is required.
   const [catalogZonesEnabled, setCatalogZonesEnabled] = useState(
@@ -1720,10 +1789,11 @@ export function ServerModal({
             <code className="rounded bg-emerald-500/20 px-1">
               ghcr.io/spatiumnorth/dns-technitium
             </code>{" "}
-            container alongside this server. v1 supports primary zones +
-            standard record types; DNSSEC, native DoT/DoH/DoQ listeners, and
-            secondary zones are on the roadmap. The agent provisions and rotates
-            its own API token automatically — leave the field below blank.
+            container alongside this server. Serves primary, secondary, stub and
+            forward zones, and native DoT, DoH and DoQ listeners (set from the
+            group&apos;s Options). DNSSEC signing is BIND9 and PowerDNS only.
+            The agent provisions and rotates its own API token automatically —
+            leave the field below blank.
           </div>
         )}
         {driver === "technitium_api" && (
@@ -2640,7 +2710,47 @@ export function ZoneModal({
     // Once, on open: later renders must not move a caret the operator placed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
+  // #1784 — the experimental agentless Technitium driver writes only the
+  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
+  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
+  // when the group list is already loaded.
+  const { data: groupList } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+    staleTime: 30_000,
+  });
+  const groupDrivers =
+    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
+  const technitiumApi = groupDrivers.includes("technitium_api");
+  // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
+  // Default Zone TTL) until the operator changes them. An existing zone
+  // shows its own values. The settings read is best-effort: a role that
+  // may not read Settings keeps the built-in "primary" / 3600.
+  const { data: dnsDefaults } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    enabled: !zone,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const [pickedZoneType, setPickedZoneType] = useState<string | null>(
+    zone?.zone_type ?? null,
+  );
+  const [pickedTtl, setPickedTtl] = useState<string | null>(
+    zone ? String(zone.ttl ?? 3600) : null,
+  );
+  // The agentless Technitium driver applies only a Primary zone at the
+  // stock TTL (above), so a stored default it would refuse is not offered.
+  const zoneType =
+    pickedZoneType ??
+    (technitiumApi
+      ? "primary"
+      : (dnsDefaults?.dns_default_zone_type ?? "primary"));
+  const setZoneType = setPickedZoneType;
+  const ttl =
+    pickedTtl ??
+    String(technitiumApi ? 3600 : (dnsDefaults?.dns_default_ttl ?? 3600));
+  const setTtl = setPickedTtl;
   // #1310 — on create, a primary zone's Kind follows its name until the
   // operator picks one. A name under in-addr.arpa / ip6.arpa is a
   // reverse-lookup zone, and IPAM publishes PTR records only into kind
@@ -2656,23 +2766,10 @@ export function ZoneModal({
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
-  const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
   // #1861 — DNSSEC at create is superadmin-only; the zone itself is not.
   const { isSuperadmin: zoneIsSuperadmin } = usePermissions();
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
-  // #1784 — the experimental agentless Technitium driver writes only the
-  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
-  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
-  // when the group list is already loaded.
-  const { data: groupList } = useQuery({
-    queryKey: ["dns-groups"],
-    queryFn: () => dnsApi.listGroups(),
-    staleTime: 30_000,
-  });
-  const groupDrivers =
-    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
-  const technitiumApi = groupDrivers.includes("technitium_api");
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // #986 — TLD scope hint under the name field. Classified server-side so
@@ -2736,10 +2833,22 @@ export function ZoneModal({
   const [customerId, setCustomerId] = useState<string | null>(
     zone?.customer_id ?? null,
   );
+  // The route takes read on 'manage_domains' and is mounted behind the
+  // network.domains module (404 when off). A user without the grant, or an
+  // install with the module off, is not asked (#2926): the select says the
+  // list is not available. ``ready`` waits for the real module state, since
+  // ``enabled`` answers true while it loads.
+  const canReadDomainPerm = usePermissions().can("read", "manage_domains");
+  const { enabled: domainModuleEnabled, ready: domainModulesReady } =
+    useFeatureModules();
+  const domainsModuleOn =
+    domainModulesReady && domainModuleEnabled("network.domains");
+  const canReadDomains = canReadDomainPerm && domainsModuleOn;
   const { data: domainList } = useQuery({
     queryKey: ["domains-picker"],
     queryFn: () => domainsApi.list({ page_size: 500 }),
     staleTime: 60_000,
+    enabled: canReadDomains,
   });
   const [error, setError] = useState("");
   // #2075 — a Primary NS that is not a host name is refused, as the API does.
@@ -3097,8 +3206,20 @@ export function ZoneModal({
             className={inputCls}
             value={domainId ?? ""}
             onChange={(e) => setDomainId(e.target.value || null)}
+            disabled={!canReadDomains}
           >
             <option value="">— Auto-match by zone name —</option>
+            {/* A link the list does not carry (the list is not readable, or
+                not loaded yet) is still the zone's link: show it as set and
+                send it back unchanged, never as "auto-match" (#2926). */}
+            {domainId &&
+              !(domainList?.items ?? []).some((d) => d.id === domainId) && (
+                <option value={domainId}>
+                  {canReadDomains
+                    ? "Linked domain (loading…)"
+                    : "Linked to a domain (kept as is)"}
+                </option>
+              )}
             {(domainList?.items ?? []).map((d) => (
               <option key={d.id} value={d.id}>
                 {d.name}
@@ -3110,6 +3231,11 @@ export function ZoneModal({
             Pin to a tracked domain registration so the Domain detail page
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
+            {!canReadDomainPerm
+              ? " The domain list is not available to your account (it needs read on domains), so the link cannot be changed here."
+              : domainModulesReady && !domainsModuleOn
+                ? " Domain tracking is turned off (Features & Integrations), so the domain list is not available."
+                : ""}
           </p>
         </Field>
         <Field label="Customer (optional)">
@@ -3180,19 +3306,50 @@ const RECORD_VALUE_PLACEHOLDER: Record<string, string> = {
   DNAME: "target.example.net.",
 };
 
-function RecordModal({
-  groupId,
-  zoneId,
-  zoneName,
-  record,
-  onClose,
-}: {
+type RecordModalProps = {
   groupId: string;
   zoneId: string;
   zoneName?: string;
   record?: DNSRecord;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the record fresh on open (#3077): the row the page holds comes
+// from a cached records page that may predate a Save made a moment ago. It is
+// opened from the zone's records page or the group-wide records list, so both
+// are refetched and the row is taken from whichever holds it.
+export function RecordModal(props: RecordModalProps) {
+  const qc = useQueryClient();
+  const fresh = useFreshRow(props.record, () =>
+    refetchRow<DNSRecord>(
+      qc,
+      [
+        ["dns-records", props.zoneId],
+        ["dns-group-records", props.groupId],
+      ],
+      props.record!.id,
+    ),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Record"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <RecordModalForm {...props} record={fresh.row} />;
+}
+
+function RecordModalForm({
+  groupId,
+  zoneId,
+  zoneName,
+  record,
+  onClose,
+}: RecordModalProps) {
   const qc = useQueryClient();
   const isReverseZone =
     !!zoneName && /\.(in-addr|ip6)\.arpa\.?$/i.test(zoneName);
@@ -3247,7 +3404,7 @@ function RecordModal({
       setError(`TTL ${recordTtl}.`);
       return;
     }
-    mut.mutate({
+    const body = {
       name,
       record_type: type,
       value,
@@ -3258,7 +3415,30 @@ function RecordModal({
       weight: isSrv && weight !== "" ? parseInt(weight, 10) : null,
       port: isSrv && port !== "" ? parseInt(port, 10) : null,
       view_id: viewId || null,
-    });
+    };
+    if (!record) {
+      mut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3077), so a dialog opened
+    // on an out-of-date row cannot write the old values back. The type is not
+    // editable, so it never rides an update.
+    const { record_type: _type, ...fields } = body;
+    const was = {
+      name: record.name,
+      value: record.value,
+      ttl: record.ttl ?? null,
+      priority: record.priority ?? null,
+      weight: record.weight ?? null,
+      port: record.port ?? null,
+      view_id: record.view_id ?? null,
+    };
+    const diff = changedFields(was, fields);
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   }
 
   return (
@@ -3509,7 +3689,8 @@ function RecordModal({
 
 /**
  * Per-server serial-drift pill (#2316: a non-active server is never counted
- * as in sync, a paused one is excluded and listed as "paused"). Display states:
+ * as in sync, a paused one is excluded and listed as "paused"; a disabled one
+ * is excluded and listed as "disabled", #2927). Display states:
  *  - All servers on the target serial → emerald "N/N synced · serial X"
  *  - Some servers behind / ahead      → amber "1/3 drift · target X"
  *  - No server has reported yet       → muted "— not reported"
@@ -3517,14 +3698,20 @@ function RecordModal({
  * Hover tooltip lists every server with its own serial for quick drift
  * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
  */
-function ZoneSyncPill({ state }: { state: ZoneServerState }) {
+export function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   if (state.servers.length === 0) return null;
   // #2316 — a paused (maintenance) server is shown separately and left out
   // of the count; a server that is not active is counted, but never as in
   // sync, whatever serial it reported before it went away.
-  const paused = state.servers.filter(
-    (s) => s.freshness === "paused" || s.freshness === "disabled",
-  );
+  const paused = state.servers.filter((s) => s.freshness === "paused");
+  const disabled = state.servers.filter((s) => s.freshness === "disabled");
+  const notActive = paused.length + disabled.length;
+  const notActiveText = [
+    paused.length > 0 ? `${paused.length} paused` : "",
+    disabled.length > 0 ? `${disabled.length} disabled` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const down = state.servers.filter((s) => s.freshness === "unreachable");
   const counted = state.servers.filter(
     (s) => s.freshness !== "paused" && s.freshness !== "disabled",
@@ -3558,7 +3745,7 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   let cls = "bg-muted/40 text-muted-foreground";
   let label = "not reported";
   if (total === 0) {
-    label = `${paused.length} paused`;
+    label = notActiveText;
   } else if (reported.length === 0 && down.length === 0) {
     // noop — keep muted
   } else if (state.in_sync) {
@@ -3571,7 +3758,7 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
     label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
     if (down.length > 0) label += ` · ${down.length} unreachable`;
   }
-  if (total > 0 && paused.length > 0) label += ` · ${paused.length} paused`;
+  if (total > 0 && notActive > 0) label += ` · ${notActiveText}`;
   return (
     <span
       className={cn(
@@ -7255,7 +7442,7 @@ export function RevealedSecretModal({
 
 // ── Options Tab ───────────────────────────────────────────────────────────────
 
-function OptionsTab({ groupId }: { groupId: string }) {
+export function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   // Server options take a superadmin (dns/router.py).
   const { isSuperadmin } = useDnsGrants();
@@ -7265,13 +7452,22 @@ function OptionsTab({ groupId }: { groupId: string }) {
   });
   // Certificate picker for the DoT/DoH listeners (issue #50). Shares the
   // appliance cert store with the web UI cert + the ACME client, so the
-  // operator issues once and points both at it. Non-admins get a 403 here;
-  // the select just falls back to "— none —" rather than erroring the page.
-  const { data: certs } = useQuery({
+  // operator issues once and points both at it. Reading it takes ``read`` on
+  // ``certificate_store`` (#3067); a 403 is said under the picker rather than
+  // shown as an empty store.
+  const { data: certs, error: certsError } = useQuery({
     queryKey: ["appliance-tls-certs"],
     queryFn: () => applianceTlsApi.list(),
     retry: false,
   });
+  // #3045 — where that store is managed: Appliance → Fleet, where the entry is
+  // "Web UI Certificate" on an appliance and "TLS certificates" on Docker /
+  // Kubernetes (#3061 made the store reachable on every install type).
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+  });
+  const applianceMode = versionInfo?.appliance_mode ?? true;
 
   // Options the agent-managed Technitium driver cannot apply (#1763): the
   // API refuses a non-default value for a group holding such a server, so the
@@ -8097,11 +8293,28 @@ function OptionsTab({ groupId }: { groupId: string }) {
             ))}
           </select>
         </Field>
+        {isRefused(certsError) && (
+          <p className="text-xs text-muted-foreground">
+            You don't have permission to see the TLS certificate store, so the
+            certificates in it are not listed here. Seeing them takes read on
+            the <code>certificate_store</code> permission (the built-in DNS
+            Editor role has it); ask an administrator.
+          </p>
+        )}
         <p className="text-xs text-muted-foreground">
-          Managed under Appliance → Web UI Certificate — upload one, or issue it
-          from Let's Encrypt with the built-in ACME client. Renewals are picked
-          up automatically. A listener with no usable certificate is skipped and
-          the server stays Do53-only rather than failing to start.
+          Managed under{" "}
+          <Link
+            to="/appliance?tab=tls"
+            className="text-primary hover:underline"
+          >
+            {applianceMode
+              ? "Appliance → Fleet → Web UI Certificate"
+              : "Appliance → Fleet → TLS certificates"}
+          </Link>{" "}
+          — upload one, or issue it from Let's Encrypt with the built-in ACME
+          client. Renewals are picked up automatically. A listener with no
+          usable certificate is skipped and the server stays Do53-only rather
+          than failing to start.
         </p>
 
         <div className="flex items-center justify-between border-t pt-3">
@@ -10673,7 +10886,7 @@ function BlocklistModal({
   );
 }
 
-function BlocklistDetail({
+export function BlocklistDetail({
   list,
   onBack,
 }: {
@@ -10877,7 +11090,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -10889,7 +11104,9 @@ function BlocklistDetail({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newDomain) {
                   e.preventDefault();
-                  addEntry.mutate();
+                  // Enter is a second path to Add: a Viewer's disabled
+                  // button must not be bypassed by it (#3103).
+                  if (can("write", "dns_blocklist")) addEntry.mutate();
                 }
               }}
             />
@@ -12113,10 +12330,7 @@ export function DNSPage() {
     },
   });
   const deleteGroupError =
-    deleteGroup.error &&
-    (((deleteGroup.error as { response?: { data?: { detail?: string } } })
-      ?.response?.data?.detail as string | undefined) ??
-      formatApiError(deleteGroup.error));
+    deleteGroup.error && formatApiError(deleteGroup.error);
 
   function toggleGroup(id: string) {
     setExpandedGroups((prev) => {

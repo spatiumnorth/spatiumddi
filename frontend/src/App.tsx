@@ -9,6 +9,7 @@ import {
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useBrandDocumentTitle } from "@/hooks/usePublicSettings";
 import { LoginPage } from "@/pages/LoginPage";
+import { AboutPage } from "@/pages/AboutPage";
 import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { AccountPage } from "@/pages/AccountPage";
@@ -157,6 +158,9 @@ export default function App() {
         }
       >
         <Route index element={<Navigate to="/dashboard" replace />} />
+        {/* #2895 — signed-in only: the version, the libraries and the
+            third-party tools are not for someone probing from outside. */}
+        <Route path="about" element={<AboutPage />} />
         <Route path="account" element={<AccountPage />} />
         <Route path="appliance" element={<AppliancePage />} />
         <Route path="appliance/setup" element={<SetupWizardPage />} />

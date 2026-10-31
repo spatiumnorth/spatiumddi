@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -27,6 +27,7 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.update_nulls import changed_keys, snapshot
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
@@ -38,7 +39,9 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.agents.spool_status import SpoolStatus
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
@@ -184,6 +187,19 @@ HA_STATE_DESCRIPTION = (
 )
 
 
+def _duplicate_agent_fields(s: DHCPServer) -> dict[str, Any]:
+    """#3143 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -257,6 +273,23 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2962 — who the current not-``ok`` daemon state came from: ``agent``
+    # (its own heartbeat) or ``supervisor`` (the appliance's supervisor, from
+    # the kubelet's container state, when the agent died with its container
+    # or has gone silent). ``null`` on ``ok`` or never reported. Derived
+    # (``container_oom.daemon_reported_by``), the same reading the alert's
+    # wording uses.
+    daemon_reported_by: Literal["agent", "supervisor"] | None = None
+    # #3143 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served. Derived
+    # (``instance_ownership.duplicate_active``), as the
+    # ``dhcp_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -333,6 +366,8 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            daemon_reported_by=daemon_reported_by(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -677,6 +712,15 @@ async def update_server(
             db, target_group, target_driver, exclude_server_id=s.id
         )
         await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
+    if target_group != s.server_group_id:
+        # #2899 — a cluster node's Kea is behind the MetalLB relay VIP
+        # Service; it cannot move into a ``direct`` group while a VIP is set.
+        from app.services.dhcp.relay_vip import server_join_refusal  # noqa: PLC0415
+
+        refusal = await server_join_refusal(db, s, target_group)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
+    before = snapshot(s, changes)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -704,6 +748,16 @@ async def update_server(
             owner.assigned_dhcp_group_id = s.server_group_id
             appliance_repointed_id = owner.id
             collect_wake(appliance_channel(owner.id))
+
+    # #2963 - a server moved into a group is a membership change: the group's
+    # appliance-hosted Kea members get an empty HA peer URL derived from the
+    # node address (host-networked HA-mode groups only; never overwrites).
+    if s.server_group_id is not None and s.server_group_id != old_group_id:
+        from app.services.dhcp.ha_peer_autofill import (  # noqa: PLC0415
+            autofill_group_ha_peer_urls,
+        )
+
+        await autofill_group_ha_peer_urls(db, s.server_group_id, via="server_update")
 
     # Credentials handling:
     #   * None → leave alone
@@ -806,7 +860,7 @@ async def update_server(
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,
-        changed_fields=list(changes.keys()),
+        changed_fields=changed_keys(before, changes),
         new_value=audit_payload,
     )
     await db.commit()
@@ -1737,6 +1791,9 @@ class DHCPRateBucket(BaseModel):
     # receive buffer was full. The one that moves when a node is short of
     # CPU; ``receive_drop`` stays at 0 through exactly that failure.
     socket_drop: int | None = None
+    # #2889 — DHCPv4 requests Kea read and then evicted from its packet
+    # queue under a burst. Loss like ``socket_drop``; no Kea counter sees it.
+    queue_evicted: int | None = None
 
 
 class DHCPServerStatsResponse(BaseModel):
@@ -1806,6 +1863,7 @@ async def get_server_stats(
             # loss. A partially-measured bucket sums the samples that did.
             func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
             func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
+            func.sum(DHCPMetricSample.queue_evicted).label("queue_evicted"),
         )
         .where(DHCPMetricSample.server_id == server_id)
         .where(DHCPMetricSample.bucket_at >= since)
@@ -1826,6 +1884,7 @@ async def get_server_stats(
             # ``is None`` rather than ``or``: 0 is a real, measured value.
             receive_drop=None if r.receive_drop is None else int(r.receive_drop),
             socket_drop=None if r.socket_drop is None else int(r.socket_drop),
+            queue_evicted=None if r.queue_evicted is None else int(r.queue_evicted),
         )
         for r in rows
     ]

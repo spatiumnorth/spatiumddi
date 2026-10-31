@@ -34,6 +34,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.core.exc_text import describe_exc
 from app.services._mirror_shape import require_list
 
 logger = structlog.get_logger(__name__)
@@ -329,7 +330,7 @@ class ProxmoxClient:
         try:
             resp = await self._client.get(path)
         except httpx.HTTPError as exc:
-            raise ProxmoxClientError(f"{path}: {exc}") from exc
+            raise ProxmoxClientError(f"{path}: {describe_exc(exc)}") from exc
         if resp.status_code == 401:
             raise ProxmoxClientError(f"{path}: HTTP 401 — token invalid / expired")
         if resp.status_code == 403:

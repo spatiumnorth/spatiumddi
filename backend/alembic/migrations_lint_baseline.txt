@@ -90,6 +90,12 @@ backend/alembic/versions/79a2e409e774_appliance_slot_telemetry.py:drop_column:13
 backend/alembic/versions/79a2e409e774_appliance_slot_telemetry.py:drop_column:137
 backend/alembic/versions/79a2e409e774_appliance_slot_telemetry.py:drop_column:138
 backend/alembic/versions/7c299e8a5490_dns_tsig_keys.py:drop_table:62
+backend/alembic/versions/833ee80c8c6b_dhcp_server_agent_instance.py:drop_column:110
+backend/alembic/versions/833ee80c8c6b_dhcp_server_agent_instance.py:drop_column:111
+backend/alembic/versions/833ee80c8c6b_dhcp_server_agent_instance.py:drop_column:112
+backend/alembic/versions/833ee80c8c6b_dhcp_server_agent_instance.py:drop_column:113
+backend/alembic/versions/833ee80c8c6b_dhcp_server_agent_instance.py:drop_column:114
+backend/alembic/versions/833ee80c8c6b_dhcp_server_agent_instance.py:drop_column:115
 backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_column:163
 backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_column:164
 backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_column:165
@@ -278,6 +284,7 @@ backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:7
 backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:63
 backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:64
 backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:65
+backend/alembic/versions/b7d2e4f91a08_dhcp_queue_evicted_metric.py:drop_column:43
 backend/alembic/versions/b7e29c4f5d18_dns_dhcp_tags.py:drop_column:63
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_column:60
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_constraint_fk:61
@@ -398,6 +405,8 @@ backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:282
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:285
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:289
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:297
+backend/alembic/versions/c4f81e2a9d37_user_session_rotation_grace.py:drop_column:44
+backend/alembic/versions/c4f81e2a9d37_user_session_rotation_grace.py:drop_column:45
 backend/alembic/versions/c4f8a2e61d37_dns_zone_forward_transport.py:drop_column:49
 backend/alembic/versions/c4f8a2e61d37_dns_zone_forward_transport.py:drop_column:50
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:36
@@ -653,6 +662,7 @@ backend/alembic/versions/e2b6f81d4a37_dhcp_server_last_sync_error.py:drop_column
 backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102
 backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
 backend/alembic/versions/e3a81c5d07f2_appliance_evict_after_demote.py:drop_column:44
+backend/alembic/versions/e3a9c71f40d2_acme_order_activate_on_issue.py:drop_column:43
 backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:58
 backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:59
 backend/alembic/versions/e3b7c19f5a42_dns_record_op_dispatched_to.py:drop_column:49

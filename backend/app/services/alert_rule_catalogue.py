@@ -300,9 +300,16 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
             )
         ],
     ),
+    (a.RULE_TYPE_DHCP_AGENT_DUPLICATE_INSTANCE, "Two DHCP agents on one server", "DHCP", []),
     (
         a.RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         "DHCP scope served by uncoordinated servers",
+        "DHCP",
+        [],
+    ),
+    (
+        a.RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
+        "DHCP group in direct mode behind the relay VIP",
         "DHCP",
         [],
     ),

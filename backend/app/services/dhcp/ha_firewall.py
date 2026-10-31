@@ -45,7 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
-from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dhcp import HA_MODES, DHCPServer, DHCPServerGroup
 from app.services.appliance.ownership import hostname_is_unambiguous, hostname_sql, norm_host
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -110,7 +110,7 @@ async def dhcp_ha_firewall_inputs(
             .options(selectinload(DHCPServerGroup.servers))
         )
     ).scalar_one_or_none()
-    if group is None:
+    if group is None or group.mode not in HA_MODES:
         return None, []
     kea = sorted((s for s in group.servers if s.driver == "kea"), key=lambda s: str(s.id))
     # Same readiness rule as _resolve_failover: no HA hook renders otherwise.

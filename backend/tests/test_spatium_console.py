@@ -93,19 +93,260 @@ def test_format_pod_age_units(m):
 
 
 def test_rst_verdict_thresholds(m):
-    recent = (datetime.now(UTC) - timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    old = (datetime.now(UTC) - timedelta(seconds=1000)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert m._rst_verdict(0, "") == "quiet"
-    # A currently-broken pod is red regardless of restart count / timestamp.
-    assert m._rst_verdict(0, "", "CrashLoopBackOff") == "red"
-    # Lifetime backstop (>= 10) is red even when quiet.
-    assert m._rst_verdict(12, old) == "red"
-    # Flapping: >= 3 restarts AND a recent one.
-    assert m._rst_verdict(4, recent) == "red"
-    # Restarted but quiet (recent restart but below the flap floor) → amber.
-    assert m._rst_verdict(2, recent) == "amber"
-    # Several restarts but not recent → amber, not red.
-    assert m._rst_verdict(5, old) == "amber"
+    assert m._rst_verdict(0) == "quiet"
+    # A currently-broken pod is red regardless of the windowed increase.
+    assert m._rst_verdict(0, "CrashLoopBackOff") == "red"
+    assert m._rst_verdict(1) == "amber"
+    assert m._rst_verdict(2) == "amber"
+    assert m._rst_verdict(3) == "red"
+
+
+# ── #2928 windowed restart / etcd deltas ──────────────────────────────────
+
+
+def _pod(name, restarts, state="Running"):
+    return {
+        "Names": name,
+        "Namespace": "spatium",
+        "K8sState": state,
+        "Restarts": restarts,
+        "RestartedAt": "",
+        "Ready": "1/1",
+    }
+
+
+def _recent(m, watch, rows, now):
+    m.stamp_recent_restarts(watch, rows, now)
+    return {r["Names"]: r["RstRecent"] for r in rows}
+
+
+def test_restart_fresh_baseline_with_high_lifetime_count_is_quiet(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    rows = [_pod("api-1", 40)]
+    assert _recent(m, w, rows, 0.0) == {"api-1": 0}
+    assert m._rst_verdict(rows[0]["RstRecent"], "Running") == "quiet"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+
+
+def test_restart_three_in_window_is_red(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    rows = [_pod("api-1", 8)]
+    assert _recent(m, w, rows, 120.0) == {"api-1": 3}
+    assert m._rst_verdict(3, "Running") == "red"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    verdict, offender = m.overall_verdict(st)
+    assert verdict == "CRITICAL"
+    assert "flapping" in offender
+
+
+def test_restart_one_in_window_is_amber(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    rows = [_pod("api-1", 6)]
+    assert _recent(m, w, rows, 60.0) == {"api-1": 1}
+    assert m._rst_verdict(1, "Running") == "amber"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+
+
+def test_restarts_older_than_window_are_quiet(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    _recent(m, w, [_pod("api-1", 8)], 60.0)
+    # Still inside the window at +800 s, then aged out past +960 s.
+    assert _recent(m, w, [_pod("api-1", 8)], 800.0) == {"api-1": 3}
+    assert _recent(m, w, [_pod("api-1", 8)], 1000.0) == {"api-1": 0}
+
+
+def test_crashloop_is_red_without_any_history(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    rows = [_pod("api-1", 30, "CrashLoopBackOff")]
+    _recent(m, w, rows, 0.0)
+    assert m._rst_verdict(rows[0]["RstRecent"], "CrashLoopBackOff") == "red"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = rows
+    assert m.overall_verdict(st)[0] == "CRITICAL"
+
+
+def test_counter_watch_forgets_vanished_pods_after_the_window(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("a", 1), _pod("b", 1)], 0.0)
+    _recent(m, w, [_pod("a", 1)], 10.0)
+    # "b" is gone from the listing but kept until it has been unseen for a
+    # whole window (so one failed cluster_pods cycle cannot wipe it) ...
+    assert w.keys() == {"spatium/a", "spatium/b"}
+    _recent(m, w, [_pod("a", 1)], 10.0 + m._RST_WINDOW_S + 1)
+    # ... and dropped after that.
+    assert w.keys() == {"spatium/a"}
+    # A recreated pod with a new name starts a fresh baseline.
+    assert _recent(m, w, [_pod("a2", 9)], 2000.0) == {"a2": 0}
+
+
+def test_counter_watch_samples_stay_bounded_at_refresh_cadence(m):
+    # The data tier refreshes every DATA_REFRESH_EVERY seconds; a steady
+    # counter observed for an hour at that cadence must not grow a deque
+    # entry per refresh.
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    t = 0.0
+    while t < 3600:
+        w.observe("k", 9, t)
+        t += m.DATA_REFRESH_EVERY
+    assert len(w._samples["k"]) == 1
+    # A counter that moves every refresh is bounded by the window instead.
+    w2 = m.CounterWatch(m._RST_WINDOW_S)
+    for i in range(2000):
+        w2.observe("k", i, i * m.DATA_REFRESH_EVERY)
+    assert len(w2._samples["k"]) <= m._RST_WINDOW_S / m.DATA_REFRESH_EVERY + 2
+
+
+def test_counter_watch_uses_a_monotonic_clock(m):
+    import time
+
+    assert m.CounterWatch(m._RST_WINDOW_S)._clock is time.monotonic
+
+
+def test_failed_pod_listing_does_not_reset_baselines(m):
+    # cluster_pods() returns [] on any failure. Treating that as "every pod
+    # vanished" would reset every baseline, and a flapping pod would read
+    # quiet again on the next good cycle.
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("api-1", 5)], 0.0)
+    _recent(m, w, [], 5.0)
+    assert _recent(m, w, [_pod("api-1", 8)], 10.0) == {"api-1": 3}
+
+
+def test_counter_reset_is_a_new_baseline_not_a_negative_or_huge_delta(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    assert w.observe("k", 8, 0.0) == 0
+    # The counter drops (pod recreated under the same name / etcd restart).
+    assert w.observe("k", 0, 10.0) == 0
+    # Increases after the drop count from the new baseline. Subtracting the
+    # pre-reset baseline instead would read 3 - 8 as nothing at all.
+    assert w.observe("k", 3, 20.0) == 3
+
+
+def test_counter_reset_keeps_in_window_increases_from_before_it(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    w.observe("k", 5, 0.0)
+    assert w.observe("k", 8, 10.0) == 3
+    assert w.observe("k", 1, 20.0) == 3
+    assert w.observe("k", 2, 30.0) == 4
+    # Once the pre-reset steps age out, only the post-reset one remains.
+    assert w.observe("k", 2, 10.0 + m._RST_WINDOW_S + 1) == 1
+
+
+def test_statefulset_pod_recreated_under_same_name_then_flapping_is_red(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    _recent(m, w, [_pod("db-0", 12)], 0.0)
+    _recent(m, w, [_pod("db-0", 0)], 30.0)
+    rows = [_pod("db-0", 3)]
+    assert _recent(m, w, rows, 300.0) == {"db-0": 3}
+    assert m._rst_verdict(rows[0]["RstRecent"], "Running") == "red"
+
+
+def test_etcd_failures_after_an_etcd_restart_still_degrade(m):
+    w = m.CounterWatch(m._ETCD_FAIL_WINDOW_S)
+    _etcd_state(m, w, 40, 0.0)
+    # k3s / etcd restarted under a running console: the counter resets.
+    st = _etcd_state(m, w, 0, 30.0)
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+    st = _etcd_state(m, w, 1, 60.0)
+    assert m.overall_verdict(st) == ("DEGRADED", "etcd write failures")
+
+
+def _iso_ago(seconds):
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_fresh_console_floors_a_recent_restart_at_amber_never_red(m):
+    # The console restarts on every F1 logout, so its baseline is often
+    # young. A pod whose last restart is inside the window restarted at
+    # least once in it: amber, not quiet. Never red — the count is unknown.
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    row = _pod("api-1", 40)
+    row["RestartedAt"] = _iso_ago(120)
+    m.stamp_recent_restarts(w, [row], 0.0)
+    assert row["RstRecent"] == 1
+    assert m._rst_verdict(row["RstRecent"], "Running") == "amber"
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.ps_rows = [row]
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+
+
+def test_restart_floor_ages_out_and_ignores_far_future_timestamps(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    old = _pod("old", 40)
+    old["RestartedAt"] = _iso_ago(m._RST_WINDOW_S + 60)
+    skewed = _pod("skewed", 40)
+    skewed["RestartedAt"] = _iso_ago(-3600)  # a node clock an hour ahead
+    near = _pod("near", 2)
+    near["RestartedAt"] = _iso_ago(-5)  # ordinary skew still counts
+    junk = _pod("junk", 2)
+    junk["RestartedAt"] = "not-a-time"
+    assert _recent(m, w, [old, skewed, near, junk], 0.0) == {
+        "old": 0,
+        "skewed": 0,
+        "near": 1,
+        "junk": 0,
+    }
+
+
+def test_restart_floor_does_not_mask_a_larger_observed_increase(m):
+    w = m.CounterWatch(m._RST_WINDOW_S)
+    row = _pod("api-1", 5)
+    row["RestartedAt"] = _iso_ago(30)
+    _recent(m, w, [row], 0.0)
+    row = _pod("api-1", 9)
+    row["RestartedAt"] = _iso_ago(5)
+    assert _recent(m, w, [row], 60.0) == {"api-1": 4}
+
+
+def test_health_screen_does_not_colour_a_quiet_lifetime_count(m, monkeypatch):
+    monkeypatch.setattr(m, "webui_selfcheck_status", lambda: None, raising=False)
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    quiet = _pod("quiet-pod", 40)
+    quiet["RstRecent"] = 0
+    hot = _pod("hot-pod", 41)
+    hot["RstRecent"] = 3
+    st.ps_rows = [quiet, hot]
+    con = Console(width=160, record=True, file=io.StringIO(), color_system="standard")
+    m._render_health_screen(con, st, [], None)
+    lines = con.export_text(styles=True).splitlines()
+    quiet_line = next(ln for ln in lines if "quiet-pod" in ln)
+    # (The verdict banner names hot-pod too; take the pods-table row.)
+    hot_line = next(ln for ln in lines if "hot-pod" in ln and "41" in ln)
+    # 33 = yellow, 31 = red (rich "standard" colour system).
+    assert "\x1b[2m40" in quiet_line  # dim
+    assert "\x1b[33m40" not in quiet_line and "\x1b[1;31m40" not in quiet_line
+    assert "31m41" in hot_line
+
+
+def _etcd_state(m, watch, failed, now):
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.etcd = {"has_leader": 1, "is_leader": 1, "proposals_failed": failed}
+    st.etcd_failed_recent = watch.observe("etcd", failed, now)
+    return st
+
+
+def test_etcd_counter_nonzero_at_start_is_not_degraded(m):
+    w = m.CounterWatch(m._ETCD_FAIL_WINDOW_S)
+    st = _etcd_state(m, w, 7, 0.0)
+    assert m.overall_verdict(st)[0] == "HEALTHY"
+    m.render_kpi_etcd(st)  # lifetime total renders without error
+
+
+def test_etcd_increase_in_window_degrades_then_clears(m):
+    w = m.CounterWatch(m._ETCD_FAIL_WINDOW_S)
+    _etcd_state(m, w, 7, 0.0)
+    st = _etcd_state(m, w, 8, 60.0)
+    assert m.overall_verdict(st) == ("DEGRADED", "etcd write failures")
+    st = _etcd_state(m, w, 8, 700.0)
+    assert m.overall_verdict(st)[0] == "HEALTHY"
 
 
 # ── 5 s-tier metric parsers (fixtures captured from the live cluster) ──────
@@ -987,3 +1228,142 @@ def test_overall_verdict_healthy_array_does_not_alarm(m):
     state.storage_chips = [("md0 raid1 ok 2/2", "green", "")]
     verdict, _offender = m.overall_verdict(state)
     assert verdict == "HEALTHY"
+
+
+# ── #2974: reboot / poweroff hand the PostgreSQL primary off first ─────────
+
+
+def test_power_action_in_progress_reads_a_live_marker(m, monkeypatch, tmp_path):
+    import os
+
+    marker = tmp_path / "power-action"
+    monkeypatch.setattr(m, "POWER_ACTION_MARKER", marker)
+    assert m.power_action_in_progress() is None
+    marker.write_text(f"{os.getpid()} poweroff\n")
+    assert m.power_action_in_progress() == "poweroff"
+
+
+def test_power_action_in_progress_ignores_a_dead_or_garbled_marker(m, monkeypatch, tmp_path):
+    """A wrapper killed outright leaves its marker: that must not pin a
+    'REBOOT under way' banner on the console for good."""
+    marker = tmp_path / "power-action"
+    monkeypatch.setattr(m, "POWER_ACTION_MARKER", marker)
+    marker.write_text("999999999 reboot\n")
+    assert m.power_action_in_progress() is None
+    marker.write_text("garbage\n")
+    assert m.power_action_in_progress() is None
+    marker.write_text("1 halt\n")
+    assert m.power_action_in_progress() is None
+
+
+def test_a_power_action_under_way_counts_as_a_pending_reboot(m, monkeypatch, tmp_path):
+    """The web-UI unit renames its trigger before the handoff: without the
+    marker, F9 would say nothing is pending for the whole handoff."""
+    import os
+
+    monkeypatch.setattr(m, "_RELEASE_STATE_DIR", tmp_path / "release-state")
+    marker = tmp_path / "power-action"
+    monkeypatch.setattr(m, "POWER_ACTION_MARKER", marker)
+    assert m.reboot_pending() is False
+    marker.write_text(f"{os.getpid()} reboot\n")
+    assert m.reboot_pending() is True
+
+
+@pytest.mark.parametrize("node_count", [1, 3])
+@pytest.mark.parametrize(("fn", "action"), [("do_reboot", "reboot"), ("do_shutdown", "poweroff")])
+def test_console_power_keys_start_the_unit_without_waiting(m, monkeypatch, fn, action, node_count):
+    """F5 / F6 hand the run to systemd and return at once, so the dashboard
+    keeps rendering through a handoff of up to a few minutes. Only a
+    multi-node control plane has a primary to hand off (#3008)."""
+    calls = []
+
+    class _Res:
+        returncode = 0
+        stdout = stderr = ""
+
+    def _run(argv, **kw):
+        calls.append(argv)
+        return _Res()
+
+    monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: True)
+    monkeypatch.setattr(m.subprocess, "run", _run)
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.nodes = [{"name": f"n{i}"} for i in range(node_count)]
+    getattr(m, fn)(Console(file=io.StringIO()), state)
+    assert calls == [["systemctl", "start", "--no-block", f"spatium-power-action@{action}.service"]]
+    assert "F9 cancels" in state.status_message
+    assert ("database primary" in state.status_message) == (node_count > 1)
+
+
+def test_console_power_key_failure_is_reported(m, monkeypatch):
+    class _Res:
+        returncode = 5
+        stdout = ""
+        stderr = "Failed to start spatium-power-action@reboot.service: Unit not found.\n"
+
+    monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: True)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Res())
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    m.do_reboot(Console(file=io.StringIO()), state)
+    assert "could not be started" in state.status_message
+    assert "Unit not found" in state.status_message
+
+
+def test_console_power_key_declined_starts_nothing(m, monkeypatch):
+    monkeypatch.setattr(m, "confirm_modal", lambda *a, **k: False)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail("nothing should run"))
+    m.do_shutdown(Console(file=io.StringIO()), m.DashboardState({}, _FakeTail(), "/dev/tty1"))
+
+
+# ── #3026: a committed slot upgrade clears the trial-boot verdict ─────────
+
+
+def test_committed_slot_clears_trial_boot_on_the_data_tier(m, monkeypatch):
+    """The console starts before firstboot runs grub-set-default. It read
+    saved_entry=slot_a once and showed 'trial boot — reboot reverts' until the
+    next reboot, although slot_b had been committed (#3026)."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_a"))
+    grubenv = {"saved_entry": "slot_a"}
+    monkeypatch.setattr(m, "read_grubenv", lambda: dict(grubenv))
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_a")
+    assert m.overall_verdict(st) == ("DEGRADED", "trial boot — reboot reverts")
+
+    # firstboot commits slot_b; the next data-tier refresh must notice.
+    grubenv["saved_entry"] = "slot_b"
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_b")
+    assert "trial" not in m.overall_verdict(st)[1]
+
+
+def test_unreadable_grubenv_keeps_the_last_known_durable_slot(m, monkeypatch):
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_b"))
+    m.refresh_durable_slot(None)
+    assert m.slot_info() == ("slot_b", "slot_b")
+
+
+def test_refresh_durable_slot_ignores_a_box_without_ab_slots(m, monkeypatch):
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", None)
+    m.refresh_durable_slot("slot_a")
+    assert m.slot_info() is None
+
+
+def test_readable_grubenv_without_saved_entry_reports_no_durable_default(m, monkeypatch):
+    """A grubenv that reads fine but carries no saved_entry is "no durable
+    default" — what detect_slot_info() reports — not "keep the old value"."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_a"))
+    monkeypatch.setattr(m, "read_grubenv", lambda: {"next_entry": ""})
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "")
+
+
+def test_unreadable_grubenv_on_the_data_tier_keeps_the_committed_slot(m, monkeypatch):
+    """A failed grub-editenv on one 5 s tick must not flip a committed box
+    back to a trial-boot verdict (#3026)."""
+    monkeypatch.setattr(m, "_SLOT_INFO_CACHE", ("slot_b", "slot_b"))
+    monkeypatch.setattr(m, "read_grubenv", lambda: None)
+    st = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    st.refresh(force=True)
+    assert m.slot_info() == ("slot_b", "slot_b")

@@ -22,6 +22,34 @@ COPY pyproject.toml .
 RUN mkdir -p app && touch app/__init__.py && \
     pip install --no-cache-dir --prefix=/install .
 
+# #2895 — the machine-made Python third-party notice list, served by the About
+# page. Generated here, from the packages the runtime image actually receives
+# (the ``/install`` prefix above), and copied into the runtime stage as one
+# static text file. ``pip-licenses`` itself lives in a throwaway venv and never
+# reaches the runtime image. It blanks PYTHONPATH before it asks the interpreter
+# named by ``--python`` for its search path, so ``/opt/py-install`` is a
+# two-line wrapper that puts ``/install`` back; the builder's own pip /
+# setuptools / wheel are left out (the runtime removes pip, #1392).
+# ``--with-system`` is required, not cosmetic: without it pip-licenses drops
+# the names of its OWN dependencies (prettytable, wcwidth, …) from the report
+# even when they come from the inspected interpreter, so ``wcwidth`` — a real
+# runtime dependency — went missing from the list. A list that is short looks
+# exactly like a clean pass, so the build fails unless every distribution in
+# ``/install`` (bar the excluded four) is named in it.
+ARG PIP_LICENSES_VERSION=5.5.5
+RUN python -m venv /opt/pip-licenses \
+    && /opt/pip-licenses/bin/pip install --no-cache-dir "pip-licenses==${PIP_LICENSES_VERSION}" \
+    && printf '#!/bin/sh\nPYTHONPATH=/install/lib/python3.12/site-packages exec /usr/local/bin/python "$@"\n' > /opt/py-install \
+    && chmod +x /opt/py-install \
+    && mkdir -p /install/share/spatiumddi \
+    && /opt/pip-licenses/bin/pip-licenses --python=/opt/py-install \
+         --format=plain-vertical --with-system --with-urls --with-authors \
+         --with-license-file --no-license-path \
+         --ignore-packages pip setuptools wheel spatiumddi \
+         --output-file=/install/share/spatiumddi/third-party-python.txt \
+    && python -c "import importlib.metadata as m, re, sys; n = lambda s: re.sub(r'[-_.]+', '-', s).lower(); listed = {n(l.strip()) for l in open(sys.argv[1], encoding='utf-8')}; want = {n(d.metadata['Name']) for d in m.distributions(path=[sys.argv[2]])} - {'pip', 'setuptools', 'wheel', 'spatiumddi'}; miss = sorted(want - listed); assert len(want) > 50 and not miss, f'third-party-python.txt is missing {miss} ({len(want)} installed)'" \
+         /install/share/spatiumddi/third-party-python.txt /install/lib/python3.12/site-packages
+
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
@@ -186,7 +214,20 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # peer, and applies X-Real-IP / X-Forwarded-Proto only when that peer is
 # in TRUSTED_PROXY_CIDRS, so audit rows still record the end user's IP
 # behind nginx rather than the nginx container's.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]
+#
+# --timeout-graceful-shutdown (#2944): without it uvicorn waits for every
+# in-flight request, so one started just before a stop can outlast the
+# orchestrator's grace period and the kill lands before lifespan shutdown
+# (which disposes the after-commit hooks' engine, #2782). 20 s must stay BELOW
+# every grace period that stops this image: 30 s in k8s/base, the chart and the
+# compose files' api ``stop_grace_period`` (Docker's own default is 10 s, so
+# compose sets it). tests/test_api_graceful_shutdown.py pins the ordering.
+# ``python -m spatium_uvicorn`` is uvicorn's own CLI with the default bind
+# address changed from one IPv4 literal to every address family the container
+# has (#2308) — IPv4-only, dual-stack and IPv6-only clusters all work. ``--host``
+# is deliberately absent; API_BIND_HOST (or --host) pins one. Full story in
+# spatium_uvicorn.py: ``--host ::`` is IPv6-only under uvicorn, not dual-stack.
+CMD ["python", "-m", "spatium_uvicorn", "app.main:app", "--port", "8000", "--workers", "1", "--no-proxy-headers", "--timeout-graceful-shutdown", "20"]
 
 
 # ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────
