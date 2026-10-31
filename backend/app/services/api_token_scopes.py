@@ -54,7 +54,8 @@ def read_only_post[F: Callable[..., Any]](fn: F) -> F:
     A ``read``-scoped token may call a marked route. Use it ONLY for a POST
     whose body is a filter / preview / dry-run input and which cannot change
     state: no row written (an audit row for the read excepted), no queued op,
-    no outbound traffic or probe. RBAC on the route is unchanged — this only
+    no outbound traffic or probe (a WinRM / API pull from a managed server
+    counts as outbound). RBAC on the route is unchanged — this only
     stops the scope gate reading every POST as a write (#3223). Apply under
     the ``@router.post(...)`` decorator.
     """
@@ -119,7 +120,10 @@ def scope_matches_request(
     request. Empty ``scopes`` always passes (no restriction).
 
     ``read_only_route`` is True when the matched handler carries
-    :func:`read_only_post`; ``read`` then covers it like a safe method.
+    :func:`read_only_post`; ``read`` then covers it like a safe method, for
+    a POST only. The marker is a statement about one POST handler, so it
+    never lets ``read`` reach a PUT / PATCH / DELETE, even if the same
+    function were ever registered for one.
 
     Returns True on first match — scopes union, not intersect.
     """
@@ -127,8 +131,9 @@ def scope_matches_request(
         return True
     method = method.upper()
     is_safe = method in _SAFE_METHODS
+    read_only_post_request = read_only_route and method == "POST"
     for scope in scopes:
-        if scope == "read" and (is_safe or read_only_route):
+        if scope == "read" and (is_safe or read_only_post_request):
             return True
         # MCP tools are read-only in Wave 2 — any safe method or a
         # JSON-RPC POST to ``/api/v1/ai/mcp`` is fine under ``read``.

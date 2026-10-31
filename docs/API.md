@@ -413,8 +413,11 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   a JSON-RPC `POST` to the read-only MCP endpoint, plus the POST routes
   that only read (a filter or preview body, no mutation, no outbound probe):
   those carry the `@read_only_post` marker from `api_token_scopes.py`
-  (the `/logs/*` queries, `/tools/mac-vendor`, and the side-effect-free
-  previews / validations). The set is pinned by
+  (the DNS query log, its analytics and the DHCP activity log under
+  `/logs/`, `/tools/mac-vendor`, and the side-effect-free previews /
+  validations). The Windows Event Log and DHCP audit pulls (`/logs/query`,
+  `/logs/dhcp-audit`) are not marked: they run PowerShell on the Windows
+  server over WinRM, so they need a write scope. The set is pinned by
   `tests/test_token_read_only_post_3223.py`.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
   specific `subnet` or `dns_zone` instance with an

@@ -299,7 +299,6 @@ async def _resolve_server(db: DB, server_kind: str, server_id: uuid.UUID) -> tup
 
 
 @router.post("/query", response_model=LogQueryResponse, dependencies=[_WINRM_READ])
-@read_only_post
 async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     """Run a filtered ``Get-WinEvent`` against the named server and return
     matching rows.
@@ -364,7 +363,6 @@ async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     response_model=DhcpAuditResponse,
     dependencies=[_WINRM_READ, Depends(require_module("core.dhcp"))],
 )
-@read_only_post
 async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
     """Read + parse a Windows DHCP server's audit log for the given day.
 

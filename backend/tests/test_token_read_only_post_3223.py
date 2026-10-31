@@ -48,10 +48,8 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
         "/api/v1/ipam/subnets/{subnet_id}/resize/preview",
         "/api/v1/ipam/subnets/{subnet_id}/split/preview",
         "/api/v1/logs/dhcp-activity",
-        "/api/v1/logs/dhcp-audit",
         "/api/v1/logs/dns-queries",
         "/api/v1/logs/dns-queries/analytics",
-        "/api/v1/logs/query",
         "/api/v1/multicast/groups/bulk-allocate/preview",
         "/api/v1/ot/devices/import/preview",
         "/api/v1/tools/mac-vendor",
@@ -72,6 +70,8 @@ DELIBERATELY_WRITE: dict[str, str] = {
     "/api/v1/dns/import/technitium/preview": "live pull from a Technitium API",
     "/api/v1/dns/import/windows-dns/preview": "live WinRM pull from a Windows server",
     "/api/v1/dns/tools/propagation-check": "sends queries to public resolvers",
+    "/api/v1/logs/query": "runs Get-WinEvent over WinRM on a Windows server (outbound, stored creds)",
+    "/api/v1/logs/dhcp-audit": "reads the audit log over WinRM on a Windows server (outbound)",
     "/api/v1/ipam/import/netbox/preview": "live pull from NetBox (outbound)",
     "/api/v1/overlays/{overlay_id}/simulate": "not reviewed as side-effect free",
     "/api/v1/settings/apt/validate": "not reviewed as side-effect free",
@@ -156,6 +156,10 @@ def test_read_scope_covers_a_marked_route_but_not_other_posts() -> None:
         scope_matches_request(["dns:write"], "POST", "/api/v1/logs/x", read_only_route=True)
         is False
     )
+    for method in ("PUT", "PATCH", "DELETE"):
+        assert (
+            scope_matches_request(["read"], method, "/api/v1/logs/x", read_only_route=True) is False
+        ), method
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────
@@ -243,3 +247,34 @@ async def test_revoked_and_expired_tokens_stay_401(
     expired = await _token(db_session, ["read"], expires_at=datetime.now(UTC) - timedelta(hours=1))
     r = await client.post("/api/v1/logs/dns-queries", json={}, headers=_h(expired))
     assert r.status_code == 401, r.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        (
+            "/api/v1/logs/query",
+            {"server_id": str(uuid.uuid4()), "server_kind": "dns", "log_name": "DNS Server"},
+        ),
+        ("/api/v1/logs/dhcp-audit", {"server_id": str(uuid.uuid4())}),
+    ],
+)
+async def test_read_token_is_refused_on_the_winrm_log_pulls(
+    client: AsyncClient, db_session: AsyncSession, path: str, body: dict
+) -> None:
+    """These run PowerShell over WinRM on a managed Windows server with its
+    stored credentials. That reaches out, so it is not ``read``."""
+    raw = await _token(db_session, ["read"])
+    r = await client.post(path, json=body, headers=_h(raw))
+    assert r.status_code == 403, r.text
+    assert "scope" in r.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_write_scope_is_not_widened_by_the_marker(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    raw = await _token(db_session, ["dns:write"])
+    r = await client.post("/api/v1/logs/dns-queries", json={}, headers=_h(raw))
+    assert r.status_code == 403, r.text
