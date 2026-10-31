@@ -54,6 +54,23 @@
 
 set -uo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/removable-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/removable-config-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/removable-status
@@ -152,17 +169,33 @@ if [ "${1:-}" = "--prepare" ]; then
         [ -d "$mp" ] || continue
         mountpoint -q "$mp" || continue
         sub="$mp/spatiumddi"
+        # The disk's own filesystem decides what is at this name, and the api
+        # and worker (uid 1000) can write on it too. chown and chmod follow a
+        # symlink, so a disk carrying ``spatiumddi -> /etc`` would have root
+        # hand /etc to uid 1000. A symlink is refused, and the chown / chmod
+        # run on ``.`` from inside the directory once it is checked to have
+        # resolved to itself, so a swap after the check cannot redirect them.
+        if [ -L "$sub" ]; then
+            echo "  ! $sub is a symlink, not a directory — not prepared"
+            continue
+        fi
         mkdir -p "$sub" 2>/dev/null || { echo "  ! mkdir failed: $sub"; continue; }
-        owner=$(stat -c '%u:%g' "$sub" 2>/dev/null || echo "")
+        sub_real="$(cd -P -- "$mp" 2>/dev/null && pwd -P)/spatiumddi"
+        if ! ( cd -P -- "$sub" 2>/dev/null && [ "$(pwd -P)" = "$sub_real" ] ); then
+            echo "  ! $sub did not resolve to itself — not prepared"
+            continue
+        fi
+        owner=$(cd -P -- "$sub" && stat -c '%u:%g' . 2>/dev/null || echo "")
         if [ "$owner" != "$APP_UID:$APP_GID" ]; then
-            if chown "$APP_UID:$APP_GID" "$sub" 2>/dev/null; then
+            if ( cd -P -- "$sub" && [ "$(pwd -P)" = "$sub_real" ] \
+                    && chown "$APP_UID:$APP_GID" . ) 2>/dev/null; then
                 echo "  ✓ chown $sub → $APP_UID:$APP_GID"
             else
                 echo "  ! chown refused on $sub (owner=$owner) — the destination will not be writable"
                 continue
             fi
         fi
-        chmod 0700 "$sub" 2>/dev/null || true
+        ( cd -P -- "$sub" && [ "$(pwd -P)" = "$sub_real" ] && chmod 0700 . ) 2>/dev/null || true
         echo "  ✓ ready: $sub"
     done
     exit 0
@@ -197,8 +230,8 @@ fi
 # fire-state ledger on the supervisor side is what bounds the retry.
 fail() {
     echo "  ✗ $1"
-    printf 'failed %s\n%s\n' "$(date -Iseconds)" "$1" > "$STATUS_SIDECAR"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
+    printf 'failed %s\n%s\n' "$(date -Iseconds)" "$1" | state_write "$STATUS_SIDECAR"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
     exit 1
 }
 
@@ -500,8 +533,8 @@ if [ "$RC_ANY_FAIL" -ne 0 ]; then
     fail "one or more removable mounts could not be applied"
 fi
 
-printf 'applied %s\n' "$(date -Iseconds)" > "$STATUS_SIDECAR"
-printf '%s\n' "$HASH" > "$HASH_SIDECAR"
+printf 'applied %s\n' "$(date -Iseconds)" | state_write "$STATUS_SIDECAR"
+printf '%s\n' "$HASH" | state_write "$HASH_SIDECAR"
 rm -f "$TRIGGER"
 echo "  ✓ removable mount plane applied (hash ${HASH:-<empty>})"
 exit 0

@@ -26,6 +26,23 @@
 
 set -euo pipefail
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER=/var/lib/spatiumddi/release-state/apt-config-pending
 HASH_SIDECAR=/var/lib/spatiumddi/release-state/apt-config-hash
 STATUS_SIDECAR=/var/lib/spatiumddi/release-state/apt-status
@@ -73,9 +90,9 @@ echo "  hash:   ${HASH:-<empty>}"
 
 finish() {
     # finish <state> <trigger-suffix>
-    echo "$1" > "$STATUS_SIDECAR"
-    echo "$2 $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.${2}.$(date +%s)"
+    echo "$1" | state_write "$STATUS_SIDECAR"
+    echo "$2 $(date -Iseconds)" | state_write "${TRIGGER}.state"
+    mv -T "$TRIGGER" "${TRIGGER}.${2}.$(date +%s)"
 }
 
 render_unattended() {
@@ -309,7 +326,7 @@ EOF
             # guard reads (mirrors spatiumddi-snmp-reload). Only on the
             # synced-success path — leaving it unwritten on failure paths
             # lets the supervisor re-fire/retry (bounded by the #387 backoff).
-            echo "$HASH" > "$HASH_SIDECAR"
+            echo "$HASH" | state_write "$HASH_SIDECAR"
             finish "synced" "done"
         else
             # The staged validate passed but the live run failed — re-classify
@@ -339,7 +356,7 @@ EOF
         # state stays idempotent. #164 made the disabled config_hash non-empty
         # (it covers the unattended policy), so clearing the sidecar to empty
         # would mismatch the non-empty bundle hash and re-fire on every tick.
-        echo "$HASH" > "$HASH_SIDECAR"
+        echo "$HASH" | state_write "$HASH_SIDECAR"
         echo "  ✓ managed apt sources removed; baked repos in effect (unattended policy applied)"
         finish "unmanaged" "done"
         ;;

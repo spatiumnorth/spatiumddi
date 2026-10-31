@@ -14,7 +14,7 @@
 #     = success, non-zero = failure. Applied in lexical (numeric) order.
 #     Patches must be idempotent.
 #   * Ledger: /var/lib/spatiumddi/release-state/host-patches-applied.json —
-#     atomic JSON write (python3 .new → os.replace), same convention as
+#     atomic JSON write (python3 mkstemp → os.replace), same convention as
 #     slot-versions.json. Survives slot swaps on the persistent /var.
 #   * On full success: stamps /var/lib/spatiumddi/release-state/
 #     host-template-version with the baked version (next boot skips the loop).
@@ -89,6 +89,23 @@ fi
 # so the script can be run standalone in recovery (e.g. from a rescue shell).
 mkdir -p "$STATE_DIR"
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 # ── Timestamp helper ──────────────────────────────────────────────────────────
 now_iso() {
     date -Iseconds 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S+00:00"
@@ -131,6 +148,7 @@ ledger_patch_ok() {
     local id="$1"
     local at="$2"
     python3 - "$LEDGER" "$id" "$at" <<'PY'
+import tempfile
 import sys, json, os, pathlib
 ledger_path_str, patch_id, applied_at = sys.argv[1], sys.argv[2], sys.argv[3]
 ledger_path = pathlib.Path(ledger_path_str)
@@ -148,8 +166,12 @@ data["patches"][patch_id] = {
 }
 # Preserve error key omission on success (clean record).
 text = json.dumps(data, indent=2, sort_keys=True) + "\n"
-tmp = ledger_path_str + ".new"
-pathlib.Path(tmp).write_text(text, encoding="utf-8")
+# A fresh temp name (mkstemp: O_EXCL, never through a symlink), not a fixed
+# one: the api and the supervisor can create names in release-state.
+fd, tmp = tempfile.mkstemp(prefix=".host-patches-applied.", dir=os.path.dirname(ledger_path_str) or ".")
+os.fchmod(fd, 0o644)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(text)
 os.replace(tmp, ledger_path_str)
 PY
 }
@@ -160,6 +182,7 @@ ledger_patch_fail() {
     local at="$2"
     local error="$3"
     python3 - "$LEDGER" "$id" "$at" "$error" <<'PY'
+import tempfile
 import sys, json, os, pathlib
 ledger_path_str, patch_id, applied_at, error = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 ledger_path = pathlib.Path(ledger_path_str)
@@ -180,8 +203,12 @@ data["patches"][patch_id] = {
     "error": error,
 }
 text = json.dumps(data, indent=2, sort_keys=True) + "\n"
-tmp = ledger_path_str + ".new"
-pathlib.Path(tmp).write_text(text, encoding="utf-8")
+# A fresh temp name (mkstemp: O_EXCL, never through a symlink), not a fixed
+# one: the api and the supervisor can create names in release-state.
+fd, tmp = tempfile.mkstemp(prefix=".host-patches-applied.", dir=os.path.dirname(ledger_path_str) or ".")
+os.fchmod(fd, 0o644)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(text)
 os.replace(tmp, ledger_path_str)
 PY
 }
@@ -194,6 +221,7 @@ ledger_finalize() {
     local at="$2"
     local baked_ver="$3"
     python3 - "$LEDGER" "$ok" "$at" "$baked_ver" <<'PY'
+import tempfile
 import sys, json, os, pathlib
 ledger_path_str, ok_str, reconcile_at, baked_ver = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 ledger_path = pathlib.Path(ledger_path_str)
@@ -209,8 +237,12 @@ if ok_bool and baked_ver:
 if "patches" not in data or not isinstance(data["patches"], dict):
     data["patches"] = {}
 text = json.dumps(data, indent=2, sort_keys=True) + "\n"
-tmp = ledger_path_str + ".new"
-pathlib.Path(tmp).write_text(text, encoding="utf-8")
+# A fresh temp name (mkstemp: O_EXCL, never through a symlink), not a fixed
+# one: the api and the supervisor can create names in release-state.
+fd, tmp = tempfile.mkstemp(prefix=".host-patches-applied.", dir=os.path.dirname(ledger_path_str) or ".")
+os.fchmod(fd, 0o644)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(text)
 os.replace(tmp, ledger_path_str)
 PY
 }
@@ -273,7 +305,7 @@ if [ "$all_ok" -eq 1 ]; then
     # (unless a new patch is added, in which case baked_ver > applied_ver and
     # the new patch will run while already-ok patches are skipped by the ledger
     # check above).
-    printf '%s\n' "$baked_ver" > "$APPLIED_VER_FILE"
+    printf '%s\n' "$baked_ver" | state_write "$APPLIED_VER_FILE"
     ledger_finalize "true" "$reconcile_at" "$baked_ver"
     if [ "$ran_any" -eq 1 ]; then
         echo "host-migrate: reconcile complete (template_version=$baked_ver)" >> "$LOG"

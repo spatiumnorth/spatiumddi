@@ -214,9 +214,15 @@ chmod 1770 /var/lib/spatiumddi/release-state
 # no-op'd. The runner publishes them group-writable to $SPATIUM_HOST_GID
 # (they were 0666 before GHSA-h2j9-qrg7-grfw); re-mode any that predate
 # that so an upgraded appliance is repaired on its first boot.
+#
+# Only a regular file root owns: chgrp and chmod follow a symlink, and the
+# api and the supervisor can create names in this directory, so anything
+# else at these names could point them at any host file. A root-owned file
+# in the sticky directory cannot be replaced between the check and the chmod.
 for _sc in /var/lib/spatiumddi/release-state/slot-upgrade-pending.state \
            /var/lib/spatiumddi/release-state/slot-upgrade.progress; do
-    if [ -e "$_sc" ]; then
+    if [ -f "$_sc" ] && [ ! -L "$_sc" ] \
+            && [ "$(stat -c %u -- "$_sc" 2>/dev/null)" = "$(id -u)" ]; then
         chgrp "$SPATIUM_HOST_GID" "$_sc" 2>/dev/null || true
         chmod 0660 "$_sc" 2>/dev/null || true
     fi
@@ -324,9 +330,21 @@ chmod 0755 /var/lib/spatiumddi/removable
 # root into this dir (root writes anywhere) and the supervisor (dir owner,
 # no sticky bit) can still unlink them. Created up front so the .path unit
 # has a dir to watch from first boot.
-mkdir -p /var/lib/spatiumddi/release-state/pcap
-chown 100:101 /var/lib/spatiumddi/release-state/pcap
-chmod 0755 /var/lib/spatiumddi/release-state/pcap
+#
+# The supervisor owns this name, so it can replace the directory with a
+# symlink, and chown / chmod follow one: on the next boot they would hand
+# whatever it points at (/etc, say) to uid 100. A symlink is removed (rm does
+# not follow it), and the chown / chmod are applied to ``.`` from inside the
+# directory, after checking it resolved to itself, so a swap after the check
+# cannot redirect them.
+SPATIUM_PCAP_DIR=/var/lib/spatiumddi/release-state/pcap
+[ -L "$SPATIUM_PCAP_DIR" ] && rm -f "$SPATIUM_PCAP_DIR"
+mkdir -p "$SPATIUM_PCAP_DIR"
+if ! ( cd -P "$SPATIUM_PCAP_DIR" 2>/dev/null \
+        && [ "$(pwd -P)" = "$(cd -P /var/lib/spatiumddi/release-state && pwd -P)/pcap" ] \
+        && chown 100:101 . && chmod 0755 . ); then
+    echo "WARN: $SPATIUM_PCAP_DIR is not a plain directory; left as it is" >&2
+fi
 
 # Detect the host's root block device's rotational flag so the
 # supervisor pod (which can't see the host's /proc/mounts properly —
@@ -360,8 +378,18 @@ chmod 0755 /var/lib/spatiumddi/release-state/pcap
         esac
         break
     done < /proc/mounts
-    printf '%s\n' "$detected" > /var/lib/spatiumddi/release-state/host-storage-type
-    chmod 0644 /var/lib/spatiumddi/release-state/host-storage-type
+    # A fresh temp name renamed over the sidecar (-T), never a redirect onto
+    # it: the api and the supervisor can create names in release-state, and
+    # a redirect would write through a symlink planted at this one.
+    _hst=/var/lib/spatiumddi/release-state/host-storage-type
+    if _hst_tmp=$(mktemp "$(dirname "$_hst")/.host-storage-type.XXXXXX"); then
+        if printf '%s\n' "$detected" > "$_hst_tmp" && chmod 0644 "$_hst_tmp" \
+                && mv -fT "$_hst_tmp" "$_hst"; then
+            :
+        else
+            rm -f "$_hst_tmp"
+        fi
+    fi
 }
 
 # k3s's auto-deploy manifests dir. k3s creates this on first start,
