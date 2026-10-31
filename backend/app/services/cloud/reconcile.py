@@ -666,6 +666,7 @@ async def _apply_addresses(
     # rows by releasing the FK instead of deleting). Skipped on a partial
     # pull (#430) — a failed scope makes "no longer desired" unreliable.
     if allow_delete:
+        gone: list[IPAddress] = []
         for addr, row in current.items():
             if addr not in desired_map:
                 dirty_subnets.add(row.subnet_id)
@@ -673,9 +674,12 @@ async def _apply_addresses(
                     row.cloud_endpoint_id = None
                     summary.addresses_updated += 1
                 else:
-                    await retract_address_dns(db, [row.id])
-                    await db.delete(row)
+                    gone.append(row)
                     summary.addresses_deleted += 1
+        # #3200 — one retraction for the whole sweep, before the deletes flush.
+        await retract_address_dns(db, [r.id for r in gone])
+        for row in gone:
+            await db.delete(row)
 
     for addr, d in desired_map.items():
         subnet = _find_subnet_for_ip(subnets, d.address)

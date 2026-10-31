@@ -660,6 +660,7 @@ async def _apply_addresses(
     # only when something actually changed.
     dirty_subnets: set[Any] = {s.id for s in subnets if s.kubernetes_cluster_id == cluster.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
@@ -669,9 +670,12 @@ async def _apply_addresses(
                 row.kubernetes_cluster_id = None
                 summary.addresses_updated += 1
             else:
-                await retract_address_dns(db, [row.id])
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
         # #2790: the cluster's own subnet first, then the longest prefix,
