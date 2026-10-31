@@ -28,12 +28,13 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
 from app.models.settings import PlatformSettings
 from app.services.dhcp.static_ipam import remove_ipam_for_static
+from app.services.ipam.orphan_aliases import withdrawn_for_an_orphan
 
 logger = structlog.get_logger(__name__)
 
@@ -109,17 +110,8 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
 
 def _held_for_an_orphan() -> Any:
     """Records the retention purge must leave alone (#2604): the aliases of an
-    address that is still an orphan. Mark as Orphan withdraws them so the
-    row's Restore can bring them back, and an orphan has no time limit, so
-    purging them after the retention window would make the restore partial.
-    Deleting the address for good deletes them with it."""
-    return and_(
-        DNSRecord.ip_alias.is_(True),
-        exists().where(
-            IPAddress.id == DNSRecord.ip_address_id,
-            IPAddress.status == "orphan",
-        ),
-    )
+    address that is still an orphan. See :mod:`app.services.ipam.orphan_aliases`."""
+    return withdrawn_for_an_orphan()
 
 
 async def _retract_records_from_providers(
