@@ -183,9 +183,12 @@ class PlatformSettings(Base):
     session_timeout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     auto_logout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # Password policy (issue #70). Defaults are deliberately permissive so
-    # an upgrade doesn't suddenly invalidate working passwords; operators
-    # tighten in Settings → Security. ``password_history_count = 0``
+    # Password policy (issue #70). It is checked only when a password is
+    # SET, so these defaults never invalidate a working password on
+    # upgrade; operators adjust them in Settings → Security. They are also
+    # the no-row fallback (``platform_setting_default``, #3203), so the
+    # first password on a fresh install is held to them.
+    # ``password_history_count = 0``
     # disables history checking; ``password_max_age_days = 0`` disables
     # forced rotation. Validator + history live in
     # ``app.services.password_policy``.
