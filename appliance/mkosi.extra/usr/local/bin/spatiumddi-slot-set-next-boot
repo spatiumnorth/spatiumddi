@@ -38,14 +38,18 @@ atomic_write() {  # $1 = target path, $2 = content (a newline is appended)
     local target="$1" tmp
     tmp=$(mktemp "${target}.XXXXXX") || return 1
     # mktemp makes 0600; keep the target's mode + group (the supervisor reads
-    # these as a different user), else the world-readable default.
-    if [ -e "$target" ]; then
+    # these as a different user), else the world-readable default. The api
+    # and the supervisor can create names in release-state and this runs as
+    # root, so the target may be a symlink planted there: its referent is not
+    # consulted, and the rename (-T) replaces whatever is at the name rather
+    # than moving the file into a directory a link points at.
+    if [ -f "$target" ] && [ ! -L "$target" ]; then
         chmod --reference="$target" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
         chgrp --reference="$target" "$tmp" 2>/dev/null || true
     else
         chmod 0644 "$tmp" 2>/dev/null || true
     fi
-    if printf '%s\n' "$2" > "$tmp" && fsync_path "$tmp" && mv -f "$tmp" "$target"; then
+    if printf '%s\n' "$2" > "$tmp" && fsync_path "$tmp" && mv -fT "$tmp" "$target"; then
         fsync_path "$(dirname "$target")"
     else
         rm -f "$tmp" 2>/dev/null || true
@@ -69,7 +73,7 @@ case "$SLOT" in
     slot_a|slot_b) ;;
     *)
         echo "  ERROR: unrecognised slot '$SLOT' (expected slot_a / slot_b)"
-        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        mv -T "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
         exit 1
         ;;
 esac
@@ -81,11 +85,11 @@ if /usr/local/bin/spatium-upgrade-slot set-next-boot "$SLOT"; then
     echo
     echo "  ✓ next-boot armed for $SLOT (reboot to switch)"
     atomic_write "${TRIGGER}.state" "done $(date -Iseconds)"
-    mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+    mv -T "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
 else
     echo
     echo "  ✗ set-next-boot failed"
     atomic_write "${TRIGGER}.state" "failed $(date -Iseconds)"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    mv -T "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi

@@ -14,7 +14,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import (
-    has_any_grant_for,
+    _has_any_read_grant,
     is_effective_superadmin,
     token_scoped_resource_ids,
     user_has_permission,
@@ -34,15 +34,27 @@ logger = structlog.get_logger(__name__)
 __all__ = ["execute", "visible_providers"]
 
 
+# Result type -> the resource type whose grant scoped to ONE row reaches that
+# row's own detail route: one subnet (#2438, #2569), and one space, block or
+# site (#3039, #3134). Each such provider is admitted on any read grant for its
+# type, scoped or not, that a resource-scoped API token (#374) does not narrow
+# away (the coarse gate the type's own list route makes), and
+# ``_narrow_to_grants`` cuts the rows to the granted ones. Every other provider
+# (addresses, the custom-field pass, ...) keeps its type-level gate.
+_INSTANCE_SCOPED_TYPES: dict[str, str] = {
+    "subnet": "subnet",
+    "block": "ip_block",
+    "space": "ip_space",
+    "site": "site",
+}
+
+
 def _may_read(user: User, provider: SearchProvider) -> bool:
     if provider.superadmin_only:
         return is_effective_superadmin(user)
-    if provider.type == "subnet" and not provider.also_emits:
-        # A grant scoped to ONE subnet (#2569) is a read on that subnet: admit
-        # the subnet provider on any such grant and let ``_narrow_to_grants``
-        # cut the rows to the granted ones. Only this provider: the address,
-        # block and custom-field passes keep their type-level gate.
-        return has_any_grant_for(user, "read", "subnet")
+    scoped_type = _INSTANCE_SCOPED_TYPES.get(provider.type)
+    if scoped_type is not None and not provider.also_emits:
+        return _has_any_read_grant(user, scoped_type)
     return any(user_has_permission(user, "read", rt) for rt in provider.resource_types)
 
 
@@ -95,16 +107,22 @@ def _narrow_to_token_scope(user: User, results: list[SearchResult]) -> list[Sear
 
 
 def _narrow_to_grants(user: User, results: list[SearchResult]) -> list[SearchResult]:
-    """Keep only the subnet rows the caller may read when it holds no
-    type-level read on subnets (a grant scoped to individual subnets, #2569).
+    """Keep only the subnet / space / block / site rows the caller may read
+    when it holds no type-level read on that type (a grant scoped to
+    individual rows, #2569, #3134).
 
-    A no-op for anyone with a type-level (or wildcard) subnet read."""
-    if user_has_permission(user, "read", "subnet"):
+    A no-op per type for anyone with a type-level (or wildcard) read on it."""
+    narrowed = {
+        rtype: scoped
+        for rtype, scoped in _INSTANCE_SCOPED_TYPES.items()
+        if not user_has_permission(user, "read", scoped)
+    }
+    if not narrowed:
         return results
     return [
         r
         for r in results
-        if r.type != "subnet" or user_has_permission(user, "read", "subnet", r.id)
+        if r.type not in narrowed or user_has_permission(user, "read", narrowed[r.type], r.id)
     ]
 
 

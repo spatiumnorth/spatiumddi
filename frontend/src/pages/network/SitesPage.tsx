@@ -421,6 +421,13 @@ function SiteTreeRow({
     perms.can("delete", "site"),
     "Requires delete permission on sites",
   );
+  // Edit asks what PUT /sites/{id} asks, which takes a grant scoped to this
+  // one site (#3039, #3134). Move and drag re-parent it, which a scoped
+  // holder may not, so they stay on the type-level write.
+  const editGate = permissionGate(
+    perms.can("write", "site", site.id),
+    "Requires write permission on sites",
+  );
   const kids = childrenByParent.get(site.id) ?? [];
   const hasKids = kids.length > 0;
   const isExpanded = expanded.has(site.id);
@@ -522,7 +529,7 @@ function SiteTreeRow({
             title="Edit"
             onClick={() => onEdit(site)}
             className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-            {...writeGate}
+            {...editGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
@@ -712,6 +719,13 @@ export function SitesPage() {
     perms.can("delete", "site"),
     "Requires delete permission on sites",
   );
+  // A row's Edit takes a grant scoped to that one site (#3039, #3134); Move
+  // re-parents it and stays type-level, like New and Delete.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "site", id),
+      "Requires write permission on sites",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<SiteKind | "">("");
@@ -1048,7 +1062,7 @@ export function SitesPage() {
                         title="Edit"
                         onClick={() => setEditing(s)}
                         className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                        {...writeGate}
+                        {...editGate(s.id)}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>

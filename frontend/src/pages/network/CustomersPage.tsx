@@ -223,6 +223,14 @@ export function CustomersPage() {
     perms.can("delete", "customer"),
     "Requires delete permission on customers",
   );
+  // A row's Edit asks what PUT /customers/{id} asks, which takes a grant
+  // scoped to that one customer (#3039, #3134); New and Delete stay
+  // type-level, as their routes do.
+  const editGate = (id: string) =>
+    permissionGate(
+      perms.can("write", "customer", id),
+      "Requires write permission on customers",
+    );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<CustomerStatus | "">("");
@@ -438,7 +446,7 @@ export function CustomersPage() {
                       title="Edit"
                       onClick={() => setEditing(c)}
                       className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      {...writeGate}
+                      {...editGate(c.id)}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>

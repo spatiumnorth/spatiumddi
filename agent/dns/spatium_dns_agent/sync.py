@@ -51,7 +51,12 @@ from .config_apply import (
 )
 from .drivers.base import SERIAL_UNREAD, DriverBase, HeldZone
 from .fetch import get_config
-from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
+from .instance import (
+    AGENT_INSTANCE,
+    AGENT_INSTANCE_HEADER,
+    DUPLICATE_INSTANCE_BACKOFF,
+    DUPLICATE_INSTANCE_HEADER,
+)
 from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
@@ -59,13 +64,8 @@ log = structlog.get_logger(__name__)
 # #2042 / #2044 — ``AGENT_INSTANCE`` (imported from ``instance``) names this
 # process on every config poll; re-exported here for older callers.
 
-# #2044 — set on the 409 the control plane answers when ANOTHER live agent
-# process owns this server identity (a cloned VM or a copied state dir keeps
-# the agent_id). Only the most recent process is served; this one keeps
-# serving its cached config and asks again on a slow backoff, taking the
-# server back by itself once the other one stops polling.
-DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
-DUPLICATE_INSTANCE_BACKOFF = 30.0
+# #2044 — ``DUPLICATE_INSTANCE_HEADER`` / ``DUPLICATE_INSTANCE_BACKOFF``
+# (imported from ``instance``, shared with registration since #2219).
 
 
 def _touch_ready_marker(state_dir: Path) -> None:

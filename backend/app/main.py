@@ -229,8 +229,10 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "DNS Editor": (
         "Create, edit and delete DNS zones, records, views and ACLs, and the "
-        "entries and exceptions of existing blocklists; read every DNS surface. "
-        "Infrastructure stays superadmin-only: server groups, servers and "
+        "entries and exceptions of existing blocklists; manage the TLS "
+        "certificate store DoT / DoH / DoQ serve from (upload, CSR, Let's "
+        "Encrypt, delete — not activating one as the Web UI certificate); "
+        "read every DNS surface. Infrastructure stays superadmin-only: server groups, servers and "
         "their options, TSIG keys, DNSSEC signing and policies, dynamic-update "
         "ACLs, blocklist subscriptions and assignments, GSLB pools (their "
         "health checks probe the network), zone moves and the importers.",
@@ -239,6 +241,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dns_zone"},
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
+            {"action": "admin", "resource_type": "certificate_store"},
             {"action": "read", "resource_type": "manage_dns_pools"},
             {"action": "read", "resource_type": "alert"},
         ],
@@ -358,9 +361,12 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "MetalLB, the kube-api CIDRs and pairing codes. Intended for ops "
         "staff who manage a node's lifecycle without superadmin over the "
         "DDI data plane. Granted ``admin`` on resource_type=appliance; "
-        "superadmin always bypasses anyway.",
+        "superadmin always bypasses anyway. Also granted ``admin`` on "
+        "resource_type=certificate_store, which the TLS store's routes now "
+        "check (#3067) — ``admin`` on ``appliance`` still opens them too.",
         [
             {"action": "admin", "resource_type": "appliance"},
+            {"action": "admin", "resource_type": "certificate_store"},
             {"action": "read", "resource_type": "alert"},
         ],
     ),
@@ -672,7 +678,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
     # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
     # is inserted once by migration f4c2a8e61b93, so an operator who deletes
-    # it keeps it deleted (the #2138 pattern).
+    # it keeps it deleted (the #2138 pattern). Its DHCP twin,
+    # ``dhcp_agent_duplicate_instance`` (#3143), is seeded the same way, by
+    # migration 833ee80c8c6b.
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.

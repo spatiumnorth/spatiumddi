@@ -209,6 +209,10 @@ async def _renew() -> str:
                 status="pending",
                 allow_manual=False,
                 certificate_id=cert.id,
+                # #3067 — a renewal never promotes a cert to the Web UI
+                # cert; if the row vanishes mid-order the fallback creates a
+                # fresh one, which must not take over nginx either.
+                activate_on_issue=False,
             )
             db.add(order)
             await db.flush()

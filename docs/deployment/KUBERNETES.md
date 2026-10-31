@@ -302,33 +302,41 @@ Every workload has `resources.requests`/`limits` defaults in
 blocks) and a per-component `nodeSelector` / `tolerations` / `affinity` /
 `podAnnotations`. Override them under the matching key.
 
-Per-pod memory and CPU with these defaults, measured on a one-node k3s
-cluster (amd64 and arm64), and on the appliance, which runs this same chart, are in
-[`SIZING.md`](SIZING.md#kubernetes). One api process holds about 300 MiB at
-rest, above the autoscaler's memory target (80 % of the 256Mi request), so
-with the defaults the autoscaler below runs 10 api replicas while idle; on
-the appliance the process held 0.4 to 0.85 GiB. Set
-`api.resources.requests.memory` to `512Mi`, `api.resources.limits.memory` to
-`1Gi` and `worker.resources.limits.memory` to `2Gi`.
+Per-pod memory and CPU, measured on a one-node k3s cluster (amd64 and
+arm64) and on the appliance, which runs this same chart, are in
+[`SIZING.md`](SIZING.md#kubernetes), and the api and worker defaults are
+sized from them (#3110). One api process holds about 300 MiB at rest and
+held 0.4 to 0.85 GiB on the appliance, hence its 512Mi request and 1Gi
+limit; the worker levels off near 1 GiB, hence its 2Gi limit.
 
 The **api Deployment has a HorizontalPodAutoscaler** (`autoscaling/v2`), gated
 on `api.autoscaling.enabled` (**default `true`**):
 
 ```yaml
 api:
-  replicas: 2
+  replicas: 2                            # only with autoscaling.enabled: false
   autoscaling:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
-    targetCPUUtilizationPercentage: 70
-    targetMemoryUtilizationPercentage: 80
+    targetCPUUtilizationPercentage: 70   # of the 200m request
+    targetMemoryUtilizationPercentage:   # unset: memory is opt-in
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
 ```
 
-The HPA scales on both CPU and memory utilisation. It requires a running
-metrics-server in the cluster (most managed Kubernetes offerings ship one); if
-yours doesn't, install
-[metrics-server](https://github.com/kubernetes-sigs/metrics-server) or set
+The HPA scales on CPU. Memory is opt-in (#3110): an api process holds about
+300 MiB from the moment it starts, and that does not fall as replicas are
+added, so a memory target below it holds the HPA at `maxReplicas` for good. If
+you set one, use 73 or more with the 512Mi request.
+
+While the HPA is on, the chart renders no `replicas` on the api Deployment, so
+the HPA alone sets the count and `helm upgrade` keeps it (#3111); `api.replicas`
+applies only with `api.autoscaling.enabled: false`. The HPA needs a running
+metrics-server in the cluster (most managed Kubernetes offerings ship one), and
+without one it holds the api at `minReplicas`. Install
+[metrics-server](https://github.com/kubernetes-sigs/metrics-server), or set
 `api.autoscaling.enabled: false` and manage `api.replicas` directly. No other
 workload defines an HPA — `frontend` / `worker` are fixed-replica Deployments
 (scale by editing `*.replicas`) and `beat` is a hard singleton.
@@ -660,6 +668,14 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <NEW_CHART_VERSION> \
   --namespace spatiumddi --reuse-values
 ```
+
+`--reuse-values` keeps the defaults of the chart the release was installed
+from, so upgrade once with `--reset-then-reuse-values` to take a new chart's
+defaults, such as the #3110 api sizing
+([chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#taking-a-new-charts-defaults-3110)).
+At the first upgrade to a chart with #3111 the api's replica count changes
+hands; the [chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#the-apis-replica-count-under-the-autoscaler-3111)
+says what each kind of release sees.
 
 Each upgrade renders a fresh per-revision migrate Job; the api / worker / beat
 pods' `wait-for-migrate` init containers hold their rollout until the new

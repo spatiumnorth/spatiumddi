@@ -41,8 +41,8 @@ level all three blocks can render side-by-side if values.yaml says so.
 ## Air-gap defaults
 
 - `global.imagePullPolicy: Never` everywhere. All container images
-  preload from `/usr/lib/spatiumddi/images/*.tar.zst` into
-  containerd at firstboot. No registry lookups at runtime.
+  are imported by k3s from `/var/lib/rancher/k3s/agent/images/*.tar.zst`
+  into containerd when it starts. No registry lookups at runtime.
 - `global.imageTag` defaults to the slot's `SPATIUMDDI_VERSION`
   stamp; the supervisor rewrites it on apply.
 

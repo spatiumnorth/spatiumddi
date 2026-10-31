@@ -593,9 +593,9 @@ def test_the_runner_claims_its_request_by_renaming_it() -> None:
     """
     runner = (INSTALLER.parent / "spatiumddi-storage-action").read_text()
     assert 'CLAIMED="$STATE_DIR/$RID.request.running"' in runner
-    assert 'mv "$REQUEST" "$CLAIMED"' in runner
+    assert 'mv -T "$REQUEST" "$CLAIMED"' in runner
     # The claim must precede any work, or the loop window still exists.
-    assert runner.index('mv "$REQUEST" "$CLAIMED"') < runner.index("__badreq__\" ]")
+    assert runner.index('mv -T "$REQUEST" "$CLAIMED"') < runner.index("__badreq__\" ]")
 
 
 def test_the_supervisor_cleans_up_the_claimed_request() -> None:

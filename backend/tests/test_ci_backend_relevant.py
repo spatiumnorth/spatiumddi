@@ -156,6 +156,14 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/16-trusted-proxies.envsh",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
+    # #2308 — runs the frontend's IPv6 renderer and reads both nginx templates +
+    # the image that ships it.
+    "test_frontend_ipv6_2308.py": (
+        "frontend/17-ipv6.envsh",
+        "frontend/default.conf.template",
+        "frontend/Dockerfile",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
     # #1173 — runs the frontend's TLS reload watcher and checks it is copied into
     # the image and that the chart no longer rolls the frontend on a cert change.
     "test_frontend_tls_reload_1173.py": (

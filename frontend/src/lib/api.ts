@@ -8616,6 +8616,14 @@ export interface DHCPServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #3143 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -12473,6 +12481,8 @@ export interface AcmeOrder {
   last_error: string | null;
   // True when the operator opted into solving unmanaged domains by hand.
   allow_manual: boolean;
+  // #3067 — whether a successful issue makes the cert the Web UI cert.
+  activate: boolean;
   // Populated while a manual order is "processing" — the TXT records the
   // operator must add. Empty for fully-managed orders.
   manual_challenges: AcmeManualChallenge[];
@@ -12487,6 +12497,9 @@ export interface AcmeIssueRequest {
   // dns-01 only — let an unmanaged domain be solved by an operator-pasted
   // TXT (the order goes "processing" with manual_challenges populated).
   allow_manual?: boolean;
+  // #3067 — make the issued cert the Web UI certificate (the API default).
+  // Needs admin on appliance; a certificate-store-only caller sends false.
+  activate?: boolean;
 }
 
 // Well-known Let's Encrypt directory endpoints surfaced as form

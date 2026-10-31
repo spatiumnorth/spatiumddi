@@ -48,6 +48,23 @@
 
 set -eu
 
+# Writes stdin to $1, a file in the release-state directory. The api and the
+# supervisor can create names in that directory and this runs as root, so a
+# redirect onto the name would follow a symlink planted there. Instead a temp
+# file is created exclusively (mktemp) next to it and renamed over the name:
+# whatever was at the name, a symlink included, is replaced, never written
+# through. -T: a directory at the name fails the rename instead of receiving
+# the file. $2 = mode, default 0644.
+state_write() {
+    local _dst="$1" _tmp
+    _tmp=$(mktemp "$(dirname -- "$_dst")/.$(basename -- "$_dst").XXXXXX") || return 1
+    if cat > "$_tmp" && chmod "${2:-0644}" "$_tmp" && mv -fT -- "$_tmp" "$_dst"; then
+        return 0
+    fi
+    rm -f -- "$_tmp"
+    return 1
+}
+
 TRIGGER_FILE=/var/lib/spatiumddi/release-state/firewall-pending
 APPLIED_HASH=/var/lib/spatiumddi/release-state/firewall-applied-hash
 APPLIED_STATUS=/var/lib/spatiumddi/release-state/firewall-applied-status
@@ -93,7 +110,7 @@ log() { printf '[spatium-firewall-reload] %s\n' "$*"; }
 
 write_status() {
     mkdir -p "$(dirname "$APPLIED_STATUS")"
-    printf '%s\n' "$1" > "$APPLIED_STATUS"
+    printf '%s\n' "$1" | state_write "$APPLIED_STATUS"
 }
 
 # #550 — on any failure path, move the trigger aside before exiting.
@@ -106,7 +123,7 @@ write_status() {
 fail_release() {
     write_status "$1"
     [ -f "$TRIGGER_FILE" ] \
-        && mv -f "$TRIGGER_FILE" "${TRIGGER_FILE}.failed.$(date +%s)" 2>/dev/null
+        && mv -fT "$TRIGGER_FILE" "${TRIGGER_FILE}.failed.$(date +%s)" 2>/dev/null
     exit 1
 }
 
@@ -161,13 +178,13 @@ fi
 # (the sentinel restore is what re-opens 6443 if the test had retired it).
 if [ "$TEST_MODE" = 1 ]; then
     mkdir -p "$(dirname "$LAST_GOOD")"
-    if [ -f "$DROP_IN" ]; then cp -f "$DROP_IN" "$LAST_GOOD"; else : > "$LAST_GOOD"; fi
+    if [ -f "$DROP_IN" ]; then state_write "$LAST_GOOD" < "$DROP_IN"; else state_write "$LAST_GOOD" </dev/null; fi
     if [ -f "$SENTINEL" ]; then
-        echo present > "$LAST_GOOD_SENTINEL"
+        echo present | state_write "$LAST_GOOD_SENTINEL"
     elif [ -f "$SENTINEL_RETIRED" ]; then
-        echo retired > "$LAST_GOOD_SENTINEL"
+        echo retired | state_write "$LAST_GOOD_SENTINEL"
     else
-        echo absent > "$LAST_GOOD_SENTINEL"
+        echo absent | state_write "$LAST_GOOD_SENTINEL"
     fi
     # #769 — snapshot the Web-UI sentinel too. Without this, a test-apply
     # that retires it (operator trialling a web_ui_allowed_cidrs scope) and
@@ -175,22 +192,22 @@ if [ "$TEST_MODE" = 1 ]; then
     # retired — i.e. the revert, whose whole job is to undo a lockout,
     # would itself leave the Web UI narrower than before the test.
     if [ -f "$WEBUI_SENTINEL" ]; then
-        echo present > "$LAST_GOOD_WEBUI_SENTINEL"
+        echo present | state_write "$LAST_GOOD_WEBUI_SENTINEL"
     elif [ -f "$WEBUI_SENTINEL_RETIRED" ]; then
-        echo retired > "$LAST_GOOD_WEBUI_SENTINEL"
+        echo retired | state_write "$LAST_GOOD_WEBUI_SENTINEL"
     else
-        echo absent > "$LAST_GOOD_WEBUI_SENTINEL"
+        echo absent | state_write "$LAST_GOOD_WEBUI_SENTINEL"
     fi
     # #1009 — and the SSH floor, for the same reason and more sharply: a
     # test-apply that retires it is the one change in this plane that can
     # cost the operator their own session, so a revert that left it retired
     # would strand them on exactly the ruleset nobody confirmed.
     if [ -f "$SSH_SENTINEL" ]; then
-        echo present > "$LAST_GOOD_SSH_SENTINEL"
+        echo present | state_write "$LAST_GOOD_SSH_SENTINEL"
     elif [ -f "$SSH_SENTINEL_RETIRED" ]; then
-        echo retired > "$LAST_GOOD_SSH_SENTINEL"
+        echo retired | state_write "$LAST_GOOD_SSH_SENTINEL"
     else
-        echo absent > "$LAST_GOOD_SSH_SENTINEL"
+        echo absent | state_write "$LAST_GOOD_SSH_SENTINEL"
     fi
 fi
 
@@ -272,18 +289,18 @@ if ! nft -f "$NFT_MAIN" 2>/tmp/nft-apply.err; then
 fi
 
 mkdir -p "$(dirname "$APPLIED_HASH")"
-printf '%s\n' "$HASH" > "$APPLIED_HASH"
+printf '%s\n' "$HASH" | state_write "$APPLIED_HASH"
 # #285 Phase 2b — record which base conf we applied against (sha256 of the
 # merged master file). An old runner won't write this → control plane sees
 # None → leaves the column untouched (forward-compatible).
-sha256sum "$NFT_MAIN" | cut -d' ' -f1 > "$BASE_MARKER" 2>/dev/null || true
+sha256sum "$NFT_MAIN" | cut -d' ' -f1 | state_write "$BASE_MARKER" 2>/dev/null || true
 # #285 Phase 2c — arm / clear the auto-revert deadline. A test-apply arms a
 # deadline the always-running spatiumddi-firewall-revert.timer enforces
 # unless the supervisor writes CONFIRM_FILE first (the control plane's
 # cross-node verdict). A normal apply supersedes any pending test window.
 if [ "$TEST_MODE" = 1 ]; then
     rm -f "$CONFIRM_FILE"
-    echo "$(( $(date +%s) + REVERT_SECONDS ))" > "$REVERT_DEADLINE"
+    echo "$(( $(date +%s) + REVERT_SECONDS ))" | state_write "$REVERT_DEADLINE"
     log "test-apply armed: auto-revert in ${REVERT_SECONDS}s unless confirmed"
 else
     rm -f "$REVERT_DEADLINE" "$CONFIRM_FILE"

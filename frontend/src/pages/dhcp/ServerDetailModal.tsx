@@ -38,6 +38,7 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { syncCard } from "@/lib/dhcp-sync-label";
 import { haPillTitle } from "@/lib/dhcpHa";
@@ -287,6 +288,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
       <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
+        <DuplicateAgentChip server={server} kind="DHCP" />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <InfoCard label="Status" value={server.status}>

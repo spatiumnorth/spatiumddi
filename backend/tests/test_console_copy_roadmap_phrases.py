@@ -63,8 +63,10 @@ def test_appliance_operator_does_not_claim_full_control() -> None:
     assert "superadmin" in desc.lower()
     assert "upgrade-image store" in desc
     # #2620 changed only the description: the appliance grant is untouched,
-    # beside the alert read every builtin role carries (#2588).
+    # beside the alert read every builtin role carries (#2588) and the
+    # certificate-store grant the TLS store's own type needs (#3067).
     assert perms == [
         {"action": "admin", "resource_type": "appliance"},
+        {"action": "admin", "resource_type": "certificate_store"},
         {"action": "read", "resource_type": "alert"},
     ]

@@ -14,7 +14,8 @@ from typing import Any
 import httpx
 import pytest
 
-from app.services.backup.targets.base import BackupDestinationError, describe_exc
+from app.core.exc_text import describe_exc
+from app.services.backup.targets.base import BackupDestinationError
 from app.services.backup.targets.webdav import WebDAVDestination
 
 CONFIG = {
