@@ -201,3 +201,245 @@ async def test_the_expiry_sweep_of_b_does_not_take_a_unexpired_ptrs(
         x for x in await _ptrs(db_session, zid) if x[0] in ("1", "10")
     ]
     assert str(zone.linked_subnet_id) == a
+
+
+async def _batch_of(db: AsyncSession, zid: uuid.UUID) -> dict[str, uuid.UUID | None]:
+    rows = (
+        await db.execute(
+            select(DNSRecord.name, DNSRecord.deletion_batch_id)
+            .where(DNSRecord.zone_id == zid, DNSRecord.record_type == "PTR")
+            .execution_options(include_deleted=True, populate_existing=True)
+        )
+    ).all()
+    return dict(rows)
+
+
+@pytest.mark.asyncio
+async def test_the_handover_leaves_b_own_auto_ptrs_in_b_batch(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Called while B's own PTRs are still there (B held back, or any caller that
+    did not retract them first), the handover must not move them into A's batch:
+    A's restore would publish PTRs for B's trashed addresses."""
+    from app.tasks.trash_purge import _purge_dns_zones
+
+    headers = await _admin_headers(db_session)
+    a, b, _gid, zid = await _both_trashed(client, db_session, headers)
+    old = datetime.now(UTC) - timedelta(days=60)
+    await db_session.execute(
+        update(DNSZone)
+        .where(DNSZone.id == zid)
+        .values(deleted_at=old)
+        .execution_options(include_deleted=True)
+    )
+    await db_session.commit()
+    b_row = await _subnet_row(db_session, b)
+    assert b_row is not None
+    b_batch = b_row.deletion_batch_id
+
+    await _purge_dns_zones(db_session, datetime.now(UTC) - timedelta(days=30))
+    await db_session.commit()
+    a_row = await _subnet_row(db_session, a)
+    assert a_row is not None
+    batches = await _batch_of(db_session, zid)
+    assert batches["1"] == batches["10"] == a_row.deletion_batch_id
+    assert batches["129"] == batches["130"] == b_batch
+
+
+@pytest.mark.asyncio
+async def test_the_full_expiry_sweep_hands_the_zone_to_a(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Through ``_sweep``: B's whole batch is past retention, A's is not."""
+    from app.models.settings import PlatformSettings
+    from app.services.soft_delete import TYPE_TO_MODEL
+    from app.tasks.trash_purge import _sweep
+
+    headers = await _admin_headers(db_session)
+    a, b, _gid, zid = await _both_trashed(client, db_session, headers)
+    if (await db_session.execute(select(PlatformSettings).limit(1))).scalar_one_or_none() is None:
+        db_session.add(PlatformSettings())
+    b_row = await _subnet_row(db_session, b)
+    assert b_row is not None
+    b_batch = b_row.deletion_batch_id
+    old = datetime.now(UTC) - timedelta(days=90)
+    for model in TYPE_TO_MODEL.values():
+        await db_session.execute(
+            update(model)
+            .where(model.deletion_batch_id == b_batch)
+            .values(deleted_at=old)
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+    await db_session.commit()
+
+    result = await _sweep()
+    assert result["per_type"]["subnet"] == 1, result
+    assert result["per_type"]["dns_zone"] == 0, result
+
+    db_session.expire_all()
+    assert await _subnet_row(db_session, b) is None
+    a_row = await _subnet_row(db_session, a)
+    assert a_row is not None
+    zone = await _zone(db_session, zid)
+    assert zone is not None and zone.deletion_batch_id == a_row.deletion_batch_id
+    assert str(zone.linked_subnet_id) == a
+    assert await _ptrs(db_session, zid) == [("1", False), ("10", False)]
+
+    from app.models.audit import AuditLog
+
+    handover = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dns_zone", AuditLog.resource_id == str(zid)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any((r.new_value or {}).get("handed_over_to_subnet") == a for r in handover)
+
+    r = await client.post(f"/api/v1/admin/trash/subnet/{a}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert await _ptrs(db_session, zid) == [("1", True), ("10", True)]
+
+
+@pytest.mark.asyncio
+async def test_the_trash_purge_audits_the_handover(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.audit import AuditLog
+
+    headers = await _admin_headers(db_session)
+    a, b, _gid, zid = await _both_trashed(client, db_session, headers)
+    r = await client.delete(f"/api/v1/admin/trash/subnet/{b}", headers=headers)
+    assert r.status_code == 204, r.text
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dns_zone", AuditLog.resource_id == str(zid)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [
+        (x.new_value or {}).get("handed_over_to_subnet") for x in rows if x.action == "update"
+    ] == [a]
+    assert not [x for x in rows if x.action == "permanent_delete"]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_delete_of_b_keeps_trashed_a_ptrs(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The permanent subnet delete (``?permanent=true``) of B while A sits in the
+    Trash used to delete the shared zone with every record in it, A's included."""
+    headers = await _admin_headers(db_session)
+    a, b, _gid, zid = await _setup(client, db_session, headers)
+    r = await client.delete(f"/api/v1/ipam/subnets/{a}", headers=headers)
+    assert r.status_code == 204, r.text
+    r = await client.delete(f"/api/v1/ipam/subnets/{b}?permanent=true&force=true", headers=headers)
+    assert r.status_code == 204, r.text
+
+    assert await _subnet_row(db_session, b) is None
+    a_row = await _subnet_row(db_session, a)
+    assert a_row is not None
+    zone = await _zone(db_session, zid)
+    assert zone is not None and zone.deleted_at is not None
+    assert zone.deletion_batch_id == a_row.deletion_batch_id
+    assert await _ptrs(db_session, zid) == [("1", False), ("10", False)]
+
+    r = await client.post(f"/api/v1/admin/trash/subnet/{a}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    zone = await _zone(db_session, zid)
+    assert zone is not None and zone.deleted_at is None
+    assert await _ptrs(db_session, zid) == [("1", True), ("10", True)]
+
+
+@pytest.mark.asyncio
+async def test_a_pre_2741_live_zone_left_on_b_keeps_trashed_a_ptrs(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A zone still LIVE on trashed B (what the block / space deletes left before
+    #2741) is retired by B's purge; it must not take A's trashed PTRs with it."""
+    headers = await _admin_headers(db_session)
+    a, b, _gid, zid = await _both_trashed(client, db_session, headers)
+    zone = await _zone(db_session, zid)
+    assert zone is not None
+    zone.deleted_at = None
+    zone.deleted_by_user_id = None
+    zone.deletion_batch_id = None
+    await db_session.commit()
+
+    r = await client.delete(f"/api/v1/admin/trash/subnet/{b}", headers=headers)
+    assert r.status_code == 204, r.text
+    a_row = await _subnet_row(db_session, a)
+    assert a_row is not None
+    zone = await _zone(db_session, zid)
+    assert zone is not None and zone.deletion_batch_id == a_row.deletion_batch_id
+    assert await _ptrs(db_session, zid) == [("1", False), ("10", False)]
+    r = await client.post(f"/api/v1/admin/trash/subnet/{a}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert await _ptrs(db_session, zid) == [("1", True), ("10", True)]
+
+
+@pytest.mark.asyncio
+async def test_three_sharers_hand_the_zone_down_the_line(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    ids = await _fixture(db_session)
+    space_id, block_id, gid, zid_fwd = ids
+    from app.models.ipam import IPBlock
+
+    child = IPBlock(
+        space_id=uuid.UUID(space_id),
+        parent_block_id=uuid.UUID(block_id),
+        network="10.67.7.0/24",
+        name="c",
+    )
+    db_session.add(child)
+    await db_session.commit()
+    sids = []
+    for net in ("10.67.7.0/26", "10.67.7.64/26", "10.67.7.128/25"):
+        r = await client.post(
+            "/api/v1/ipam/subnets",
+            headers=headers,
+            json={
+                "space_id": space_id,
+                "block_id": str(child.id),
+                "network": net,
+                "dns_group_id": gid,
+                "dns_zone_id": zid_fwd,
+            },
+        )
+        assert r.status_code == 201, r.text
+        sids.append(r.json()["id"])
+    a, c, b = sids
+    await _address(client, headers, a, "10.67.7.10", "ha")
+    await _address(client, headers, c, "10.67.7.70", "hc")
+    await _address(client, headers, b, "10.67.7.130", "hb")
+    zone = await _zone_row(db_session, gid, "7.67.10.in-addr.arpa.")
+    assert zone is not None
+    zid = zone.id
+    for sid in (a, c, b):
+        r = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+        assert r.status_code == 204, r.text
+
+    r = await client.delete(f"/api/v1/admin/trash/subnet/{b}", headers=headers)
+    assert r.status_code == 204, r.text
+    zone_now = await _zone(db_session, zid)
+    assert zone_now is not None and str(zone_now.linked_subnet_id) == c
+    r = await client.delete(f"/api/v1/admin/trash/subnet/{c}", headers=headers)
+    assert r.status_code == 204, r.text
+    zone_now = await _zone(db_session, zid)
+    assert zone_now is not None and str(zone_now.linked_subnet_id) == a
+    assert await _ptrs(db_session, zid) == [("1", False), ("10", False)]
+
+    r = await client.post(f"/api/v1/admin/trash/subnet/{a}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert await _ptrs(db_session, zid) == [("1", True), ("10", True)]

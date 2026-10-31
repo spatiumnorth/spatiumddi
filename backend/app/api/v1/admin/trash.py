@@ -165,6 +165,26 @@ def _purge_audit(current_user: Any, resource_type: str, row: Any) -> AuditLog:
     )
 
 
+def _handover_audit(current_user: Any, zone: Any, heir: Any) -> AuditLog:
+    """The auto reverse zone a subnet purge left in the Trash for another
+    trashed subnet whose records still sit in it (spatiumddi#3190)."""
+    return AuditLog(
+        user_id=current_user.id,
+        user_display_name=current_user.display_name,
+        auth_source=current_user.auth_source,
+        action="update",
+        resource_type="dns_zone",
+        resource_id=str(zone.id),
+        resource_display=_row_label(zone),
+        result="success",
+        new_value={
+            "handed_over_to_subnet": str(heir.id),
+            "deletion_batch_id": str(heir.deletion_batch_id),
+            "reason": "another trashed subnet's records still sit in the zone",
+        },
+    )
+
+
 def _refuse_live_children(label: str, live: list[str]) -> None:
     shown = ", ".join(live[:5]) + (f" and {len(live) - 5} more" if len(live) > 5 else "")
     raise HTTPException(
@@ -343,7 +363,10 @@ async def _prepare_subnet_purge(
     from app.services.dns.reverse_zone import purge_auto_reverse_zones  # noqa: PLC0415
 
     groups = groups | await purge_auto_reverse_zones(
-        db, subnets, audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z))
+        db,
+        subnets,
+        audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z)),
+        audit_handover=lambda z, heir: db.add(_handover_audit(current_user, z, heir)),
     )
     return retracted, groups
 

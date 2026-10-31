@@ -259,7 +259,25 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
             # #3190 — a shared auto reverse zone holding the PTRs of a trashed
             # subnet that has NOT expired is handed to that subnet's batch, not
             # purged out from under it.
-            if await hand_over_zone_to_trashed_sharer(db, zone) is not None:
+            heir = await hand_over_zone_to_trashed_sharer(db, zone)
+            if heir is not None:
+                db.add(
+                    AuditLog(
+                        user_id=None,
+                        user_display_name="system",
+                        auth_source="system",
+                        action="update",
+                        resource_type="dns_zone",
+                        resource_id=str(zone.id),
+                        resource_display=zone.name,
+                        new_value={
+                            "handed_over_to_subnet": str(heir.id),
+                            "deletion_batch_id": str(heir.deletion_batch_id),
+                            "reason": "another trashed subnet's records still sit in the zone",
+                        },
+                        result="success",
+                    )
+                )
                 continue
             await purge_trashed_zone(db, zone)
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
