@@ -12,6 +12,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
 vi.mock("@/lib/api", () => ({
+  tagsApi: {
+    listKeys: () => Promise.resolve({ keys: ["env", "site"] }),
+    listValues: () => Promise.resolve({ values: [] }),
+  },
   dhcpApi: {
     listOptionCodes: () =>
       Promise.resolve([
@@ -39,6 +43,7 @@ vi.mock("@/lib/api", () => ({
 
 import { DHCPOptionsEditor } from "@/pages/dhcp/DHCPOptionsEditor";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { Modal } from "@/components/ui/modal";
 
 afterEach(cleanup);
@@ -69,6 +74,15 @@ function PickerDialog({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="New thing" onClose={onClose}>
       <IPAddressPicker value={id} onChange={setId} />
+    </Modal>
+  );
+}
+
+function TagDialog({ onClose }: { onClose: () => void }) {
+  const [tags, setTags] = useState<string[]>([]);
+  return (
+    <Modal title="Wake schedule" onClose={onClose}>
+      <TagFilterChips value={tags} onChange={setTags} />
     </Modal>
   );
 }
@@ -112,6 +126,23 @@ describe("Esc on a suggestion reached with Tab (#3157)", () => {
     await user.keyboard("{Escape}");
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.queryByText("h1 · 10.0.0.0/24 · default")).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("tag filter: closes the list, the dialog stays", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    wrap(<TagDialog onClose={onClose} />);
+    await user.click(screen.getByPlaceholderText(/Filter by tag/));
+    await screen.findByText("env");
+    await user.tab();
+    expect(document.activeElement).toBe(
+      screen.getByText("env").closest("button"),
+    );
+    await user.keyboard("{Escape}");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByText("env")).toBeNull();
     await user.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
