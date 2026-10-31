@@ -3610,9 +3610,18 @@ the step failure itself had (#1542).
 **Rolling back, and why a Kubernetes minor is different (#974).**
 
 For a same-minor release an **A/B slot revert is a rollback**: boot the
-previous slot and the node is as it was. Across a Kubernetes *minor* it
-is not, and the difference is easy to miss because the slot machinery
-behaves identically.
+previous slot and the node is as it was, with one exception, the node's
+container images. k3s imports its image tarballs from the shared `/var`,
+which holds the newest upgraded slot's set, so a rolled-back slot can
+come up with pods in `ErrImageNeverPull` if containerd no longer holds
+its images (a cluster join on the newer slot, or kubelet image GC,
+removes them). Recovery by hand is in
+[Troubleshooting](../TROUBLESHOOTING.md#pods-stuck-in-errimageneverpull-after-a-slot-rollback);
+the permanent fix is tracked in
+[#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169). Across a
+Kubernetes *minor* the revert is not a rollback at all, and the
+difference is easy to miss because the slot machinery behaves
+identically.
 
 The k3s datastore (`/var/lib/rancher/k3s`) lives on the persistent
 `/var`, **outside the A/B slot**. Booting a slot that carries the older
