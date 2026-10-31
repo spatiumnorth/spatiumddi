@@ -244,6 +244,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     page's permanent delete goes through the same helper and fails the same
     way (#1830).
     """
+    from app.services.dns.reverse_zone import hand_over_zone_to_trashed_sharer  # noqa: PLC0415
     from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
@@ -255,6 +256,11 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     skipped = 0
     for zone in res.scalars().all():
         try:
+            # #3190 — a shared auto reverse zone holding the PTRs of a trashed
+            # subnet that has NOT expired is handed to that subnet's batch, not
+            # purged out from under it.
+            if await hand_over_zone_to_trashed_sharer(db, zone) is not None:
+                continue
             await purge_trashed_zone(db, zone)
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
