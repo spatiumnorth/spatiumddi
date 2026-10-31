@@ -15,6 +15,8 @@ udev rules add — measured on a real md array.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -92,3 +94,74 @@ def test_a_single_disk_is_unchanged(tmp_path, monkeypatch) -> None:
     }
     _host(tmp_path, monkeypatch, records, "66666666-7777-4888-9999-aaaaaaaaaaaa")
     assert slot_service._current_slot_from_cmdline() == "slot_b"
+
+
+# The supervisor carries its own copy of ``_current_slot_from_cmdline`` (a
+# separate package). Fleet reads the supervisor's answer, the api its own, so
+# the two must agree on every record set — including the precedence cases
+# where a record carries more than one name.
+PARITY_CASES: list[tuple[str, dict[str, str], str]] = [
+    ("mirror-a", MIRROR, ROOT_A_FS),
+    ("mirror-b", MIRROR, ROOT_B_FS),
+    ("md-link-only", {"b9:125": f"S:disk/by-uuid/{ROOT_A_FS}\nS:md/root_a\n"}, ROOT_A_FS),
+    (
+        "devname-only",
+        {"b9:125": f"S:disk/by-uuid/{ROOT_A_FS}\nE:MD_DEVNAME=root_a\n"},
+        ROOT_A_FS,
+    ),
+    (
+        "devname-beats-link-link-first",
+        {"b9:125": f"S:md/root_b\nS:disk/by-uuid/{ROOT_A_FS}\nE:MD_DEVNAME=root_a\n"},
+        ROOT_A_FS,
+    ),
+    (
+        "devname-beats-link-devname-first",
+        {"b9:125": f"E:MD_DEVNAME=root_a\nS:disk/by-uuid/{ROOT_A_FS}\nS:md/root_b\n"},
+        ROOT_A_FS,
+    ),
+    (
+        "partlabel-beats-devname",
+        {
+            "b9:125": f"E:MD_DEVNAME=root_b\nS:disk/by-uuid/{ROOT_A_FS}\nS:disk/by-partlabel/root_A\n"
+        },
+        ROOT_A_FS,
+    ),
+    (
+        "empty-devname-falls-back-to-link",
+        {"b9:125": f"E:MD_DEVNAME=\nS:disk/by-uuid/{ROOT_A_FS}\nS:md/ROOT_B\n"},
+        ROOT_A_FS,
+    ),
+    ("non-slot-array", {"b9:126": f"S:disk/by-uuid/{ROOT_A_FS}\nE:MD_DEVNAME=var\n"}, ROOT_A_FS),
+    ("member-only-no-fs-uuid", {"b254:4": "S:disk/by-partlabel/root_A\n"}, ROOT_A_FS),
+    (
+        "single-disk",
+        {"b8:4": f"S:disk/by-partlabel/root_A\nS:disk/by-uuid/{ROOT_A_FS}\n"},
+        ROOT_A_FS,
+    ),
+]
+
+
+def _supervisor_state():  # type: ignore[no-untyped-def]
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "agent/supervisor/spatium_supervisor/appliance_state.py"
+    )
+    if not path.exists():
+        pytest.skip("agent/supervisor is not in this checkout")
+    spec = importlib.util.spec_from_file_location("_sup_appliance_state_3172", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize(
+    ("records", "root"), [c[1:] for c in PARITY_CASES], ids=[c[0] for c in PARITY_CASES]
+)
+def test_supervisor_copy_agrees(tmp_path, monkeypatch, records, root) -> None:
+    sup = _supervisor_state()
+    _host(tmp_path, monkeypatch, records, root)
+    monkeypatch.setattr(sup, "_UDEV_DATA", slot_service._UDEV_DATA)
+    monkeypatch.setattr(sup, "_PROC_CMDLINE", slot_service._PROC_CMDLINE)
+    assert sup._current_slot_from_cmdline() == slot_service._current_slot_from_cmdline()

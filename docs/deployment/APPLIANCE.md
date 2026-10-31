@@ -2568,7 +2568,12 @@ landed past the array's end back inside it, the mapping is removed, and
 `e2fsck -n` checks the result through the array alone before the
 bootloader is touched. Only the overflow is staged, a few MiB. If the
 mapping cannot be removed the apply fails and says so: it holds the
-array open, and a slot that cannot be mounted cannot be booted.
+array open, and a slot that cannot be mounted cannot be booted. The
+mapping is also torn down when the write fails or the upgrade unit is
+stopped or times out (SIGTERM). Finally, an image whose root filesystem
+carries no `mdadm` (anything built before #999 added it) is refused
+before GRUB is pointed at it: its initrd could not assemble the array,
+and the node would stop in the initramfs.
 
 ### Installing onto a multipath SAN LUN (#999 Part C3)
 

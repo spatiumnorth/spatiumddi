@@ -36,6 +36,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -839,6 +840,7 @@ def cmd_apply(args) -> int:
         write_dev = target_dev
         spill_loop: str | None = None
         array_bytes: int | None = None
+        prev_sigterm = None
         if inactive.get("members"):
             image_bytes = _xz_uncompressed_bytes(staged)
             array_bytes = _device_bytes(target_dev)
@@ -852,6 +854,10 @@ def cmd_apply(args) -> int:
                 print(f"  mirrored slot: {target_dev} is {array_bytes} B, the image "
                       f"{image_bytes} B — writing through a spill device, then "
                       "shrinking the filesystem into the array")
+                # The unit's stop / TimeoutStartSec arrives as SIGTERM, whose
+                # default action skips every ``finally`` — and with it the
+                # spill teardown, leaving the mapping holding the array open.
+                prev_sigterm = signal.signal(signal.SIGTERM, _exit_on_sigterm)
                 write_dev, spill_loop = _open_spill(target_dev, array_bytes, image_bytes)
 
         # Decompress + dd directly into the inactive partition. xz can
@@ -872,12 +878,14 @@ def cmd_apply(args) -> int:
         _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
         print(f"  writing → {target_dev} (paced to "
               f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
-        xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
-                              stdout=subprocess.PIPE)
-        dd = subprocess.Popen(["dd", f"of={write_dev}", "bs=4M", "iflag=fullblock",
-                               "oflag=direct", "conv=fsync", "status=progress"],
-                              stdin=subprocess.PIPE)
+        xz: subprocess.Popen | None = None
+        dd: subprocess.Popen | None = None
         try:
+            xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
+                                  stdout=subprocess.PIPE)
+            dd = subprocess.Popen(["dd", f"of={write_dev}", "bs=4M", "iflag=fullblock",
+                                   "oflag=direct", "conv=fsync", "status=progress"],
+                                  stdin=subprocess.PIPE)
             try:
                 _paced_copy(xz.stdout, dd.stdin)
             except BrokenPipeError:
@@ -902,7 +910,17 @@ def cmd_apply(args) -> int:
                     _write_progress("failed", None, failure)
                     return 4
         finally:
+            if spill_loop is not None:
+                # A writer still running (an exception or a signal cut the
+                # copy short) holds the mapping open: stop it first, or the
+                # teardown below cannot remove it.
+                for proc in (dd, xz):
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
             spill_gone = spill_loop is None or _close_spill(spill_loop)
+            if prev_sigterm is not None:
+                signal.signal(signal.SIGTERM, prev_sigterm)
         if not spill_gone:
             msg = (f"could not remove the spill mapping /dev/mapper/{_SPILL_DM_NAME}; "
                    f"it holds {target_dev} open. `dmsetup remove {_SPILL_DM_NAME}` "
@@ -913,7 +931,11 @@ def cmd_apply(args) -> int:
         if spill_loop is not None:
             # Read back through the array alone: the spill device is gone,
             # so a block the shrink left behind in it reads as corruption
-            # here, before the bootloader is ever pointed at the slot.
+            # here, before the bootloader is ever pointed at the slot. The
+            # write reached the array through the mapping, never through the
+            # array's own page cache, so drop whatever that cache still holds
+            # of the old filesystem before anything reads or edits it.
+            subprocess.run(["blockdev", "--flushbufs", target_dev], check=False)
             if subprocess.run(["e2fsck", "-f", "-n", target_dev], check=False).returncode != 0:
                 msg = (f"the filesystem on {target_dev} does not check clean after "
                        "fitting it into the mirror; the active slot is untouched")
@@ -1047,6 +1069,20 @@ def cmd_apply(args) -> int:
         print(f"ERROR: {msg}", file=sys.stderr)
         _write_progress("failed", None, msg)
         return 5
+
+    # #3172 — the same last-line-of-defence position, for a mirror: the root
+    # filesystem is an md array, which only an initrd carrying mdadm can
+    # assemble. An image built before #999 put mdadm in the package set has
+    # none, and pointing GRUB at it is a node that stops in the initramfs.
+    if inactive.get("members") and _slot_has_mdadm(inactive) is False:
+        msg = (
+            f"the image written to {inactive['partlabel']} carries no mdadm, so "
+            "its initrd cannot assemble this mirrored root. Refusing to make it "
+            "bootable; the active slot is untouched."
+        )
+        print(f"ERROR: {msg}", file=sys.stderr)
+        _write_progress("failed", None, msg)
+        return 4
 
     # Sync the sidecar FIRST so the renderer reads correct per-slot labels
     # when it re-renders grub.cfg below. (Previously sync_slot_versions was
@@ -1219,6 +1255,32 @@ def _refresh_baked_images(target_dev: str) -> None:
 # gigabytes of the /var the cluster is running on.
 _SPILL_DM_NAME = "spatium-slot-write"
 _SPILL_TAIL_NAME = "slot-tail.raw"
+
+
+def _exit_on_sigterm(signum, _frame) -> None:
+    """Turn SIGTERM into SystemExit while the spill is mapped, so the
+    ``finally`` that tears it down runs."""
+    raise SystemExit(128 + signum)
+
+
+def _slot_has_mdadm(slot: dict[str, str]) -> bool | None:
+    """Does the slot's rootfs carry mdadm (and so an initrd that can
+    assemble an md root)? None when the slot cannot be mounted — the caller
+    refuses only on a definite no, like the #1026 check."""
+    mountpoint = Path(f"/run/spatium-slot-probe-{slot['partlabel']}")
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            run(["mount", "-o", "ro", slot["device"], str(mountpoint)])
+        except subprocess.CalledProcessError:
+            return None
+        return any((mountpoint / rel).exists() for rel in ("usr/sbin/mdadm", "sbin/mdadm"))
+    finally:
+        run(["umount", str(mountpoint)], check=False)
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            pass  # cosmetic: an empty dir under /run, a tmpfs
 
 
 def _xz_uncompressed_bytes(path: Path) -> int | None:

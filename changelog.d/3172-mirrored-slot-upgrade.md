@@ -14,7 +14,10 @@
   members. Because the array is 9 MiB smaller than the image, the image
   is written through a temporary device-mapper overflow and its
   filesystem shrunk into the array with `resize2fs`, then checked with
-  `e2fsck` before the bootloader is pointed at it. `rollback` now also
+  `e2fsck` before the bootloader is pointed at it. The overflow mapping
+  is removed even when the write fails or the upgrade is stopped, and an
+  image too old to carry `mdadm` is refused on a mirror, since its initrd
+  could not assemble the array. `rollback` now also
   copies the boot config to the second disk's ESP, as the other slot
   commands already did, and so does firstboot when it commits a trial
   boot, so the second disk no longer boots the slot just upgraded away

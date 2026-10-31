@@ -316,6 +316,12 @@ def applying(slot_cli, monkeypatch, tmp_path):
         slot_cli.mounted.append(("probe", slot["device"]))
         return {"APPLIANCE_VERSION": "2026.10.30-1", "APPLIANCE_ARCH": "amd64"}, ""
     monkeypatch.setattr(slot_cli, "slot_probe", probe)
+
+    def has_mdadm(slot):
+        slot_cli.mounted.append(("mdadm", slot["device"]))
+        return slot_cli.image_has_mdadm
+    slot_cli.image_has_mdadm = True
+    monkeypatch.setattr(slot_cli, "_slot_has_mdadm", has_mdadm)
     return slot_cli
 
 
@@ -346,7 +352,9 @@ def test_apply_writes_the_inactive_array_never_a_member(applying, host) -> None:
     assert not h.ran("partprobe")
     # The #1026 arch check, the version sidecar and the #3169-area image
     # refresh all mount the array.
-    assert set(applying.mounted) == {("probe", "/dev/md127"), ("refresh", "/dev/md127")}
+    assert set(applying.mounted) == {
+        ("probe", "/dev/md127"), ("refresh", "/dev/md127"), ("mdadm", "/dev/md127"),
+    }
 
     # GRUB is rendered with the FILESYSTEM UUIDs, and both ESPs get it.
     render = h.ran("spatium-grub-render")[0]
@@ -381,6 +389,87 @@ def test_apply_refuses_when_the_shrink_fails(applying, host, monkeypatch) -> Non
     assert not h.ran("spatium-grub-render")
 
 
+def test_apply_drops_the_arrays_stale_cache_before_reading_it_back(applying, host) -> None:
+    h = host(MIRROR, ROOT_A_FS)
+    assert applying.cmd_apply(_apply_args()) == 0
+    flush = h.calls.index(["blockdev", "--flushbufs", "/dev/md127"])
+    assert h.calls.index(["dmsetup", "remove", "--retry", "spatium-slot-write"]) < flush
+    assert flush < h.calls.index(["e2fsck", "-f", "-n", "/dev/md127"])
+
+
+def test_a_failed_write_still_tears_the_spill_down(applying, host, monkeypatch) -> None:
+    h = host(MIRROR, ROOT_A_FS)
+    real_popen = h.Popen
+
+    def failing_dd(argv, **kw):
+        if argv[0] == "dd":
+            h.popen.append([str(a) for a in argv])
+            return _REAL_POPEN(["sh", "-c", "cat >/dev/null; exit 1"], **kw)
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(applying.subprocess, "Popen", failing_dd)
+    with pytest.raises(subprocess.CalledProcessError):
+        applying.cmd_apply(_apply_args())
+    assert h.ran("dmsetup", "remove", "--retry", "spatium-slot-write")
+    assert h.ran("losetup", "-d", "/dev/loop7")
+    assert not h.ran("resize2fs") and not h.ran("spatium-grub-render")
+
+
+def test_sigterm_mid_write_tears_the_spill_down(applying, host, monkeypatch) -> None:
+    """The unit's stop or timeout is a SIGTERM, whose default action runs no
+    ``finally``: the mapping would stay, holding the array open."""
+    import os
+    import signal
+
+    h = host(MIRROR, ROOT_A_FS)
+
+    class Unhandled(Exception):
+        pass
+
+    def unhandled(*_):
+        raise Unhandled  # stands in for the default action: no teardown
+
+    # Never the real default action: on a regression that would kill pytest.
+    previous = signal.signal(signal.SIGTERM, unhandled)
+    writers = []
+
+    def popen(argv, **kw):
+        proc = Host.Popen(h, argv, **kw)
+        writers.append(proc)
+        return proc
+
+    monkeypatch.setattr(applying.subprocess, "Popen", popen)
+    monkeypatch.setattr(applying, "_paced_copy",
+                        lambda src, dst, **kw: os.kill(os.getpid(), signal.SIGTERM))
+    try:
+        with pytest.raises(SystemExit) as exc:
+            applying.cmd_apply(_apply_args())
+    finally:
+        after = signal.signal(signal.SIGTERM, previous)
+    assert exc.value.code == 128 + signal.SIGTERM
+    assert after is unhandled, "the previous handler was restored"
+    assert h.ran("dmsetup", "remove", "--retry", "spatium-slot-write")
+    assert h.ran("losetup", "-d", "/dev/loop7")
+    assert all(p.poll() is not None for p in writers), "the writers were stopped"
+    assert not h.ran("spatium-grub-render")
+
+
+def test_apply_refuses_an_image_that_cannot_assemble_the_mirror(applying, host) -> None:
+    h = host(MIRROR, ROOT_A_FS)
+    applying.image_has_mdadm = False
+    assert applying.cmd_apply(_apply_args()) == 4
+    assert not h.ran("spatium-grub-render")
+    assert not h.ran("/usr/local/bin/spatiumddi-esp-sync")
+    progress = json.loads(applying._PROGRESS_FILE.read_text())
+    assert progress["step"] == "failed" and "mdadm" in progress["detail"]
+
+
+def test_an_unmountable_slot_is_not_refused_for_mdadm(applying, host) -> None:
+    host(MIRROR, ROOT_A_FS)
+    applying.image_has_mdadm = None
+    assert applying.cmd_apply(_apply_args()) == 0
+
+
 def test_single_disk_apply_writes_the_partition_directly(applying, host) -> None:
     h = host(SINGLE, SINGLE_A)
     assert applying.cmd_apply(_apply_args()) == 0
@@ -388,6 +477,7 @@ def test_single_disk_apply_writes_the_partition_directly(applying, host) -> None
     assert not h.ran("dmsetup") and not h.ran("resize2fs") and not h.ran("blockdev")
     assert not h.ran("xz")
     assert h.ran("partprobe")
+    assert ("mdadm", "/dev/sda5") not in applying.mounted, "no mirror gate on one disk"
 
 
 # ══════════════════════════════════════════════════════════════════════
