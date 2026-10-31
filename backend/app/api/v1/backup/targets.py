@@ -986,7 +986,26 @@ async def download_target_archive(
     )
 
 
-@router.get("/{target_id}/archives/{filename}/manifest-preview")
+class ArchiveManifestPreviewResponse(BaseModel):
+    """What ``manifest_preview_payload`` returns, as a published schema.
+
+    Typed so the route does not join the untyped-routes baseline (#917).
+    Field for field the body of ``POST /backup/manifest-preview``.
+    """
+
+    manifest: dict[str, Any]
+    archive_bytes: int
+    format_recognised: bool
+    dump_format: str | None = None
+    selective_restore_supported: bool
+    restorable: bool
+    restore_refusal: str | None = None
+
+
+@router.get(
+    "/{target_id}/archives/{filename}/manifest-preview",
+    response_model=ArchiveManifestPreviewResponse,
+)
 async def preview_target_archive_manifest(
     target_id: uuid.UUID,
     filename: str,

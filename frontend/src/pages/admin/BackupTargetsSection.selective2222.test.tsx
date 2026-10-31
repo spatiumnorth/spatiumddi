@@ -62,7 +62,7 @@ function preview(
   };
 }
 
-async function openModal(p: BackupManifestPreviewResponse) {
+async function openModal(p: BackupManifestPreviewResponse | Error) {
   list.mockResolvedValue([
     {
       id: "t-1",
@@ -85,7 +85,8 @@ async function openModal(p: BackupManifestPreviewResponse) {
     ],
     note: null,
   });
-  previewArchiveManifest.mockResolvedValue(p);
+  if (p instanceof Error) previewArchiveManifest.mockRejectedValue(p);
+  else previewArchiveManifest.mockResolvedValue(p);
   render(
     (
       <QueryClientProvider client={new QueryClient()}>
@@ -116,5 +117,17 @@ describe("Restore from archive: Selective needs a custom-format dump (#2222)", (
     await openModal(preview("custom"));
     await vi.waitFor(() => expect(selectiveRadio().disabled).toBe(false));
     expect(screen.queryByText(/dump is plain SQL/)).toBeNull();
+  });
+
+  it("keeps Full restore available when the format cannot be read", async () => {
+    await openModal(new Error("destination unreachable"));
+    expect(await screen.findByText(/could not be read/)).toBeTruthy();
+    expect(selectiveRadio().disabled).toBe(true);
+    const full = screen
+      .getByText("Full restore", { selector: "strong" })
+      .closest("label")!
+      .querySelector("input") as HTMLInputElement;
+    expect(full.disabled).toBe(false);
+    expect(full.checked).toBe(true);
   });
 });
