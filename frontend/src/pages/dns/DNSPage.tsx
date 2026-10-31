@@ -4059,7 +4059,7 @@ type ZoneSubtab = "records" | "pools" | "certs" | "drift";
 // is split, and each call is its own trash batch — the confirm copy says so.
 const BULK_DELETE_CHUNK = 2000;
 
-function ZoneDetailView({
+export function ZoneDetailView({
   group,
   zone,
   highlightRecordId,
@@ -5463,8 +5463,8 @@ function ZoneDetailView({
                 {bulkPermanent
                   ? "? This cannot be undone."
                   : selectedRecords.size > BULK_DELETE_CHUNK
-                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches in Admin → Trash, each restored separately.`
-                    : " to the trash? They can be restored together from Admin → Trash."}{" "}
+                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
+                    : " to the trash? A superadmin can restore them together from Administration → Trash."}{" "}
                 IPAM-managed records are excluded automatically.
               </p>
               {isSuperadmin && (
