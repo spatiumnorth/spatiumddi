@@ -3597,7 +3597,10 @@ running. A node Fleet has scheduled hears of this before its reboot,
 so its first pass on the new slot already leaves the chart alone. Once
 every member reports one version, the next heartbeat moves the chart to
 the new tag and each node's DNS and DHCP pods restart once. A role change
-made while the versions differ is applied then too. Nothing pins the
+made while the versions differ is applied then too. A member that is
+down while on the old version counts at the version it last reported,
+so the chart waits for it: bring it back and upgrade it, or replace it
+from Fleet. Nothing pins the
 bootstrap and control charts on this path, and the seed's own boot
 renders them from its new slot: upgrade the members first and the seed
 last, or use the Rolling Upgrade, which holds those too.
