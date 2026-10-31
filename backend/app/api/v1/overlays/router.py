@@ -613,7 +613,17 @@ async def _validate_overlay_site_fks(
 
     preferred = getattr(body, "preferred_circuits", None)
     if preferred:
-        rows = (await db.execute(select(Circuit).where(Circuit.id.in_(preferred)))).scalars().all()
+        # Circuit is outside the global soft-delete filter (``app.db``), so
+        # a deleted circuit is excluded here by hand: it is "not found" (#3191).
+        rows = (
+            (
+                await db.execute(
+                    select(Circuit).where(Circuit.id.in_(preferred), Circuit.deleted_at.is_(None))
+                )
+            )
+            .scalars()
+            .all()
+        )
         found = {r.id for r in rows}
         missing = [str(c) for c in preferred if c not in found]
         if missing:
@@ -1046,7 +1056,15 @@ async def simulate(
     if all_circuit_ids:
         circuits_by_id = {
             c.id: c
-            for c in (await db.execute(select(Circuit).where(Circuit.id.in_(all_circuit_ids))))
+            for c in (
+                await db.execute(
+                    # A deleted circuit resolves to no name, as a purged one
+                    # does (#3191): Circuit is outside the global filter.
+                    select(Circuit).where(
+                        Circuit.id.in_(all_circuit_ids), Circuit.deleted_at.is_(None)
+                    )
+                )
+            )
             .scalars()
             .all()
         }
