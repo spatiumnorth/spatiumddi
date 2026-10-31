@@ -40,6 +40,7 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.netbird import NetbirdInstance
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.dns.cname_conflict import find_record_insert_conflict
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     SpaceRelease,
     address_taken,
@@ -347,6 +348,7 @@ async def _apply_addresses(
                 row.netbird_instance_id = None
                 summary.addresses_updated += 1
             else:
+                await retract_address_dns(db, [row.id])
                 await db.delete(row)
                 summary.addresses_deleted += 1
 

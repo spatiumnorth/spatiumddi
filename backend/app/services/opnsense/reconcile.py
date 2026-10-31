@@ -41,6 +41,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
 from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     SpaceRelease,
     addresses_in_space,
@@ -397,6 +398,7 @@ async def _apply_blocks_and_subnets(
             row.opnsense_router_id = None
             summary.subnets_updated += 1
         else:
+            await retract_address_dns(db, subnet_ids=[row.id])
             await db.delete(row)
             summary.subnets_deleted += 1
 
@@ -587,6 +589,7 @@ async def _apply_addresses(
                 row.opnsense_router_id = None
                 summary.addresses_updated += 1
             else:
+                await retract_address_dns(db, [row.id])
                 await db.delete(row)
                 summary.addresses_deleted += 1
 

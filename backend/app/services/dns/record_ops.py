@@ -39,6 +39,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import event as sa_event
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2186,6 +2187,126 @@ async def retract_address_records(
         zones=zones,
     )
     return len(records), wake
+
+
+_RETRACT_WAKE_KEY = "dns_retract_wake_groups"
+
+
+def _wake_groups_after_commit(db: AsyncSession, groups: set[uuid.UUID]) -> None:
+    """Publish the DNS group wakes once ``db`` commits, in any context.
+
+    ``collect_wake`` only works inside a request's collector and is a no-op in
+    a Celery task, which is where the integration reconcilers run, so a
+    retraction made there would reach the agents only on the 12 s safety tick.
+    One ``after_commit`` listener per session, accumulating groups; it runs
+    the publish through ``after_commit_dispatch`` so a task's final commit
+    cannot cancel it. The wake is advisory (the ETag compare stays the source
+    of truth), so a later commit publishing a stale group is harmless.
+    """
+    pending: set[uuid.UUID] | None = db.info.get(_RETRACT_WAKE_KEY)
+    if pending is not None:
+        pending.update(groups)
+        return
+    pending = set(groups)
+    db.info[_RETRACT_WAKE_KEY] = pending
+
+    def _fire(_session: Any) -> None:
+        db.info.pop(_RETRACT_WAKE_KEY, None)
+        channels = [dns_group_channel(g) for g in pending]
+        if not channels:
+            return
+        from app.core.agent_wake import publish_wake  # noqa: PLC0415
+        from app.services import after_commit_dispatch  # noqa: PLC0415
+
+        after_commit_dispatch.dispatch(
+            "dns_retract_wake", lambda: publish_wake(*channels), count=len(channels)
+        )
+
+    sa_event.listen(db.sync_session, "after_commit", _fire, once=True)
+
+
+async def retract_address_dns(
+    db: AsyncSession,
+    address_ids: Collection[uuid.UUID] = (),
+    subnet_ids: Collection[uuid.UUID] = (),
+) -> int:
+    """Retract the live auto-generated DNS records of addresses about to be
+    deleted, the way an IPAM permanent delete does (spatiumddi#3200).
+
+    The one call every integration mirror (Docker, Kubernetes, Proxmox, ...)
+    makes before it removes ``IPAddress`` rows: its absence-delete, its
+    subnet delete (which cascades to the subnet's addresses) and a target
+    delete. Left to the foreign key, ``dns_record.ip_address_id`` goes NULL and
+    the record stays served with no owner. Each live auto record becomes a
+    ``delete`` op through the record-ops pipeline (RFC 2136 / driver, per
+    server) and its row is removed; trashed ones are only deleted. Hand-made
+    records are untouched. Works from a request or a Celery task: the agent
+    wake is published after the session commits either way. MUST run before the
+    address / subnet delete is flushed, or the SET NULL has already orphaned
+    the records. Returns the number of live records retracted.
+    """
+    ids = set(address_ids)
+    sub = list(subnet_ids)
+    for start in range(0, len(sub), _RETRACT_CHUNK):
+        ids.update(
+            (
+                await db.execute(
+                    select(IPAddress.id).where(
+                        IPAddress.subnet_id.in_(sub[start : start + _RETRACT_CHUNK])
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not ids:
+        return 0
+    id_list = list(ids)
+    records: list[DNSRecord] = []
+    for start in range(0, len(id_list), _RETRACT_CHUNK):
+        chunk = id_list[start : start + _RETRACT_CHUNK]
+        # Trashed records are not served: only delete them, as the purge does.
+        await db.execute(
+            sa_delete(DNSRecord)
+            .where(
+                DNSRecord.deleted_at.is_not(None),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_address_id.in_(chunk),
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+        records.extend(
+            (
+                await db.execute(
+                    select(DNSRecord)
+                    .where(
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.ip_address_id.in_(chunk),
+                    )
+                    .options(selectinload(DNSRecord.zone))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not records:
+        return 0
+    wake, zones = await _queue_record_deletes(db, records)
+    # After the enqueue: the RRset stamp reads the zone's live members.
+    record_ids = [r.id for r in records]
+    for start in range(0, len(record_ids), _RETRACT_CHUNK):
+        await db.execute(
+            sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids[start : start + _RETRACT_CHUNK]))
+        )
+    if wake:
+        _wake_groups_after_commit(db, wake)
+    logger.info(
+        "integration_address_records_retracted",
+        addresses=len(ids),
+        records=len(records),
+        zones=zones,
+    )
+    return len(records)
 
 
 async def _apply_agentless_batch(

@@ -44,6 +44,7 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     SpaceRelease,
     addresses_in_space,
@@ -617,6 +618,7 @@ async def _apply_blocks_and_subnets(
             row.unifi_controller_id = None
             summary.subnets_updated += 1
             continue
+        await retract_address_dns(db, subnet_ids=[row.id])
         await db.delete(row)
         summary.subnets_deleted += 1
 
@@ -772,6 +774,7 @@ async def _apply_addresses(
         if len(rows) > 1:
             rows.sort(key=lambda r: r.modified_at or datetime.min, reverse=True)
             for stale in rows[1:]:
+                await retract_address_dns(db, [stale.id])
                 await db.delete(stale)
                 summary.addresses_deleted += 1
                 pre_dedup_dirty = True
@@ -842,6 +845,7 @@ async def _apply_addresses(
                 row.unifi_controller_id = None
                 summary.addresses_updated += 1
             else:
+                await retract_address_dns(db, [row.id])
                 await db.delete(row)
                 summary.addresses_deleted += 1
 
@@ -889,6 +893,7 @@ async def _apply_addresses(
                 if conflict is not None:
                     dirty_subnets.add(row.subnet_id)
                     dirty_subnets.add(subnet.id)
+                    await retract_address_dns(db, [row.id])
                     await db.delete(row)
                     summary.addresses_deleted += 1
                     summary.warnings.append(

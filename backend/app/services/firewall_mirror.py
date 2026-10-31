@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
 from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
@@ -478,6 +479,7 @@ async def apply_subnets(
             setattr(row, owner.fk_attr, None)
             summary.subnets_updated += 1
         else:
+            await retract_address_dns(db, subnet_ids=[row.id])
             await db.delete(row)
             summary.subnets_deleted += 1
 
@@ -587,6 +589,7 @@ async def apply_addresses(
                 setattr(row, owner.fk_attr, None)
                 summary.addresses_updated += 1
             else:
+                await retract_address_dns(db, [row.id])
                 await db.delete(row)
                 summary.addresses_deleted += 1
 
