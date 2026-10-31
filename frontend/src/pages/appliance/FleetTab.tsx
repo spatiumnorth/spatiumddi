@@ -2262,7 +2262,7 @@ function ApplianceTableSection({
   );
 }
 
-function ApplianceTableRow({
+export function ApplianceTableRow({
   row,
   highlight,
   busy,
@@ -2308,7 +2308,20 @@ function ApplianceTableRow({
     >
       <td className="px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="font-medium">{row.hostname}</span>
+          {/* The keyboard path to the row's detail dialog, which a
+              click on the row opens (#3158, as #2724 did for the
+              server and address rows). */}
+          <button
+            type="button"
+            title="View details"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen();
+            }}
+            className="rounded-sm font-medium hover:underline focus-visible:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {row.hostname}
+          </button>
           {/* #272 — installer-role chip. Two variants: control-plane
               (Control plane table) + appliance (Service agents).
               Legacy strings still render with a sensible label. */}
