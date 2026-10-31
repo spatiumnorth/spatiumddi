@@ -596,3 +596,43 @@ make this symptom permanent.)
 A `warn` reading `last tick Ns in the future (clock skew)` means the node
 that ran the tick and the node serving this endpoint disagree about the
 time — check NTP on both rather than looking at Celery.
+
+---
+
+## Pods stuck in `ErrImageNeverPull` after a slot rollback
+
+Appliance only. Tracked in [#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169).
+
+**Symptom.** After rolling an appliance back to its previous slot (`spatium-upgrade-slot rollback` / `set-default`, or Fleet → OS Versions), the `spatium-supervisor` and the DNS / DHCP agent pods on that node (and the control plane, on a control-plane node) sit in `ErrImageNeverPull` at the old tag. `kubectl get pods -A` shows them; `kubectl describe pod` names an image that `k3s crictl images` does not list.
+
+**Cause.** k3s imports image tarballs from one directory on the shared `/var` (`/var/lib/rancher/k3s/agent/images`), not from the running slot. A slot upgrade copies the *new* slot's tarballs into it, and k3s's import cache (`.cache.json`, keyed on path, size and mtime) records them as imported. After a rollback the old slot's k3s therefore imports nothing, and every SpatiumDDI pod is `imagePullPolicy: Never`, so it only starts if containerd still holds the old images. A cluster join, promote or demote made on the newer slot, or kubelet image GC, removes them. The old slot's own tarballs are still on its root filesystem, but at the same path, so the `/var` mount hides them.
+
+**Recovery.** Run as root on the affected node, on the slot you rolled back to:
+
+```bash
+# 1. Reach the running slot's own /var directory, which the /var mount hides.
+#    A plain (non-recursive) bind mount of / does not carry the /var mount.
+mkdir -p /run/slotroot && mount --bind / /run/slotroot
+ls /run/slotroot/var/lib/rancher/k3s/agent/images/*.tar.zst   # must list files; see below if empty
+
+# 2. Copy them into the live directory. No -p: the copies need a NEW mtime.
+cp /run/slotroot/var/lib/rancher/k3s/agent/images/*.tar.zst \
+   /var/lib/rancher/k3s/agent/images/
+
+# 3. Reset k3s's import cache. A file with the same size and an older mtime
+#    than its cache entry is skipped, so without this an equal-size tarball
+#    would not be re-imported.
+echo '{}' > /var/lib/rancher/k3s/agent/images/.cache.json
+
+umount /run/slotroot
+systemctl restart k3s
+```
+
+Wait 2-3 minutes: k3s re-imports the whole set at start. Then verify:
+
+```bash
+k3s crictl images | grep <old tag>      # the tag the pods were asking for
+kubectl get pods -A                     # pods leave ErrImageNeverPull
+```
+
+**When this does not apply.** Step 1's `ls` must list tarballs. A slot written by a slot upgrade carries its images in its own filesystem. A slot laid down by the installer does not: the installer mounts `/var` before it copies the live root, so the tarballs land on `/var` and the slot's own `/var` directory is empty. If the `ls` is empty, do not copy anything from the *other* slot's partition: those are the wrong version's images. Instead, get that release's slot image, boot the other slot, and apply the image to the inactive slot with `spatium-upgrade-slot`, which writes a root filesystem that does carry them, then switch back. The same recipe does not help a node whose pods are already pulling at the *current* slot's tag; this is only for images that belong to the slot that is running.
