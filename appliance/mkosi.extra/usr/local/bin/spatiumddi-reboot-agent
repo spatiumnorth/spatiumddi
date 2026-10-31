@@ -89,11 +89,18 @@ on_stop() {
     if [ -n "$sleep_pid" ]; then
         kill "$sleep_pid" 2>/dev/null || true
     fi
+    clear_grace
     log "reboot-agent stopped: the grace marker is cleared"
+    # #3162 — a stop is a cancel, not a failure: end by the signal itself, which
+    # systemd counts as a clean stop (the unit inactive, not failed).
+    trap - EXIT TERM INT HUP
+    kill -s "$1" "$$"
     exit 1
 }
 trap clear_grace EXIT
-trap on_stop TERM INT HUP
+trap 'on_stop TERM' TERM
+trap 'on_stop INT' INT
+trap 'on_stop HUP' HUP
 
 BOOT_ID="$(cat "$BOOT_ID_FILE" 2>/dev/null || true)"
 printf '%s %s\n' "$$" "${BOOT_ID:-unknown}" | state_write "$GRACE_MARKER" \
