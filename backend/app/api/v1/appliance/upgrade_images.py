@@ -84,6 +84,7 @@ from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 from app.core.body_limit import UPGRADE_IMAGE_MAX_BYTES
 from app.core.content_disposition import content_disposition
+from app.core.exc_text import describe_exc
 from app.core.permissions import require_permission
 from app.core.responses import OctetStreamResponse
 from app.core.versions import is_installed_target
@@ -450,7 +451,7 @@ async def _bytes_present_in_active_store(image_id: uuid.UUID) -> bool:
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY,
-                f"Could not reach the upgrade-image mirror: {exc}",
+                f"Could not reach the upgrade-image mirror: {describe_exc(exc)}",
             ) from exc
     if resp.status_code == 404:
         return False
