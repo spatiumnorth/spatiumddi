@@ -61,9 +61,7 @@ def test_unsigned_zone_keys_survive_the_grace_period_then_go(tmp_path, keydir):
 
     removed = drv.prune_dnssec_keys(bundle, now=100.0 + GRACE)
     assert len(removed) == 6
-    assert _left(keydir) == {
-        f"Kkept.test.+013+00001.{e}" for e in ("key", "private", "state")
-    }
+    assert _left(keydir) == {f"Kkept.test.+013+00001.{e}" for e in ("key", "private", "state")}
     # Nothing pending any more.
     assert json.loads((tmp_path / b9.DNSSEC_KEY_PRUNE_STATE).read_text()) == {}
 
@@ -183,9 +181,7 @@ class _PruneDriver(_Driver):
         self.pruned: list[set[str]] = []
 
     def prune_dnssec_keys(self, bundle: dict[str, Any]) -> list[str]:
-        self.pruned.append(
-            {z["name"] for z in bundle["zones"] if z.get("dnssec_enabled")}
-        )
+        self.pruned.append({z["name"] for z in bundle["zones"] if z.get("dnssec_enabled")})
         return []
 
 
@@ -244,9 +240,7 @@ def _polled(tag: str, structural: str, *signed: str) -> dict[str, Any]:
     }
 
 
-def test_key_cleanup_resumes_after_a_recovered_config(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_key_cleanup_resumes_after_a_recovered_config(tmp_path: Path, monkeypatch) -> None:
     """A failed apply clears the prune set. Undoing the bad change leaves the
     live structure unchanged, so the poll takes the recovery path and no
     structural apply follows: cleanup must still resume from that poll."""
@@ -287,3 +281,71 @@ def test_key_cleanup_resumes_after_a_recovered_config(
     driver.pruned.clear()
     loop._prune_dnssec_keys()
     assert driver.pruned == [{"a.test"}]
+
+
+def test_recovered_config_reports_the_daemon_healthy_again_3161(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The failed apply echoed ``degraded`` into the daemon verdict; the undo
+    must clear it with the config verdict, not leave it until the next
+    structural apply."""
+    from spatium_dns_agent.sync import STATUS_OK
+    from .test_config_revert import _Http, _assert_echoed
+
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _PruneDriver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http(
+        [
+            _polled("e1", "s1", "a.test"),
+            _polled("e2", "s2", "a.test", "b.test"),
+            _polled("e3", "s1", "a.test"),
+            _polled("e4", "s2", "a.test", "b.test"),
+        ]
+    )
+    loop._client = lambda: http  # type: ignore[method-assign]
+
+    loop._poll_once()
+    driver.fail_on = "render"
+    loop._poll_once()
+    assert not loop.apply_status.healthy
+    _assert_echoed(loop, "reverted")
+
+    driver.fail_on = None
+    loop._poll_once()
+    assert loop.apply_status.status == STATUS_OK
+    assert loop.heartbeat.daemon_status == {"status": "ok"}
+
+    # A still-failing config keeps reporting failing.
+    driver.fail_on = "render"
+    loop._poll_once()
+    assert not loop.apply_status.healthy
+    _assert_echoed(loop, "reverted")
+
+
+def test_recovery_leaves_an_oom_verdict_and_other_degraded_reasons_3161(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from .test_config_revert import _Http
+
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _PruneDriver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http(
+        [
+            _polled("e1", "s1", "a.test"),
+            _polled("e2", "s2", "a.test"),
+            _polled("e3", "s1", "a.test"),
+        ]
+    )
+    loop._client = lambda: http  # type: ignore[method-assign]
+    loop._poll_once()
+    driver.fail_on = "render"
+    loop._poll_once()
+    other = {"status": "degraded", "reason": "named exited"}
+    loop.heartbeat.daemon_status = other
+    driver.fail_on = None
+    loop._poll_once()
+    assert loop.heartbeat.daemon_status == other

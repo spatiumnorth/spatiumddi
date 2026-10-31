@@ -1278,6 +1278,17 @@ class SyncLoop:
             self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
             recovered = True
             self.heartbeat.config_apply = self.apply_status
+            # #3161 — the failed apply also set the daemon verdict (the
+            # ``config_apply_`` echo). Only a structural apply clears it
+            # otherwise, and none follows an undo, so clear it here — but only
+            # that echo: any other degraded reason is not this path's to clear.
+            reason = str(self.heartbeat.daemon_status.get("reason") or "")
+            if (
+                self.heartbeat.daemon_status.get("status") == "degraded"
+                and reason.startswith("config_apply_")
+                and not is_oom_status(self.heartbeat.daemon_status)
+            ):
+                self.heartbeat.daemon_status = {"status": "ok"}
             log.info("config_apply_recovered", etag=etag)
 
         # #882 — a poll that got all the way here had no apply failure, so
