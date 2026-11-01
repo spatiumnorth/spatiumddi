@@ -1018,16 +1018,19 @@ async def compute_subnet_dns_drift(
         ]
         ip_ptr_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "PTR"]
 
-        # #3268 — the commit publishes the subnet's own zone through the same
-        # owner rules (``_sync_dns_record(strict=True)``) and refuses a name
-        # the record API would, e.g. an underscore label in the zone's name.
-        # Offering a row for such a zone would be offered again after every
-        # Apply, so none is offered: neither the forward record nor the PTR
-        # (whose target is ``<hostname>.<zone>``) is expected there.
-        primary_unpublishable = ip_zone is not None and (
-            publishable_host_owner_error(ip.hostname) is not None
-            or host_in_zone_error(ip.hostname, ip_zone.name.rstrip("."), field="h") is not None
+        # #3268 — the commit (``_sync_dns_record(strict=True)``) refuses the
+        # whole address, before writing anything, when the hostname is no
+        # publishable owner or ``<hostname>.<zone>`` is no host name in its
+        # own zone (an underscore label in the zone's name, #2918). A row
+        # offered for such an address would be refused and offered again
+        # after every Apply, so none is: not the forward record, not the PTR
+        # (whose target is that same ``<hostname>.<zone>``), and not the
+        # extra zones', which the refused re-sync never reaches either.
+        unpublishable = publishable_host_owner_error(ip.hostname) is not None or (
+            ip_zone is not None
+            and host_in_zone_error(ip.hostname, ip_zone.name.rstrip("."), field="h") is not None
         )
+        primary_unpublishable = ip_zone is not None and unpublishable
 
         # The extra zones this address publishes to (#2107), minus any the name
         # does not fit in, as ``_sync_dns_record`` skips those too. A forward
@@ -1036,7 +1039,8 @@ async def compute_subnet_dns_drift(
         extra_zones = [
             extra_zones_by_id[z]
             for z in forward_zone_ids_in_order(primary_id, ip.extra_zone_ids)
-            if z != primary_id
+            if not unpublishable
+            and z != primary_id
             and z in extra_zones_by_id
             and host_in_zone_error(ip.hostname, extra_zones_by_id[z].name.rstrip("."), field="h")
             is None
