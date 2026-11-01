@@ -148,6 +148,7 @@ import {
   zoneTransportOptions,
 } from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
+import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { feedChip, FEED_CHIP_CLS } from "@/lib/blocklist-feed";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
@@ -8864,7 +8865,6 @@ function RecordsTab({
   const [filterModes, setFilterModes] = useState<
     Partial<Record<ColKey, RecordFilterMode>>
   >({});
-  const [openFilterMenu, setOpenFilterMenu] = useState<ColKey | null>(null);
   const [editing, setEditing] = useState<DNSGroupRecord | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSGroupRecord | null>(
     null,
@@ -9025,51 +9025,10 @@ function RecordsTab({
           placeholder="Filter…"
           className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
         />
-        <div className="relative">
-          <button
-            type="button"
-            onClick={() =>
-              setOpenFilterMenu(openFilterMenu === col ? null : col)
-            }
-            className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-            title="Filter mode"
-          >
-            {mode === "begins"
-              ? "^"
-              : mode === "ends"
-                ? "$"
-                : mode === "regex"
-                  ? ".*"
-                  : "⊂"}
-          </button>
-          {openFilterMenu === col && (
-            <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-              {(
-                [
-                  ["contains", "⊂ Contains"],
-                  ["begins", "^ Begins"],
-                  ["ends", "$ Ends"],
-                  ["regex", ".* Regex"],
-                ] as const
-              ).map(([m, label]) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => {
-                    setFilterModes((p) => ({ ...p, [col]: m }));
-                    setOpenFilterMenu(null);
-                  }}
-                  className={cn(
-                    "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                    mode === m && "font-semibold text-primary",
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        <FilterModePicker
+          value={mode}
+          onChange={(m) => setFilterModes((p) => ({ ...p, [col]: m }))}
+        />
       </div>
     );
   }
