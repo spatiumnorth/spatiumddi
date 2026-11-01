@@ -194,7 +194,7 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
  * install's hundreds of subnets/zones never render as one giant <select>.
  * The submitted value is the UUID; the user only ever sees labels.
  */
-function ResourcePicker({
+export function ResourcePicker({
   resource,
   value,
   onChange,
@@ -246,6 +246,13 @@ function ResourcePicker({
       className="relative"
       // An Esc on an option reached with Tab is the list's too (#3157).
       onKeyDown={(e) => closePopupOnEscape(e, open, () => setOpen(false))}
+      // Close when focus leaves the picker, not when it moves onto an option:
+      // a blur timer on the input fired after Tab reached an option and made
+      // the next Esc fall through to the dialog (#3157).
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setOpen(false);
+      }}
     >
       <input
         className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
@@ -256,7 +263,6 @@ function ResourcePicker({
           setOpen(true);
         }}
         onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
         onKeyDown={(e) => closePopupOnEscape(e, open, () => setOpen(false))}
       />
       {open ? (
