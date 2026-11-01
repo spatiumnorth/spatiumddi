@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, KeyRound, ShieldCheck, Smartphone, Loader2 } from "lucide-react";
 import { authApi, formatApiError, type MfaEnrolBeginResponse } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import { Modal } from "@/components/ui/modal";
 import { QrCode } from "@/components/QrCode";
 
@@ -579,7 +580,7 @@ function DisableModal({
   );
 }
 
-function RegenerateRecoveryModal({
+export function RegenerateRecoveryModal({
   onClose,
   onRegenerated,
 }: {
@@ -599,9 +600,18 @@ function RegenerateRecoveryModal({
       setError(formatApiError(err, "Regeneration failed."));
     },
   });
+  // #3222 — the old codes are revoked and the new ones are shown once, so
+  // closing before copying them asks first.
+  const codeValues = useMemo(() => newCodes ?? [], [newCodes]);
+  const guard = useSecretCloseGuard({
+    onClose,
+    secrets: codeValues,
+    noun: "set of recovery codes",
+    active: newCodes !== null,
+  });
 
   const successContent = newCodes ? (
-    <div className="space-y-2">
+    <div className="space-y-2" {...guard.copyProps}>
       <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
         Save these codes now. Each one works once. Old codes have been revoked.
       </p>
@@ -612,7 +622,9 @@ function RegenerateRecoveryModal({
       </div>
       <button
         type="button"
-        onClick={() => copyToClipboard(newCodes.join("\n"))}
+        onClick={async () => {
+          if (await copyToClipboard(newCodes.join("\n"))) guard.markTaken();
+        }}
         className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
       >
         <Copy className="h-3 w-3" /> Copy all codes
@@ -621,18 +633,21 @@ function RegenerateRecoveryModal({
   ) : undefined;
 
   return (
-    <PasswordCodePrompt
-      title="Regenerate recovery codes"
-      cta="Generate new codes"
-      onSubmit={(password, code) => {
-        setError(null);
-        mut.mutate({ password, code });
-      }}
-      onClose={onClose}
-      isPending={mut.isPending}
-      error={error}
-      successContent={successContent}
-    />
+    <>
+      <PasswordCodePrompt
+        title="Regenerate recovery codes"
+        cta="Generate new codes"
+        onSubmit={(password, code) => {
+          setError(null);
+          mut.mutate({ password, code });
+        }}
+        onClose={guard.requestClose}
+        isPending={mut.isPending}
+        error={error}
+        successContent={successContent}
+      />
+      {guard.confirm}
+    </>
   );
 }
 
