@@ -3439,6 +3439,19 @@ export const backupTargetsApi = {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   },
+  /** Manifest + dump format of one stored archive (#2222) — the same
+   *  answer as ``backupApi.previewManifest``, for an archive already at
+   *  the destination. Fetches that archive server-side, so call it for
+   *  the archive the operator picked, never for the whole listing. */
+  previewArchiveManifest: (
+    id: string,
+    filename: string,
+  ): Promise<BackupManifestPreviewResponse> =>
+    api
+      .get<BackupManifestPreviewResponse>(
+        `/backup/targets/${id}/archives/${encodeURIComponent(filename)}/manifest-preview`,
+      )
+      .then((r) => r.data),
   restoreFromArchive: (
     id: string,
     body: {
