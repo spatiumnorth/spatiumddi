@@ -40,6 +40,8 @@ from app.services.dns.record_ops import push_records_restore, retract_address_re
 from app.services.dns.view_collisions import RenderGuard, collision_detail
 from app.services.ipam.orphan_aliases import (
     is_withdrawn_alias,
+    orphan_record_owners,
+    orphan_record_reason,
     refusal_reason,
     withdrawn_alias_owners,
 )
@@ -615,6 +617,15 @@ async def restore_row(
             raise HTTPException(
                 status_code=409,
                 detail=f"Cannot restore {_row_label(target)}: {refusal_reason(orphan_address)}.",
+            )
+        # #3189 — a record trashed on its own, whose address was then marked
+        # as orphan. Its siblings in a bulk delete are refused by
+        # ``restore_batch``.
+        owner = (await orphan_record_owners(db, record_ids=[target.id])).get(target.id)
+        if owner is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot restore {_row_label(target)}: {orphan_record_reason(owner[2])}.",
             )
 
     batch_id = target.deletion_batch_id

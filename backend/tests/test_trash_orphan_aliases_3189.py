@@ -8,12 +8,15 @@ orphan the Trash neither lists them nor acts on them.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.dns import DNSRecord
 from app.tasks.trash_purge import _purge_dns_records
 from tests.test_ipam_alias_cname_exclusive_2080 import _setup
 from tests.test_ipam_orphan_aliases_2604 import (
@@ -171,3 +174,109 @@ async def test_retention_purge_holds_only_what_the_orphan_withdrew(
     left = {r.id for r in await _all_alias_rows(db_session, ip_id)}
     assert withdrawn_id in left
     assert hand_id not in left
+
+
+# ── Mark as Orphan after a hand delete (#3189 against #3186's purge) ──
+
+
+async def _trashed_row(db: AsyncSession, record_id: uuid.UUID) -> DNSRecord | None:
+    return (
+        await db.execute(
+            select(DNSRecord)
+            .where(DNSRecord.id == record_id)
+            .execution_options(include_deleted=True, populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
+@pytest.mark.asyncio
+async def test_mark_as_orphan_keeps_an_alias_trashed_by_hand(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The walk's case 7: the operator's own Trash row is not hard-deleted by
+    the orphan, its Restore waits for the address, and then works."""
+    headers, ip_id, hand_id, _withdrawn = await _hand_trashed_then_orphaned(
+        client, db_session, "10.98.5.29"
+    )
+    row = await _trashed_row(db_session, hand_id)
+    assert row is not None and row.deleted_at is not None
+    assert str(hand_id) in await _trash_ids(client, headers)
+
+    r = await client.post(f"/api/v1/admin/trash/dns_record/{hand_id}/restore", headers=headers)
+    assert r.status_code == 409, r.text
+    assert "10.98.5.29" in r.json()["detail"]
+    await db_session.rollback()
+    row = await _trashed_row(db_session, hand_id)
+    assert row is not None and row.deleted_at is not None
+
+    # Un-orphaning brings back what the orphan withdrew, not the hand delete...
+    p = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"status": "allocated"}
+    )
+    assert p.status_code == 200, p.text
+    assert await _alias_names(client, headers, ip_id) == ["ftp"]
+    # ...which the Trash now restores.
+    r = await client.post(f"/api/v1/admin/trash/dns_record/{hand_id}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    assert await _alias_names(client, headers, ip_id) == ["ftp", "www"]
+
+
+@pytest.mark.asyncio
+async def test_a_bulk_delete_sibling_does_not_restore_an_orphans_alias(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An alias bulk-deleted with a hand-made record: restoring the record
+    must not bring the alias back while its address is an orphan."""
+    headers, sid, zone = await _setup(client, db_session)
+    ip_id = await _aliased(client, headers, sid, "10.98.5.30")
+    www = next(r for r in await _all_alias_rows(db_session, ip_id) if r.name == "www")
+    base = f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/records"
+    c = await client.post(
+        base, headers=headers, json={"name": "note", "record_type": "TXT", "value": "hi"}
+    )
+    assert c.status_code == 201, c.text
+    note_id = c.json()["id"]
+    b = await client.post(
+        f"{base}/bulk-delete", headers=headers, json={"record_ids": [str(www.id), note_id]}
+    )
+    assert b.status_code == 200, b.text
+    assert b.json()["deleted"] == 2
+    o = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert o.status_code == 204, o.text
+
+    r = await client.post(f"/api/v1/admin/trash/dns_record/{note_id}/restore", headers=headers)
+    assert r.status_code == 409, r.text
+    conflicts = r.json()["detail"]["conflicts"]
+    assert [c["id"] for c in conflicts] == [str(www.id)]
+    assert "10.98.5.30" in conflicts[0]["reason"]
+
+    r = await client.post(
+        f"/api/v1/admin/trash/dns_record/{note_id}/restore?skip_conflicts=true", headers=headers
+    )
+    assert r.status_code == 200, r.text
+    await db_session.rollback()
+    row = await _trashed_row(db_session, www.id)
+    assert row is not None and row.deleted_at is not None
+    note = await _trashed_row(db_session, uuid.UUID(note_id))
+    assert note is not None and note.deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_zone_restore_does_not_bring_back_an_orphans_alias(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3186 control: aliases riding their zone's batch are still purged by
+    Mark as Orphan, so the zone's restore publishes nothing for the orphan."""
+    headers, sid, zone = await _setup(client, db_session)
+    zone_id = zone.id
+    ip_id = await _aliased(client, headers, sid, "10.98.5.31")
+    d = await client.delete(f"/api/v1/dns/groups/{zone.group_id}/zones/{zone_id}", headers=headers)
+    assert d.status_code == 204, d.text
+    o = await client.delete(f"/api/v1/ipam/addresses/{ip_id}", headers=headers)
+    assert o.status_code == 204, o.text
+    assert await _all_alias_rows(db_session, ip_id) == []
+
+    r = await client.post(f"/api/v1/admin/trash/dns_zone/{zone_id}/restore", headers=headers)
+    assert r.status_code == 200, r.text
+    names = {n for n, _t, _v in await _live_zone(db_session, zone_id)}
+    assert not names & {"h1", "www", "ftp"}

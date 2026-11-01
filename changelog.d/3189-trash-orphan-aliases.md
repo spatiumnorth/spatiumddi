@@ -1,3 +1,4 @@
 ### Fixed
 
 - An alias withdrawn by Mark as Orphan is no longer listed in the Trash as a stand-alone DNS Record. Restoring it alone served a CNAME to a withdrawn host, and Delete permanently lost it for good. It now follows its address: it comes back when the address is restored and is deleted when the address is deleted permanently, and the Trash refuses a direct Restore or Delete permanently on it while the address is an orphan (#3189).
+- Mark as Orphan no longer deletes for good, with no audit entry, an alias or other IPAM record you had already moved to the Trash yourself. It stays in the Trash and ages out as usual; while its address is an orphan the Trash refuses to restore it (alone or with the other records of a bulk delete), and once the address is restored it can be restored too. A record that went to the Trash with its zone is still removed, so restoring the zone publishes nothing for the orphan (#3189).
