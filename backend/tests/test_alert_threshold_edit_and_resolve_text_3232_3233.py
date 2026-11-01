@@ -258,7 +258,7 @@ async def test_edit_twice_and_an_escalation_in_between(
 async def test_event_opened_before_the_change_still_composes(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An open event with no ``peak_thresholds`` (written before #3233)."""
+    """An open event with no ``peak_message`` (written before #3233)."""
     monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
     rule = _rule(alerts_svc.RULE_TYPE_SUBNET_UTILIZATION, threshold_percent=68)
     db_session.add(rule)
@@ -274,7 +274,7 @@ async def test_event_opened_before_the_change_still_composes(
     await alerts_svc.evaluate_all(db_session)
     ev = await _event(db_session)
     assert ev.message.endswith("[now: 72.0% / 10/14]") or "[now: 72.0%" in ev.message
-    assert ev.last_observed_value["peak_thresholds"] == {"threshold_percent": 68}
+    assert "71.4% (threshold 68%)" in ev.last_observed_value["peak_message"]
     # From here on a threshold edit is restated.
     msg = await _edit_and_eval(db_session, rule, threshold_percent=70)
     assert "(threshold 70%)" in msg and "[now: 70" not in msg
@@ -282,18 +282,74 @@ async def test_event_opened_before_the_change_still_composes(
 
 async def test_a_reading_equal_to_the_old_threshold_is_not_rewritten() -> None:
     restate = alerts_svc._restate_edited_thresholds
-    peak = "Subnet x utilisation 68.0% (threshold 68%) — 10/14 IPs allocated"
-    # Reading unchanged at 68.0 while the threshold moves 68 → 70: only the
-    # threshold position changes, and "68.0%" is not the token "68%".
-    cur = "Subnet x utilisation 68.0% (threshold 70%) — 10/14 IPs allocated"
-    out = restate(peak, cur, {"threshold_percent": 68}, {"threshold_percent": 70})
-    assert out == cur
-    # A count reading equal to the old threshold stays where the reading did not move.
-    peak = "Voice subnet x has 5 active lease(s) (threshold 5) — y"
-    cur = "Voice subnet x has 5 active lease(s) (threshold 7) — y"
-    assert restate(peak, cur, {"threshold_percent": 5}, {"threshold_percent": 7}) == cur
-    # Different templates (a skeleton change) are left to the composer.
-    assert restate(peak, "other 7", {"threshold_percent": 5}, {"threshold_percent": 7}) == peak
+    unmark = alerts_svc._unmark_thresholds
+    token = alerts_svc._MARK_THRESHOLDS.set(True)
+    try:
+        thr = alerts_svc._thr
+        peak = "Subnet x utilisation 68.0% (threshold 68%) — 10/14 IPs allocated"
+        # Reading unchanged at 68.0 while the threshold moves 68 → 70: only the
+        # threshold position changes.
+        cur, idx = unmark(
+            f"Subnet x utilisation 68.0% (threshold {thr(70)}%) — 10/14 IPs allocated"
+        )
+        assert restate(peak, cur, idx) == cur
+        # A count reading equal to the old threshold stays where the reading did not move.
+        peak = "Voice subnet x has 5 active lease(s) (threshold 5) — y"
+        cur, idx = unmark(f"Voice subnet x has 5 active lease(s) (threshold {thr(7)}) — y")
+        assert restate(peak, cur, idx) == cur
+        # Different templates (a skeleton change) are left to the composer.
+        other, idx = unmark(f"other {thr(7)}")
+        assert restate(peak, other, idx) == peak
+    finally:
+        alerts_svc._MARK_THRESHOLDS.reset(token)
+    # Outside an evaluation pass a matcher's text carries no marks.
+    assert alerts_svc._thr(70) == "70"
+
+
+async def test_a_reading_that_moves_with_its_threshold_is_kept(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review thread 1: count and threshold both 3 → 4; the reading is not restated."""
+    from app.services.ipam import stale_ips
+
+    monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
+    rule = _rule(alerts_svc.RULE_TYPE_STALE_IP_COUNT, threshold_percent=3, threshold_days=30)
+    db_session.add(rule)
+    subnet = await _subnet(db_session)
+    await db_session.commit()
+    network = str(subnet.network)
+    count = {"n": 3}
+
+    async def fake(db, *, stale_days, include_never_seen):  # type: ignore[no-untyped-def]
+        return {subnet.id: count["n"]}
+
+    monkeypatch.setattr(stale_ips, "count_stale_per_subnet", fake)
+    await alerts_svc.evaluate_all(db_session)
+    count["n"] = 4
+    msg = await _edit_and_eval(db_session, rule, threshold_percent=4)
+    assert msg.startswith(f"Subnet {network}") and "has 3 stale" in msg
+    assert "(threshold 4)" in msg and msg.endswith("[now: 4]")
+    assert "\ue000" not in msg and "\ue001" not in msg
+
+
+async def test_var_threshold_edit_across_the_resolve_margin(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review thread 2: 27% at threshold 0%, edited to 29% (margin template),
+    then to 26% — the peak ends on 26% with no ``[now: 26%]``."""
+    monkeypatch.setattr(alerts_svc, "_deliver", _no_delivery)
+    rule = _rule(alerts_svc.RULE_TYPE_APPLIANCE_DISK_USAGE, threshold_percent=0)
+    db_session.add(rule)
+    await _node(db_session, var=_pct_of(40 * GIB, 27))
+    await db_session.commit()
+    await alerts_svc.evaluate_all(db_session)
+    msg = await _edit_and_eval(db_session, rule, threshold_percent=29)
+    assert "the rule's 0% threshold" in msg and "[now:" in msg  # different template
+    msg = await _edit_and_eval(db_session, rule, threshold_percent=26)
+    assert "the rule's 26% threshold" in msg and "[now:" not in msg
+    # And it stays that way on the next pass.
+    await alerts_svc.evaluate_all(db_session)
+    assert "[now:" not in (await _event(db_session)).message
 
 
 async def test_legacy_var_description_is_the_text_main_seeded() -> None:

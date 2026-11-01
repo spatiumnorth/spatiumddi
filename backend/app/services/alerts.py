@@ -28,10 +28,11 @@ it resolved.
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import re
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -1071,7 +1072,7 @@ async def _matching_subnet_subjects(
             continue  # inside the resolve margin, but nothing open to hold (#2778)
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
-            f"Subnet {display} utilisation {pct:.1f}% (threshold {threshold}%) — "
+            f"Subnet {display} utilisation {pct:.1f}% (threshold {_thr(threshold)}%) — "
             f"{s.allocated_ips}/{s.total_ips} IPs allocated"
         )
         matches.append((str(s.id), display, message))
@@ -1123,7 +1124,7 @@ async def _matching_voice_lease_count_below_subjects(
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
             f"Voice subnet {display} has {int(count or 0)} active lease(s) "
-            f"(threshold {threshold}) — possible mass-disconnect event"
+            f"(threshold {_thr(threshold)}) — possible mass-disconnect event"
         )
         matches.append((str(s.id), display, message))
     return matches
@@ -1185,9 +1186,9 @@ async def _matching_dhcp_pool_exhaustion_subjects(
         display = pool_label + (f" ({scope_name})" if scope_name else "")
         reasons = []
         if over_pct:
-            reasons.append(f"{occ.percent:.1f}% occupied (threshold {pct_threshold}%)")
+            reasons.append(f"{occ.percent:.1f}% occupied (threshold {_thr(pct_threshold)}%)")
         if under_free:
-            reasons.append(f"{occ.free} free (floor {min_free})")
+            reasons.append(f"{occ.free} free (floor {_thr(min_free)})")
         message = (
             f"DHCP pool {display} — {', '.join(reasons)}; "
             f"{occ.assigned}/{occ.total} addresses leased"
@@ -1234,7 +1235,7 @@ async def _matching_stale_ip_count_subjects(
         display = f"{s.network}" + (f" — {s.name}" if s.name else "")
         message = (
             f"Subnet {display} has {n} stale allocated IP(s) not seen on the "
-            f"wire in {stale_days}+ days (threshold {threshold}) — review for "
+            f"wire in {_thr(stale_days)}+ days (threshold {_thr(threshold)}) — review for "
             f"deprecation from the Stale-IP report"
         )
         matches.append((str(s.id), display, message))
@@ -1272,7 +1273,7 @@ async def _matching_ip_free_but_responding_subjects(
         message = (
             f"IP {r.address} is marked 'available' but answered on the wire{via} "
             f"at {r.last_seen_at.isoformat() if r.last_seen_at else '?'} (within "
-            f"{days}d) — reclaim it as allocated/discovered or investigate the host."
+            f"{_thr(days)}d) — reclaim it as allocated/discovered or investigate the host."
         )
         matches.append((str(r.id), str(r.address), message))
     return matches
@@ -1309,7 +1310,7 @@ async def _matching_stale_reservation_subjects(
         label = str(r.address) + (f" ({r.hostname})" if r.hostname else "")
         message = (
             f"{r.status} IP {label} hasn't been seen on the wire since "
-            f"{r.last_seen_at.isoformat() if r.last_seen_at else '?'} (> {days}d) — "
+            f"{r.last_seen_at.isoformat() if r.last_seen_at else '?'} (> {_thr(days)}d) — "
             f"verify the host still exists or release the reservation."
         )
         matches.append((str(r.id), str(r.address), message))
@@ -1644,7 +1645,7 @@ async def _matching_backup_stale_subjects(
             )
         message = (
             f"Backup target '{h.name}' ({h.kind}) has had no successful run {since}, "
-            f"across {runs} scheduled run(s) ({h.schedule_cron}). {why}"
+            f"across {_thr(runs)} scheduled run(s) ({h.schedule_cron}). {why}"
         )
         matches.append((subject_id, h.name, message, None))
     return matches
@@ -2129,8 +2130,8 @@ async def _matching_dns_nxdomain_spike_subjects(
         name = names.get(r.server_id) or str(r.server_id)
         message = (
             f"DNS server {name} — {nx} NXDOMAIN responses ({ratio:.0f}% of {q} "
-            f"queries) in the last {win_min} min (threshold {ratio_threshold}% / "
-            f"floor {min_count}). Possible DGA beacon, broken client, or "
+            f"queries) in the last {win_min} min (threshold {_thr(ratio_threshold)}% / "
+            f"floor {_thr(min_count)}). Possible DGA beacon, broken client, or "
             f"mistyped-search-domain storm."
         )
         matches.append((str(r.server_id), name, message))
@@ -2188,12 +2189,12 @@ async def _matching_dns_query_rate_spike_subjects(
             message = (
                 f"DNS server {name} — query-rate spike: {q_cur} queries in the "
                 f"last {win_min} min vs {q_prev} in the prior {win_min} min "
-                f"(+{(q_cur / q_prev - 1) * 100:.0f}%, threshold +{pct}%)."
+                f"(+{(q_cur / q_prev - 1) * 100:.0f}%, threshold +{_thr(pct)}%)."
             )
         else:
             message = (
                 f"DNS server {name} — {q_cur} queries in the last {win_min} min "
-                f"from a cold prior window (floor {floor})."
+                f"from a cold prior window (floor {_thr(floor)})."
             )
         matches.append((str(sid), name, message))
     return matches
@@ -2233,7 +2234,7 @@ async def _matching_dns_rate_limit_dropping_subjects(
         message = (
             f"DNS server {name} — Response Rate Limiting dropped {dropped} "
             f"responses in the last {win_min} min ({slipped} slipped/truncated); "
-            f"the server is shedding a query flood (floor {floor}). Investigate a "
+            f"the server is shedding a query flood (floor {_thr(floor)}). Investigate a "
             "possible amplification attempt or misbehaving client."
         )
         matches.append((str(sid), name, message))
@@ -2701,7 +2702,7 @@ async def _matching_bgp_lg_route_flap_subjects(
         message = (
             f"Route {route.prefix} via peer '{peer.name}' (AS{peer.peer_asn}) has flapped "
             f"{route.flap_count} times, most recently {route.last_flap_at.isoformat()} "
-            f"(threshold {threshold} within the trailing ~{win_min} min) — unstable path."
+            f"(threshold {_thr(threshold)} within the trailing ~{win_min} min) — unstable path."
         )
         matches.append((str(route.id), display, message))
     return matches
@@ -2816,41 +2817,59 @@ def _compose_peak_and_now(peak: str, current: str) -> str:
     return f"{peak} [now: {now}]"
 
 
-def _rule_thresholds(rule: AlertRule) -> dict[str, int | float]:
-    """The numeric knobs a rule's messages may print as a threshold (#3233).
-
-    ``min_free_addresses`` is printed as a floor by the DHCP pool and DNS
-    anomaly rules, so an edit to it is a threshold edit too.
-    """
-    out: dict[str, int | float] = {}
-    for col in ("threshold_percent", "threshold_days", "min_free_addresses"):
-        val = getattr(rule, col, None)
-        if isinstance(val, int | float) and not isinstance(val, bool):
-            out[col] = val
-    return out
+# #3233 — a matcher prints each rule knob it reports (a threshold, a floor,
+# a day count) through ``_thr``. During an evaluation pass that wraps the
+# value in two private-use characters, which ``evaluate_all`` strips before
+# the message is stored, keeping only WHICH numeric tokens were thresholds.
+# Outside a pass (a matcher called directly) ``_thr`` is plain formatting.
+_MARK_THRESHOLDS: ContextVar[bool] = ContextVar("_alert_mark_thresholds", default=False)
+_THR_OPEN, _THR_CLOSE = "\ue000", "\ue001"
+_THR_MARK_RE = re.compile(f"{_THR_OPEN}([^{_THR_OPEN}{_THR_CLOSE}]*){_THR_CLOSE}")
 
 
-def _restate_edited_thresholds(
-    peak: str, current: str, then: dict[str, int | float], now: dict[str, int | float]
-) -> str:
-    """Rewrite the threshold in a peak message to the rule's edited one (#3233).
+def _thr(value: object, fmt: str = "") -> str:
+    """Format a rule knob that an alert message prints as a threshold (#3233)."""
+    text = format(value, fmt)
+    return f"{_THR_OPEN}{text}{_THR_CLOSE}" if _MARK_THRESHOLDS.get() else text
+
+
+def _unmark_thresholds(marked: str) -> tuple[str, frozenset[int]]:
+    """Strip ``_thr`` marks: the clean message, and which of its numeric tokens
+    (indices into :func:`_message_numbers`) are thresholds."""
+    parts: list[str] = []
+    starts: list[int] = []
+    pos = length = 0
+    for m in _THR_MARK_RE.finditer(marked):
+        parts.append(marked[pos : m.start()])
+        length += m.start() - pos
+        starts.append(length)
+        parts.append(m.group(1))
+        length += len(m.group(1))
+        pos = m.end()
+    parts.append(marked[pos:])
+    clean = "".join(parts)
+    if not starts:
+        return clean, frozenset()
+    idx = frozenset(
+        i
+        for i, tok in enumerate(_NUM_RE.finditer(clean))
+        if any(tok.start() <= st < tok.end() for st in starts)
+    )
+    return clean, idx
+
+
+def _restate_edited_thresholds(peak: str, current: str, threshold_idx: frozenset[int]) -> str:
+    """Carry the rule's current thresholds into a peak message (#3233).
 
     A threshold edit leaves the rule's open events as they are, so the peak
     message still prints the old threshold; the composer would then show the
-    threshold, unlabelled, as the current reading. A number is restated only
-    when the peak carries the old threshold there and the current message
-    carries the new one at the same position, so a reading that merely
-    equals a threshold is never rewritten.
+    threshold, unlabelled, as the current reading. ``threshold_idx`` names the
+    numeric tokens the matcher printed as thresholds, so when the peak was
+    rendered from the same template (same skeleton) exactly those tokens are
+    taken from the current message. Readings are never rewritten, whatever
+    their value; a peak from another template is left to the composer.
     """
-    # Two knobs can share an old value and move to different new ones, so
-    # each old token maps to every new token it may have become.
-    swap: dict[str, set[str]] = {}
-    for col, old in then.items():
-        new = now.get(col)
-        if new is not None and new != old:
-            swap.setdefault(f"{old}", set()).add(f"{new}")
-            swap.setdefault(f"{old}%", set()).add(f"{new}%")
-    if not swap:
+    if not threshold_idx:
         return peak
     cur_skel, cur_nums = _message_numbers(current)
     peak_skel, peak_nums = _message_numbers(peak)
@@ -2860,9 +2879,7 @@ def _restate_edited_thresholds(
 
     def sub(m: re.Match[str]) -> str:
         i = next(idx)
-        if cur_nums[i] in swap.get(peak_nums[i], ()):
-            return cur_nums[i]
-        return m.group(0)
+        return cur_nums[i] if i in threshold_idx else m.group(0)
 
     return _NUM_RE.sub(sub, peak)
 
@@ -2961,7 +2978,7 @@ async def _matching_domain_expiring_subjects(
 
         message = (
             f"Domain {d.name} {descriptor} (expires_at "
-            f"{exp.isoformat()}, threshold {threshold_days} d)"
+            f"{exp.isoformat()}, threshold {_thr(threshold_days)} d)"
         )
         matches.append((str(d.id), d.name, message, sev))
     return matches
@@ -3019,7 +3036,7 @@ async def _matching_tls_cert_expiring_subjects(
         label = t.display_name or t.host
         message = (
             f"TLS cert for {label} {descriptor} (not_after "
-            f"{exp.isoformat()}, threshold {threshold_days} d)"
+            f"{exp.isoformat()}, threshold {_thr(threshold_days)} d)"
         )
         matches.append((str(t.id), label, message, sev))
     return matches
@@ -3420,7 +3437,7 @@ async def _matching_circuit_term_expiring_subjects(
         message = (
             f"Circuit {c.name} {descriptor} "
             f"(term_end_date {c.term_end_date.isoformat()}, threshold "
-            f"{threshold_days} d)"
+            f"{_thr(threshold_days)} d)"
         )
         matches.append((str(c.id), c.name, message, sev))
     return matches
@@ -3483,7 +3500,7 @@ async def _matching_k3s_api_cert_expiring_subjects(
         message = (
             f"k3s API server cert on {a.hostname} {descriptor} "
             f"({a.k3s_api_cert_expires_at.isoformat()}, threshold "
-            f"{threshold_days} d). k3s rotates this automatically; "
+            f"{_thr(threshold_days)} d). k3s rotates this automatically; "
             f"a restart of k3s.service should pick up a refreshed cert."
         )
         matches.append((str(a.id), a.hostname, message, sev))
@@ -3555,7 +3572,7 @@ async def _matching_secret_expiring_subjects(
         message = (
             f"Supervisor mTLS certificate for appliance {a.hostname} "
             f"{_descriptor(days)} ({a.cert_expires_at.isoformat()}, threshold "
-            f"{threshold_days} d). Re-key it from the Fleet drilldown."
+            f"{_thr(threshold_days)} d). Re-key it from the Fleet drilldown."
         )
         matches.append((f"appliance_cert:{a.id}", f"{a.hostname} supervisor cert", message, sev))
 
@@ -3581,7 +3598,7 @@ async def _matching_secret_expiring_subjects(
         )
         message = (
             f"API token '{t.name}' ({t.prefix}…) {_descriptor(days)} "
-            f"({t.expires_at.isoformat()}, threshold {threshold_days} d). "
+            f"({t.expires_at.isoformat()}, threshold {_thr(threshold_days)} d). "
             f"Rotate it from Administration → API Tokens."
         )
         matches.append((f"api_token:{t.id}", f"{t.name} API token", message, sev))
@@ -3637,7 +3654,7 @@ async def _matching_secret_expiring_subjects(
         message = (
             f"Let's Encrypt Web UI certificate '{c.subject_cn or c.name}' "
             f"{_descriptor(days)} ({valid_to.isoformat()}, threshold "
-            f"{threshold_days} d). Auto-renewal may be stuck — check "
+            f"{_thr(threshold_days)} d). Auto-renewal may be stuck — check "
             f"{certificate_store_location(settings.appliance_mode)}.{stale_note}"
         )
         matches.append(
@@ -3725,7 +3742,7 @@ async def _tailscale_token_subjects(
                 display,
                 f"Tailscale API access token for tenant '{t.name}' "
                 f"{descriptor(days)} ({expires_at.isoformat()}, {source}; threshold "
-                f"{threshold_days} d). Tailscale caps these tokens at 90 days; "
+                f"{_thr(threshold_days)} d). Tailscale caps these tokens at 90 days; "
                 f"generate a new one at https://login.tailscale.com/admin/settings/keys "
                 f"and replace it from Integrations → Tailscale.",
                 sev,
@@ -3960,7 +3977,8 @@ async def _matching_node_pressure_subjects(
             some = _psi_avg300(node.get(key), "some")
             if some is not None and some >= threshold:
                 reasons.append(
-                    f"{label} stall {some:.1f}% of the last 5 min (threshold {threshold:.0f}%)"
+                    f"{label} stall {some:.1f}% of the last 5 min "
+                    f"(threshold {_thr(threshold, '.0f')}%)"
                 )
                 severity = severity or "warning"
 
@@ -5283,7 +5301,7 @@ async def _matching_appliance_disk_usage_subjects(
                     subject_id,
                     a.hostname,
                     f"/var on {a.hostname} is {pct:.0f}% full ({size}), at or above "
-                    f"the rule's {threshold:.0f}% threshold. The alert turns critical "
+                    f"the rule's {_thr(threshold, '.0f')}% threshold. The alert turns critical "
                     f"at {_APPLIANCE_DISK_CRITICAL_PCT}% used, a few points before the "
                     "kubelet starts evicting pods (at about 90%); free space or grow "
                     "the data disk before then.",
@@ -5299,8 +5317,8 @@ async def _matching_appliance_disk_usage_subjects(
                     subject_id,
                     a.hostname,
                     f"/var on {a.hostname} is {pct:.0f}% full ({size}), below the "
-                    f"rule's {threshold:.0f}% threshold but not yet under "
-                    f"{_pct_resolve_floor(threshold):.0f}%; the alert resolves "
+                    f"rule's {_thr(threshold, '.0f')}% threshold but not yet under "
+                    f"{_thr(_pct_resolve_floor(threshold), '.0f')}%; the alert resolves "
                     "below that.",
                     held_sev,
                 )
@@ -5490,7 +5508,7 @@ async def _matching_service_term_expiring_subjects(
         message = (
             f"Service {s.name} {descriptor} "
             f"(term_end_date {s.term_end_date.isoformat()}, threshold "
-            f"{threshold_days} d)"
+            f"{_thr(threshold_days)} d)"
         )
         matches.append((str(s.id), s.name, message, sev))
     return matches
@@ -5545,7 +5563,7 @@ async def _matching_decom_expiring_subjects(
             descriptor = f"is scheduled for decommission in {days_to_expiry} day(s)"
         message = (
             f"Subnet {display} {descriptor} "
-            f"(decom_date {s.decom_date.isoformat()}, threshold {threshold_days} d)"
+            f"(decom_date {s.decom_date.isoformat()}, threshold {_thr(threshold_days)} d)"
         )
         matches.append((str(s.id), display, message, sev))
     return matches
@@ -8186,6 +8204,23 @@ def rule_type_module(rule_type: str) -> str | None:
     return _RULE_TYPE_MODULE.get(rule_type)
 
 
+def _marking_thresholds(
+    fn: Callable[[AsyncSession], Awaitable[dict[str, int]]],
+) -> Callable[[AsyncSession], Awaitable[dict[str, int]]]:
+    """Run an evaluation pass with ``_thr`` marking on (#3233)."""
+
+    @functools.wraps(fn)
+    async def wrapper(db: AsyncSession) -> dict[str, int]:
+        token = _MARK_THRESHOLDS.set(True)
+        try:
+            return await fn(db)
+        finally:
+            _MARK_THRESHOLDS.reset(token)
+
+    return wrapper
+
+
+@_marking_thresholds
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -8693,7 +8728,8 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     }
 
             # Open new events for unseen matches; escalate existing ones.
-            for subject_id, display, message, severity_override in matches:
+            for subject_id, display, marked, severity_override in matches:
+                message, threshold_idx = _unmark_thresholds(marked)
                 existing = open_by_subject.get(subject_id)
                 if existing is None and subject_id in suppressed_ids:
                     continue
@@ -8715,7 +8751,6 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         existing.last_observed_value = {
                             **(existing.last_observed_value or {}),
                             "peak_message": message,
-                            "peak_thresholds": _rule_thresholds(rule),
                         }
                         ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
@@ -8741,22 +8776,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         peak = lov.get("peak_message") or existing.message
                         # #3233 — a threshold edit leaves the open event alone,
                         # so restate the threshold in the peak first.
-                        peak = _restate_edited_thresholds(
-                            peak, message, lov.get("peak_thresholds") or {}, _rule_thresholds(rule)
-                        )
+                        peak = _restate_edited_thresholds(peak, message, threshold_idx)
                         composed = _compose_peak_and_now(peak, message)
-                        thresholds = _rule_thresholds(rule)
-                        if (
-                            composed != existing.message
-                            or lov.get("peak_message") != peak
-                            or lov.get("peak_thresholds") != thresholds
-                        ):
+                        if composed != existing.message or lov.get("peak_message") != peak:
                             existing.message = composed
-                            existing.last_observed_value = {
-                                **lov,
-                                "peak_message": peak,
-                                "peak_thresholds": thresholds,
-                            }
+                            existing.last_observed_value = {**lov, "peak_message": peak}
                     continue
                 event = AlertEvent(
                     rule_id=rule.id,
@@ -8766,10 +8790,6 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     severity=severity_override or rule.severity,
                     message=message,
                     fired_at=now,
-                    last_observed_value={
-                        "peak_message": message,
-                        "peak_thresholds": _rule_thresholds(rule),
-                    },
                 )
                 db.add(event)
                 await db.flush()  # populate event.id for delivery payload
