@@ -56,6 +56,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { cn } from "@/lib/utils";
 import { isHeartbeatStale, silenceLabel } from "@/lib/heartbeat";
 import { releaseVerdict, upgradeDirection } from "@/lib/versions";
@@ -887,7 +888,7 @@ export function FleetTab({
   // session) so it stays dismissed across browser restarts; the
   // checkbox gate makes dismissal deliberate rather than a stray click.
   const [vipAdvisoryDismissed, setVipAdvisoryDismissed] = useState<boolean>(
-    () => localStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
+    () => safeLocalStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
   );
   const [vipDismissAck, setVipDismissAck] = useState(false);
 
@@ -1529,7 +1530,10 @@ export function FleetTab({
                           type="button"
                           disabled={!vipDismissAck}
                           onClick={() => {
-                            localStorage.setItem(VIP_ADVISORY_DISMISS_KEY, "1");
+                            safeLocalStorage.setItem(
+                              VIP_ADVISORY_DISMISS_KEY,
+                              "1",
+                            );
                             setVipAdvisoryDismissed(true);
                           }}
                           className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
