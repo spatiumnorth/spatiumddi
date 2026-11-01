@@ -670,7 +670,11 @@ function InlineEditableText({
           if (e.key === "Enter") {
             e.preventDefault();
             commit();
-          } else if (e.key === "Escape") {
+          } else if (
+            e.key === "Escape" &&
+            !e.nativeEvent.isComposing &&
+            e.keyCode !== 229
+          ) {
             e.preventDefault();
             setDraft(value);
             setEditing(false);
@@ -3313,7 +3317,11 @@ function InlineStatusSelect({
         }}
         onBlur={() => setEditing(false)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") {
+          if (
+            e.key === "Escape" &&
+            !e.nativeEvent.isComposing &&
+            e.keyCode !== 229
+          ) {
             e.preventDefault();
             setEditing(false);
           }
