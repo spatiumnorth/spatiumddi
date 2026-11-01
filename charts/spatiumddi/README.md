@@ -143,6 +143,42 @@ externalRedis:
   existingSecret: my-redis-secret    # optional; remove for unauth'd redis
 ```
 
+### Exposing DNS and DHCP to clients
+
+The DNS and DHCP agent Services are `ClusterIP` unless a server sets
+`service.type`. A `ClusterIP` Service is reachable from inside the cluster
+only, which is enough for the control plane but not for clients on your LAN.
+
+Do not point a default k3s at `type: LoadBalancer` for port 53. k3s ships
+**servicelb** (klipper-lb), which runs an `svclb-*` pod with `hostPort: 53`
+on every node. The CNI hostPort DNAT then also captures the node's own
+resolver stub at `127.0.0.53:53`, so the node stops resolving: image pulls
+fail with `lookup ghcr.io: Try again`, the `svclb` image itself cannot pull,
+local-path provisioning times out, and the install never converges (#3229).
+UDP 67 for DHCP uses the same hostPort mechanism.
+
+Pick one of these instead:
+
+- **MetalLB** (or a cloud load balancer). Install MetalLB, start k3s with
+  `--disable servicelb` so the two do not both claim the Service, and set
+  `service: { type: LoadBalancer }` with the pool / address annotations shown
+  in `values.yaml`. MetalLB announces a dedicated VIP, so nothing binds :53 on
+  the node.
+- **Another LoadBalancer implementation** with `--disable servicelb` (kube-vip,
+  Cilium LB-IPAM, ...). The same rule applies: whatever implements the
+  Service must not use hostPort 53.
+- **`NodePort`**, for a resolver you reach through a forwarder or an external
+  load balancer. Port 53 is not in the NodePort range, so clients cannot use
+  it directly.
+- **`hostNetwork`** (DHCP only in this chart). It binds the node's own port, so
+  never run it on a node where something else, such as `systemd-resolved`, owns
+  that port. DNS agents do not offer it here for exactly that reason.
+
+On a node where only the resolver stub is the problem, never expose :53 with
+servicelb; if you already did, delete the Service and the `svclb-*` DaemonSet,
+then `iptables -t nat -S CNI-HOSTPORT-DNAT | grep 'dports 53'` should come back
+empty.
+
 ### Running managed DNS agents
 
 ```yaml
@@ -155,11 +191,11 @@ dnsAgents:
     - name: ns1
       role: primary
       group: internal-resolvers
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
     - name: ns2
       role: secondary
       group: internal-resolvers
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
     # PowerDNS (issue #127 — online DNSSEC, ALIAS, LUA, catalog zones).
     # Lives in its own group so PowerDNS-only features can engage; the
     # control plane rejects mixed-driver groups for those features.
@@ -167,7 +203,7 @@ dnsAgents:
       flavor: powerdns
       role: primary
       group: powerdns-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
     # Technitium (third DNS driver — online DNSSEC, catalog zones both
     # ways, and native DoT/DoH/DoQ listeners plus encrypted upstream
     # forwarding with no dnsdist-style sidecar). Own group, same rule.
@@ -175,8 +211,13 @@ dnsAgents:
       flavor: technitium
       role: primary
       group: technitium-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
 ```
+
+The agent Services default to `ClusterIP` (#3229). The `LoadBalancer` lines
+above are opt-in and need a load balancer that does not bind port 53 on the
+node itself; read [Exposing DNS and DHCP to clients](#exposing-dns-and-dhcp-to-clients)
+before copying them onto k3s.
 
 Each server picks its image from `dnsAgents.image` (default,
 configures BIND9) or `dnsAgents.flavors.<flavor>` per-driver
@@ -342,7 +383,8 @@ Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 `service.nodePort` (DHCP only; pins the node-facing port of a NodePort
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send
-to UDP/67 only, so use LoadBalancer or `hostNetwork` for those),
+to UDP/67 only, so use LoadBalancer or `hostNetwork` for those; setting it
+without `service.type` implies `NodePort`),
 `hostNetwork` (DHCP only), `resources`, `storageClass` (on an existing install, [read this first](#adopting-storageclass-on-an-existing-install)), `nodeSelector`,
 `tolerations` and `affinity` (#3206: merged with the chart's preferred
 one-agent-per-node anti-affinity; only a `podAntiAffinity` of your own
@@ -415,6 +457,17 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <NEW_CHART_VERSION> \
   --namespace spatiumddi --reuse-values
 ```
+
+**DNS / DHCP agent Service default changed to `ClusterIP` (#3229).** Earlier
+chart versions rendered a `LoadBalancer` Service for an agent server that set
+no `service.type`. An upgrade with `--reuse-values` keeps your values, so a
+server that never set the type now renders `ClusterIP`: Kubernetes changes the
+type in place and **releases the external IP clients use**. Before upgrading,
+list what you have (`kubectl -n spatiumddi get svc -l
+app.kubernetes.io/component=dns-agent`) and add `service: { type:
+LoadBalancer }` to every server that must keep its address, keeping the same
+`loadBalancerIP` or MetalLB annotation. Servers that already set a type are
+unchanged.
 
 The migrate Job is a regular Job named per revision, not a Helm hook. Each
 upgrade creates a new one, and the api, worker and beat pods wait for the

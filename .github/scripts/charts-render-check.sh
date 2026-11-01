@@ -774,6 +774,7 @@ render umbrella-dns-agent-lb "$UMBRELLA" \
     --set dnsAgents.servers[0].dotPort=853 \
     --set dnsAgents.servers[0].dohPort=8443 \
     --set dnsAgents.servers[0].doqPort=853 \
+    --set dnsAgents.servers[0].service.type=LoadBalancer \
     --set dnsAgents.servers[0].service.loadBalancerIP=10.0.0.53 \
     --set dnsAgents.servers[0].service.loadBalancerSourceRanges[0]=192.0.2.0/24 \
     --set dnsAgents.servers[0].service.ipFamilyPolicy=PreferDualStack \
@@ -788,6 +789,79 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
     --expect-annotation metallb.universe.tf/loadBalancerIPs=10.0.0.53 \
     --expect-annotation metallb.universe.tf/address-pool=default \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+# #3229 — a DNS agent server with no service.type must render ClusterIP, and
+# a DHCP agent likewise: a LoadBalancer default is a hostPort-53 svclb pod on
+# k3s that captures the node's own 127.0.0.53 resolver. Explicit
+# LoadBalancer (above) must still work.
+render umbrella-agent-default-svc "$UMBRELLA" \
+    --set dnsAgents.enabled=true \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+echo "── agent Services default to ClusterIP (umbrella, #3229)"
+python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
+    --expect-type ClusterIP "$OUT/umbrella-agent-default-svc.yaml" \
+    || failures=$((failures + 1))
+python3 - "$OUT/umbrella-agent-default-svc.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+rc = 0
+for comp in ("dns-agent", "dhcp-agent"):
+    # The client-facing Service only: the headless peer Service is excluded,
+    # and one must exist so the assertion cannot pass on its absence.
+    svcs = [
+        d for d in docs
+        if d.get("kind") == "Service"
+        and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == comp
+        and d["spec"].get("clusterIP") != "None"
+    ]
+    if not svcs:
+        print(f"FAIL no client-facing {comp} Service rendered (#3229)", file=sys.stderr)
+        rc = 1
+        continue
+    bad = [d["metadata"]["name"] for d in svcs if d["spec"].get("type") != "ClusterIP"]
+    if bad:
+        print(f"FAIL {comp} Service default is not ClusterIP: {bad} (#3229)", file=sys.stderr)
+        rc = 1
+    else:
+        print(f"   {comp} Service defaults to ClusterIP")
+sys.exit(rc)
+PYEOF
+# #3229 under #3209 naming: the same ClusterIP default must hold when agent
+# objects are prefixed with the release fullname.
+render umbrella-agent-default-svc-prefixed "$UMBRELLA" \
+    --set dnsAgents.enabled=true \
+    --set dnsAgents.prefixWithFullname=true \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.prefixWithFullname=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+echo "── agent Services default to ClusterIP (prefixWithFullname, #3229 + #3209)"
+python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
+    --expect-type ClusterIP "$OUT/umbrella-agent-default-svc-prefixed.yaml" \
+    || failures=$((failures + 1))
+# #3229 — a DHCP service.nodePort with no service.type implies NodePort.
+render umbrella-dhcp-nodeport-implied "$UMBRELLA" \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.servers[0].service.nodePort=30067
+echo "── DHCP service.nodePort without type implies NodePort (umbrella, #3229)"
+python3 - "$OUT/umbrella-dhcp-nodeport-implied.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+svcs = [
+    d for d in yaml.safe_load_all(open(sys.argv[1]))
+    if d and d.get("kind") == "Service"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-agent"
+    and d["spec"].get("clusterIP") != "None"
+]
+if not svcs or any(
+    d["spec"].get("type") != "NodePort" or d["spec"]["ports"][0].get("nodePort") != 30067
+    for d in svcs
+):
+    print(f"FAIL DHCP nodePort without type is not NodePort: {[d['spec'].get('type') for d in svcs]} (#3229)", file=sys.stderr)
+    sys.exit(1)
+print("   DHCP nodePort implies NodePort")
+PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
