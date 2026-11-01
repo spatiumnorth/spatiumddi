@@ -1820,6 +1820,24 @@ def storage_summary() -> list[tuple[str, str, str]]:
     return chips
 
 
+def _slot_holding_uuid(nodes: list, root_uuid: str, inherited: str = "") -> str:
+    """``slot_a`` / ``slot_b`` for the lsblk node whose UUID is ``root_uuid``,
+    or "". The slot name is the node's own PARTLABEL on a single disk; on a
+    mirrored install (#999) the root filesystem is an md array with no
+    PARTLABEL, listed as a child of its root_A / root_B members, so the name
+    is inherited from the member above it (#3172)."""
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        label = (node.get("partlabel") or "").lower() or inherited
+        if (node.get("uuid") or "").lower() == root_uuid:
+            return "slot_" + label.split("_", 1)[1] if label in ("root_a", "root_b") else ""
+        found = _slot_holding_uuid(node.get("children") or [], root_uuid, label)
+        if found:
+            return found
+    return ""
+
+
 def detect_slot_info() -> tuple[str, str] | None:
     """Return (current_slot, durable_default) — both "slot_a"/"slot_b" or
     None if we can't determine. Phase 8c A/B boot detection:
@@ -1846,18 +1864,12 @@ def detect_slot_info() -> tuple[str, str] | None:
     current = ""
     try:
         out = subprocess.run(
-            ["lsblk", "-no", "PARTLABEL,UUID"],
+            ["lsblk", "-J", "-o", "PARTLABEL,UUID"],
             capture_output=True, text=True, check=True, timeout=2,
         ).stdout
-        for line in out.splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[-1].lower() == root_uuid:
-                label = parts[0].lower()
-                if label.startswith("root_"):
-                    current = "slot_" + label.split("_", 1)[1]
-                break
+        current = _slot_holding_uuid(json.loads(out).get("blockdevices") or [], root_uuid)
     except (FileNotFoundError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired):
+            subprocess.TimeoutExpired, ValueError, AttributeError):
         # Optional probe — when blkid isn't present (dev container) or
         # the call times out, leave `current` empty and fall through to
         # the "no slot info" branch below.
