@@ -6,10 +6,13 @@ payloads with operator-supplied parameters substituted in.
 
 Templates can mark records ``skip_if_empty: ["param"]`` so optional fields
 (DKIM selector, AD site name, IPv6 origin) drop out cleanly when not
-filled in. ``skip_if_set`` is the inverse (a fallback used only while the parameter
-is blank). ``{{__zone__}}`` is a built-in token that resolves to the new
-zone's name so apex aliases like ``www CNAME @`` can render as
-``www CNAME example.com.`` without extra parameters.
+filled in. ``skip_if_set: ["param"]`` is the inverse: a fallback record
+that is written only while the parameter is blank (the Email template's
+``p=none`` DMARC stub stands in for the ``rua=`` one, #3267). Every key
+either list names must be one of the template's parameters.
+``{{__zone__}}`` is a built-in token that resolves to the new zone's name
+so apex aliases like ``www CNAME @`` can render as ``www CNAME example.com.``
+without extra parameters.
 """
 
 from __future__ import annotations
@@ -57,6 +60,14 @@ class ZoneTemplate:
     description: str
     parameters: list[TemplateParameter]
     records: list[TemplateRecord]
+
+    @property
+    def max_record_count(self) -> int:
+        """Records written with every parameter filled in — the catalog's
+        ``record_count``. A ``skip_if_set`` record is a fallback for one that
+        the filled-in parameter writes instead, so counting it would promise
+        a record no zone gets (#3267)."""
+        return sum(1 for r in self.records if not r.skip_if_set)
 
 
 @lru_cache(maxsize=1)
@@ -128,7 +139,8 @@ def materialize(
     """Resolve ``template.records`` to concrete record-create payloads.
 
     Empty / missing parameters skip records that list them in
-    ``skip_if_empty``; all other placeholders that match nothing collapse
+    ``skip_if_empty``, and filled-in ones skip records that list them in
+    ``skip_if_set``; all other placeholders that match nothing collapse
     to "" (so a careless template authoring won't 500). The reserved
     ``__zone__`` token always resolves to the zone's name with the
     trailing dot preserved — useful for apex CNAME aliasing.
