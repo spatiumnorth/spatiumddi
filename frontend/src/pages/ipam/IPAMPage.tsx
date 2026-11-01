@@ -4557,7 +4557,10 @@ const NEEDS_BLOCK_WRITE = "Requires write permission on IP blocks";
 const NEEDS_SUBNET_WRITE = "Requires write permission on subnets";
 const NEEDS_ADDRESS_WRITE =
   "Requires write permission on this subnet or on an address set in it";
-const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
+// A scan is started with write and watched with read: a role holding only
+// write would start one it cannot see (#3279).
+const NEEDS_NMAP_WRITE =
+  "Requires write and read permission on nmap scans (read shows the result)";
 const NEEDS_ADDRESS_DELETE =
   "Requires delete permission on subnets, and write on this subnet or on an address set in it";
 const NEEDS_DNS_SYNC =
@@ -4619,6 +4622,9 @@ function ToolsMenu({
   onAskAi?: () => void;
 }) {
   const aiAvailable = useAiAvailable();
+  // #3279 — every nmap route answers "Feature 'tools.nmap' is disabled."
+  // with the module off, so the entry is not offered at all.
+  const nmapOn = useModuleOn("tools.nmap");
   const reshape = permissionGate(can.reshape, NEEDS_SUBNET_WRITE);
   return (
     <HeaderMenu
@@ -4660,13 +4666,17 @@ function ToolsMenu({
           onSelect: onResize,
           ...reshape,
         },
-        {
-          key: "scan",
-          label: "Scan with nmap",
-          icon: Radar,
-          onSelect: onScan,
-          ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
-        },
+        ...(nmapOn
+          ? [
+              {
+                key: "scan",
+                label: "Scan with nmap",
+                icon: Radar,
+                onSelect: onScan,
+                ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
+              },
+            ]
+          : []),
         {
           key: "split",
           label: "Split…",
@@ -5065,7 +5075,9 @@ export function SubnetDetail({
   // the type-level ask: the server still refuses them to a scoped holder.
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
-  const canScan = perms.can("write", "manage_nmap_scans");
+  const canScan =
+    perms.can("write", "manage_nmap_scans") &&
+    perms.can("read", "manage_nmap_scans");
   // #2571 — DNS sync: the drift preview reads the subnet and its addresses
   // and the commit is write on subnets, all at the type level (a grant scoped
   // to one subnet reaches neither, #2497; #3058).
@@ -9588,6 +9600,11 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const { data: networkRows } = useNetworkContext(address.id);
   const networkCount = networkRows?.length ?? 0;
   const [nmapOpen, setNmapOpen] = useState(false);
+  const nmapPerms = usePermissions();
+  const nmapOn = useModuleOn("tools.nmap");
+  const canNmap =
+    nmapPerms.can("write", "manage_nmap_scans") &&
+    nmapPerms.can("read", "manage_nmap_scans");
 
   return (
     <Modal title={`Edit ${address.address}`} onClose={onClose}>
@@ -9617,15 +9634,18 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           Network
           <NetworkTabBadge count={networkCount} />
         </button>
-        <button
-          type="button"
-          onClick={() => setNmapOpen(true)}
-          className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
-          title="Run an nmap scan against this IP"
-        >
-          <Radar className="h-3.5 w-3.5" />
-          Scan with Nmap
-        </button>
+        {nmapOn && (
+          <button
+            type="button"
+            onClick={() => setNmapOpen(true)}
+            className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            title="Run an nmap scan against this IP"
+            {...permissionGate(canNmap, NEEDS_NMAP_WRITE)}
+          >
+            <Radar className="h-3.5 w-3.5" />
+            Scan with Nmap
+          </button>
+        )}
       </div>
       {nmapOpen && (
         <NmapScanModal

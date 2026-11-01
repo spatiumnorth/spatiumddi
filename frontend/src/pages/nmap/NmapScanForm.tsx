@@ -84,11 +84,14 @@ export function NmapScanForm({
   onScanStarted,
 }: NmapScanFormProps) {
   // #1341 — a read-only user is offered no write it would be refused:
-  // the router asks write on 'manage_nmap_scans'.
+  // the router asks write on 'manage_nmap_scans' to start a scan and read
+  // to watch it, so a role with only write would start a scan it cannot see
+  // (#3279).
   const perms = usePermissions();
   const writeGate = permissionGate(
-    perms.can("write", "manage_nmap_scans"),
-    "Requires write permission on nmap scans",
+    perms.can("write", "manage_nmap_scans") &&
+      perms.can("read", "manage_nmap_scans"),
+    "Requires write and read permission on nmap scans (read shows the result)",
   );
   const [targetIp, setTargetIp] = useState(defaultTargetIp);
   const [preset, setPreset] = useState<NmapPreset>(defaultPreset);
