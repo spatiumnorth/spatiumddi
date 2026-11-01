@@ -185,6 +185,19 @@ async def test_approved_portal_request_creates_a_record(
     )
     assert resp.status_code == 201, resp.text
     rid = resp.json()["id"]
+    # A second request for the same name, queued while the first is still
+    # pending: nothing clashes yet, so submit accepts it.
+    resp = await client.post(
+        "/api/v1/requests",
+        headers=req_hdr,
+        json={
+            "kind": "ip_address",
+            "args": {"subnet_id": sid, "address": "10.98.5.21", "hostname": "app01"},
+            "justification": "Second host with a clashing name.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    rid2 = resp.json()["id"]
     resp = await client.post(
         f"/api/v1/requests/{rid}/approve", headers=appr_hdr, json={"decision_note": "ok"}
     )
@@ -202,21 +215,24 @@ async def test_approved_portal_request_creates_a_record(
         (o.op, o.record) for o in ops
     ]
 
-    # A second request for the same name collides with the first (the REST
-    # FQDN check). The approve refuses, and the transaction boundary holds:
-    # no address row, no record. The request ends failed with the clash
-    # spelled out for the requester (#2911).
+    # Now the name is taken, a new request for it is refused at submit
+    # (#3243), in words that do not name the address holding it.
     resp = await client.post(
         "/api/v1/requests",
         headers=req_hdr,
         json={
             "kind": "ip_address",
-            "args": {"subnet_id": sid, "address": "10.98.5.21", "hostname": "app01"},
-            "justification": "Second host with a clashing name.",
+            "args": {"subnet_id": sid, "address": "10.98.5.22", "hostname": "app01"},
+            "justification": "Third host with a clashing name.",
         },
     )
-    assert resp.status_code == 201, resp.text
-    rid2 = resp.json()["id"]
+    assert resp.status_code == 409, resp.text
+    assert "10.98.5.20" not in resp.text
+
+    # The second request, queued before the first was approved, collides
+    # with it (the REST FQDN check). The approve refuses, and the transaction
+    # boundary holds: no address row, no record. The request ends failed
+    # with the clash spelled out for the requester (#2911).
     resp = await client.post(
         f"/api/v1/requests/{rid2}/approve", headers=appr_hdr, json={"decision_note": "ok"}
     )

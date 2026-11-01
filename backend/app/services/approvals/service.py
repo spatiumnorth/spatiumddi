@@ -501,8 +501,9 @@ def _refusal_text(detail: Any) -> str:
     sentence, not a Python ``repr``. Most details are strings. The IPAM
     collision check raises ``{"warnings": [...], "requires_confirmation":
     True}`` — the REST UI's "save anyway" prompt — which has no confirm step
-    at approve time, so each warning is spelled out instead. Anything else
-    falls back to JSON."""
+    at approve time, so each warning is spelled out instead (collisions, a
+    dynamic DHCP pool, a public-facing zone). Anything else falls back to
+    JSON."""
     if isinstance(detail, str):
         return detail
     if isinstance(detail, dict) and isinstance(detail.get("warnings"), list):
@@ -527,6 +528,20 @@ def _refusal_text(detail: Any) -> str:
                     f"The reverse name {w.get('ptr_name')} in {w.get('zone')} already"
                     f" points to {w.get('existing_value')}."
                 )
+            elif kind == "dynamic_pool":
+                span = (
+                    f" ({w.get('pool_start')} to {w.get('pool_end')})"
+                    if w.get("pool_start") and w.get("pool_end")
+                    else ""
+                )
+                parts.append(
+                    f"The address {w.get('address')} now falls inside a DHCP dynamic"
+                    f" pool{span}, so the DHCP server may hand it to another device."
+                )
+            elif isinstance(w.get("message"), str) and w["message"]:
+                # The public-facing zone warning (keyed "type", not "kind")
+                # and any later warning that carries its own sentence.
+                parts.append(w["message"])
             else:
                 parts.append(json.dumps(w, sort_keys=True, default=str))
         if parts:

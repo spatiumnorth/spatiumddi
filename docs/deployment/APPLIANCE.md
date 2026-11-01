@@ -1687,7 +1687,7 @@ Surfacing: a fresh `blocked` verdict renders in bold red on the console identity
 The Talos-style console got a wave of usability fixes:
 
 - F9 / Diag chip removed (handler was a no-op). *(Later, #556) F9 is repurposed to **Cancel pending reboot** — shown only while a reboot is queued; it stops the reboot service mid-grace and removes the trigger, aborting a web-UI / Fleet reboot from the physical console. The Slot-box indicator reads `REBOOT pending — F5 now · F9 cancel`.*
-- *(#2974)* **Every operator-initiated reboot or power-off hands the PostgreSQL primary off first.** The web-UI reboot (`spatiumddi-reboot.service`) and the console's F5 / F6 (`spatium-power-action@reboot|poweroff.service`, started without waiting, so the dashboard keeps rendering and a console restart cannot kill the run) all go through `spatium-power-action`, which runs `spatium-reboot-handoff --before-reboot` (as the Fleet reboot does, #2849) and then `systemctl reboot` / `poweroff`. On the node holding the primary that adds up to a few minutes, bounded: the handoff is capped at 240 s and the reboot goes on whatever it did. The Slot box reads `REBOOT under way — handing off DB primary · F9 cancel` meanwhile (just `REBOOT under way · F9 cancel` on a one-node install, which has no primary to hand off; the console's run holds a 10 s grace first, `SPATIUM_POWER_ACTION_GRACE_S`, so the web UI sees it under way), and F9 stops it and uncordons the node. The node stays cordoned through the reboot and uncordons itself at its next boot (`spatiumddi-reboot-handoff.service`); **a node powered off for good stays cordoned in the cluster** until it is booted again or removed from the cluster. *(#3008)* The Fleet reboot (`spatiumddi-reboot-agent`) now runs the same wrapper after its 5 s grace, so it gets the same banner and F9 cancel. While the wrapper runs it holds an `flock` on the release-state directory, which `GET /api/v1/appliance/system/info` reports as `reboot_in_progress` (with `node`, the node whose api pod answered): the web UI's Reboot button stays disabled through the handoff. `reboot_in_progress` also reads a pending web-UI or Fleet trigger, the Fleet agent's `reboot-fleet-grace` marker (held from taking its trigger until it exits, so the console's F9 can cancel a Fleet reboot during its grace too), and `power-action-issued`, which the wrapper writes just before `systemctl reboot` stamped with the host's boot id, so the flag holds until the node is actually down and clears itself with the reboot.
+- *(#2974)* **Every operator-initiated reboot or power-off hands the PostgreSQL primary off first.** The web-UI reboot (`spatiumddi-reboot.service`) and the console's F5 / F6 (`spatium-power-action@reboot|poweroff.service`, started without waiting, so the dashboard keeps rendering and a console restart cannot kill the run) all go through `spatium-power-action`, which runs `spatium-reboot-handoff --before-reboot` (as the Fleet reboot does, #2849) and then `systemctl reboot` / `poweroff`. On the node holding the primary that adds up to a few minutes, bounded: the handoff is capped at 240 s and the reboot goes on whatever it did. The Slot box reads `REBOOT under way — handing off DB primary · F9 cancel` meanwhile (just `REBOOT under way · F9 cancel` on a one-node install, which has no primary to hand off; the console's run holds a 10 s grace first, `SPATIUM_POWER_ACTION_GRACE_S`, so the web UI sees it under way), and F9 stops it and uncordons the node. *(#3162)* F9 within the console's grace asks the database for nothing; once the handoff has cordoned the node, CloudNativePG has been asked to switch the primary over and that switchover still completes (a few seconds of API unavailability, with no reboot), which the console says after the cancel. A cancelled run ends by the stop's signal rather than `exit 1`, and the units running it list `SIGTERM` / `SIGINT` / `SIGHUP` in `SuccessExitStatus=` (a `Type=oneshot` unit otherwise counts death by a signal as a failure), so its unit is left inactive, not `failed`. The node stays cordoned through the reboot and uncordons itself at its next boot (`spatiumddi-reboot-handoff.service`); **a node powered off for good stays cordoned in the cluster** until it is booted again or removed from the cluster. *(#3008)* The Fleet reboot (`spatiumddi-reboot-agent`) now runs the same wrapper after its 5 s grace, so it gets the same banner and F9 cancel. While the wrapper runs it holds an `flock` on the release-state directory, which `GET /api/v1/appliance/system/info` reports as `reboot_in_progress` (with `node`, the node whose api pod answered): the web UI's Reboot button stays disabled through the handoff. `reboot_in_progress` also reads a pending web-UI or Fleet trigger, the Fleet agent's `reboot-fleet-grace` marker (held from taking its trigger until it exits, so the console's F9 can cancel a Fleet reboot during its grace too), and `power-action-issued`, which the wrapper writes just before `systemctl reboot` stamped with the host's boot id, so the flag holds until the node is actually down and clears itself with the reboot.
 - Control-plane reachability chip (#556, appliance role only) — a ≤ 2 s TCP probe of `CONTROL_PLANE_URL`, fanned out in the data-tier pool so it overlaps the kubectl forks. Rendered on the header identity row so an operator can distinguish "network-partitioned" from "unapproved" (which `pairing_status` alone can't). Off on the control-plane role (empty URL).
 - Live-log noise filter — Python traceback frames, caret indicators, systemd restart-counter spam dropped before they hit the renderer; `--since` window 10 min → 2 min so crash spam clears 5× faster.
 - CPU usage 92 % → 1.4 % — Rich Live had its background `auto_refresh` thread + main loop both rendering at 4 Hz. Fixed with `auto_refresh=False` + main-loop tick 0.25 s → 0.5 s.
@@ -2485,7 +2485,8 @@ set-default / set-next-boot writes `grubenv`. All of that lands on the
 leaves the survivor booting the **old kernel from a stale menu** — a
 mirror that protected the data and lost the appliance. So
 `spatiumddi-esp-sync` is called from `spatium-install`,
-`spatium-upgrade-slot apply`, `set-next-boot` and `set-default`, and is
+`spatium-upgrade-slot apply`, `set-next-boot`, `set-default` and
+`rollback`, and from firstboot when it commits a trial boot, and is
 a no-op on a single-disk box so every caller can invoke it
 unconditionally. `spatiumddi-esp-sync --check` reports drift without
 changing anything.
@@ -2545,6 +2546,34 @@ with ARRAY lines — written from `mdadm --detail --scan` at install and
 **checked**, because a conf with no ARRAY line produces an initrd that
 cannot find root, and the install aborts there rather than at the first
 reboot.
+
+**Slot upgrades and rollbacks on a mirror (#3172).** On a mirrored box
+a slot is the md array (`/dev/md/root_a`, `/dev/md/root_b`), not the
+`root_A` / `root_B` partitions: those are its two members, and a member
+carries the array's UUID rather than the filesystem's that
+`root=UUID=` names. `spatium-upgrade-slot`, the console, firstboot's
+trial-boot commit and the supervisor's Fleet telemetry all resolve the
+booted slot through the array. Before this, every
+`spatium-upgrade-slot` subcommand on a mirror exited with
+"couldn't detect A/B slots".
+
+`apply` writes the inactive **array**, never a member. The array is
+9 MiB smaller than its 8 GiB partition (metadata 1.2 keeps its data
+offset at the start of each member), and the slot image is built for the
+bare partition, so a straight `dd` would run out of room at the end.
+The image is written through a device-mapper concatenation of the array
+and a small sparse overflow file under
+`/var/lib/spatiumddi/slot-staging`; `resize2fs` then moves whatever
+landed past the array's end back inside it, the mapping is removed, and
+`e2fsck -n` checks the result through the array alone before the
+bootloader is touched. Only the overflow is staged, a few MiB. If the
+mapping cannot be removed the apply fails and says so: it holds the
+array open, and a slot that cannot be mounted cannot be booted. The
+mapping is also torn down when the write fails or the upgrade unit is
+stopped or times out (SIGTERM). Finally, an image whose root filesystem
+carries no `mdadm` (anything built before #999 added it) is refused
+before GRUB is pointed at it: its initrd could not assemble the array,
+and the node would stop in the initramfs.
 
 ### Installing onto a multipath SAN LUN (#999 Part C3)
 

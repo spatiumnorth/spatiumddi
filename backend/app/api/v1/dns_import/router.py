@@ -26,6 +26,7 @@ from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
+from app.services.api_token_scopes import read_only_post
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns_import import (
@@ -464,6 +465,7 @@ async def _read_archive(file: UploadFile) -> bytes:
 
 
 @router.post("/bind9/preview", response_model=PreviewOut)
+@read_only_post
 async def bind9_preview(
     current_user: SuperAdmin,
     db: DB,
