@@ -380,7 +380,11 @@ helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
 ```
 
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
-The chart renders a StatefulSet + LoadBalancer Service per entry.
+The chart renders a StatefulSet + LoadBalancer Service per entry, named
+`dns-<flavor>-<name>`; `dnsAgents.prefixWithFullname=true` prefixes them with
+the release fullname (new installs only: it recreates a live StatefulSet with
+new PVCs, #3209). `servers[].affinity` / `storageClass` (or
+`dnsAgents.storageClass`) set placement and the claims' StorageClass (#3206).
 Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
 `ghcr.io/spatiumnorth/dns-powerdns` / `ghcr.io/spatiumnorth/dns-technitium`
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked

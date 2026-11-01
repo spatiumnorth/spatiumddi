@@ -1,5 +1,7 @@
 {{- if .Values.dhcpAgents.enabled }}
 {{- $root := . -}}
+{{- /* #3209 — fail on two servers rendering one object name. */ -}}
+{{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dhcpAgents.image.tag | default .Chart.AppVersion -}}
 {{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
 {{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}
@@ -17,7 +19,9 @@ stringData:
 {{- end }}
 {{- range $server := .Values.dhcpAgents.servers }}
 {{- $flavor := $server.flavor | default "kea" -}}
-{{- $instance := printf "dhcp-%s-%s" $flavor $server.name -}}
+{{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dhcp-%s-%s" $flavor $server.name) "prefix" $root.Values.dhcpAgents.prefixWithFullname) -}}
+{{- $storageClass := $server.storageClass | default $root.Values.dhcpAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -54,16 +58,15 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: {{ include "spatiumddi.name" $root }}
-                    app.kubernetes.io/component: dhcp-agent
-                topologyKey: kubernetes.io/hostname
+      {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dhcp-agent" "override" $server.affinity) | nindent 6 }}
+      {{- with $server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with $root.Values.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -120,12 +123,18 @@ spec:
     - metadata: { name: agent-state }
       spec:
         accessModes: [ReadWriteOnce]
+        {{- with $storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "agentState") | default "1Gi" }}
     - metadata: { name: kea-state }
       spec:
         accessModes: [ReadWriteOnce]
+        {{- with $storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "keaState") | default "2Gi" }}
