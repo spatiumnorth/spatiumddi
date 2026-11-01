@@ -90,8 +90,8 @@ SUPERVISED_SERVICES: tuple[str, ...] = (
 log = structlog.get_logger(__name__)
 
 # Baked-chart path the build-time script writes (#183 Phase 3).
-# Sibling to /usr/lib/spatiumddi/images/*.tar.zst — same lifecycle
-# (slot-baked at build, mounted via mkosi.extra/ copy).
+# Slot-baked at build time (mkosi.extra/ copy), like the image tarballs
+# under /var/lib/rancher/k3s/agent/images/.
 _BAKED_CHART_TARBALL = Path("/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz")
 
 # HelmChart CR name + namespaces. Single chart per appliance — one
@@ -543,7 +543,8 @@ def record_shared_chart_hold(env_file: Path, hold: object) -> None:
     """Keep (or clear) the hold a heartbeat response carried (#1710).
 
     ``hold`` is the response's ``shared_chart_hold``: a mapping while a
-    rolling upgrade holds the cluster's shared charts, else None, which is
+    rolling upgrade holds the cluster's shared charts, or while the cluster's
+    members run different versions with no run (#3136), else None, which is
     also what a control plane from before the hold sends. Best effort: a
     failed write leaves the last known hold, and the next heartbeat writes
     again."""
@@ -587,7 +588,12 @@ def shared_chart_hold_refusal(hold: dict[str, str] | None) -> str | None:
 
     "Already on the target" is the host's installed version, the file the
     control plane's health gate reads too: not the tag in this process's
-    env, which can lag a slot boot."""
+    env, which can lag a slot boot.
+
+    A hold with no ``run_id`` comes from no run (#3136): the cluster is being
+    upgraded node by node from Fleet, its members run different versions, and
+    the control plane holds every one of them on the version it runs until
+    they run one. The rule is the same; only the reason says so."""
     if not hold:
         return None
     target = str(hold.get("target_version") or "")
@@ -597,6 +603,13 @@ def shared_chart_hold_refusal(hold: dict[str, str] | None) -> str | None:
         appliance_state.read_installed_version(), target
     ):
         return None
+    if not hold.get("run_id"):
+        others = hold.get("from_tag") or "another version"
+        return (
+            f"not writing the role chart: this node runs {target} and other "
+            f"nodes of the cluster run {others}, so the cluster's shared role "
+            "chart stays as it is until every node runs one version"
+        )
     held = hold.get("from_tag") or "the version it runs"
     return (
         "not writing the role chart: a rolling upgrade holds the cluster's "

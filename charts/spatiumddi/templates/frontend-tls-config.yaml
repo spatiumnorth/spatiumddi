@@ -98,9 +98,9 @@ data:
     # location would drift.
     server {
         listen 80 default_server;
-        listen [::]:80 default_server;
+        ${SPATIUM_LISTEN6_80_DS}
         listen 443 ssl default_server;
-        listen [::]:443 ssl default_server;
+        ${SPATIUM_LISTEN6_443_DS}
         http2 on;
         server_name _;
         root /usr/share/nginx/html;
@@ -156,7 +156,7 @@ data:
         # see ``map … $spatium_hsts`` above.
         add_header Strict-Transport-Security $spatium_hsts always;
 
-        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ${SPATIUM_RESOLVER_IPV6};
 
         # Same nginx-local healthcheck as the :80 block, so a probe
         # pointed at either port answers without touching an upstream.

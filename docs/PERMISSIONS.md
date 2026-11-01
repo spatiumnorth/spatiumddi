@@ -189,7 +189,10 @@ on inactive.
    ASN), nor change a setting the subnets underneath inherit from a space or
    block (DDNS on / policy / TTL / inherit, the DNS and DHCP inherit switches,
    split-horizon, do-not-probe), since those subnets are outside the grant;
-   re-sending the current value passes.
+   re-sending the current value passes. Global search finds the granted
+   space, block or site (and no other), and the console's IPAM tree lists
+   a block-scoped holder's granted blocks in place of the spaces it may not
+   read (#3134).
    **IPAM address sets (#103).** A `write` / `admin` grant on an address set
    (the Address Set Editor role, scoped to one set) reaches an allow-list of
    address routes and nothing else in IPAM: create, next-IP, bulk-allocate

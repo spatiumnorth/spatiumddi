@@ -56,6 +56,10 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_nightly_upgrade_cleared_3026.py": (
         "agent/supervisor/spatium_supervisor/appliance_state.py"
     ),
+    # #3172 — the supervisor's booted-slot reader must agree with the api's.
+    "test_appliance_current_slot_mirror_3172.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
     # #1465: runs the demo seeder's own template payloads through the API model.
@@ -154,6 +158,14 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_frontend_proxy_trust.py": (
         "frontend/default.conf.template",
         "frontend/16-trusted-proxies.envsh",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
+    # #2308 — runs the frontend's IPv6 renderer and reads both nginx templates +
+    # the image that ships it.
+    "test_frontend_ipv6_2308.py": (
+        "frontend/17-ipv6.envsh",
+        "frontend/default.conf.template",
+        "frontend/Dockerfile",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
     # #1173 — runs the frontend's TLS reload watcher and checks it is copied into

@@ -163,6 +163,8 @@ frontend/default.conf.template
 # templates goes through the trust map rather than overwriting an outer
 # proxy's value with $scheme.
 frontend/16-trusted-proxies.envsh
+# test_frontend_ipv6_2308.py (#2308) executes the IPv6 renderer the same templates use.
+frontend/17-ipv6.envsh
 charts/spatiumddi/templates/frontend-tls-config.yaml
 
 # test_ipam_bulk_allocate_template_vectors_2071.py (#2071) runs the server's

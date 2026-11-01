@@ -8549,9 +8549,15 @@ export interface DHCPServerGroup {
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
   /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
-   *  of two or more. HA does not render while this is non-empty. Empty for a
-   *  standalone group. Optional so fixtures predating it still type-check. */
+   *  of two or more. Empty for a standalone group. HA does not render while
+   *  fewer than two members have a URL; otherwise the URL-less ones are
+   *  listed in `ha_sidelined_members` too. Optional so fixtures predating it
+   *  still type-check. */
   ha_peer_urls_missing?: string[];
+  /** #3151 — URL-less Kea members of a group whose other Kea members DO run
+   *  HA. They are left out of the relationship and serve none of the group's
+   *  scopes, so the pair keeps running. Empty when HA is not rendered. */
+  ha_sidelined_members?: string[];
   /** #2963 — why the control plane did not derive the missing URL(s):
    *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
    *  becomes a Kea backup and can take over the primary role, so it is left
@@ -8616,6 +8622,14 @@ export interface DHCPServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #3143 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -15985,6 +15999,8 @@ export interface TrashRestoreResponse {
   batch_id: string;
   restored: number;
   skipped: { type: string; id: string; display: string; reason: string }[];
+  // Rows that stayed in the Trash on purpose (a subnet's records, #2732).
+  held_back?: { type: string; id: string; display: string; reason: string }[];
 }
 
 export const trashApi = {

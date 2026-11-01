@@ -54,6 +54,7 @@ from app.models.dhcp import DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignmen
 from app.models.dns import DNSRecord, DNSServer, DNSZone
 from app.models.ipam import Subnet
 from app.services.cutover.canonical import ParityDifference, ParityReport
+from app.services.dhcp.option_validation import canonical_domain_options
 from app.services.dhcp_import.options import normalise_mac
 from app.services.dns.pull_from_server import _key, targets_are_relative
 
@@ -605,12 +606,27 @@ def _diff_dhcp_options(
     scope: DHCPScope,
     windows_only_class: str,
 ) -> None:
-    """Compare scope options by canonical name."""
-    wire = {str(k): normalise_option_value(v) for k, v in (source.get("options") or {}).items()}
-    ours = {str(k): normalise_option_value(v) for k, v in (scope.options or {}).items()}
+    """Compare scope options by canonical name.
+
+    ``domain-name`` / ``domain-search`` are compared in their DNS form on both
+    sides (#2924): the importer stores them that way, while Windows reports
+    them as typed, so ``Corp.Example.COM.`` against ``corp.example.com`` is the
+    same configuration rather than a ``value_mismatch``. The values shown stay
+    as each side has them.
+    """
+    wire_raw = source.get("options") or {}
+    ours_raw = scope.options or {}
+    wire = {str(k): normalise_option_value(v) for k, v in wire_raw.items()}
+    ours = {str(k): normalise_option_value(v) for k, v in ours_raw.items()}
+    wire_cmp = {
+        str(k): normalise_option_value(v) for k, v in canonical_domain_options(wire_raw).items()
+    }
+    ours_cmp = {
+        str(k): normalise_option_value(v) for k, v in canonical_domain_options(ours_raw).items()
+    }
 
     for key in sorted(set(wire) & set(ours)):
-        if wire[key] == ours[key]:
+        if wire_cmp[key] == ours_cmp[key]:
             report.in_sync += 1
             continue
         report.differences.append(

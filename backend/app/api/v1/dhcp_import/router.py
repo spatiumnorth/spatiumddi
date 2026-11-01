@@ -27,6 +27,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.models.dhcp import DHCPServer
+from app.services.dhcp.option_validation import canonical_domain_options
 from app.services.dhcp_import import (
     CommitResult,
     IscImportError,
@@ -204,9 +205,14 @@ def _scope_to_pydantic(s: ImportedScope) -> ImportedScopeOut:
         min_lease_time=s.min_lease_time,
         max_lease_time=s.max_lease_time,
         is_active=s.is_active,
-        options=dict(s.options),
+        # #2924 — the domain options in the DNS form commit stores, so the
+        # preview shows what the scope will hold.
+        options=canonical_domain_options(s.options),
         pools=[ImportedPoolOut(**p.__dict__) for p in s.pools],
-        reservations=[ImportedReservationOut(**r.__dict__) for r in s.reservations],
+        reservations=[
+            ImportedReservationOut(**{**r.__dict__, "options": canonical_domain_options(r.options)})
+            for r in s.reservations
+        ],
         ddns_enabled=s.ddns_enabled,
         ddns_hostname_policy=s.ddns_hostname_policy,
         v6_address_mode=s.v6_address_mode,
@@ -220,7 +226,10 @@ def _preview_to_pydantic(p: ImportPreview) -> PreviewOut:
     return PreviewOut(
         source=p.source,
         scopes=[_scope_to_pydantic(s) for s in p.scopes],
-        client_classes=[ImportedClientClassOut(**c.__dict__) for c in p.client_classes],
+        client_classes=[
+            ImportedClientClassOut(**{**c.__dict__, "options": canonical_domain_options(c.options)})
+            for c in p.client_classes
+        ],
         conflicts=[ScopeConflictOut(**c.__dict__) for c in p.conflicts],
         warnings=list(p.warnings),
         unsupported=list(p.unsupported),

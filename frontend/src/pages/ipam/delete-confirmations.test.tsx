@@ -103,6 +103,16 @@ describe("IPAM delete confirmations", () => {
   it("Edit Space → Danger zone: says the space goes to Trash, and sends the Trash delete", async () => {
     const deleteSpace = vi.fn(() => Promise.resolve({}));
     const space = { id: "sp-1", name: "retiring-space" } as IPSpace;
+    // The Danger-zone Delete is gated on delete on this item (#3134); this
+    // test is about what the delete does, so sign in as a superadmin. The
+    // answer arrives late on purpose: under CI load it does, and the walk
+    // must wait for the gated button rather than click it disabled.
+    answers.authApi = {
+      myPermissions: () =>
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ is_superadmin: true, grants: [] }), 300),
+        ),
+    };
     answers.ipamApi = { deleteSpace, getSpace: () => Promise.resolve(space) };
     open(
       <EditSpaceModal space={space} onClose={() => {}} onDeleted={() => {}} />,
@@ -110,12 +120,16 @@ describe("IPAM delete confirmations", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
     const danger = words(topDialog());
-    fireEvent.click(
-      screen.getByRole("button", { name: /^Delete this IP space/ }),
-    );
+    // Permissions arrive asynchronously; a click on the still-disabled
+    // button is a silent no-op and the Continue lookup then fails.
+    const del = screen.getByRole("button", {
+      name: /^Delete this IP space/,
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(del.disabled).toBe(false));
+    fireEvent.click(del);
     let said = `${danger} ${words(topDialog())}`;
     fireEvent.click(
-      within(topDialog()).getByRole("button", { name: "Continue" }),
+      await within(topDialog()).findByRole("button", { name: "Continue" }),
     );
     const last = topDialog();
     said += ` ${words(last)}`;

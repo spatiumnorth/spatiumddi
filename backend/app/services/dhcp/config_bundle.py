@@ -2,11 +2,13 @@
 
 Scopes + client classes live on ``DHCPServerGroup`` — every server in
 a group renders the same config. HA tuning also lives on the group;
-a group with ≥ 2 Kea members emits a ``FailoverConfig`` (the first two
-sorted members are the primary + secondary/standby partners, any 3rd+
-members are ``backup`` peers), a single-member group is standalone and
-doesn't. Peer URLs are per-server (``DHCPServer.ha_peer_url``) — Kea
-uses them to reach the other peers for heartbeats + lease updates.
+an HA-mode group with ≥ 2 Kea members that carry a peer URL emits a
+``FailoverConfig`` for each of them (the first two sorted are the
+primary + secondary/standby partners, any 3rd+ are ``backup`` peers); a
+URL-less Kea member beside them is sidelined with no hook and no scopes
+(#3151, ``services/dhcp/ha_members``). Peer URLs are per-server
+(``DHCPServer.ha_peer_url``) — Kea uses them to reach the other peers
+for heartbeats + lease updates.
 
 Mirrors ``app.services.dns.config_bundle``.
 """
@@ -38,7 +40,6 @@ from app.drivers.dhcp.base import (
     StaticAssignmentDef,
 )
 from app.models.dhcp import (
-    HA_MODES,
     DHCPClientClass,
     DHCPMACBlock,
     DHCPPhoneProfile,
@@ -55,8 +56,10 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
+from app.services.dhcp.ha_members import kea_ha_members
 from app.services.dhcp.ha_peer_auth import current_peer_credential
 from app.services.dhcp.option_validation import (
+    canonical_domain_options,
     options_for_family,
     phone_options_loadable,
     vendor_class_match_renderable,
@@ -77,47 +80,40 @@ _dup_prefix_logged: set[tuple[str, str]] = set()
 async def _resolve_failover(
     db: AsyncSession, server: DHCPServer, group: DHCPServerGroup | None
 ) -> FailoverConfig | None:
-    """Return the FailoverConfig for ``server`` if its group is an HA group.
+    """Return the FailoverConfig for ``server`` if it takes part in its group's HA.
 
-    An HA group is a DHCPServerGroup with >= 2 Kea members. The
-    ``peers`` array carries an entry for *every* Kea member regardless
+    An HA group is a DHCPServerGroup in an HA mode with >= 2 Kea members
+    that carry an ``ha_peer_url`` (``services/dhcp/ha_members``). The
+    ``peers`` array carries an entry for every such participant regardless
     of this server's role; ``this_server_name`` tells Kea which one is
     "us". Non-Kea servers in the group (e.g. Windows DHCP read-only)
     are ignored for HA purposes — Kea HA only speaks to Kea.
 
     Kea's ``libdhcp_ha.so`` requires ``this-server-name`` to match an
-    entry in the ``peers`` array. The first sorted Kea member plays the
+    entry in the ``peers`` array. The first sorted participant plays the
     ``primary`` role, the second plays ``secondary`` (load-balancing) /
-    ``standby`` (hot-standby), and every additional member (3rd, 4th, …)
+    ``standby`` (hot-standby), and every additional one (3rd, 4th, …)
     plays the ``backup`` role. Backup servers don't partner in the
     heartbeat but receive lease updates — this keeps a group's 3rd+
     member valid instead of rendering a config whose own name is absent
     from its 2-entry peers list (issue #332).
 
-    Peer URLs come from ``DHCPServer.ha_peer_url`` on each member.
-    An empty peer URL on any Kea member suppresses HA rendering for the
-    whole group (the operator hasn't finished setting things up yet).
+    Peer URLs come from ``DHCPServer.ha_peer_url`` on each member. A Kea
+    member with no URL is not a participant: with fewer than two
+    participants nothing renders HA; otherwise the URL-less member is
+    sidelined (no hook here, and ``build_config_bundle`` gives it no
+    scopes), so a third member joining a working pair leaves the pair's
+    HA in place (#3151).
     """
     if group is None:
         return None
     # A standalone group never renders HA, whatever peer URLs its members
-    # carry (#2969).
-    if group.mode not in HA_MODES:
-        return None
-    kea_peers = [s for s in group.servers if s.driver == "kea"]
-    if len(kea_peers) < 2:
-        return None
-    # Stable ordering so every member renders the same peers array
-    # regardless of which server is asking for its bundle. Sort by id
-    # (UUID) — the concept of "primary" in a group is not a model field
-    # today; whichever Kea peer ends up first in the sort plays the
-    # ``primary`` role, the second ``secondary``/``standby``, the rest
-    # ``backup``.
-    kea_peers.sort(key=lambda s: str(s.id))
-
-    # Every Kea member needs a peer URL — an HA peer with no URL can't be
-    # reached for heartbeats or lease updates, so the group isn't ready.
-    if any(not s.ha_peer_url for s in kea_peers):
+    # carry (#2969) — ``kea_ha_members`` returns no participants for it.
+    # Stable ordering (by id) so every member renders the same peers array
+    # regardless of which server is asking for its bundle — the concept of
+    # "primary" in a group is not a model field today.
+    kea_peers = kea_ha_members(group.mode, group.servers).participants
+    if not any(s.id == server.id for s in kea_peers):
         return None
 
     secondary_role = "standby" if group.mode == "hot-standby" else "secondary"
@@ -137,7 +133,7 @@ async def _resolve_failover(
                 "auto-failover": group.auto_failover,
             }
         )
-    # The peer credential, only once every Kea member's agent renders it:
+    # The peer credential, only once every participant's agent renders it:
     # Kea's listener cannot accept TLS and plaintext at once, so switching one
     # peer before its partner's agent understands the fields would stop the
     # pair talking for the length of the upgrade (ha_peer_auth module doc).
@@ -231,6 +227,18 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
             .scalars()
             .all()
         )
+
+    # #3151 — a Kea member with no HA peer URL in a group whose other Kea
+    # members run HA is sidelined: no HA hook (``_resolve_failover``) and no
+    # scopes, so no pools, reservations or RAs. Serving the group's pools
+    # beside the running pair, with no lease sync between them, would hand one
+    # address to two clients. It serves again once it has a URL (and joins the
+    # relationship) or the group stops rendering HA. Never true in a group of
+    # one or two Kea members (``services/dhcp/ha_members``).
+    if group is not None and any(
+        s.id == server.id for s in kea_ha_members(group.mode, group.servers).sidelined
+    ):
+        scope_rows = []
 
     # Pre-fetch subnet CIDRs
     subnet_ids = [s.subnet_id for s in scope_rows]
@@ -334,7 +342,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 name=p.name or "",
                 class_restriction=p.class_restriction,
                 lease_time_override=p.lease_time_override,
-                options_override=p.options_override or None,
+                options_override=canonical_domain_options(p.options_override) or None,
                 pd_prefix=getattr(p, "pd_prefix", None),
                 delegated_length=getattr(p, "delegated_length", None),
                 excluded_prefix=getattr(p, "excluded_prefix", None),
@@ -347,7 +355,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 mac_address=str(s.mac_address),
                 hostname=s.hostname or "",
                 client_id=s.client_id,
-                options_override=s.options_override or None,
+                options_override=canonical_domain_options(s.options_override) or None,
                 duid=getattr(s, "duid", None),
             )
             for s in sc.statics
@@ -362,7 +370,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                     _with_location_options(
                         location_erls,
                         subnet,
-                        dict(sc.options or {}),
+                        canonical_domain_options(sc.options),
                         address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                     ),
                     subnet,
@@ -745,7 +753,7 @@ async def _assemble_device_policy_classes(
             DevicePolicyClassDef(
                 name=policy.class_name,
                 match_expression=compiled.expression,
-                options=dict(policy.options or {}),
+                options=canonical_domain_options(policy.options),
                 lease_time=policy.lease_time,
             )
         )
@@ -788,7 +796,7 @@ def _with_v6_domain_search(
 
 def _client_class_def(c: DHCPClientClass) -> ClientClassDef:
     """A client class with the options each daemon gets (#1229, #1295)."""
-    options = dict(c.options or {})
+    options = canonical_domain_options(c.options)
     family = c.address_family or "ipv4"
     if family == "dual":
         v4, v6 = options_for_family(options, "ipv4"), options_for_family(options, "ipv6")

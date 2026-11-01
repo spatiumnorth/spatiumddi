@@ -150,6 +150,28 @@ The hold is cleared through the API with `POST /api/v1/dns/groups/{group_id}/ser
 
 On restart, the agent tries its cached token first. If the control plane returns `401`, it falls back to bootstrap with the PSK. If the PSK has rotated too, the agent logs and enters a retry loop with jittered backoff (cap 5 min).
 
+### Duplicate agent processes
+
+Two agent processes can run on one server identity at once: a cloned VM
+keeps its `agent_id`, and so do two containers given one state directory.
+Both authenticate as the same server, against its one token. Each agent
+therefore sends a random per-process id (`X-Spatium-Agent-Instance`, never
+persisted) and the control plane serves only one process per server; the
+full rules, and the DNS record-op consequences, are under §5 *Retries,
+unacknowledged ops and supersession* (#2044, #2219). The **DHCP agent**
+follows the same rules since
+[#3143](https://github.com/spatiumnorth/spatiumddi/issues/3143): the newest
+process owns the server (`dhcp_server.agent_instance`), the one it
+displaced is answered `409` + `X-Spatium-Duplicate-Agent-Instance: 1` on
+its config polls and registrations while the owner is live, is never
+minted or rotated a token, keeps Kea on its cached config and retries every
+30 s, and takes the server back by itself once the owner has been silent
+for 5 minutes. Its heartbeats count for liveness and op acks, but not for
+the row's daemon / config-apply / spool state. A persisting episode shows
+the **Duplicate agent** chip on the DHCP server and raises the default-on
+`dhcp_agent_duplicate_instance` alert. An agent that sends no id (older
+than these changes) is never judged and registers and polls as before.
+
 ### Alternatives considered
 
 - **mTLS with internal CA** — more robust but requires a CA pipeline (cert-manager in K8s, something custom in Docker Compose). Deferred to Phase 4; the token model is a clean superset.
@@ -828,8 +850,17 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   agent also sends its process id on heartbeats: a refused process's
   heartbeats still count for liveness and op acks, but its daemon,
   config-apply and spool reports are kept off the server row, which shows
-  the owner's. To fix it, stop the extra agent, or clear its state
-  directory so it registers as a server of its own.
+  the owner's. Both processes also share the server's one token
+  ([#2219](https://github.com/spatiumnorth/spatiumddi/issues/2219)), so a
+  token issued to either would make the other's stale and the two would
+  take turns re-registering. The agent therefore sends its process id when
+  it registers too: the refused process is answered the same `409` at
+  registration, nothing is minted, it logs
+  `register_duplicate_agent_instance` and tries again every 30 s, and its
+  heartbeats never rotate the token. The owner keeps a working token, and
+  the pair settles. An agent older than this sends no id at registration
+  and registers as before. To fix it, stop the extra agent, or clear its
+  state directory so it registers as a server of its own.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when

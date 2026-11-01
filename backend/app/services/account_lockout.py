@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 import structlog
 
 from app.models.auth import User
-from app.models.settings import PlatformSettings
+from app.models.settings import PlatformSettings, platform_setting_default
 
 logger = structlog.get_logger(__name__)
 
@@ -52,7 +52,12 @@ class LockoutPolicy:
     @classmethod
     def from_row(cls, row: PlatformSettings | None) -> LockoutPolicy:
         if row is None:
-            return cls(threshold=0, duration_minutes=15, reset_minutes=15)
+            d = platform_setting_default
+            return cls(
+                threshold=int(d("lockout_threshold")),
+                duration_minutes=int(d("lockout_duration_minutes")),
+                reset_minutes=int(d("lockout_reset_minutes")),
+            )
         return cls(
             threshold=int(row.lockout_threshold),
             duration_minutes=int(row.lockout_duration_minutes),

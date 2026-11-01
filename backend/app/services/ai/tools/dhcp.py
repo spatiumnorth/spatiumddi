@@ -30,6 +30,7 @@ from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.normalize import canonical_duid
@@ -46,7 +47,9 @@ class ListDHCPServersArgs(BaseModel):
     permission=("read", "dhcp_server"),
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, driver, operational status, and HA state. "
+        "includes name, group, driver, operational status, HA state, and "
+        "whether two agent processes are polling as it at once "
+        "(``duplicate_agent``, a cloned VM or copied agent state dir). "
         "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
         "and DHCPv6 scopes on an HA group are served by each member "
         "independently, with no lease coordination."
@@ -80,6 +83,10 @@ async def list_dhcp_servers(
             "driver": s.driver,
             "status": s.status,
             "ha_state": s.ha_state,
+            # #3143 — a second live agent process polls as this server and is
+            # being refused (the one the row's alert and chip read).
+            "duplicate_agent": duplicate_agent_active(s),
+            "duplicate_agent_ip": s.duplicate_agent_ip if duplicate_agent_active(s) else None,
         }
         for s in rows
     ]

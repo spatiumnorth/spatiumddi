@@ -553,6 +553,17 @@ so there is no private-key custody.
   (`POST .../dnssec/rollover`) enqueues a `dnssec_rollover` op; the agent
   runs `rndc dnssec -rollover -key <tag>`. Routine rollover is automatic
   per the policy — this is the "roll now" escape hatch.
+- **Key cleanup (#2309).** When a zone stops being signed on a BIND9
+  server — unsigned, deleted, or moved to another group — the agent removes
+  its `K<zone>.+…` files from the key directory once the zone has stayed
+  unsigned there for a grace period, default **7 days**
+  (`DNSSEC_KEY_PRUNE_GRACE_SECONDS` on the agent; `0` removes them on the
+  first successful apply). The window is deliberate: re-signing a zone after
+  its keys are gone makes BIND generate a new KSK whose DS the parent does
+  not have, so the zone goes bogus until the registrar is updated. Signed
+  again inside the window, the zone keeps its old keys and its DS stays
+  valid. Nothing is removed while the agent's newest config has failed to
+  apply, and each server ages out only its own key files.
 - **Driver gating.** Sign/unsign are allowed on BIND9 + PowerDNS groups,
   rollover on BIND9 only; Windows DNS is refused (422). NSEC3 follows
   RFC 9276 (iterations 0 + salt-length 0 recommended) — the policy editor

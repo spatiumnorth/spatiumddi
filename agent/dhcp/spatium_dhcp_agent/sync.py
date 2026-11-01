@@ -53,6 +53,12 @@ from .config_apply import (
     truncate_error,
 )
 from .ha_tls import materialise as materialise_ha_tls
+from .instance import (
+    AGENT_INSTANCE,
+    AGENT_INSTANCE_HEADER,
+    DUPLICATE_INSTANCE_BACKOFF,
+    DUPLICATE_INSTANCE_HEADER,
+)
 from .kea_ctrl import (
     KeaCheckUnavailable,
     KeaConfigRejected,
@@ -736,7 +742,12 @@ class SyncLoop:
             # ask it for the whole bundle rather than a 304 on the old etag.
             self._reauth_gen = gen
             self._current_etag = None
-        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        headers = {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            # #3143 — names this process, so a second live agent on the same
+            # identity is refused rather than served alongside it.
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
         # sending that etag. Dropping If-None-Match makes the server answer
@@ -776,6 +787,25 @@ class SyncLoop:
             reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
             # Force a fresh 200 for the new row (the apply is etag-gated).
             self._current_etag = None
+            return
+        if resp.status_code == 409 and resp.headers.get(DUPLICATE_INSTANCE_HEADER):
+            # #3143 — another live agent process owns this server identity. Not
+            # a re-registration case (a new token would not change which
+            # process owns the row) and not an outage: Kea keeps serving the
+            # config it has (non-negotiable #5). Loud, because this agent now
+            # serves a configuration that no longer changes.
+            try:
+                detail = resp.json().get("detail")
+            except ValueError:
+                detail = None
+            log.error(
+                "sync_duplicate_agent_instance",
+                instance=AGENT_INSTANCE,
+                detail=detail,
+                retry_in_seconds=DUPLICATE_INSTANCE_BACKOFF,
+            )
+            # An Event wait, not a sleep: a stop request ends it at once.
+            self._stop.wait(DUPLICATE_INSTANCE_BACKOFF)
             return
         if resp.status_code != 200:
             self._record_failure(f"status:{resp.status_code}")

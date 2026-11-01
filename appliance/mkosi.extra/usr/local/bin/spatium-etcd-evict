@@ -68,6 +68,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -369,11 +370,22 @@ def refused_before_proposing(err: str) -> bool:
 # ---- the run -----------------------------------------------------------------------
 
 def write_state(request_id: str, lines: list[str]) -> None:
-    tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.new")
-    tmp.write_text("".join([f"id {request_id}\n", *(f"{ln}\n" for ln in lines)]),
-                   encoding="utf-8")
-    tmp.chmod(0o644)
-    tmp.replace(STATE)
+    # A fresh temp name from mkstemp (O_EXCL, never through a symlink), not
+    # a predictable one: the api and the supervisor can create names in
+    # release-state, and a write through a link planted there would land on
+    # any host file. The rename replaces whatever is at STATE's name.
+    fd, name = tempfile.mkstemp(prefix=f".{STATE.name}.", dir=STATE.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with open(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join([f"id {request_id}\n", *(f"{ln}\n" for ln in lines)]))
+        os.replace(name, STATE)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass  # already renamed into place: nothing left to remove
+        raise
 
 
 def describe(m: dict) -> str:

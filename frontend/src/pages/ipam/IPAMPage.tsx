@@ -91,6 +91,7 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -4237,7 +4238,7 @@ interface BreadcrumbItem {
   onClick?: () => void;
 }
 
-function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
+export function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
   // Compress if more than 4 items
   let visible = items;
   if (items.length > 4) {
@@ -4248,7 +4249,7 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
     ];
   }
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-1">
+    <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1">
       {visible.map((item, i) => (
         <span key={i} className="contents">
           {item.label === "…" ? (
@@ -4257,8 +4258,9 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
             <button
               onClick={item.onClick}
               disabled={!item.onClick}
+              title={item.label}
               className={cn(
-                "rounded-full px-2 py-0.5 text-xs font-medium transition-colors",
+                "max-w-full min-w-0 truncate rounded-full px-2 py-0.5 text-xs font-medium transition-colors",
                 PILL_STYLES[item.variant],
               )}
             >
@@ -4552,6 +4554,8 @@ const NEEDS_ADDRESS_DELETE =
 const NEEDS_DNS_SYNC =
   "Requires read permission on subnets and IP addresses, and write permission on subnets";
 const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
+const NEEDS_BLOCK_DELETE = "Requires delete permission on IP blocks";
+const NEEDS_SPACE_DELETE = "Requires delete permission on IP spaces";
 const NEEDS_ORPHAN_PURGE = "Requires delete and write permission on subnets";
 
 // The IPAM router's gate: an address delete and the multi-row deletes (Bulk
@@ -5687,8 +5691,8 @@ export function SubnetDetail({
       {/* Header */}
       <div className="border-b">
         {/* Top bar: breadcrumb + actions */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
-          <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 pt-3 pb-2">
+          <div className="min-w-[12rem] flex-1">
             {spaceName &&
               (() => {
                 const crumbs: BreadcrumbItem[] = [
@@ -5732,7 +5736,7 @@ export function SubnetDetail({
               primary), so no regrouping needed here; ``flex-wrap`` is the
               other half of that issue's fix, so a narrow window moves the
               actions to a second line instead of clipping the last one. */}
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             <HeaderButton
               icon={RefreshCw}
               onClick={refreshSubnet}
@@ -11958,6 +11962,9 @@ function EditSpaceModalForm({
   onClose,
   onDeleted,
 }: EditSpaceModalProps) {
+  // The dialog opens for a holder of write on this one space, but the server
+  // asks delete over every IP space (no id), so a grant on one space is not enough.
+  const canDeleteSpace = usePermissions().can("delete", "ip_space");
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
@@ -12316,7 +12323,8 @@ function EditSpaceModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteSpace, NEEDS_SPACE_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this IP space…
           </button>
@@ -12786,6 +12794,9 @@ function EditBlockModalForm({
   onClose,
   onDeleted,
 }: EditBlockModalProps) {
+  // The dialog opens for a holder of write on this one block, but the server
+  // asks delete over every IP block (no id), so a grant on one block is not enough.
+  const canDeleteBlock = usePermissions().can("delete", "ip_block");
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
   const [description, setDescription] = useState(block.description ?? "");
@@ -13201,7 +13212,8 @@ function EditBlockModalForm({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteBlock, NEEDS_BLOCK_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this block…
           </button>
@@ -13533,11 +13545,14 @@ export function BlockDetailView({
   const qc = useQueryClient();
 
   // #1155 — the header's write actions, each on the check the server makes
-  // for it: Edit, Add child block and the Resize / Move tools change blocks
-  // (write on IP blocks, as PUT / POST /blocks ask); New Subnet creates one
-  // (write on subnets, as POST /subnets asks).
+  // for it: Add child block and the Resize / Move tools change blocks (write
+  // on IP blocks, as POST /blocks and those routes ask); New Subnet creates
+  // one (write on subnets, as POST /subnets asks). Edit asks what
+  // ``PUT /blocks/{id}`` asks, which takes a grant scoped to this one block
+  // (#3039, #3134).
   const perms = usePermissions();
   const canWriteBlocks = perms.can("write", "ip_block");
+  const canEditBlock = perms.can("write", "ip_block", block.id);
   const canWriteSubnets = perms.can("write", "subnet");
 
   const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
@@ -13710,9 +13725,14 @@ export function BlockDetailView({
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b">
         {/* Top bar */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
-          <BreadcrumbPills items={crumbs} />
-          <div className="flex flex-shrink-0 items-center gap-2">
+        {/* #3213 — wraps rather than clips: the breadcrumb takes the line's
+            spare width (``min-w-0`` so its pills truncate) and the actions
+            drop to their own line once it would fall under 12rem. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 pt-3 pb-2">
+          <div className="min-w-[12rem] flex-1">
+            <BreadcrumbPills items={crumbs} />
+          </div>
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             {selectedCount > 0 ? (
               <>
                 {!hasBlocksSelected && (
@@ -13798,7 +13818,7 @@ export function BlockDetailView({
                 <HeaderButton
                   icon={Pencil}
                   onClick={() => setShowEdit(true)}
-                  {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+                  {...permissionGate(canEditBlock, NEEDS_BLOCK_WRITE)}
                 >
                   Edit
                 </HeaderButton>
@@ -14510,7 +14530,7 @@ export function BlockDetailView({
                               <RowTypeBadge kind="block" />
                             </span>
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground">
+                          <td className="min-w-[10rem] px-4 py-2 break-words text-muted-foreground">
                             {b.name || (
                               <span className="text-muted-foreground/40">
                                 —
@@ -14590,7 +14610,7 @@ export function BlockDetailView({
                               <RowTypeBadge kind="subnet" />
                             </span>
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground">
+                          <td className="min-w-[10rem] px-4 py-2 break-words text-muted-foreground">
                             {s.name || (
                               <span className="text-muted-foreground/40">
                                 —
@@ -14917,11 +14937,14 @@ export function SpaceTableView({
   onSpaceDeleted?: () => void;
 }) {
   const qc = useQueryClient();
-  // #1155 — the header's write actions, each on the type-level write the
-  // server asks for: PUT /spaces (Edit Space), POST /blocks (Add block),
-  // POST /subnets (Add Subnet).
+  // #1155 — the header's write actions, each on the write the server asks
+  // for: PUT /spaces/{id} (Edit Space) takes a grant scoped to this one space
+  // (#3039, #3134); POST /blocks (Add block) and POST /subnets (Add Subnet)
+  // want the type-level write. The VRF badge's edit stays type-level: a
+  // scoped holder may not repoint the space at another VRF.
   const perms = usePermissions();
   const canWriteSpaces = perms.can("write", "ip_space");
+  const canEditSpace = perms.can("write", "ip_space", space.id);
   const canWriteBlocks = perms.can("write", "ip_block");
   const canWriteSubnets = perms.can("write", "subnet");
   const { data: blocks, isLoading: blocksLoading } = useQuery({
@@ -15176,9 +15199,13 @@ export function SpaceTableView({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b px-6 py-3">
-        <div className="flex items-center justify-between gap-4 pb-2">
-          <BreadcrumbPills items={[{ label: space.name, variant: "space" }]} />
-          <div className="flex flex-shrink-0 items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 pb-2">
+          <div className="min-w-[12rem] flex-1">
+            <BreadcrumbPills
+              items={[{ label: space.name, variant: "space" }]}
+            />
+          </div>
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             {selected.size > 0 && (
               <>
                 {!hasBlocksSelected && (
@@ -15243,7 +15270,7 @@ export function SpaceTableView({
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSpace(true)}
-              {...permissionGate(canWriteSpaces, NEEDS_SPACE_WRITE)}
+              {...permissionGate(canEditSpace, NEEDS_SPACE_WRITE)}
             >
               Edit Space
             </HeaderButton>
@@ -16926,7 +16953,7 @@ export function IPAMPage() {
   });
 
   // Fetch ALL subnets (limited) for deep-link resolution
-  const { data: allSubnets } = useQuery({
+  const { data: allSubnets, error: subnetsError } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
   });
@@ -17011,17 +17038,29 @@ export function IPAMPage() {
   // up the now-populated params. The `urlRestored` guard is only set once
   // we've actually matched a param, so an early run with empty searchParams
   // doesn't latch us into "nothing to restore".
+  //
+  // #3134 — a holder whose grant names one block or space is refused the
+  // other lists, so a refused list counts as settled here and the item is
+  // looked up in the lists that did answer (each narrowed to the granted
+  // rows). With a list refused, latch only on a match, so #2569's
+  // single-subnet fetch above can still open ``?subnet=X``.
+  const listsSettled =
+    (spaces != null || spacesError != null) &&
+    (allBlocks != null || blocksError != null) &&
+    (allSubnets != null || subnetsError != null);
+  const anyListRefused = parentsRefused || subnetsError != null;
   useEffect(() => {
     if (urlRestored.current) return;
-    if (!spaces || !allBlocks || !allSubnets) return;
+    if (!listsSettled) return;
     const subnetId = searchParams.get("subnet");
     const blockId = searchParams.get("block");
     const spaceId = searchParams.get("space");
     if (!subnetId && !blockId && !spaceId) return;
-    urlRestored.current = true;
+    if (!anyListRefused) urlRestored.current = true;
     if (subnetId) {
-      const sn = allSubnets.find((s: Subnet) => s.id === subnetId);
+      const sn = allSubnets?.find((s: Subnet) => s.id === subnetId);
       if (sn) {
+        urlRestored.current = true;
         setSelectedSubnet(sn);
         setSelectedBlock(null);
         setSelectedSpace(null);
@@ -17029,8 +17068,9 @@ export function IPAMPage() {
       }
     }
     if (blockId) {
-      const bl = allBlocks.find((b) => b.id === blockId);
+      const bl = allBlocks?.find((b) => b.id === blockId);
       if (bl) {
+        urlRestored.current = true;
         setSelectedBlock(bl);
         setSelectedSubnet(null);
         setSelectedSpace(null);
@@ -17038,15 +17078,23 @@ export function IPAMPage() {
       }
     }
     if (spaceId) {
-      const sp = spaces.find((s) => s.id === spaceId);
+      const sp = spaces?.find((s) => s.id === spaceId);
       if (sp) {
+        urlRestored.current = true;
         setSelectedSpace(sp);
         setSelectedSubnet(null);
         setSelectedBlock(null);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [spaces, allBlocks, allSubnets, searchParams]);
+  }, [
+    listsSettled,
+    anyListRefused,
+    spaces,
+    allBlocks,
+    allSubnets,
+    searchParams,
+  ]);
 
   // Fetch blocks + subnets for whichever space the selected item belongs to
   const activeSpaceId =
@@ -17123,7 +17171,12 @@ export function IPAMPage() {
   return (
     <div className="flex h-full">
       {/* ── Left tree panel ── */}
-      <div className="flex w-72 flex-shrink-0 flex-col border-r">
+      <ResizablePane
+        storageKey="ipam"
+        defaultWidth={288}
+        label="Resize IP spaces tree"
+        className="flex flex-col border-r"
+      >
         <div className="flex h-12 items-center justify-between border-b px-3">
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
@@ -17222,6 +17275,61 @@ export function IPAMPage() {
               <ListReadError error={spacesError} what="IP spaces" />
             </p>
           )}
+          {/* #3134 — a holder whose grant names one block (or subnet, #2569)
+              is refused the spaces above it, but the block and subnet lists
+              answer with the rows it was granted. List those, so the item is
+              one click away rather than reachable only through search. */}
+          {!spaces &&
+            spacesError != null &&
+            ((allBlocks?.length ?? 0) > 0 || (allSubnets?.length ?? 0) > 0) && (
+              <div role="list" aria-label="Blocks and subnets you can open">
+                <p className="px-2 pb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  You can open
+                </p>
+                {allBlocks?.map((b) => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    role="listitem"
+                    onClick={() => selectBlock(b)}
+                    aria-current={selectedBlock?.id === b.id || undefined}
+                    className={cn(
+                      "flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 text-left text-xs hover:bg-muted",
+                      selectedBlock?.id === b.id && "bg-muted font-medium",
+                    )}
+                  >
+                    <Layers className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <span className="font-mono">{b.network}</span>
+                    {b.name && (
+                      <span className="truncate text-muted-foreground">
+                        {b.name}
+                      </span>
+                    )}
+                  </button>
+                ))}
+                {allSubnets?.map((sn: Subnet) => (
+                  <button
+                    key={sn.id}
+                    type="button"
+                    role="listitem"
+                    onClick={() => selectSubnet(sn)}
+                    aria-current={selectedSubnet?.id === sn.id || undefined}
+                    className={cn(
+                      "flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 text-left text-xs hover:bg-muted",
+                      selectedSubnet?.id === sn.id && "bg-muted font-medium",
+                    )}
+                  >
+                    <Network className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <span className="font-mono">{sn.network}</span>
+                    {sn.name && (
+                      <span className="truncate text-muted-foreground">
+                        {sn.name}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
           {spaces?.length === 0 && !isLoading && (
             <div className="flex flex-col items-center justify-center py-10 text-center">
               <Layers className="mb-2 h-8 w-8 text-muted-foreground/30" />
@@ -17269,7 +17377,7 @@ export function IPAMPage() {
               </p>
             )}
         </div>
-      </div>
+      </ResizablePane>
 
       {/* ── Right detail panel ── */}
       <div className="flex flex-1 flex-col overflow-hidden">
@@ -17310,7 +17418,16 @@ export function IPAMPage() {
               const sp = spaces?.find(
                 (s: IPSpace) => s.id === selectedBlock.space_id,
               );
-              if (sp) selectSpace(sp);
+              if (sp) {
+                selectSpace(sp);
+                return;
+              }
+              // The spaces list was refused: there is no space page to go
+              // to, so leave the block (a deleted block's dialog closes).
+              setSelectedBlock(null);
+              setSelectedSubnet(null);
+              setSelectedSpace(null);
+              setSearchParams({}, { replace: true });
             }}
             onSelectBlock={selectBlock}
             onSelectSubnet={selectSubnet}
