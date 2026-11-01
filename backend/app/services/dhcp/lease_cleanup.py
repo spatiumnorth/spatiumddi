@@ -38,6 +38,7 @@ from sqlalchemy.orm import selectinload
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 
 logger = structlog.get_logger(__name__)
@@ -271,6 +272,7 @@ async def purge_lease(
                         ip=str(lease.ip_address),
                         error=str(exc),
                     )
+            await purge_trashed_address_records(db, [mirror.id])  # #3186
             await db.delete(mirror)
             mirror_removed = True
 
@@ -452,6 +454,7 @@ async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) ->
         .scalars()
         .all()
     )
+    await purge_trashed_address_records(db, [row.id for row in rows])  # #3186
     for row in rows:
         if row.subnet is not None:
             try:

@@ -36,6 +36,7 @@ import {
   type DHCPLease,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import { useSessionState } from "@/lib/useSessionState";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -175,7 +176,12 @@ function GroupSidebar({
   }
 
   return (
-    <div className="w-72 flex-shrink-0 flex flex-col border-r bg-card">
+    <ResizablePane
+      storageKey="dhcp"
+      defaultWidth={288}
+      label="Resize DHCP server groups tree"
+      className="flex flex-col border-r bg-card"
+    >
       <div className="flex items-center justify-between px-4 py-3 border-b">
         <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           DHCP Server Groups
@@ -339,7 +345,7 @@ function GroupSidebar({
           </div>
         )}
       </div>
-    </div>
+    </ResizablePane>
   );
 }
 
@@ -1602,6 +1608,8 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
                             <button
                               onClick={() => setEditScope(sc)}
                               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Edit scope ${sc.name}`}
+                              title="Edit scope"
                               {...dhcpGate("write", "dhcp_scope")}
                             >
                               <Pencil className="h-3.5 w-3.5" />
@@ -1609,6 +1617,8 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
                             <button
                               onClick={() => setDelScope(sc)}
                               className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                              aria-label={`Delete scope ${sc.name}`}
+                              title="Delete scope"
                               {...dhcpGate("delete", "dhcp_scope")}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
@@ -2215,6 +2225,8 @@ export function ClientClassesTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => setEdit(c)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Edit client class ${c.name}`}
+                        title="Edit client class"
                         {...dhcpGate("write", "dhcp_client_class")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -2222,6 +2234,8 @@ export function ClientClassesTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => setDel(c)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Delete client class ${c.name}`}
+                        title="Delete client class"
                         {...dhcpGate("delete", "dhcp_client_class")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -2269,7 +2283,7 @@ export function ClientClassesTab({ groupId }: { groupId: string }) {
   );
 }
 
-function OptionTemplatesTab({ groupId }: { groupId: string }) {
+export function OptionTemplatesTab({ groupId }: { groupId: string }) {
   // #1339, #1861 — each write takes the tab's own resource permission, with
   // the HTTP method's action (``delete`` for a delete).
   const dhcpGate = useDhcpGate();
@@ -2358,6 +2372,8 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => setEdit(t)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Edit option template ${t.name}`}
+                        title="Edit option template"
                         {...dhcpGate("write", "dhcp_option_template")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -2365,6 +2381,8 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => setDel(t)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Delete option template ${t.name}`}
+                        title="Delete option template"
                         {...dhcpGate("delete", "dhcp_option_template")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
