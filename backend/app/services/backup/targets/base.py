@@ -319,6 +319,20 @@ class BackupDestination(ABC):
     #: ever fail silently every night.
     inherently_write_only: bool = False
 
+    #: Auth modes of the "Set ONE of ..." kind (#3289). Each entry is one
+    #: mode, as the tuple of secret fields that belong to it. An update
+    #: that supplies a new value for one mode's field replaces the other
+    #: modes' stored secrets, because the client hands the driver every
+    #: secret that is stored and would go on using the one left behind.
+    #: Supplying two modes in one update is refused.
+    secret_alternatives: tuple[tuple[str, ...], ...] = ()
+
+    def unused_secret_fields(self, config: dict[str, Any]) -> frozenset[str]:
+        """Secret fields the merged ``config`` no longer uses (#3289), to
+        be dropped from storage. Default: none.
+        """
+        return frozenset()
+
     @abstractmethod
     def validate_config(self, config: dict[str, Any]) -> None:
         """Raise :class:`DestinationConfigError` if ``config`` is

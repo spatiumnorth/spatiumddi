@@ -288,6 +288,17 @@ class HttpsPutDestination(BackupDestination):
         ),
     )
 
+    def unused_secret_fields(self, config: dict[str, Any]) -> frozenset[str]:
+        # Auth ``none`` sends no credential; one left stored would be
+        # carried silently and come back into use if auth is switched
+        # back (#3289).
+        try:
+            if _auth_mode(config) == "none":
+                return frozenset({"credential"})
+        except DestinationConfigError:
+            pass  # a bad ``auth`` is validate_config's to report
+        return frozenset()
+
     # ── validation ────────────────────────────────────────────────────
 
     def validate_config(self, config: dict[str, Any]) -> None:
