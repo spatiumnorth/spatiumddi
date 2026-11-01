@@ -1210,6 +1210,10 @@ dnsAgents:
   startupProbe:
     periodSeconds: 10
     failureThreshold: 360
+  # Agent Services default to ClusterIP (#3229): set servers[].service.type
+  # to LoadBalancer (MetalLB / cloud LB) or NodePort to reach DNS from
+  # clients. k3s's bundled servicelb breaks the node's own resolver on :53;
+  # see the chart README, "Exposing DNS and DHCP to clients".
   servers: []
     # - name: ns1
     #   flavor: bind9            # bind9 (default) | powerdns | technitium
@@ -1311,7 +1315,8 @@ dhcpAgents:
     #                            # broadcast clients work with no relay,
     #                            # and a relay reaches the node on 67
     #   service: { type: LoadBalancer }
-    #                            # the default. A DHCP relay (ip
+    #                            # opt-in (the default is ClusterIP, #3229;
+    #                            # not with k3s servicelb). A DHCP relay (ip
     #                            # helper-address) can only forward to
     #                            # UDP/67, so without hostNetwork point it
     #                            # at the LoadBalancer address. A pinned

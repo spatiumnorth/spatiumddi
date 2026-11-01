@@ -212,7 +212,12 @@ spec:
             storage: {{ (get ($server.storage | default dict) "dnsState") | default "2Gi" }}
 ---
 {{- $svc := $server.service | default dict -}}
-{{- $svcType := (get $svc "type") | default "LoadBalancer" -}}
+{{- /* #3229 — ClusterIP by default. A LoadBalancer default turns into a
+       hostPort-53 svclb pod on every node under k3s's bundled servicelb,
+       and the CNI hostPort DNAT captures the node's own 127.0.0.53
+       resolver stub: image pulls fail and the install never converges.
+       LoadBalancer / NodePort are opt-in (see the chart README). */}}
+{{- $svcType := (get $svc "type") | default "ClusterIP" -}}
 apiVersion: v1
 kind: Service
 metadata:

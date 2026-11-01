@@ -2132,6 +2132,63 @@ async def _queue_record_deletes(
     return wake, len(by_zone)
 
 
+async def purge_trashed_address_records(
+    db: AsyncSession,
+    address_ids: Collection[uuid.UUID],
+    *,
+    host_records_only: bool = False,
+    keep_batch_id: uuid.UUID | None = None,
+) -> int:
+    """Hard-delete the trashed auto-generated records bound to these addresses
+    (spatiumddi#3186).
+
+    Called wherever an address row is deleted for good, before that delete
+    flushes: the single / bulk permanent delete and the orphan purge, and the
+    DHCP lease and reservation mirrors' teardown (lease expiry, release, purge,
+    orphan sweep, subnet delete; static mirror removal). A record already in
+    the trash — e.g. riding the batch of a zone deleted before the address —
+    is not being served, so it is only deleted: left behind, the address's
+    delete nulls its ``ip_address_id`` (SET NULL) and the zone's restore would
+    publish a record owned by nothing.
+
+    It is also called where an address KEEPS its row but its auto DNS is
+    retracted — IPAM's DNS delete (``_sync_dns_record(action="delete")``:
+    a reservation removed, a hostname or zone cleared, a lease's DDNS
+    revoked, Mark as Orphan) and the blank-hostname retraction. The live
+    records go through the record-op queue there; a trashed copy the select
+    cannot see would otherwise come back with its zone's restore, for a host
+    that no longer publishes one. ``host_records_only`` limits the purge to
+    the A / AAAA / PTR the blank-hostname retraction withdraws (its aliases
+    stay), and ``keep_batch_id`` spares the aliases Mark as Orphan has just
+    withdrawn into the address's own batch, which the row's Restore brings
+    back (#2604).
+
+    Hand-made records are untouched, as in :func:`retract_address_records`:
+    an operator's record is theirs, and keeps its place with
+    ``ip_address_id`` null. Returns the row count.
+    """
+    ids = list(address_ids)
+    total = 0
+    for start in range(0, len(ids), _RETRACT_CHUNK):
+        stmt = sa_delete(DNSRecord).where(
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_address_id.in_(ids[start : start + _RETRACT_CHUNK]),
+        )
+        if host_records_only:
+            stmt = stmt.where(
+                DNSRecord.ip_alias.is_(False),
+                DNSRecord.record_type.in_(["A", "AAAA", "PTR"]),
+            )
+        if keep_batch_id is not None:
+            stmt = stmt.where(DNSRecord.deletion_batch_id.is_distinct_from(keep_batch_id))
+        res = await db.execute(
+            stmt.execution_options(include_deleted=True, synchronize_session=False)
+        )
+        total += int(getattr(res, "rowcount", 0) or 0)
+    return total
+
+
 async def retract_address_records(
     db: AsyncSession, subnet_ids: Collection[uuid.UUID]
 ) -> tuple[int, set[uuid.UUID]]:

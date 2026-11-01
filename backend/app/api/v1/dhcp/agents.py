@@ -89,6 +89,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -1715,6 +1716,7 @@ async def agent_lease_events(
                         ip=ev.ip_address,
                         error=str(exc),
                     )
+                await purge_trashed_address_records(db, [ipam_row.id])  # #3186
                 await db.delete(ipam_row)
                 ipam_by_key.pop((subnet.id, norm_ip(ev.ip_address)), None)
 

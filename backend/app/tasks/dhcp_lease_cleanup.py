@@ -35,6 +35,7 @@ from app.services.dhcp.lease_cleanup import (
     address_still_held,
 )
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.feature_modules import is_module_enabled
 from app.tasks.module_gate import module_gated
 
@@ -125,6 +126,7 @@ async def _sweep() -> tuple[int, int]:
                             ip=str(row.address),
                             error=str(exc),
                         )
+                await purge_trashed_address_records(db, [row.id])  # #3186
                 await db.delete(row)
                 cleaned += 1
 
