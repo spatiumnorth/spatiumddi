@@ -7,7 +7,7 @@
  * only to a user who can read the scan.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { IPAddress } from "@/lib/api";
@@ -57,17 +57,18 @@ afterEach(() => {
 });
 
 function signInAs(grants: [string, string][]) {
-  answers.authApi = {
-    myPermissions: () =>
-      Promise.resolve({
-        is_superadmin: false,
-        grants: grants.map(([action, resource_type]) => ({
-          action,
-          resource_type,
-          resource_id: null,
-        })),
-      }),
-  };
+  const myPermissions = vi.fn(() =>
+    Promise.resolve({
+      is_superadmin: false,
+      grants: grants.map(([action, resource_type]) => ({
+        action,
+        resource_type,
+        resource_id: null,
+      })),
+    }),
+  );
+  answers.authApi = { myPermissions };
+  return myPermissions;
 }
 
 const STAMP = "2026-10-22T00:00:00Z";
@@ -111,7 +112,7 @@ const buttons = () =>
 
 describe("Device profile re-profile", () => {
   it("is not offered, and the scan is not read, without read on manage_nmap_scans", async () => {
-    signInAs([
+    const myPermissions = signInAs([
       ["read", "ip_address"],
       ["write", "ip_address"],
     ]);
@@ -121,6 +122,9 @@ describe("Device profile re-profile", () => {
     await waitFor(() =>
       expect(document.body.textContent).toContain("Device profile"),
     );
+    // The grants have been fetched, so the absence below is a verdict
+    // on them and not the fail-closed state while they load.
+    await waitFor(() => expect(myPermissions).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 50));
     expect(buttons().some((t) => t?.includes("Re-profile now"))).toBe(false);
     expect(getScan).not.toHaveBeenCalled();
@@ -140,5 +144,51 @@ describe("Device profile re-profile", () => {
     await waitFor(() =>
       expect(buttons().some((t) => t?.includes("Re-profile now"))).toBe(true),
     );
+  });
+
+  it("stops saying Scanning when the started scan cannot be read", async () => {
+    signInAs([
+      ["read", "ip_address"],
+      ["write", "ip_address"],
+      ["read", "manage_nmap_scans"],
+    ]);
+    answers.ipamApi = {
+      profileAddress: () =>
+        Promise.resolve({
+          scan_id: "scan2",
+          preset: "service_and_os",
+          status: "running",
+        }),
+    };
+    answers.nmapApi = {
+      getScan: (id: unknown) =>
+        id === "scan2"
+          ? Promise.reject(
+              Object.assign(new Error("Request failed with status code 403"), {
+                response: {
+                  status: 403,
+                  data: {
+                    detail:
+                      "Permission denied: need 'read' on 'manage_nmap_scans'",
+                  },
+                },
+              }),
+            )
+          : new Promise(() => {}),
+    };
+    openDetail();
+    const reprofile = await waitFor(() => {
+      const b = Array.from(document.querySelectorAll("button")).find((x) =>
+        x.textContent?.includes("Re-profile now"),
+      );
+      expect(b).toBeTruthy();
+      return b as HTMLButtonElement;
+    });
+    fireEvent.click(reprofile);
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("Permission denied"),
+    );
+    expect(buttons().some((t) => t?.includes("Scanning"))).toBe(false);
+    expect(buttons().some((t) => t?.includes("Re-profile now"))).toBe(true);
   });
 });

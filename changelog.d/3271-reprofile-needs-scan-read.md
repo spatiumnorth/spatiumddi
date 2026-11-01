@@ -5,3 +5,5 @@
   address's detail but not read it back (`manage_nmap_scans`), so the
   button stayed on "Scanning..." until the modal closed. The button and
   the scan read now need that grant, and the section says so instead.
+  A started scan whose progress cannot be read for any other reason now
+  ends the "Scanning..." state and shows the error.

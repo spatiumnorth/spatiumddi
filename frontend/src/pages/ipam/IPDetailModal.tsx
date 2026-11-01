@@ -1254,6 +1254,21 @@ function DeviceProfileSection({
     qc,
   ]);
 
+  // A scan whose progress cannot be read (refused, gone, or the read
+  // failing) never reaches a terminal status above, so without this the
+  // button would stay on "Scanning…" for as long as the modal is open
+  // (#3271). Stop tracking it and say why.
+  useEffect(() => {
+    if (!activeScanId || !activeScanQuery.isError) return;
+    setError(
+      formatApiError(
+        activeScanQuery.error,
+        "The scan started, but its progress could not be read",
+      ),
+    );
+    setActiveScanId(null);
+  }, [activeScanId, activeScanQuery.isError, activeScanQuery.error]);
+
   // Passive fingerprint — Phase 2. The endpoint 404s when no MAC or
   // no fingerprint has been observed; treat 404 as "no data" rather
   // than a hard error.
