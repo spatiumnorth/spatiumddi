@@ -1,0 +1,3 @@
+### Fixed
+
+- Restoring a DNS zone from the Trash no longer brings back the auto-generated record of an address that was deleted for good after the zone, or whose DNS was removed after it. The single permanent address delete, the bulk permanent delete and the subnet's orphan purge now remove the address's trashed auto records with it, as the subnet purges already did, and so do the paths that drop DHCP lease and reservation mirrors (lease expiry, release, purge, the orphan sweep and a reservation's removal). The same goes for an address that keeps its row but loses its DNS: a deleted DHCP reservation, a hostname or DNS zone cleared in IPAM, a reservation's name cleared, or a lease's DDNS revoked (#3186).
