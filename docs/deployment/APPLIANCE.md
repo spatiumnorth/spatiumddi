@@ -3616,6 +3616,24 @@ To back out by hand, delete the `global.imageTag` key from the
 `spatium-bootstrap` HelmChartConfig and `image.tag` from
 `spatium-control` in `kube-system`.
 
+**Upgrading a cluster node by node from Fleet (#3136).** With no Rolling
+Upgrade running, a cluster upgraded one node at a time (Fleet's Schedule
+OS upgrade, then the node's reboot) has nodes on two versions all the
+same. While the cluster members report different installed versions, no
+member writes the agents chart: it stays on the image tag every node is
+running, so the DNS and DHCP pods of the nodes not yet upgraded keep
+running. A node Fleet has scheduled hears of this before its reboot,
+so its first pass on the new slot already leaves the chart alone. Once
+every member reports one version, the next heartbeat moves the chart to
+the new tag and each node's DNS and DHCP pods restart once. A role change
+made while the versions differ is applied then too. A member that is
+down while on the old version counts at the version it last reported,
+so the chart waits for it: bring it back and upgrade it, or replace it
+from Fleet. Nothing pins the
+bootstrap and control charts on this path, and the seed's own boot
+renders them from its new slot: upgrade the members first and the seed
+last, or use the Rolling Upgrade, which holds those too.
+
 **One DNS server group per cluster (#1427).** The cluster has one
 `spatiumddi-appliance` chart and so one DNS agent group. Giving a
 cluster member (or a joiner) DNS in a group other than the one the
