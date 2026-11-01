@@ -72,6 +72,7 @@ from app.services.ai.operations_risky import (
     DeleteSpaceArgs,
     DeleteSubnetArgs,
 )
+from app.services.api_token_scopes import read_only_post
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.agent_wake_targets import dhcp_group_channels_for_subnets
 from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
@@ -5851,6 +5852,7 @@ class PlanAllocationResponse(BaseModel):
 
 
 @router.post("/blocks/{block_id}/plan-allocation", response_model=PlanAllocationResponse)
+@read_only_post
 async def plan_block_allocation(
     block_id: uuid.UUID,
     body: PlanAllocationRequest,
@@ -7955,6 +7957,7 @@ class BlockResizeCommitResponse(BaseModel):
     "/subnets/{subnet_id}/resize/preview",
     response_model=SubnetResizePreviewResponse,
 )
+@read_only_post
 async def resize_subnet_preview(
     subnet_id: uuid.UUID,
     body: SubnetResizePreviewRequest,
@@ -8073,6 +8076,7 @@ async def resize_subnet_commit(
     "/blocks/{block_id}/resize/preview",
     response_model=BlockResizePreviewResponse,
 )
+@read_only_post
 async def resize_block_preview(
     block_id: uuid.UUID,
     body: BlockResizePreviewRequest,
@@ -8208,6 +8212,7 @@ class BlockMoveCommitResponse(BaseModel):
     "/blocks/{block_id}/move/preview",
     response_model=BlockMovePreviewResponse,
 )
+@read_only_post
 async def move_block_preview(
     block_id: uuid.UUID,
     body: BlockMovePreviewRequest,
@@ -8370,6 +8375,7 @@ class FindFreeResponse(BaseModel):
     "/spaces/{space_id}/find-free",
     response_model=FindFreeResponse,
 )
+@read_only_post
 async def find_free_space_in_space(
     space_id: uuid.UUID,
     body: FindFreeRequest,
@@ -8468,6 +8474,7 @@ class SplitSubnetCommitResponse(BaseModel):
     "/subnets/{subnet_id}/split/preview",
     response_model=SplitSubnetPreviewResponse,
 )
+@read_only_post
 async def split_subnet_preview(
     subnet_id: uuid.UUID,
     body: SplitSubnetPreviewRequest,
@@ -8596,6 +8603,7 @@ class MergeSubnetCommitResponse(BaseModel):
     "/subnets/{subnet_id}/merge/preview",
     response_model=MergeSubnetPreviewResponse,
 )
+@read_only_post
 async def merge_subnet_preview(
     subnet_id: uuid.UUID,
     body: MergeSubnetPreviewRequest,
@@ -9781,6 +9789,63 @@ async def list_addresses(
     return rows
 
 
+async def address_create_warnings(
+    db: AsyncSession,
+    subnet: Subnet,
+    *,
+    address: str,
+    hostname: str | None,
+    mac_address: str | None,
+    role: str | None,
+    forward_zone_id: uuid.UUID | None,
+    extra_zone_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """The confirm-or-force warnings the address create refuses with a 409.
+
+    Name / MAC / PTR collisions, a private address in a public-facing zone and
+    an address inside a DHCP dynamic pool. One home so the create and the
+    request portal's submit and apply (#3243, #3248) apply the same checks.
+    """
+    # An ``available`` row at this address is the slot being taken (#2980):
+    # its own name and PTR are retracted by the take, not a collision.
+    free_row_id = await db.scalar(
+        select(IPAddress.id).where(
+            IPAddress.subnet_id == subnet.id,
+            IPAddress.address == address,
+            IPAddress.status == "available",
+        )
+    )
+    warnings = await _check_ip_collisions(
+        db,
+        hostname=hostname,
+        forward_zone_id=forward_zone_id,
+        mac_address=mac_address,
+        role=role,
+        subnet=subnet,
+        address=address,
+        exclude_ip_id=free_row_id,
+    )
+    # Public-facing safety guard (issue #25). Append to the same
+    # warnings list so the operator sees both surfaces in one
+    # 409 — they only have to typed-CIDR-confirm once.
+    warnings.extend(
+        await _check_public_facing_warnings(
+            db,
+            address=address,
+            forward_zone_id=forward_zone_id,
+            extra_zone_ids=extra_zone_ids,
+        )
+    )
+    # Allocating inside a dynamic DHCP pool is allowed but flagged (#631):
+    # soft, force-overridable warning rather than the old hard 422, since a
+    # MAC pinned inside the range is the standard idiom on every driver.
+    dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
+    addr_int = int(ipaddress.ip_address(address))
+    if dynamic_ranges and _ip_int_in_dynamic_pool(addr_int, dynamic_ranges):
+        warnings.append(_dynamic_pool_warning(address, addr_int, dynamic_ranges))
+    return warnings
+
+
 @router.post(
     "/subnets/{subnet_id}/addresses",
     response_model=IPAddressResponse,
@@ -9853,42 +9918,16 @@ async def create_address(
     if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
-        # An ``available`` row at this address is the slot being taken (#2980):
-        # its own name and PTR are retracted by the take, not a collision.
-        free_row_id = await db.scalar(
-            select(IPAddress.id).where(
-                IPAddress.subnet_id == subnet_id,
-                IPAddress.address == body.address,
-                IPAddress.status == "available",
-            )
-        )
-        warnings = await _check_ip_collisions(
+        warnings = await address_create_warnings(
             db,
+            subnet,
+            address=body.address,
             hostname=body.hostname,
-            forward_zone_id=effective_zone,
             mac_address=body.mac_address,
             role=body.role,
-            subnet=subnet,
-            address=body.address,
-            exclude_ip_id=free_row_id,
+            forward_zone_id=effective_zone,
+            extra_zone_ids=body.extra_zone_ids,
         )
-        # Public-facing safety guard (issue #25). Append to the same
-        # warnings list so the operator sees both surfaces in one
-        # 409 — they only have to typed-CIDR-confirm once.
-        warnings.extend(
-            await _check_public_facing_warnings(
-                db,
-                address=body.address,
-                forward_zone_id=effective_zone,
-                extra_zone_ids=body.extra_zone_ids,
-            )
-        )
-        # Allocating inside a dynamic DHCP pool is allowed but flagged (#631):
-        # soft, force-overridable warning rather than the old hard 422, since a
-        # MAC pinned inside the range is the standard idiom on every driver.
-        dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet_id)
-        if dynamic_ranges and _ip_int_in_dynamic_pool(int(addr), dynamic_ranges):
-            warnings.append(_dynamic_pool_warning(body.address, int(addr), dynamic_ranges))
         if warnings:
             if scoped_writer:
                 warnings = await _redact_foreign_collisions(db, current_user, subnet_id, warnings)
@@ -11371,6 +11410,7 @@ async def _build_bulk_allocate_candidates(
     "/subnets/{subnet_id}/bulk-allocate/preview",
     response_model=BulkAllocatePreviewResponse,
 )
+@read_only_post
 async def bulk_allocate_preview(
     subnet_id: uuid.UUID,
     body: BulkAllocateRequest,
