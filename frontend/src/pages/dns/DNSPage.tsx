@@ -10600,6 +10600,8 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       <button
                         className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setEditList(l)}
+                        aria-label={`Edit blocking list ${l.name}`}
+                        title="Edit blocking list"
                         {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Pencil className="h-3 w-3" />
@@ -10607,6 +10609,8 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       <button
                         className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setConfirmDelete(l)}
+                        aria-label={`Delete blocking list ${l.name}`}
+                        title="Delete blocking list"
                         {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Trash2 className="h-3 w-3" />
