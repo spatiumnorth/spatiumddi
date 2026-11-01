@@ -656,3 +656,23 @@ async def test_commit_failed_entity_does_not_poison_the_rest_2816(
         ).scalars()
     }
     assert audited == {"good-before", "good-after"}
+
+
+@pytest.mark.asyncio
+async def test_commit_does_not_attach_to_trashed_customer_3192(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A customer in the Trash is not a match for a NetBox tenant (#3192)."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    _patch_client(monkeypatch, _FIXTURE)
+    actor = await _make_admin(db_session)
+    trashed = Customer(name="Acme Corp", status="active", deleted_at=datetime.now(UTC))
+    db_session.add(trashed)
+    await db_session.commit()
+
+    await _preview_then_commit(db_session, actor)
+
+    vrf_a = (await db_session.execute(select(VRF).where(VRF.name == "cust-a"))).scalar_one()
+    assert vrf_a.customer_id is not None
+    assert vrf_a.customer_id != trashed.id

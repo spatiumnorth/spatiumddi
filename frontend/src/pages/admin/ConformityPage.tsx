@@ -30,6 +30,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { exportErrorMessage, isRefused } from "@/lib/refusal";
 
 /**
  * Conformity admin page (issue #106).
@@ -114,7 +115,7 @@ export function ConformityPage() {
     mutationFn: (framework: string | undefined) =>
       conformityApi.exportPdf(framework),
     onError: (e: unknown) => {
-      alert(`PDF export failed: ${formatApiError(e, "unknown error")}`);
+      alert(exportErrorMessage(e, "the conformity report"));
     },
   });
 
@@ -142,6 +143,12 @@ export function ConformityPage() {
               variant="secondary"
               onClick={() => exportPdfMut.mutate(undefined)}
               disabled={exportPdfMut.isPending}
+              // The PDF needs the same `read` on `conformity` the list
+              // does (#3255), as the Audit Log's does (#1865).
+              {...permissionGate(
+                !isRefused(policiesQ.error),
+                "Requires read permission on conformity",
+              )}
             >
               <FileDown className="h-4 w-4" />
               {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}

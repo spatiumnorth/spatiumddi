@@ -163,6 +163,8 @@ export function TagFilterChips({
             return;
           }
           if (e.key === "Escape") {
+            // An IME composition's Esc belongs to the input method.
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
             // Esc closes the open list and clears the draft; it is this
             // control's Esc, so the dialog around it must not also close
             // (#2720). With nothing open, let it through.

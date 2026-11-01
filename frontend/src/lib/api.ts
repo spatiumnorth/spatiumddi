@@ -185,6 +185,40 @@ function createClient(): AxiosInstance {
 
 export const api = createClient();
 
+/** A file download is requested with `responseType: "blob"`, so a refusal's
+ *  JSON body also arrives as a Blob and `response.data.detail` is unreadable
+ *  (#3255). Decode it in place and re-throw the same error, so the status and
+ *  `formatApiError` both still work for the caller. A JSON body keeps its
+ *  `detail`; a short plain-text body becomes the detail; an empty body, a
+ *  proxy's HTML error page or one that cannot be read leaves no detail, so
+ *  the caller says what it would say for a bodiless error rather than show
+ *  raw bytes. Decoding never throws: the caller always gets `err` back. */
+export async function rethrowBlobError(err: unknown): Promise<never> {
+  const res = (err as { response?: { data?: unknown } } | null)?.response;
+  if (res && res.data instanceof Blob) {
+    let detail: unknown = undefined;
+    try {
+      const text = (await res.data.text()).trim();
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "detail" in parsed) {
+          detail = (parsed as { detail?: unknown }).detail ?? undefined;
+        }
+      } catch {
+        // Not JSON: a short plain-text reason is still worth showing, a
+        // proxy's HTML error page is not.
+        if (text && text.length <= 300 && !text.startsWith("<")) {
+          detail = text;
+        }
+      }
+    } catch {
+      // The body could not be read at all; re-throw without a detail.
+    }
+    res.data = detail === undefined ? undefined : { detail };
+  }
+  throw err;
+}
+
 /**
  * Normalise whatever shape an API error arrives in into a single string
  * suitable for React children (issue #31) and operator-readable toasts
@@ -2415,9 +2449,11 @@ export const ipamIoApi = {
     format: "csv" | "json" | "xlsx";
     include_addresses?: boolean;
   }) => {
-    const res = await api.get(ipamIoApi.exportUrl(params), {
-      responseType: "blob",
-    });
+    const res = await api
+      .get(ipamIoApi.exportUrl(params), {
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     // UTC YYYYMMDD-HHMMSS matches the backend's export filename convention
@@ -3439,6 +3475,19 @@ export const backupTargetsApi = {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   },
+  /** Manifest + dump format of one stored archive (#2222) — the same
+   *  answer as ``backupApi.previewManifest``, for an archive already at
+   *  the destination. Fetches that archive server-side, so call it for
+   *  the archive the operator picked, never for the whole listing. */
+  previewArchiveManifest: (
+    id: string,
+    filename: string,
+  ): Promise<BackupManifestPreviewResponse> =>
+    api
+      .get<BackupManifestPreviewResponse>(
+        `/backup/targets/${id}/archives/${encodeURIComponent(filename)}/manifest-preview`,
+      )
+      .then((r) => r.data),
   restoreFromArchive: (
     id: string,
     body: {
@@ -5958,11 +6007,21 @@ export interface ZoneDriftServer {
   server_id: string;
   server_name: string;
   driver: string;
-  // "ok" — pulled and diffed. "error" — the pull failed (unreachable, paused,
-  // AXFR refused); counts are meaningless. "unsupported" — the driver has no
-  // `pull_zone_records`, so drift can't be computed for it at all.
-  status: "ok" | "error" | "unsupported";
+  // "ok" — pulled, nothing missing or extra, and not below the zone's serial.
+  // "syncing" — the zone changed under two minutes ago and the server has not
+  // caught up yet. "behind" — pulled, but the server is not serving the zone
+  // as saved: a saved record is missing or it sits below the zone's serial.
+  // "drift" — not behind, but the record sets differ (records SpatiumDDI
+  // doesn't hold, or a difference DNS views can explain). "error" — the pull
+  // failed (unreachable, paused, AXFR refused); counts are meaningless.
+  // "unsupported" — the driver has no `pull_zone_records`.
+  status: "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported";
   error: string | null;
+  // Why a pulled server is "syncing" / "behind" / "drift".
+  reason: string | null;
+  // The serial the server reported (null = it hasn't) and the zone's target.
+  current_serial: number | null;
+  target_serial: number;
   in_sync: number;
   // `extra_on_server.length + missing_on_server.length` — the backend derives
   // it, so don't recompute it in the UI.
@@ -6827,6 +6886,7 @@ export const dnsApi = {
         params: { format },
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -6843,6 +6903,7 @@ export const dnsApi = {
         params: { format },
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -6918,6 +6979,7 @@ export const dnsApi = {
         params: viewId ? { view_id: viewId } : {},
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -11157,10 +11219,12 @@ export const conformityApi = {
   // ``Content-Disposition`` for the backend's UTC-timestamped
   // filename, trigger a synthetic anchor click for the download.
   exportPdf: async (framework?: string): Promise<void> => {
-    const res = await api.get<Blob>("/conformity/export.pdf", {
-      params: framework ? { framework } : undefined,
-      responseType: "blob",
-    });
+    const res = await api
+      .get<Blob>("/conformity/export.pdf", {
+        params: framework ? { framework } : undefined,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     const ts = new Date()
@@ -19784,6 +19848,7 @@ export const supportBundleApi = {
         },
         { responseType: "blob" },
       )
+      .catch(rethrowBlobError)
       .then((r) => r.data as Blob),
   decodeMap: () =>
     api
@@ -21347,10 +21412,12 @@ export const e911Api = {
   download: async (kind: "csv" | "ios", siteId?: string) => {
     const path =
       kind === "csv" ? "/e911/export.csv" : "/e911/export/ios-lldp-med.txt";
-    const res = await api.get(path, {
-      params: siteId ? { site_id: siteId } : undefined,
-      responseType: "blob",
-    });
+    const res = await api
+      .get(path, {
+        params: siteId ? { site_id: siteId } : undefined,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = String(res.headers["content-disposition"] ?? "");
     const match = disp.match(/filename="?([^"]+)"?/);
     const ts = new Date()
