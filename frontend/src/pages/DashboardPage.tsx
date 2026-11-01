@@ -2210,7 +2210,7 @@ export function DashboardPage() {
                 )
               }
               icon={Cpu}
-              tone={unhealthyServers > 0 ? "bad" : "default"}
+              tone={!serversWhy && unhealthyServers > 0 ? "bad" : "default"}
             />
           </div>
         )}

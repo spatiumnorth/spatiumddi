@@ -105,6 +105,63 @@ describe("refused reads are not an empty estate (#3234)", () => {
     expect(text).not.toMatch(/0 subnets/);
     expect(text).not.toContain("none registered");
     expect(text).not.toContain("no groups");
+    // ...and says why, rather than just rendering nothing.
+    expect(text).toContain("you may not read this");
+    expect(text).toContain("You don't have permission to see subnets");
+  });
+
+  it("Servers tile: one refused half is a dash, not the other half's count", async () => {
+    // DNS readable with one server, DHCP refused: counting the DNS server
+    // alone would say "1" for a fleet the reader cannot see half of.
+    calls["ipamApi.listSpaces"] = () => Promise.resolve([]);
+    calls["ipamApi.listSubnets"] = () => Promise.resolve([]);
+    calls["dnsApi.listGroups"] = () =>
+      Promise.resolve([{ id: "g1", name: "default" }]);
+    calls["dnsApi.listZones"] = () => Promise.resolve([]);
+    calls["dnsApi.listServers"] = () =>
+      Promise.resolve([
+        {
+          id: "s1",
+          group_id: "g1",
+          name: "ns1",
+          host: "10.0.0.1",
+          port: 53,
+          driver: "bind9",
+          status: "active",
+          is_enabled: true,
+        },
+      ]);
+    calls["dhcpApi.listServers"] = refused;
+    calls["dhcpApi.listGroups"] = refused;
+    await show("dns");
+    const label = Array.from(document.querySelectorAll("p, span")).find(
+      (el) => el.textContent === "Servers",
+    );
+    const tile = label?.closest("a, div.rounded-lg") ?? null;
+    expect(tile).not.toBeNull();
+    expect(tile?.textContent).toContain("—");
+    expect(tile?.textContent).toContain("you may not read this");
+    expect(tile?.textContent).not.toMatch(/\b1\b/);
+  });
+
+  it("a refused DHCP read is not asked again on the 30 s poll", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let n = 0;
+      calls["dhcpApi.listServers"] = () => {
+        n += 1;
+        return refused();
+      };
+      await show("dhcp");
+      const first = n;
+      expect(first).toBeGreaterThan(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(95_000);
+      });
+      expect(n).toBe(first);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("DNS and DHCP tabs say refused, not 'registered none'", async () => {

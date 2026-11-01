@@ -174,6 +174,25 @@ async def test_security_summary_full_detail_for_audit_reader(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["failed_login_top_sources"], "audit reader should see the detail"
+    assert body["detail_withheld"] is False
+
+
+async def test_security_summary_full_detail_for_user_reader(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """read/user alone is privileged too: the lists come back and the summary
+    does not claim it withheld them (#3235 mirrors #400's condition exactly)."""
+    await _ensure_settings(db_session)
+    await _seed_security_signals(db_session)
+    reader = await _user(db_session)
+    await _grant_role(db_session, reader, [{"action": "read", "resource_type": "user"}])
+    await db_session.commit()
+
+    r = await client.get(_SECURITY_URL, headers=_bearer(reader))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["mfa_unenrolled"]) >= 1
+    assert body["detail_withheld"] is False
 
 
 async def test_security_summary_requires_auth(client: AsyncClient) -> None:
