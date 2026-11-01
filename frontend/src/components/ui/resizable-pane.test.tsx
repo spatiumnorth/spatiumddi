@@ -226,6 +226,35 @@ describe("ResizablePane", () => {
     expect(now()).toBe(600);
   });
 
+  it("keeps the preferred width when mounted in a narrow window, then grown", () => {
+    window.localStorage.setItem("spatium.paneWidth.t", "600");
+    setViewport(900);
+    render(pane());
+    expect(now()).toBe(450);
+    resizeWindow(1600);
+    expect(now()).toBe(600);
+    expect(window.localStorage.getItem("spatium.paneWidth.t")).toBe("600");
+  });
+
+  it("persists the width reached when the pane unmounts mid-drag", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    const { unmount } = render(pane());
+    fireEvent.pointerDown(sep(), { clientX: 300, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(sep(), { clientX: 400, pointerId: 1 });
+    expect(setItem).not.toHaveBeenCalled();
+    unmount();
+    expect(setItem).toHaveBeenCalledTimes(1);
+    expect(window.localStorage.getItem("spatium.paneWidth.t")).toBe("388");
+  });
+
+  it("persists the width reached when the window narrows below md mid-drag", () => {
+    render(pane());
+    fireEvent.pointerDown(sep(), { clientX: 300, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(sep(), { clientX: 400, pointerId: 1 });
+    resizeWindow(600);
+    expect(window.localStorage.getItem("spatium.paneWidth.t")).toBe("388");
+  });
+
   it("crossing md keeps the tree mounted, so its state survives", () => {
     function Counter() {
       const [n, setN] = useState(0);

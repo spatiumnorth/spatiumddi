@@ -59,7 +59,9 @@ export function useResizableWidth(storageKey: string, defaultWidth: number) {
   const vw = () => (typeof window === "undefined" ? 1280 : window.innerWidth);
   const [width, setWidthState] = useState<number>(() => {
     const stored = readStored(storageKey);
-    return clampPaneWidth(stored ?? defaultWidth, vw());
+    // Absolute bounds only: the viewport cap is applied at render, so a
+    // preference larger than this window allows survives the window growing.
+    return clampPaneWidth(stored ?? defaultWidth, Infinity);
   });
   const [viewport, setViewport] = useState<number>(vw);
 
@@ -86,7 +88,7 @@ export function useResizableWidth(storageKey: string, defaultWidth: number) {
     [storageKey],
   );
   const reset = useCallback(() => {
-    const clamped = clampPaneWidth(defaultWidth, window.innerWidth);
+    const clamped = clampPaneWidth(defaultWidth, Infinity);
     latest.current = clamped;
     setWidthState(clamped);
     writeStored(storageKey, null);
@@ -162,10 +164,17 @@ export function ResizablePane({
     window.addEventListener("blur", finishDrag);
     return () => {
       window.removeEventListener("blur", finishDrag);
+      // Unmounted, or narrowed below `md`, mid-drag: pointerup will never
+      // arrive, so end the drag as it would have (no setState: the handle
+      // is going away or `dragging` was already cleared).
+      if (drag.current) {
+        drag.current = null;
+        persist();
+      }
       document.body.style.cursor = cursor;
       document.body.style.userSelect = userSelect;
     };
-  }, [dragging, finishDrag]);
+  }, [dragging, finishDrag, persist]);
 
   function onPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
     if (e.button !== 0) return;
