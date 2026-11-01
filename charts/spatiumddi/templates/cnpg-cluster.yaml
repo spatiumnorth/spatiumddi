@@ -85,15 +85,20 @@ spec:
   # upgrade (#1313). ``keep`` only keeps it, and the database with it,
   # through a Helm-driven delete.
 
-  # #296 Phase A — PDB on by default (set in values.yaml). Suspended
-  # during a rolling-upgrade node's maintenance window — the api-side
-  # orchestrator stamps + clears
+  # #296 Phase A — PDB on whenever there is a replica (see #3204 below).
+  # Suspended during a rolling-upgrade node's maintenance window — the
+  # api-side orchestrator stamps + clears
   # ``spec.nodeMaintenanceWindow.inProgress``. Outside the upgrade flow
   # the PDB prevents accidental simultaneous primary eviction (e.g. a
   # manual ``kubectl drain`` of two nodes at once). Sprig's ``| default``
-  # treats ``false`` as falsy and would emit ``true``, so we read the
-  # value directly and require the user to set it in values.yaml.
-  enablePDB: {{ .Values.postgresql.cnpg.enablePDB }}
+  # treats ``false`` as falsy and would emit ``true``, so unset is told
+  # apart from an explicit ``false`` with ``kindIs "invalid"`` (null).
+  {{- /* #3204: unset (null) means "on when there is a replica": a single
+         instance has nothing to fail over to, and its PDB allows 0
+         disruptions, so ``kubectl drain`` of the node could never evict it.
+         An explicit true or false always wins. */}}
+  {{- $pdb := .Values.postgresql.cnpg.enablePDB }}
+  enablePDB: {{ if kindIs "invalid" $pdb }}{{ gt (int .Values.postgresql.cnpg.instances) 1 }}{{ else }}{{ $pdb }}{{ end }}
   {{- if gt (int .Values.postgresql.cnpg.instances) 1 }}
 
   # #2831: a rolling update reaches the primary last. With replicas,
@@ -213,6 +218,13 @@ spec:
     {{- if $mergedSel }}
     nodeSelector:
       {{- toYaml $mergedSel | nindent 6 }}
+    {{- end }}
+    {{- /* #3205 — "prefer this node, schedule elsewhere if it is full".
+           CNPG's spec.affinity carries nodeAffinity verbatim (a
+           corev1.NodeAffinity); the nodeSelector above stays the hard pin. */}}
+    {{- with (.Values.postgresql.affinity | default dict).nodeAffinity }}
+    nodeAffinity:
+      {{- toYaml . | nindent 6 }}
     {{- end }}
     {{- with .Values.postgresql.tolerations }}
     tolerations:

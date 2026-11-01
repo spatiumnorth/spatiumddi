@@ -121,9 +121,15 @@ async function confirmMoveToTrash() {
 
 async function walkDelete(openLabel: RegExp) {
   fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
-  fireEvent.click(screen.getByRole("button", { name: openLabel }));
+  // Permissions arrive asynchronously; a click on the still-disabled
+  // button is a silent no-op and the Continue lookup then fails.
+  const del = screen.getByRole("button", {
+    name: openLabel,
+  }) as HTMLButtonElement;
+  await waitFor(() => expect(del.disabled).toBe(false));
+  fireEvent.click(del);
   fireEvent.click(
-    within(topDialog()).getByRole("button", { name: "Continue" }),
+    await within(topDialog()).findByRole("button", { name: "Continue" }),
   );
   await confirmMoveToTrash();
 }

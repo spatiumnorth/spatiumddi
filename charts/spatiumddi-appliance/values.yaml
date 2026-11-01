@@ -5,7 +5,7 @@
 # subset to ``true`` based on the SpatiumApplianceRole spec.
 #
 # All container images come from the slot's containerd content store
-# (preloaded at firstboot from /usr/lib/spatiumddi/images/*.tar.zst).
+# (imported by k3s from /var/lib/rancher/k3s/agent/images/*.tar.zst).
 # imagePullPolicy is ``Never`` everywhere — air-gap means no registry
 # lookup at runtime, ever.
 
@@ -308,6 +308,10 @@ dhcpKea:
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
+  # #3202: rendered nowhere. The dhcp-kea pod template is one for every node
+  # of a cluster and carries no node's DHCP group: the control plane places
+  # each Kea agent in the group its appliance is assigned. The key stays so a
+  # values file that still sets it renders unchanged.
   serverGroupName: ""
   # ``host`` = listen on the host's NIC (the default + only mode
   # that lets DHCP broadcasts reach Kea). ``bridged`` would require

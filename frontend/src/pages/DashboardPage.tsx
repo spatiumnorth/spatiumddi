@@ -110,6 +110,7 @@ import {
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -1467,7 +1468,7 @@ export function DashboardPage() {
   };
 
   const [tab, setTab] = useState<DashboardTab>(() => {
-    const saved = localStorage.getItem("dashboard-tab");
+    const saved = safeLocalStorage.getItem("dashboard-tab");
     if (saved && _PERSISTED_TABS.has(saved as DashboardTab)) {
       return saved as DashboardTab;
     }
@@ -1475,7 +1476,7 @@ export function DashboardPage() {
   });
   function selectTab(next: DashboardTab) {
     setTab(next);
-    localStorage.setItem("dashboard-tab", next);
+    safeLocalStorage.setItem("dashboard-tab", next);
   }
 
   // If the persisted tab points at a now-hidden (module-disabled) tab,
@@ -1487,7 +1488,7 @@ export function DashboardPage() {
     // below — mounted against a module that may turn out to be off (#2130).
     if (ready && !tabVisible(tab)) {
       setTab("overview");
-      localStorage.setItem("dashboard-tab", "overview");
+      safeLocalStorage.setItem("dashboard-tab", "overview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, enabled, ready]);
