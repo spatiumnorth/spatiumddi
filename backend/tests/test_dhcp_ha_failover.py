@@ -160,13 +160,28 @@ async def test_five_member_group_has_three_backups(db_session: AsyncSession) -> 
 
 
 @pytest.mark.asyncio
-async def test_missing_peer_url_on_any_member_suppresses_ha(
+async def test_missing_peer_url_leaves_that_member_out_not_the_pair(
     db_session: AsyncSession,
 ) -> None:
+    """#3151: a third member with no HA URL is left out of the relationship;
+    the two members that have one keep their HA hook."""
     grp = await _make_group(db_session)
     a = await _add_kea_server(db_session, grp, "a", ha_peer_url="http://a:8000/")
-    await _add_kea_server(db_session, grp, "b", ha_peer_url="http://b:8000/")
-    # Third member never got its HA URL filled in — whole group isn't ready.
+    b = await _add_kea_server(db_session, grp, "b", ha_peer_url="http://b:8000/")
+    c = await _add_kea_server(db_session, grp, "c", ha_peer_url="")
+    await db_session.refresh(grp, ["servers"])
+
+    fo = await _resolve_failover(db_session, a, grp)
+    assert fo is not None
+    assert {p["name"] for p in fo.peers} == {a.name, b.name}
+    assert await _resolve_failover(db_session, c, grp) is None
+
+
+@pytest.mark.asyncio
+async def test_fewer_than_two_peer_urls_suppresses_ha(db_session: AsyncSession) -> None:
+    grp = await _make_group(db_session)
+    a = await _add_kea_server(db_session, grp, "a", ha_peer_url="http://a:8000/")
+    await _add_kea_server(db_session, grp, "b", ha_peer_url="")
     await _add_kea_server(db_session, grp, "c", ha_peer_url="")
     await db_session.refresh(grp, ["servers"])
 
