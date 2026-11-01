@@ -35,6 +35,8 @@ const updateZone = vi.fn(
 const pending = () => new Promise<never>(() => {});
 let groups: unknown[] = [];
 
+let listedZones: unknown[] = [];
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -45,6 +47,7 @@ vi.mock("@/lib/api", async () => {
       // kind must not wait for it.
       classifyZoneName: pending,
       listGroups: () => Promise.resolve(groups),
+      listZones: () => Promise.resolve(listedZones),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (groupId: string, data: Record<string, unknown>) =>
@@ -63,6 +66,7 @@ vi.mock("@/lib/api", async () => {
 const { ZoneModal } = await import("./DNSPage");
 
 function open(zone?: DNSZone) {
+  listedZones = zone ? [zone] : [];
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -164,9 +168,15 @@ describe("Add Zone's Kind", () => {
       customer_id: null,
     } as unknown as DNSZone);
 
+    await screen.findByText("Zone Name (FQDN)");
     expect(control("Kind").value).toBe("forward");
-    await save();
-    expect(updateZone.mock.calls[0][2]).toMatchObject({ kind: "forward" });
+    // An untouched Save sends nothing (#3269): the kind stays as stored.
+    fireEvent.submit(control("Kind").form!);
+    await waitFor(() =>
+      expect(screen.queryByText("Zone Name (FQDN)")).toBeTruthy(),
+    );
+    expect(updateZone).not.toHaveBeenCalled();
+    expect(createZone).not.toHaveBeenCalled();
   });
 });
 
@@ -256,19 +266,19 @@ describe("the zone dialog's Primary NS (#2075)", () => {
 
   it("lets a zone stored with a bad value be saved unchanged, and flags it", async () => {
     open(zoneRow("ns1"));
+    await screen.findByText("Zone Name (FQDN)");
     expect(screen.getByText(/Stored before this was checked/)).toBeTruthy();
     fireEvent.change(control("Default TTL (seconds)"), {
       target: { value: "600" },
     });
     await save();
-    expect(updateZone.mock.calls[0][2]).toMatchObject({
-      primary_ns: "ns1",
-      ttl: 600,
-    });
+    // Only the changed field is sent (#3269): the stored value is left as is.
+    expect(updateZone.mock.calls[0][2]).toEqual({ ttl: 600 });
   });
 
   it("refuses changing a stored value to another non-host name", async () => {
     open(zoneRow("ns1"));
+    await screen.findByText("Zone Name (FQDN)");
     fireEvent.change(control("Primary NS"), {
       target: { value: "ns_1.legacy.test." },
     });

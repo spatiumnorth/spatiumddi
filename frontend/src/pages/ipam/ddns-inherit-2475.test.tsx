@@ -133,13 +133,14 @@ function inheritBox(): HTMLInputElement {
 }
 
 describe("Edit Subnet's DDNS tab (#2475)", () => {
-  function edit(s: Subnet) {
+  function edit(s: Subnet, onClose: () => void = () => {}) {
     answer("ipamApi", "getEffectiveSubnetDdns", () =>
       Promise.resolve(inherited),
     );
     const updateSubnet = sink(s);
     answer("ipamApi", "updateSubnet", updateSubnet);
-    open(<EditSubnetModal subnet={s} onClose={() => {}} />);
+    answer("ipamApi", "getSubnet", () => Promise.resolve(s));
+    open(<EditSubnetModal subnet={s} onClose={onClose} />);
     return updateSubnet;
   }
 
@@ -157,13 +158,23 @@ describe("Edit Subnet's DDNS tab (#2475)", () => {
     ).toBe("always_generate");
   });
 
-  it("an untouched Save keeps inheritance: no ddns_enabled is sent", async () => {
+  it("an untouched Save keeps inheritance: nothing is sent (#3269)", async () => {
+    const onClose = vi.fn();
+    const updateSubnet = edit(subnet, onClose);
+    await screen.findByRole("button", { name: "DDNS" });
+    await press("Save");
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateSubnet).not.toHaveBeenCalled();
+  });
+
+  it("a Save of another field leaves the DDNS settings out", async () => {
     const updateSubnet = edit(subnet);
+    fireEvent.change(await screen.findByDisplayValue("s"), {
+      target: { value: "s2" },
+    });
     await press("Save");
     await waitFor(() => expect(updateSubnet).toHaveBeenCalledTimes(1));
-    const body = updateSubnet.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.ddns_inherit_settings).toBe(true);
-    expect(body).not.toHaveProperty("ddns_enabled");
+    expect(updateSubnet.mock.calls[0][1]).toEqual({ name: "s2" });
   });
 
   it("opting out sends the subnet's own settings with inheritance off", async () => {
@@ -173,9 +184,9 @@ describe("Edit Subnet's DDNS tab (#2475)", () => {
     expect(enabledBox().checked).toBe(false);
     await press("Save");
     await waitFor(() => expect(updateSubnet).toHaveBeenCalledTimes(1));
-    expect(updateSubnet.mock.calls[0][1]).toMatchObject({
+    // Only what changed: the stored ddns_enabled (false) is already in force.
+    expect(updateSubnet.mock.calls[0][1]).toEqual({
       ddns_inherit_settings: false,
-      ddns_enabled: false,
     });
   });
 });

@@ -184,6 +184,7 @@ describe("Edit Zone after a save (#2462)", () => {
       fireEvent.click(
         await screen.findByRole("menuitem", { name: /Edit Zone/ }),
       );
+      await waitFor(() => topDialog());
       return (
         await within(topDialog()).findByText("Default TTL (seconds)", {
           selector: "label",
@@ -203,9 +204,12 @@ describe("Edit Zone after a save (#2462)", () => {
 
     const again = await openEditZone();
     expect(again.value).toBe("300");
+    // An untouched Save sends nothing (#3269): the stored value stays.
     fireEvent.click(within(topDialog()).getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(store.saved).toHaveLength(2));
-    expect(store.saved[1]).toMatchObject({ ttl: 300 });
+    await waitFor(() =>
+      expect(screen.queryAllByRole("dialog")).toHaveLength(0),
+    );
+    expect(store.saved).toHaveLength(1);
     expect(store.zone.ttl).toBe(300);
   });
 });

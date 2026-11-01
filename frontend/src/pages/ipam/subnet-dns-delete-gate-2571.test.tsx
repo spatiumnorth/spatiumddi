@@ -85,7 +85,6 @@ function signInAs(grants: G[] | "superadmin") {
 }
 
 async function openSubnet() {
-  answers.ipamApi = { listAddresses: () => Promise.resolve([]) };
   answers.dhcpApi = { listScopesBySubnet: () => Promise.resolve([]) };
   const subnet = {
     id: "sub-1",
@@ -100,6 +99,11 @@ async function openSubnet() {
     created_at: STAMP,
     modified_at: STAMP,
   } as unknown as Subnet;
+  // Edit Subnet reads the subnet fresh on open (#3269).
+  answers.ipamApi = {
+    listAddresses: () => Promise.resolve([]),
+    getSubnet: () => Promise.resolve(subnet),
+  };
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
