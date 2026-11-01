@@ -2816,6 +2816,51 @@ def _compose_peak_and_now(peak: str, current: str) -> str:
     return f"{peak} [now: {now}]"
 
 
+def _rule_thresholds(rule: AlertRule) -> dict[str, int | float]:
+    """The numeric ``threshold_*`` knobs a rule's messages may print (#3233)."""
+    out: dict[str, int | float] = {}
+    for col in ("threshold_percent", "threshold_days"):
+        val = getattr(rule, col, None)
+        if isinstance(val, int | float) and not isinstance(val, bool):
+            out[col] = val
+    return out
+
+
+def _restate_edited_thresholds(
+    peak: str, current: str, then: dict[str, int | float], now: dict[str, int | float]
+) -> str:
+    """Rewrite the threshold in a peak message to the rule's edited one (#3233).
+
+    A threshold edit leaves the rule's open events as they are, so the peak
+    message still prints the old threshold; the composer would then show the
+    threshold, unlabelled, as the current reading. A number is restated only
+    when the peak carries the old threshold there and the current message
+    carries the new one at the same position, so a reading that merely
+    equals a threshold is never rewritten.
+    """
+    swap: dict[str, str] = {}
+    for col, old in then.items():
+        new = now.get(col)
+        if new is not None and new != old:
+            swap[f"{old}"] = f"{new}"
+            swap[f"{old}%"] = f"{new}%"
+    if not swap:
+        return peak
+    cur_skel, cur_nums = _message_numbers(current)
+    peak_skel, peak_nums = _message_numbers(peak)
+    if cur_skel != peak_skel or len(cur_nums) != len(peak_nums):
+        return peak
+    idx = iter(range(len(peak_nums)))
+
+    def sub(m: re.Match[str]) -> str:
+        i = next(idx)
+        if swap.get(peak_nums[i]) == cur_nums[i]:
+            return cur_nums[i]
+        return m.group(0)
+
+    return _NUM_RE.sub(sub, peak)
+
+
 def _severity_rank(severity: str) -> int:
     """Ordinal rank for an alert severity: ``info < warning < critical``.
 
@@ -6219,6 +6264,25 @@ async def seed_postgres_instance_alert_rule() -> None:
         await session.commit()
 
 
+def _appliance_disk_description(*, legacy: bool = False) -> str:
+    """The seeded /var rule's description; ``legacy`` is the pre-#3232 text."""
+    tail = "threshold." if legacy else f"{int(_PCT_RESOLVE_MARGIN)} points below the threshold."
+    return (
+        "Fires when an appliance's /var data partition (Postgres, "
+        "container images, logs) fills. Warning at the threshold "
+        f"({_APPLIANCE_DISK_USAGE_DEFAULT_PCT}% by default); critical at "
+        f"{_APPLIANCE_DISK_CRITICAL_PCT}% used whatever the threshold, a "
+        "few points before the kubelet's eviction line: from about 90% "
+        "used the kubelet is down to its last 5% of free space (ext4 "
+        "keeps another 5% for root) and evicts pods, the control "
+        "plane's among them. Silent on supervisors that do not report "
+        "/var; a reading that stops arriving holds an open alert rather "
+        "than resolving it. Auto-resolves "
+        + ("when usage drops below the " if legacy else "once usage is ")
+        + tail
+    )
+
+
 async def seed_appliance_disk_usage_alert_rule() -> None:
     """Seed the #2240 rule, ENABLED by default, warning at 80%.
 
@@ -6238,23 +6302,16 @@ async def seed_appliance_disk_usage_alert_rule() -> None:
             select(AlertRule).where(AlertRule.name == _APPLIANCE_DISK_RULE_NAME)
         )
         if existing is not None:
+            # #3232 — the seeded text used to promise a resolve at the
+            # threshold; refresh it only while the operator has not edited it.
+            if existing.description == _appliance_disk_description(legacy=True):
+                existing.description = _appliance_disk_description()
+                await session.commit()
             return
         session.add(
             AlertRule(
                 name=_APPLIANCE_DISK_RULE_NAME,
-                description=(
-                    "Fires when an appliance's /var data partition (Postgres, "
-                    "container images, logs) fills. Warning at the threshold "
-                    f"({_APPLIANCE_DISK_USAGE_DEFAULT_PCT}% by default); critical at "
-                    f"{_APPLIANCE_DISK_CRITICAL_PCT}% used whatever the threshold, a "
-                    "few points before the kubelet's eviction line: from about 90% "
-                    "used the kubelet is down to its last 5% of free space (ext4 "
-                    "keeps another 5% for root) and evicts pods, the control "
-                    "plane's among them. Silent on supervisors that do not report "
-                    "/var; a reading that stops arriving holds an open alert rather "
-                    "than resolving it. Auto-resolves when usage drops below the "
-                    "threshold."
-                ),
+                description=_appliance_disk_description(),
                 rule_type=RULE_TYPE_APPLIANCE_DISK_USAGE,
                 severity="warning",
                 enabled=True,
@@ -8652,6 +8709,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         existing.last_observed_value = {
                             **(existing.last_observed_value or {}),
                             "peak_message": message,
+                            "peak_thresholds": _rule_thresholds(rule),
                         }
                         ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
@@ -8675,10 +8733,24 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                         # above, by severity alone.
                         lov = existing.last_observed_value or {}
                         peak = lov.get("peak_message") or existing.message
+                        # #3233 — a threshold edit leaves the open event alone,
+                        # so restate the threshold in the peak first.
+                        peak = _restate_edited_thresholds(
+                            peak, message, lov.get("peak_thresholds") or {}, _rule_thresholds(rule)
+                        )
                         composed = _compose_peak_and_now(peak, message)
-                        if composed != existing.message or lov.get("peak_message") != peak:
+                        thresholds = _rule_thresholds(rule)
+                        if (
+                            composed != existing.message
+                            or lov.get("peak_message") != peak
+                            or lov.get("peak_thresholds") != thresholds
+                        ):
                             existing.message = composed
-                            existing.last_observed_value = {**lov, "peak_message": peak}
+                            existing.last_observed_value = {
+                                **lov,
+                                "peak_message": peak,
+                                "peak_thresholds": thresholds,
+                            }
                     continue
                 event = AlertEvent(
                     rule_id=rule.id,
@@ -8688,6 +8760,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     severity=severity_override or rule.severity,
                     message=message,
                     fired_at=now,
+                    last_observed_value={
+                        "peak_message": message,
+                        "peak_thresholds": _rule_thresholds(rule),
+                    },
                 )
                 db.add(event)
                 await db.flush()  # populate event.id for delivery payload
