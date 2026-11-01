@@ -11,6 +11,7 @@ Where the two disagree about a license, THIS file is authoritative.
 
 ── Operating system & boot (OS appliance image) ──────────────────────────
 - Linux Kernel — GPL v2 — https://kernel.org
+- Raspberry Pi Linux kernel + raspi-firmware (rpi5 appliance profile only) — GPL v2 (kernel) / Raspberry Pi license (firmware) — https://github.com/raspberrypi/linux
 - Debian — DFSG (mixed) — https://debian.org
 - Alpine Linux — MIT + GPL v2 (kernel) — https://alpinelinux.org
 - GRUB 2 — GPL v3 — https://www.gnu.org/software/grub
