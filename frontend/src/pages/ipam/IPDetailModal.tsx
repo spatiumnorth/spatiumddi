@@ -176,6 +176,7 @@ export function IPDetailModal({
   // A scan is started with write on 'manage_nmap_scans' and watched with
   // read; a role holding only write would start one it cannot see (#3279).
   const nmapPerms = usePermissions();
+  const nmapOn = useModuleOn("tools.nmap");
   const canNmap =
     nmapPerms.can("write", "manage_nmap_scans") &&
     nmapPerms.can("read", "manage_nmap_scans");
@@ -307,18 +308,20 @@ export function IPDetailModal({
               tooltip="Ask AI about this IP"
               prompt="Summarise this IP — owner, last-seen, services, vendor, and anything flagged."
             />
-            <button
-              type="button"
-              onClick={onScan}
-              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-              title="Run an nmap scan against this IP"
-              {...permissionGate(
-                canNmap,
-                "Requires write and read permission on nmap scans (read shows the result)",
-              )}
-            >
-              <Radar className="h-3.5 w-3.5" /> Scan with Nmap
-            </button>
+            {nmapOn && (
+              <button
+                type="button"
+                onClick={onScan}
+                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                title="Run an nmap scan against this IP"
+                {...permissionGate(
+                  canNmap,
+                  "Requires write and read permission on nmap scans (read shows the result)",
+                )}
+              >
+                <Radar className="h-3.5 w-3.5" /> Scan with Nmap
+              </button>
+            )}
             {addr.mac_address && (
               <div className="inline-flex items-center gap-2">
                 <button

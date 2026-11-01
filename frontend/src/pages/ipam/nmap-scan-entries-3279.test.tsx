@@ -4,7 +4,9 @@
  * The IPAM "Scan with nmap" entry points are offered only to a role that can
  * both start a scan (write on 'manage_nmap_scans') and read it back (read),
  * since the viewer the UI opens next asks read (#3279). A write-only role is
- * shown each entry disabled with the reason. Real `usePermissions`.
+ * shown each entry disabled with the reason. With the `tools.nmap` module
+ * off the server refuses every scan route, so no entry is offered at all,
+ * whatever the grants. Real `usePermissions`.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -47,6 +49,9 @@ vi.mock("@/lib/api", async () => {
   return { ...actual, ...stubs };
 });
 
+// Module ids switched off for the current case; everything else is on.
+const modulesOff = new Set<string>();
+
 vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({
     modules: [],
@@ -54,7 +59,7 @@ vi.mock("@/hooks/useFeatureModules", () => ({
     isLoading: false,
     isError: false,
     refetch: () => {},
-    enabled: () => true,
+    enabled: (id: string) => !modulesOff.has(id),
   }),
 }));
 
@@ -63,6 +68,7 @@ const { IPDetailModal } = await import("./IPDetailModal");
 
 afterEach(() => {
   cleanup();
+  modulesOff.clear();
   for (const name of Object.keys(answers)) delete answers[name];
 });
 
@@ -196,6 +202,65 @@ const ENTRIES: [string, (g: Grants) => Promise<HTMLButtonElement>][] = [
   ["IP detail Scan with Nmap", detailScanButton],
   ["Edit address Scan with Nmap", editScanButton],
 ];
+
+// Same three surfaces, asserting absence (the helpers above throw/time out
+// when the control is missing, so these query directly).
+const ABSENT: [string, (g: Grants) => Promise<boolean>][] = [
+  [
+    "subnet Tools > Scan with nmap",
+    async (g) => {
+      signInAs(g);
+      answers.ipamApi = { listAddresses: () => Promise.resolve([]) };
+      await mount(<SubnetDetail subnet={SUBNET} onSubnetEdited={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: /Tools/ }));
+      await screen.findByText("Split…");
+      return screen.queryAllByText("Scan with nmap").length === 0;
+    },
+  ],
+  [
+    "IP detail Scan with Nmap",
+    async (g) => {
+      signInAs(g);
+      await mount(
+        <IPDetailModal
+          address={ADDR}
+          canEdit={false}
+          onClose={() => {}}
+          onEdit={() => {}}
+          onScan={() => {}}
+        />,
+      );
+      return (
+        screen.queryAllByRole("button", { name: /Scan with Nmap/ }).length === 0
+      );
+    },
+  ],
+  [
+    "Edit address Scan with Nmap",
+    async (g) => {
+      signInAs(g);
+      answers.ipamApi = { getAddress: () => Promise.resolve(ADDR) };
+      answers.customFieldsApi = { list: () => Promise.resolve([]) };
+      await mount(<EditAddressModal address={ADDR} onClose={() => {}} />);
+      await screen.findByRole("button", { name: /Network/ });
+      return (
+        screen.queryAllByRole("button", { name: /Scan with Nmap/ }).length === 0
+      );
+    },
+  ],
+];
+
+describe.each(ABSENT)("%s with tools.nmap off (#3279)", (_name, absent) => {
+  it("is not offered to a role holding write and read", async () => {
+    modulesOff.add("tools.nmap");
+    expect(await absent(WRITE_READ)).toBe(true);
+  });
+
+  it("is not offered to a superadmin", async () => {
+    modulesOff.add("tools.nmap");
+    expect(await absent("superadmin")).toBe(true);
+  });
+});
 
 describe.each(ENTRIES)("%s (#3279)", (_name, entry) => {
   it("is disabled, with the reason, for a role with write but no read", async () => {

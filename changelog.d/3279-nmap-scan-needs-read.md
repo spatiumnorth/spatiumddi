@@ -9,3 +9,7 @@
   scan proposal run by such a role now says its progress cannot be shown,
   instead of polling a 403 behind a "Loading scan…" spinner. The API gates
   are unchanged.
+- **With the nmap module turned off, "Scan with nmap" is no longer offered
+  (#3279).** The server refuses every scan route then, but the subnet Tools
+  menu and the IP detail and Edit address buttons were still shown. They are
+  now hidden, whatever the role's grants.

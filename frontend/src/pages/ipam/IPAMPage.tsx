@@ -4622,6 +4622,9 @@ function ToolsMenu({
   onAskAi?: () => void;
 }) {
   const aiAvailable = useAiAvailable();
+  // #3279 — every nmap route answers "Feature 'tools.nmap' is disabled."
+  // with the module off, so the entry is not offered at all.
+  const nmapOn = useModuleOn("tools.nmap");
   const reshape = permissionGate(can.reshape, NEEDS_SUBNET_WRITE);
   return (
     <HeaderMenu
@@ -4663,13 +4666,17 @@ function ToolsMenu({
           onSelect: onResize,
           ...reshape,
         },
-        {
-          key: "scan",
-          label: "Scan with nmap",
-          icon: Radar,
-          onSelect: onScan,
-          ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
-        },
+        ...(nmapOn
+          ? [
+              {
+                key: "scan",
+                label: "Scan with nmap",
+                icon: Radar,
+                onSelect: onScan,
+                ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
+              },
+            ]
+          : []),
         {
           key: "split",
           label: "Split…",
@@ -9594,6 +9601,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const networkCount = networkRows?.length ?? 0;
   const [nmapOpen, setNmapOpen] = useState(false);
   const nmapPerms = usePermissions();
+  const nmapOn = useModuleOn("tools.nmap");
   const canNmap =
     nmapPerms.can("write", "manage_nmap_scans") &&
     nmapPerms.can("read", "manage_nmap_scans");
@@ -9626,16 +9634,18 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           Network
           <NetworkTabBadge count={networkCount} />
         </button>
-        <button
-          type="button"
-          onClick={() => setNmapOpen(true)}
-          className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-          title="Run an nmap scan against this IP"
-          {...permissionGate(canNmap, NEEDS_NMAP_WRITE)}
-        >
-          <Radar className="h-3.5 w-3.5" />
-          Scan with Nmap
-        </button>
+        {nmapOn && (
+          <button
+            type="button"
+            onClick={() => setNmapOpen(true)}
+            className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            title="Run an nmap scan against this IP"
+            {...permissionGate(canNmap, NEEDS_NMAP_WRITE)}
+          >
+            <Radar className="h-3.5 w-3.5" />
+            Scan with Nmap
+          </button>
+        )}
       </div>
       {nmapOpen && (
         <NmapScanModal
