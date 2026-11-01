@@ -408,6 +408,8 @@ export function CopilotDrawer({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // A dialog over the drawer owns this Esc (#1947).
+      // An Esc that ends an IME composition belongs to the input method.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape" && !hasOpenModal()) onClose();
     }
     window.addEventListener("keydown", onKey);
@@ -2147,6 +2149,7 @@ function PromptsPopover({
       }
     }
     function onEsc(e: KeyboardEvent) {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape") onClose();
     }
     document.addEventListener("mousedown", onDocClick);

@@ -684,7 +684,7 @@ the create dialog.
 
 Scope enforcement runs **before** RBAC: a non-empty scope set narrows the
 token, and the owning user's RBAC still applies on top, so a `read`-scoped
-token owned by an IPAM Editor can list subnets but cannot create one. A
+token owned by an IPAM Editor can list subnets but cannot create one. A scope refusal is a `403`; it is also what a `read` token gets on a POST that writes, while POST routes that only read (the DNS query and DHCP activity logs, previews) accept it. A
 per-token resource-instance binding (`resource_grants`, #374) can narrow
 further to specific `{action, resource_type, resource_id}` grants, validated
 at create time to be a subset of what the issuing user holds.

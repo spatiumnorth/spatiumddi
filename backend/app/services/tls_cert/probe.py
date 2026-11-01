@@ -49,6 +49,7 @@ from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, r
 from OpenSSL import SSL, crypto
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exc_text import describe_exc
 from app.models.tls_cert import (
     IDENTITY_FIELDS,
     STATE_EXPIRED,
@@ -421,7 +422,7 @@ def fetch_endpoint(
     except TimeoutError:
         return _failure(f"TLS handshake timed out after {timeout:.1f}s")
     except (SSL.Error, ssl.SSLError, OSError, socket.gaierror) as exc:
-        return _failure(f"TLS connection failed: {exc}")
+        return _failure(f"TLS connection failed: {describe_exc(exc)}")
 
     if not chain_ders:
         return _failure("server presented no certificate")
@@ -436,7 +437,7 @@ def fetch_endpoint(
         identity, hostname_matches = _parse_identity(leaf_der, chain_ders, sni)
     except Exception as exc:  # noqa: BLE001 — surface parse failures cleanly
         logger.warning("tls_cert_parse_failed", host=host, error=str(exc))
-        return _failure(f"failed to parse certificate: {exc}")
+        return _failure(f"failed to parse certificate: {describe_exc(exc)}")
 
     identity["chain_valid"] = chain_valid
     identity["chain_error"] = chain_error

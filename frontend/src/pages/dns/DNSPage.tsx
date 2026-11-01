@@ -133,6 +133,7 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import {
   DNS_TTL_MAX,
   fqdnError,
@@ -4061,7 +4062,7 @@ type ZoneSubtab = "records" | "pools" | "certs" | "drift";
 // is split, and each call is its own trash batch — the confirm copy says so.
 const BULK_DELETE_CHUNK = 2000;
 
-function ZoneDetailView({
+export function ZoneDetailView({
   group,
   zone,
   highlightRecordId,
@@ -5465,8 +5466,8 @@ function ZoneDetailView({
                 {bulkPermanent
                   ? "? This cannot be undone."
                   : selectedRecords.size > BULK_DELETE_CHUNK
-                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches in Admin → Trash, each restored separately.`
-                    : " to the trash? They can be restored together from Admin → Trash."}{" "}
+                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches. A superadmin can restore each batch separately from Administration → Trash.`
+                    : " to the trash? A superadmin can restore them together from Administration → Trash."}{" "}
                 IPAM-managed records are excluded automatically.
               </p>
               {isSuperadmin && (
@@ -7400,45 +7401,51 @@ export function RevealedSecretModal({
   action: "created" | "rotated";
   onClose: () => void;
 }) {
+  // #3222 — the plaintext is shown once; closing before copying it loses it.
+  const secrets = useMemo(() => [secret], [secret]);
+  const guard = useSecretCloseGuard({ onClose, secrets, noun: "secret" });
   return (
-    <Modal title="Copy this secret now" onClose={onClose}>
-      <div className="space-y-3 text-sm">
-        <p className="text-xs text-muted-foreground">
-          This is the only time the plaintext secret for{" "}
-          <code className="font-mono">{name}</code> will be shown. Copy it into
-          your <code>nsupdate</code> client / secondary-server config before
-          closing. SpatiumDDI keeps it encrypted at rest (it has to, to sign DNS
-          updates), but the UI never shows it again — rotate the key to get a
-          new one.
-        </p>
-        <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
-          <div className="mb-1 text-muted-foreground">{algorithm}</div>
-          <div className="break-all">{secret}</div>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            void navigator.clipboard.writeText(secret);
-          }}
-          className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
-        >
-          <Copy className="h-3 w-3" /> Copy secret
-        </button>
-        <p className="text-[11px] text-muted-foreground">
-          Key {action} • The new value will reach BIND9 servers on the next
-          ConfigBundle long-poll (typically within seconds).
-        </p>
-        <div className="flex justify-end pt-1">
+    <>
+      <Modal title="Copy this secret now" onClose={guard.requestClose}>
+        <div className="space-y-3 text-sm" {...guard.copyProps}>
+          <p className="text-xs text-muted-foreground">
+            This is the only time the plaintext secret for{" "}
+            <code className="font-mono">{name}</code> will be shown. Copy it
+            into your <code>nsupdate</code> client / secondary-server config
+            before closing. SpatiumDDI keeps it encrypted at rest (it has to, to
+            sign DNS updates), but the UI never shows it again — rotate the key
+            to get a new one.
+          </p>
+          <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
+            <div className="mb-1 text-muted-foreground">{algorithm}</div>
+            <div className="break-all">{secret}</div>
+          </div>
           <button
             type="button"
-            onClick={onClose}
-            className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            onClick={async () => {
+              if (await copyToClipboard(secret)) guard.markTaken();
+            }}
+            className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
           >
-            I have copied it
+            <Copy className="h-3 w-3" /> Copy secret
           </button>
+          <p className="text-[11px] text-muted-foreground">
+            Key {action} • The new value will reach BIND9 servers on the next
+            ConfigBundle long-poll (typically within seconds).
+          </p>
+          <div className="flex justify-end pt-1">
+            <button
+              type="button"
+              onClick={guard.requestClose}
+              className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              I have copied it
+            </button>
+          </div>
         </div>
-      </div>
-    </Modal>
+      </Modal>
+      {guard.confirm}
+    </>
   );
 }
 
@@ -10593,6 +10600,8 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       <button
                         className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setEditList(l)}
+                        aria-label={`Edit blocking list ${l.name}`}
+                        title="Edit blocking list"
                         {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Pencil className="h-3 w-3" />
@@ -10600,6 +10609,8 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       <button
                         className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setConfirmDelete(l)}
+                        aria-label={`Delete blocking list ${l.name}`}
+                        title="Delete blocking list"
                         {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Trash2 className="h-3 w-3" />
