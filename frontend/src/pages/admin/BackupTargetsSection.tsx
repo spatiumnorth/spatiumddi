@@ -589,10 +589,14 @@ function RestoreFromArchiveModal({
     onSuccess,
   });
 
+  // The restore's own refusals (missing member, unsupported format_version,
+  // a schema this install cannot place), read from the preview (#3287).
+  const restoreRefused = previewQ.data?.restorable === false;
   const canSubmit =
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
     !restoreMut.isPending &&
+    !restoreRefused &&
     (mode !== "selective" || (!selectiveDisabledReason && sections.length > 0));
 
   const { dialogProps, titleProps } = useModalDialog(onClose);
@@ -636,6 +640,15 @@ function RestoreFromArchiveModal({
             </>
           )}
         </div>
+        {restoreRefused && (
+          <div
+            role="alert"
+            className="mb-3 rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2 text-xs text-red-700 dark:text-red-300"
+          >
+            This archive cannot be restored:{" "}
+            {previewQ.data?.restore_refusal ?? "the restore refuses it"}
+          </div>
+        )}
         <form
           className="space-y-3"
           onSubmit={(e) => {

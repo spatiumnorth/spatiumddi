@@ -734,7 +734,7 @@ def preview_backup_archive(
     the restore preview: the manifest as :func:`read_backup_manifest` reads
     it, the dump format the restore will act on (None when the archive does
     not say), and the reason the restore would refuse the archive for a
-    missing member or an unsupported ``format_version`` (None when it would
+    missing member, an unsupported ``format_version`` or a newer schema (None when it would
     go ahead). The restore's own checks, not a parallel copy (#2949)."""
     manifest = read_backup_manifest(archive_bytes)
     try:
@@ -742,10 +742,16 @@ def preview_backup_archive(
             names = set(zf.namelist())
     except _MALFORMED_MANIFEST_ERRORS as exc:
         raise BackupArchiveError(f"archive is malformed: {exc}") from exc
+    from app.services.backup.migrations import schema_direction_error  # noqa: PLC0415
     from app.services.backup.restore import format_version_refusal  # noqa: PLC0415
 
-    refusal = archive_member_refusal(manifest, names) or format_version_refusal(
-        manifest.get("format_version")
+    # The restore's pre-destructive schema direction check (#3287), run on
+    # the manifest's head. An archive whose head is blank is left to the
+    # restore, which reads it from secrets.enc after decrypting.
+    refusal = (
+        archive_member_refusal(manifest, names)
+        or format_version_refusal(manifest.get("format_version"))
+        or schema_direction_error(manifest.get("schema_version"))
     )
     return manifest, resolve_dump_format(manifest, names), refusal
 

@@ -114,3 +114,36 @@ def test_extract_and_preview_share_the_member_rule() -> None:
     data, _, _ = CASES["no_dump"]
     with pytest.raises(BackupArchiveError, match="neither database.dump"):
         extract_archive_members(data)
+
+
+@pytest.mark.asyncio
+async def test_preview_refuses_a_schema_head_this_install_cannot_place(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3287: a head the restore would refuse as newer is not restorable."""
+    from app.services.backup.migrations import _local_head
+
+    headers = await _superadmin(db_session)
+
+    async def preview(schema_version: str | None) -> dict:
+        manifest = {**_BASE, "dump_format": "custom"}
+        if schema_version is not None:
+            manifest["schema_version"] = schema_version
+        resp = await client.post(
+            "/api/v1/backup/manifest-preview",
+            headers=headers,
+            files={"archive": ("a.zip", io.BytesIO(_zip(manifest, _GOOD)), "application/zip")},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    newer = await preview("ffffffffffff")
+    assert newer["restorable"] is False
+    assert "NEWER schema" in newer["restore_refusal"]
+    # Controls: no recorded head (read from secrets.enc by the restore) and
+    # this install's own head are both restorable.
+    blank = await preview(None)
+    assert blank["restorable"] is True and blank["restore_refusal"] is None
+    own = _local_head()
+    if own:
+        assert (await preview(own))["restorable"] is True
