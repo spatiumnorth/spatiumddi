@@ -40,6 +40,7 @@ from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
 from app.services.feature_modules import get_enabled_modules, require_module
 from app.services.logs.agent_logs import (
+    InvalidLogFilter,
     LogScopeError,
     dns_query_analytics,
     resolve_dhcp_log_servers,
@@ -597,18 +598,21 @@ async def query_dns_queries(
     except LogScopeError as exc:
         raise _scope_http_error(exc) from exc
     names = {s.id: s.name for s in servers}
-    rows = await search_dns_queries(
-        db,
-        list(names),
-        since=body.since,
-        until=body.until,
-        q=body.q,
-        qtype=body.qtype,
-        client_ip=body.client_ip,
-        view=body.view,
-        rcode=body.rcode,
-        limit=body.max_events,
-    )
+    try:
+        rows = await search_dns_queries(
+            db,
+            list(names),
+            since=body.since,
+            until=body.until,
+            q=body.q,
+            qtype=body.qtype,
+            client_ip=body.client_ip,
+            view=body.view,
+            rcode=body.rcode,
+            limit=body.max_events,
+        )
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     events = [
         DNSQueryLogRow(
             id=r.id,
@@ -777,18 +781,21 @@ async def query_dhcp_activity(
     except LogScopeError as exc:
         raise _scope_http_error(exc) from exc
     names = {s.id: s.name for s in servers}
-    rows = await search_dhcp_activity(
-        db,
-        list(names),
-        since=body.since,
-        until=body.until,
-        q=body.q,
-        severity=body.severity,
-        code=body.code,
-        mac_address=body.mac_address,
-        ip_address=body.ip_address,
-        limit=body.max_events,
-    )
+    try:
+        rows = await search_dhcp_activity(
+            db,
+            list(names),
+            since=body.since,
+            until=body.until,
+            q=body.q,
+            severity=body.severity,
+            code=body.code,
+            mac_address=body.mac_address,
+            ip_address=body.ip_address,
+            limit=body.max_events,
+        )
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     events = [
         DHCPActivityLogRow(
             id=r.id,
