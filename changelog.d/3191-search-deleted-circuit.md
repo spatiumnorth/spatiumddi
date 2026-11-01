@@ -6,6 +6,8 @@
   not contain it. Search now skips deleted circuits, as the list does. An
   overlay site's preferred circuits no longer accept a deleted circuit
   (422, as for an unknown id), and the overlay simulation no longer names
-  one as a site's primary circuit. A new test walks the search providers
+  one as a site's primary circuit, while a deleted circuit still counts when
+  it is taken down in a what-if, so a transport-class policy is not reported
+  unaffected while its site is blackholed. A new test walks the search providers
   and fails if one reads a soft-deletable table without excluding deleted
   rows.
