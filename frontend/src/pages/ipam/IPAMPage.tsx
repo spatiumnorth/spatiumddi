@@ -51,6 +51,7 @@ import {
 } from "@dnd-kit/core";
 import {
   ipamApi,
+  settingsApi,
   dnsApi,
   dhcpApi,
   customFieldsApi,
@@ -13243,9 +13244,20 @@ export function BlockTreeRow({
   // regardless of the operator's saved expand/collapse state.
   forceExpand?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  // Settings → IPAM "Default Expanded Depth" (#3290): a block opens by default
+  // only while its level (depth 0 = level 1) is within that depth. null means
+  // the operator has not toggled this row, so it keeps following the setting
+  // (which may arrive after first paint). The backend default is 2.
+  const { data: treeSettings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const defaultDepth = treeSettings?.subnet_tree_default_expanded_depth ?? 2;
+  const [expanded, setExpanded] = useState<boolean | null>(null);
   const [showAllChildren, setShowAllChildren] = useState(false);
-  const isExpanded = forceExpand || expanded;
+  const isExpanded = forceExpand || (expanded ?? depth < defaultDepth);
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
   const {
@@ -13293,7 +13305,7 @@ export function BlockTreeRow({
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  setExpanded((v) => !v);
+                  setExpanded(!isExpanded);
                 }}
                 className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
                 title={isExpanded ? "Collapse" : "Expand"}
