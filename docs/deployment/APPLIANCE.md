@@ -2485,7 +2485,8 @@ set-default / set-next-boot writes `grubenv`. All of that lands on the
 leaves the survivor booting the **old kernel from a stale menu** — a
 mirror that protected the data and lost the appliance. So
 `spatiumddi-esp-sync` is called from `spatium-install`,
-`spatium-upgrade-slot apply`, `set-next-boot` and `set-default`, and is
+`spatium-upgrade-slot apply`, `set-next-boot`, `set-default` and
+`rollback`, and from firstboot when it commits a trial boot, and is
 a no-op on a single-disk box so every caller can invoke it
 unconditionally. `spatiumddi-esp-sync --check` reports drift without
 changing anything.
@@ -2545,6 +2546,34 @@ with ARRAY lines — written from `mdadm --detail --scan` at install and
 **checked**, because a conf with no ARRAY line produces an initrd that
 cannot find root, and the install aborts there rather than at the first
 reboot.
+
+**Slot upgrades and rollbacks on a mirror (#3172).** On a mirrored box
+a slot is the md array (`/dev/md/root_a`, `/dev/md/root_b`), not the
+`root_A` / `root_B` partitions: those are its two members, and a member
+carries the array's UUID rather than the filesystem's that
+`root=UUID=` names. `spatium-upgrade-slot`, the console, firstboot's
+trial-boot commit and the supervisor's Fleet telemetry all resolve the
+booted slot through the array. Before this, every
+`spatium-upgrade-slot` subcommand on a mirror exited with
+"couldn't detect A/B slots".
+
+`apply` writes the inactive **array**, never a member. The array is
+9 MiB smaller than its 8 GiB partition (metadata 1.2 keeps its data
+offset at the start of each member), and the slot image is built for the
+bare partition, so a straight `dd` would run out of room at the end.
+The image is written through a device-mapper concatenation of the array
+and a small sparse overflow file under
+`/var/lib/spatiumddi/slot-staging`; `resize2fs` then moves whatever
+landed past the array's end back inside it, the mapping is removed, and
+`e2fsck -n` checks the result through the array alone before the
+bootloader is touched. Only the overflow is staged, a few MiB. If the
+mapping cannot be removed the apply fails and says so: it holds the
+array open, and a slot that cannot be mounted cannot be booted. The
+mapping is also torn down when the write fails or the upgrade unit is
+stopped or times out (SIGTERM). Finally, an image whose root filesystem
+carries no `mdadm` (anything built before #999 added it) is refused
+before GRUB is pointed at it: its initrd could not assemble the array,
+and the node would stop in the initramfs.
 
 ### Installing onto a multipath SAN LUN (#999 Part C3)
 
