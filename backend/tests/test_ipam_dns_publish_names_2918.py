@@ -405,3 +405,48 @@ async def test_kea_import_drops_hostname_static_form_refuses(
     by_ip = {str(x.ip_address): x.hostname for x in rows}
     assert by_ip["192.0.2.140"] == ""
     assert by_ip["192.0.2.141"] == "good-host"
+
+
+# ── #3268 — Sync DNS offers only what its Apply can write ────────────
+
+
+async def _preview(client: AsyncClient, env: Env) -> dict[str, Any]:
+    r = await client.get(
+        f"/api/v1/ipam/subnets/{env.subnet.id}/dns-sync/preview", headers=env.headers
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.mark.asyncio
+async def test_sync_preview_offers_nothing_the_commit_refuses(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    env = await _env(db_session, UNDERSCORE_ZONE, net="10.91.3.0/24")
+    db_session.add_all(
+        [
+            IPAddress(
+                subnet_id=env.subnet.id, address="10.91.3.10", status="allocated", hostname="h1"
+            ),
+            IPAddress(
+                subnet_id=env.subnet.id, address="10.91.3.1", status="allocated", hostname="gateway"
+            ),
+        ]
+    )
+    await db_session.commit()
+    data = await _preview(client, env)
+    assert data["missing"] == [], data
+    assert data["mismatched"] == [], data
+
+
+@pytest.mark.asyncio
+async def test_sync_preview_still_offers_rows_in_an_ordinary_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    env = await _env(db_session, "example.test", net="10.91.4.0/24")
+    db_session.add(
+        IPAddress(subnet_id=env.subnet.id, address="10.91.4.10", status="allocated", hostname="h1")
+    )
+    await db_session.commit()
+    data = await _preview(client, env)
+    assert [m["record_type"] for m in data["missing"]] == ["A"], data
