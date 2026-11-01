@@ -1,4 +1,12 @@
-import { Children, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Children,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -102,6 +110,7 @@ import {
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -1460,7 +1469,7 @@ export function DashboardPage() {
   };
 
   const [tab, setTab] = useState<DashboardTab>(() => {
-    const saved = localStorage.getItem("dashboard-tab");
+    const saved = safeLocalStorage.getItem("dashboard-tab");
     if (saved && _PERSISTED_TABS.has(saved as DashboardTab)) {
       return saved as DashboardTab;
     }
@@ -1468,7 +1477,7 @@ export function DashboardPage() {
   });
   function selectTab(next: DashboardTab) {
     setTab(next);
-    localStorage.setItem("dashboard-tab", next);
+    safeLocalStorage.setItem("dashboard-tab", next);
   }
 
   // If the persisted tab points at a now-hidden (module-disabled) tab,
@@ -1480,7 +1489,7 @@ export function DashboardPage() {
     // below — mounted against a module that may turn out to be off (#2130).
     if (ready && !tabVisible(tab)) {
       setTab("overview");
-      localStorage.setItem("dashboard-tab", "overview");
+      safeLocalStorage.setItem("dashboard-tab", "overview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, enabled, ready]);
@@ -2826,7 +2835,7 @@ export function DashboardPage() {
  * selecting a subset narrows every IPAM-tab card. Renders nothing when
  * fewer than two spaces exist — there's nothing to filter against.
  */
-function IpamSpaceFilter({
+export function IpamSpaceFilter({
   spaces,
   selected,
   onChange,
@@ -2837,20 +2846,16 @@ function IpamSpaceFilter({
 }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (
-        wrapperRef.current &&
-        !wrapperRef.current.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  // Esc / outside press / focus leaving close the picker (#3159).
+  const closePicker = useCallback(() => setOpen(false), []);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePicker,
+    containerRef: wrapperRef,
+    triggerRef,
+  });
 
   const sortedSpaces = useMemo(
     () => [...spaces].sort((a, b) => a.name.localeCompare(b.name)),
@@ -2873,9 +2878,12 @@ function IpamSpaceFilter({
   }
 
   return (
-    <div className="relative" ref={wrapperRef}>
+    <div className="relative" ref={wrapperRef} onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         title="Scope IPAM-tab cards to one or more IP spaces"
         className={cn(
@@ -4435,7 +4443,7 @@ function ComplianceKpi({
 //
 // The companion Compliance tab covers the static + reactive picture
 // (classification roll-up + audit-log change events).
-function ConformityPanel() {
+export function ConformityPanel() {
   const { enabled, ready } = useFeatureModules();
   const moduleEnabled = enabled("compliance.conformity");
   // Gate queries on ``ready`` so they wait for the real module state; show the
@@ -4477,6 +4485,19 @@ function ConformityPanel() {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground">
         Conformity module is disabled — enable it under Features & Integrations.
+      </div>
+    );
+  }
+
+  // A refused or failed conformity read is not "0 frameworks, nothing
+  // failing" (#3148): say so instead of drawing zeros over it.
+  if (summaryQ.isError && !summaryQ.data) {
+    return (
+      <div
+        role="alert"
+        className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={summaryQ.error} what="conformity results" />
       </div>
     );
   }
@@ -4656,6 +4677,10 @@ function ConformityPanel() {
         {failingQ.isLoading ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
             Loading…
+          </div>
+        ) : failingQ.isError ? (
+          <div className="px-4 py-6 text-center text-xs">
+            <ListReadError error={failingQ.error} what="failing results" />
           </div>
         ) : (failingQ.data ?? []).length === 0 ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">

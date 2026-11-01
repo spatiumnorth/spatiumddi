@@ -651,6 +651,26 @@ def test_bind9_validate_reads_checkconf_stdout(tmp_path: Path, monkeypatch) -> N
     assert "named.conf:20" in str(ei.value)
 
 
+def test_bind9_validate_empty_output_names_exit_status(tmp_path: Path, monkeypatch) -> None:
+    """No text on either stream must not read as a bare "no output" (#3153)."""
+    import subprocess
+
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver
+
+    (tmp_path / "rendered.new").mkdir(parents=True)
+    (tmp_path / "rendered.new" / "named.conf").write_text("options {};\n")
+    monkeypatch.setattr("spatium_dns_agent.drivers.bind9.shutil.which", lambda _: "/x")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], -9, stdout="", stderr=""),
+    )
+    with pytest.raises(RuntimeError) as ei:
+        Bind9Driver(tmp_path).validate()
+    assert "exit status -9" in str(ei.value)
+    assert "named-checkconf" in str(ei.value)
+
+
 def test_commit_is_skipped_when_previous_already_matches(tmp_path: Path) -> None:
     """``commit_config`` is called from two points in a successful poll; the
     second must not re-copy a bundle that can be tens of kilobytes."""
