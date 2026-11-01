@@ -49,7 +49,7 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 
 6. DNS agent StatefulSets:
 {{- range .Values.dnsAgents.servers }}
-     - dns-{{ .flavor | default "bind9" }}-{{ .name }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
+     - {{ include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dns-%s-%s" (.flavor | default "bind9") .name) "prefix" $.Values.dnsAgents.prefixWithFullname) }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
 {{- end }}
 {{- end }}
 
@@ -57,8 +57,16 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 
 7. DHCP agent StatefulSets:
 {{- range .Values.dhcpAgents.servers }}
-     - dhcp-{{ .flavor | default "kea" }}-{{ .name }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
+     - {{ include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dhcp-%s-%s" (.flavor | default "kea") .name) "prefix" $.Values.dhcpAgents.prefixWithFullname) }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
 {{- end }}
+{{- end }}
+
+{{- $scSet := false }}
+{{- if .Values.dnsAgents.enabled }}{{ if .Values.dnsAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dnsAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
+{{- if .Values.dhcpAgents.enabled }}{{ if .Values.dhcpAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dhcpAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
+{{- if $scSet }}
+
+Note: a storageClass on an existing agent StatefulSet cannot be updated in place (Kubernetes forbids it). On an upgrade or Argo CD sync that fails, delete the StatefulSet with --cascade=orphan and sync again; see "Adopting storageClass on an existing install" in the chart README.
 {{- end }}
 
 Docs: https://www.spatiumddi.com/

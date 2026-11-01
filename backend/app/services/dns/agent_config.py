@@ -67,6 +67,7 @@ from app.services.dns.named_conf_validation import (
     AclCycleError,
     ViewValidationError,
     bind9_refused_prefix,
+    effective_nsec3_iterations,
     is_name_reference,
     key_reference,
     order_acls_for_render,
@@ -2050,7 +2051,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             "ksk_lifetime_days": p.ksk_lifetime_days,
             "zsk_lifetime_days": p.zsk_lifetime_days,
             "nsec3": p.nsec3,
-            "nsec3_iterations": p.nsec3_iterations,
+            "nsec3_iterations": effective_nsec3_iterations(p.name, p.nsec3_iterations, logger),
             "nsec3_salt_length": p.nsec3_salt_length,
             "nsec3_optout": p.nsec3_optout,
         }

@@ -1,5 +1,7 @@
 {{- if .Values.dnsAgents.enabled }}
 {{- $root := . -}}
+{{- /* #3209 — fail on two servers rendering one object name. */ -}}
+{{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dnsAgents.image.tag | default .Chart.AppVersion -}}
 {{- $secretName := .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) -}}
 {{- if and (not .Values.dnsAgents.agentKey.existingSecret) .Values.dnsAgents.agentKey.value }}
@@ -30,7 +32,9 @@ stringData:
 {{- if and (eq $flavor "powerdns") (or $server.dotPort $server.dohPort) }}
 {{- fail (printf "dnsAgents server %q: dotPort/dohPort are not supported with flavor: powerdns — PowerDNS needs a dnsdist front for DoT/DoH, which has no Kubernetes deployment yet; remove dotPort/dohPort" $server.name) }}
 {{- end }}
-{{- $instance := printf "dns-%s-%s" $flavor $server.name -}}
+{{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
+{{- $storageClass := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 {{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
        optionally overrides repository + tag; missing keys (or the default
        bind9 case) fall back to the top-level dnsAgents.image. Same
@@ -86,19 +90,12 @@ spec:
         seccompProfile:
           type: {{ . }}
       {{- end }}
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: {{ include "spatiumddi.name" $root }}
-                    app.kubernetes.io/component: dns-agent
-                topologyKey: kubernetes.io/hostname
+      {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
       {{- /* Per-server placement. The spread above is only preferred, so
              after a node drain an agent moves and stays co-located; pin a
-             server to a node (kubernetes.io/hostname) to keep one per node. */}}
+             server to a node (kubernetes.io/hostname) to keep one per node,
+             or give the server its own ``affinity`` (#3206, merged with
+             the spread). */}}
       {{- with $server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -198,12 +195,18 @@ spec:
     - metadata: { name: agent-state }
       spec:
         accessModes: [ReadWriteOnce]
+        {{- with $storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "agentState") | default "1Gi" }}
     - metadata: { name: dns-state }
       spec:
         accessModes: [ReadWriteOnce]
+        {{- with $storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "dnsState") | default "2Gi" }}
