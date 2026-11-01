@@ -2817,9 +2817,13 @@ def _compose_peak_and_now(peak: str, current: str) -> str:
 
 
 def _rule_thresholds(rule: AlertRule) -> dict[str, int | float]:
-    """The numeric ``threshold_*`` knobs a rule's messages may print (#3233)."""
+    """The numeric knobs a rule's messages may print as a threshold (#3233).
+
+    ``min_free_addresses`` is printed as a floor by the DHCP pool and DNS
+    anomaly rules, so an edit to it is a threshold edit too.
+    """
     out: dict[str, int | float] = {}
-    for col in ("threshold_percent", "threshold_days"):
+    for col in ("threshold_percent", "threshold_days", "min_free_addresses"):
         val = getattr(rule, col, None)
         if isinstance(val, int | float) and not isinstance(val, bool):
             out[col] = val
@@ -2838,12 +2842,14 @@ def _restate_edited_thresholds(
     carries the new one at the same position, so a reading that merely
     equals a threshold is never rewritten.
     """
-    swap: dict[str, str] = {}
+    # Two knobs can share an old value and move to different new ones, so
+    # each old token maps to every new token it may have become.
+    swap: dict[str, set[str]] = {}
     for col, old in then.items():
         new = now.get(col)
         if new is not None and new != old:
-            swap[f"{old}"] = f"{new}"
-            swap[f"{old}%"] = f"{new}%"
+            swap.setdefault(f"{old}", set()).add(f"{new}")
+            swap.setdefault(f"{old}%", set()).add(f"{new}%")
     if not swap:
         return peak
     cur_skel, cur_nums = _message_numbers(current)
@@ -2854,7 +2860,7 @@ def _restate_edited_thresholds(
 
     def sub(m: re.Match[str]) -> str:
         i = next(idx)
-        if swap.get(peak_nums[i]) == cur_nums[i]:
+        if cur_nums[i] in swap.get(peak_nums[i], ()):
             return cur_nums[i]
         return m.group(0)
 
