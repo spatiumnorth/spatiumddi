@@ -5366,9 +5366,10 @@ async def _apply_approve_change_request(
     try:
         cr = await approve_change_request(db, cr_id, approver=user, request=None, note=args.note)
     except DecisionForbidden as exc:
-        # Map the self-approval / missing-permission case to the op's RBAC
-        # error so the apply endpoint returns a clean 403.
-        raise OperationPermissionError("approve", "change_request") from exc
+        # Still a 403 from the apply endpoint, but carry the orchestrator's
+        # own reason (self-approval, missing write on the target, ...): the
+        # approver usually DOES hold 'approve' on 'change_request' (#3152).
+        raise OperationPermissionError("approve", "change_request", str(exc)) from exc
     except DecisionError as exc:
         raise ValueError(str(exc)) from exc
     return {
@@ -5434,7 +5435,7 @@ async def _apply_reject_change_request(
     try:
         cr = await reject_change_request(db, cr_id, approver=user, request=None, note=args.note)
     except DecisionForbidden as exc:
-        raise OperationPermissionError("approve", "change_request") from exc
+        raise OperationPermissionError("approve", "change_request", str(exc)) from exc
     except DecisionError as exc:
         raise ValueError(str(exc)) from exc
     return {"id": str(cr.id), "operation": cr.operation, "state": cr.state}

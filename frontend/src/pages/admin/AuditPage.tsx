@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
-import { isRefused } from "@/lib/refusal";
+import { isRefused, listReadErrorMessage } from "@/lib/refusal";
 import {
   ClipboardList,
   ChevronLeft,
@@ -515,12 +515,26 @@ function ChainIntegrityBadge() {
   // Celery task checks new rows each night and the whole chain once its
   // last full pass is over 7 days old (#2286), and writes an alert event
   // on a break; the tooltip says which range this badge covered (#2297).
-  const { data } = useQuery({
+  const { data, error } = useQuery({
     queryKey: ["audit-integrity-newest-1000"],
     queryFn: () => auditApi.integrity(1000, true),
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   });
+  // A failed read is not a check still running (#3148): a refusal says it
+  // was refused, any other failure says the check could not run.
+  if (!data && error) {
+    return (
+      <span
+        className="rounded-full border bg-muted/40 px-2 py-0.5 text-xs text-muted-foreground"
+        title={listReadErrorMessage(error, "the chain integrity check")}
+      >
+        {isRefused(error)
+          ? "Integrity check not permitted"
+          : "Integrity check unavailable"}
+      </span>
+    );
+  }
   if (!data) {
     return (
       <span className="rounded-full border bg-muted/40 px-2 py-0.5 text-xs text-muted-foreground">
