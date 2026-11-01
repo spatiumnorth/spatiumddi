@@ -280,19 +280,25 @@ Called from dns-agent.yaml and dhcp-agent.yaml; ``.`` is the chart root.
 {{- if .Values.dnsAgents.enabled -}}
 {{- range .Values.dnsAgents.servers -}}
 {{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dns-%s-%s" (.flavor | default "bind9") .name) "prefix" $.Values.dnsAgents.prefixWithFullname) -}}
-{{- if hasKey $seen $n -}}
-{{- fail (printf "dnsAgents server %q renders object name %q, already used by server %q; server names must be unique" .name $n (get $seen $n)) -}}
+{{- $sname := .name -}}
+{{- range $obj := list $n (printf "%s-headless" $n) -}}
+{{- if hasKey $seen $obj -}}
+{{- fail (printf "dnsAgents server %q renders object name %q, already used by server %q; server names must be unique (each server owns <name> and <name>-headless)" $sname $obj (get $seen $obj)) -}}
 {{- end -}}
-{{- $_ := set $seen $n .name -}}
+{{- $_ := set $seen $obj $sname -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.dhcpAgents.enabled -}}
 {{- range .Values.dhcpAgents.servers -}}
 {{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dhcp-%s-%s" (.flavor | default "kea") .name) "prefix" $.Values.dhcpAgents.prefixWithFullname) -}}
-{{- if hasKey $seen $n -}}
-{{- fail (printf "dhcpAgents server %q renders object name %q, already used by server %q; server names must be unique" .name $n (get $seen $n)) -}}
+{{- $sname := .name -}}
+{{- range $obj := list $n (printf "%s-headless" $n) -}}
+{{- if hasKey $seen $obj -}}
+{{- fail (printf "dhcpAgents server %q renders object name %q, already used by server %q; server names must be unique (each server owns <name> and <name>-headless)" $sname $obj (get $seen $obj)) -}}
 {{- end -}}
-{{- $_ := set $seen $n .name -}}
+{{- $_ := set $seen $obj $sname -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

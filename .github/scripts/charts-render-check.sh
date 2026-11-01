@@ -1205,6 +1205,14 @@ neg3209() { # label expected-message [helm args...]
 echo "── negative controls: agent object names (#3209)"
 neg3209 "two servers with one name" "server names must be unique" \
     --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1"}]'
+neg3209 "servers ns1 and ns1-headless (unprefixed)" "server names must be unique" \
+    --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1-headless"}]'
+neg3209 "servers ns1 and ns1-headless (prefixed)" "server names must be unique" \
+    --set dnsAgents.prefixWithFullname=true \
+    --set-json 'dnsAgents.servers=[{"name":"ns1"},{"name":"ns1-headless"}]'
+neg3209 "DHCP servers a and a-headless" "server names must be unique" \
+    --set dhcpAgents.enabled=true --set dhcpAgents.agentKey.value=x \
+    --set-json 'dhcpAgents.servers=[{"name":"a"},{"name":"a-headless"}]'
 REL=1dev neg3209 "a prefixed name starting with a digit" "must start with a lowercase letter" \
     --set dnsAgents.prefixWithFullname=true --set-json 'dnsAgents.servers=[{"name":"ns1"}]'
 
