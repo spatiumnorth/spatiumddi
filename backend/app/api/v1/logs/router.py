@@ -38,8 +38,10 @@ from app.drivers.dns import AGENTLESS_DRIVERS as DNS_AGENTLESS
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
+from app.services.api_token_scopes import read_only_post
 from app.services.feature_modules import get_enabled_modules, require_module
 from app.services.logs.agent_logs import (
+    InvalidLogFilter,
     LogScopeError,
     dns_query_analytics,
     resolve_dhcp_log_servers,
@@ -579,6 +581,7 @@ class DNSQueryLogResponse(BaseModel):
     dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
 @honours_token_binding
+@read_only_post
 async def query_dns_queries(
     body: DNSQueryLogRequest, db: DB, current_user: CurrentUser
 ) -> DNSQueryLogResponse:
@@ -597,18 +600,21 @@ async def query_dns_queries(
     except LogScopeError as exc:
         raise _scope_http_error(exc) from exc
     names = {s.id: s.name for s in servers}
-    rows = await search_dns_queries(
-        db,
-        list(names),
-        since=body.since,
-        until=body.until,
-        q=body.q,
-        qtype=body.qtype,
-        client_ip=body.client_ip,
-        view=body.view,
-        rcode=body.rcode,
-        limit=body.max_events,
-    )
+    try:
+        rows = await search_dns_queries(
+            db,
+            list(names),
+            since=body.since,
+            until=body.until,
+            q=body.q,
+            qtype=body.qtype,
+            client_ip=body.client_ip,
+            view=body.view,
+            rcode=body.rcode,
+            limit=body.max_events,
+        )
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     events = [
         DNSQueryLogRow(
             id=r.id,
@@ -685,6 +691,7 @@ def _rows(pairs: list[tuple[str, int]]) -> list[DNSQueryAnalyticsRow]:
     response_model=DNSQueryAnalyticsResponse,
     dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
+@read_only_post
 async def query_dns_analytics(
     body: DNSQueryAnalyticsRequest, db: DB, current_user: CurrentUser
 ) -> DNSQueryAnalyticsResponse:
@@ -765,6 +772,7 @@ class DHCPActivityLogResponse(BaseModel):
     dependencies=[_AGENT_READ, Depends(require_module("core.dhcp"))],
 )
 @honours_token_binding
+@read_only_post
 async def query_dhcp_activity(
     body: DHCPActivityLogRequest, db: DB, current_user: CurrentUser
 ) -> DHCPActivityLogResponse:
@@ -777,18 +785,21 @@ async def query_dhcp_activity(
     except LogScopeError as exc:
         raise _scope_http_error(exc) from exc
     names = {s.id: s.name for s in servers}
-    rows = await search_dhcp_activity(
-        db,
-        list(names),
-        since=body.since,
-        until=body.until,
-        q=body.q,
-        severity=body.severity,
-        code=body.code,
-        mac_address=body.mac_address,
-        ip_address=body.ip_address,
-        limit=body.max_events,
-    )
+    try:
+        rows = await search_dhcp_activity(
+            db,
+            list(names),
+            since=body.since,
+            until=body.until,
+            q=body.q,
+            severity=body.severity,
+            code=body.code,
+            mac_address=body.mac_address,
+            ip_address=body.ip_address,
+            limit=body.max_events,
+        )
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     events = [
         DHCPActivityLogRow(
             id=r.id,

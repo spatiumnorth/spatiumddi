@@ -27,6 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns_rpz_hit import DNSRPZHit
+from app.services.logs.ip_filter import ip_filter_clause
 from app.services.search.ranking import like_pattern
 
 # An explicit allow, not a block. See the module docstring.
@@ -294,7 +295,7 @@ async def recent_hits(
     if not include_passthru:
         stmt = stmt.where(DNSRPZHit.policy != PASSTHRU)
     if client_ip:
-        stmt = stmt.where(DNSRPZHit.client_ip == client_ip)
+        stmt = stmt.where(ip_filter_clause(DNSRPZHit.client_ip, client_ip, field="client_ip"))
     if qname_contains:
         # Names are stored lower-cased and dot-stripped by the parser, so
         # the needle is normalised the same way rather than relying on

@@ -41,6 +41,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
 from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     SpaceRelease,
     addresses_in_space,
@@ -49,6 +50,7 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owning_integration,
     refuse_sync_into_trashed_space,
+    subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
@@ -385,18 +387,14 @@ async def _apply_blocks_and_subnets(
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
             continue
-        surviving_foreign = await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == row.id)
-            .where(IPAddress.opnsense_router_id.is_(None))
-        )
+        surviving_foreign = await subnet_has_surviving_addresses(db, row.id, "opnsense_router_id")
         if surviving_foreign:
             # Operator / other-owned addresses still depend on this
             # subnet — don't cascade-delete them. Hand the subnet back.
             row.opnsense_router_id = None
             summary.subnets_updated += 1
         else:
+            await retract_address_dns(db, subnet_ids=[row.id])
             await db.delete(row)
             summary.subnets_deleted += 1
 
@@ -564,6 +562,7 @@ async def _apply_addresses(
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.opnsense_router_id == router.id}
 
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired_map:
             # #1556 — a category whose backend REFUSED the API user
@@ -587,8 +586,12 @@ async def _apply_addresses(
                 row.opnsense_router_id = None
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, d in desired_map.items():
         # A row at this address is owned by another firewall / integration

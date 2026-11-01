@@ -95,7 +95,7 @@ describe("RequestsPage decision note (#2906)", () => {
   it("renders no empty note label when there is no note", async () => {
     rows.mockResolvedValue([req({ decision_note: null })]);
     renderPage();
-    await screen.findByText("10.9.0.0/24");
+    await screen.findByText("Create subnet");
     expect(screen.queryByTestId("decision-note")).toBeNull();
     expect(screen.queryByText("Note:")).toBeNull();
   });

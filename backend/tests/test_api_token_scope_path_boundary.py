@@ -162,7 +162,7 @@ async def test_dns_write_token_is_refused_on_dnsbl_and_dns_threat(
         json={"name": "probe", "zone_suffix": "probe.example.test"},
         headers=hdr,
     )
-    assert r.status_code == 401, r.text
+    assert r.status_code == 403, r.text
     assert "scope" in r.text.lower()
 
     r = await client.post(
@@ -170,7 +170,7 @@ async def test_dns_write_token_is_refused_on_dnsbl_and_dns_threat(
         json={"client_ip": "10.0.0.1", "reason": "probe"},
         headers=hdr,
     )
-    assert r.status_code == 401, r.text
+    assert r.status_code == 403, r.text
 
 
 @pytest.mark.asyncio

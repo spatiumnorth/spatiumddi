@@ -37,6 +37,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -68,7 +69,7 @@ function Field({
 
 // ── Subscription editor ────────────────────────────────────────────────────
 
-function SubscriptionEditor({
+export function SubscriptionEditor({
   existing,
   eventTypeVocab,
   onClose,
@@ -105,6 +106,19 @@ function SubscriptionEditor({
   // a "secret revealed" panel inside the modal so the operator can
   // copy it before the modal closes. The list query never sees it.
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
+  // #3222 — a generated secret is shown once; closing before copying it
+  // loses it, so the reveal step asks first. One the operator typed into
+  // the form is already theirs, so that one closes as before.
+  const secretValues = useMemo(
+    () => (revealedSecret ? [revealedSecret] : []),
+    [revealedSecret],
+  );
+  const secretGuard = useSecretCloseGuard({
+    onClose,
+    secrets: secretValues,
+    noun: "secret",
+    active: !!revealedSecret && revealedSecret !== secret,
+  });
 
   const parseHeaders = (): Record<string, string> | null => {
     const lines = headers
@@ -181,53 +195,61 @@ function SubscriptionEditor({
 
   if (revealedSecret) {
     return (
-      <Modal
-        onClose={onClose}
-        title="Webhook secret — copy now, this is the only chance"
-        wide
-      >
-        <div className="space-y-3">
-          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
-            <div className="mb-1 flex items-center gap-2 font-medium">
-              <AlertTriangle className="h-4 w-4" />
-              Stored encrypted at rest. The server will not display it again —
-              copy it now into your receiver's HMAC verifier.
+      <>
+        <Modal
+          onClose={secretGuard.requestClose}
+          title="Webhook secret — copy now, this is the only chance"
+          wide
+        >
+          <div className="space-y-3" {...secretGuard.copyProps}>
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
+              <div className="mb-1 flex items-center gap-2 font-medium">
+                <AlertTriangle className="h-4 w-4" />
+                Stored encrypted at rest. The server will not display it again —
+                copy it now into your receiver's HMAC verifier.
+              </div>
+              Use it as the HMAC-SHA256 key over{" "}
+              <span className="font-mono">{`<X-SpatiumDDI-Timestamp>`}</span> +{" "}
+              <span className="font-mono">"."</span> + the raw request body.
+              Compare against the{" "}
+              <span className="font-mono">{`X-SpatiumDDI-Signature`}</span>{" "}
+              header (format{" "}
+              <span className="font-mono">sha256=&lt;hex&gt;</span>).
             </div>
-            Use it as the HMAC-SHA256 key over{" "}
-            <span className="font-mono">{`<X-SpatiumDDI-Timestamp>`}</span> +{" "}
-            <span className="font-mono">"."</span> + the raw request body.
-            Compare against the{" "}
-            <span className="font-mono">{`X-SpatiumDDI-Signature`}</span> header
-            (format <span className="font-mono">sha256=&lt;hex&gt;</span>).
-          </div>
-          <div className="rounded-md border bg-muted/30 p-3">
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">
-                Secret
-              </span>
+            <div className="rounded-md border bg-muted/30 p-3">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Secret
+                </span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (await copyToClipboard(revealedSecret)) {
+                      secretGuard.markTaken();
+                    }
+                  }}
+                  className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs hover:bg-accent"
+                >
+                  <Copy className="h-3 w-3" /> Copy
+                </button>
+              </div>
+              <code className="block break-all font-mono text-sm">
+                {revealedSecret}
+              </code>
+            </div>
+            <div className="flex justify-end">
               <button
                 type="button"
-                onClick={() => copyToClipboard(revealedSecret)}
-                className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-xs hover:bg-accent"
+                onClick={secretGuard.requestClose}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
               >
-                <Copy className="h-3 w-3" /> Copy
+                Done — I've stored the secret
               </button>
             </div>
-            <code className="block break-all font-mono text-sm">
-              {revealedSecret}
-            </code>
           </div>
-          <div className="flex justify-end">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
-            >
-              Done — I've stored the secret
-            </button>
-          </div>
-        </div>
-      </Modal>
+        </Modal>
+        {secretGuard.confirm}
+      </>
     );
   }
 

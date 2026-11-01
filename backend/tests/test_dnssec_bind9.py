@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -223,3 +224,69 @@ async def test_rollover_requires_signed_zone(client: AsyncClient, db_session: As
         json={"key_tag": 12345},
     )
     assert r.status_code == 409
+
+
+async def test_nsec3_iterations_above_zero_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """BIND 9.20 refuses ``nsec3param iterations`` > 0 and rejects the whole
+    named.conf over it (#3153), so the API must not store one."""
+    token = await _admin(db_session)
+    h = {"Authorization": f"Bearer {token}"}
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": "it151", "nsec3": True, "nsec3_iterations": 151},
+    )
+    assert r.status_code == 422, r.text
+    assert "BIND 9.20" in r.text
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": "salty", "nsec3": True, "nsec3_salt_length": 256},
+    )
+    assert r.status_code == 422, r.text
+    r = await client.post(
+        "/api/v1/dns/dnssec-policies",
+        headers=h,
+        json={"name": "ok3", "nsec3": True, "nsec3_iterations": 0, "nsec3_salt_length": 8},
+    )
+    assert r.status_code == 201, r.text
+    r = await client.put(
+        f"/api/v1/dns/dnssec-policies/{r.json()['id']}",
+        headers=h,
+        json={"nsec3_iterations": 5},
+    )
+    assert r.status_code == 422, r.text
+
+
+async def test_stored_nonzero_iterations_ship_as_zero(db_session: AsyncSession) -> None:
+    """A row saved before the API refused it must not reach named (#3153).
+
+    The agent bundle ships 0, and its ETag is the one a policy stored with 0
+    gives, so the hash is taken over the clamped value and an agent that
+    applied it does not see a change that is not there.
+    """
+    from app.services.dns.agent_config import render_bundle_body
+
+    grp = await _group_with_driver(db_session, "bind9")
+    server = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == grp.id))
+    ).scalar_one()
+    pol = DNSSECPolicy(name="old151", nsec3=True, nsec3_iterations=151, nsec3_salt_length=8)
+    db_session.add(pol)
+    await db_session.flush()
+    zone = await _zone_row(db_session, grp)
+    zone.dnssec_enabled = True
+    zone.dnssec_policy_id = pol.id
+    await db_session.commit()
+
+    stored = await render_bundle_body(db_session, server)
+    shipped = [p for p in stored.body["dnssec_policies"] if p["name"] == "old151"]
+    assert [p["nsec3_iterations"] for p in shipped] == [0]
+
+    pol.nsec3_iterations = 0
+    await db_session.commit()
+    zero = await render_bundle_body(db_session, server)
+    assert zero.etag == stored.etag
+    assert zero.body["structural_etag"] == stored.body["structural_etag"]

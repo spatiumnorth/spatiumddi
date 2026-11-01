@@ -125,6 +125,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -148,6 +149,7 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.drift import zone_state_in_sync
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.name_targets import (
     absolute_target_error,
@@ -165,6 +167,8 @@ from app.services.dns.named_conf_validation import (
     validate_acl_entries,
     validate_acl_name,
     validate_address_match_list,
+    validate_nsec3_iterations,
+    validate_nsec3_salt_length,
     validate_server_option,
     validate_update_acl_entry,
     validate_view_name,
@@ -5968,26 +5972,6 @@ class ServerZoneStateResponse(BaseModel):
     in_sync: bool
 
 
-def _zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
-    """Whether a server's reported serial for ``zone`` reads as in sync.
-
-    A primary zone is in sync when the server serves our serial
-    (``last_serial``). A secondary / stub zone's serial is its primary's, not
-    ours to number, so it is never compared with ``last_serial`` (0 for a
-    secondary): a server that holds the zone is in sync. That is how BIND9
-    secondaries have always read — the BIND9 agent reports the bundle's serial,
-    0, which equals the target 0 — and it is kept for every driver that does
-    not read back what it serves. PowerDNS reports the serial it serves, so a
-    secondary there is in sync once it has transferred (a transferred zone
-    never serves 0) and not before: at 0 it holds no data and answers REFUSED
-    (#1967)."""
-    if (zone.zone_type or "primary") in ("secondary", "stub"):
-        if driver == "powerdns":
-            return current != 0
-        return current == target
-    return current == target
-
-
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/server-state",
     response_model=ServerZoneStateResponse,
@@ -6065,7 +6049,7 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if pending or not _zone_state_in_sync(zone, current, target, srv.driver):
+            if pending or not zone_state_in_sync(zone, current, target, srv.driver):
                 all_in_sync = False
 
     return ServerZoneStateResponse(
@@ -6094,8 +6078,14 @@ class ServerDriftEntry(BaseModel):
     server_id: str
     server_name: str
     driver: str
-    status: str  # "ok" | "error" | "unsupported"
+    # "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported" — see
+    # ServerDrift.
+    status: Literal["ok", "syncing", "behind", "drift", "error", "unsupported"]
     error: str | None = None
+    # Why a transferred server is "syncing" / "behind" / "drift" (#3198).
+    reason: str | None = None
+    current_serial: int | None = None
+    target_serial: int = 0
     in_sync: int
     drift_count: int
     extra_on_server: list[DriftRecordEntry]
@@ -6144,6 +6134,9 @@ async def get_zone_drift(
                 driver=s.driver,
                 status=s.status,
                 error=s.error,
+                reason=s.reason,
+                current_serial=s.current_serial,
+                target_serial=s.target_serial,
                 in_sync=s.in_sync,
                 drift_count=s.drift_count,
                 extra_on_server=[
@@ -6247,7 +6240,7 @@ async def get_server_zone_state(
         # #2042 — an unacknowledged op is drift whatever the serial says.
         in_sync = (
             current is not None
-            and _zone_state_in_sync(z, current, target, server.driver)
+            and zone_state_in_sync(z, current, target, server.driver)
             and not pending
         )
         if current is None:
@@ -7195,6 +7188,16 @@ class DNSSECPolicyCreate(BaseModel):
             raise ValueError("name must be 1-64 chars of [A-Za-z0-9_-]")
         return v
 
+    @field_validator("nsec3_iterations")
+    @classmethod
+    def _iterations(cls, v: int) -> int:
+        return validate_nsec3_iterations(v)
+
+    @field_validator("nsec3_salt_length")
+    @classmethod
+    def _salt(cls, v: int) -> int:
+        return validate_nsec3_salt_length(v)
+
 
 class DNSSECPolicyUpdate(BaseModel):
     description: str | None = None
@@ -7212,6 +7215,16 @@ class DNSSECPolicyUpdate(BaseModel):
         if v is not None and v not in DNSSEC_ALGORITHMS:
             raise ValueError(f"algorithm must be one of {sorted(DNSSEC_ALGORITHMS)}")
         return v
+
+    @field_validator("nsec3_iterations")
+    @classmethod
+    def _iterations(cls, v: int | None) -> int | None:
+        return None if v is None else validate_nsec3_iterations(v)
+
+    @field_validator("nsec3_salt_length")
+    @classmethod
+    def _salt(cls, v: int | None) -> int | None:
+        return None if v is None else validate_nsec3_salt_length(v)
 
 
 class DNSSECPolicyResponse(BaseModel):
@@ -7808,6 +7821,7 @@ class ZoneMoveCommitResponse(ZoneMovePreviewResponse):
     "/groups/{group_id}/zones/{zone_id}/move/preview",
     response_model=ZoneMovePreviewResponse,
 )
+@read_only_post
 async def move_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -10021,6 +10035,7 @@ async def _queue_import_ops(
     response_model=ImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -10733,6 +10748,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
     response_model=SheetImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

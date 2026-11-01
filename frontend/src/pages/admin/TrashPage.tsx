@@ -71,6 +71,10 @@ function ConfirmRestoreModal({
   // deleted zone's batch is a dns_record too, so the clicked row's type cannot
   // tell the two apart: the 409 carries `skip_conflicts_allowed` instead.
   const [canSkipConflicts, setCanSkipConflicts] = useState(false);
+  // Set after a restore that left rows behind (a "Restore the others" run, or
+  // a held-back record): the dialog says which and why instead of closing on a
+  // 200 that restored less than the operator asked for (#3187).
+  const [leftBehind, setLeftBehind] = useState<string[] | null>(null);
   // Set after a 409 whose clash is a parent still in the Trash (#1957): the
   // server names that parent's Trash row, so the dialog can restore it and then
   // this row in one click instead of sending the operator to find it (it may
@@ -133,9 +137,17 @@ function ConfirmRestoreModal({
   const mut = useMutation({
     mutationFn: (skipConflicts: boolean) =>
       trashApi.restore(entry.type, entry.id, { skipConflicts }),
-    onSuccess: () => {
+    onSuccess: (res) => {
       invalidate();
-      onClose();
+      const left = [...(res.skipped ?? []), ...(res.held_back ?? [])];
+      if (left.length === 0) {
+        onClose();
+        return;
+      }
+      setError(null);
+      setBlocker(null);
+      setCanSkipConflicts(false);
+      setLeftBehind(left.map((c) => `${c.display} — ${c.reason}`));
     },
     onError: showError,
   });
@@ -172,26 +184,43 @@ function ConfirmRestoreModal({
             {error}
           </p>
         )}
+        {leftBehind && (
+          <div className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-300">
+            {/* No row count: one held-back entry stands for all of a
+                subnet's records ("2 IPAM records of …"), so counting entries
+                would understate what stayed behind (#3188). */}
+            <p className="font-medium">
+              Restored, but these were left in the Trash:
+            </p>
+            <ul className="mt-1 list-disc pl-4">
+              {leftBehind.map((l) => (
+                <li key={l}>{l}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
             className="rounded-md border px-3 py-1.5 text-sm"
           >
-            Cancel
+            {leftBehind ? "Close" : "Cancel"}
           </button>
-          {blocker && (
-            <button
-              onClick={() => {
-                setError(null);
-                parentMut.mutate({ type: blocker.type, id: blocker.id });
-              }}
-              disabled={pending}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
-              title="Restore the parent from the Trash (with the rows deleted with it), then this row"
-            >
-              Restore {blocker.display} first
-            </button>
-          )}
+          {leftBehind
+            ? null
+            : blocker && (
+                <button
+                  onClick={() => {
+                    setError(null);
+                    parentMut.mutate({ type: blocker.type, id: blocker.id });
+                  }}
+                  disabled={pending}
+                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+                  title="Restore the parent from the Trash (with the rows deleted with it), then this row"
+                >
+                  Restore {blocker.display} first
+                </button>
+              )}
           {canSkipConflicts && (
             <button
               onClick={() => {
@@ -205,16 +234,18 @@ function ConfirmRestoreModal({
               Restore the others
             </button>
           )}
-          <button
-            onClick={() => {
-              setError(null);
-              mut.mutate(false);
-            }}
-            disabled={pending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {pending ? "Restoring…" : "Restore"}
-          </button>
+          {!leftBehind && (
+            <button
+              onClick={() => {
+                setError(null);
+                mut.mutate(false);
+              }}
+              disabled={pending}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {pending ? "Restoring…" : "Restore"}
+            </button>
+          )}
         </div>
       </div>
     </Modal>
@@ -235,7 +266,7 @@ function purgeScope(entry: TrashEntry): string {
     case "dhcp_scope":
       return ` Its pools and static assignments are removed with it.`;
     case "customer":
-      return ` Subnets, zones, overlays and other rows that name it are left with no customer.`;
+      return ` Subnets, zones, overlays and other rows that name it are left with no customer. A customer that a service still names cannot be purged until that service is gone.`;
     default:
       return "";
   }

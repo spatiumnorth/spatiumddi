@@ -119,3 +119,12 @@ def test_keyfile_is_ksk(tmp_path: Path) -> None:
     zsk.write_text("ex.com. IN DNSKEY 256 3 13 BBBB...\n")
     assert _keyfile_is_ksk(str(ksk)) is True
     assert _keyfile_is_ksk(str(zsk)) is False
+
+
+def test_nonzero_nsec3_iterations_render_as_zero() -> None:
+    """BIND 9.20 rejects the whole named.conf over iterations > 0 (#3153)."""
+    out = _render_dnssec_policies(
+        [{"name": "old", "nsec3": True, "nsec3_iterations": 151, "nsec3_salt_length": 8}]
+    )
+    assert "nsec3param iterations 0 optout no salt-length 8;" in out
+    assert "151" not in out

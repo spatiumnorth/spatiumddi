@@ -25,6 +25,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   authApi,
+  ipamApi,
   requestsApi,
   type ChangeRequestState,
   type ProvisioningRequest,
@@ -40,6 +41,7 @@ import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
+import { fieldWords, plainText, submitErrorWords } from "@/lib/requestWords";
 import {
   Ban,
   Check,
@@ -123,6 +125,17 @@ function StateChip({ state }: { state: ChangeRequestState }) {
   );
 }
 
+// One list for the filter and the empty state, so the empty state names a
+// state by the label the filter shows (#3252), not the API's word for it.
+const STATE_FILTERS: { value: ChangeRequestState; label: string }[] = [
+  { value: "pending", label: "Pending" },
+  { value: "executed", label: "Provisioned" },
+  { value: "rejected", label: "Rejected" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+  { value: "expired", label: "Expired" },
+];
+
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString();
@@ -141,6 +154,7 @@ type FieldSpec = {
   type: string;
   required: boolean;
   enum?: string[];
+  enumLabels?: Record<string, string>;
   // #759 — RBAC resource_type of the resource this field references
   // (server-annotated via x-resource); drives the searchable picker.
   resource?: string;
@@ -157,6 +171,7 @@ type FieldSpec = {
  * renderer.
  */
 function fieldsFrom(kind: RequestKind): FieldSpec[] {
+  const kindId = kind.kind;
   const props = kind.args_schema?.properties ?? {};
   const required = new Set(kind.args_schema?.required ?? []);
   return Object.entries(props).map(([name, raw]) => {
@@ -169,14 +184,25 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
       const concrete = anyOf.find((b) => b.type && b.type !== "null");
       if (concrete && typeof concrete.type === "string") type = concrete.type;
     }
+    // Labels and hints are the requester's words, not the schema's (#3253).
+    const words = fieldWords(
+      kindId,
+      name,
+      typeof spec.title === "string" ? spec.title : undefined,
+      typeof spec.description === "string" ? spec.description : undefined,
+    );
     return {
       name,
-      title: typeof spec.title === "string" ? spec.title : name,
-      description:
-        typeof spec.description === "string" ? spec.description : undefined,
+      title: words.label,
+      description: words.hint,
       type,
       required: required.has(name),
-      enum: Array.isArray(spec.enum) ? (spec.enum as string[]) : undefined,
+      enum: Array.isArray(spec.enum)
+        ? (spec.enum as string[])
+        : words.options
+          ? [...words.options]
+          : undefined,
+      enumLabels: words.optionLabels,
       resource:
         typeof spec["x-resource"] === "string"
           ? (spec["x-resource"] as string)
@@ -356,7 +382,13 @@ function NewRequestModal({
       void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
       onClose();
     },
-    onError: (e) => setError(errMessage(e, "Could not submit the request")),
+    onError: (e) =>
+      setError(
+        submitErrorWords(
+          e,
+          (name) => fields.find((f) => f.name === name)?.title ?? name,
+        ) ?? errMessage(e, "Could not submit the request"),
+      ),
   });
 
   return (
@@ -418,7 +450,7 @@ function NewRequestModal({
                     <option value="">—</option>
                     {f.enum.map((o) => (
                       <option key={o} value={o}>
-                        {o}
+                        {f.enumLabels?.[o] ?? o}
                       </option>
                     ))}
                   </select>
@@ -485,6 +517,32 @@ function NewRequestModal({
   );
 }
 
+/**
+ * The IPAM template a subnet request names (#3251). Approving stamps its
+ * tags, zone binding, server groups and DDNS settings on the new subnet, so
+ * the approver is shown which one before deciding. Shows the id until the
+ * name arrives, and keeps it when this user cannot read the template, so the
+ * line never waits on a lookup or reads "undefined".
+ */
+function TemplateLine({ request }: { request: ProvisioningRequest }) {
+  const raw = request.args?.template_id;
+  const id = typeof raw === "string" && raw ? raw : null;
+  const tpl = useQuery({
+    queryKey: ["ipam-template", id],
+    queryFn: () => ipamApi.getTemplate(id as string),
+    enabled: id !== null,
+    retry: false,
+    staleTime: 60_000,
+  });
+  if (!id) return null;
+  return (
+    <p data-testid="request-template" className="mt-1 text-xs">
+      <span className="font-medium">Template applied on approval:</span>{" "}
+      {tpl.data?.name || id}
+    </p>
+  );
+}
+
 // ── Decision modal (approve / reject / cancel with an optional note) ────────
 
 function DecisionModal({
@@ -499,6 +557,7 @@ function DecisionModal({
   const qc = useQueryClient();
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   const title =
     action === "approve"
@@ -514,8 +573,23 @@ function DecisionModal({
       if (action === "reject") return requestsApi.reject(request.id, n);
       return requestsApi.cancel(request.id, n);
     },
-    onSuccess: () => {
+    onSuccess: (done) => {
       void qc.invalidateQueries({ queryKey: ["provisioning-requests"] });
+      // An approval whose provisioning was refused answers 200 with the
+      // request in state "failed" (#2911). Say so here, with the reason,
+      // rather than closing as if it had worked (#3246).
+      if (action === "approve" && done.state === "failed") {
+        const reason = done.error?.trim()
+          ? plainText(done.error.trim())
+          : "no reason was recorded";
+        setError(
+          `Approved, but it could not be provisioned: ${reason}${
+            /[.!?]$/.test(reason) ? "" : "."
+          } The request is now marked failed.`,
+        );
+        setFailed(true);
+        return;
+      }
       onClose();
     },
     onError: (e) => setError(errMessage(e, `Could not ${action} the request`)),
@@ -525,10 +599,10 @@ function DecisionModal({
     <Modal title={title} onClose={onClose} wide>
       <div className="space-y-3">
         <div className="rounded border border-border bg-muted/40 p-2">
-          <p className="text-xs font-medium">{request.resource_display}</p>
-          <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-snug text-muted-foreground">
-            {request.preview_text}
-          </pre>
+          <p className="whitespace-pre-wrap break-words text-xs font-medium">
+            {plainText(request.preview_text)}
+          </p>
+          <TemplateLine request={request} />
         </div>
         {request.justification ? (
           <div>
@@ -565,11 +639,11 @@ function DecisionModal({
         ) : null}
         <div className="flex justify-end gap-2">
           <HeaderButton variant="secondary" onClick={onClose}>
-            Cancel
+            {failed ? "Close" : "Cancel"}
           </HeaderButton>
           <HeaderButton
             variant={action === "approve" ? "primary" : "destructive"}
-            disabled={mutation.isPending}
+            disabled={mutation.isPending || failed}
             onClick={() => {
               setError(null);
               mutation.mutate();
@@ -644,12 +718,11 @@ export default function RequestsPage() {
             }
           >
             <option value="">All states</option>
-            <option value="pending">Pending</option>
-            <option value="executed">Provisioned</option>
-            <option value="rejected">Rejected</option>
-            <option value="failed">Failed</option>
-            <option value="cancelled">Cancelled</option>
-            <option value="expired">Expired</option>
+            {STATE_FILTERS.map((f) => (
+              <option key={f.value} value={f.value}>
+                {f.label}
+              </option>
+            ))}
           </select>
           <HeaderButton variant="secondary" onClick={() => void list.refetch()}>
             Refresh
@@ -690,7 +763,13 @@ export default function RequestsPage() {
                   <p className="text-sm text-muted-foreground">
                     <ListEmpty error={list.error} what="requests">
                       No requests
-                      {stateFilter ? ` in state "${stateFilter}"` : ""}.
+                      {stateFilter
+                        ? ` in state "${
+                            STATE_FILTERS.find((f) => f.value === stateFilter)
+                              ?.label ?? stateFilter
+                          }"`
+                        : ""}
+                      .
                     </ListEmpty>
                   </p>
                 </td>
@@ -699,10 +778,10 @@ export default function RequestsPage() {
               rows.map((r) => (
                 <tr key={r.id} className="align-top">
                   <td className="px-3 py-2">
-                    <p className="font-medium">{r.resource_display}</p>
-                    <p className="whitespace-pre-wrap break-words text-xs text-muted-foreground">
-                      {r.preview_text}
+                    <p className="whitespace-pre-wrap break-words font-medium">
+                      {plainText(r.preview_text)}
                     </p>
+                    {canApprove ? <TemplateLine request={r} /> : null}
                     {r.justification ? (
                       <p className="mt-1 break-words text-xs italic text-muted-foreground">
                         “{r.justification}”
@@ -713,7 +792,7 @@ export default function RequestsPage() {
                         trust in a portal (#696). */}
                     {r.error ? (
                       <p className="mt-1 break-words rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-1 text-xs text-rose-600 dark:text-rose-400">
-                        {r.error}
+                        {plainText(r.error)}
                       </p>
                     ) : null}
                   </td>
