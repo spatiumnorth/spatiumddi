@@ -29,6 +29,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
+from app.services.api_token_scopes import read_only_post
 from app.services.ipam.custom_field_rules import (
     inherited_block_custom_fields,
     missing_required_custom_fields,
@@ -594,6 +595,7 @@ async def delete_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
 
 
 @router.post("/{plan_id}/validate", response_model=ValidationResult)
+@read_only_post
 async def validate_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ValidationResult:
     plan = await db.get(SubnetPlan, plan_id)
     if plan is None:
@@ -613,6 +615,7 @@ async def validate_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -
 
 
 @router.post("/validate-tree", response_model=ValidationResult)
+@read_only_post
 async def validate_unsaved_tree(
     body: SubnetPlanCreate, current_user: CurrentUser, db: DB
 ) -> ValidationResult:

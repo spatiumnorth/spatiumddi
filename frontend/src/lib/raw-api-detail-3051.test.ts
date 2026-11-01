@@ -66,6 +66,10 @@ const ALLOWED: Record<string, Entry> = {
   },
   "/src/lib/upgrade-cancel.ts": structured(),
   "/src/lib/schema-rollback.ts": structured(),
+  "/src/lib/requestWords.ts": {
+    why: "submitErrorWords reads only a 422 field-error array; anything else returns null and the caller uses formatApiError (#3253)",
+    reads: 1,
+  },
   "/src/pages/ChangePasswordPage.tsx": {
     why: "parsePasswordError handles all shapes (#1004)",
     reads: 1,

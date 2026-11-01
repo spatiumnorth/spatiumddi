@@ -1,4 +1,12 @@
-import { Children, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Children,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -102,6 +110,7 @@ import {
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
@@ -1300,11 +1309,11 @@ function SubnetDecomCard() {
 function LookingGlassHealthCard() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.looking_glass");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
     staleTime: 30_000,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: moduleOn,
   });
 
@@ -1328,9 +1337,10 @@ function LookingGlassHealthCard() {
       );
     }
     if (isError) {
+      // A refusal is said to be one, not "Failed to load" (#3149).
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load Looking Glass data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="Looking Glass data" />
         </p>
       );
     }
@@ -1459,7 +1469,7 @@ export function DashboardPage() {
   };
 
   const [tab, setTab] = useState<DashboardTab>(() => {
-    const saved = localStorage.getItem("dashboard-tab");
+    const saved = safeLocalStorage.getItem("dashboard-tab");
     if (saved && _PERSISTED_TABS.has(saved as DashboardTab)) {
       return saved as DashboardTab;
     }
@@ -1467,7 +1477,7 @@ export function DashboardPage() {
   });
   function selectTab(next: DashboardTab) {
     setTab(next);
-    localStorage.setItem("dashboard-tab", next);
+    safeLocalStorage.setItem("dashboard-tab", next);
   }
 
   // If the persisted tab points at a now-hidden (module-disabled) tab,
@@ -1479,7 +1489,7 @@ export function DashboardPage() {
     // below — mounted against a module that may turn out to be off (#2130).
     if (ready && !tabVisible(tab)) {
       setTab("overview");
-      localStorage.setItem("dashboard-tab", "overview");
+      safeLocalStorage.setItem("dashboard-tab", "overview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, enabled, ready]);
@@ -1603,13 +1613,13 @@ export function DashboardPage() {
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
     enabled: kubernetesEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: dockerHosts = [] } = useQuery<DockerHost[]>({
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
     enabled: dockerEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const { data: tailscaleTenants = [] } = useQuery<TailscaleTenant[]>({
     queryKey: ["tailscale-tenants"],
@@ -1626,49 +1636,49 @@ export function DashboardPage() {
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: opnsenseRouters = [] } = useQuery<OPNsenseRouter[]>({
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
     enabled: opnsenseEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: panosFirewalls = [] } = useQuery<PANOSFirewall[]>({
     queryKey: ["panos-firewalls"],
     queryFn: panosApi.list,
     enabled: panosEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: fortinetFirewalls = [] } = useQuery<FortinetFirewall[]>({
     queryKey: ["fortinet-firewalls"],
     queryFn: fortinetApi.list,
     enabled: fortinetEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: merakiOrgs = [] } = useQuery<MerakiOrg[]>({
     queryKey: ["meraki-orgs"],
     queryFn: merakiApi.list,
     enabled: merakiEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: cloudEndpoints = [] } = useQuery<CloudEndpoint[]>({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
     enabled: cloudEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const { data: unifiControllers = [] } = useQuery<UnifiController[]>({
     queryKey: ["unifi-controllers"],
     queryFn: unifiApi.listControllers,
     enabled: unifiEnabled,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   // Platform health — covers api / postgres / redis / celery workers /
@@ -2892,7 +2902,7 @@ export function DashboardPage() {
  * selecting a subset narrows every IPAM-tab card. Renders nothing when
  * fewer than two spaces exist — there's nothing to filter against.
  */
-function IpamSpaceFilter({
+export function IpamSpaceFilter({
   spaces,
   selected,
   onChange,
@@ -2903,20 +2913,16 @@ function IpamSpaceFilter({
 }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (
-        wrapperRef.current &&
-        !wrapperRef.current.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  // Esc / outside press / focus leaving close the picker (#3159).
+  const closePicker = useCallback(() => setOpen(false), []);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePicker,
+    containerRef: wrapperRef,
+    triggerRef,
+  });
 
   const sortedSpaces = useMemo(
     () => [...spaces].sort((a, b) => a.name.localeCompare(b.name)),
@@ -2939,9 +2945,12 @@ function IpamSpaceFilter({
   }
 
   return (
-    <div className="relative" ref={wrapperRef}>
+    <div className="relative" ref={wrapperRef} onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         title="Scope IPAM-tab cards to one or more IP spaces"
         className={cn(
@@ -4522,7 +4531,7 @@ function ComplianceKpi({
 //
 // The companion Compliance tab covers the static + reactive picture
 // (classification roll-up + audit-log change events).
-function ConformityPanel() {
+export function ConformityPanel() {
   const { enabled, ready } = useFeatureModules();
   const moduleEnabled = enabled("compliance.conformity");
   // Gate queries on ``ready`` so they wait for the real module state; show the
@@ -4533,13 +4542,13 @@ function ConformityPanel() {
   const summaryQ = useQuery<ConformitySummary>({
     queryKey: ["conformity-summary"],
     queryFn: () => conformityApi.summary(),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     enabled: moduleOn,
   });
   const failingQ = useQuery<ConformityResult[]>({
     queryKey: ["conformity-results", "fail-recent"],
     queryFn: () => conformityApi.listResults({ status: "fail", limit: 20 }),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
     enabled: moduleOn,
   });
 
@@ -4564,6 +4573,19 @@ function ConformityPanel() {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground">
         Conformity module is disabled — enable it under Features & Integrations.
+      </div>
+    );
+  }
+
+  // A refused or failed conformity read is not "0 frameworks, nothing
+  // failing" (#3148): say so instead of drawing zeros over it.
+  if (summaryQ.isError && !summaryQ.data) {
+    return (
+      <div
+        role="alert"
+        className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground"
+      >
+        <ListReadError error={summaryQ.error} what="conformity results" />
       </div>
     );
   }
@@ -4743,6 +4765,10 @@ function ConformityPanel() {
         {failingQ.isLoading ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
             Loading…
+          </div>
+        ) : failingQ.isError ? (
+          <div className="px-4 py-6 text-center text-xs">
+            <ListReadError error={failingQ.error} what="failing results" />
           </div>
         ) : (failingQ.data ?? []).length === 0 ? (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
@@ -5091,17 +5117,19 @@ function NetworkKpi({
 // Overview tab (the legacy one is per-target chips, this one is the
 // rollup-driven tab body).
 function IntegrationsDashboardTabPanel() {
-  const { data, isLoading, isError } = useQuery<IntegrationsDashboardSummary>({
-    queryKey: ["dashboards", "integrations"],
-    queryFn: () => dashboardsApi.integrationsSummary(),
-    refetchInterval: 30_000,
-  });
+  const { data, isLoading, isError, error } =
+    useQuery<IntegrationsDashboardSummary>({
+      queryKey: ["dashboards", "integrations"],
+      queryFn: () => dashboardsApi.integrationsSummary(),
+      refetchInterval: pollUnlessRefused(30_000),
+    });
 
+  // A refusal says so; any other failure says the read failed, never that
+  // the role may lack access (#3149).
   if (isError) {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
-        Integration health is unavailable. Your role may not include read access
-        to any integration.
+        <ListReadError error={error} what="integration health" />
       </div>
     );
   }
