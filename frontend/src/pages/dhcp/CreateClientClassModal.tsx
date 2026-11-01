@@ -145,7 +145,11 @@ function ClientClassModalForm({
           <h3 className="text-sm font-semibold mb-2">Options</h3>
           <DHCPOptionsEditor value={options} onChange={setOptions} />
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>
