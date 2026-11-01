@@ -130,6 +130,10 @@ def slot_cli(tmp_path, monkeypatch):
     # Never read the machine's real ESP: on a CI runner /boot/efi/grub can
     # exist and be unreadable to the test user (EACCES).
     monkeypatch.setattr(module, "GRUBENV", tmp_path / "grubenv")
+    # #3169 — a slot switch re-copies the target slot's baked images first
+    # (mounts the slot under /run, copies ~1 GB). These tests are about the
+    # ESP commit, not that copy (test_upgrade_slot_image_copy.py covers it).
+    monkeypatch.setattr(module, "_recopy_slot_images_for_switch", lambda target: None)
     return module
 
 
@@ -312,7 +316,7 @@ def applying(slot_cli, monkeypatch, tmp_path):
     monkeypatch.setattr(slot_cli, "_ACTIVE_RELEASE_FILE", tmp_path / "no-release")
     monkeypatch.setattr(slot_cli, "_ACTIVE_ROOT", tmp_path / "no-root")
     monkeypatch.setattr(slot_cli, "_refresh_baked_images",
-                        lambda dev: slot_cli.mounted.append(("refresh", dev)))
+                        lambda dev, **kw: slot_cli.mounted.append(("refresh", dev)))
     slot_cli.mounted = []
 
     def probe(slot):
