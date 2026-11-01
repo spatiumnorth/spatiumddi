@@ -67,7 +67,7 @@ class SecretFieldError(Exception):
     """
 
 
-def _secret_field_names(driver: BackupDestination) -> set[str]:
+def secret_field_names(driver: BackupDestination) -> set[str]:
     # ``config_field_specs`` rather than ``config_fields``: a notice is
     # prose, never a value, and must not participate in secret handling
     # or the PATCH merge (#989 review).
@@ -80,7 +80,7 @@ def encrypt_config_secrets(driver: BackupDestination, config: dict[str, Any]) ->
     untouched. Empty/missing secret values are left as-is so an
     operator submitting "" effectively clears the secret.
     """
-    secrets = _secret_field_names(driver)
+    secrets = secret_field_names(driver)
     out: dict[str, Any] = dict(config)
     for name in secrets:
         value = out.get(name)
@@ -99,7 +99,7 @@ def decrypt_config_secrets(driver: BackupDestination, config: dict[str, Any]) ->
     with secret fields decrypted; raises :class:`SecretFieldError`
     if any wrapped value can't be decrypted.
     """
-    secrets = _secret_field_names(driver)
+    secrets = secret_field_names(driver)
     out: dict[str, Any] = dict(config)
     for name in secrets:
         value = out.get(name)
@@ -125,7 +125,7 @@ def redact_config_secrets(driver: BackupDestination, config: dict[str, Any]) -> 
     by :data:`REDACTED_SENTINEL` if they're set, or empty string
     otherwise. Use on every list / get response.
     """
-    secrets = _secret_field_names(driver)
+    secrets = secret_field_names(driver)
     out: dict[str, Any] = dict(config)
     for name in secrets:
         value = out.get(name)
@@ -146,16 +146,20 @@ def merge_config_for_update(
     encrypted value". Operators editing a target's name without
     re-typing the access key are the canonical case.
 
-    An empty value cannot clear a secret, so a stored secret is taken
-    away by moving the destination to another auth mode (#3289): a new
-    value for one of the driver's ``secret_alternatives`` drops the
-    secrets of the others, and a new value for two is refused.
+    An empty string keeps the secret, because it is what the console's
+    Edit sends for a secret field left blank. A stored secret is taken
+    away (#3289) by an explicit ``null`` for that field, or by moving the
+    destination to another auth mode: a new value for one of the
+    driver's ``secret_alternatives`` drops the secrets of the others, and
+    a new value for two is refused.
     """
-    secrets = _secret_field_names(driver)
+    secrets = secret_field_names(driver)
     merged: dict[str, Any] = dict(existing)
     for key, value in incoming.items():
         if key in secrets:
-            if _is_new_secret_value(value):
+            if value is None:
+                merged.pop(key, None)
+            elif _is_new_secret_value(value):
                 merged[key] = value
             # else: drop the field from the merge so the existing
             # encrypted value carries over from ``merged = dict(existing)``.

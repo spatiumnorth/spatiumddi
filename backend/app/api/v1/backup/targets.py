@@ -62,6 +62,7 @@ from app.services.backup.targets import (
     merge_config_for_update,
     redact_config_secrets,
     safe_filename,
+    secret_field_names,
 )
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
@@ -520,13 +521,20 @@ async def update_target(
     )
     row.write_only = new_write_only
 
-    if "config" in payload:
+    # The secret fields this edit takes away (#3289), by name, for the
+    # audit row: which credential went is worth recording, its value is not.
+    secrets_cleared: list[str] = []
+    # ``config`` is NOT NULL: an explicit null leaves it as stored (#3288)
+    # rather than reaching the merge, which needs a dict.
+    if payload.get("config") is not None:
         # PATCH semantics for secret fields: an operator who only
         # changes the bucket name shouldn't have to retype the
         # secret access key. ``merge_config_for_update`` keeps the
         # existing encrypted value when the incoming payload omits
-        # the secret (or sends the redaction sentinel). Validation
-        # runs on the merged dict so shape checks see all fields.
+        # the secret (or sends "" or the redaction sentinel); an explicit
+        # null, or a move to the driver's other auth mode, takes it away
+        # (#3289). Validation runs on the merged dict so shape checks see
+        # all fields.
         try:
             merged = merge_config_for_update(
                 driver, incoming=payload["config"], existing=row.config
@@ -546,6 +554,11 @@ async def update_target(
         # Re-encrypt — fields carried over are already wrapped
         # (the helper detects the prefix and skips them); newly
         # supplied secrets get wrapped fresh.
+        secrets_cleared = sorted(
+            name
+            for name in secret_field_names(driver)
+            if row.config.get(name) and not merged.get(name)
+        )
         row.config = encrypt_config_secrets(driver, merged)
         attributes.flag_modified(row, "config")
 
@@ -619,6 +632,7 @@ async def update_target(
                     if "config" in payload
                     else {}
                 ),
+                **({"config_secrets_cleared": secrets_cleared} if secrets_cleared else {}),
             },
         )
     )

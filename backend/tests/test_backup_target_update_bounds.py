@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.backup import BackupTarget
 from app.services.backup.targets import get_destination
@@ -175,3 +179,102 @@ def test_https_put_auth_none_drops_the_stored_credential():
         existing={"url": "https://h/x", "auth": "bearer", "credential": _enc("tok")},
     )
     assert kept["credential"].startswith(ENC_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_update_null_config_leaves_it_unchanged(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _headers(db_session)
+    t = await _target(db_session, "local_volume", {"path": "/x"})
+    res = await client.patch(
+        f"/api/v1/backup/targets/{t.id}", json={"config": None}, headers=headers
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["config"]["path"] == "/x"
+
+
+@pytest.mark.asyncio
+async def test_null_clears_a_secret_and_empty_string_keeps_it(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """``""`` is what the console sends for a secret left blank, so it must
+    keep the stored value; an explicit null is the API's way to clear one
+    (#3289). SCP's key passphrase has no other mode to move to."""
+    headers = await _headers(db_session)
+    base = {
+        "host": "h",
+        "username": "u",
+        "remote_path": "/b",
+        "host_key_check": "insecure_skip",
+    }
+    t = await _target(
+        db_session,
+        "scp",
+        {**base, "private_key": _enc("PEM"), "private_key_passphrase": _enc("PASSPHRASE-OLD")},
+    )
+    url = f"/api/v1/backup/targets/{t.id}"
+    kept = await client.patch(
+        url,
+        json={"config": {**base, "private_key": "", "private_key_passphrase": ""}},
+        headers=headers,
+    )
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["config"]["private_key_passphrase"] == REDACTED_SENTINEL
+    assert kept.json()["config"]["private_key"] == REDACTED_SENTINEL
+
+    cleared = await client.patch(
+        url, json={"config": {**base, "private_key_passphrase": None}}, headers=headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["config"]["private_key_passphrase"] == ""
+    assert cleared.json()["config"]["private_key"] == REDACTED_SENTINEL
+    await db_session.refresh(t)
+    assert not t.config.get("private_key_passphrase")
+
+    # Clearing the only credential is refused, and nothing is stored.
+    refused = await client.patch(url, json={"config": {"private_key": None}}, headers=headers)
+    assert refused.status_code == 422, refused.text
+    await db_session.refresh(t)
+    assert t.config["private_key"].startswith(ENC_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_audit_row_names_the_cleared_secret_never_its_value(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _headers(db_session)
+    t = await _target(
+        db_session,
+        "azure_blob",
+        {"container": "c", "connection_string": _enc("CONNSTR-OLD-VALUE")},
+    )
+    res = await client.patch(
+        f"/api/v1/backup/targets/{t.id}",
+        json={
+            "config": {
+                "container": "c",
+                "account_name": "acct",
+                "account_key": "ACCOUNTKEY-NEW-VALUE",
+                "connection_string": "",
+            }
+        },
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    row = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.resource_type == "backup_target", AuditLog.action == "update")
+                .order_by(AuditLog.seq.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert row is not None
+    assert row.new_value["config_secrets_cleared"] == ["connection_string"]
+    blob = json.dumps(row.new_value)
+    assert "CONNSTR-OLD-VALUE" not in blob and "ACCOUNTKEY-NEW-VALUE" not in blob
+    assert ENC_PREFIX not in blob

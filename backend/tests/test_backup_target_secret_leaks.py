@@ -67,14 +67,18 @@ async def test_patch_config_secrets_never_reach_the_audit_row(
     monkeypatch.setattr(type(driver), "validate_config", lambda self, c: None)
     monkeypatch.setattr(type(driver), "validate_config_network", lambda self, c: _ok())
 
-    # An update names ONE auth mode (#3289), so skip the alternatives the
-    # driver offers beyond its first.
-    other_modes = {n for alt in driver.secret_alternatives[1:] for n in alt}
-    secret_names = [
-        f.name for f in config_field_specs(driver) if f.secret and f.name not in other_modes
-    ]
-    new_config = {n: f"NEWSECRET-{kind}-{n}" for n in secret_names}
-    new_config["url"] = SIGNED  # a non-secret-flagged field that can still be a credential
+    # An update names ONE auth mode (#3289), so send one PATCH per mode:
+    # every secret field the driver declares is still sent once.
+    all_secrets = [f.name for f in config_field_specs(driver) if f.secret]
+    alt_names = {n for alt in driver.secret_alternatives for n in alt}
+    common = [n for n in all_secrets if n not in alt_names]
+    modes = [list(alt) for alt in driver.secret_alternatives] or [[]]
+    configs = []
+    for mode in modes:
+        cfg = {n: f"NEWSECRET-{kind}-{n}" for n in [*common, *mode]}
+        cfg["url"] = SIGNED  # a non-secret-flagged field that can still be a credential
+        configs.append(cfg)
+    assert {n for cfg in configs for n in cfg} >= set(all_secrets)
 
     headers = await _superadmin(db_session)
     target = BackupTarget(
@@ -89,28 +93,31 @@ async def test_patch_config_secrets_never_reach_the_audit_row(
     db_session.add(target)
     await db_session.flush()
 
-    res = await client.patch(
-        f"/api/v1/backup/targets/{target.id}", json={"config": new_config}, headers=headers
-    )
-    assert res.status_code == 200, res.text
+    for new_config in configs:
+        res = await client.patch(
+            f"/api/v1/backup/targets/{target.id}", json={"config": new_config}, headers=headers
+        )
+        assert res.status_code == 200, res.text
 
     rows = (
         (
             await db_session.execute(
-                select(AuditLog).where(
-                    AuditLog.resource_type == "backup_target", AuditLog.action == "update"
-                )
+                select(AuditLog)
+                .where(AuditLog.resource_type == "backup_target", AuditLog.action == "update")
+                .order_by(AuditLog.seq)
             )
         )
         .scalars()
         .all()
     )
-    assert rows
+    assert len(rows) == len(configs)
     blob = json.dumps([r.new_value for r in rows])
-    for value in new_config.values():
-        assert value not in blob
+    for cfg in configs:
+        for value in cfg.values():
+            assert value not in blob
     assert "SIGSECRET" not in blob and "NEWSECRET" not in blob
-    assert set(rows[-1].new_value["config_keys_changed"]) == set(new_config)
+    for row, cfg in zip(rows, configs, strict=True):
+        assert set(row.new_value["config_keys_changed"]) == set(cfg)
 
 
 def _patch_client(monkeypatch, mod, cls, handler):
