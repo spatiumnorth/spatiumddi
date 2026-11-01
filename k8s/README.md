@@ -380,7 +380,13 @@ helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
 ```
 
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
-The chart renders a StatefulSet + LoadBalancer Service per entry.
+The chart renders a StatefulSet + Service per entry. The Service is
+`ClusterIP` unless you set `service.type` (#3229). The stock manifests
+in `k8s/dns/` and `k8s/dhcp/` still use `type: LoadBalancer`. On k3s with
+its bundled servicelb, a LoadBalancer on UDP/53 or UDP/67 binds that
+host port on every node and captures the node's own resolver, so image
+pulls fail. Use MetalLB (with `--disable servicelb`) or another
+load balancer for those Services, not servicelb.
 Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
 `ghcr.io/spatiumnorth/dns-powerdns` / `ghcr.io/spatiumnorth/dns-technitium`
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
