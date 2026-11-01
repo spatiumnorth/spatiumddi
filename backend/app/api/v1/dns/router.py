@@ -165,6 +165,8 @@ from app.services.dns.named_conf_validation import (
     validate_acl_entries,
     validate_acl_name,
     validate_address_match_list,
+    validate_nsec3_iterations,
+    validate_nsec3_salt_length,
     validate_server_option,
     validate_update_acl_entry,
     validate_view_name,
@@ -7195,6 +7197,16 @@ class DNSSECPolicyCreate(BaseModel):
             raise ValueError("name must be 1-64 chars of [A-Za-z0-9_-]")
         return v
 
+    @field_validator("nsec3_iterations")
+    @classmethod
+    def _iterations(cls, v: int) -> int:
+        return validate_nsec3_iterations(v)
+
+    @field_validator("nsec3_salt_length")
+    @classmethod
+    def _salt(cls, v: int) -> int:
+        return validate_nsec3_salt_length(v)
+
 
 class DNSSECPolicyUpdate(BaseModel):
     description: str | None = None
@@ -7212,6 +7224,16 @@ class DNSSECPolicyUpdate(BaseModel):
         if v is not None and v not in DNSSEC_ALGORITHMS:
             raise ValueError(f"algorithm must be one of {sorted(DNSSEC_ALGORITHMS)}")
         return v
+
+    @field_validator("nsec3_iterations")
+    @classmethod
+    def _iterations(cls, v: int | None) -> int | None:
+        return None if v is None else validate_nsec3_iterations(v)
+
+    @field_validator("nsec3_salt_length")
+    @classmethod
+    def _salt(cls, v: int | None) -> int | None:
+        return None if v is None else validate_nsec3_salt_length(v)
 
 
 class DNSSECPolicyResponse(BaseModel):
