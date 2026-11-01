@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import re
 import uuid
 from datetime import UTC, datetime
@@ -13,7 +14,6 @@ from sqlalchemy import select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-import app.models  # noqa: F401  (registers every mapper)
 from app.core.security import create_access_token, hash_password
 from app.db import _get_soft_delete_models
 from app.models.auth import User
@@ -22,6 +22,10 @@ from app.models.circuit import Circuit
 from app.models.ownership import Provider, Site
 from app.services.search.providers import PROVIDERS
 from app.services.search.schemas import shape_of
+
+# Import for side effect: registers every mapper. importlib keeps it from
+# binding an unused ``app`` name in this module.
+importlib.import_module("app.models")
 
 pytestmark = pytest.mark.asyncio
 
