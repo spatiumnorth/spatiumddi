@@ -191,6 +191,44 @@ describe("Delete IP Address lists every record the delete retracts (#3210)", () 
   });
 });
 
+describe("a cleared hostname leaves no name in the dialogs (#3210)", () => {
+  it("names only the IP when the row still holds an old fqdn", () => {
+    show({ hostname: null, fqdn: "old.corp.example.com", dns_record_id: "r1" });
+    expect(flat(screen.getByText(/What should happen to/))).toBe(
+      "What should happen to 192.168.0.22?",
+    );
+    expect(screen.queryByText(/old\.corp\.example\.com/)).toBeNull();
+    expect(screen.queryByText(/DNS records:/)).toBeNull();
+  });
+
+  it("the purge confirmation names only the IP too", () => {
+    const src = readFileSync(join(__dirname, "IPAMPage.tsx"), "utf8");
+    expect(src).toMatch(/return a\.hostname \? a\.fqdn \|\| a\.hostname : "";/);
+  });
+});
+
+describe("a refused aliases read keeps the host's own records (#3210)", () => {
+  it("lists the A and PTR lines and still carries the permission note", async () => {
+    listAliases.mockRejectedValue({ response: { status: 403, data: {} } });
+    show({
+      hostname: "printer-3",
+      fqdn: "printer-3.corp.example.com",
+      dns_record_id: "r1",
+      reverse_zone_id: "z-rev",
+      alias_count: 1,
+    });
+    await waitFor(() =>
+      expect(screen.getAllByText(/don't have permission to see/)).toHaveLength(
+        2,
+      ),
+    );
+    expect(screen.getAllByText("printer-3.corp.example.com A")).toHaveLength(2);
+    expect(screen.getAllByText("22.0.168.192.in-addr.arpa PTR")).toHaveLength(
+      2,
+    );
+  });
+});
+
 describe("Permanently Delete names the host (#3210)", () => {
   it("names the FQDN in the orphan purge confirmation", () => {
     const src = readFileSync(join(__dirname, "IPAMPage.tsx"), "utf8");

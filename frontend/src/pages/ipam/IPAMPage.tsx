@@ -11421,7 +11421,7 @@ export function BulkDeleteAddressesModal({
         {named.length > 0 && (
           <ul className="space-y-0.5 text-xs" aria-label="Selected addresses">
             {named.map((a) => {
-              const h = a.fqdn || a.hostname;
+              const h = rowHost(a);
               return (
                 <li key={a.id}>
                   <span className="font-mono">{a.address}</span>
@@ -11645,6 +11645,15 @@ function ConfirmDeleteModal({
 
 const RECORDS_SHOWN = 5;
 
+/** The name a row answers to. A cleared hostname leaves `fqdn` behind on
+ *  older rows, so without a hostname the row has no name (#3210). */
+function rowHost(a: {
+  hostname?: string | null;
+  fqdn?: string | null;
+}): string {
+  return a.hostname ? a.fqdn || a.hostname : "";
+}
+
 /** "192.168.0.22 (printer-3.corp.example.com)", or the bare IP when the row
  *  carries no name — how a delete confirmation names the address (#3210). */
 function addressWithHost(a: {
@@ -11652,7 +11661,7 @@ function addressWithHost(a: {
   hostname?: string | null;
   fqdn?: string | null;
 }): string {
-  const host = a.fqdn || a.hostname;
+  const host = rowHost(a);
   return host ? `${a.address} (${host})` : a.address;
 }
 
@@ -11673,37 +11682,38 @@ function RecordsNote({
   error: unknown;
 }) {
   if (loading) return null;
-  if (error) {
-    return (
-      <p className="mt-1 text-xs text-muted-foreground">
-        <ListReadError error={error} what="this address's DNS aliases" /> Its
-        records may still be removed with it.
-      </p>
-    );
-  }
-  if (records.length === 0) return null;
+  const refused = error ? (
+    <p className="mt-1 text-xs text-muted-foreground">
+      <ListReadError error={error} what="this address's DNS aliases" /> Its
+      records may still be removed with it.
+    </p>
+  ) : null;
+  if (records.length === 0) return refused;
   const shown = records.slice(0, RECORDS_SHOWN);
   const more = records.length - shown.length;
   return (
-    <p className="mt-1 text-xs">
-      <span className="text-muted-foreground">DNS records: </span>
-      {shown.map((r, i) => (
-        <span key={r}>
-          {i > 0 && ", "}
-          <code className="break-all">{r}</code>
-        </span>
-      ))}
-      {more > 0 && (
-        <span className="text-muted-foreground"> and {more} more</span>
-      )}
-      {extraZones > 0 && (
-        <span className="text-muted-foreground">
-          {" "}
-          (the host record also in {extraZones} additional zone
-          {extraZones === 1 ? "" : "s"})
-        </span>
-      )}
-    </p>
+    <>
+      <p className="mt-1 text-xs">
+        <span className="text-muted-foreground">DNS records: </span>
+        {shown.map((r, i) => (
+          <span key={r}>
+            {i > 0 && ", "}
+            <code className="break-all">{r}</code>
+          </span>
+        ))}
+        {more > 0 && (
+          <span className="text-muted-foreground"> and {more} more</span>
+        )}
+        {extraZones > 0 && (
+          <span className="text-muted-foreground">
+            {" "}
+            (the host record also in {extraZones} additional zone
+            {extraZones === 1 ? "" : "s"})
+          </span>
+        )}
+      </p>
+      {refused}
+    </>
   );
 }
 
@@ -11729,7 +11739,7 @@ export function DeleteOrOrphanModal({
   // #3210 — name the host and the records the consequence touches. The
   // primary record is known from the row; aliases need a read, which may
   // fail or be refused without the dialog losing its choices.
-  const host = address.fqdn || address.hostname || "";
+  const host = rowHost(address);
   const hasAliases = address.alias_count !== 0;
   const aliasesQ = useQuery({
     queryKey: ["address-aliases", address.id],
