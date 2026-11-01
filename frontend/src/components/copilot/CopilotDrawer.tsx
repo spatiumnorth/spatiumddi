@@ -21,12 +21,14 @@ import {
   X,
 } from "lucide-react";
 import { copyToClipboard } from "@/lib/clipboard";
+import { usePermissions } from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
 } from "@/lib/approvalQueue";
 import {
   aiApi,
+  formatApiError,
   nmapApi,
   streamChatTurn,
   type AIChatMessage,
@@ -1542,12 +1544,19 @@ function ToolCard({ message }: { message: AIChatMessage }) {
  *  the per-host list when present.
  */
 function NmapScanLiveResult({ scanId }: { scanId: string }) {
+  // Running the scan proposal takes write on 'manage_nmap_scans', reading it
+  // back takes read: a role holding only write is told so rather than
+  // polling a 403 behind a spinner that never ends (#3279).
+  const perms = usePermissions();
+  const canRead = perms.can("read", "manage_nmap_scans");
   const scanQ = useQuery({
     queryKey: ["nmap-scan", scanId],
     queryFn: () => nmapApi.getScan(scanId),
-    // Poll until terminal state lands. ``refetchInterval`` returns
-    // false once we're done so React Query stops the timer.
+    enabled: canRead,
+    // Poll until terminal state lands, or the read fails. ``refetchInterval``
+    // returns false once we're done so React Query stops the timer.
     refetchInterval: (q) => {
+      if (q.state.status === "error") return false;
       const s = (q.state.data as NmapScanRead | undefined)?.status;
       if (s && ["completed", "failed", "cancelled"].includes(s)) return false;
       return 2000;
@@ -1556,6 +1565,18 @@ function NmapScanLiveResult({ scanId }: { scanId: string }) {
   });
 
   const scan = scanQ.data;
+  if (!scan && !perms.isLoading && (!canRead || scanQ.isError)) {
+    return (
+      <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-[11px] text-destructive">
+        {!canRead
+          ? "The scan started, but you don't have permission to see its progress (read on nmap scans)."
+          : formatApiError(
+              scanQ.error,
+              "The scan started, but its progress could not be read",
+            )}
+      </div>
+    );
+  }
   if (!scan) {
     return (
       <div className="mt-2 flex items-center gap-2 rounded border bg-background/40 px-2 py-1.5 text-[11px] text-muted-foreground">

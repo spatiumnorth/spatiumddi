@@ -173,6 +173,12 @@ export function IPDetailModal({
   // while core.dns is off (the stored values are untouched).
   const dnsOn = useModuleOn("core.dns");
   const zoneNames = zoneNameById ?? {};
+  // A scan is started with write on 'manage_nmap_scans' and watched with
+  // read; a role holding only write would start one it cannot see (#3279).
+  const nmapPerms = usePermissions();
+  const canNmap =
+    nmapPerms.can("write", "manage_nmap_scans") &&
+    nmapPerms.can("read", "manage_nmap_scans");
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
   // Fire-and-forget: no data changes, so no query invalidation; we just
@@ -304,8 +310,12 @@ export function IPDetailModal({
             <button
               type="button"
               onClick={onScan}
-              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent"
+              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               title="Run an nmap scan against this IP"
+              {...permissionGate(
+                canNmap,
+                "Requires write and read permission on nmap scans (read shows the result)",
+              )}
             >
               <Radar className="h-3.5 w-3.5" /> Scan with Nmap
             </button>
