@@ -75,6 +75,7 @@ from app.models.av import (
 from app.models.ipam import IPSpace
 from app.models.multicast import MulticastGroup
 from app.models.vlans import VLAN
+from app.services.api_token_scopes import read_only_post
 from app.services.av.ranges import (
     AllocationConflictReport,
     check_allocation_conflict,
@@ -744,6 +745,7 @@ async def delete_flow(group_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
 
 
 @router.post("/allocation-preview", response_model=AVAllocationPreviewResponse)
+@read_only_post
 async def allocation_preview(
     body: AVAllocationPreviewRequest, db: DB, _: CurrentUser
 ) -> AVAllocationPreviewResponse:

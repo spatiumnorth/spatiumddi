@@ -72,6 +72,7 @@ from app.services.ai.operations_risky import (
     DeleteSpaceArgs,
     DeleteSubnetArgs,
 )
+from app.services.api_token_scopes import read_only_post
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.agent_wake_targets import dhcp_group_channels_for_subnets
 from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
@@ -5851,6 +5852,7 @@ class PlanAllocationResponse(BaseModel):
 
 
 @router.post("/blocks/{block_id}/plan-allocation", response_model=PlanAllocationResponse)
+@read_only_post
 async def plan_block_allocation(
     block_id: uuid.UUID,
     body: PlanAllocationRequest,
@@ -7955,6 +7957,7 @@ class BlockResizeCommitResponse(BaseModel):
     "/subnets/{subnet_id}/resize/preview",
     response_model=SubnetResizePreviewResponse,
 )
+@read_only_post
 async def resize_subnet_preview(
     subnet_id: uuid.UUID,
     body: SubnetResizePreviewRequest,
@@ -8073,6 +8076,7 @@ async def resize_subnet_commit(
     "/blocks/{block_id}/resize/preview",
     response_model=BlockResizePreviewResponse,
 )
+@read_only_post
 async def resize_block_preview(
     block_id: uuid.UUID,
     body: BlockResizePreviewRequest,
@@ -8208,6 +8212,7 @@ class BlockMoveCommitResponse(BaseModel):
     "/blocks/{block_id}/move/preview",
     response_model=BlockMovePreviewResponse,
 )
+@read_only_post
 async def move_block_preview(
     block_id: uuid.UUID,
     body: BlockMovePreviewRequest,
@@ -8370,6 +8375,7 @@ class FindFreeResponse(BaseModel):
     "/spaces/{space_id}/find-free",
     response_model=FindFreeResponse,
 )
+@read_only_post
 async def find_free_space_in_space(
     space_id: uuid.UUID,
     body: FindFreeRequest,
@@ -8468,6 +8474,7 @@ class SplitSubnetCommitResponse(BaseModel):
     "/subnets/{subnet_id}/split/preview",
     response_model=SplitSubnetPreviewResponse,
 )
+@read_only_post
 async def split_subnet_preview(
     subnet_id: uuid.UUID,
     body: SplitSubnetPreviewRequest,
@@ -8596,6 +8603,7 @@ class MergeSubnetCommitResponse(BaseModel):
     "/subnets/{subnet_id}/merge/preview",
     response_model=MergeSubnetPreviewResponse,
 )
+@read_only_post
 async def merge_subnet_preview(
     subnet_id: uuid.UUID,
     body: MergeSubnetPreviewRequest,
@@ -11402,6 +11410,7 @@ async def _build_bulk_allocate_candidates(
     "/subnets/{subnet_id}/bulk-allocate/preview",
     response_model=BulkAllocatePreviewResponse,
 )
+@read_only_post
 async def bulk_allocate_preview(
     subnet_id: uuid.UUID,
     body: BulkAllocateRequest,

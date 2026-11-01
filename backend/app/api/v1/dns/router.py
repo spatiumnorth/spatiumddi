@@ -125,6 +125,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -7820,6 +7821,7 @@ class ZoneMoveCommitResponse(ZoneMovePreviewResponse):
     "/groups/{group_id}/zones/{zone_id}/move/preview",
     response_model=ZoneMovePreviewResponse,
 )
+@read_only_post
 async def move_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -10033,6 +10035,7 @@ async def _queue_import_ops(
     response_model=ImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -10745,6 +10748,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
     response_model=SheetImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
