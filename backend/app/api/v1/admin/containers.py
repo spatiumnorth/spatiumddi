@@ -24,6 +24,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app.api.deps import SuperAdmin
+from app.core.exc_text import describe_http_exc
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -158,7 +159,7 @@ async def container_stats(
             logger.warning("container_stats_list_failed", error=str(exc))
             return ContainerStatsResponse(
                 available=False,
-                hint=f"Couldn't list containers via {DOCKER_SOCKET}: {exc}",
+                hint=f"Couldn't list containers via {DOCKER_SOCKET}: {describe_http_exc(exc)}",
             )
 
         rows: list[ContainerStat] = []
