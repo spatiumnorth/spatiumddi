@@ -310,7 +310,15 @@ export function NetworkToolsPage() {
 
         {/* Right form + result */}
         <div className="flex-1 overflow-auto p-6">
-          <div className="mx-auto max-w-3xl">
+          {/* The forms also run on Enter in a field, not only from the
+              disabled Run button, so a refused user's Enter is dropped
+              here before it reaches them (#3254). */}
+          <div
+            className="mx-auto max-w-3xl"
+            onKeyDownCapture={(e) => {
+              if (denied && e.key === "Enter") e.stopPropagation();
+            }}
+          >
             <ToolPanel key={active} tool={tool} target={target} />
           </div>
         </div>

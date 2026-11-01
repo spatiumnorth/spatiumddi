@@ -24,6 +24,16 @@ export function isRefused(err: unknown): boolean {
   return apiErrorStatus(err) === 403;
 }
 
+/** The server's own words for a failed call, or "" when it gave none. Only
+ *  a `detail` counts: without one, formatApiError falls back to axios's
+ *  "Request failed with status code N", the status code these messages
+ *  exist to replace. */
+function serverReason(err: unknown): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } } | null)
+    ?.response?.data?.detail;
+  return detail == null ? "" : formatApiError(err, "");
+}
+
 /**
  * The sentence a page shows in place of a list it could not read, never its
  * empty state. `what` names what the list holds, as the reader would say it
@@ -36,9 +46,7 @@ export function isRefused(err: unknown): boolean {
  */
 export function listReadErrorMessage(err: unknown, what: string): string {
   if (isRefused(err)) {
-    const detail = (err as { response?: { data?: { detail?: unknown } } })
-      .response?.data?.detail;
-    const reason = detail == null ? "" : formatApiError(err, "");
+    const reason = serverReason(err);
     const shown = reason && reason !== "Forbidden" ? ` (${reason})` : "";
     return `You don't have permission to see ${what}${shown}.`;
   }
@@ -65,7 +73,7 @@ export function pollUnlessRefused(
  * "Request failed with status code N".
  */
 export function exportErrorMessage(err: unknown, what: string): string {
-  const reason = formatApiError(err, "");
+  const reason = serverReason(err);
   if (isRefused(err)) {
     const shown = reason && reason !== "Forbidden" ? ` (${reason})` : "";
     return `You're not permitted to export ${what}${shown}.`;

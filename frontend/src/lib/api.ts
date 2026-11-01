@@ -188,16 +188,31 @@ export const api = createClient();
 /** A file download is requested with `responseType: "blob"`, so a refusal's
  *  JSON body also arrives as a Blob and `response.data.detail` is unreadable
  *  (#3255). Decode it in place and re-throw the same error, so the status and
- *  `formatApiError` both still work for the caller. */
+ *  `formatApiError` both still work for the caller. A JSON body keeps its
+ *  `detail`; a short plain-text body becomes the detail; an empty body, a
+ *  proxy's HTML error page or one that cannot be read leaves no detail, so
+ *  the caller says what it would say for a bodiless error rather than show
+ *  raw bytes. Decoding never throws: the caller always gets `err` back. */
 export async function rethrowBlobError(err: unknown): Promise<never> {
   const res = (err as { response?: { data?: unknown } } | null)?.response;
   if (res && res.data instanceof Blob) {
-    const text = await res.data.text();
-    let detail: unknown = text || undefined;
+    let detail: unknown = undefined;
     try {
-      detail = JSON.parse(text)?.detail ?? detail;
+      const text = (await res.data.text()).trim();
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "detail" in parsed) {
+          detail = (parsed as { detail?: unknown }).detail ?? undefined;
+        }
+      } catch {
+        // Not JSON: a short plain-text reason is still worth showing, a
+        // proxy's HTML error page is not.
+        if (text && text.length <= 300 && !text.startsWith("<")) {
+          detail = text;
+        }
+      }
     } catch {
-      // body wasn't JSON: keep the raw text
+      // The body could not be read at all; re-throw without a detail.
     }
     res.data = detail === undefined ? undefined : { detail };
   }
@@ -2434,9 +2449,11 @@ export const ipamIoApi = {
     format: "csv" | "json" | "xlsx";
     include_addresses?: boolean;
   }) => {
-    const res = await api.get(ipamIoApi.exportUrl(params), {
-      responseType: "blob",
-    });
+    const res = await api
+      .get(ipamIoApi.exportUrl(params), {
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     // UTC YYYYMMDD-HHMMSS matches the backend's export filename convention
@@ -6846,6 +6863,7 @@ export const dnsApi = {
         params: { format },
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -6862,6 +6880,7 @@ export const dnsApi = {
         params: { format },
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -6937,6 +6956,7 @@ export const dnsApi = {
         params: viewId ? { view_id: viewId } : {},
         responseType: "blob",
       })
+      .catch(rethrowBlobError)
       .then((r) => ({
         data: r.data,
         filename: _parseContentDispositionFilename(
@@ -19805,6 +19825,7 @@ export const supportBundleApi = {
         },
         { responseType: "blob" },
       )
+      .catch(rethrowBlobError)
       .then((r) => r.data as Blob),
   decodeMap: () =>
     api
