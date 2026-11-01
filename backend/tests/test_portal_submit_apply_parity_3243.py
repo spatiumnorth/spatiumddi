@@ -181,6 +181,7 @@ async def test_subnet_request_with_bad_template_refused(
     base = {"block_id": block, "prefix_len": 28, "name": "x"}
     bad = await _submit(client, tok, "subnet", {**base, "template_id": "not-a-uuid"})
     assert bad.status_code == 422, bad.text
+    assert "template_id" not in bad.text  # plain words, not the field name (#3253)
     gone = await _submit(client, tok, "subnet", {**base, "template_id": str(uuid.uuid4())})
     assert gone.status_code == 404, gone.text
     assert await _rows(db_session) == 0

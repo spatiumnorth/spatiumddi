@@ -2132,7 +2132,8 @@ async def _validate_submit_allocate_subnet(
         template_id = UUID(args.template_id) if args.template_id else None
     except ValueError as exc:
         raise HTTPException(
-            status_code=422, detail=f"template_id {args.template_id!r} is not a valid UUID"
+            status_code=422,
+            detail=f"The IPAM template must be given by its id; {args.template_id!r} is not one.",
         ) from exc
     body = SubnetAllocate(
         prefix_len=args.prefix_len,
@@ -2143,7 +2144,7 @@ async def _validate_submit_allocate_subnet(
     if template_id is not None:
         template = await db.get(IPAMTemplate, template_id)
         if template is None:
-            raise HTTPException(status_code=404, detail="Template not found")
+            raise HTTPException(status_code=404, detail="No IPAM template has that id.")
         try:
             apply_template_on_create_subnet(template, body)
         except TemplateError as exc:
@@ -2152,7 +2153,8 @@ async def _validate_submit_allocate_subnet(
             raise HTTPException(
                 status_code=exc.status_code,
                 detail=(
-                    f"Template {template_id} applies to {template.applies_to!r}, " "not 'subnet'."
+                    f"The IPAM template {template_id} is for {template.applies_to}s, "
+                    "not subnets."
                 ),
             ) from exc
     await enforce_required_custom_fields(
