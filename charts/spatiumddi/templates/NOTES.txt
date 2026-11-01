@@ -45,11 +45,31 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
      kubectl -n {{ .Release.Namespace }} get secret {{ .Release.Name }}-postgresql -o jsonpath='{.data.password}' | base64 -d
 {{- end }}
 
+{{- if or .Values.dnsAgents.enabled .Values.dhcpAgents.enabled }}
+
+   Agent Services (#3229): DNS / DHCP agent Services default to ClusterIP,
+   which is reachable inside the cluster only. Service type per server:
+{{- if .Values.dnsAgents.enabled }}
+{{- range .Values.dnsAgents.servers }}
+     - dns-{{ .flavor | default "bind9" }}-{{ .name }}: {{ (get (.service | default dict) "type") | default "ClusterIP" }}
+{{- end }}
+{{- end }}
+{{- if .Values.dhcpAgents.enabled }}
+{{- range .Values.dhcpAgents.servers }}
+     - dhcp-{{ .flavor | default "kea" }}-{{ .name }}: {{ (get (.service | default dict) "type") | default "ClusterIP" }}{{ if .hostNetwork }} (hostNetwork){{ end }}
+{{- end }}
+{{- end }}
+   To serve clients on :53 / :67 set servers[].service.type to LoadBalancer
+   (needs MetalLB or a cloud LB; k3s's bundled servicelb binds hostPort 53
+   on every node and breaks the node's own resolver, so disable it first)
+   or NodePort. See "Exposing DNS and DHCP to clients" in the chart README.
+{{- end }}
+
 {{- if .Values.dnsAgents.enabled }}
 
 6. DNS agent StatefulSets:
 {{- range .Values.dnsAgents.servers }}
-     - dns-{{ .flavor | default "bind9" }}-{{ .name }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
+     - {{ include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dns-%s-%s" (.flavor | default "bind9") .name) "prefix" $.Values.dnsAgents.prefixWithFullname) }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
 {{- end }}
 {{- end }}
 
@@ -57,8 +77,16 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 
 7. DHCP agent StatefulSets:
 {{- range .Values.dhcpAgents.servers }}
-     - dhcp-{{ .flavor | default "kea" }}-{{ .name }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
+     - {{ include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dhcp-%s-%s" (.flavor | default "kea") .name) "prefix" $.Values.dhcpAgents.prefixWithFullname) }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
 {{- end }}
+{{- end }}
+
+{{- $scSet := false }}
+{{- if .Values.dnsAgents.enabled }}{{ if .Values.dnsAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dnsAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
+{{- if .Values.dhcpAgents.enabled }}{{ if .Values.dhcpAgents.storageClass }}{{ $scSet = true }}{{ end }}{{ range .Values.dhcpAgents.servers }}{{ if .storageClass }}{{ $scSet = true }}{{ end }}{{ end }}{{ end }}
+{{- if $scSet }}
+
+Note: a storageClass on an existing agent StatefulSet cannot be updated in place (Kubernetes forbids it). On an upgrade or Argo CD sync that fails, delete the StatefulSet with --cascade=orphan and sync again; see "Adopting storageClass on an existing install" in the chart README.
 {{- end }}
 
 Docs: https://www.spatiumddi.com/

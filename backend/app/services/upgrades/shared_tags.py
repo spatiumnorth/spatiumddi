@@ -63,6 +63,20 @@ exactly the state the hold protects. A new run's Start takes it over, and
 the cluster reports one version, for a roll the operator finished node by
 node instead.
 
+With no run at all, a cluster upgraded node by node from Fleet ("Schedule OS
+upgrade", then each node's reboot) has nodes on two versions just the same,
+and the first node to boot the new slot wrote the appliance chart with its
+own tag: the agents of every node still on the old slot went to
+ErrImageNeverPull until each of them was upgraded too (#3136). So while the
+members report different installed versions, :func:`heartbeat_hold` holds
+every one of them, each on the version it runs (no member writes that chart,
+and it stays on the tag every node runs); and a member Fleet has scheduled
+onto a version it does not run yet hears of the hold before its reboot,
+because a fresh boot can apply the chart before its first heartbeat's reply.
+Nothing is stored: the hold ends with the first heartbeat after every member
+reports one version. The bootstrap and control charts are not pinned on this
+path; the seed's own boot moves them, which is why the seed goes last.
+
 Everything here is a no-op off k3s (no ServiceAccount) and for a run of
 fewer than two nodes, which has no mixed-version window.
 """
@@ -82,6 +96,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import is_installed_target
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.system_upgrade import SystemUpgradeRun
 from app.services.appliance import k8s
@@ -634,12 +649,15 @@ async def heartbeat_hold(db: AsyncSession, hostname: str | None) -> dict[str, st
     the cluster writes its own chart, which nothing shares. The supervisor
     compares ``target_version`` with its host's installed version, the
     value the per-node health gate reads, and a node already on it writes
-    nothing to the shared chart until the hold ends."""
+    nothing to the shared chart until the hold ends.
+
+    With no run holding, the members' own versions decide
+    (:func:`_version_hold`, #3136)."""
     if not hostname:
         return None
     run = await _newest_hold_run(db)
     if run is None:
-        return None
+        return await _version_hold(db, hostname)
     record = record_of(run)
     if record.get("released_at"):
         return None
@@ -650,6 +668,60 @@ async def heartbeat_hold(db: AsyncSession, hostname: str | None) -> dict[str, st
         "run_id": str(run.id),
         "from_tag": str(record.get("from_tag") or ""),
         "target_version": str(record.get("to_tag") or ""),
+    }
+
+
+async def _version_hold(db: AsyncSession, hostname: str) -> dict[str, str] | None:
+    """The hold outside a Rolling Upgrade: a cluster upgraded node by node (#3136).
+
+    The supervisor's rule is the run's: a node already on ``target_version``
+    writes nothing to the shared role chart. So the hold names, for each node:
+
+    * the version Fleet has scheduled it onto, while it does not run that yet.
+      It stops nothing before the reboot, and it is kept on the host, so the
+      first pass on the new slot (the watchdog's comes before the first
+      heartbeat's reply) already defers;
+    * otherwise, while the members report different installed versions, the
+      version the node runs: no member writes the chart, and it stays on the
+      tag every node is running.
+
+    Versions are compared as the strings the nodes report (one build, one
+    string), as :func:`release_lingering_hold` does: a re-apply of the same
+    bytes under another goal label (ddi-pg's node-by-node roll) is never held
+    back, because no node runs the label. ``run_id`` is empty: no run holds.
+    A single node, or a name that matches no single member row, is not held."""
+    rows = (
+        await db.execute(
+            select(
+                Appliance.hostname,
+                Appliance.installed_appliance_version,
+                Appliance.desired_appliance_version,
+            ).where(
+                Appliance.state == APPLIANCE_STATE_APPROVED,
+                Appliance.cluster_role.in_(("primary", "member")),
+            )
+        )
+    ).all()
+    if len(rows) < 2:
+        return None
+    node = k8s_node_name(hostname)
+    mine = [
+        (installed, desired) for name, installed, desired in rows if k8s_node_name(name) == node
+    ]
+    if len(mine) != 1:
+        return None
+    installed, desired = mine[0]
+    versions = {version for _name, version, _desired in rows if version}
+    if desired and not is_installed_target(installed, desired):
+        target = str(desired)
+    elif installed and len(versions) > 1:
+        target = str(installed)
+    else:
+        return None
+    return {
+        "run_id": "",
+        "from_tag": ", ".join(sorted(v for v in versions if v != target)),
+        "target_version": target,
     }
 
 
