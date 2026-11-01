@@ -526,9 +526,8 @@ def _describe_address_warnings(warnings: list[dict[str, Any]], subnet: Subnet) -
                 f"MAC {w.get('mac_address')} is already recorded on another address in this IP space"
             )
         elif kind == "ptr_collision":
-            parts.append(
-                f"the reverse zone {w.get('zone')} already holds a PTR at {w.get('ptr_name')}"
-            )
+            # Not the reverse zone's name: the requester may not read it.
+            parts.append("the reverse DNS name for this address already holds a PTR record")
         elif kind == "dynamic_pool":
             parts.append(
                 f"{w.get('address')} is inside the DHCP dynamic pool "
@@ -548,33 +547,28 @@ def _describe_address_warnings(warnings: list[dict[str, Any]], subnet: Subnet) -
 
 
 async def _static_dhcp_scope_error(
-    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs, *, user: User | None = None
 ) -> str | None:
-    """Why a ``static_dhcp`` request cannot get its DHCP reservation, else None (#3250).
+    """Why a ``static_dhcp`` request would get no DHCP reservation, else None (#3250).
 
     The reservation is made by the same sync a manual create calls, which makes
-    none (and only warns) when no scope, or more than one, serves the subnet.
-    A request must not end provisioned with no reservation, so say so up front.
+    none (and only warns) when no scope, or more than one, serves the subnet,
+    when the reservation conflicts, or when the acting user may not write
+    reservations. A request must not end provisioned with no reservation, so
+    submit (``user=None``: the requester is not the one who provisions) and
+    apply (``user`` = the approver) refuse up front.
     """
     if args.status != "static_dhcp":
         return None
-    from app.services.dhcp.static_ipam import candidate_scopes_for_ipam_row  # noqa: PLC0415
+    from app.services.dhcp.static_ipam import new_reservation_refusal  # noqa: PLC0415
 
-    probe = IPAddress(subnet_id=subnet.id, address=args.address)
-    scopes = await candidate_scopes_for_ipam_row(db, probe)
-    if not scopes:
-        return (
-            f"No DHCP scope serves {args.address}, so no DHCP reservation can be made for "
-            "a static_dhcp address. Create a scope for the subnet, or request the address "
-            "with another status."
-        )
-    if len(scopes) > 1:
-        return (
-            f"{len(scopes)} DHCP scopes serve subnet {subnet.network}, so the reservation "
-            "for a static_dhcp address cannot be placed. Ask an operator to make this "
-            "allocation by hand."
-        )
-    return None
+    probe = IPAddress(
+        subnet_id=subnet.id,
+        address=args.address,
+        status=args.status,
+        mac_address=args.mac_address,
+    )
+    return await new_reservation_refusal(db, probe, user=user)
 
 
 async def _address_request_refusal(
@@ -705,7 +699,7 @@ async def _apply_create_ip_address(
 
     # #3250 — a static_dhcp request that can get no reservation fails here,
     # before anything is written, rather than ending provisioned without one.
-    reason = await _static_dhcp_scope_error(db, subnet, args)
+    reason = await _static_dhcp_scope_error(db, subnet, args, user=user)
     if reason is not None:
         raise ValueError(reason)
 
@@ -752,9 +746,10 @@ async def _apply_create_ip_address(
             "status": args.status,
             "hostname": args.hostname,
         }
-        # A ``static_dhcp`` row whose reservation could not be created (an
-        # ambiguous scope, or no ``dhcp_static`` write) carries the reason;
-        # keep it on the executed request / proposal instead of dropping it.
+        # The pre-flight above refuses every case the sync would decline
+        # (#3250), but ``create_address`` commits, so a reservation lost to a
+        # DHCP-side change in between cannot be rolled back here: keep the
+        # sync's reason on the executed request / proposal instead.
         warning = getattr(created, "dhcp_static_warning", None)
         if warning:
             named["dhcp_static_warning"] = warning
@@ -787,6 +782,11 @@ async def _apply_create_ip_address(
     # otherwise), and the subnet / block utilisation counters.
     await _record_mac_history(db, row.id, args.mac_address)
     dhcp_sync = await sync_static_for_ipam_row(db, row, user=user)
+    if args.status == "static_dhcp" and dhcp_sync.warning:
+        # #3250 — the pre-flight passed but the sync still made no
+        # reservation (a DHCP-side change in between). Nothing is committed
+        # yet, so fail: the caller rolls the address back with it.
+        raise ValueError(dhcp_sync.warning)
 
     # Audit the apply path so the audit log captures the outcome (the
     # propose step doesn't audit — proposals can be discarded). The
@@ -2147,7 +2147,14 @@ async def _validate_submit_allocate_subnet(
         try:
             apply_template_on_create_subnet(template, body)
         except TemplateError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            # The allocate's words name the template; the requester may hold
+            # no read on templates, so say what is wrong without the name.
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=(
+                    f"Template {template_id} applies to {template.applies_to!r}, " "not 'subnet'."
+                ),
+            ) from exc
     await enforce_required_custom_fields(
         db,
         "subnet",

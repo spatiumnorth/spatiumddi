@@ -362,3 +362,121 @@ async def test_static_dhcp_without_a_scope_refused_at_submit_and_apply(
         )
         == 0
     )
+
+
+# ── #3250, the rest of the sync's refusals ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_static_dhcp_with_a_clashing_mac_refused_at_submit(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A MAC the scope's group already reserves: the sync would make no
+    reservation, so submit says so and names no other address."""
+    from app.models.dhcp import DHCPStaticAssignment
+
+    tok = await _requester(db_session)
+    scope, subnet, _ = await _estate(db_session)
+    db_session.add(
+        DHCPStaticAssignment(
+            scope_id=scope.id, ip_address="10.60.0.77", mac_address="02:00:5e:20:11:05"
+        )
+    )
+    await db_session.flush()
+    resp = await _submit(
+        client,
+        tok,
+        "ip_address",
+        {
+            "subnet_id": str(subnet.id),
+            "address": "10.60.0.31",
+            "status": "static_dhcp",
+            "mac_address": "02:00:5e:20:11:05",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert "already" in resp.text
+    assert "10.60.0.77" not in resp.text
+    assert await _rows(db_session) == 0
+
+
+@pytest.mark.asyncio
+async def test_approver_without_dhcp_static_write_fails_the_request_and_records_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Approved by someone who may not write reservations: the request ends
+    failed with the reason, and no address is left behind (atomic), instead of
+    "executed" with only ``result.dhcp_static_warning``."""
+    from app.models.dhcp import DHCPStaticAssignment
+    from tests.test_self_service_requests import _auth
+
+    tok = await _requester(db_session)
+    _, subnet, _ = await _estate(db_session)
+    subnet_id = subnet.id  # the approval's commit / rollback expires ``subnet``
+    _, appr = await _user(
+        db_session,
+        name="appr",
+        permissions=[
+            {"action": "approve", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "change_request"},
+            {"action": "write", "resource_type": "subnet"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "write", "resource_type": "ip_address"},
+            {"action": "read", "resource_type": "ip_address"},
+        ],
+    )
+    for host in (None, "host-s"):
+        last = "32" if host is None else "33"
+        args = {
+            "subnet_id": str(subnet_id),
+            "address": f"10.60.0.{last}",
+            "status": "static_dhcp",
+            "mac_address": f"02:00:5e:20:11:{last}",
+        }
+        if host:
+            args["hostname"] = host
+        sub = await _submit(client, tok, "ip_address", args)
+        assert sub.status_code == 201, sub.text
+        resp = await client.post(
+            f"/api/v1/requests/{sub.json()['id']}/approve",
+            headers=_auth(appr),
+            json={"decision_note": "ok"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "failed", body
+        assert "dhcp_static" in (body.get("error") or ""), body
+    assert (
+        await db_session.scalar(
+            select(func.count()).select_from(IPAddress).where(IPAddress.subnet_id == subnet_id)
+        )
+        == 0
+    )
+    assert await db_session.scalar(select(func.count()).select_from(DHCPStaticAssignment)) == 0
+
+
+@pytest.mark.asyncio
+async def test_hostless_static_dhcp_apply_rolls_back_when_the_sync_declines(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-flight passed but the sync made no reservation (a DHCP-side
+    change in between): the no-hostname apply raises before it commits."""
+    from app.services.ai import operations
+    from app.services.dhcp import static_ipam
+
+    _, subnet, _ = await _estate(db_session)
+    admin, _ = await _user(db_session, name="adm", superadmin=True)
+
+    async def _declines(db: AsyncSession, row: IPAddress, **_: object) -> object:
+        return static_ipam.IPAMStaticSync(warning="raced: no reservation was created")
+
+    monkeypatch.setattr(static_ipam, "sync_static_for_ipam_row", _declines)
+    op = operations.get_operation("create_ip_address")
+    args = op.args_model(
+        subnet_id=str(subnet.id),
+        address="10.60.0.34",
+        status="static_dhcp",
+        mac_address="02:00:5e:20:11:34",
+    )
+    with pytest.raises(ValueError, match="raced"):
+        await op.apply(db_session, admin, args)
