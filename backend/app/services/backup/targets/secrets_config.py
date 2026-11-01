@@ -44,7 +44,11 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.crypto import decrypt_str, encrypt_str
-from app.services.backup.targets.base import BackupDestination, config_field_specs
+from app.services.backup.targets.base import (
+    BackupDestination,
+    DestinationConfigError,
+    config_field_specs,
+)
 
 #: Prefix on stored config strings that have been Fernet-wrapped.
 #: Detection-by-prefix is enough because Fernet ciphertext is
@@ -141,20 +145,41 @@ def merge_config_for_update(
     redaction sentinel — anything else means "keep the existing
     encrypted value". Operators editing a target's name without
     re-typing the access key are the canonical case.
+
+    An empty value cannot clear a secret, so a stored secret is taken
+    away by moving the destination to another auth mode (#3289): a new
+    value for one of the driver's ``secret_alternatives`` drops the
+    secrets of the others, and a new value for two is refused.
     """
     secrets = _secret_field_names(driver)
     merged: dict[str, Any] = dict(existing)
     for key, value in incoming.items():
         if key in secrets:
-            if (
-                isinstance(value, str)
-                and value
-                and value != REDACTED_SENTINEL
-                and not value.startswith(ENC_PREFIX)
-            ):
+            if _is_new_secret_value(value):
                 merged[key] = value
             # else: drop the field from the merge so the existing
             # encrypted value carries over from ``merged = dict(existing)``.
         else:
             merged[key] = value
+    supplied = {k for k in secrets if k in incoming and _is_new_secret_value(incoming[k])}
+    modes = [alt for alt in driver.secret_alternatives if supplied.intersection(alt)]
+    if len(modes) > 1:
+        names = " and ".join(f"'{alt[0]}'" for alt in modes)
+        raise DestinationConfigError(f"set ONE of {names}, not both")
+    if modes:
+        for alt in driver.secret_alternatives:
+            if alt is not modes[0]:
+                for name in alt:
+                    merged.pop(name, None)
+    for name in driver.unused_secret_fields(merged):
+        merged.pop(name, None)
     return merged
+
+
+def _is_new_secret_value(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value != REDACTED_SENTINEL
+        and not value.startswith(ENC_PREFIX)
+    )

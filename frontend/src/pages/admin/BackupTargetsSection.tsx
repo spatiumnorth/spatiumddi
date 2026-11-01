@@ -898,6 +898,8 @@ function TargetFormModal({
             <input
               type="text"
               value={name}
+              required
+              maxLength={120}
               onChange={(e) => setName(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               autoFocus
@@ -907,6 +909,7 @@ function TargetFormModal({
             <input
               type="text"
               value={description}
+              maxLength={500}
               onChange={(e) => setDescription(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
@@ -949,6 +952,10 @@ function TargetFormModal({
               );
             }
             const isSecretInEdit = f.secret && mode === "edit";
+            // Say a secret is set only when one is stored: the API reads an
+            // unset secret back as "" and a set one as a sentinel (#3289).
+            const isSecretStored =
+              isSecretInEdit && Boolean(existing?.config?.[f.name]);
             return (
               <Field
                 key={f.name}
@@ -966,7 +973,7 @@ function TargetFormModal({
                     value={config[f.name] ?? ""}
                     onChange={(v) => setConfig({ ...config, [f.name]: v })}
                     placeholder={
-                      isSecretInEdit
+                      isSecretStored
                         ? "(set — leave empty to keep, type to replace)"
                         : undefined
                     }
@@ -981,7 +988,7 @@ function TargetFormModal({
                       setConfig({ ...config, [f.name]: e.target.value })
                     }
                     placeholder={
-                      isSecretInEdit
+                      isSecretStored
                         ? "(set — leave empty to keep, type to replace)"
                         : undefined
                     }

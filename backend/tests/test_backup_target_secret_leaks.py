@@ -67,7 +67,12 @@ async def test_patch_config_secrets_never_reach_the_audit_row(
     monkeypatch.setattr(type(driver), "validate_config", lambda self, c: None)
     monkeypatch.setattr(type(driver), "validate_config_network", lambda self, c: _ok())
 
-    secret_names = [f.name for f in config_field_specs(driver) if f.secret]
+    # An update names ONE auth mode (#3289), so skip the alternatives the
+    # driver offers beyond its first.
+    other_modes = {n for alt in driver.secret_alternatives[1:] for n in alt}
+    secret_names = [
+        f.name for f in config_field_specs(driver) if f.secret and f.name not in other_modes
+    ]
     new_config = {n: f"NEWSECRET-{kind}-{n}" for n in secret_names}
     new_config["url"] = SIGNED  # a non-secret-flagged field that can still be a credential
 

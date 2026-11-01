@@ -100,6 +100,7 @@ def _open_sftp(client):  # type: ignore[no-untyped-def]
 
 class ScpDestination(BackupDestination):
     kind = "scp"
+    secret_alternatives = (("password",), ("private_key", "private_key_passphrase"))
     label = "SCP / SFTP"
     config_fields = (
         ConfigFieldSpec(

@@ -229,6 +229,9 @@ class BackupTargetCreate(BaseModel):
         return v
 
 
+_NULLABLE_UPDATE_KEYS = frozenset({"retention_keep_last_n", "retention_keep_days"})
+
+
 class BackupTargetUpdate(BaseModel):
     """Partial update — only the explicitly-supplied fields are
     overwritten. Passphrase has its own dedicated rotation
@@ -237,18 +240,18 @@ class BackupTargetUpdate(BaseModel):
     validator below.
     """
 
-    name: str | None = None
-    description: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
     enabled: bool | None = None
     config: dict[str, Any] | None = None
     passphrase: str | None = Field(default=None, min_length=8, max_length=512)
-    passphrase_hint: str | None = None
-    schedule_cron: str | None = None
+    passphrase_hint: str | None = Field(default=None, max_length=200)
+    schedule_cron: str | None = Field(default=None, max_length=120)
     retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool | None = None
     drill_enabled: bool | None = None
-    drill_cron: str | None = None
+    drill_cron: str | None = Field(default=None, max_length=120)
 
 
 class BackupTargetResponse(BaseModel):
@@ -524,7 +527,12 @@ async def update_target(
         # existing encrypted value when the incoming payload omits
         # the secret (or sends the redaction sentinel). Validation
         # runs on the merged dict so shape checks see all fields.
-        merged = merge_config_for_update(driver, incoming=payload["config"], existing=row.config)
+        try:
+            merged = merge_config_for_update(
+                driver, incoming=payload["config"], existing=row.config
+            )
+        except DestinationConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         # #989 item 3 — same derivation as create. No-op unless the path
         # moved under the removable root and no node was set by hand.
         from app.services.appliance.removable import stamp_node_name  # noqa: PLC0415
@@ -584,6 +592,12 @@ async def update_target(
         "drill_enabled",
     ):
         if key in payload:
+            # An explicit null on a NOT NULL column means "leave it"
+            # (#3288), as ``write_only`` above; it must never reach the
+            # database. The retention columns are nullable and a null
+            # there clears the limit.
+            if payload[key] is None and key not in _NULLABLE_UPDATE_KEYS:
+                continue
             setattr(row, key, payload[key])
 
     db.add(
