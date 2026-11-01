@@ -35,19 +35,29 @@ def describe_exc(exc: BaseException) -> str:
     return name
 
 
-_QUERY_RE = re.compile(r"(://[^\s?#'\"]+)[?#][^\s'\"]*")
-_USERINFO_RE = re.compile(r"(://)[^/@\s'\"]*@")
+# A URL anywhere in the text, split so only scheme + host (+ port) survive.
+# The userinfo group is greedy up to the LAST ``@`` before the path, so a
+# password holding a bare ``@`` is dropped whole rather than cut at its
+# first ``@`` and half-quoted.
+_URL_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.-]*://)"  # scheme
+    r"(?:[^\s/?#'\"]*@)?"  # userinfo (dropped)
+    r"(\[[^\]\s]*\]|[^\s/?#'\"@:]*)"  # host, or a bracketed IPv6 literal
+    r"(:\d+)?"  # port
+    r"[^\s'\"]*"  # path, query, fragment (dropped)
+)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def _redact(text: str) -> str:
-    """Drop URL userinfo and query strings from ``text``.
+    """Reduce every URL in ``text`` to ``scheme://host[:port]``.
 
-    A v1 InfluxDB write carries its password as ``?p=`` and other
-    integrations pass tokens the same way, so a message built from an
-    exception that echoes the request URL must not keep either.
+    A v1 InfluxDB write carries its password as ``?p=``, other
+    integrations pass tokens in the query or the userinfo, and a webhook
+    URL (Slack, Teams, Discord) carries its secret in the PATH, so a
+    message built from an exception that echoes a URL keeps none of them.
     """
-    return _USERINFO_RE.sub(r"\1", _QUERY_RE.sub(r"\1", text))
+    return _URL_RE.sub(r"\1\2\3", text)
 
 
 def _target(exc: BaseException) -> str | None:
@@ -77,10 +87,11 @@ def describe_http_exc(exc: BaseException, *, timeout: float | None = None) -> st
     out)`` — true, but it names neither the destination nor the limit.
     This says which address did not answer and, when the caller passes the
     ``timeout`` it configured, within how long. Only ``host:port`` is ever
-    quoted from the request; the URL's userinfo and query (where a token
-    or a v1 password may sit) are not. Anything that is not an httpx
-    request error falls back to ``describe_exc``, with URLs in its text
-    redacted the same way.
+    quoted from the request; the URL's userinfo, path and query (where a
+    token, a webhook secret or a v1 password may sit) are not, and neither
+    is a header h11 refused. Anything that is not an httpx request error
+    falls back to ``describe_exc``, with every URL in its text reduced to
+    ``scheme://host[:port]``.
     """
     target = _target(exc)
     after = f" after {timeout:g}s" if timeout else ""
@@ -92,6 +103,15 @@ def describe_http_exc(exc: BaseException, *, timeout: float | None = None) -> st
         return f"Request to {target} timed out{after}"
     if target and isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code} from {target}"
+    if isinstance(exc, httpx.LocalProtocolError):
+        # h11 quotes the offending header verbatim ("Illegal header value
+        # b'Token <secret>\n'"), and the header is usually the credential.
+        where = f" to {target}" if target else ""
+        return (
+            f"Request{where} could not be sent: a header holds a character "
+            "HTTP does not allow (check the token or custom headers for a "
+            "stray newline)"
+        )
     if target and isinstance(exc, httpx.ConnectError):
         cause = _redact(str(exc).strip())
         return f"Could not connect to {target}" + (f": {cause}" if cause else "")
