@@ -33,6 +33,7 @@ export function ConfirmModal({
   loading = false,
   requireCheckboxLabel,
   requirePassword = false,
+  autoFocusCancel = false,
   passwordError,
   onConfirm,
   onClose,
@@ -46,6 +47,9 @@ export function ConfirmModal({
   loading?: boolean;
   requireCheckboxLabel?: string;
   requirePassword?: boolean;
+  // Focus Cancel on open, so Enter backs out instead of confirming. For
+  // destructive confirmations where the safe answer must be the default.
+  autoFocusCancel?: boolean;
   // Surfaced to the password input as inline error text — used by
   // callers to render the server's 403 "Current password incorrect."
   // body without bouncing the operator out of the modal.
@@ -121,6 +125,7 @@ export function ConfirmModal({
             type="button"
             onClick={onClose}
             disabled={loading}
+            autoFocus={autoFocusCancel}
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
           >
             {cancelLabel}

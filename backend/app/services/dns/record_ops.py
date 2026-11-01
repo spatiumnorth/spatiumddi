@@ -831,6 +831,10 @@ class _DispatchState:
     bind: Any
     units: list[_AgentlessUnit] = field(default_factory=list)
     committed: bool = False
+    #: DNS groups to wake once the root transaction commits (#3200): the
+    #: ``collect_wake`` collector exists only inside a request, and the
+    #: integration reconcilers that retract records run in Celery.
+    wake_groups: set[uuid.UUID] = field(default_factory=set)
 
 
 def _applied_values(now: datetime) -> dict[str, Any]:
@@ -1369,8 +1373,12 @@ def _on_after_transaction_end(sync_session: Any, transaction: Any) -> None:
     if transaction.parent is not None:
         return  # a savepoint or subtransaction; the root has not ended
     state: _DispatchState | None = sync_session.info.pop(_DISPATCH_KEY, None)
-    if state is None or not state.committed or not state.units:
+    if state is None or not state.committed:
         return  # nothing queued, or the root transaction rolled back
+    if state.wake_groups:
+        _publish_wake_after_commit(state.wake_groups)
+    if not state.units:
+        return
     try:
         # Runs inside the greenlet ``AsyncSession.commit()`` spawned, after
         # the root transaction returned its connection to the pool.
@@ -1392,7 +1400,9 @@ def _defer_agentless(
     _defer_unit(db, _AgentlessUnit(server_id=server.id, op_rows=op_rows, batched=batched))
 
 
-def _defer_unit(db: AsyncSession, unit: _AgentlessUnit) -> None:
+def _dispatch_state(db: AsyncSession) -> _DispatchState:
+    """This transaction's after-commit state, registering the session's two
+    listeners the first time (once per session, never once per call)."""
     sync = db.sync_session
     state: _DispatchState | None = sync.info.get(_DISPATCH_KEY)
     if state is None:
@@ -1402,7 +1412,33 @@ def _defer_unit(db: AsyncSession, unit: _AgentlessUnit) -> None:
             sync.info[_LISTENING_KEY] = True
             event.listen(sync, "after_commit", _on_after_commit)
             event.listen(sync, "after_transaction_end", _on_after_transaction_end)
-    state.units.append(unit)
+    return state
+
+
+def _defer_unit(db: AsyncSession, unit: _AgentlessUnit) -> None:
+    _dispatch_state(db).units.append(unit)
+
+
+def defer_dns_group_wake(db: AsyncSession, group_ids: Collection[uuid.UUID]) -> None:
+    """Wake these DNS groups' agents once ``db``'s ROOT transaction commits,
+    from a request or a Celery task alike (#3200). Nothing is published for a
+    rolled-back transaction or at a SAVEPOINT release. In a request the
+    ``collect_wake`` collector may wake the same groups too; the wake is
+    advisory and idempotent, so the second one only costs a re-check."""
+    if group_ids:
+        _dispatch_state(db).wake_groups.update(group_ids)
+
+
+def _publish_wake_after_commit(group_ids: Collection[uuid.UUID]) -> None:
+    from app.core.agent_wake import publish_wake  # noqa: PLC0415
+    from app.services import after_commit_dispatch  # noqa: PLC0415
+
+    channels = [dns_group_channel(g) for g in group_ids]
+    # Through ``after_commit_dispatch`` so a Celery task's last commit, which
+    # ends its ``asyncio.run``, cannot cancel the publish (#1168).
+    after_commit_dispatch.dispatch(
+        "dns_group_wake", lambda: publish_wake(*channels), count=len(channels)
+    )
 
 
 async def _apply_agentless(
@@ -2096,6 +2132,63 @@ async def _queue_record_deletes(
     return wake, len(by_zone)
 
 
+async def purge_trashed_address_records(
+    db: AsyncSession,
+    address_ids: Collection[uuid.UUID],
+    *,
+    host_records_only: bool = False,
+    keep_batch_id: uuid.UUID | None = None,
+) -> int:
+    """Hard-delete the trashed auto-generated records bound to these addresses
+    (spatiumddi#3186).
+
+    Called wherever an address row is deleted for good, before that delete
+    flushes: the single / bulk permanent delete and the orphan purge, and the
+    DHCP lease and reservation mirrors' teardown (lease expiry, release, purge,
+    orphan sweep, subnet delete; static mirror removal). A record already in
+    the trash — e.g. riding the batch of a zone deleted before the address —
+    is not being served, so it is only deleted: left behind, the address's
+    delete nulls its ``ip_address_id`` (SET NULL) and the zone's restore would
+    publish a record owned by nothing.
+
+    It is also called where an address KEEPS its row but its auto DNS is
+    retracted — IPAM's DNS delete (``_sync_dns_record(action="delete")``:
+    a reservation removed, a hostname or zone cleared, a lease's DDNS
+    revoked, Mark as Orphan) and the blank-hostname retraction. The live
+    records go through the record-op queue there; a trashed copy the select
+    cannot see would otherwise come back with its zone's restore, for a host
+    that no longer publishes one. ``host_records_only`` limits the purge to
+    the A / AAAA / PTR the blank-hostname retraction withdraws (its aliases
+    stay), and ``keep_batch_id`` spares the aliases Mark as Orphan has just
+    withdrawn into the address's own batch, which the row's Restore brings
+    back (#2604).
+
+    Hand-made records are untouched, as in :func:`retract_address_records`:
+    an operator's record is theirs, and keeps its place with
+    ``ip_address_id`` null. Returns the row count.
+    """
+    ids = list(address_ids)
+    total = 0
+    for start in range(0, len(ids), _RETRACT_CHUNK):
+        stmt = sa_delete(DNSRecord).where(
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_address_id.in_(ids[start : start + _RETRACT_CHUNK]),
+        )
+        if host_records_only:
+            stmt = stmt.where(
+                DNSRecord.ip_alias.is_(False),
+                DNSRecord.record_type.in_(["A", "AAAA", "PTR"]),
+            )
+        if keep_batch_id is not None:
+            stmt = stmt.where(DNSRecord.deletion_batch_id.is_distinct_from(keep_batch_id))
+        res = await db.execute(
+            stmt.execution_options(include_deleted=True, synchronize_session=False)
+        )
+        total += int(getattr(res, "rowcount", 0) or 0)
+    return total
+
+
 async def retract_address_records(
     db: AsyncSession, subnet_ids: Collection[uuid.UUID]
 ) -> tuple[int, set[uuid.UUID]]:
@@ -2136,56 +2229,115 @@ async def retract_address_records(
     ids = list(subnet_ids)
     if not ids:
         return 0, set()
-    records: list[DNSRecord] = []
-    for start in range(0, len(ids), _RETRACT_CHUNK):
-        chunk = ids[start : start + _RETRACT_CHUNK]
+    count, wake, zones = await _retract_auto_records(
+        db,
+        [
+            DNSRecord.ip_address_id.in_(
+                select(IPAddress.id).where(IPAddress.subnet_id.in_(ids[i : i + _RETRACT_CHUNK]))
+            )
+            for i in range(0, len(ids), _RETRACT_CHUNK)
+        ],
+    )
+    if count:
+        logger.info("ipam_address_records_retracted", subnets=len(ids), records=count, zones=zones)
+    return count, wake
+
+
+async def _retract_auto_records(
+    db: AsyncSession, owned_by: list[Any]
+) -> tuple[int, set[uuid.UUID], int]:
+    """Withdraw the auto-generated records matching any of ``owned_by`` (one
+    ``DNSRecord.ip_address_id`` predicate per chunk) and return
+    ``(records_retracted, groups_to_wake, zones_touched)``.
+
+    Trashed ones are only hard-deleted (#2732); live ones get one queued
+    ``delete`` op per record per server (:func:`_queue_record_deletes`) and
+    are then removed. Hand-made records are never touched.
+    """
+    found: dict[uuid.UUID, DNSRecord] = {}
+    for owned in owned_by:
         # #2732 — the trashed ones, whatever batch they ride.
         await db.execute(
             sa_delete(DNSRecord)
             .where(
                 DNSRecord.deleted_at.is_not(None),
                 DNSRecord.auto_generated.is_(True),
-                DNSRecord.ip_address_id.in_(
-                    select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
-                ),
+                owned,
             )
             .execution_options(include_deleted=True, synchronize_session=False)
         )
-        records.extend(
-            (
-                await db.execute(
-                    select(DNSRecord)
-                    .where(
-                        DNSRecord.auto_generated.is_(True),
-                        DNSRecord.ip_address_id.in_(
-                            select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
-                        ),
-                    )
-                    .options(selectinload(DNSRecord.zone))
-                )
+        for rec in (
+            await db.execute(
+                select(DNSRecord)
+                .where(DNSRecord.auto_generated.is_(True), owned)
+                .options(selectinload(DNSRecord.zone))
             )
-            .scalars()
-            .all()
-        )
-    if not records:
-        return 0, set()
+        ).scalars():
+            # Predicates may overlap (an address passed by id AND by its
+            # subnet): one record, one op.
+            found.setdefault(rec.id, rec)
+    if not found:
+        return 0, set(), 0
+    records = list(found.values())
 
     wake, zones = await _queue_record_deletes(db, records)
 
     # After the enqueue: the RRset stamp reads the zone's live members and
     # removes each op's own value (rrset._fold), so the victims are still rows.
-    record_ids = [r.id for r in records]
+    record_ids = list(found)
     for start in range(0, len(record_ids), _RETRACT_CHUNK):
         await db.execute(
             sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids[start : start + _RETRACT_CHUNK]))
         )
-    logger.info(
-        "ipam_address_records_retracted",
-        subnets=len(ids),
-        records=len(records),
-        zones=zones,
-    )
-    return len(records), wake
+    return len(records), wake, zones
+
+
+async def retract_address_dns(
+    db: AsyncSession,
+    address_ids: Collection[uuid.UUID] = (),
+    subnet_ids: Collection[uuid.UUID] = (),
+) -> int:
+    """Retract the live auto-generated DNS records of addresses about to be
+    deleted, the way a subnet hard delete does (spatiumddi#3200).
+
+    The one call every integration mirror (Docker, Kubernetes, Proxmox, ...)
+    makes before it removes ``IPAddress`` rows: its absence-delete
+    (``address_ids``) and its subnet delete, which cascades to the subnet's
+    addresses (``subnet_ids``). Left to the foreign key,
+    ``dns_record.ip_address_id`` goes NULL and the record stays served with no
+    owner. Same withdrawal as :func:`retract_address_records` — a ``delete``
+    op per live auto record per server (RFC 2136 / driver), trashed ones only
+    deleted, hand-made records untouched — and the agent wake is deferred to
+    the session's commit, so it works from a Celery task, where
+    ``collect_wake`` is a no-op. Pass a whole sweep's ids in one call: the cost
+    is two queries per 5000 ids, not per address. MUST run before the address /
+    subnet delete is flushed, or the SET NULL has already orphaned the
+    records. Returns the number of live records retracted.
+    """
+    addr = list(address_ids)
+    sub = list(subnet_ids)
+    owned_by: list[Any] = [
+        DNSRecord.ip_address_id.in_(addr[i : i + _RETRACT_CHUNK])
+        for i in range(0, len(addr), _RETRACT_CHUNK)
+    ] + [
+        DNSRecord.ip_address_id.in_(
+            select(IPAddress.id).where(IPAddress.subnet_id.in_(sub[i : i + _RETRACT_CHUNK]))
+        )
+        for i in range(0, len(sub), _RETRACT_CHUNK)
+    ]
+    if not owned_by:
+        return 0
+    count, wake, zones = await _retract_auto_records(db, owned_by)
+    if count:
+        defer_dns_group_wake(db, wake)
+        logger.info(
+            "integration_address_records_retracted",
+            addresses=len(addr),
+            subnets=len(sub),
+            records=count,
+            zones=zones,
+        )
+    return count
 
 
 async def _apply_agentless_batch(
