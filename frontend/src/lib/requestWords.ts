@@ -36,7 +36,23 @@ export const DNS_RECORD_TYPES = [
   "LOC",
 ] as const;
 
-type FieldWords = { label: string; hint?: string; options?: readonly string[] };
+type FieldWords = {
+  label: string;
+  hint?: string;
+  options?: readonly string[];
+  /** How each option reads in the picker; the submitted value is the key. */
+  optionLabels?: Record<string, string>;
+};
+
+const IP_STATUS_LABELS: Record<string, string> = {
+  allocated: "Allocated",
+  available: "Available",
+  deprecated: "Deprecated",
+  dhcp: "DHCP (dynamic)",
+  orphan: "Orphan",
+  reserved: "Reserved",
+  static_dhcp: "Static DHCP",
+};
 
 const WORDS: Record<string, FieldWords> = {
   block_id: {
@@ -49,7 +65,9 @@ const WORDS: Record<string, FieldWords> = {
   },
   template_id: {
     label: "Template",
-    hint: "Optional. An IPAM template to apply to the new subnet.",
+    // A free field, not a picker: there is no template picker yet, so the
+    // hint says plainly that it takes the template's id.
+    hint: "Optional. The id of an IPAM template to apply to the new subnet; your network team can give it to you.",
   },
   subnet_id: {
     label: "Subnet",
@@ -64,6 +82,7 @@ const WORDS: Record<string, FieldWords> = {
     label: "Status",
     hint: "Defaults to allocated. A static DHCP address needs a MAC address.",
     options: IP_STATUSES,
+    optionLabels: IP_STATUS_LABELS,
   },
   fqdn: {
     label: "Full host name",
@@ -134,56 +153,102 @@ export function fieldWords(
   return { label, hint };
 }
 
-/** Markdown a Copilot preview carries, as plain text (`code`, **bold**). */
+/**
+ * Markdown a Copilot preview carries (`code`, **bold**), as plain text.
+ *
+ * Only paired marks are removed: a lone `*` is data, the wildcard owner in a
+ * DNS record request (`*.example.com`) above all. The result is rendered as a
+ * React text node, so nothing here is ever interpreted as HTML.
+ */
 export function plainText(s: string): string {
-  return s
-    .replace(/\*\*(.+?)\*\*/g, "$1")
-    .replace(/`([^`]*)`/g, "$1")
-    .replace(/[*`]/g, "");
+  return s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/`([^`]*)`/g, "$1");
 }
 
-const PAYLOAD_PREFIX = /^Invalid request payload\s*[—-]\s*/;
+type FieldError = {
+  type?: unknown;
+  loc?: unknown;
+  msg?: unknown;
+  ctx?: Record<string, unknown>;
+};
 
-function plainMessage(msg: string, field: string): string {
-  let m = msg.replace(/^Value error,\s*/i, "").trim();
-  // "status must be one of …": the label already names the field.
-  for (const w of [field, field.replace(/_/g, " ")]) {
-    if (m.toLowerCase().startsWith(`${w} `)) m = m.slice(w.length + 1);
+/** One field error's words, by its Pydantic error ``type``. */
+function errorWords(e: FieldError, field: string | null): string {
+  const ctx = e.ctx ?? {};
+  switch (e.type) {
+    case "missing":
+      return "is required";
+    case "int_parsing":
+    case "int_type":
+    case "int_from_float":
+      return "must be a whole number";
+    case "float_parsing":
+    case "float_type":
+      return "must be a number";
+    case "greater_than_equal":
+      return `must be at least ${String(ctx.ge)}`;
+    case "less_than_equal":
+      return `must be at most ${String(ctx.le)}`;
+    case "greater_than":
+      return `must be more than ${String(ctx.gt)}`;
+    case "less_than":
+      return `must be less than ${String(ctx.lt)}`;
+    case "string_too_short":
+      return `must be at least ${String(ctx.min_length)} characters`;
+    case "string_too_long":
+      return `must be at most ${String(ctx.max_length)} characters`;
+    case "string_type":
+      return "must be text";
   }
-  if (/^field required$/i.test(m) || /^Input should be a valid string/i.test(m))
-    return "is required";
-  if (/^Input should be a valid (integer|number)/i.test(m))
-    return "must be a number";
-  const ge = m.match(/^Input should be greater than or equal to (\S+)/i);
-  if (ge) return `must be at least ${ge[1]}`;
-  const le = m.match(/^Input should be less than or equal to (\S+)/i);
-  if (le) return `must be at most ${le[1]}`;
+  let m = typeof e.msg === "string" ? e.msg : "is not valid";
+  m = m
+    .replace(/^(Value error|Assertion failed),\s*/i, "")
+    .replace(/^Input should be /i, "should be ")
+    .trim();
+  // "status must be one of …": the label already names the field.
+  if (field) {
+    for (const w of [field, field.replace(/_/g, " ")]) {
+      if (m.toLowerCase().startsWith(`${w.toLowerCase()} `))
+        m = m.slice(w.length + 1);
+    }
+  }
   return m.charAt(0).toLowerCase() + m.slice(1);
 }
 
 /**
- * The submit's 400 is one string, "Invalid request payload — loc: msg; …".
- * Name each field as the form labels it and drop the validator's phrasing.
- * Anything that is not that shape is returned as it came.
+ * The submit's field errors (#3253), named as the form labels each field.
+ *
+ * The server answers an args payload that does not validate with FastAPI's
+ * own 422 shape, each entry located under ``body.args``, so the words come
+ * from the error ``type`` and its ``ctx`` rather than from Pydantic's English.
+ * Returns null for any other error, which the caller shows as it came.
  */
-export function plainSubmitError(
-  message: string,
+export function submitErrorWords(
+  err: unknown,
   labelOf: (field: string) => string,
-): string {
-  if (!PAYLOAD_PREFIX.test(message)) return message;
-  const parts = message
-    .replace(PAYLOAD_PREFIX, "")
-    .split("; ")
-    .map((seg) => {
-      const m = seg.match(/^([A-Za-z0-9_.]+): ([\s\S]*)$/);
-      if (!m) return seg;
-      const field = m[1].split(".")[0];
-      const text = plainMessage(m[2], field);
-      const label = labelOf(field);
-      // "Status must be one of …" reads whole; "is required" needs the label.
-      return /^(is |must |should )/.test(text)
+): string | null {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })
+    ?.response?.data?.detail;
+  if (!Array.isArray(detail) || detail.length === 0) return null;
+  const parts: string[] = [];
+  for (const raw of detail) {
+    if (!raw || typeof raw !== "object") return null;
+    const e = raw as FieldError;
+    const loc = Array.isArray(e.loc) ? e.loc : [];
+    if (loc[0] !== "body" || loc[1] !== "args") return null;
+    const field = typeof loc[2] === "string" ? loc[2] : null;
+    const text = errorWords(e, field);
+    if (!field) {
+      parts.push(text.charAt(0).toUpperCase() + text.slice(1));
+      continue;
+    }
+    const label = labelOf(field);
+    // "Status must be one of …" reads whole; anything else needs a colon.
+    parts.push(
+      /^(is |must |should )/.test(text)
         ? `${label} ${text}`
-        : `${label}: ${text}`;
-    });
-  return parts.join("; ") + ".";
+        : `${label}: ${text}`,
+    );
+  }
+  const out = parts.join("; ");
+  return /[.!?]$/.test(out) ? out : `${out}.`;
 }

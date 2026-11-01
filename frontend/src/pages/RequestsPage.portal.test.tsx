@@ -217,6 +217,54 @@ describe("a failed approval is said at the moment of approving (#3246)", () => {
   });
 });
 
+describe("a failed approval never reads as a success (#3246)", () => {
+  async function approveWith(result: () => Promise<unknown>) {
+    rows.mockResolvedValue([req({})]);
+    approve.mockImplementation(result);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Approve and provision" }),
+    );
+  }
+
+  it("says so when a failed request carries no reason", async () => {
+    await approveWith(async () => req({ state: "failed", error: null }));
+    expect(await screen.findByText(/no reason was recorded/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Approve and provision",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+  });
+
+  it.each([
+    [
+      "a 409",
+      { response: { status: 409, data: { detail: "Request is not pending" } } },
+      /Request is not pending/,
+    ],
+    [
+      "a 500",
+      {
+        response: { status: 500, data: { detail: "Internal Server Error" } },
+        message: "Request failed with status code 500",
+      },
+      /Internal Server Error/,
+    ],
+    ["a network error", { message: "Network Error" }, /Network Error/],
+  ])("keeps the dialog open with the error on %s", async (_, err, shown) => {
+    await approveWith(async () => {
+      throw err;
+    });
+    expect(await screen.findByText(shown)).toBeTruthy();
+    expect(screen.getByText("Note (optional)")).toBeTruthy();
+  });
+});
+
 describe("the list shows each request once, in plain words (#3252)", () => {
   it("prints the text once, with no Markdown", async () => {
     const text = "Create **A** record `host-a` in zone `example.test.`";
@@ -227,6 +275,17 @@ describe("the list shows each request once, in plain words (#3252)", () => {
     await screen.findByText(/Create A record host-a in zone example.test./);
     expect(screen.getAllByText(/Create A record host-a/).length).toBe(1);
     expect(document.body.textContent).not.toMatch(/\*\*|`/);
+  });
+
+  it("keeps a wildcard record name's asterisk", async () => {
+    const text = "Create **A** record `*.lab` in zone `example.test.`";
+    rows.mockResolvedValue([
+      req({ resource_display: text, preview_text: text }),
+    ]);
+    renderPage();
+    expect(
+      await screen.findByText("Create A record *.lab in zone example.test."),
+    ).toBeTruthy();
   });
 
   it("headlines the subnet an executed request carved", async () => {
@@ -267,6 +326,25 @@ describe("the approver is shown the template (#3251)", () => {
     );
   });
 
+  it("shows the id when the template cannot be read, never undefined", async () => {
+    getTemplate.mockRejectedValue({ response: { status: 403 } });
+    rows.mockResolvedValue([req({ args: { template_id: "tpl-42" } })]);
+    renderPage();
+    const line = await screen.findByTestId("request-template");
+    await waitFor(() => expect(getTemplate).toHaveBeenCalled());
+    await waitFor(() => expect(line.textContent).toContain("tpl-42"));
+    expect(line.textContent).not.toMatch(/undefined|…/);
+  });
+
+  it("shows the id while the lookup is still pending", async () => {
+    getTemplate.mockReturnValue(new Promise(() => {}));
+    rows.mockResolvedValue([req({ args: { template_id: "tpl-43" } })]);
+    renderPage();
+    const line = await screen.findByTestId("request-template");
+    expect(line.textContent).toContain("tpl-43");
+    expect(line.textContent).not.toMatch(/undefined|…/);
+  });
+
   it("shows nothing when the request names no template", async () => {
     rows.mockResolvedValue([req({ args: {} })]);
     renderPage();
@@ -304,18 +382,45 @@ describe("the New request form speaks in words (#3253)", () => {
   it("offers status as a choice of all seven", async () => {
     await openForm("IP address");
     const options = (
-      await screen.findAllByRole("option", { name: "static_dhcp" })
+      await screen.findAllByRole("option", { name: "Static DHCP" })
     ).length;
     expect(options).toBe(1);
-    expect(screen.getByRole("option", { name: "orphan" })).toBeTruthy();
+    const status = screen
+      .getByRole("option", { name: "Static DHCP" })
+      .closest("select") as HTMLSelectElement;
+    // Seven statuses plus the blank "—", each read in words but submitted
+    // as the API's value.
+    expect(status.options.length).toBe(8);
+    expect(
+      (screen.getByRole("option", { name: "Static DHCP" }) as HTMLOptionElement)
+        .value,
+    ).toBe("static_dhcp");
+    expect(screen.queryByRole("option", { name: "static_dhcp" })).toBeNull();
   });
 
   it("explains a refusal in the form's own labels", async () => {
+    // The server's 422 field errors (#3253), as requests/service.py answers.
     submit.mockRejectedValue({
       response: {
+        status: 422,
         data: {
-          detail:
-            "Invalid request payload — subnet_id: Field required; address: Field required; status: Value error, status must be one of: allocated, reserved",
+          detail: [
+            {
+              type: "missing",
+              loc: ["body", "args", "subnet_id"],
+              msg: "Field required",
+            },
+            {
+              type: "missing",
+              loc: ["body", "args", "address"],
+              msg: "Field required",
+            },
+            {
+              type: "value_error",
+              loc: ["body", "args", "status"],
+              msg: "Value error, status must be one of: allocated, reserved",
+            },
+          ],
         },
       },
     });

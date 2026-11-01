@@ -41,7 +41,7 @@ import { closePopupOnEscape } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
-import { fieldWords, plainSubmitError, plainText } from "@/lib/requestWords";
+import { fieldWords, plainText, submitErrorWords } from "@/lib/requestWords";
 import {
   Ban,
   Check,
@@ -154,6 +154,7 @@ type FieldSpec = {
   type: string;
   required: boolean;
   enum?: string[];
+  enumLabels?: Record<string, string>;
   // #759 — RBAC resource_type of the resource this field references
   // (server-annotated via x-resource); drives the searchable picker.
   resource?: string;
@@ -201,6 +202,7 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
         : words.options
           ? [...words.options]
           : undefined,
+      enumLabels: words.optionLabels,
       resource:
         typeof spec["x-resource"] === "string"
           ? (spec["x-resource"] as string)
@@ -372,10 +374,10 @@ function NewRequestModal({
     },
     onError: (e) =>
       setError(
-        plainSubmitError(
-          errMessage(e, "Could not submit the request"),
+        submitErrorWords(
+          e,
           (name) => fields.find((f) => f.name === name)?.title ?? name,
-        ),
+        ) ?? errMessage(e, "Could not submit the request"),
       ),
   });
 
@@ -438,7 +440,7 @@ function NewRequestModal({
                     <option value="">—</option>
                     {f.enum.map((o) => (
                       <option key={o} value={o}>
-                        {o}
+                        {f.enumLabels?.[o] ?? o}
                       </option>
                     ))}
                   </select>
@@ -508,8 +510,9 @@ function NewRequestModal({
 /**
  * The IPAM template a subnet request names (#3251). Approving stamps its
  * tags, zone binding, server groups and DDNS settings on the new subnet, so
- * the approver is shown which one before deciding. Falls back to the id when
- * the template cannot be read by this user.
+ * the approver is shown which one before deciding. Shows the id until the
+ * name arrives, and keeps it when this user cannot read the template, so the
+ * line never waits on a lookup or reads "undefined".
  */
 function TemplateLine({ request }: { request: ProvisioningRequest }) {
   const raw = request.args?.template_id;
@@ -525,7 +528,7 @@ function TemplateLine({ request }: { request: ProvisioningRequest }) {
   return (
     <p data-testid="request-template" className="mt-1 text-xs">
       <span className="font-medium">Template applied on approval:</span>{" "}
-      {tpl.data ? tpl.data.name : tpl.isError ? id : "…"}
+      {tpl.data?.name || id}
     </p>
   );
 }
@@ -566,9 +569,12 @@ function DecisionModal({
       // request in state "failed" (#2911). Say so here, with the reason,
       // rather than closing as if it had worked (#3246).
       if (action === "approve" && done.state === "failed") {
+        const reason = done.error?.trim()
+          ? plainText(done.error.trim())
+          : "no reason was recorded";
         setError(
-          `Approved, but it could not be provisioned: ${
-            done.error ? plainText(done.error) : "no reason was recorded"
+          `Approved, but it could not be provisioned: ${reason}${
+            /[.!?]$/.test(reason) ? "" : "."
           } The request is now marked failed.`,
         );
         setFailed(true);
