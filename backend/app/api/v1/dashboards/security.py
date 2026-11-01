@@ -81,6 +81,10 @@ class PermissionChangeRow(BaseModel):
 class SecurityDashboardSummary(BaseModel):
     generated_at: datetime
 
+    # True when the four per-row lists below were stripped for this caller
+    # (#400 M2): an empty list then means "not shown to you", never "none".
+    detail_withheld: bool = False
+
     # MFA
     mfa_total_local_users: int
     mfa_enrolled_count: int
@@ -287,6 +291,7 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
     # callers — the tile still renders from the headline counts.
     return SecurityDashboardSummary(
         generated_at=now,
+        detail_withheld=not privileged,
         mfa_total_local_users=mfa_total,
         mfa_enrolled_count=mfa_enrolled,
         mfa_coverage_pct=round(mfa_pct, 1),
