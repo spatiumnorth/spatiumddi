@@ -329,8 +329,8 @@ function RestoreBackupCard() {
     ? (preview.dump_format ?? preview.manifest?.dump_format ?? null)
     : null;
   // The restore's own refusals (no dump, no secrets.enc, a newer
-  // format_version), read from the same checks server-side (#2949). Blocks
-  // both modes.
+  // format_version, a schema head this install cannot migrate forward), read
+  // from the same checks server-side (#2949, #3287). Blocks both modes.
   const restoreRefused = !!preview && preview.restorable === false;
   const selectiveBlockedByPlainFormat =
     mode === "selective" &&

@@ -147,3 +147,58 @@ async def test_preview_refuses_a_schema_head_this_install_cannot_place(
     own = _local_head()
     if own:
         assert (await preview(own))["restorable"] is True
+
+
+@pytest.mark.asyncio
+async def test_schema_refusal_matches_the_restore_and_older_heads_pass(
+    db_session: AsyncSession,
+) -> None:
+    """#3287: the preview's schema verdict is the restore's own sentence.
+
+    Built through :func:`manifest_preview_payload`, the one builder both the
+    upload preview and a destination's archive preview return. An older head
+    in this install's chain is restorable (the restore upgrades it); a head
+    the chain does not contain is refused before anything destructive, by
+    the preview and by the restore alike.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    from app.services.backup.archive import manifest_preview_payload
+    from app.services.backup.crypto import encrypt_secrets
+    from app.services.backup.migrations import _alembic_ini, _local_head
+
+    local = _local_head()
+    ini = _alembic_ini()
+    assert local and ini, "the test needs a single readable alembic head"
+    down = ScriptDirectory.from_config(Config(str(ini))).get_revision(local).down_revision
+    parent = down[0] if isinstance(down, tuple) else down
+    assert isinstance(parent, str)
+
+    def archive(head: str) -> bytes:
+        return _zip(
+            {**_BASE, "dump_format": "custom", "schema_version": head},
+            {
+                "database.dump": b"PGDMP",
+                "secrets.enc": encrypt_secrets({"schema_version": head}, passphrase=_PASS),
+            },
+        )
+
+    older = manifest_preview_payload(archive(parent))
+    assert older["restorable"] is True and older["restore_refusal"] is None
+
+    for head in ("ffffffffffff", "000000000000"):
+        data = archive(head)
+        body = manifest_preview_payload(data)
+        assert body["restorable"] is False
+        assert repr(head) in body["restore_refusal"]
+        assert "Upgrade SpatiumDDI" in body["restore_refusal"]
+        with pytest.raises(BackupRestoreError) as exc:
+            await _apply_backup_restore_inner(
+                db_session,
+                archive_bytes=data,
+                passphrase=_PASS,
+                confirmation_phrase=_PHRASE,
+                db_url="postgresql://unused",
+            )
+        assert str(exc.value) == body["restore_refusal"]

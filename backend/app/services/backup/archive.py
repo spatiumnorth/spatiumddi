@@ -734,8 +734,9 @@ def preview_backup_archive(
     the restore preview: the manifest as :func:`read_backup_manifest` reads
     it, the dump format the restore will act on (None when the archive does
     not say), and the reason the restore would refuse the archive for a
-    missing member, an unsupported ``format_version`` or a newer schema (None when it would
-    go ahead). The restore's own checks, not a parallel copy (#2949)."""
+    missing member, an unsupported ``format_version`` or a schema head this
+    install cannot migrate forward (None when it would go ahead). The
+    restore's own checks, not a parallel copy (#2949, #3287)."""
     manifest = read_backup_manifest(archive_bytes)
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
@@ -778,7 +779,8 @@ def manifest_preview_payload(archive_bytes: bytes) -> dict[str, Any]:
         "selective_restore_supported": dump_format == "custom",
         # Whether the restore would accept this archive at all, and if not
         # why (#2949): the restore's own refusals for a missing dump, a
-        # missing secrets.enc, or a format_version this build cannot read.
+        # missing secrets.enc, a format_version this build cannot read, or a
+        # recorded schema head it cannot migrate forward (#3287).
         "restorable": refusal is None,
         "restore_refusal": refusal,
     }
