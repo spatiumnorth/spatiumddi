@@ -195,7 +195,7 @@ dnsAgents:
     - name: ns1
       role: primary
       group: internal-resolvers
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
     # PowerDNS (issue #127 — ALIAS, LUA, online DNSSEC, catalog zones).
     # Lives in its own group: the control plane rejects mixed-driver
     # groups for those PowerDNS-only features.
@@ -203,7 +203,7 @@ dnsAgents:
       flavor: powerdns
       role: primary
       group: powerdns-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
     # Technitium (issue #746 — native DoT / DoH / DoQ with no sidecar,
     # encrypted upstream forwarding, online DNSSEC, catalog zones both
     # ways). Also its own group, same single-driver rule.
@@ -211,7 +211,7 @@ dnsAgents:
       flavor: technitium
       role: primary
       group: technitium-edge
-      service: { type: LoadBalancer }
+      service: { type: LoadBalancer }   # opt-in; see "Serving DNS on :53" below
 
 dhcpAgents:
   enabled: true
@@ -222,6 +222,34 @@ dhcpAgents:
       role: primary
       hostNetwork: true   # required for real DHCPv4 unless relay-only
 ```
+
+#### Serving DNS on :53 to clients (k3s and others)
+
+The agent Services default to `ClusterIP` (#3229), reachable in-cluster only.
+To answer clients on your LAN you must expose them, and on k3s the obvious
+choice is a trap: the bundled **servicelb** turns a `LoadBalancer` Service
+into an `svclb-*` pod with `hostPort: 53` on every node, and the CNI hostPort
+DNAT also captures the node's own resolver stub at `127.0.0.53:53`. The node
+then cannot resolve anything, so image pulls fail (`lookup ghcr.io: Try
+again`), local-path provisioning times out and the install never converges.
+UDP 67 for DHCP has the same mechanism.
+
+- **MetalLB** (recommended): start k3s with `--disable servicelb`, install
+  MetalLB, then set `service: { type: LoadBalancer }` on the DNS server with
+  a pool or `loadBalancerIP`. The VIP is announced by MetalLB, so nothing
+  binds :53 on the node.
+- **Another LB** (kube-vip, Cilium LB-IPAM, a cloud LB): same rule, disable
+  servicelb and make sure the implementation does not use hostPort 53.
+- **`NodePort`**: works behind your own forwarder or external load balancer,
+  but :53 is outside the NodePort range, so clients cannot use it directly.
+- **`hostNetwork`**: offered for DHCP only. Binding the node's own :53 would
+  collide with `systemd-resolved` on most distributions.
+
+Upgrading from a chart that defaulted to `LoadBalancer`: a server that never
+set `service.type` becomes `ClusterIP` and **releases its external IP**. Add
+`service: { type: LoadBalancer }` (with the same address) to each server that
+must keep serving clients before you upgrade. See the
+[chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-dns-and-dhcp-to-clients).
 
 Pre-create the bootstrap PSK Secrets (or use `agentKey.value` inline for lab
 use only):
@@ -234,7 +262,7 @@ kubectl -n spatiumddi create secret generic spatium-dhcp-agent-key \
 ```
 
 Each server entry renders a StatefulSet + a Service (default type
-`LoadBalancer` for DNS). The image is selected by `flavor`: the default
+`ClusterIP`; `LoadBalancer` and `NodePort` are opt-in, see below). The image is selected by `flavor`: the default
 `dnsAgents.image` configures BIND9; `flavor: powerdns` pulls
 `ghcr.io/spatiumnorth/dns-powerdns` and switches the state-volume mount path to
 `/var/lib/powerdns` for the LMDB store; `flavor: technitium` pulls
@@ -247,7 +275,7 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
 > `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
-> at a LoadBalancer Service on UDP/67. The static manifests under
+> at a LoadBalancer Service on UDP/67 you opted into. The static manifests under
 > `k8s/dhcp/` use that LoadBalancer Service: on a `NodePort` Service the
 > declared `port: 67` is in-cluster only, and the node-facing port is a
 > random 30000–32767 pick. Pinning it (`service.nodePort` in the chart)

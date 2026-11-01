@@ -139,7 +139,10 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
 spec:
-  type: {{ (get ($server.service | default dict) "type") | default "LoadBalancer" }}
+  {{- /* #3229 — ClusterIP by default, as for the DNS agents: under k3s's
+         servicelb a LoadBalancer Service becomes a hostPort svclb pod on
+         every node. Opt in with service.type for a relay target. */}}
+  type: {{ (get ($server.service | default dict) "type") | default "ClusterIP" }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}

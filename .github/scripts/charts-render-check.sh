@@ -773,6 +773,7 @@ render umbrella-dns-agent-lb "$UMBRELLA" \
     --set dnsAgents.servers[0].dotPort=853 \
     --set dnsAgents.servers[0].dohPort=8443 \
     --set dnsAgents.servers[0].doqPort=853 \
+    --set dnsAgents.servers[0].service.type=LoadBalancer \
     --set dnsAgents.servers[0].service.loadBalancerIP=10.0.0.53 \
     --set dnsAgents.servers[0].service.loadBalancerSourceRanges[0]=192.0.2.0/24 \
     --set dnsAgents.servers[0].service.ipFamilyPolicy=PreferDualStack \
@@ -787,6 +788,33 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
     --expect-annotation metallb.universe.tf/loadBalancerIPs=10.0.0.53 \
     --expect-annotation metallb.universe.tf/address-pool=default \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+# #3229 — a DNS agent server with no service.type must render ClusterIP, and
+# a DHCP agent likewise: a LoadBalancer default is a hostPort-53 svclb pod on
+# k3s that captures the node's own 127.0.0.53 resolver. Explicit
+# LoadBalancer (above) must still work.
+render umbrella-agent-default-svc "$UMBRELLA" \
+    --set dnsAgents.enabled=true \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true \
+    --set dhcpAgents.servers[0].name=dhcp1
+echo "── agent Services default to ClusterIP (umbrella, #3229)"
+python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
+    --expect-type ClusterIP "$OUT/umbrella-agent-default-svc.yaml" \
+    || failures=$((failures + 1))
+python3 - "$OUT/umbrella-agent-default-svc.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+bad = [
+    d["metadata"]["name"]
+    for d in yaml.safe_load_all(open(sys.argv[1]))
+    if d and d.get("kind") == "Service"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "dhcp-agent"
+    and (d["spec"].get("type") or "ClusterIP") != "ClusterIP"
+]
+if bad:
+    print(f"FAIL DHCP agent Service default is not ClusterIP: {bad} (#3229)", file=sys.stderr)
+    sys.exit(1)
+print("   DHCP agent Service defaults to ClusterIP")
+PYEOF
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
