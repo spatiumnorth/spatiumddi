@@ -32,7 +32,10 @@ import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
-import { CustomerChip } from "@/components/ownership/pickers";
+import {
+  CustomerChip,
+  MissingCustomerOption,
+} from "@/components/ownership/pickers";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
@@ -783,7 +786,7 @@ function CustomSummaryView({ summary }: { summary: CustomGroupedSummary }) {
 
 type EditorTab = "general" | "resources" | "term" | "notes" | "summary";
 
-function ServiceEditorModal({
+export function ServiceEditorModal({
   existing,
   onClose,
 }: {
@@ -925,6 +928,10 @@ function ServiceEditorModal({
               onChange={(e) => setCustomerId(e.target.value)}
             >
               <option value="">— select —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
