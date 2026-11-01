@@ -138,6 +138,8 @@ async def test_security_summary_strips_pii_for_unprivileged(
     assert body["api_tokens_expiring"] == []
     assert body["failed_login_top_sources"] == []
     assert body["permission_changes"] == []
+    # ...and the summary says so, so a client can tell withheld from none (#3235).
+    assert body["detail_withheld"] is True
 
 
 async def test_security_summary_full_detail_for_superadmin(
@@ -155,6 +157,7 @@ async def test_security_summary_full_detail_for_superadmin(
     assert any(row["source_ip"] == "203.0.113.7" for row in body["failed_login_top_sources"])
     assert any(row["actor"] == "some-admin" for row in body["permission_changes"])
     assert len(body["mfa_unenrolled"]) >= 1
+    assert body["detail_withheld"] is False
 
 
 async def test_security_summary_full_detail_for_audit_reader(

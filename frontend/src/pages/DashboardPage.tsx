@@ -104,7 +104,7 @@ import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
-import { ListReadError } from "@/components/ui/list-read-error";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
@@ -1559,7 +1559,7 @@ export function DashboardPage() {
   >({
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: dhcpOn,
   });
   // Single groups fetch — drives both the DHCP server-row group-name
@@ -1567,7 +1567,7 @@ export function DashboardPage() {
   const { data: dhcpGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     enabled: dhcpOn,
   });
   const haGroups = dhcpGroups.filter((g) => g.kea_member_count >= 2);
@@ -1821,6 +1821,14 @@ export function DashboardPage() {
   const fleetUnreadable = !!dnsGroupsError || !!dhcpServersError;
   const unreadableWhy = (err: unknown) =>
     isRefused(err) ? "you may not read this" : "couldn't load this";
+  // The same for the faces that count one read's rows (#3234): the value is
+  // a dash and the sub-line says why, never a zero.
+  const subnetsWhy = subnetsError ? unreadableWhy(subnetsError) : undefined;
+  const zonesWhy = dnsGroupsError ? unreadableWhy(dnsGroupsError) : undefined;
+  const serversWhy =
+    dnsGroupsError || dhcpServersError
+      ? unreadableWhy(dnsGroupsError ?? dhcpServersError)
+      : undefined;
 
   const degraded =
     unhealthyServers > 0 ||
@@ -2112,55 +2120,74 @@ export function DashboardPage() {
             />
             <KpiCard
               label="Subnets"
-              value={subnetsScoped.length}
+              value={subnetsWhy ? "—" : subnetsScoped.length}
               sub={
-                <>
-                  <span className="text-emerald-600 dark:text-emerald-400">
-                    {subnetsScoped.length - critical - warning} healthy
-                  </span>
-                  {(critical > 0 || warning > 0) && (
-                    <>
-                      {" · "}
-                      <span className="text-red-600 dark:text-red-400">
-                        {critical + warning} alert
-                        {critical + warning === 1 ? "" : "s"}
-                      </span>
-                    </>
-                  )}
-                </>
+                subnetsWhy ? (
+                  subnetsWhy
+                ) : (
+                  <>
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      {subnetsScoped.length - critical - warning} healthy
+                    </span>
+                    {(critical > 0 || warning > 0) && (
+                      <>
+                        {" · "}
+                        <span className="text-red-600 dark:text-red-400">
+                          {critical + warning} alert
+                          {critical + warning === 1 ? "" : "s"}
+                        </span>
+                      </>
+                    )}
+                  </>
+                )
               }
               icon={Network}
-              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              tone={
+                subnetsWhy
+                  ? "default"
+                  : critical > 0
+                    ? "bad"
+                    : warning > 0
+                      ? "warn"
+                      : "good"
+              }
               to="/ipam"
             />
             <KpiCard
               label="Allocated IPs (IPv4)"
-              value={allocatedIPs.toLocaleString()}
-              sub={`${freeIPs.toLocaleString()} free`}
+              value={subnetsWhy ? "—" : allocatedIPs.toLocaleString()}
+              sub={subnetsWhy ?? `${freeIPs.toLocaleString()} free`}
               icon={Activity}
               to="/ipam"
             />
             <KpiCard
               label="Utilization (IPv4)"
-              value={`${overallUtil.toFixed(1)}%`}
-              sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
+              value={subnetsWhy ? "—" : `${overallUtil.toFixed(1)}%`}
+              sub={
+                subnetsWhy ??
+                `${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`
+              }
               icon={Server}
               tone={
-                overallUtil >= 95
-                  ? "bad"
-                  : overallUtil >= 80
-                    ? "warn"
-                    : "default"
+                subnetsWhy
+                  ? "default"
+                  : overallUtil >= 95
+                    ? "bad"
+                    : overallUtil >= 80
+                      ? "warn"
+                      : "default"
               }
             />
             {dnsOn && (
               <KpiCard
                 label="DNS Zones"
-                value={totalZones}
+                value={zonesWhy ? "—" : totalZones}
                 sub={
-                  dnsGroups.length > 0
-                    ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                    : "no groups"
+                  zonesWhy
+                    ? zonesWhy
+                    : dnsGroups.length > 0
+                      ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                      : "no groups"
                 }
                 icon={Globe2}
                 to="/dns"
@@ -2168,9 +2195,11 @@ export function DashboardPage() {
             )}
             <KpiCard
               label="Servers"
-              value={allServers.length}
+              value={serversWhy ? "—" : allServers.length}
               sub={
-                unhealthyServers > 0 ? (
+                serversWhy ? (
+                  serversWhy
+                ) : unhealthyServers > 0 ? (
                   <span className="text-red-600 dark:text-red-400">
                     {activeServers} active · {unhealthyServers} unhealthy
                   </span>
@@ -2353,9 +2382,9 @@ export function DashboardPage() {
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-mono">IPv4</span>
                     <span className="text-muted-foreground">
-                      {v4SubnetCount} subnet
-                      {v4SubnetCount === 1 ? "" : "s"} ·{" "}
-                      {allocatedIPs.toLocaleString()} alloc
+                      {subnetsWhy
+                        ? subnetsWhy
+                        : `${v4SubnetCount} subnet${v4SubnetCount === 1 ? "" : "s"} · ${allocatedIPs.toLocaleString()} alloc`}
                     </span>
                   </div>
                   <div className="mt-1 h-2 overflow-hidden rounded-full bg-muted">
@@ -2377,9 +2406,9 @@ export function DashboardPage() {
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-mono">IPv6</span>
                     <span className="text-muted-foreground">
-                      {v6SubnetCount} subnet
-                      {v6SubnetCount === 1 ? "" : "s"} ·{" "}
-                      {v6AllocCount.toLocaleString()} alloc
+                      {subnetsWhy
+                        ? subnetsWhy
+                        : `${v6SubnetCount} subnet${v6SubnetCount === 1 ? "" : "s"} · ${v6AllocCount.toLocaleString()} alloc`}
                     </span>
                   </div>
                   <div className="mt-1 h-2 overflow-hidden rounded-full bg-muted">
@@ -2412,11 +2441,17 @@ export function DashboardPage() {
 
             <KpiCard
               label="Capacity headroom"
-              value={`${(100 - overallUtil).toFixed(1)}%`}
-              sub={`${freeIPs.toLocaleString()} IPv4 free`}
+              value={subnetsWhy ? "—" : `${(100 - overallUtil).toFixed(1)}%`}
+              sub={subnetsWhy ?? `${freeIPs.toLocaleString()} IPv4 free`}
               icon={HardDrive}
               tone={
-                overallUtil >= 95 ? "bad" : overallUtil >= 80 ? "warn" : "good"
+                subnetsWhy
+                  ? "default"
+                  : overallUtil >= 95
+                    ? "bad"
+                    : overallUtil >= 80
+                      ? "warn"
+                      : "good"
               }
             />
 
@@ -2439,14 +2474,18 @@ export function DashboardPage() {
                   </h3>
                 </div>
                 <span className="text-[11px] text-muted-foreground">
-                  Showing {topSubnets.length} of {subnets?.length ?? 0}
+                  {subnetsError
+                    ? "—"
+                    : `Showing ${topSubnets.length} of ${subnets?.length ?? 0}`}
                 </span>
               </div>
               <div className="overflow-x-auto">
                 <div className="min-w-[480px] divide-y">
                   {topSubnets.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                      No subnets have allocated IPs yet.
+                      <ListEmpty error={subnetsError} what="subnets">
+                        No subnets have allocated IPs yet.
+                      </ListEmpty>
                     </div>
                   ) : (
                     topSubnets.map((subnet) => (
@@ -2572,13 +2611,17 @@ export function DashboardPage() {
                 </h3>
               </div>
               <span className="text-[11px] text-muted-foreground">
-                Showing {ipamTopSubnets.length} of {subnetsScoped.length}
+                {subnetsError
+                  ? "—"
+                  : `Showing ${ipamTopSubnets.length} of ${subnetsScoped.length}`}
               </span>
             </div>
             <div className="divide-y">
               {ipamTopSubnets.length === 0 ? (
                 <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                  No subnets have allocated IPs yet.
+                  <ListEmpty error={subnetsError} what="subnets">
+                    No subnets have allocated IPs yet.
+                  </ListEmpty>
                 </div>
               ) : (
                 ipamTopSubnets.map((subnet) => (
@@ -2656,10 +2699,19 @@ export function DashboardPage() {
         {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-            <p className="text-sm font-medium">No DNS servers registered</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Register a DNS server to see query rates, zones, and health here.
-            </p>
+            {dnsGroupsError ? (
+              <p className="text-sm text-muted-foreground">
+                <ListReadError error={dnsGroupsError} what="DNS servers" />
+              </p>
+            ) : (
+              <>
+                <p className="text-sm font-medium">No DNS servers registered</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Register a DNS server to see query rates, zones, and health
+                  here.
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -2729,11 +2781,21 @@ export function DashboardPage() {
         {tab === "dhcp" && dhcpOn && dhcpServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-            <p className="text-sm font-medium">No DHCP servers registered</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Register a DHCP server to see lease activity, scopes, and HA state
-              here.
-            </p>
+            {dhcpServersError ? (
+              <p className="text-sm text-muted-foreground">
+                <ListReadError error={dhcpServersError} what="DHCP servers" />
+              </p>
+            ) : (
+              <>
+                <p className="text-sm font-medium">
+                  No DHCP servers registered
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Register a DHCP server to see lease activity, scopes, and HA
+                  state here.
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -2791,7 +2853,12 @@ export function DashboardPage() {
 
         {tab === "security" && <SecurityPanel />}
 
-        {tab === "compliance" && <CompliancePanel subnets={subnets ?? []} />}
+        {tab === "compliance" && (
+          <CompliancePanel
+            subnets={subnets ?? []}
+            subnetsError={subnetsError}
+          />
+        )}
 
         {/* ── Conformity tab ────────────────────────────────────────── */}
         {tab === "conformity" && <ConformityPanel />}
@@ -4128,7 +4195,13 @@ function IntegrationRow({
 // this one — different audience question. This tab answers "is
 // anything *changing* in scope?", the conformity tab answers "is
 // scope still in policy *right now*?".
-function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
+function CompliancePanel({
+  subnets,
+  subnetsError,
+}: {
+  subnets: Subnet[];
+  subnetsError?: unknown;
+}) {
   const pciCount = subnets.filter((s) => s.pci_scope).length;
   const hipaaCount = subnets.filter((s) => s.hipaa_scope).length;
   const internetCount = subnets.filter((s) => s.internet_facing).length;
@@ -4161,6 +4234,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           label="PCI scope"
           count={pciCount}
           total={subnets.length}
+          error={subnetsError}
           to="/admin/compliance"
           tone="bad"
         />
@@ -4168,6 +4242,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           label="HIPAA scope"
           count={hipaaCount}
           total={subnets.length}
+          error={subnetsError}
           to="/admin/compliance"
           tone="warn"
         />
@@ -4175,6 +4250,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           label="Internet-facing"
           count={internetCount}
           total={subnets.length}
+          error={subnetsError}
           to="/admin/compliance"
           tone="warn"
         />
@@ -4396,12 +4472,15 @@ function ComplianceKpi({
   total,
   to,
   tone,
+  error,
 }: {
   label: string;
   count: number;
   total: number;
   to: string;
   tone: Tone;
+  /** The subnets read's error: the counts are of a list never read (#3234). */
+  error?: unknown;
 }) {
   const cls = TONE_CLASS[tone];
   const pct = total > 0 ? Math.round((count / total) * 100) : 0;
@@ -4413,11 +4492,20 @@ function ComplianceKpi({
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
         {label}
       </p>
-      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
-        {count}
+      <p
+        className={cn(
+          "mt-2 text-3xl font-bold tabular-nums",
+          error ? "text-muted-foreground" : cls.value,
+        )}
+      >
+        {error ? "—" : count}
       </p>
       <p className="text-[11px] text-muted-foreground">
-        {pct}% of {total} subnets · click to filter
+        {error
+          ? isRefused(error)
+            ? "you may not read subnets"
+            : "couldn't load subnets"
+          : `${pct}% of ${total} subnets · click to filter`}
       </p>
     </Link>
   );
@@ -5373,6 +5461,7 @@ function SecurityPanel() {
     );
   }
 
+  const withheld = data.detail_withheld === true;
   const mfaTone: Tone =
     data.mfa_coverage_pct >= 90
       ? "good"
@@ -5477,7 +5566,12 @@ function SecurityPanel() {
 
       <div className="grid gap-5 lg:grid-cols-2">
         <DashboardListCard
-          title={`Local users without MFA (${data.mfa_unenrolled.length})`}
+          title={
+            withheld
+              ? "Local users without MFA"
+              : `Local users without MFA (${data.mfa_unenrolled.length})`
+          }
+          withheld={withheld}
           emptyHint="Every local user has TOTP enrolled."
         >
           {data.mfa_unenrolled.map((u) => (
@@ -5502,6 +5596,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title="API tokens expiring < 30 d"
+          withheld={withheld}
           emptyHint="No tokens are expiring in the next 30 days."
         >
           {data.api_tokens_expiring.map((t) => (
@@ -5527,6 +5622,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title={`Failed logins past ${data.failed_login_window_hours} h`}
+          withheld={withheld}
           emptyHint={`No failed logins in the last ${data.failed_login_window_hours} h.`}
         >
           {data.failed_login_top_sources.map((row, i) => (
@@ -5556,6 +5652,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title={`Permission changes past ${data.permission_change_window_days} d`}
+          withheld={withheld}
           emptyHint="No role / group / token / auth-provider changes recorded."
         >
           {data.permission_changes.map((row) => (
@@ -5591,10 +5688,14 @@ function SecurityPanel() {
 function DashboardListCard({
   title,
   emptyHint,
+  withheld = false,
   children,
 }: {
   title: string;
   emptyHint: string;
+  /** The server stripped this list for the caller (#400): say so in place of
+   *  the all-clear sentence (#3235). */
+  withheld?: boolean;
   children: React.ReactNode;
 }) {
   // ``React.Children.toArray`` flattens nested arrays (a card fed two
@@ -5611,7 +5712,9 @@ function DashboardListCard({
       </div>
       {childArray.length === 0 ? (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-          {emptyHint}
+          {withheld
+            ? "The detail is not shown to your role. The count above is the whole headline."
+            : emptyHint}
         </div>
       ) : (
         <ul className="divide-y max-h-96 overflow-auto">

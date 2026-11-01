@@ -11344,6 +11344,9 @@ export interface SecurityDashboardPermissionChangeRow {
 }
 export interface SecurityDashboardSummary {
   generated_at: string;
+  /** The per-row lists were stripped for this caller (#400): empty means
+   *  "not shown to you", not "none". Absent from an older server. */
+  detail_withheld?: boolean;
   mfa_total_local_users: number;
   mfa_enrolled_count: number;
   mfa_coverage_pct: number;
