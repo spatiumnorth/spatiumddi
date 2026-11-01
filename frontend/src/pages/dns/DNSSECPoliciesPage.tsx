@@ -202,7 +202,6 @@ function PolicyModal({
   const [kskLife, setKskLife] = useState(existing?.ksk_lifetime_days ?? 0);
   const [zskLife, setZskLife] = useState(existing?.zsk_lifetime_days ?? 90);
   const [nsec3, setNsec3] = useState(existing?.nsec3 ?? false);
-  const [iterations, setIterations] = useState(existing?.nsec3_iterations ?? 0);
   const [saltLen, setSaltLen] = useState(existing?.nsec3_salt_length ?? 0);
   const [optout, setOptout] = useState(existing?.nsec3_optout ?? false);
   const [error, setError] = useState<string | null>(null);
@@ -215,7 +214,7 @@ function PolicyModal({
         ksk_lifetime_days: kskLife,
         zsk_lifetime_days: zskLife,
         nsec3,
-        nsec3_iterations: iterations,
+        nsec3_iterations: 0,
         nsec3_salt_length: saltLen,
         nsec3_optout: optout,
       };
@@ -313,10 +312,12 @@ function PolicyModal({
               Iterations
               <input
                 type="number"
-                min={0}
                 className={cn(inputCls, "mt-1")}
-                value={iterations}
-                onChange={(e) => setIterations(Number(e.target.value))}
+                value={0}
+                readOnly
+                disabled
+                aria-label="Iterations"
+                title="BIND 9.20 only accepts 0 (RFC 9276)"
               />
             </label>
             <label className="block text-xs font-medium text-muted-foreground">
@@ -324,6 +325,7 @@ function PolicyModal({
               <input
                 type="number"
                 min={0}
+                max={255}
                 className={cn(inputCls, "mt-1")}
                 value={saltLen}
                 onChange={(e) => setSaltLen(Number(e.target.value))}
@@ -339,9 +341,11 @@ function PolicyModal({
             </label>
           </div>
         )}
-        {nsec3 && iterations > 0 && (
-          <p className="text-[11px] text-amber-600 dark:text-amber-400">
-            RFC 9276 recommends iterations 0 + salt length 0 for NSEC3.
+        {nsec3 && (
+          <p className="text-[11px] text-muted-foreground">
+            Iterations are fixed at 0: BIND 9.20 refuses any other value (RFC
+            9276), and a refused policy stops the whole server group&rsquo;s
+            config from applying.
           </p>
         )}
         {error && <p className="text-xs text-destructive">{error}</p>}

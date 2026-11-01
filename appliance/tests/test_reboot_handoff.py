@@ -36,6 +36,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -334,7 +335,7 @@ def _module():
 def _run(tmp_path: Path, argv: tuple, *, clusters: list | None = None,
          pods: list | None = None, slices: list | None = None, node: dict | None = None,
          no_node: bool = False, wait_s: float = 5.0, short_wait_s: float = 1.0,
-         handoff_s: float = 5.0, cordon_s: float = 5.0,
+         handoff_s: float = 5.0, cordon_s: float = 5.0, env_extra: dict | None = None,
          **state) -> tuple[subprocess.CompletedProcess, dict]:
     fake = tmp_path / "fake_kubectl.py"
     fake.write_text(FAKE_KUBECTL)
@@ -360,6 +361,7 @@ def _run(tmp_path: Path, argv: tuple, *, clusters: list | None = None,
         "SPATIUM_RETRY_FIRST_S": "0.05",
         "SPATIUM_RETRY_MAX_S": "0.1",
         "FAKE_KUBECTL_STATE": str(state_file),
+        **(env_extra or {}),
     }
     res = subprocess.run([sys.executable, str(SCRIPT), *argv], env=env, capture_output=True,
                          text=True, check=False, timeout=120)
@@ -500,7 +502,7 @@ def test_a_stop_during_the_grace_never_reboots_and_clears_the_marker(tmp_path: P
            and (state / "reboot-pending-fleet.done").exists())
     started = time.monotonic()
     proc.terminate()
-    assert proc.wait(10) == 1
+    assert proc.wait(10) == -signal.SIGTERM
     assert time.monotonic() - started < 5
     assert not (state / "reboot-fleet-grace").exists()
     assert not (tmp_path / "calls").exists()
@@ -521,7 +523,7 @@ def test_a_stop_during_the_wrapper_waits_for_it_then_clears_the_marker(tmp_path:
     proc, state = _agent_start(tmp_path, grace_s=0, wrapper_body="sleep 1; exit 1")
     _until(lambda: (tmp_path / "calls").exists())
     proc.terminate()
-    assert proc.wait(10) == 1
+    assert proc.wait(10) == -signal.SIGTERM
     assert not (state / "reboot-fleet-grace").exists()
 
 
@@ -972,3 +974,61 @@ def test_unknown_arguments_do_nothing(tmp_path: Path) -> None:
     assert res.returncode == 0
     assert "patches" not in st
     assert "unknown arguments" in res.stdout
+
+
+# ---- #3162: the note a cancelled reboot reads ------------------------------------
+
+
+def _note(tmp_path: Path) -> tuple[Path, dict]:
+    note = tmp_path / "switchover"
+    return note, {"SPATIUM_HANDOFF_SWITCHOVER_FILE": str(note)}
+
+
+def test_it_notes_the_switchover_it_asks_cnpg_for(tmp_path: Path) -> None:
+    """A cancel after the cordon cannot take the switchover back: the wrapper
+    keeps this note so the console can say the switchover still completes."""
+    note, env = _note(tmp_path)
+    res, st = _run(tmp_path, ("--before-reboot",), env_extra=env,
+                   switch={"after_gets": 1, "to": f"{CL}-2"})
+    assert res.returncode == 0, res.stderr
+    assert len(st["patches"]) == 1
+    assert note.read_text().split() == [f"{NS}/{CL}", f"{CL}-1"]
+
+
+def test_it_notes_the_switchover_before_the_cordon_is_sent(tmp_path: Path) -> None:
+    """Written before the request, so a cancel landing while the patch is in
+    flight is told the switchover may complete, never that none was asked."""
+    note, env = _note(tmp_path)
+    fake = tmp_path / "fake_kubectl.py"
+    seen = tmp_path / "note-at-patch"
+    # wrap the stub kubectl: record whether the note was there at the patch
+    wrapper = tmp_path / "kubectl_wrap.py"
+    wrapper.write_text(
+        "import os, runpy, sys\n"
+        "if 'patch' in sys.argv:\n"
+        f"    open({str(seen)!r}, 'a').write(str(os.path.exists({str(note)!r})) + '\\n')\n"
+        f"sys.argv = [{str(fake)!r}] + sys.argv[1:]\n"
+        f"runpy.run_path({str(fake)!r}, run_name='__main__')\n")
+    env["SPATIUM_KUBECTL"] = f'"{sys.executable}" "{wrapper}"'
+    res, st = _run(tmp_path, ("--before-reboot",), env_extra=env,
+                   switch={"after_gets": 1, "to": f"{CL}-2"})
+    assert res.returncode == 0, res.stderr
+    assert seen.read_text().split() == ["True"]
+
+
+def test_no_note_when_nothing_is_asked_of_cnpg(tmp_path: Path) -> None:
+    note, env = _note(tmp_path)
+    pods = [_ipod(1, OTHER, "primary"), _ipod(2, NODE, "replica"), _ipod(3, THIRD, "replica")]
+    res, st = _run(tmp_path, ("--before-reboot",), pods=pods, env_extra=env)
+    assert res.returncode == 0
+    assert "patches" not in st
+    assert not note.exists()
+
+
+def test_a_cordon_that_never_lands_takes_its_note_back(tmp_path: Path) -> None:
+    note, env = _note(tmp_path)
+    res, st = _run(tmp_path, ("--before-reboot",), failing_patches=10_000, cordon_s=0.5,
+                   env_extra=env)
+    assert res.returncode == 0
+    assert "could not cordon it" in res.stdout
+    assert not note.exists()
