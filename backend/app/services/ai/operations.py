@@ -469,6 +469,7 @@ async def _preview_create_ip_address(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet.id,
                 IPAddress.address == args.address,
+                holds_address(),  # an ``available`` row is a free slot (#2980, #3249)
             )
         )
     ).scalar_one_or_none()
@@ -508,10 +509,117 @@ async def _preview_create_ip_address(
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
+def _describe_address_warnings(warnings: list[dict[str, Any]], subnet: Subnet) -> str:
+    """The create's confirm-or-force warnings as words for a request.
+
+    The portal has no ``force`` (an approver does not override a collision), so
+    each is a refusal. Another address is never named: the requester may not
+    hold read on it.
+    """
+    parts: list[str] = []
+    for w in warnings:
+        kind = w.get("kind") or w.get("type")
+        if kind == "fqdn_collision":
+            parts.append(f"the name {w.get('fqdn')} is already in use in that DNS zone")
+        elif kind == "mac_collision":
+            parts.append(
+                f"MAC {w.get('mac_address')} is already recorded on another address in this IP space"
+            )
+        elif kind == "ptr_collision":
+            parts.append(
+                f"the reverse zone {w.get('zone')} already holds a PTR at {w.get('ptr_name')}"
+            )
+        elif kind == "dynamic_pool":
+            parts.append(
+                f"{w.get('address')} is inside the DHCP dynamic pool "
+                f"{w.get('pool_start')} to {w.get('pool_end')}"
+            )
+        elif kind == "public_facing_private_ip":
+            parts.append(
+                f"{w.get('address') or 'a private address'} would be published into zone "
+                f"'{w.get('zone')}', which is in a public-facing DNS server group"
+            )
+        else:
+            parts.append(str(w.get("message") or kind))
+    return (
+        f"Cannot allocate in subnet {subnet.network}: " + "; ".join(parts) + ". "
+        "Choose another address, name or MAC."
+    )
+
+
+async def _static_dhcp_scope_error(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+) -> str | None:
+    """Why a ``static_dhcp`` request cannot get its DHCP reservation, else None (#3250).
+
+    The reservation is made by the same sync a manual create calls, which makes
+    none (and only warns) when no scope, or more than one, serves the subnet.
+    A request must not end provisioned with no reservation, so say so up front.
+    """
+    if args.status != "static_dhcp":
+        return None
+    from app.services.dhcp.static_ipam import candidate_scopes_for_ipam_row  # noqa: PLC0415
+
+    probe = IPAddress(subnet_id=subnet.id, address=args.address)
+    scopes = await candidate_scopes_for_ipam_row(db, probe)
+    if not scopes:
+        return (
+            f"No DHCP scope serves {args.address}, so no DHCP reservation can be made for "
+            "a static_dhcp address. Create a scope for the subnet, or request the address "
+            "with another status."
+        )
+    if len(scopes) > 1:
+        return (
+            f"{len(scopes)} DHCP scopes serve subnet {subnet.network}, so the reservation "
+            "for a static_dhcp address cannot be placed. Ask an operator to make this "
+            "allocation by hand."
+        )
+    return None
+
+
+async def _address_request_refusal(
+    db: AsyncSession, subnet: Subnet, args: CreateIPAddressArgs
+) -> Exception | None:
+    """The REST create's collision / pool / name-length refusals, for a request.
+
+    Shared by submit (#3243) and the no-hostname apply (#3248), which does not
+    go through ``create_address`` and so never ran them.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.ipam.router import (  # noqa: PLC0415 — avoid cycle
+        _resolve_effective_zone,
+        address_create_warnings,
+    )
+    from app.core.dns_names import host_in_zone_error  # noqa: PLC0415
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    zone_id = await _resolve_effective_zone(db, subnet) if args.hostname else None
+    zone = await db.get(DNSZone, zone_id) if zone_id else None
+    if args.hostname and zone is not None:
+        err = host_in_zone_error(args.hostname, zone.name.rstrip("."), field="hostname")
+        if err is not None:
+            return HTTPException(status_code=422, detail=err)
+    warnings = await address_create_warnings(
+        db,
+        subnet,
+        address=args.address,
+        hostname=args.hostname,
+        mac_address=args.mac_address,
+        role=None,
+        forward_zone_id=zone.id if zone is not None else None,
+    )
+    if warnings:
+        return HTTPException(status_code=409, detail=_describe_address_warnings(warnings, subnet))
+    return None
+
+
 async def _validate_submit_create_ip_address(
     db: AsyncSession, user: User, args: CreateIPAddressArgs
 ) -> None:
     """Request-portal submit check: what the REST create would refuse (#2903/#2905)."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
     from app.services.ipam.address_create_rules import (  # noqa: PLC0415
         assert_address_unallocated,
         assert_static_dhcp_has_mac,
@@ -524,6 +632,12 @@ async def _validate_submit_create_ip_address(
     assert_subnet_takes_addresses(subnet)
     assert_static_dhcp_has_mac(args.status, args.mac_address)
     await assert_address_unallocated(db, subnet.id, args.address)
+    reason = await _static_dhcp_scope_error(db, subnet, args)
+    if reason is not None:
+        raise HTTPException(status_code=422, detail=reason)
+    refusal = await _address_request_refusal(db, subnet, args)
+    if refusal is not None:
+        raise refusal
 
 
 async def _apply_create_ip_address(
@@ -588,6 +702,20 @@ async def _apply_create_ip_address(
 
     if args.status == "static_dhcp" and not args.mac_address:
         raise ValueError("mac_address is required when status is 'static_dhcp'")
+
+    # #3250 — a static_dhcp request that can get no reservation fails here,
+    # before anything is written, rather than ending provisioned without one.
+    reason = await _static_dhcp_scope_error(db, subnet, args)
+    if reason is not None:
+        raise ValueError(reason)
+
+    if not args.hostname:
+        # #3248 — the create's collision / pool checks. A named address meets
+        # them inside ``create_address``; this path inserts directly, and the
+        # approver cannot force past them.
+        refusal = await _address_request_refusal(db, subnet, args)
+        if refusal is not None:
+            raise ValueError(str(refusal.detail))  # type: ignore[attr-defined]
 
     if args.hostname:
         # #2900 — a named address goes through the REST create, so an
@@ -1978,6 +2106,57 @@ async def _preview_allocate_subnet(
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
 
 
+async def _validate_submit_allocate_subnet(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> None:
+    """Request-portal submit check: what the REST allocate would refuse (#3244).
+
+    A malformed / unknown / non-subnet template, and a subnet the estate's
+    Required custom fields would refuse (counting what the template and the
+    block chain supply), answered in the allocate's own words.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.ipam.router import SubnetAllocate  # noqa: PLC0415 — avoid cycle
+    from app.models.ipam import IPAMTemplate  # noqa: PLC0415
+    from app.services.ipam.custom_field_rules import (  # noqa: PLC0415
+        enforce_required_custom_fields,
+        inherited_block_custom_fields,
+    )
+    from app.services.ipam.templates import (  # noqa: PLC0415
+        TemplateError,
+        apply_template_on_create_subnet,
+    )
+
+    try:
+        template_id = UUID(args.template_id) if args.template_id else None
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"template_id {args.template_id!r} is not a valid UUID"
+        ) from exc
+    body = SubnetAllocate(
+        prefix_len=args.prefix_len,
+        name=args.name or "",
+        description=args.description or "",
+        template_id=template_id,
+    )
+    if template_id is not None:
+        template = await db.get(IPAMTemplate, template_id)
+        if template is None:
+            raise HTTPException(status_code=404, detail="Template not found")
+        try:
+            apply_template_on_create_subnet(template, body)
+        except TemplateError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    await enforce_required_custom_fields(
+        db,
+        "subnet",
+        body.custom_fields,
+        inherited=await inherited_block_custom_fields(db, UUID(args.block_id)),
+        creating=True,
+    )
+
+
 async def _apply_allocate_subnet(
     db: AsyncSession, user: User, args: AllocateSubnetArgs
 ) -> dict[str, Any]:
@@ -2023,6 +2202,7 @@ register(
         args_model=AllocateSubnetArgs,
         preview=_preview_allocate_subnet,
         apply=_apply_allocate_subnet,
+        validate_submit=_validate_submit_allocate_subnet,
         category="ipam",
         required_permission=("write", "subnet"),
     )
@@ -2375,9 +2555,24 @@ def _zone_records_refusal(user: User, zone_id: object) -> OperationPermissionErr
     return OperationPermissionError("write", "dns_zone", "API token is not scoped to this DNS zone")
 
 
+def _record_struct_fields(
+    args: CreateDNSRecordArgs, rtype: str
+) -> tuple[int | None, int | None, int | None]:
+    """The record create's per-type priority / weight / port rules (#3245).
+
+    Returns what the create would store; raises its own 422 (HTTPException) for
+    a field the type does not take, so submit, preview and apply agree with it.
+    """
+    from app.api.v1.dns.router import _normalize_record_struct_fields  # noqa: PLC0415
+
+    return _normalize_record_struct_fields(rtype, args.priority, args.weight, args.port)
+
+
 async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> PreviewResult:
+    from fastapi import HTTPException  # noqa: PLC0415
+
     from app.models.dns import DNSRecord, DNSZone  # local import — avoid cycle
     from app.services.dns.cname_conflict import (
         APEX_CNAME_DETAIL,
@@ -2407,6 +2602,10 @@ async def _preview_create_dns_record(
                 ok=False,
                 detail="SRV records require " + ", ".join(missing) + ".",
             )
+    try:
+        priority, weight, port = _record_struct_fields(args, rtype)
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=str(exc.detail))
 
     zone = await db.get(DNSZone, args.zone_id)
     # A zone the caller can neither read nor create records in (the REST
@@ -2439,9 +2638,9 @@ async def _preview_create_dns_record(
     rdata_err = record_value_error(
         rtype,
         args.value,
-        priority=args.priority,
-        weight=args.weight,
-        port=args.port,
+        priority=priority,
+        weight=weight,
+        port=port,
         origin=zone.name,
     )
     if rdata_err is not None:
@@ -2479,12 +2678,12 @@ async def _preview_create_dns_record(
     ]
     if args.ttl is not None:
         parts.append(f"ttl={args.ttl}")
-    if args.priority is not None:
-        parts.append(f"priority={args.priority}")
-    if args.weight is not None:
-        parts.append(f"weight={args.weight}")
-    if args.port is not None:
-        parts.append(f"port={args.port}")
+    if priority is not None:
+        parts.append(f"priority={priority}")
+    if weight is not None:
+        parts.append(f"weight={weight}")
+    if port is not None:
+        parts.append(f"port={port}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
@@ -2499,6 +2698,9 @@ async def _validate_submit_create_dns_record(
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
 
     rtype = args.record_type.strip().upper()
+    # The create's per-type priority / weight / port rules (#3245): 422 in its
+    # words for a field the type does not take.
+    priority, weight, port = _record_struct_fields(args, rtype)
     existing = await find_identical_record(
         db,
         UUID(args.zone_id),
@@ -2506,9 +2708,9 @@ async def _validate_submit_create_dns_record(
         name=args.name.strip(),
         record_type=rtype,
         value=args.value,
-        priority=args.priority,
-        weight=args.weight if rtype == "SRV" else None,
-        port=args.port if rtype == "SRV" else None,
+        priority=priority,
+        weight=weight,
+        port=port,
     )
     if existing is not None:
         # The REST wording minus the existing row's id (``describe_identical``
@@ -2525,6 +2727,8 @@ async def _validate_submit_create_dns_record(
 async def _apply_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> dict[str, Any]:
+    from fastapi import HTTPException
+
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
     from app.core.agent_wake import dns_group_channel, publish_wake
     from app.models.dns import DNSRecord, DNSZone
@@ -2550,6 +2754,12 @@ async def _apply_create_dns_record(
         raise ValueError("MX records require a priority.")
     if rtype == "SRV" and (args.priority is None or args.weight is None or args.port is None):
         raise ValueError("SRV records require priority, weight, and port.")
+    # The REST create's per-type field rules (#3245), so no record is stored
+    # with a field its own update refuses.
+    try:
+        priority, weight, port = _record_struct_fields(args, rtype)
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
 
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
@@ -2580,9 +2790,9 @@ async def _apply_create_dns_record(
     rdata_err = record_value_error(
         rtype,
         args.value,
-        priority=args.priority,
-        weight=args.weight,
-        port=args.port,
+        priority=priority,
+        weight=weight,
+        port=port,
         origin=zone.name,
     )
     if rdata_err is not None:
@@ -2600,9 +2810,9 @@ async def _apply_create_dns_record(
         name=name,
         record_type=rtype,
         value=args.value,
-        priority=args.priority,
-        weight=args.weight if rtype == "SRV" else None,
-        port=args.port if rtype == "SRV" else None,
+        priority=priority,
+        weight=weight,
+        port=port,
     )
     if existing is not None:
         raise ValueError(describe_identical(existing))
@@ -2620,9 +2830,9 @@ async def _apply_create_dns_record(
         record_type=rtype,
         value=args.value,
         ttl=args.ttl,
-        priority=args.priority,
-        weight=args.weight if rtype == "SRV" else None,
-        port=args.port if rtype == "SRV" else None,
+        priority=priority,
+        weight=weight,
+        port=port,
         created_by_user_id=user.id,
     )
     db.add(row)
@@ -2664,9 +2874,9 @@ async def _apply_create_dns_record(
             "type": rtype,
             "value": args.value,
             "ttl": args.ttl,
-            "priority": args.priority,
-            "weight": args.weight if rtype == "SRV" else None,
-            "port": args.port if rtype == "SRV" else None,
+            "priority": priority,
+            "weight": weight,
+            "port": port,
             "via": "ai_proposal",
         },
     )
