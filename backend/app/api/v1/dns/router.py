@@ -8147,7 +8147,9 @@ async def create_zone_from_template(
 
     # Every provider-refusal gate runs on the whole record set BEFORE the zone
     # exists or is pushed anywhere, so a refusal is atomic (#3007).
-    record_payloads = materialize(template, body.zone_name, body.params)
+    # Reuses the list checked above, whose owners were written back in the
+    # record API's stored form (#3266) — never re-materialised from the raw
+    # parameters, or the rows below would store the names as typed.
     for r in record_payloads:
         if r["record_type"] in VALID_RECORD_TYPES:
             await _check_driver_gated_record_type(r["record_type"], group_id, db)
