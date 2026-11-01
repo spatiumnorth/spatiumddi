@@ -35,18 +35,33 @@ def describe_exc(exc: BaseException) -> str:
     return name
 
 
-# A URL anywhere in the text, split so only scheme + host (+ port) survive.
-# The userinfo group is greedy up to the LAST ``@`` before the path, so a
-# password holding a bare ``@`` is dropped whole rather than cut at its
-# first ``@`` and half-quoted.
-_URL_RE = re.compile(
-    r"([A-Za-z][A-Za-z0-9+.-]*://)"  # scheme
-    r"(?:[^\s/?#'\"]*@)?"  # userinfo (dropped)
-    r"(\[[^\]\s]*\]|[^\s/?#'\"@:]*)"  # host, or a bracketed IPv6 literal
-    r"(:\d+)?"  # port
-    r"[^\s'\"]*"  # path, query, fragment (dropped)
-)
+# A URL anywhere in the text: an optional opening wrapper, the scheme, then
+# EVERYTHING up to the next whitespace. Quotes, brackets, ``@``, ``/`` and
+# ``#`` are all legal inside userinfo, paths and query values, so no
+# character other than whitespace may end the match: stopping at one would
+# leave the rest of a secret behind in the message (fail closed).
+_URL_RE = re.compile(r"(?P<open>[(\[<'\"])?(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<rest>\S*)")
+_CLOSERS = {"(": ")", "[": "]", "<": ">", "'": "'", '"': '"'}
+_AUTHORITY_RE = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._~-]+)(:\d+)?")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _reduce_url(match: re.Match[str]) -> str:
+    scheme = match["scheme"]
+    rest = match["rest"]
+    opener = match["open"]
+    # The authority ends at the first / ? # ; userinfo ends at the LAST @
+    # inside it. Anything that is then not a plain host[:port] is redacted
+    # whole rather than half-quoted.
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0].rsplit("@", 1)[-1]
+    ok = _AUTHORITY_RE.fullmatch(authority)
+    out = scheme + (authority if ok else "[redacted]")
+    # Keep a wrapping closer only when it pairs with the opener right
+    # before the URL; it is re-added from our own table, never copied
+    # from the URL's text.
+    if opener and rest.endswith(_CLOSERS[opener]):
+        out += _CLOSERS[opener]
+    return (opener or "") + out
 
 
 def _redact(text: str) -> str:
@@ -56,8 +71,10 @@ def _redact(text: str) -> str:
     integrations pass tokens in the query or the userinfo, and a webhook
     URL (Slack, Teams, Discord) carries its secret in the PATH, so a
     message built from an exception that echoes a URL keeps none of them.
+    A URL is consumed up to the next whitespace; if its authority is not
+    a plain host it becomes ``scheme://[redacted]``.
     """
-    return _URL_RE.sub(r"\1\2\3", text)
+    return _URL_RE.sub(_reduce_url, text)
 
 
 def _target(exc: BaseException) -> str | None:

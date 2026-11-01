@@ -194,3 +194,34 @@ def test_tls_probe_failure_with_empty_exception_says_something(
     outcome = probe.fetch_endpoint("h.example", 443, None, timeout=1)
     assert outcome.error and not outcome.error.rstrip().endswith(":")
     assert "ZeroReturnError" in outcome.error
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "bad https://h.example/services/'TOKEN",
+        'bad https://h.example/services/"TOKEN',
+        "bad https://h.example/p?k='TOKEN&x=1",
+        "bad https://u:p'TOKEN@h.example/x",
+        'bad https://u:p"TOKEN@h.example/x',
+        "bad https://u:p@TOKEN@h.example/x",
+        "bad https://u:p#TOKEN@h.example/x",
+        "bad https://u:p/TOKEN@h.example/x",
+        "bad (https://h.example/a'TOKEN)",
+        "bad 'https://h.example/a'TOKEN",
+        'bad "https://h.example/a"TOKEN"',
+        "bad [https://h.example/a]TOKEN",
+    ],
+)
+def test_url_reduction_fails_closed(text: str) -> None:
+    out = describe_http_exc(ValueError(text))
+    assert "TOKEN" not in out
+    assert out.startswith("bad ")
+
+
+def test_url_wrapped_in_quotes_or_brackets_keeps_the_wrapper() -> None:
+    assert describe_http_exc(ValueError("see 'https://h.example/s/T'")) == "see 'https://h.example'"
+    assert describe_http_exc(ValueError("see (https://u:p@h.example:8443/s)")) == (
+        "see (https://h.example:8443)"
+    )
+    assert describe_http_exc(ValueError('x "http://h.example/a" y')) == 'x "http://h.example" y'
