@@ -57,3 +57,22 @@ export function pollUnlessRefused(
 ): (query: { state: { error: Error | null } }) => number | false {
   return (query) => (isRefused(query.state.error) ? false : ms);
 }
+
+/**
+ * What a failed export or download says, in words (#3255). A 403 says the
+ * caller is not permitted, with the server's reason; a 5xx says the export is
+ * unavailable; anything else gives the server's own message. Never a bare
+ * "Request failed with status code N".
+ */
+export function exportErrorMessage(err: unknown, what: string): string {
+  const reason = formatApiError(err, "");
+  if (isRefused(err)) {
+    const shown = reason && reason !== "Forbidden" ? ` (${reason})` : "";
+    return `You're not permitted to export ${what}${shown}.`;
+  }
+  const status = apiErrorStatus(err);
+  if (status !== undefined && status >= 500) {
+    return `Exporting ${what} is unavailable right now${reason ? ` (${reason})` : ""}.`;
+  }
+  return `Couldn't export ${what}: ${reason || "the request failed"}`;
+}

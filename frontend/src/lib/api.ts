@@ -185,6 +185,25 @@ function createClient(): AxiosInstance {
 
 export const api = createClient();
 
+/** A file download is requested with `responseType: "blob"`, so a refusal's
+ *  JSON body also arrives as a Blob and `response.data.detail` is unreadable
+ *  (#3255). Decode it in place and re-throw the same error, so the status and
+ *  `formatApiError` both still work for the caller. */
+export async function rethrowBlobError(err: unknown): Promise<never> {
+  const res = (err as { response?: { data?: unknown } } | null)?.response;
+  if (res && res.data instanceof Blob) {
+    const text = await res.data.text();
+    let detail: unknown = text || undefined;
+    try {
+      detail = JSON.parse(text)?.detail ?? detail;
+    } catch {
+      // body wasn't JSON: keep the raw text
+    }
+    res.data = detail === undefined ? undefined : { detail };
+  }
+  throw err;
+}
+
 /**
  * Normalise whatever shape an API error arrives in into a single string
  * suitable for React children (issue #31) and operator-readable toasts
@@ -11157,10 +11176,12 @@ export const conformityApi = {
   // ``Content-Disposition`` for the backend's UTC-timestamped
   // filename, trigger a synthetic anchor click for the download.
   exportPdf: async (framework?: string): Promise<void> => {
-    const res = await api.get<Blob>("/conformity/export.pdf", {
-      params: framework ? { framework } : undefined,
-      responseType: "blob",
-    });
+    const res = await api
+      .get<Blob>("/conformity/export.pdf", {
+        params: framework ? { framework } : undefined,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     const ts = new Date()
@@ -21347,10 +21368,12 @@ export const e911Api = {
   download: async (kind: "csv" | "ios", siteId?: string) => {
     const path =
       kind === "csv" ? "/e911/export.csv" : "/e911/export/ios-lldp-med.txt";
-    const res = await api.get(path, {
-      params: siteId ? { site_id: siteId } : undefined,
-      responseType: "blob",
-    });
+    const res = await api
+      .get(path, {
+        params: siteId ? { site_id: siteId } : undefined,
+        responseType: "blob",
+      })
+      .catch(rethrowBlobError);
     const disp = String(res.headers["content-disposition"] ?? "");
     const match = disp.match(/filename="?([^"]+)"?/);
     const ts = new Date()

@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // ── tool catalog ────────────────────────────────────────────────────
 
@@ -207,6 +208,10 @@ export function NetworkToolsPage() {
   // ``"server"`` or an appliance id. Default = server (back-compat).
   const [runFrom, setRunFrom] = useState("server");
   const tool = TOOLS.find((t) => t.id === active)!;
+  // #3254 — every tool route asks read on 'use_network_tools', so a user
+  // without it is told so on opening rather than after a Run.
+  const perms = usePermissions();
+  const denied = !perms.isLoading && !perms.can("read", TOOLS_PERMISSION);
 
   // Fleet appliances we can dispatch reachability tools to. Cheap +
   // shared list endpoint; refetch on a short cadence so the online set
@@ -248,6 +253,11 @@ export function NetworkToolsPage() {
           tools can run from the control-plane server or a Fleet appliance's
           vantage; rate-limited per user.
         </p>
+        {denied && (
+          <p role="alert" className="mt-2 text-xs text-muted-foreground">
+            {TOOLS_DENIED_REASON}
+          </p>
+        )}
       </div>
 
       <div className="flex flex-1 overflow-hidden">
@@ -1233,6 +1243,9 @@ function WolTool({ target }: { target?: NetToolTarget }) {
 
 // ── run button ────────────────────────────────────────────────────────
 
+const TOOLS_PERMISSION = "use_network_tools";
+const TOOLS_DENIED_REASON = `You don't have permission to run the network tools (Permission denied: need 'read' on '${TOOLS_PERMISSION}').`;
+
 function RunButton({
   busy,
   onClick,
@@ -1242,9 +1255,19 @@ function RunButton({
   onClick: () => void;
   label: string;
 }) {
+  const perms = usePermissions();
+  const gate = permissionGate(
+    perms.can("read", TOOLS_PERMISSION),
+    TOOLS_DENIED_REASON,
+  );
   return (
     <div className="flex justify-end">
-      <HeaderButton variant="primary" onClick={onClick} disabled={busy}>
+      <HeaderButton
+        variant="primary"
+        onClick={onClick}
+        disabled={busy}
+        {...gate}
+      >
         {busy ? (
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
         ) : (
