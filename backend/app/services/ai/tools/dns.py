@@ -1225,6 +1225,14 @@ class FindZoneDriftArgs(BaseModel):
         "change made directly on the host), 'missing on the server' (DB "
         "rows the server isn't serving), and in-sync — plus a sample of the "
         "drifting records. A value change shows as a missing+extra pair. "
+        "Each server's `status` is 'ok' only when the zone transferred, "
+        "nothing is missing or extra and it is not below the zone's serial; "
+        "'syncing' = the zone changed under two minutes ago and the server "
+        "has not caught up yet; 'behind' = transferred but saved records are "
+        "missing or the server is below the zone's serial; 'drift' = not "
+        "behind, but carries records SpatiumDDI does not hold (or differs in "
+        "a way DNS views can explain); 'error' / 'unsupported' = the transfer "
+        "failed or cannot be done (no diff). `reason` says why. "
         "Use to answer 'is example.com drifting?' or 'did someone edit "
         "records directly on the BIND9 host?'. Read-only."
     ),
@@ -1255,6 +1263,9 @@ async def find_dns_zone_drift(
                 "driver": s.driver,
                 "status": s.status,
                 "error": s.error,
+                "reason": s.reason,
+                "current_serial": s.current_serial,
+                "target_serial": s.target_serial,
                 "in_sync": s.in_sync,
                 "drift_count": s.drift_count,
                 "extra_on_server": [
@@ -1401,7 +1412,8 @@ async def find_dns_query_stats(
 
 class FindDNSQueriesArgs(BaseModel):
     client_ip: str | None = Field(
-        default=None, description="Only queries from this client IP address."
+        default=None,
+        description="Client IP: a whole address, a CIDR, or a leading part (e.g. 10.1.).",
     )
     qname_contains: str | None = Field(
         default=None, max_length=255, description="Substring match on the queried name."
@@ -1457,17 +1469,13 @@ async def find_dns_queries(
     from datetime import UTC, datetime, timedelta  # noqa: PLC0415
 
     from app.services.logs.agent_logs import (  # noqa: PLC0415
+        InvalidLogFilter,
         LogScopeError,
         resolve_dns_log_servers,
         search_dns_queries,
     )
 
-    client_ip: str | None = None
-    if args.client_ip:
-        try:
-            client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
-        except ValueError:
-            return [{"result": f"{args.client_ip!r} is not an IP address"}]
+    client_ip = args.client_ip
     # A UUID column comparison raises a DBAPIError on anything that is not
     # one, and the likeliest wrong value here is a server or group NAME the
     # model read off another tool's output — so answer the question instead
@@ -1487,16 +1495,19 @@ async def find_dns_queries(
     except LogScopeError as exc:
         return [{"result": exc.detail}]
     names = {s.id: s.name for s in servers}
-    rows = await search_dns_queries(
-        db,
-        list(names),
-        since=datetime.now(UTC) - timedelta(minutes=args.minutes),
-        client_ip=client_ip,
-        qname_contains=args.qname_contains,
-        qtype=args.qtype,
-        rcode=args.rcode,
-        limit=args.limit,
-    )
+    try:
+        rows = await search_dns_queries(
+            db,
+            list(names),
+            since=datetime.now(UTC) - timedelta(minutes=args.minutes),
+            client_ip=client_ip,
+            qname_contains=args.qname_contains,
+            qtype=args.qtype,
+            rcode=args.rcode,
+            limit=args.limit,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat(),

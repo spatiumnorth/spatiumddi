@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   Activity,
   AlertTriangle,
@@ -1153,6 +1154,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
   const sinceIso = since ? new Date(since).toISOString() : null;
   const enabled = !!selection;
+  // A partial address filters as you type; wait for a pause so each
+  // keystroke is not its own request (#3171).
+  const debouncedClientIp = useDebouncedValue(clientIp);
 
   const dnsQueriesQuery = useQuery({
     queryKey: [
@@ -1162,7 +1166,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
       sinceIso,
       q,
       qtype,
-      clientIp,
+      debouncedClientIp,
       view,
       rcode,
     ],
@@ -1173,7 +1177,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         since: sinceIso,
         q: q.trim() || null,
         qtype: qtype.trim() || null,
-        client_ip: clientIp.trim() || null,
+        client_ip: debouncedClientIp.trim() || null,
         view: view.trim() || null,
         rcode: rcode.trim() || null,
       }),
@@ -1656,6 +1660,8 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
 
   const sinceIso = since ? new Date(since).toISOString() : null;
   const enabled = !!selection;
+  const debouncedMac = useDebouncedValue(mac);
+  const debouncedIp = useDebouncedValue(ip);
 
   const activityQuery = useQuery({
     queryKey: [
@@ -1666,8 +1672,8 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
       q,
       severity,
       code,
-      mac,
-      ip,
+      debouncedMac,
+      debouncedIp,
     ],
     queryFn: () =>
       logsApi.dhcpActivity({
@@ -1677,8 +1683,8 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
         q: q.trim() || null,
         severity: severity.trim() || null,
         code: code.trim() || null,
-        mac_address: mac.trim() || null,
-        ip_address: ip.trim() || null,
+        mac_address: debouncedMac.trim() || null,
+        ip_address: debouncedIp.trim() || null,
       }),
     enabled,
     staleTime: 5_000,

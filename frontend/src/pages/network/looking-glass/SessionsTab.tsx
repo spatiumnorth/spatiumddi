@@ -18,6 +18,7 @@ import {
   type MetalLBBgpPeer,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -85,7 +86,7 @@ export function SessionsTab({
   const sessionsQ = useQuery({
     queryKey: ["bgp-lg-sessions"],
     queryFn: () => lookingGlassApi.listSessions(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
   // Peers carry the full config (matched_asn_id, collector, description, …)
   // that SessionRead doesn't — needed for the ASN link + the edit/delete
@@ -93,7 +94,7 @@ export function SessionsTab({
   const peersQ = useQuery({
     queryKey: ["bgp-lg-peers"],
     queryFn: () => lookingGlassApi.listPeers(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
 
   const peersById = useMemo(() => {

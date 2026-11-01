@@ -258,7 +258,8 @@ def test_a_member_on_another_release_keeps_the_agents_and_writes_its_own_release
     assert member["dnsBind9"]["agentKey"] == DNS_KEY
     assert member["dnsBind9"]["serverGroupName"] == "default"
     assert member["dhcpKea"]["agentKey"] == DHCP_KEY
-    assert member["dhcpKea"]["serverGroupName"] == "default-dhcp"
+    # #3202: the shared chart carries no node's DHCP group.
+    assert "serverGroupName" not in member["dhcpKea"]
     assert member["lookingGlass"]["enabled"] is False
 
 
@@ -269,7 +270,9 @@ def test_a_kept_agent_takes_only_the_holders_values_from_the_live_chart(
     server group, its DHCP network mode) comes from the live chart; the writer
     renders the rest. Here the live chart carries a value no supervisor of this
     release writes into an agent block (as a block another release rendered
-    could), and a control-plane URL other than the writer's: neither is copied."""
+    could), and a control-plane URL other than the writer's: neither is copied.
+    Nor is a DHCP group an older build wrote there: dhcpKea carries none
+    (#3202)."""
     monkeypatch.setattr(appliance_state, "is_control_plane_member", lambda: False)
     monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
     values = service_lifecycle._build_values([], {})
@@ -283,13 +286,13 @@ def test_a_kept_agent_takes_only_the_holders_values_from_the_live_chart(
         },
     )
     live["dhcpKea"]["image"] = {"tag": "2026.10.02-1"}
+    live["dhcpKea"]["serverGroupName"] = "site-a"  # as an older build wrote it
     out, kept = service_lifecycle.keep_other_nodes_agents(values, live, {"dhcp"})
     assert kept == ["dhcpKea"]
     assert out["dhcpKea"] == {
         **values["dhcpKea"],
         "enabled": True,
         "agentKey": DHCP_KEY,
-        "serverGroupName": "site-a",
         "networkMode": "bridge",
     }
     assert out["global"] == values["global"]

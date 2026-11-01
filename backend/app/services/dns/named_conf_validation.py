@@ -1024,3 +1024,47 @@ def validate_update_acl_entry(
             if t is not None and str(t).strip()
         ] or None
     return pattern, types
+
+
+#: BIND 9.20 accepts exactly one NSEC3 iteration count. ``named-checkconf``
+#: answers ``dnssec-policy: nsec3 iterations value N not allowed, must be
+#: zero`` (verified against 9.20.29), and RFC 9276 §3.1 says the same. A
+#: refused ``dnssec-policy`` rejects the WHOLE ``named.conf``, so one such
+#: policy stops every structural change on the group converging (#3153, the
+#: #876 / #899 class). The salt length is NOT restricted (0-255 loads).
+BIND_NSEC3_ITERATIONS = 0
+BIND_NSEC3_SALT_MAX = 255
+
+
+def validate_nsec3_iterations(value: int) -> int:
+    """Raise ``ValueError`` (a 422 inside a pydantic validator) unless 0."""
+    if value != BIND_NSEC3_ITERATIONS:
+        raise ValueError(
+            f"nsec3_iterations must be {BIND_NSEC3_ITERATIONS}: BIND 9.20 refuses "
+            "any other value (RFC 9276 recommends 0), and a policy it refuses "
+            "stops the whole server group's config from applying"
+        )
+    return value
+
+
+def validate_nsec3_salt_length(value: int) -> int:
+    if not 0 <= value <= BIND_NSEC3_SALT_MAX:
+        raise ValueError(f"nsec3_salt_length must be between 0 and {BIND_NSEC3_SALT_MAX}")
+    return value
+
+
+def effective_nsec3_iterations(policy_name: str, value: int | None, log: Any = None) -> int:
+    """What a stored policy renders as. Rows saved before the API refused a
+    non-zero count still exist; rendering them as stored would make BIND
+    reject the whole config, so they render as 0 with a warning."""
+    v = int(value or 0)
+    if v != BIND_NSEC3_ITERATIONS:
+        if log is not None:
+            log.warning(
+                "dnssec_policy_nsec3_iterations_clamped",
+                policy=policy_name,
+                stored=v,
+                rendered=BIND_NSEC3_ITERATIONS,
+            )
+        return BIND_NSEC3_ITERATIONS
+    return v

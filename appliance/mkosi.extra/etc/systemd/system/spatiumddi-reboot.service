@@ -24,3 +24,10 @@ ExecStartPre=-/bin/mv -T /var/lib/spatiumddi/release-state/reboot-pending /var/l
 # reboots whatever the handoff did.
 TimeoutStartSec=infinity
 ExecStart=/usr/local/bin/spatium-power-action reboot
+# #3162 — F9 (systemctl stop) is a cancel, not a failure: the wrapper ends by
+# the stop's own signal. For Type=oneshot systemd counts death by SIGTERM /
+# SIGINT / SIGHUP as a FAILURE (result 'signal') unless listed here, so
+# without this line the unit is left 'failed' exactly as with the old exit 1
+# (verified on systemd 257). It also covers a stop that lands in an
+# ExecStartPre sleep. Exit 1 (a failed systemctl reboot) stays a failure.
+SuccessExitStatus=TERM INT HUP
