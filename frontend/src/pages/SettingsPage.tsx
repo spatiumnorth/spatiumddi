@@ -9,6 +9,7 @@ import {
   type PlatformSettings,
   versionApi,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   AlertCircle,
   ArrowRight,
@@ -1481,7 +1482,13 @@ export function SettingsPage() {
   return (
     <div className="flex h-full overflow-hidden">
       {/* ── Sidebar ── */}
-      <aside className="w-64 flex-shrink-0 border-r bg-card overflow-y-auto">
+      <ResizablePane
+        storageKey="settings"
+        defaultWidth={256}
+        label="Resize settings sections"
+        as="aside"
+        className="border-r bg-card overflow-y-auto"
+      >
         <div className="border-b px-4 py-3">
           <h1 className="text-sm font-semibold">Settings</h1>
           <p className="text-xs text-muted-foreground">
@@ -1555,7 +1562,7 @@ export function SettingsPage() {
                 );
               })}
         </nav>
-      </aside>
+      </ResizablePane>
 
       {/* ── Main pane ── */}
       <main className="flex-1 overflow-y-auto">

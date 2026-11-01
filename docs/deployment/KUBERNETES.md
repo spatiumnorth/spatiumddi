@@ -273,6 +273,29 @@ rotating JWT, and long-polls the config bundle — the full bootstrap +
 registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 [`k8s/README.md` → How servers register](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md#how-servers-register).
 
+**Naming of agent objects (#3209).** The StatefulSet, Service and headless
+Service are named `dns-<flavor>-<name>` (DHCP: `dhcp-<flavor>-<name>`), without
+the release fullname, so two releases in one namespace collide. Set
+`dnsAgents.prefixWithFullname: true` (and `dhcpAgents.prefixWithFullname`) to
+get `<fullname>-dns-<flavor>-<name>` (a name over 52 characters is cut to 43
+plus a hash of the whole, so it stays unique). It defaults to `false` because a
+StatefulSet cannot be renamed: changing it on a live install deletes the old
+StatefulSet and creates a new one with **new PVCs** and a new pod name (the
+server's registered identity), so the agent registers again as a new server.
+Set it at install time; the default is expected to flip in a later release.
+
+**Placement and storage (#3206).** A server's `affinity` is merged with the
+chart's preferred one-per-node anti-affinity, so you can *prefer* a node
+without pinning it; `dnsAgents.storageClass` / `dhcpAgents.storageClass` (and
+`servers[].storageClass`) set the class of both volume claims, which otherwise
+use the cluster's default StorageClass. Set it before the first install: claim
+templates are immutable, so Kubernetes refuses the change on a live
+StatefulSet, and a PVC that already exists keeps the class it was created with.
+On an existing install, `kubectl delete sts <name> -n <ns> --cascade=orphan`
+(pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
+with that command when it detects the change. See the chart README,
+[Adopting `storageClass` on an existing install](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#adopting-storageclass-on-an-existing-install).
+
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
 > `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
 > at a LoadBalancer Service on UDP/67 you opted into. The static manifests under
@@ -282,8 +305,9 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 > only helps a relay that can forward to a non-standard port; most,
 > including `ip helper-address`, send to UDP/67 only.
 
-Per-server entry fields (`name`, `role`, `group`, `storage.*`, `service.type`,
-`service.nodePort`, `hostNetwork`, `resources`) are documented in the
+Per-server entry fields (`name`, `role`, `group`, `storage.*`, `storageClass`,
+`service.type`, `service.nodePort`, `hostNetwork`, `resources`, `nodeSelector`,
+`tolerations`, `affinity`) are documented in the
 [chart README → Agents](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
 
 ---
@@ -302,6 +326,17 @@ in the [migrate-job template](https://github.com/spatiumnorth/spatiumddi/blob/ma
 header.
 
 Alembic is idempotent, so re-running the migrate Job is always safe.
+
+**Placement (#3207).** The Job's pod follows the api: `migrate.nodeSelector`,
+`migrate.tolerations` and `migrate.affinity` default to unset, meaning
+`api.nodeSelector` / `api.tolerations` / `api.affinity.nodeAffinity` (the
+api's pod anti-affinity is about api pods and is not copied), with
+`global.controlPlaneNodeSelector` merged into the selector as for every
+control-plane workload. Set one to `{}` / `[]` to give the Job none of the api's
+values. The `wait-for-postgres` / `wait-for-migrate` init containers carry
+`initContainers.resources` (#3208; requests `10m` / `32Mi`, limit `256Mi`), so a
+namespace LimitRange or a policy that wants resources on every container,
+init containers included, admits them.
 
 **GitOps with `helm template` (Argo CD).** A controller that renders with
 `helm template` always sees revision `1`, so the Job is `<release>-migrate-r1` on every sync,
@@ -408,8 +443,15 @@ postgresql:
   cnpg:
     instances: 3        # smallest quorum-friendly default; 5 / 7 for larger
     imageName: "ghcr.io/cloudnative-pg/postgresql:16"
-    enablePDB: true
+    # enablePDB: unset = on only with instances > 1 (#3204). With a single
+    # instance the PDB allows 0 disruptions and `kubectl drain` of its node
+    # hangs, protecting nothing; set true / false to override.
 ```
+
+Postgres placement: `postgresql.nodeSelector` hard-pins the instances, and
+`postgresql.affinity.nodeAffinity` (#3205) is rendered into the Cluster's
+`spec.affinity.nodeAffinity` for a preference ("this node, elsewhere if it is
+full") beside it.
 
 This requires the **CloudNativePG operator already installed** in the cluster.
 The appliance chart bundles it; for a plain Kubernetes install, apply it
