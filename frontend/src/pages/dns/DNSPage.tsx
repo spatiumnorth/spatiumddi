@@ -133,6 +133,7 @@ import {
 import { ResizablePane } from "@/components/ui/resizable-pane";
 import { isRefused } from "@/lib/refusal";
 import { copyToClipboard } from "@/lib/clipboard";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
 import {
   DNS_TTL_MAX,
   fqdnError,
@@ -7400,45 +7401,51 @@ export function RevealedSecretModal({
   action: "created" | "rotated";
   onClose: () => void;
 }) {
+  // #3222 — the plaintext is shown once; closing before copying it loses it.
+  const secrets = useMemo(() => [secret], [secret]);
+  const guard = useSecretCloseGuard({ onClose, secrets, noun: "secret" });
   return (
-    <Modal title="Copy this secret now" onClose={onClose}>
-      <div className="space-y-3 text-sm">
-        <p className="text-xs text-muted-foreground">
-          This is the only time the plaintext secret for{" "}
-          <code className="font-mono">{name}</code> will be shown. Copy it into
-          your <code>nsupdate</code> client / secondary-server config before
-          closing. SpatiumDDI keeps it encrypted at rest (it has to, to sign DNS
-          updates), but the UI never shows it again — rotate the key to get a
-          new one.
-        </p>
-        <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
-          <div className="mb-1 text-muted-foreground">{algorithm}</div>
-          <div className="break-all">{secret}</div>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            void navigator.clipboard.writeText(secret);
-          }}
-          className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
-        >
-          <Copy className="h-3 w-3" /> Copy secret
-        </button>
-        <p className="text-[11px] text-muted-foreground">
-          Key {action} • The new value will reach BIND9 servers on the next
-          ConfigBundle long-poll (typically within seconds).
-        </p>
-        <div className="flex justify-end pt-1">
+    <>
+      <Modal title="Copy this secret now" onClose={guard.requestClose}>
+        <div className="space-y-3 text-sm" {...guard.copyProps}>
+          <p className="text-xs text-muted-foreground">
+            This is the only time the plaintext secret for{" "}
+            <code className="font-mono">{name}</code> will be shown. Copy it
+            into your <code>nsupdate</code> client / secondary-server config
+            before closing. SpatiumDDI keeps it encrypted at rest (it has to, to
+            sign DNS updates), but the UI never shows it again — rotate the key
+            to get a new one.
+          </p>
+          <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
+            <div className="mb-1 text-muted-foreground">{algorithm}</div>
+            <div className="break-all">{secret}</div>
+          </div>
           <button
             type="button"
-            onClick={onClose}
-            className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            onClick={async () => {
+              if (await copyToClipboard(secret)) guard.markTaken();
+            }}
+            className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
           >
-            I have copied it
+            <Copy className="h-3 w-3" /> Copy secret
           </button>
+          <p className="text-[11px] text-muted-foreground">
+            Key {action} • The new value will reach BIND9 servers on the next
+            ConfigBundle long-poll (typically within seconds).
+          </p>
+          <div className="flex justify-end pt-1">
+            <button
+              type="button"
+              onClick={guard.requestClose}
+              className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              I have copied it
+            </button>
+          </div>
         </div>
-      </div>
-    </Modal>
+      </Modal>
+      {guard.confirm}
+    </>
   );
 }
 

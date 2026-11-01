@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { usePermissions } from "@/hooks/usePermissions";
+import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -1920,40 +1922,72 @@ export function FleetTab({
 
       {/* #272 Phase 9 — show the minted replacement pairing code once. */}
       {replaceResult && (
-        <Modal
-          title="Replacement pairing code"
+        <ReplacementCodeModal
+          result={replaceResult}
           onClose={() => setReplaceResult(null)}
-        >
-          <div className="space-y-3 text-sm">
-            <p>
-              <strong>{replaceResult.evicted.hostname}</strong> has been
-              evicted. Install a fresh appliance (Appliance role) and pair it
-              with this single-use code, then approve + promote it to restore
-              the cluster:
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="rounded-md bg-muted px-3 py-2 font-mono text-lg tracking-widest">
-                {replaceResult.pairing_code}
-              </code>
-              <button
-                type="button"
-                onClick={() =>
-                  navigator.clipboard?.writeText(replaceResult.pairing_code)
-                }
-                className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Copy
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Expires{" "}
-              {new Date(replaceResult.pairing_expires_at).toLocaleString()}.
-              Shown once — regenerate from the Pairing tab if you lose it.
-            </p>
-          </div>
-        </Modal>
+        />
       )}
     </div>
+  );
+}
+
+// #272 Phase 9 — the replacement pairing code is single-use and shown once,
+// so closing before copying it asks first (#3222).
+export function ReplacementCodeModal({
+  result,
+  onClose,
+}: {
+  result: ControlPlaneReplaceResult;
+  onClose: () => void;
+}) {
+  const codes = useMemo(() => [result.pairing_code], [result.pairing_code]);
+  const guard = useSecretCloseGuard({
+    onClose,
+    secrets: codes,
+    noun: "pairing code",
+  });
+  return (
+    <>
+      <Modal title="Replacement pairing code" onClose={guard.requestClose}>
+        <div className="space-y-3 text-sm" {...guard.copyProps}>
+          <p>
+            <strong>{result.evicted.hostname}</strong> has been evicted. Install
+            a fresh appliance (Appliance role) and pair it with this single-use
+            code, then approve + promote it to restore the cluster:
+          </p>
+          <div className="flex items-center gap-2">
+            <code className="rounded-md bg-muted px-3 py-2 font-mono text-lg tracking-widest">
+              {result.pairing_code}
+            </code>
+            <button
+              type="button"
+              onClick={async () => {
+                if (await copyToClipboard(result.pairing_code)) {
+                  guard.markTaken();
+                }
+              }}
+              className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Copy
+            </button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Expires {new Date(result.pairing_expires_at).toLocaleString()}.
+            Shown once — regenerate from the Pairing tab if you lose it.
+          </p>
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={guard.requestClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </Modal>
+      {guard.confirm}
+    </>
   );
 }
 
