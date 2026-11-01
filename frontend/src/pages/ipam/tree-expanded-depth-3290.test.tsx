@@ -80,7 +80,7 @@ const l1 = {
   subnets: [] as Subnet[],
 };
 
-function open() {
+function open(selected: { subnet?: string; block?: string } = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -88,8 +88,8 @@ function open() {
         <DndContext>
           <BlockTreeRow
             node={l1}
-            selectedSubnetId={null}
-            selectedBlockId={null}
+            selectedSubnetId={selected.subnet ?? null}
+            selectedBlockId={selected.block ?? null}
             onSelectBlock={() => {}}
             onSelectSubnet={() => {}}
             onDeleteSubnet={() => {}}
@@ -131,5 +131,27 @@ describe("IPAM tree default expanded depth (#3290)", () => {
     };
     open();
     await waitFor(() => expect(state("10.249.17.0/24")).toBe("true"));
+  });
+
+  it("opens the path to a selected block past the depth", async () => {
+    answers.settingsApi = {
+      get: () => Promise.resolve({ subnet_tree_default_expanded_depth: 1 }),
+    };
+    open({ block: "4" });
+    // The /26 at level 4 is the selection, so its ancestors open to show it.
+    await waitFor(() =>
+      expect(screen.getByRole("treeitem", { name: "10.249.17.64/26" })),
+    );
+    expect(state("10.249.16.0/20")).toBe("true");
+    expect(state("10.249.17.0/24")).toBe("true");
+  });
+
+  it("the selection does not open a row beside it", async () => {
+    answers.settingsApi = {
+      get: () => Promise.resolve({ subnet_tree_default_expanded_depth: 1 }),
+    };
+    open({ block: "3" });
+    await waitFor(() => expect(state("10.249.17.0/24")).toBe("false"));
+    expect(state("10.249.16.0/20")).toBe("true");
   });
 });

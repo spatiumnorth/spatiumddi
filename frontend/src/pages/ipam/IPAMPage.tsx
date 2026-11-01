@@ -13213,6 +13213,21 @@ function EditBlockModalForm({
 
 // ─── Recursive Block Tree Row ─────────────────────────────────────────────────
 
+/** True when the selected subnet or block lies strictly beneath `node`. */
+function subtreeHolds(
+  node: BlockNode,
+  subnetId: string | null,
+  blockId: string | null,
+): boolean {
+  if (!subnetId && !blockId) return false;
+  if (subnetId && node.subnets.some((s) => s.id === subnetId)) return true;
+  return node.children.some(
+    (c) =>
+      (blockId !== null && c.block.id === blockId) ||
+      subtreeHolds(c, subnetId, blockId),
+  );
+}
+
 export function BlockTreeRow({
   node,
   selectedSubnetId,
@@ -13256,8 +13271,17 @@ export function BlockTreeRow({
   });
   const defaultDepth = treeSettings?.subnet_tree_default_expanded_depth ?? 2;
   const [expanded, setExpanded] = useState<boolean | null>(null);
+  // A block past the default depth still opens when the selected subnet or
+  // block sits beneath it (a deep link, a search hit), or the selection would
+  // be hidden behind a collapsed row. Latched as an operator choice, so the
+  // row stays open when the selection later moves elsewhere.
+  const holdsSelection = subtreeHolds(node, selectedSubnetId, selectedBlockId);
+  useEffect(() => {
+    if (holdsSelection && expanded === null) setExpanded(true);
+  }, [holdsSelection, expanded]);
   const [showAllChildren, setShowAllChildren] = useState(false);
-  const isExpanded = forceExpand || (expanded ?? depth < defaultDepth);
+  const isExpanded =
+    forceExpand || (expanded ?? (holdsSelection || depth < defaultDepth));
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
   const {
