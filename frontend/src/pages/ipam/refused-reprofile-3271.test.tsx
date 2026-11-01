@@ -38,6 +38,7 @@ vi.mock("@/lib/api", async () => {
   return { ...actual, ...stubs };
 });
 
+let nmapModuleOn = true;
 vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({
     modules: [],
@@ -45,7 +46,7 @@ vi.mock("@/hooks/useFeatureModules", () => ({
     isLoading: false,
     isError: false,
     refetch: () => {},
-    enabled: () => true,
+    enabled: (id: string) => (id === "tools.nmap" ? nmapModuleOn : true),
   }),
 }));
 
@@ -53,6 +54,7 @@ const { IPDetailModal } = await import("./IPDetailModal");
 
 afterEach(() => {
   cleanup();
+  nmapModuleOn = true;
   for (const name of Object.keys(answers)) delete answers[name];
 });
 
@@ -190,5 +192,22 @@ describe("Device profile re-profile", () => {
     );
     expect(buttons().some((t) => t?.includes("Scanning"))).toBe(false);
     expect(buttons().some((t) => t?.includes("Re-profile now"))).toBe(true);
+  });
+
+  it("is not offered, and the scan is not read, with the tools.nmap module off", async () => {
+    nmapModuleOn = false;
+    const myPermissions = signInAs([
+      ["read", "ip_address"],
+      ["write", "ip_address"],
+      ["read", "manage_nmap_scans"],
+    ]);
+    const getScan = vi.fn(() => Promise.resolve({}));
+    answers.nmapApi = { getScan };
+    openDetail();
+    await waitFor(() => expect(myPermissions).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(buttons().some((t) => t?.includes("Re-profile now"))).toBe(false);
+    expect(getScan).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Nmap scanning is turned off");
   });
 });

@@ -1184,7 +1184,14 @@ function DeviceProfileSection({
   // 'manage_nmap_scans', which the IPAM/DNS/DHCP Editor roles lack. A user
   // who cannot read the scan is not offered the press (it would sit on
   // "Scanning…" for a scan it can never see end) and is not asked for it (#3271).
-  const canReadScans = usePermissions().can("read", "manage_nmap_scans");
+  // The tools.nmap module being off refuses every scan route with "Feature
+  // 'tools.nmap' is disabled.", so it closes the same door (#3271).
+  const nmapOn = useModuleOn("tools.nmap");
+  const canReadScans =
+    usePermissions().can("read", "manage_nmap_scans") && nmapOn;
+  const scansUnavailable = nmapOn
+    ? "You don't have permission to see this IP's profile scan."
+    : "Nmap scanning is turned off, so this IP's profile scan is not shown.";
   const [error, setError] = useState<string | null>(null);
   const [showRawSig, setShowRawSig] = useState(false);
   // Track the scan dispatched by clicking "Re-profile now" so we can
@@ -1461,7 +1468,9 @@ function DeviceProfileSection({
             <p className="text-xs text-muted-foreground italic">
               No active profile yet.{" "}
               {!canReadScans
-                ? "You don't have permission to run or see profile scans."
+                ? nmapOn
+                  ? "You don't have permission to run or see profile scans."
+                  : "Nmap scanning is turned off."
                 : dhcpOn
                   ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`
                   : "Run one ad-hoc via the button above."}
@@ -1475,6 +1484,7 @@ function DeviceProfileSection({
             scan={displayScan}
             loading={scanQuery.isLoading && !sessionScan}
             scanHidden={!canReadScans}
+            hiddenReason={scansUnavailable}
           />
         );
       })()}
@@ -1518,11 +1528,13 @@ function DeviceProfileScanPanel({
   scan,
   loading,
   scanHidden = false,
+  hiddenReason = "You don't have permission to see this IP's profile scan.",
 }: {
   lastProfiledAt: string | null;
   scan: NmapScanRead | null;
   loading: boolean;
   scanHidden?: boolean;
+  hiddenReason?: string;
 }) {
   if (scanHidden && !scan) {
     return (
@@ -1530,7 +1542,7 @@ function DeviceProfileScanPanel({
         {lastProfiledAt
           ? `Last scanned ${new Date(lastProfiledAt).toLocaleString()}. `
           : ""}
-        You don't have permission to see this IP's profile scan.
+        {hiddenReason}
       </p>
     );
   }
