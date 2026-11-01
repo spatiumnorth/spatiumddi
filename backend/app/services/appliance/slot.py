@@ -127,7 +127,8 @@ def _read_grubenv() -> dict[str, str]:
 
 def _current_slot_from_cmdline() -> SlotName | None:
     """Resolve which slot we booted from by matching /proc/cmdline's
-    root=UUID= against the partition labels via udev runtime data.
+    root=UUID= against the partition labels via udev runtime data (on a
+    mirrored install, the md array's slot name — #3172).
 
     Reads ``/run/udev/data/b<major>:<minor>`` files directly rather than
     shelling out to ``lsblk``. lsblk inside a container without
@@ -161,17 +162,29 @@ def _current_slot_from_cmdline() -> SlotName | None:
             text = entry.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        # #3172 — on a mirrored install (#999) the root filesystem is an md
+        # array, which has no PARTLABEL: its by-partlabel links sit on the
+        # member partitions, its by-uuid link on the array. The array is
+        # named after its slot instead (``mdadm --create /dev/md/root_a``),
+        # which udev records as MD_DEVNAME and the ``md/root_a`` link.
         partlabel: str | None = None
+        md_name: str | None = None
         matches_uuid = False
         for line in text.splitlines():
+            if line.startswith("E:MD_DEVNAME="):
+                md_name = line.split("=", 1)[1].strip() or md_name
+                continue
             if not line.startswith("S:"):
                 continue
             value = line[2:].strip()
             if value.startswith("disk/by-partlabel/"):
                 partlabel = value.rsplit("/", 1)[-1]
+            elif value.startswith("md/"):
+                md_name = md_name or value.rsplit("/", 1)[-1]
             elif value.startswith("disk/by-uuid/"):
                 if value.rsplit("/", 1)[-1].lower() == root_uuid:
                     matches_uuid = True
+        partlabel = partlabel or md_name
         if matches_uuid and partlabel:
             lower = partlabel.lower()
             if lower == "root_a":

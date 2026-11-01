@@ -1,0 +1,3 @@
+### Fixed
+
+- A page no longer keeps asking for a read the server refused. The Dashboard's integration lists, Looking Glass card, Integrations tab and Conformity tab, Packet Capture's capture list (every 5 s) and the Looking Glass sessions and peers (every 15 s) now stop their timers after a 403, so a user without those reads no longer writes a denied audit row every few seconds for as long as the page stays open. Packet Capture and the Dashboard's Looking Glass card now say the read was refused instead of "Failed to load", and the Integrations tab no longer blames the reader's role when the read failed for another reason (#3149).

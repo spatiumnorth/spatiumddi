@@ -83,6 +83,7 @@ from app.services.dns.ddns import (
     resolve_effective_ddns,
     resolve_effective_ddns_for_block,
 )
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.dns.sync_check import (
     address_own_forward_zone_id,
     forward_zone_ids_in_order,
@@ -2705,6 +2706,9 @@ async def _retract_host_records(db: AsyncSession, ip: IPAddress) -> bool:
     )
     # #1800 — PTRs first, as the delete action orders them.
     records = sorted(result.scalars().all(), key=lambda r: r.record_type != "PTR")
+    # #3186 — and a trashed copy (riding a deleted zone's batch) goes for
+    # good, or that zone's restore would serve the name the row dropped.
+    await purge_trashed_address_records(db, [ip.id], host_records_only=True)
     for record in records:
         zone = await db.get(DNSZone, record.zone_id)
         # #1633 — a zone IPAM does not author never took the record: drop the
@@ -2836,6 +2840,15 @@ async def _sync_dns_record(
                     record_id=record.id,
                 )
             await db.delete(record)
+        # #3186 — the select above cannot see a record in the trash (one
+        # riding the batch of a zone deleted earlier), so it is purged here:
+        # left behind, that zone's restore would publish it again for a row
+        # that no longer publishes one. Every path that retracts an address's
+        # DNS while keeping the row (reservation removed, hostname / zone
+        # cleared, DDNS revoked, Mark as Orphan) comes through here. The
+        # aliases Mark as Orphan withdrew into the row's own batch stay, for
+        # its Restore (#2604).
+        await purge_trashed_address_records(db, [ip.id], keep_batch_id=orphan_alias_batch_id(ip.id))
         ip.dns_record_id = None
         # Preserve ``ip.fqdn`` and ``forward_zone_id`` / ``reverse_zone_id`` so
         # the orphan row keeps showing what was published before the delete
@@ -7772,6 +7785,8 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
         .scalars()
         .all()
     )
+    # #3186 — their records a zone deleted earlier took into its batch go too.
+    await purge_trashed_address_records(db, [row.id for row in rows])
     revoked = 0
     for row in rows:
         try:
@@ -10869,6 +10884,7 @@ async def delete_address(
         if subnet:
             await _sync_dns_record(db, ip, subnet, action="delete")
         await _purge_withdrawn_aliases(db, [ip.id])
+        await purge_trashed_address_records(db, [ip.id])
         db.add(
             _audit(
                 current_user,
@@ -10964,6 +10980,7 @@ async def purge_orphans(
 
     # The aliases these orphans withdrew go with them (#2604).
     await _purge_withdrawn_aliases(db, [ip.id for ip in rows])
+    await purge_trashed_address_records(db, [ip.id for ip in rows])
     for ip in rows:
         # Best-effort DNS teardown (the FK would null it, but be explicit).
         try:
@@ -12483,6 +12500,7 @@ async def bulk_delete_addresses(
     if body.permanent:
         # Aliases an orphan among them withdrew go with it (#2604).
         await _purge_withdrawn_aliases(db, [ip.id for ip in to_delete])
+        await purge_trashed_address_records(db, [ip.id for ip in to_delete])
     for ip in to_delete:
         if not body.permanent:
             # Withdrawn, not deleted, so the row's Restore brings them back (#2604).

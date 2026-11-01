@@ -227,6 +227,117 @@ affinity:
 {{- end -}}
 
 {{/*
+Object name of one agent server's StatefulSet / Service / headless Service
+(#3209). Pass ``root`` (the chart root), ``instance`` (``dns-bind9-ns1``) and
+``prefix`` (``<kind>Agents.prefixWithFullname``).
+
+Off (the default) it is ``instance`` unchanged: renaming a StatefulSet
+recreates it, and through the claim-template names its PVCs, so the new
+naming is opt-in for an existing install. On, it is prefixed with the release
+fullname like every other object in the chart (which honours
+``fullnameOverride``). Capped at 52 characters: the longest suffix added
+to it is ``-headless`` (9) and Kubernetes caps a Service name at 63; a
+StatefulSet's pods and ControllerRevision labels need the same headroom.
+
+A name over 52 is NOT plainly truncated: two servers that differ only past
+the cut (``...-ns1`` / ``...-ns2``), or every agent under a long
+``fullnameOverride``, would come out identical and Helm would apply one
+object over the other. It keeps the first 43 characters and appends ``-``
+plus 8 hex characters of the full name's sha256, so distinct full names stay
+distinct and the result is stable across renders. A name that fits is used
+as is.
+
+The Service must be a DNS-1035 label, which starts with a letter. The
+fullname follows the release name, and Helm accepts a release named
+``1dev``, so a prefixed name starting with anything else fails the render
+here, naming the fix, instead of at the API server on the first Service.
+*/}}
+{{- define "spatiumddi.agentObjectName" -}}
+{{- if .prefix -}}
+{{- $full := printf "%s-%s" (include "spatiumddi.fullname" .root) .instance -}}
+{{- if not (regexMatch "^[a-z]" $full) -}}
+{{- fail (printf "agent object name %q (dnsAgents/dhcpAgents.prefixWithFullname) must start with a lowercase letter to be a valid Service name (DNS-1035); use a release name or fullnameOverride that starts with one, or leave prefixWithFullname false" $full) -}}
+{{- end -}}
+{{- if le (len $full) 52 -}}
+{{- $full -}}
+{{- else -}}
+{{- printf "%s-%s" ($full | trunc 43 | trimSuffix "-") ($full | sha256sum | trunc 8) -}}
+{{- end -}}
+{{- else -}}
+{{- .instance -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+#3209 — refuse two agent servers that would render the same object name.
+Helm does not: the later StatefulSet and Services silently replace the
+earlier ones, so one configured server never runs. Covers both agent kinds,
+since a fullname-prefixed DNS and DHCP name share one namespace of objects.
+Called from dns-agent.yaml and dhcp-agent.yaml; ``.`` is the chart root.
+*/}}
+{{- define "spatiumddi.agentNamesUnique" -}}
+{{- $seen := dict -}}
+{{- if .Values.dnsAgents.enabled -}}
+{{- range .Values.dnsAgents.servers -}}
+{{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dns-%s-%s" (.flavor | default "bind9") .name) "prefix" $.Values.dnsAgents.prefixWithFullname) -}}
+{{- $sname := .name -}}
+{{- range $obj := list $n (printf "%s-headless" $n) -}}
+{{- if hasKey $seen $obj -}}
+{{- fail (printf "dnsAgents server %q renders object name %q, already used by server %q; server names must be unique (each server owns <name> and <name>-headless)" $sname $obj (get $seen $obj)) -}}
+{{- end -}}
+{{- $_ := set $seen $obj $sname -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.dhcpAgents.enabled -}}
+{{- range .Values.dhcpAgents.servers -}}
+{{- $n := include "spatiumddi.agentObjectName" (dict "root" $ "instance" (printf "dhcp-%s-%s" (.flavor | default "kea") .name) "prefix" $.Values.dhcpAgents.prefixWithFullname) -}}
+{{- $sname := .name -}}
+{{- range $obj := list $n (printf "%s-headless" $n) -}}
+{{- if hasKey $seen $obj -}}
+{{- fail (printf "dhcpAgents server %q renders object name %q, already used by server %q; server names must be unique (each server owns <name> and <name>-headless)" $sname $obj (get $seen $obj)) -}}
+{{- end -}}
+{{- $_ := set $seen $obj $sname -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+``affinity:`` block of a DNS / DHCP agent pod (#3206). The chart's own
+preferred one-agent-per-node anti-affinity is MERGED into the per-server
+``affinity`` rather than replaced by it, so an operator who adds
+``nodeAffinity`` keeps the spread; only a ``podAntiAffinity`` of their own
+wins (an explicit opt-out). With no per-server ``affinity`` the block is the
+literal the templates always rendered.
+
+  {{- include "spatiumddi.agentAffinity" (dict "root" $root "component" "dns-agent" "override" $server.affinity) | nindent 6 }}
+*/}}
+{{- define "spatiumddi.agentAffinity" -}}
+{{- $override := default (dict) .override -}}
+{{- $label := dict "app.kubernetes.io/name" (include "spatiumddi.name" .root) "app.kubernetes.io/component" .component -}}
+affinity:
+{{- if $override }}
+  {{- $merged := deepCopy $override -}}
+  {{- if not (hasKey $merged "podAntiAffinity") -}}
+    {{- $term := dict "labelSelector" (dict "matchLabels" $label) "topologyKey" "kubernetes.io/hostname" -}}
+    {{- $_ := set $merged "podAntiAffinity" (dict "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term))) -}}
+  {{- end }}
+  {{- toYaml $merged | nindent 2 }}
+{{- else }}
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "spatiumddi.name" .root }}
+              app.kubernetes.io/component: {{ .component }}
+          topologyKey: kubernetes.io/hostname
+{{- end }}
+{{- end -}}
+
+{{/*
 Name of the chart-owned secret carrying SECRET_KEY.
 */}}
 {{- define "spatiumddi.appSecretName" -}}
@@ -533,6 +644,15 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
 {{- end -}}
 
 {{/*
+#3208 — resources of the ``wait-for-*`` init containers (``initContainers.
+resources``). ``alembic`` in the wait-for-migrate loop imports the whole app's
+model tree, so the memory limit leaves room for that.
+*/}}
+{{- define "spatiumddi.initContainerResources" -}}
+{{- toYaml (default (dict "requests" (dict "cpu" "10m" "memory" "32Mi") "limits" (dict "memory" "256Mi")) (.Values.initContainers).resources) -}}
+{{- end -}}
+
+{{/*
 Init container that blocks until the bundled / external Postgres is
 accepting connections. Used by the migrate Job. ``pg_isready`` ships in
 the api image (postgresql-client-16, see backend/Dockerfile).
@@ -559,6 +679,8 @@ the api image (postgresql-client-16, see backend/Dockerfile).
       value: {{ include "spatiumddi.postgresUser" . | quote }}
     - name: PGDATABASE
       value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+  resources:
+    {{- include "spatiumddi.initContainerResources" . | nindent 4 }}
 {{- end -}}
 
 {{/*
@@ -616,6 +738,8 @@ URL comes from commonEnv.
       done
   env:
     {{- include "spatiumddi.commonEnv" . | nindent 4 }}
+  resources:
+    {{- include "spatiumddi.initContainerResources" . | nindent 4 }}
 {{- end -}}
 
 {{/*
@@ -887,3 +1011,34 @@ Args: the root context.
 {{- end -}}
 {{- toYaml $res -}}
 {{- end }}
+
+{{/*
+#3206 follow-up — refuse an in-place storageClass adoption on a live agent
+StatefulSet with the fix in the message, instead of the API server's
+"updates to statefulset spec for fields other than ... are forbidden".
+volumeClaimTemplates are immutable, so setting dnsAgents/dhcpAgents
+.storageClass (or servers[].storageClass) on an existing install can only be
+applied after the StatefulSet is deleted with --cascade=orphan.
+
+Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>).
+Fires only when this render SETS a class and the live object has a claim
+template whose class is absent or different. An install that never set a
+class renders no storageClassName and never reaches the comparison. `lookup`
+returns an empty map under `helm template` and in Argo CD's render, so this
+only ever fires for a real `helm install/upgrade` against a cluster; those
+render paths get the static NOTES.txt pointer instead. A storage SIZE change
+is the same immutability but is not checked here: the API server normalises
+quantities (1024Mi reads back as 1Gi), so a string compare could refuse a
+render that changes nothing.
+*/}}
+{{- define "spatiumddi.checkAgentClaimClass" -}}
+{{- if .class -}}
+{{- $live := lookup "apps/v1" "StatefulSet" .root.Release.Namespace .name -}}
+{{- range $t := (dig "spec" "volumeClaimTemplates" (list) $live) -}}
+{{- $old := dig "spec" "storageClassName" "" $t -}}
+{{- if ne $old $.class -}}
+{{- fail (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q. Kubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete the StatefulSet without deleting its pod or PVCs, then upgrade again:\n  kubectl delete sts %s -n %s --cascade=orphan\nExisting PVCs keep their old class; only new claims get %q. See the chart README, \"Adopting storageClass on an existing install\"." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class $.name $.root.Release.Namespace $.class) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
