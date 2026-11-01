@@ -50,6 +50,7 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owning_integration,
     refuse_sync_into_trashed_space,
+    subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
@@ -386,12 +387,7 @@ async def _apply_blocks_and_subnets(
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
             continue
-        surviving_foreign = await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == row.id)
-            .where(IPAddress.opnsense_router_id.is_(None))
-        )
+        surviving_foreign = await subnet_has_surviving_addresses(db, row.id, "opnsense_router_id")
         if surviving_foreign:
             # Operator / other-owned addresses still depend on this
             # subnet — don't cascade-delete them. Hand the subnet back.

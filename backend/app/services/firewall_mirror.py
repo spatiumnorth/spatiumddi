@@ -41,6 +41,7 @@ from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
     owned_addresses_in_space,
+    subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 
@@ -469,12 +470,7 @@ async def apply_subnets(
     for cidr, row in list(fw_subnets.items()):
         if cidr in desired:
             continue
-        surviving = await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == row.id)
-            .where(getattr(IPAddress, owner.fk_attr).is_(None))
-        )
+        surviving = await subnet_has_surviving_addresses(db, row.id, owner.fk_attr)
         if surviving:
             setattr(row, owner.fk_attr, None)
             summary.subnets_updated += 1

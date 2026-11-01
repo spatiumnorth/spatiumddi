@@ -92,8 +92,9 @@ async def _records(db: AsyncSession, zone_id: uuid.UUID) -> list[str]:
 
 
 async def _delete_ops(db: AsyncSession, server) -> list[str]:  # type: ignore[no-untyped-def]
+    server_id = getattr(server, "id", server)
     rows = (
-        (await db.execute(select(DNSRecordOp).where(DNSRecordOp.server_id == server.id)))
+        (await db.execute(select(DNSRecordOp).where(DNSRecordOp.server_id == server_id)))
         .scalars()
         .all()
     )
@@ -398,3 +399,96 @@ def test_the_guard_catches_a_function_that_deletes_without_retracting(
         "    summary.subnets_deleted += 1\n"
     )
     assert _deletes_without_retracting(src) == (2, ["reconcile.py:bad"])
+
+
+async def _edited_address_with_record(db: AsyncSession, subnet: Subnet, own_kwargs: dict[str, Any]):  # type: ignore[no-untyped-def]
+    """An address the mirror owns that an operator then edited, carrying a
+    live auto record. The address pass keeps (un-claims) it, so the subnet
+    pass must not cascade it away first."""
+    from datetime import UTC, datetime
+
+    _grp, server, zone = await _dns(db)
+    addr = IPAddress(
+        subnet_id=subnet.id,
+        address="10.0.0.77",
+        status="allocated",
+        hostname="keep",
+        user_modified_at=datetime.now(UTC),
+        **own_kwargs,
+    )
+    db.add(addr)
+    await db.flush()
+    rec = DNSRecord(
+        zone_id=zone.id,
+        name="keep",
+        fqdn=f"keep.{zone.name}",
+        record_type="A",
+        value="10.0.0.77",
+        auto_generated=True,
+        ip_address_id=addr.id,
+    )
+    db.add(rec)
+    await db.commit()
+    return server.id, zone.id, addr.id, subnet.id
+
+
+async def _assert_preserved(db: AsyncSession, server_id, zone_id, addr_id, subnet_id) -> None:  # type: ignore[no-untyped-def]
+    db.expire_all()
+    assert await db.get(Subnet, subnet_id) is not None
+    assert await db.get(IPAddress, addr_id) is not None
+    assert await _records(db, zone_id) == ["keep"]
+    assert await _delete_ops(db, server_id) == []
+
+
+@pytest.mark.asyncio
+async def test_opnsense_subnet_delete_keeps_operator_edited_address_dns(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.opnsense.reconcile import reconcile_router
+    from tests.test_opnsense_reconcile import _FakeClient as OpnClient
+    from tests.test_opnsense_reconcile import _iface, _make_router
+    from tests.test_opnsense_reconcile import _make_space as opn_space
+    from tests.test_opnsense_reconcile import _patch_client as opn_patch
+
+    space = await opn_space(db_session)
+    router = await _make_router(db_session, space)
+    await db_session.commit()
+    with opn_patch(OpnClient(interfaces=[_iface("lan", "igb1", "10.0.0.1", "10.0.0.0/24")])):
+        await reconcile_router(db_session, router)
+    sub = (
+        await db_session.execute(select(Subnet).where(Subnet.opnsense_router_id == router.id))
+    ).scalar_one()
+    ctx = await _edited_address_with_record(db_session, sub, {"opnsense_router_id": router.id})
+    with opn_patch(OpnClient(interfaces=[])):
+        summary = await reconcile_router(db_session, router)
+    assert summary.ok, summary.error
+    assert summary.subnets_deleted == 0
+    await _assert_preserved(db_session, *ctx)
+
+
+@pytest.mark.asyncio
+async def test_firewall_mirror_subnet_delete_keeps_operator_edited_address_dns(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.fortinet.client import _FortiInterface
+    from app.services.fortinet.reconcile import reconcile_firewall
+    from tests.test_fortinet_reconcile import _FakeClient as FgClient
+    from tests.test_fortinet_reconcile import _make_fw
+    from tests.test_fortinet_reconcile import _make_space as fg_space
+    from tests.test_fortinet_reconcile import _patch as fg_patch
+
+    space = await fg_space(db_session)
+    fw = await _make_fw(db_session, space, mirror_interfaces=True)
+    await db_session.commit()
+    iface = _FortiInterface(name="port1", cidr="10.0.0.0/24", address="10.0.0.1", zone="lan")
+    with fg_patch(FgClient(interfaces=[iface])):
+        await reconcile_firewall(db_session, fw)
+    sub = (
+        await db_session.execute(select(Subnet).where(Subnet.fortinet_firewall_id == fw.id))
+    ).scalar_one()
+    ctx = await _edited_address_with_record(db_session, sub, {"fortinet_firewall_id": fw.id})
+    with fg_patch(FgClient(interfaces=[])):
+        summary = await reconcile_firewall(db_session, fw)
+    assert summary.ok, summary.error
+    assert summary.subnets_deleted == 0
+    await _assert_preserved(db_session, *ctx)
