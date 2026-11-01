@@ -55,6 +55,7 @@ from app.services.dhcp.ipam_mirror import (
     lease_hostname_suppressed_subnets,
 )
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
+from app.services.dns.record_ops import purge_trashed_address_records
 
 logger = structlog.get_logger(__name__)
 
@@ -650,6 +651,7 @@ async def _delete_mirror_row(
             await _sync_dns_record(db, row, subnet_row, action="delete")
         except Exception:  # noqa: BLE001 — DNS sync is best-effort
             pass
+    await purge_trashed_address_records(db, [row.id])  # #3186
     await db.delete(row)
 
 

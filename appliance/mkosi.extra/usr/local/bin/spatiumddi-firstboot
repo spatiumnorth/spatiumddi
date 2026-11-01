@@ -2160,6 +2160,17 @@ release_bootstrap_manifest() {
     mv -f "$held" "$BOOTSTRAP_MANIFEST"
 }
 
+# The slot GPT name (lower-cased root_a / root_b) behind the root filesystem's
+# device, or nothing. On a single disk that device IS the slot partition. On a
+# mirrored install (#999) it is the md array, which carries no PARTLABEL of its
+# own: ``-s`` walks down to the members, which do (#3172). Without it a
+# mirrored box could never tell which slot it booted, so a trial boot was
+# never committed and the next reboot silently reverted every upgrade.
+root_dev_partlabel() {
+    lsblk -lsno PARTLABEL "$1" 2>/dev/null | tr 'A-Z' 'a-z' \
+        | grep -m1 -E '^root_[ab]$' || true
+}
+
 # #554 — is this a TRIAL boot (running slot != durable default)? Blocking
 # the slot commit on a host-migrate failure only matters during a trial
 # boot; on a steady-state boot there's nothing to commit, so a persistent
@@ -2171,7 +2182,7 @@ is_trial_boot() {
     root_uuid=$(awk 'BEGIN{RS=" "} /^root=UUID=/{print substr($0,11)}' /proc/cmdline 2>/dev/null | head -1)
     [ -n "$root_uuid" ] || return 1
     root_dev=$(blkid -U "$root_uuid" 2>/dev/null) || return 1
-    cur=$(lsblk -no PARTLABEL "$root_dev" 2>/dev/null | tr 'A-Z' 'a-z' | head -1)
+    cur=$(root_dev_partlabel "$root_dev")
     case "$cur" in root_a) cur=slot_a ;; root_b) cur=slot_b ;; *) return 1 ;; esac
     saved=$(grub-editenv "$gbd/grub/grubenv" list 2>/dev/null | awk -F= '/^saved_entry=/{print $2}')
     [ -n "$saved" ] && [ "$saved" != "$cur" ]
@@ -2298,7 +2309,7 @@ commit_slot_if_healthy() {
         local root_dev
         root_dev=$(blkid -U "$root_uuid" 2>/dev/null)
         if [ -n "$root_dev" ]; then
-            current_slot=$(lsblk -no PARTLABEL "$root_dev" 2>/dev/null | tr 'A-Z' 'a-z' | head -1)
+            current_slot=$(root_dev_partlabel "$root_dev")
         fi
     fi
     case "$current_slot" in
@@ -2317,6 +2328,14 @@ commit_slot_if_healthy() {
     echo "  k3s reports Ready — committing $current_slot as the new default."
     if grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
         >> "$LOG" 2>&1; then
+        # #3172 — grubenv lives on the ESP, which a mirrored install (#999)
+        # does not mirror: without this the second disk's ESP keeps the OLD
+        # default, and losing the primary disk boots the slot just upgraded
+        # away from. A no-op on a single disk; never fatal, the commit stands.
+        if [ -x /usr/local/bin/spatiumddi-esp-sync ]; then
+            /usr/local/bin/spatiumddi-esp-sync >> "$LOG" 2>&1 \
+                || echo "  WARN: spatiumddi-esp-sync failed — the mirror's ESP still names the old default" >> "$LOG"
+        fi
         # #441 — the upgrade is now durable. Kick off a version-aware image
         # prune to drop releases OLDER than the two slots (keeps BOTH slots
         # bootable for rollback + the running set). Fired async via systemd

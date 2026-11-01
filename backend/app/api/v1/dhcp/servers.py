@@ -182,8 +182,11 @@ class ServerUpdate(BaseModel):
 # #1238 — shared by ``ServerResponse`` and the group roll-up's
 # ``ServerSummary`` so the two descriptions of one column cannot drift.
 HA_STATE_DESCRIPTION = (
-    "Kea HA state reported by the DHCPv4 daemon. HA covers DHCPv4 only: "
-    "DHCPv6 scopes on the group are served by each member independently (#1238)."
+    "Kea HA state reported by the DHCPv4 daemon. Null when the server takes part "
+    "in no HA relationship (a standalone group, no partner or peer URL, or "
+    "sidelined): it is cleared once the server's config carries no HA hook "
+    "(#3241). HA covers DHCPv4 only: DHCPv6 scopes on the group are served by "
+    "each member independently (#1238)."
 )
 
 

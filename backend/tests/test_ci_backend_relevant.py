@@ -56,6 +56,10 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_nightly_upgrade_cleared_3026.py": (
         "agent/supervisor/spatium_supervisor/appliance_state.py"
     ),
+    # #3172 — the supervisor's booted-slot reader must agree with the api's.
+    "test_appliance_current_slot_mirror_3172.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
     # #1465: runs the demo seeder's own template payloads through the API model.
