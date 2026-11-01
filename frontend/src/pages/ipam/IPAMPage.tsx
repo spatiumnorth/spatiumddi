@@ -8439,7 +8439,15 @@ function EditSubnetModalForm({
         site_id: siteId,
       };
       // Send only what the operator changed (#3269), so a dialog opened on an
-      // out-of-date subnet cannot write the old values back.
+      // out-of-date subnet cannot write the old values back. Each inheriting
+      // family's own values are compared against the STORED inherit flag, not
+      // the form's: toggling inherit on then sends the explicit nulls that
+      // clear the subnet's own pins (as a full save did), and toggling it off
+      // sends the values shown, so the subnet's settings are stated, not
+      // assumed.
+      const storedDnsInherit = subnet.dns_inherit_settings ?? true;
+      const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
+      const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
       const was: Record<string, unknown> = {
         name: subnet.name || undefined,
         description: subnet.description ?? "",
@@ -8449,22 +8457,26 @@ function EditSubnetModalForm({
         status: subnet.status,
         custom_fields: subnet.custom_fields ?? {},
         dns_inherit_settings: subnet.dns_inherit_settings ?? true,
-        dns_group_ids: dnsInherit ? null : (subnet.dns_group_ids ?? []),
-        dns_zone_id: dnsInherit ? null : (subnet.dns_zone_id ?? null),
-        dns_additional_zone_ids: dnsInherit
+        dns_group_ids: storedDnsInherit ? null : (subnet.dns_group_ids ?? []),
+        dns_zone_id: storedDnsInherit ? null : (subnet.dns_zone_id ?? null),
+        dns_additional_zone_ids: storedDnsInherit
           ? null
           : (subnet.dns_additional_zone_ids ?? []),
         dns_split_horizon: subnet.dns_split_horizon ?? false,
         dhcp_inherit_settings: subnet.dhcp_inherit_settings ?? true,
-        dhcp_server_group_id: dhcpInherit
+        dhcp_server_group_id: storedDhcpInherit
           ? null
           : (subnet.dhcp_server_group_id ?? null),
         ddns_inherit_settings: subnet.ddns_inherit_settings ?? true,
-        ddns_enabled: subnet.ddns_enabled ?? false,
-        ddns_hostname_policy:
-          subnet.ddns_hostname_policy ?? "client_or_generated",
-        ddns_domain_override: subnet.ddns_domain_override ?? null,
-        ddns_ttl: subnet.ddns_ttl ?? null,
+        ...(storedDdnsInherit
+          ? {}
+          : {
+              ddns_enabled: subnet.ddns_enabled ?? false,
+              ddns_hostname_policy:
+                subnet.ddns_hostname_policy ?? "client_or_generated",
+              ddns_domain_override: subnet.ddns_domain_override ?? null,
+              ddns_ttl: subnet.ddns_ttl ?? null,
+            }),
         auto_profile_on_dhcp_lease: subnet.auto_profile_on_dhcp_lease ?? false,
         auto_profile_preset: subnet.auto_profile_preset ?? "service_and_os",
         auto_profile_refresh_days: subnet.auto_profile_refresh_days ?? 30,

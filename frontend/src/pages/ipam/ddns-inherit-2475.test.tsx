@@ -184,9 +184,12 @@ describe("Edit Subnet's DDNS tab (#2475)", () => {
     expect(enabledBox().checked).toBe(false);
     await press("Save");
     await waitFor(() => expect(updateSubnet).toHaveBeenCalledTimes(1));
-    // Only what changed: the stored ddns_enabled (false) is already in force.
-    expect(updateSubnet.mock.calls[0][1]).toEqual({
+    // Leaving inheritance states the subnet's own settings (#3269 keeps
+    // this): the values shown are sent, not assumed from the stored row.
+    expect(updateSubnet.mock.calls[0][1]).toMatchObject({
       ddns_inherit_settings: false,
+      ddns_enabled: false,
+      ddns_hostname_policy: "client_or_generated",
     });
   });
 });

@@ -65,12 +65,12 @@ vi.mock("@/lib/api", async () => {
 
 const { ZoneModal } = await import("./DNSPage");
 
-function open(zone?: DNSZone) {
+function open(zone?: DNSZone, onClose: () => void = () => {}) {
   listedZones = zone ? [zone] : [];
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
-      <ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={() => {}} />
+      <ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={onClose} />
     </QueryClientProvider>,
   );
 }
@@ -149,32 +149,36 @@ describe("Add Zone's Kind", () => {
   });
 
   it("shows an existing zone's kind as it is stored", async () => {
-    open({
-      id: "zone-1",
-      group_id: "grp-1",
-      view_id: null,
-      name: "88.98.10.in-addr.arpa.",
-      zone_type: "primary",
-      kind: "forward",
-      ttl: 3600,
-      primary_ns: "",
-      admin_email: "",
-      dnssec_enabled: false,
-      color: null,
-      forwarders: [],
-      forward_only: true,
-      masters: [],
-      domain_id: null,
-      customer_id: null,
-    } as unknown as DNSZone);
+    const onClose = vi.fn();
+    open(
+      {
+        id: "zone-1",
+        group_id: "grp-1",
+        view_id: null,
+        name: "88.98.10.in-addr.arpa.",
+        zone_type: "primary",
+        kind: "forward",
+        ttl: 3600,
+        primary_ns: "",
+        admin_email: "",
+        dnssec_enabled: false,
+        color: null,
+        forwarders: [],
+        forward_only: true,
+        masters: [],
+        domain_id: null,
+        customer_id: null,
+      } as unknown as DNSZone,
+      onClose,
+    );
 
     await screen.findByText("Zone Name (FQDN)");
     expect(control("Kind").value).toBe("forward");
-    // An untouched Save sends nothing (#3269): the kind stays as stored.
+    // An untouched Save sends nothing (#3269): the kind stays as stored. A
+    // kind recomputed from the reverse-looking name would be a change, and
+    // would be sent before the dialog closed.
     fireEvent.submit(control("Kind").form!);
-    await waitFor(() =>
-      expect(screen.queryByText("Zone Name (FQDN)")).toBeTruthy(),
-    );
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(updateZone).not.toHaveBeenCalled();
     expect(createZone).not.toHaveBeenCalled();
   });

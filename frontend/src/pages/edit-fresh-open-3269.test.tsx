@@ -213,6 +213,67 @@ describe("Edit Subnet (#3269)", () => {
   });
 });
 
+describe("Edit Subnet's DNS inheritance toggle (#3269)", () => {
+  const base = {
+    id: "s-2",
+    space_id: "sp-1",
+    block_id: "b-1",
+    network: "10.2.0.0/24",
+    name: "lan2",
+    description: "",
+    status: "active",
+    custom_fields: {},
+    dhcp_inherit_settings: true,
+    ddns_inherit_settings: true,
+  };
+
+  async function toggleDnsInherit(subnet: Subnet) {
+    const updateSubnet = vi.fn(() => Promise.resolve(subnet));
+    answers.ipamApi = {
+      getSubnet: () => Promise.resolve(subnet),
+      updateSubnet,
+    };
+    open(<EditSubnetModal subnet={subnet} onClose={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "DNS" }));
+    fireEvent.click(screen.getByLabelText(/Inherit from parent/));
+    save();
+    await waitFor(() => expect(updateSubnet).toHaveBeenCalled());
+    return (updateSubnet.mock.calls[0] as unknown[])[1];
+  }
+
+  it("turning inheritance on clears the subnet's own pins", async () => {
+    const body = await toggleDnsInherit({
+      ...base,
+      dns_inherit_settings: false,
+      dns_group_ids: ["g-1"],
+      dns_zone_id: "z-1",
+      dns_additional_zone_ids: ["z-2"],
+    } as unknown as Subnet);
+    expect(body).toEqual({
+      dns_inherit_settings: true,
+      dns_group_ids: null,
+      dns_zone_id: null,
+      dns_additional_zone_ids: null,
+    });
+  });
+
+  it("turning inheritance off sends the values the dialog shows", async () => {
+    const body = await toggleDnsInherit({
+      ...base,
+      dns_inherit_settings: true,
+      dns_group_ids: ["g-1"],
+      dns_zone_id: "z-1",
+      dns_additional_zone_ids: [],
+    } as unknown as Subnet);
+    expect(body).toEqual({
+      dns_inherit_settings: false,
+      dns_group_ids: ["g-1"],
+      dns_zone_id: "z-1",
+      dns_additional_zone_ids: [],
+    });
+  });
+});
+
 describe("Sync with server failure (#3270)", () => {
   const failed = { ok: false as const, error: "No primary DNS server" };
   const render_ = (drivers: string[]) =>
