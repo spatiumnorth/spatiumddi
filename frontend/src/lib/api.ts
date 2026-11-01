@@ -5958,11 +5958,21 @@ export interface ZoneDriftServer {
   server_id: string;
   server_name: string;
   driver: string;
-  // "ok" — pulled and diffed. "error" — the pull failed (unreachable, paused,
-  // AXFR refused); counts are meaningless. "unsupported" — the driver has no
-  // `pull_zone_records`, so drift can't be computed for it at all.
-  status: "ok" | "error" | "unsupported";
+  // "ok" — pulled, nothing missing or extra, and not below the zone's serial.
+  // "syncing" — the zone changed under two minutes ago and the server has not
+  // caught up yet. "behind" — pulled, but the server is not serving the zone
+  // as saved: a saved record is missing or it sits below the zone's serial.
+  // "drift" — not behind, but the record sets differ (records SpatiumDDI
+  // doesn't hold, or a difference DNS views can explain). "error" — the pull
+  // failed (unreachable, paused, AXFR refused); counts are meaningless.
+  // "unsupported" — the driver has no `pull_zone_records`.
+  status: "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported";
   error: string | null;
+  // Why a pulled server is "syncing" / "behind" / "drift".
+  reason: string | null;
+  // The serial the server reported (null = it hasn't) and the zone's target.
+  current_serial: number | null;
+  target_serial: number;
   in_sync: number;
   // `extra_on_server.length + missing_on_server.length` — the backend derives
   // it, so don't recompute it in the UI.
