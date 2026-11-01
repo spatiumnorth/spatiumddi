@@ -1,4 +1,12 @@
-import { Children, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Children,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useDismissableMenu } from "@/hooks/useDismissableMenu";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -2826,7 +2834,7 @@ export function DashboardPage() {
  * selecting a subset narrows every IPAM-tab card. Renders nothing when
  * fewer than two spaces exist — there's nothing to filter against.
  */
-function IpamSpaceFilter({
+export function IpamSpaceFilter({
   spaces,
   selected,
   onChange,
@@ -2837,20 +2845,16 @@ function IpamSpaceFilter({
 }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (
-        wrapperRef.current &&
-        !wrapperRef.current.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  // Esc / outside press / focus leaving close the picker (#3159).
+  const closePicker = useCallback(() => setOpen(false), []);
+  const { onBlur } = useDismissableMenu({
+    open,
+    onClose: closePicker,
+    containerRef: wrapperRef,
+    triggerRef,
+  });
 
   const sortedSpaces = useMemo(
     () => [...spaces].sort((a, b) => a.name.localeCompare(b.name)),
@@ -2873,9 +2877,12 @@ function IpamSpaceFilter({
   }
 
   return (
-    <div className="relative" ref={wrapperRef}>
+    <div className="relative" ref={wrapperRef} onBlur={onBlur}>
       <button
+        ref={triggerRef}
         type="button"
+        aria-haspopup="true"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         title="Scope IPAM-tab cards to one or more IP spaces"
         className={cn(

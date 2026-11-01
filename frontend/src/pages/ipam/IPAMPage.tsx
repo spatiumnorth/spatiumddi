@@ -155,6 +155,7 @@ import {
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
+import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
@@ -5154,7 +5155,6 @@ export function SubnetDetail({
   const [filterModes, setFilterModes] = useState<Record<string, FilterMode>>(
     {},
   );
-  const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   // Client-side sort of the IP table (issue #519). ``null`` = the API's
   // native inet order (which also keeps DHCP-pool / gap boundary rows
   // meaningful; those are suppressed under any custom sort).
@@ -6506,63 +6506,12 @@ export function SubnetDetail({
                                   aria-label="Filter"
                                   className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                                 />
-                                <div className="relative">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setOpenFilterMenu(
-                                        openFilterMenu === col ? null : col,
-                                      )
-                                    }
-                                    className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                                    title="Filter mode"
-                                  >
-                                    {filterModes[col] === "begins"
-                                      ? "^"
-                                      : filterModes[col] === "ends"
-                                        ? "$"
-                                        : filterModes[col] === "regex"
-                                          ? ".*"
-                                          : "⊂"}
-                                  </button>
-                                  {openFilterMenu === col && (
-                                    <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                      {(
-                                        [
-                                          "contains",
-                                          "begins",
-                                          "ends",
-                                          "regex",
-                                        ] as const
-                                      ).map((m) => (
-                                        <button
-                                          key={m}
-                                          type="button"
-                                          onClick={() => {
-                                            setFilterModes((p) => ({
-                                              ...p,
-                                              [col]: m,
-                                            }));
-                                            setOpenFilterMenu(null);
-                                          }}
-                                          className={cn(
-                                            "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                            filterModes[col] === m &&
-                                              "font-semibold text-primary",
-                                          )}
-                                        >
-                                          {m === "contains"
-                                            ? "⊂ Contains"
-                                            : m === "begins"
-                                              ? "^ Begins"
-                                              : m === "ends"
-                                                ? "$ Ends"
-                                                : ".* Regex"}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
+                                <FilterModePicker
+                                  value={filterModes[col] ?? "contains"}
+                                  onChange={(m) =>
+                                    setFilterModes((p) => ({ ...p, [col]: m }))
+                                  }
+                                />
                               </div>
                             )}
                           </td>
