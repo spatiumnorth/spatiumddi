@@ -553,6 +553,17 @@ so there is no private-key custody.
   (`POST .../dnssec/rollover`) enqueues a `dnssec_rollover` op; the agent
   runs `rndc dnssec -rollover -key <tag>`. Routine rollover is automatic
   per the policy — this is the "roll now" escape hatch.
+- **Key cleanup (#2309).** When a zone stops being signed on a BIND9
+  server — unsigned, deleted, or moved to another group — the agent removes
+  its `K<zone>.+…` files from the key directory once the zone has stayed
+  unsigned there for a grace period, default **7 days**
+  (`DNSSEC_KEY_PRUNE_GRACE_SECONDS` on the agent; `0` removes them on the
+  first successful apply). The window is deliberate: re-signing a zone after
+  its keys are gone makes BIND generate a new KSK whose DS the parent does
+  not have, so the zone goes bogus until the registrar is updated. Signed
+  again inside the window, the zone keeps its old keys and its DS stays
+  valid. Nothing is removed while the agent's newest config has failed to
+  apply, and each server ages out only its own key files.
 - **Driver gating.** Sign/unsign are allowed on BIND9 + PowerDNS groups,
   rollover on BIND9 only; Windows DNS is refused (422). NSEC3 follows
   RFC 9276 (iterations 0 + salt-length 0 recommended) — the policy editor
@@ -1814,6 +1825,8 @@ The UI surfaces per-server results with zones-imported / zones-pushed / errors, 
 **Name targets are read the way the driver reads them (#1794).** A CNAME / DNAME / NS / PTR / MX / SRV / NAPTR / SVCB / HTTPS target with no trailing dot is relative to the zone on BIND9, Technitium (both drivers) and Windows without WinRM credentials, so `a.b` means `a.b.<zone>.`; on the cloud drivers and Windows over WinRM the name is taken as given, so `a.b` is already absolute. Drift and sync compare on that reading, so neither reports a false difference nor imports a duplicate.
 
 **Apex NS (#1857).** An agent-managed BIND9 or Technitium server serves the zone's own apex NS rows as its NS set, so drift reads the apex NS from it and compares the two: an NS set changed on the server, or an NS change the agent has not applied, shows as drift. When the zone has no apex NS rows, the NS set the server answers with (its Primary NS or placeholder, or a provider's name servers) is its own and is not reported. When the read carries no apex NS at all (an operator's own BIND9, Windows over a zone transfer), the stored rows are left out, since they would otherwise read "missing on server" forever. NS records below the apex are always compared. Import and Sync with Servers never read the apex NS. Sync's push set follows the same rule (#1893): a stored apex NS is left out of the push to a server whose read carries no apex NS, instead of being pushed again on every run (on agent-managed BIND9 that push failed for want of a TSIG key each time); a provider read that does carry the apex NS is compared like any record. The apex NS an import brings in is covered in MIGRATION.md (#1892).
+
+**What a server's status means (#3198).** The per-server status in the drift report (the zone's **Drift** tab, `GET …/zones/{id}/drift`, the `find_dns_zone_drift` copilot tool) answers two separate questions. `error` / `unsupported`: the transfer failed or the driver cannot do one, and nothing was compared. For a server whose zone was read, the status says whether it is serving the zone as saved. `ok`: no saved record is missing, nothing extra is served, and the server's last reported serial (the zone's server state) is not below the zone's target. A serial *ahead* of the target is not a fault: an inline-signed BIND9 zone serves the signed copy's serial, which signing moves past ours on its own. `syncing`: the zone changed less than two minutes ago and the server has not reached the serial carrying that change yet, so a missing record or a lower serial is a change still on its way. `behind`: a saved record is not being served, or the serial is below the target, and the server has had those two minutes (a server that reports the target serial and still lacks a record is behind at once). `drift`: not behind, but the record sets differ: the host serves records SpatiumDDI does not hold (typically a manual change on the host), or, under DNS views, a difference the transfer cannot attribute to this server's copy. DNSSEC signing records, including BIND9's private `TYPE65534` signing-state record, are never compared. Each entry carries a `reason`, the server's `current_serial` (null when it has not reported) and the `target_serial`. Treat any status other than `ok` as not ok.
 
 Manual drift checks from the subnet / block / space side use **Check DNS Sync** which only covers IPAM-managed records (A/AAAA/PTR). The group-level reconciliation covers everything in a zone.
 

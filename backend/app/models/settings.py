@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -182,9 +183,12 @@ class PlatformSettings(Base):
     session_timeout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     auto_logout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # Password policy (issue #70). Defaults are deliberately permissive so
-    # an upgrade doesn't suddenly invalidate working passwords; operators
-    # tighten in Settings → Security. ``password_history_count = 0``
+    # Password policy (issue #70). It is checked only when a password is
+    # SET, so these defaults never invalidate a working password on
+    # upgrade; operators adjust them in Settings → Security. They are also
+    # the no-row fallback (``platform_setting_default``, #3203), so the
+    # first password on a fresh install is held to them.
+    # ``password_history_count = 0``
     # disables history checking; ``password_max_age_days = 0`` disables
     # forced rotation. Validator + history live in
     # ``app.services.password_policy``.
@@ -1205,3 +1209,17 @@ class BrandingAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # instead of sitting behind a stale browser cache.
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+def platform_setting_default(name: str) -> Any:
+    """The shipped default of one ``PlatformSettings`` column.
+
+    The singleton row is created lazily, so on a fresh install the first
+    requests (the forced first-login password change among them) run with no
+    row at all. A fallback for "no row" must therefore be the column default,
+    and reading it from the mapped column keeps the two from drifting (#3203).
+    """
+    default = PlatformSettings.__table__.c[name].default
+    if default is None or not default.is_scalar:
+        raise LookupError(f"PlatformSettings.{name} has no scalar default")
+    return default.arg

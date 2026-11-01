@@ -31,6 +31,7 @@ from app.models.auth import User
 from app.models.dns_threat import DNSClientWindow
 from app.services.ai.tools.base import register_tool
 from app.services.dns_threat.aggregate import INTERESTING_SCORE
+from app.services.logs.ip_filter import InvalidLogFilter
 
 
 class FindSuspiciousDNSClientsArgs(BaseModel):
@@ -494,7 +495,7 @@ class FindRPZHitsArgs(BaseModel):
     hours: int = Field(default=24, ge=1, le=24 * 30, description="Trailing window in hours.")
     limit: int = Field(default=50, ge=1, le=500)
     client_ip: str | None = Field(
-        default=None, description="Only hits from this client IP address."
+        default=None, description="Client IP: whole address, CIDR, or leading part (e.g. 10.1.)."
     )
     qname_contains: str | None = Field(
         default=None, max_length=255, description="Substring match on the blocked domain."
@@ -530,22 +531,17 @@ async def find_rpz_hits(
 ) -> list[dict[str, Any]]:
     from app.services.dns_threat import rpz as rpz_service  # noqa: PLC0415
 
-    client_ip: str | None = None
-    if args.client_ip:
-        # An INET comparison raises on a malformed literal, so the model's
-        # own answer ("no such client") is returned instead of a 500 that
-        # reads to the copilot as a broken tool.
-        try:
-            client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
-        except ValueError:
-            return [{"result": f"{args.client_ip!r} is not an IP address"}]
-
-    rows = await rpz_service.recent_hits(
-        db,
-        hours=args.hours,
-        limit=args.limit,
-        client_ip=client_ip,
-        qname_contains=args.qname_contains,
-        include_passthru=args.include_passthru,
-    )
+    # A value that cannot be an address is answered as text rather than a
+    # 500 that reads to the copilot as a broken tool.
+    try:
+        rows = await rpz_service.recent_hits(
+            db,
+            hours=args.hours,
+            limit=args.limit,
+            client_ip=args.client_ip,
+            qname_contains=args.qname_contains,
+            include_passthru=args.include_passthru,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [{**r, "ts": r["ts"].isoformat() if r.get("ts") else None} for r in rows]

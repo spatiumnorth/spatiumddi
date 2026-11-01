@@ -1328,6 +1328,8 @@ function AliasesSection() {
                       type="button"
                       disabled={a.is_builtin}
                       onClick={() => del.mutate(a.id)}
+                      aria-label={`Delete alias ${a.name}`}
+                      title="Delete alias"
                       className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
                       {...applianceGate}
                     >

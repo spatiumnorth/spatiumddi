@@ -30,6 +30,7 @@ from app.models.dns_threat import DNSClientWindow
 from app.models.dns_threat_mute import DNSThreatMute
 from app.services.dns_threat import rpz as rpz_service
 from app.services.dns_threat.aggregate import INTERESTING_SCORE, compute_threat_summary
+from app.services.logs.ip_filter import InvalidLogFilter
 
 # Same gate the Logs router uses: this is a rollup of the DNS query
 # log, so whoever may read raw queries may read a summary of them.
@@ -486,17 +487,18 @@ async def rpz_hits(
     ALLOW, and listing it among blocks makes a working allowlist look
     like an infection.
     """
-    return [
-        RPZHitRow(**r)
-        for r in await rpz_service.recent_hits(
+    try:
+        hits = await rpz_service.recent_hits(
             db,
             hours=hours,
             limit=limit,
-            client_ip=_validated_ip(client_ip) if client_ip else None,
+            client_ip=client_ip,
             qname_contains=qname_contains,
             include_passthru=include_passthru,
         )
-    ]
+    except InvalidLogFilter as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return [RPZHitRow(**r) for r in hits]
 
 
 @router.get("/rpz/feeds", response_model=list[RPZFeedRow])

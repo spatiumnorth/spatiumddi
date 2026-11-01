@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 
+import { safeLocalStorage } from "@/lib/safeStorage";
+
 type Theme = "light" | "dark";
 
 function applyTheme(theme: Theme) {
@@ -7,7 +9,7 @@ function applyTheme(theme: Theme) {
 }
 
 function initialTheme(): Theme {
-  const saved = localStorage.getItem("theme");
+  const saved = safeLocalStorage.getItem("theme");
   if (saved === "light" || saved === "dark") return saved;
   // Fall back to OS preference on first visit
   return window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -20,7 +22,7 @@ export function useTheme() {
 
   useEffect(() => {
     applyTheme(theme);
-    localStorage.setItem("theme", theme);
+    safeLocalStorage.setItem("theme", theme);
   }, [theme]);
 
   const setTheme = (t: Theme) => setThemeState(t);

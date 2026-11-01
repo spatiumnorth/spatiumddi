@@ -5971,11 +5971,21 @@ export interface ZoneDriftServer {
   server_id: string;
   server_name: string;
   driver: string;
-  // "ok" — pulled and diffed. "error" — the pull failed (unreachable, paused,
-  // AXFR refused); counts are meaningless. "unsupported" — the driver has no
-  // `pull_zone_records`, so drift can't be computed for it at all.
-  status: "ok" | "error" | "unsupported";
+  // "ok" — pulled, nothing missing or extra, and not below the zone's serial.
+  // "syncing" — the zone changed under two minutes ago and the server has not
+  // caught up yet. "behind" — pulled, but the server is not serving the zone
+  // as saved: a saved record is missing or it sits below the zone's serial.
+  // "drift" — not behind, but the record sets differ (records SpatiumDDI
+  // doesn't hold, or a difference DNS views can explain). "error" — the pull
+  // failed (unreachable, paused, AXFR refused); counts are meaningless.
+  // "unsupported" — the driver has no `pull_zone_records`.
+  status: "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported";
   error: string | null;
+  // Why a pulled server is "syncing" / "behind" / "drift".
+  reason: string | null;
+  // The serial the server reported (null = it hasn't) and the zone's target.
+  current_serial: number | null;
+  target_serial: number;
   in_sync: number;
   // `extra_on_server.length + missing_on_server.length` — the backend derives
   // it, so don't recompute it in the UI.
@@ -8562,9 +8572,15 @@ export interface DHCPServerGroup {
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
   /** #2963 — names of Kea members with no `ha_peer_url` in an HA-mode group
-   *  of two or more. HA does not render while this is non-empty. Empty for a
-   *  standalone group. Optional so fixtures predating it still type-check. */
+   *  of two or more. Empty for a standalone group. HA does not render while
+   *  fewer than two members have a URL; otherwise the URL-less ones are
+   *  listed in `ha_sidelined_members` too. Optional so fixtures predating it
+   *  still type-check. */
   ha_peer_urls_missing?: string[];
+  /** #3151 — URL-less Kea members of a group whose other Kea members DO run
+   *  HA. They are left out of the relationship and serve none of the group's
+   *  scopes, so the pair keeps running. Empty when HA is not rendered. */
+  ha_sidelined_members?: string[];
   /** #2963 — why the control plane did not derive the missing URL(s):
    *  `bridged_network_mode`, or `more_than_two_kea_members` (a 3rd+ member
    *  becomes a Kea backup and can take over the primary role, so it is left
@@ -16006,6 +16022,8 @@ export interface TrashRestoreResponse {
   batch_id: string;
   restored: number;
   skipped: { type: string; id: string; display: string; reason: string }[];
+  // Rows that stayed in the Trash on purpose (a subnet's records, #2732).
+  held_back?: { type: string; id: string; display: string; reason: string }[];
 }
 
 export const trashApi = {
