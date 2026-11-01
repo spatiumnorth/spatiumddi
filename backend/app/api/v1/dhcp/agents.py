@@ -71,7 +71,10 @@ from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
-from app.services.appliance.ownership import owning_appliance_for_dhcp_server
+from app.services.appliance.ownership import (
+    owning_appliance_for_dhcp_agent,
+    owning_appliance_for_dhcp_server,
+)
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
@@ -89,6 +92,7 @@ from app.services.dhcp.ipam_mirror import (
 )
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
+from app.services.dns.record_ops import purge_trashed_address_records
 from app.tasks.prune_logs import log_retention_hours
 
 logger = structlog.get_logger(__name__)
@@ -570,8 +574,30 @@ async def agent_register(
         ):
             return duplicate_instance_response("DHCP", server.name)
 
+    # #3202: an agent with no row yet that runs on an appliance lands in the
+    # group the APPLIANCE is assigned, not the one its pod env names (DNS's
+    # #2190 rule). On a cluster the appliance chart renders ONE dhcp-kea pod
+    # template for every node, so it carries no node's DHCP group: a group in
+    # it made a Fleet group move of one node replace the Kea pod on every node.
+    # The env's group (a compose or Kubernetes agent's ``AGENT_GROUP``) still
+    # decides for an agent no appliance claims. A row found below keeps its
+    # group either way: moving a row is the control plane's job
+    # (``dhcp_group_move``), never registration's.
     group: DHCPServerGroup | None = None
-    if body.group_name:
+    if server is None:
+        appliance = await owning_appliance_for_dhcp_agent(db, body.hostname)
+        if appliance is not None and appliance.assigned_dhcp_group_id is not None:
+            group = await db.get(DHCPServerGroup, appliance.assigned_dhcp_group_id)
+            if group is not None and body.group_name and body.group_name != group.name:
+                logger.warning(
+                    "dhcp_agent_group_follows_appliance",
+                    appliance_id=str(appliance.id),
+                    hostname=body.hostname,
+                    env_group=body.group_name,
+                    assigned_group=group.name,
+                    issue="#3202",
+                )
+    if group is None and body.group_name:
         res = await db.execute(
             select(DHCPServerGroup).where(DHCPServerGroup.name == body.group_name)
         )
@@ -1715,6 +1741,7 @@ async def agent_lease_events(
                         ip=ev.ip_address,
                         error=str(exc),
                     )
+                await purge_trashed_address_records(db, [ipam_row.id])  # #3186
                 await db.delete(ipam_row)
                 ipam_by_key.pop((subnet.id, norm_ip(ev.ip_address)), None)
 

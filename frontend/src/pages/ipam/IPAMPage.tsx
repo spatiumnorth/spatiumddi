@@ -91,6 +91,7 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -154,6 +155,7 @@ import {
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
+import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
@@ -668,7 +670,11 @@ function InlineEditableText({
           if (e.key === "Enter") {
             e.preventDefault();
             commit();
-          } else if (e.key === "Escape") {
+          } else if (
+            e.key === "Escape" &&
+            !e.nativeEvent.isComposing &&
+            e.keyCode !== 229
+          ) {
             e.preventDefault();
             setDraft(value);
             setEditing(false);
@@ -3311,7 +3317,11 @@ function InlineStatusSelect({
         }}
         onBlur={() => setEditing(false)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") {
+          if (
+            e.key === "Escape" &&
+            !e.nativeEvent.isComposing &&
+            e.keyCode !== 229
+          ) {
             e.preventDefault();
             setEditing(false);
           }
@@ -4237,7 +4247,7 @@ interface BreadcrumbItem {
   onClick?: () => void;
 }
 
-function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
+export function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
   // Compress if more than 4 items
   let visible = items;
   if (items.length > 4) {
@@ -4248,7 +4258,7 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
     ];
   }
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-1">
+    <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1">
       {visible.map((item, i) => (
         <span key={i} className="contents">
           {item.label === "…" ? (
@@ -4257,8 +4267,9 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
             <button
               onClick={item.onClick}
               disabled={!item.onClick}
+              title={item.label}
               className={cn(
-                "rounded-full px-2 py-0.5 text-xs font-medium transition-colors",
+                "max-w-full min-w-0 truncate rounded-full px-2 py-0.5 text-xs font-medium transition-colors",
                 PILL_STYLES[item.variant],
               )}
             >
@@ -5152,7 +5163,6 @@ export function SubnetDetail({
   const [filterModes, setFilterModes] = useState<Record<string, FilterMode>>(
     {},
   );
-  const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   // Client-side sort of the IP table (issue #519). ``null`` = the API's
   // native inet order (which also keeps DHCP-pool / gap boundary rows
   // meaningful; those are suppressed under any custom sort).
@@ -5689,8 +5699,8 @@ export function SubnetDetail({
       {/* Header */}
       <div className="border-b">
         {/* Top bar: breadcrumb + actions */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
-          <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 pt-3 pb-2">
+          <div className="min-w-[12rem] flex-1">
             {spaceName &&
               (() => {
                 const crumbs: BreadcrumbItem[] = [
@@ -5734,7 +5744,7 @@ export function SubnetDetail({
               primary), so no regrouping needed here; ``flex-wrap`` is the
               other half of that issue's fix, so a narrow window moves the
               actions to a second line instead of clipping the last one. */}
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             <HeaderButton
               icon={RefreshCw}
               onClick={refreshSubnet}
@@ -6504,63 +6514,12 @@ export function SubnetDetail({
                                   aria-label="Filter"
                                   className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                                 />
-                                <div className="relative">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setOpenFilterMenu(
-                                        openFilterMenu === col ? null : col,
-                                      )
-                                    }
-                                    className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                                    title="Filter mode"
-                                  >
-                                    {filterModes[col] === "begins"
-                                      ? "^"
-                                      : filterModes[col] === "ends"
-                                        ? "$"
-                                        : filterModes[col] === "regex"
-                                          ? ".*"
-                                          : "⊂"}
-                                  </button>
-                                  {openFilterMenu === col && (
-                                    <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                      {(
-                                        [
-                                          "contains",
-                                          "begins",
-                                          "ends",
-                                          "regex",
-                                        ] as const
-                                      ).map((m) => (
-                                        <button
-                                          key={m}
-                                          type="button"
-                                          onClick={() => {
-                                            setFilterModes((p) => ({
-                                              ...p,
-                                              [col]: m,
-                                            }));
-                                            setOpenFilterMenu(null);
-                                          }}
-                                          className={cn(
-                                            "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                            filterModes[col] === m &&
-                                              "font-semibold text-primary",
-                                          )}
-                                        >
-                                          {m === "contains"
-                                            ? "⊂ Contains"
-                                            : m === "begins"
-                                              ? "^ Begins"
-                                              : m === "ends"
-                                                ? "$ Ends"
-                                                : ".* Regex"}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
+                                <FilterModePicker
+                                  value={filterModes[col] ?? "contains"}
+                                  onChange={(m) =>
+                                    setFilterModes((p) => ({ ...p, [col]: m }))
+                                  }
+                                />
                               </div>
                             )}
                           </td>
@@ -13723,9 +13682,14 @@ export function BlockDetailView({
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b">
         {/* Top bar */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
-          <BreadcrumbPills items={crumbs} />
-          <div className="flex flex-shrink-0 items-center gap-2">
+        {/* #3213 — wraps rather than clips: the breadcrumb takes the line's
+            spare width (``min-w-0`` so its pills truncate) and the actions
+            drop to their own line once it would fall under 12rem. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 pt-3 pb-2">
+          <div className="min-w-[12rem] flex-1">
+            <BreadcrumbPills items={crumbs} />
+          </div>
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             {selectedCount > 0 ? (
               <>
                 {!hasBlocksSelected && (
@@ -14523,7 +14487,7 @@ export function BlockDetailView({
                               <RowTypeBadge kind="block" />
                             </span>
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground">
+                          <td className="min-w-[10rem] px-4 py-2 break-words text-muted-foreground">
                             {b.name || (
                               <span className="text-muted-foreground/40">
                                 —
@@ -14603,7 +14567,7 @@ export function BlockDetailView({
                               <RowTypeBadge kind="subnet" />
                             </span>
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground">
+                          <td className="min-w-[10rem] px-4 py-2 break-words text-muted-foreground">
                             {s.name || (
                               <span className="text-muted-foreground/40">
                                 —
@@ -15192,9 +15156,13 @@ export function SpaceTableView({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b px-6 py-3">
-        <div className="flex items-center justify-between gap-4 pb-2">
-          <BreadcrumbPills items={[{ label: space.name, variant: "space" }]} />
-          <div className="flex flex-shrink-0 items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 pb-2">
+          <div className="min-w-[12rem] flex-1">
+            <BreadcrumbPills
+              items={[{ label: space.name, variant: "space" }]}
+            />
+          </div>
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             {selected.size > 0 && (
               <>
                 {!hasBlocksSelected && (
@@ -17160,7 +17128,12 @@ export function IPAMPage() {
   return (
     <div className="flex h-full">
       {/* ── Left tree panel ── */}
-      <div className="flex w-72 flex-shrink-0 flex-col border-r">
+      <ResizablePane
+        storageKey="ipam"
+        defaultWidth={288}
+        label="Resize IP spaces tree"
+        className="flex flex-col border-r"
+      >
         <div className="flex h-12 items-center justify-between border-b px-3">
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
@@ -17361,7 +17334,7 @@ export function IPAMPage() {
               </p>
             )}
         </div>
-      </div>
+      </ResizablePane>
 
       {/* ── Right detail panel ── */}
       <div className="flex flex-1 flex-col overflow-hidden">

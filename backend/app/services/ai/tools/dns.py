@@ -1401,7 +1401,8 @@ async def find_dns_query_stats(
 
 class FindDNSQueriesArgs(BaseModel):
     client_ip: str | None = Field(
-        default=None, description="Only queries from this client IP address."
+        default=None,
+        description="Client IP: a whole address, a CIDR, or a leading part (e.g. 10.1.).",
     )
     qname_contains: str | None = Field(
         default=None, max_length=255, description="Substring match on the queried name."
@@ -1457,17 +1458,13 @@ async def find_dns_queries(
     from datetime import UTC, datetime, timedelta  # noqa: PLC0415
 
     from app.services.logs.agent_logs import (  # noqa: PLC0415
+        InvalidLogFilter,
         LogScopeError,
         resolve_dns_log_servers,
         search_dns_queries,
     )
 
-    client_ip: str | None = None
-    if args.client_ip:
-        try:
-            client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
-        except ValueError:
-            return [{"result": f"{args.client_ip!r} is not an IP address"}]
+    client_ip = args.client_ip
     # A UUID column comparison raises a DBAPIError on anything that is not
     # one, and the likeliest wrong value here is a server or group NAME the
     # model read off another tool's output — so answer the question instead
@@ -1487,16 +1484,19 @@ async def find_dns_queries(
     except LogScopeError as exc:
         return [{"result": exc.detail}]
     names = {s.id: s.name for s in servers}
-    rows = await search_dns_queries(
-        db,
-        list(names),
-        since=datetime.now(UTC) - timedelta(minutes=args.minutes),
-        client_ip=client_ip,
-        qname_contains=args.qname_contains,
-        qtype=args.qtype,
-        rcode=args.rcode,
-        limit=args.limit,
-    )
+    try:
+        rows = await search_dns_queries(
+            db,
+            list(names),
+            since=datetime.now(UTC) - timedelta(minutes=args.minutes),
+            client_ip=client_ip,
+            qname_contains=args.qname_contains,
+            qtype=args.qtype,
+            rcode=args.rcode,
+            limit=args.limit,
+        )
+    except InvalidLogFilter as exc:
+        return [{"result": exc.detail}]
     return [
         {
             "ts": r.ts.isoformat(),
