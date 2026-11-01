@@ -355,11 +355,13 @@ tables nothing prunes are tracked in
 [#2274](https://github.com/spatiumnorth/spatiumddi/issues/2274).
 
 **Data retention** (Settings → Application → Data Retention, #2273).
-Each window below is read by a nightly prune task, which deletes
-anything older. All are superadmin-only to change, and every change is
-written to the audit log (`resource_type=platform_settings`,
-`resource_id=retention`) with the old and new values. Shortening a
-window deletes the older data on the next nightly run.
+Each window below is read by a prune task, which deletes anything
+older; the log windows are applied by dropping time partitions every
+15 minutes, at the grain of the partition (an hour or a day). All are
+superadmin-only to change, and every change is written to the audit log
+(`resource_type=platform_settings`, `resource_id=retention`) with the
+old and new values. Shortening a window deletes the older data on the
+next run.
 
 | Setting | Data | Default | Range |
 |---|---|---|---|
@@ -370,12 +372,13 @@ window deletes the older data on the next nightly run.
 | `pcap_retention_days` | Finished packet captures and their `.pcap` files | 7 days | 1–90 days |
 | `appliance_revoked_retention_days` | Deleted (revoked) Fleet appliance rows | 30 days | 0–365 days (0 = keep until permanently deleted) |
 
-`log_retention_hours` is capped at a week because the prune is a single
-`DELETE`, and a longer window makes that one transaction larger;
-[#2185](https://github.com/spatiumnorth/spatiumddi/issues/2185) replaces
-it with partition drops and raises the cap. The agent ingest endpoints
-skip a replayed log line already older than this window rather than
-inserting a row the next prune would delete. For longer log history,
+`log_retention_hours` keeps its cap of a week. It was there because the
+prune was a single `DELETE` whose transaction grew with the window; since
+[#2185](https://github.com/spatiumnorth/spatiumddi/issues/2185) the log
+tables are time-partitioned and retention is a partition drop, so the
+cap is a product decision and no longer a limit of the mechanism. The
+agent ingest endpoints skip a replayed log line already older than this
+window rather than inserting a row the next partition drop would remove. For longer log history,
 forward to Loki or a SIEM. Backups have their own retention per
 destination (§2.9).
 
