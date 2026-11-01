@@ -24,6 +24,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, PendingRollbackError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
@@ -86,6 +87,7 @@ from app.services.dhcp.agent_token import (
     verify_agent_token,
 )
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.dhcp.ha_members import kea_ha_members
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
     lease_hostname_suppressed_subnets,
@@ -765,6 +767,15 @@ async def agent_config_longpoll(
                 # not ship ops; the new owner's polls do.
                 return duplicate_instance_response("DHCP", server.name)
             bundle = await build_config_bundle(db, server)
+            # #3241: a bundle with no failover block tells the agent to run no
+            # HA hook, so it stops reporting an HA state. Whatever state it
+            # reported last describes a relationship the server has left (its
+            # group's mode, its group, its partner or its peer URL changed), and
+            # every way out of HA ends in this bundle, so it is forgotten here.
+            # On every pass: a poll that answers 304 clears a stale row too.
+            if bundle.failover is None and _forget_ha_state(server):
+                await db.commit()
+                logger.info("dhcp_ha_state_cleared", server_id=str(server.id), why="no_ha_hook")
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
             # mix below so a Settings → Appliance → SNMP change wakes the
             # agent's long-poll even when nothing in the DHCP driver
@@ -1955,6 +1966,32 @@ async def agent_mac_sightings(
     return {"recorded": recorded, "new": new_count}
 
 
+def _forget_ha_state(server: DHCPServer) -> bool:
+    """#3241: clear the HA state ``server`` last reported. True if it held one."""
+    if server.ha_state is None and server.ha_last_heartbeat_at is None:
+        return False
+    server.ha_state = None
+    server.ha_last_heartbeat_at = None
+    return True
+
+
+async def _takes_part_in_ha(db: AsyncSession, server: DHCPServer) -> bool:
+    """#3241: whether ``server`` is one of its group's HA participants, by the
+    rule its bundle's failover block follows (``services/dhcp/ha_members``)."""
+    if server.server_group_id is None:
+        return False
+    group = (
+        await db.execute(
+            select(DHCPServerGroup)
+            .where(DHCPServerGroup.id == server.server_group_id)
+            .options(selectinload(DHCPServerGroup.servers))
+        )
+    ).scalar_one_or_none()
+    if group is None:
+        return False
+    return any(s.id == server.id for s in kea_ha_members(group.mode, group.servers).participants)
+
+
 @router.post("/ha-status")
 async def agent_ha_status(
     body: HAStatusReport,
@@ -1968,8 +2005,18 @@ async def agent_ha_status(
     Only updates the two ``ha_*`` columns on DHCPServer; never rewrites
     config or creates audit rows. Drift-free reporting is out of band
     from the config push path.
+
+    #3241: only an HA participant's state is stored. A server that left HA
+    can still send a report, read from its Kea before its agent applied the
+    bundle that switches the hook off; storing it would bring back the state
+    its config poll cleared, so the answer is ``not_in_ha`` and the row reads
+    no HA state.
     """
     server, _ = auth
+    if not await _takes_part_in_ha(db, server):
+        if _forget_ha_state(server):
+            await db.commit()
+        return {"status": "not_in_ha"}
     server.ha_state = body.state
     server.ha_last_heartbeat_at = datetime.now(UTC)
     await db.commit()
