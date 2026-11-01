@@ -58,6 +58,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { cn } from "@/lib/utils";
 import { isHeartbeatStale, silenceLabel } from "@/lib/heartbeat";
 import { releaseVerdict, upgradeDirection } from "@/lib/versions";
@@ -889,7 +890,7 @@ export function FleetTab({
   // session) so it stays dismissed across browser restarts; the
   // checkbox gate makes dismissal deliberate rather than a stray click.
   const [vipAdvisoryDismissed, setVipAdvisoryDismissed] = useState<boolean>(
-    () => localStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
+    () => safeLocalStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
   );
   const [vipDismissAck, setVipDismissAck] = useState(false);
 
@@ -1531,7 +1532,10 @@ export function FleetTab({
                           type="button"
                           disabled={!vipDismissAck}
                           onClick={() => {
-                            localStorage.setItem(VIP_ADVISORY_DISMISS_KEY, "1");
+                            safeLocalStorage.setItem(
+                              VIP_ADVISORY_DISMISS_KEY,
+                              "1",
+                            );
                             setVipAdvisoryDismissed(true);
                           }}
                           className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
@@ -2296,7 +2300,7 @@ function ApplianceTableSection({
   );
 }
 
-function ApplianceTableRow({
+export function ApplianceTableRow({
   row,
   highlight,
   busy,
@@ -2342,7 +2346,20 @@ function ApplianceTableRow({
     >
       <td className="px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="font-medium">{row.hostname}</span>
+          {/* The keyboard path to the row's detail dialog, which a
+              click on the row opens (#3158, as #2724 did for the
+              server and address rows). */}
+          <button
+            type="button"
+            title="View details"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen();
+            }}
+            className="rounded-sm font-medium hover:underline focus-visible:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {row.hostname}
+          </button>
           {/* #272 — installer-role chip. Two variants: control-plane
               (Control plane table) + appliance (Service agents).
               Legacy strings still render with a sensible label. */}
