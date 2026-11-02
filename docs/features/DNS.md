@@ -543,10 +543,10 @@ so there is no private-key custody.
   paste at the parent registrar, plus a per-key table (tag / type / state).
   The DS shown is the set BIND itself would publish as CDS: only keys whose
   `DSState` is rumoured or omnipresent. So a newly signed zone shows **no
-  DS until its DNSKEY has propagated** (on the built-in `default` policy
-  about two hours: DNSKEY TTL + publish-safety + propagation delay), and a
-  KSK being withdrawn at the end of a rollover drops out of the card when
-  BIND withdraws it. The agent re-reads this state every 5 minutes, not
+  DS until its new signatures have propagated**: on the built-in `default`
+  policy about a day, since BIND's own `PublishCDS` time for a new key
+  falls 24 h 5 min after signing (#3154). A KSK being withdrawn at the end
+  of a rollover drops out of the card when BIND withdraws it. The agent re-reads this state every 5 minutes, not
   only after a config change, so both transitions reach the card on their
   own.
 - **Manual rollover.** The card's per-key **Roll** button
@@ -756,6 +756,8 @@ Zones are displayed and managed in a **tree hierarchy** that mirrors the DNS nam
 </p>
 
 ### Zone Model
+
+> **Renaming (#3265).** A zone that holds records cannot be renamed: the API answers 409, because each record's name, the name IPAM keeps on its addresses and the PTR values it published are stored under the zone's name and would stay on the old one. Records in the Trash count too, since a restore brings a record back under the name it was deleted with. Create a zone under the new name and move the records, or delete them first and purge them from the Trash. An empty zone renames freely.
 
 ```
 DNSZone

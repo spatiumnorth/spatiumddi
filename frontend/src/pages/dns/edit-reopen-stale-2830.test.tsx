@@ -162,10 +162,8 @@ function storingApi() {
       store.saved.length === 0
         ? Promise.resolve([{ ...store.group }])
         : new Promise(() => {}),
-    listZones: () =>
-      store.saved.length === 0
-        ? Promise.resolve([{ ...store.zone }, ZONES[1]])
-        : new Promise(() => {}),
+    // Edit Zone reads the zone fresh on open (#3269), so this list answers.
+    listZones: () => Promise.resolve([{ ...store.zone }, ZONES[1]]),
     listViews: async () => [],
     listServers: async () => [],
     updateZone: async (_g: unknown, _z: unknown, d: unknown) => {
@@ -192,6 +190,7 @@ describe("Edit Zone reopened before the refetch resolves (#2830)", () => {
       fireEvent.click(
         await screen.findByRole("menuitem", { name: /Edit Zone/ }),
       );
+      await waitFor(() => topDialog());
       return (
         await within(topDialog()).findByText("Default TTL (seconds)", {
           selector: "label",
@@ -209,9 +208,13 @@ describe("Edit Zone reopened before the refetch resolves (#2830)", () => {
 
     const again = await openEditZone();
     expect(again.value).toBe("300");
+    // An untouched Save sends nothing (#3269): the stored value stays.
     fireEvent.click(within(topDialog()).getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(store.saved).toHaveLength(2));
-    expect(store.saved[1]).toMatchObject({ ttl: 300 });
+    await waitFor(() =>
+      expect(screen.queryAllByRole("dialog")).toHaveLength(0),
+    );
+    expect(store.saved).toHaveLength(1);
+    expect(store.zone.ttl).toBe(300);
   });
 });
 

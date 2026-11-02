@@ -167,6 +167,7 @@ describe("Edit modals' Danger zone and delete steps", () => {
   }
 
   it("subnet", async () => {
+    answers.ipamApi = { getSubnet: () => Promise.resolve(subnet) };
     open(
       <EditSubnetModal
         subnet={subnet}
