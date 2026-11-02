@@ -107,3 +107,66 @@ async def test_stored_agent_only_token_is_refused_everywhere_not_unrestricted(
         r = await client.request(method, path, headers=hdr, json={} if method == "POST" else None)
         assert r.status_code == 403, (method, path, r.status_code, r.text)
         assert "scope" in r.text.lower()
+
+
+async def _stored_token(db: AsyncSession, u: User, scopes: list[str]) -> tuple[str, APIToken]:
+    raw, _p, token_hash = generate_api_token()
+    tok = APIToken(
+        name=f"legacy-{uuid.uuid4().hex[:6]}",
+        token_hash=token_hash,
+        prefix=raw[:10],
+        scope="user",
+        scopes=scopes,
+        user_id=u.id,
+        created_by_user_id=u.id,
+        is_active=True,
+    )
+    db.add(tok)
+    await db.commit()
+    return raw, tok
+
+
+@pytest.mark.asyncio
+async def test_stored_agent_only_token_cannot_reach_mcp(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    u, _h = await _admin(db_session)
+    raw, _tok = await _stored_token(db_session, u, ["agent"])
+    r = await client.post(
+        "/api/v1/ai/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {raw}"},
+    )
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_stored_agent_plus_read_behaves_as_read(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    u, _h = await _admin(db_session)
+    raw, _tok = await _stored_token(db_session, u, ["agent", "read"])
+    hdr = {"Authorization": f"Bearer {raw}"}
+    assert (await client.get("/api/v1/ipam/spaces", headers=hdr)).status_code == 200
+    w = await client.post("/api/v1/ipam/spaces", headers=hdr, json={"name": "x"})
+    assert w.status_code == 403, w.text
+
+
+@pytest.mark.asyncio
+async def test_update_cannot_add_or_keep_agent(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    u, h = await _admin(db_session)
+    _raw, tok = await _stored_token(db_session, u, ["agent", "read"])
+    for scopes in (["agent", "read"], ["agent"], ["read", "agent", "dns:write"]):
+        r = await client.patch(
+            f"/api/v1/api-tokens/{tok.id}",
+            json={"scopes": scopes, "stepup_password": "x"},
+            headers=h,
+        )
+        assert r.status_code == 422, (scopes, r.text)
+        assert "retired" in r.text
+    # Dropping it is a narrowing: no step-up needed, and the row loses it.
+    ok = await client.patch(f"/api/v1/api-tokens/{tok.id}", json={"scopes": ["read"]}, headers=h)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["scopes"] == ["read"]

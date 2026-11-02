@@ -10851,7 +10851,9 @@ export interface ApiToken {
   description: string;
   prefix: string;
   scope: string;
-  scopes: ApiTokenScope[];
+  /** What the row stores. Usually an ``ApiTokenScope``, but a token minted
+   *  before #3302 may still carry the retired ``agent`` (matches nothing). */
+  scopes: string[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
   /** Set by the list endpoint (#2443). */
