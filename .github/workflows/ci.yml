@@ -490,12 +490,16 @@ jobs:
         run: |
           set -euo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          # Retried: this runs on every backend shard, and a dropped TLS read
+          # from postgresql.org (curl exit 55) failed whole shards before any
+          # test ran. --retry-all-errors covers mid-transfer drops too.
+          sudo curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends postgresql-client-16
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends postgresql-client-16
           # Ahead of the runner's own client on PATH for every later step.
           echo /usr/lib/postgresql/16/bin >> "$GITHUB_PATH"
 

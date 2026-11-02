@@ -8,6 +8,7 @@ import {
   type IPSpace,
   type SubnetPlanRead,
   formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { newNodeId } from "@/lib/uuid";
@@ -171,6 +172,11 @@ export function SubnetPlannerListPage() {
             This deletes only the plan record — any IPAM blocks / subnets that
             were already applied stay in place.
           </p>
+          {deleteMut.isError && (
+            <p role="alert" className="mb-3 text-xs text-destructive">
+              {formatDialogError(deleteMut.error, "Failed to delete plan")}
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <button
               type="button"
