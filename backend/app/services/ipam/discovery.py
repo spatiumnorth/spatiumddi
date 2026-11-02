@@ -20,7 +20,9 @@ Reconciliation writes (``reconcile_subnet``):
   overwritten);
 * live IPs with no row → inserted ``status='discovered'`` — UNLESS the
   IP sits in a dynamic DHCP pool (owned by the DHCP server) or is the
-  network / broadcast address.
+  network / broadcast address;
+* when it inserted any, the subnet's and its blocks' utilization
+  counters are recounted in the same transaction.
 
 Rows an operator has touched (``user_modified_at`` set) keep their
 status; discovery only refreshes their ``last_seen_at`` timestamp.
@@ -51,6 +53,7 @@ from app.services.ipam.new_device import (
     classify_mac,
     is_locally_administered,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
 
@@ -408,6 +411,11 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
         for new_row, mac in newly_discovered:
             if new_row.id is not None:
                 await record_mac_observation(db, new_row.id, mac)
+
+    # A ``discovered`` row counts toward utilization, so the subnet's and its
+    # blocks' figures follow the inserts in this pass (#3320).
+    if counts["created"]:
+        await recount_subnets_and_blocks(db, [subnet.id])
 
     return counts
 

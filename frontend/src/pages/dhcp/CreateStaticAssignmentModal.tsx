@@ -108,6 +108,9 @@ function StaticModalForm({
       qc.invalidateQueries({ queryKey: ["dhcp-statics", scope.id] });
       // Static upserts an IPAM row (status=static_dhcp) — refresh IPAM views.
       qc.invalidateQueries({ queryKey: ["addresses", scope.subnet_id] });
+      // The mirror row moves the subnet's and its blocks' counts (#2533).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["subnet-dns-sync", scope.subnet_id] });
       onClose();
     },

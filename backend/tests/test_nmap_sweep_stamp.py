@@ -116,3 +116,34 @@ async def test_stamp_single_host_scan_still_422(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert r.status_code == 422
+
+
+async def test_stamp_recounts_subnet_and_block(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3320: a stamped ``discovered`` row counts toward utilization, so the
+    subnet's and block's cached figures follow the stamp — a fresh insert and
+    an ``available`` row bumped to ``discovered`` alike."""
+    summary = parse_nmap_xml(_xml(_host("10.0.0.5"), _host("10.0.0.6")), sweep=True)
+    token, scan = await _setup(db_session, summary)
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.network == "10.0.0.0/24"))
+    ).scalar_one()
+    subnet.total_ips = 254
+    subnet_id, block_id = subnet.id, subnet.block_id
+    db_session.add(IPAddress(subnet_id=subnet_id, address="10.0.0.6", status="available"))
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/nmap/scans/{scan.id}/stamp-discovered",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["created"], r.json()["bumped"]) == (1, 1)
+
+    db_session.expire_all()
+    sub = await db_session.get(Subnet, subnet_id)
+    blk = await db_session.get(IPBlock, block_id)
+    assert sub.allocated_ips == 2
+    # A block counts its subnets' network + broadcast too (#2982).
+    assert blk.allocated_ips == 4
