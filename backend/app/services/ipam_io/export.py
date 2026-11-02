@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.host_name import current_fqdn
 
 Format = Literal["csv", "json", "xlsx"]
 
@@ -176,7 +177,7 @@ async def _collect(
                     "address": str(a.address),
                     "status": a.status,
                     "hostname": a.hostname,
-                    "fqdn": a.fqdn,
+                    "fqdn": current_fqdn(a.hostname, a.fqdn),
                     "mac_address": str(a.mac_address) if a.mac_address else None,
                     "description": a.description,
                     "last_seen_at": _dt(a.last_seen_at),

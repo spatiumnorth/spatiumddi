@@ -37,6 +37,7 @@ from app.models.dns import DNSRecord, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import TLS_SERVING_ROLES, IPAddress
 from app.models.tls_cert import SOURCE_DISCOVERED, TLSCertTarget
+from app.services.ipam.host_name import current_fqdn
 
 logger = structlog.get_logger(__name__)
 
@@ -44,8 +45,9 @@ logger = structlog.get_logger(__name__)
 def _host_for_ip(ip: IPAddress) -> str:
     """Probe host for a TLS-serving IP — prefer a name (so SNI + cert-name
     match work), fall back to the literal IP."""
-    if ip.fqdn and ip.fqdn.strip():
-        return ip.fqdn.rstrip(".").lower()
+    fqdn = current_fqdn(ip.hostname, ip.fqdn)
+    if fqdn and fqdn.strip():
+        return fqdn.rstrip(".").lower()
     if ip.hostname and ip.hostname.strip():
         return ip.hostname.rstrip(".").lower()
     return str(ip.address).split("/")[0]
