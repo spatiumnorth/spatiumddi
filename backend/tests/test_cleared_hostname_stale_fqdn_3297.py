@@ -78,9 +78,12 @@ async def test_export_ansible_and_tls_probe_do_not_use_the_stale_fqdn(
         client, db_session, "10.173.0.0/16", "10.173.1.0/24", "10.173.1.10"
     )
     sp = (await client.get(f"/api/v1/ipam/subnets/{sid}", headers=headers)).json()["space_id"]
-    exp = await client.get(f"/api/v1/ipam/export?space_id={sp}&format=json", headers=headers)
+    exp = await client.get(
+        f"/api/v1/ipam/export?space_id={sp}&format=json&include_addresses=true", headers=headers
+    )
     assert exp.status_code == 200, exp.text
-    assert "gone-host" not in exp.text
+    # The address is exported (so the check below is not vacuous), nameless.
+    assert "10.173.1.10" in exp.text and "gone-host" not in exp.text
 
     inv = await client.get("/api/v1/ansible/inventory", headers=headers)
     assert inv.status_code == 200, inv.text
@@ -116,3 +119,36 @@ async def test_copilot_find_ip_addresses_reports_no_stale_fqdn(
     # By the stale name: no match.
     res = await REGISTRY.call("find_ip_addresses", {"q": "gone-host"}, db=db_session, user=user)
     assert ip_id not in [m["id"] for m in res["matches"]]
+    # The single-address lookup reports the same.
+    res = await REGISTRY.call("find_ip", {"address": "10.174.1.10"}, db=db_session, user=user)
+    rows = [m for m in res["matches"] if m["id"] == ip_id]
+    assert rows and rows[0]["fqdn"] is None
+
+
+@pytest.mark.asyncio
+async def test_csv_export_and_vendor_devices_carry_no_stale_fqdn(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers, sid, _ip_id, row, _ = await _cleared(
+        client, db_session, "10.175.0.0/16", "10.175.1.0/24", "10.175.1.10"
+    )
+    exp = await client.get(
+        f"/api/v1/ipam/export?subnet_id={sid}&format=csv&include_addresses=true", headers=headers
+    )
+    assert exp.status_code == 200, exp.text
+    assert "10.175.1.10" in exp.text and "gone-host" not in exp.text
+
+    # Vendor device list: give the row a MAC and stub the OUI lookup.
+    row.mac_address = "00:11:22:33:44:55"
+    await db_session.commit()
+
+    async def _vendors(_db: Any, macs: Any) -> dict[str, str]:
+        from app.services.oui import normalize_mac_key
+
+        return {k: "Acme Corp" for m in macs if m and (k := normalize_mac_key(m))}
+
+    monkeypatch.setattr("app.services.ipam.vendor_rollup.bulk_lookup_vendors", _vendors)
+    r = await client.get("/api/v1/ipam/reports/vendors/devices?vendor_search=acme", headers=headers)
+    assert r.status_code == 200, r.text
+    mine = [m for m in r.json()["matches"] if m["ip_address"] == "10.175.1.10"]
+    assert mine and mine[0]["fqdn"] is None
