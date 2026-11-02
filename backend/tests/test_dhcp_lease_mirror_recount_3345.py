@@ -229,7 +229,7 @@ async def test_recount_is_one_batch_for_a_100_lease_post(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One recount call per batch, and its SQL does not scale with leases."""
-    import app.api.v1.dhcp.agents as agents
+    from app.api.v1.dhcp import agents
 
     server, subnet, block = await _seed(db_session)
     await db_session.commit()
@@ -269,7 +269,7 @@ async def test_renewal_only_batch_skips_the_recount(
 ) -> None:
     """A renewal of a row already at ``dhcp`` moves no count, so the hot
     path does not pay for a recount (or take subnet / block row locks)."""
-    import app.api.v1.dhcp.agents as agents
+    from app.api.v1.dhcp import agents
 
     server, subnet, block = await _seed(db_session)
     await db_session.commit()
