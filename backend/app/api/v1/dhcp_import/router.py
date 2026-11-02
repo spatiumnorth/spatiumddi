@@ -376,12 +376,13 @@ async def _attach_conflicts(
         target_group_id=target_group_id,
         ipam_space_id=ipam_space_id,
     )
+    # #3335 — a reservation outside its subnet is never stored; say so here.
+    # First, so a dropped reservation is not also named for its hostname.
+    preview.warnings.extend(drop_invalid_reservations(preview.scopes))
     # #2919 — the preview shows what the commit will store.
     preview.warnings.extend(drop_unservable_hostnames(preview.scopes))
     # #3037 — Kea / ISC drop a bad pool at parse; this covers Windows too.
     preview.warnings.extend(drop_invalid_pools(preview.scopes))
-    # #3335 — a reservation outside its subnet is never stored; say so here.
-    preview.warnings.extend(drop_invalid_reservations(preview.scopes))
     preview.total_pools = sum(len(s.pools) for s in preview.scopes)
     preview.total_reservations = sum(len(s.reservations) for s in preview.scopes)
 

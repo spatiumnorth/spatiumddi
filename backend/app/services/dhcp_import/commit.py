@@ -180,8 +180,11 @@ def reservation_problem(ip: str, subnet_cidr: str) -> str | None:
     its whole config at load for one out-of-range host, so none is stored.
     """
     try:
-        addr = ipaddress.ip_address(str(ip).strip())
         net = ipaddress.ip_network(subnet_cidr, strict=False)
+    except ValueError:
+        return f"its scope's subnet {subnet_cidr!r} is not a valid CIDR"
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
     except ValueError:
         return "not an IP address"
     if addr.version != net.version:
@@ -197,6 +200,10 @@ def drop_invalid_reservations(scopes: list[ImportedScope]) -> list[str]:
     Same contract as ``drop_invalid_pools``: runs on the preview and again on
     the commit (which takes the plan the client sends back), the scope is
     still imported, and each dropped reservation is named in the warnings.
+    A kept address is rewritten in its canonical spelling, so the commit's
+    same-IP de-duplication sees ``fd00::0:1`` and ``fd00::1`` as one address.
+    Only the subnet is tested: an address inside a pool, or outside the
+    pools but inside the subnet, is a valid reservation on every driver.
     """
     warnings: list[str] = []
     for scope in scopes:
@@ -204,6 +211,7 @@ def drop_invalid_reservations(scopes: list[ImportedScope]) -> list[str]:
         for r in scope.reservations:
             problem = reservation_problem(r.ip_address, scope.subnet_cidr)
             if problem is None:
+                r.ip_address = str(ipaddress.ip_address(str(r.ip_address).strip()))
                 kept.append(r)
             else:
                 warnings.append(
@@ -671,9 +679,10 @@ async def commit_import(
     now = datetime.now(UTC)
     results: list[CommitScopeResult] = []
     warnings = list(preview.warnings)
+    # Reservations first, so a dropped one is not also named for its hostname.
+    warnings.extend(drop_invalid_reservations(preview.scopes))
     warnings.extend(drop_unservable_hostnames(preview.scopes))
     warnings.extend(drop_invalid_pools(preview.scopes))
-    warnings.extend(drop_invalid_reservations(preview.scopes))
 
     # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
     # importer keeps an unmapped option as ``opt-NN``), whatever the target

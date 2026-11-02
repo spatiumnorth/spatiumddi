@@ -198,9 +198,14 @@ Three sources, all reducing to canonical `ImportedScope` +
   and top-level `client-classes` → client classes (Kea `test`
   expressions are SpatiumDDI's native class shape, so they import
   verbatim). Subnets under `shared-networks` are flattened into
-  individual scopes (the shared network's own `option-data` /
-  `valid-lifetime` are inherited, and the preview says each network
-  was flattened), as the ISC importer does. A reservation whose
+  individual scopes, as the ISC importer does: a member inherits the
+  network's `option-data` (option by option), `valid-lifetime`,
+  `min-` / `max-valid-lifetime` and `ddns-send-updates`, and its own
+  value wins. The preview says each network was flattened, and names
+  any setting a scope has no field for (`interface`, `relay`,
+  `client-class`, `match-client-id`, other `ddns-*`, …) on the
+  network or on a subnet, so a lost relay or interface binding is
+  never silent. A reservation whose
   address is not an IP address, is the wrong family, or lies outside
   its scope's subnet (the static form's rule) is dropped in the
   preview and the commit with a warning naming it, and the scope is

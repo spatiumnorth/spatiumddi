@@ -17,6 +17,8 @@ Pipeline:
 4. Each ``subnet4`` / ``subnet6`` becomes an :class:`ImportedScope`;
    ``pools`` → :class:`ImportedPool`, ``reservations`` →
    :class:`ImportedReservation`, ``option-data`` → canonical options.
+   A subnet under ``shared-networks`` is flattened into a scope of its
+   own, inheriting the network's options and lifetimes (#3336).
    Top-level ``client-classes`` become :class:`ImportedClientClass`.
 
 We deliberately don't carry hook libraries (HA / host-cache /
@@ -58,6 +60,49 @@ _UNSUPPORTED_KEYS: dict[str, str] = {
     "repopulate from the running daemon once a server is attached.",
     "loggers": "Kea logger config is not imported.",
 }
+
+
+# Subnet-level parameters a scope models; a shared network's value is what
+# its members inherit when they do not set their own (#3336).
+_INHERITED_SCALARS = (
+    "valid-lifetime",
+    "min-valid-lifetime",
+    "max-valid-lifetime",
+    "ddns-send-updates",
+)
+
+# Subnet / shared-network parameters that change how Kea serves the subnet
+# and that a scope has no field for. Named rather than dropped silently: a
+# lost relay or interface binding, or a class restriction, changes which
+# clients the imported scope answers (#3336).
+_UNMODELLED_SUBNET_KEYS = (
+    "interface",
+    "interface-id",
+    "relay",
+    "client-class",
+    "require-client-classes",
+    "evaluate-additional-classes",
+    "match-client-id",
+    "authoritative",
+    "reservations-global",
+    "reservations-in-subnet",
+    "reservations-out-of-pool",
+    "reservation-mode",
+    "next-server",
+    "server-hostname",
+    "boot-file-name",
+    "preferred-lifetime",
+    "min-preferred-lifetime",
+    "max-preferred-lifetime",
+    "rapid-commit",
+)
+
+
+def _unmodelled_keys(entry: dict[str, Any]) -> list[str]:
+    """The serving-relevant keys ``entry`` sets that no scope field carries."""
+    keys = [k for k in _UNMODELLED_SUBNET_KEYS if k in entry]
+    keys += sorted(k for k in entry if k.startswith("ddns-") and k != "ddns-send-updates")
+    return keys
 
 
 class KeaImportError(ValueError):
@@ -263,6 +308,16 @@ def _parse_subnet(
                 )
         elif isinstance(r, dict) and not r.get("hw-address"):
             skipped_duid += 1
+        elif isinstance(r, dict):
+            # A MAC-keyed reservation that still cannot be one: the hw-address
+            # is not a MAC, or there is no address (a hostname / options-only
+            # or prefix-only reservation). Named, not dropped silently (#3336).
+            why = (
+                "hw-address is not a MAC address"
+                if normalise_mac(r.get("hw-address")) is None
+                else "it reserves no address"
+            )
+            parse_warnings.append(f"Reservation for {r.get('hw-address')!r} not imported: {why}.")
     if skipped_duid:
         parse_warnings.append(
             f"{skipped_duid} DUID-only reservation(s) skipped — only MAC-keyed reservations import."
@@ -286,6 +341,13 @@ def _parse_subnet(
                 else "(options 58/59: 50% / 87.5% of its lifetime)"
             )
             + " and cannot be set per scope."
+        )
+
+    unmodelled = _unmodelled_keys(entry)
+    if unmodelled:
+        parse_warnings.append(
+            f"{', '.join(unmodelled)} not imported — the scope has no equivalent; "
+            "set it up by hand after the import."
         )
 
     lease_time = int(entry.get("valid-lifetime") or global_lease_time or 86400)
@@ -379,7 +441,14 @@ def _dhcp_block(obj: dict[str, Any], wrapper: str, subnet_key: str) -> dict[str,
     (``{"Dhcp4": {...}}``) or bare (``{"subnet4": [...]}``)."""
     if wrapper in obj and isinstance(obj[wrapper], dict):
         return obj[wrapper]
-    if subnet_key in obj or "shared-networks" in obj:
+    if subnet_key in obj:
+        return obj
+    # A bare body of shared networks alone (#3336): only the family its
+    # members are written in, or a v4 body would be read as Dhcp6 too.
+    networks = obj.get("shared-networks")
+    if isinstance(networks, list) and any(
+        isinstance(sn, dict) and subnet_key in sn for sn in networks
+    ):
         return obj
     return None
 
@@ -428,35 +497,45 @@ def parse_kea_config(data: bytes) -> ImportPreview:
                 f"({', '.join(str(block[k]) for k in global_timers)} s) not imported — "
                 "renew/rebind times are derived from each lease and cannot be set."
             )
-        # (subnet, options, lease time) — subnets under a shared network are
-        # flattened into scopes, as the ISC importer does (#3336); the network's
-        # own option-data and valid-lifetime are what its members inherit.
-        members: list[tuple[Any, dict[str, Any], int]] = [
-            (s, global_options, global_lease_time) for s in block.get(subnet_key) or []
+        # (subnet, options) — subnets under a shared network are flattened into
+        # scopes, as the ISC importer does (#3336). A member inherits the
+        # network's option-data (option by option) and the scalars a scope
+        # models; its own value wins. What a scope cannot carry is named.
+        members: list[tuple[Any, dict[str, Any]]] = [
+            (s, global_options) for s in block.get(subnet_key) or []
         ]
         for sn in block.get("shared-networks") or []:
             if not isinstance(sn, dict):
                 continue
-            sn_subnets = sn.get(subnet_key) or []
+            sn_name = str(sn.get("name") or "(unnamed)")
+            sn_subnets = [s for s in sn.get(subnet_key) or [] if isinstance(s, dict)]
             warnings.append(
-                f"{wrapper}: shared network {str(sn.get('name') or '(unnamed)')!r} flattened — "
-                f"its {len(sn_subnets)} member subnet(s) imported individually; SpatiumDDI has "
+                f"{wrapper}: shared network {sn_name!r} flattened — its "
+                f"{len(sn_subnets)} member subnet(s) imported individually; SpatiumDDI has "
                 "no shared-network grouping."
             )
+            not_carried = _unmodelled_keys(sn) + [
+                k for k in ("renew-timer", "rebind-timer") if sn.get(k) is not None
+            ]
+            if not_carried:
+                warnings.append(
+                    f"{wrapper}: shared network {sn_name!r} sets {', '.join(not_carried)}, "
+                    "which its member scopes do not carry — set it up by hand after the import."
+                )
             sn_options = {
                 **global_options,
                 **_parse_option_data(sn.get("option-data"), address_family=af),
             }
-            sn_lease = int(sn.get("valid-lifetime") or global_lease_time)
-            members.extend((s, sn_options, sn_lease) for s in sn_subnets)
-        for raw_subnet, sub_options, sub_lease in members:
+            inherited = {k: sn[k] for k in _INHERITED_SCALARS if k in sn}
+            members.extend(({**inherited, **s}, sn_options) for s in sn_subnets)
+        for raw_subnet, sub_options in members:
             if not isinstance(raw_subnet, dict):
                 continue
             scope = _parse_subnet(
                 raw_subnet,
                 address_family=af,
                 global_options=sub_options,
-                global_lease_time=sub_lease,
+                global_lease_time=global_lease_time,
                 global_ddns=global_ddns,
                 warnings=warnings,
             )
