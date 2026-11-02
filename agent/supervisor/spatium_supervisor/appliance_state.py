@@ -2038,8 +2038,9 @@ def maybe_fire_set_next_boot(
     tick).
 
     Strict appliance-only gate (mirrors ``maybe_fire_reboot``). Empty
-    intent or invalid slot literal → skip. A trigger still present is the
-    runner's; the host runner renames it to .done / .failed on completion.
+    intent or invalid slot literal → skip. A trigger fired in this boot is
+    the runner's; the host runner renames it to .done / .failed on
+    completion. One left by an earlier boot is written over (#3283).
 
     #3284: fires once per request. The response carries the request on
     every heartbeat until the slot boots, so a run already fired for this
@@ -2054,10 +2055,26 @@ def maybe_fire_set_next_boot(
         return False
     if current_slot == desired_slot:
         return False
+    boot_id = read_boot_id()
+    fired_slot, fired_boot = _read_set_next_boot_fired()
     if _SET_NEXT_BOOT_TRIGGER_FILE.exists():
-        return False
-    fired_slot, _fired_boot = _read_set_next_boot_fired()
-    if fired_slot == desired_slot:
+        # #3283: a trigger fired in this boot is the runner's; it renames it
+        # away when it finishes. One from an earlier boot never will be: a
+        # reboot cut its run, ``PathChanged=`` does not fire for a file that
+        # is already there when the watch starts, and every later request
+        # skipped here, so no Boot once ran on the node again. Write the
+        # request over it: the rename onto the watched path is a change the
+        # watch sees. Without a boot id this boot cannot be told from the one
+        # that wrote it, so the trigger is left alone.
+        if not boot_id or fired_boot == boot_id:
+            return False
+        log.warning(
+            "supervisor.slot_set_next_boot.stale_trigger_replaced",
+            fired_slot=fired_slot,
+            fired_boot_id=fired_boot,
+            desired_slot=desired_slot,
+        )
+    elif fired_slot == desired_slot:
         return False
     try:
         _SET_NEXT_BOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -2070,7 +2087,7 @@ def maybe_fire_set_next_boot(
         tmp.replace(_SET_NEXT_BOOT_TRIGGER_FILE)
     except OSError:
         return False
-    _record_set_next_boot_fire(desired_slot, read_boot_id())
+    _record_set_next_boot_fire(desired_slot, boot_id)
     return True
 
 
