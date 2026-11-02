@@ -343,7 +343,7 @@ export function ExportButton({
         include_addresses: includeAddrs,
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Export failed");
+      setError(formatApiError(e, "Export failed"));
     } finally {
       setBusy(false);
     }
@@ -645,7 +645,7 @@ export function SubnetImportExportButton({
         include_addresses: includeAddrs,
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Export failed");
+      setError(formatApiError(e, "Export failed"));
     } finally {
       setBusy(false);
     }

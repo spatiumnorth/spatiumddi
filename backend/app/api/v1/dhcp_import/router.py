@@ -27,6 +27,7 @@ from app.api.deps import DB, SuperAdmin
 from app.api.pre_body_auth import PreBodyAuthRoute
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.models.dhcp import DHCPServer
+from app.services.api_token_scopes import read_only_post
 from app.services.dhcp.option_validation import canonical_domain_options
 from app.services.dhcp_import import (
     CommitResult,
@@ -385,6 +386,7 @@ async def _attach_conflicts(
 
 
 @router.post("/kea/preview", response_model=PreviewOut)
+@read_only_post
 async def kea_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -422,6 +424,7 @@ async def kea_commit(current_user: SuperAdmin, db: DB, body: CommitIn = Body(...
 
 
 @router.post("/isc/preview", response_model=PreviewOut)
+@read_only_post
 async def isc_preview(
     current_user: SuperAdmin,
     db: DB,

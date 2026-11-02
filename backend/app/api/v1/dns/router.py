@@ -125,6 +125,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -148,6 +149,7 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.drift import zone_state_in_sync
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.name_targets import (
     absolute_target_error,
@@ -5970,26 +5972,6 @@ class ServerZoneStateResponse(BaseModel):
     in_sync: bool
 
 
-def _zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
-    """Whether a server's reported serial for ``zone`` reads as in sync.
-
-    A primary zone is in sync when the server serves our serial
-    (``last_serial``). A secondary / stub zone's serial is its primary's, not
-    ours to number, so it is never compared with ``last_serial`` (0 for a
-    secondary): a server that holds the zone is in sync. That is how BIND9
-    secondaries have always read — the BIND9 agent reports the bundle's serial,
-    0, which equals the target 0 — and it is kept for every driver that does
-    not read back what it serves. PowerDNS reports the serial it serves, so a
-    secondary there is in sync once it has transferred (a transferred zone
-    never serves 0) and not before: at 0 it holds no data and answers REFUSED
-    (#1967)."""
-    if (zone.zone_type or "primary") in ("secondary", "stub"):
-        if driver == "powerdns":
-            return current != 0
-        return current == target
-    return current == target
-
-
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/server-state",
     response_model=ServerZoneStateResponse,
@@ -6067,7 +6049,7 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if pending or not _zone_state_in_sync(zone, current, target, srv.driver):
+            if pending or not zone_state_in_sync(zone, current, target, srv.driver):
                 all_in_sync = False
 
     return ServerZoneStateResponse(
@@ -6096,8 +6078,14 @@ class ServerDriftEntry(BaseModel):
     server_id: str
     server_name: str
     driver: str
-    status: str  # "ok" | "error" | "unsupported"
+    # "ok" | "syncing" | "behind" | "drift" | "error" | "unsupported" — see
+    # ServerDrift.
+    status: Literal["ok", "syncing", "behind", "drift", "error", "unsupported"]
     error: str | None = None
+    # Why a transferred server is "syncing" / "behind" / "drift" (#3198).
+    reason: str | None = None
+    current_serial: int | None = None
+    target_serial: int = 0
     in_sync: int
     drift_count: int
     extra_on_server: list[DriftRecordEntry]
@@ -6146,6 +6134,9 @@ async def get_zone_drift(
                 driver=s.driver,
                 status=s.status,
                 error=s.error,
+                reason=s.reason,
+                current_serial=s.current_serial,
+                target_serial=s.target_serial,
                 in_sync=s.in_sync,
                 drift_count=s.drift_count,
                 extra_on_server=[
@@ -6249,7 +6240,7 @@ async def get_server_zone_state(
         # #2042 — an unacknowledged op is drift whatever the serial says.
         in_sync = (
             current is not None
-            and _zone_state_in_sync(z, current, target, server.driver)
+            and zone_state_in_sync(z, current, target, server.driver)
             and not pending
         )
         if current is None:
@@ -6666,6 +6657,40 @@ async def update_zone(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # #3265 — a record's fqdn, the fqdn IPAM keeps on each address and every PTR
+    # value IPAM published are stored absolute under the zone's name, so a rename
+    # of a zone that holds records leaves all of them on the old name (and can put
+    # an A owner under an underscore label BIND refuses). The console disables the
+    # name in Edit Zone; the API now agrees. Empty the zone, or create the new zone
+    # and move the records. Records in the Trash count too: a restore brings a
+    # record back with the fqdn it was deleted under, i.e. on the old name.
+    if (
+        "name" in changes
+        and (changes["name"] or "").rstrip(".").lower() != zone.name.rstrip(".").lower()
+    ):
+        held, trashed = (
+            await db.execute(
+                select(
+                    func.count(),
+                    func.count().filter(DNSRecord.deleted_at.is_not(None)),
+                )
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == zone.id)
+                .execution_options(include_deleted=True)
+            )
+        ).one()
+        if held:
+            in_trash = f", {trashed} of them in the Trash" if trashed else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} holds {held} record(s){in_trash}, and a zone's name "
+                    "cannot be changed while it does: each record's name, the name IPAM keeps "
+                    "on its addresses and the PTR values it published would stay on the old "
+                    "name. Create a zone under the new name and move the records, or delete "
+                    "them first (and purge them from the Trash)."
+                ),
+            )
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
@@ -7830,6 +7855,7 @@ class ZoneMoveCommitResponse(ZoneMovePreviewResponse):
     "/groups/{group_id}/zones/{zone_id}/move/preview",
     response_model=ZoneMovePreviewResponse,
 )
+@read_only_post
 async def move_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -8058,7 +8084,7 @@ async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
                         }
                         for p in t.parameters
                     ],
-                    "record_count": len(t.records),
+                    "record_count": t.max_record_count,
                 }
                 for t in templates
             ]
@@ -8146,11 +8172,11 @@ async def create_zone_from_template(
         )
 
     # Every provider-refusal gate runs on the whole record set BEFORE the zone
-    # exists or is pushed anywhere, so a refusal is atomic (#3007).
-    record_payloads = materialize(template, body.zone_name, body.params)
-    for r in record_payloads:
-        if r["record_type"] in VALID_RECORD_TYPES:
-            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    # exists or is pushed anywhere, so a refusal is atomic (#3007); the
+    # per-type gate already ran in the loop above. This is the list checked
+    # there, whose owners were written back in the record API's stored form
+    # (#3266) — never re-materialise it from the raw parameters, or the rows
+    # below store the names as typed.
     await _check_driver_refusals(
         [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
     )
@@ -10043,6 +10069,7 @@ async def _queue_import_ops(
     response_model=ImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -10755,6 +10782,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
     response_model=SheetImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

@@ -976,6 +976,75 @@ def _dhcp_permission_warning(
     )
 
 
+async def new_reservation_refusal(
+    db: AsyncSession, row: IPAddress, *, user: User | None = None
+) -> str | None:
+    """Why :func:`sync_static_for_ipam_row` would make no reservation for a NEW
+    ``static_dhcp`` row, else ``None`` (#3250).
+
+    The sync's create path, run read-only before the row is written, so a
+    caller that must not end with an address and no reservation (the request
+    portal's submit and approval) can refuse up front instead of keeping a
+    warning nobody reads. ``user`` is the acting user; ``None`` skips the
+    ``dhcp_static`` permission gate (the requester at submit is by definition
+    not the one who provisions). The words name no other address or scope:
+    the requester may not be able to read them.
+    """
+    if row.status != "static_dhcp" or not row.mac_address:
+        return None
+    try:
+        mac = canonicalize_mac(str(row.mac_address))
+    except ValueError:
+        return f"Invalid MAC address {row.mac_address!r}"
+    if _dhcp_permission_warning(user, "write", row, verb="created") is not None:
+        return (
+            "The approver has no 'write' permission on DHCP reservations (dhcp_static), "
+            f"so no reservation can be made for {row.address}."
+        )
+    scopes = await candidate_scopes_for_ipam_row(db, row)
+    if not scopes:
+        return (
+            f"No DHCP scope serves {row.address}, so no DHCP reservation can be made for "
+            "a static_dhcp address. Create a scope for the subnet, or request the address "
+            "with another status."
+        )
+    if len(scopes) > 1:
+        return (
+            f"{len(scopes)} DHCP scopes serve this subnet, so the reservation for a "
+            f"static_dhcp address at {row.address} cannot be placed. Ask an operator to "
+            "make this allocation by hand."
+        )
+    scope = scopes[0]
+    existing = (
+        (
+            await db.execute(
+                select(DHCPStaticAssignment).where(
+                    DHCPStaticAssignment.scope_id == scope.id,
+                    or_(
+                        DHCPStaticAssignment.ip_address == str(row.address),
+                        DHCPStaticAssignment.mac_address == mac,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        if str(existing.ip_address) == str(row.address) and str(existing.mac_address) == mac:
+            return None  # adopted by the sync, not a conflict
+        return (
+            f"A DHCP reservation for {row.address} or MAC {mac} already exists on the "
+            "scope that serves this subnet, so no reservation can be made."
+        )
+    if await _static_mac_clash(db, scope, mac, exclude_id=None) is not None:
+        return (
+            f"MAC {mac} is already reserved in the DHCP server group that serves this "
+            "subnet, so no reservation can be made."
+        )
+    return None
+
+
 async def sync_static_for_ipam_row(
     db: AsyncSession,
     row: IPAddress,
