@@ -24,6 +24,23 @@
 # spatiumddi-reboot-handoff.service uncordons it; a node powered off for
 # good stays cordoned in the cluster until it is removed from it.
 #
+# A stop before systemctl is a cancel, not a failure (#3162): the wrapper then
+# ends by the signal it was stopped with, which the units running it list in
+# SuccessExitStatus= (a Type=oneshot unit otherwise counts it as failed, as it
+# did the old exit 1), so the unit is left inactive, not failed, while a
+# caller still reads "no reboot" (a non-zero status). A failed systemctl
+# stays exit 1.
+#
+# The handoff's request to CloudNativePG cannot be taken back (#3162): its
+# cordon makes CNPG switch the primary over, and a switchover CNPG has begun
+# runs to its end: undoing the cordon does not stop it, and nothing else asks
+# CNPG to put the primary back (that would be a second outage). So the cancel
+# undoes the cordon and does not reboot, but the switchover already asked for
+# completes, with its few seconds of API unavailability, and the wrapper says
+# so. The handoff writes SWITCHOVER just before its cordon (the console reads
+# it after its cancel to tell the operator); a cancel before that point, the
+# console's 10 s grace included, never reaches CNPG at all.
+#
 # While it runs, MARKER holds "<pid> <action>", so the console shows the
 # reboot or poweroff as under way and F9 can cancel it. /run is a tmpfs:
 # nothing of it outlives the reboot.
@@ -58,6 +75,10 @@ MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"
 LOCK="${SPATIUM_POWER_ACTION_LOCK:-/var/lib/spatiumddi/release-state}"
 ISSUED="${SPATIUM_POWER_ACTION_ISSUED:-/var/lib/spatiumddi/release-state/power-action-issued}"
 BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+# #3162 — written by the handoff just before it cordons (asks CNPG for the
+# switchover); kept by a cancel, for the console to read, and removed at the
+# start of the next run and when systemctl fails. /run is a tmpfs.
+SWITCHOVER="${SPATIUM_POWER_ACTION_SWITCHOVER:-${MARKER}-switchover}"
 # #3008 — a grace between taking the lock and the handoff / systemctl. The
 # console's unit sets it (10 s, as the web-UI reboot has); the web-UI and Fleet
 # paths sleep their own grace before calling this, so they leave it 0. It is
@@ -67,6 +88,17 @@ BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 # otherwise be issued within a second of the console's confirm).
 GRACE_S="${SPATIUM_POWER_ACTION_GRACE_S:-0}"
 case "$GRACE_S" in ''|*[!0-9]*) GRACE_S=0 ;; esac
+# #3169 — a slot switch (rollback / set-default / set-next-boot to the other
+# slot) first copies that slot's baked image tarballs into k3s's images dir,
+# about 1 GB, and only then flips GRUB. A reboot that lands mid-copy stops the
+# runner before GRUB is flipped, and the node comes back on the SAME slot with
+# the switch never made — the Fleet "Boot once, then Reboot" sequence did
+# exactly that, since both triggers can arrive in one heartbeat. So a running
+# slot-switch unit is waited for, up to SLOT_WAIT_CAP_S; past the cap the
+# action goes on, as with the handoff.
+SLOT_UNITS="${SPATIUM_POWER_ACTION_SLOT_UNITS-spatiumddi-slot-rollback.service spatiumddi-slot-set-default.service spatiumddi-slot-set-next-boot.service}"
+SLOT_WAIT_CAP_S="${SPATIUM_POWER_ACTION_SLOT_WAIT_CAP_S:-900}"
+case "$SLOT_WAIT_CAP_S" in ''|*[!0-9]*) SLOT_WAIT_CAP_S=900 ;; esac
 ACTION="${1:-}"
 
 case "$ACTION" in
@@ -103,10 +135,36 @@ state_write() {
     return 1
 }
 
+# Prints the slot-switch units still running (a oneshot is "activating"
+# while its ExecStart runs); nothing when there are none.
+busy_slot_units() {
+    local _u _state
+    for _u in $SLOT_UNITS; do
+        _state="$(systemctl show -p ActiveState --value "$_u" 2>/dev/null)"
+        case "$_state" in
+            activating|deactivating) printf ' %s' "$_u" ;;
+        esac
+    done
+}
+
+wait_for_slot_switch() {
+    local _waited=0 _busy
+    while _busy="$(busy_slot_units)"; [ -n "$_busy" ]; do
+        if [ "$_waited" -ge "$SLOT_WAIT_CAP_S" ]; then
+            log "a slot switch is still running after ${SLOT_WAIT_CAP_S} s:${_busy}; going on with $ACTION"
+            return 0
+        fi
+        [ "$_waited" = 0 ] && log "waiting for a slot switch to finish before $ACTION:${_busy}"
+        sleep 2
+        _waited=$((_waited + 2))
+    done
+}
+
 child=""
 issued=0
 
 on_signal() {
+    local sig="$1"
     if [ "$issued" = 1 ]; then
         # systemctl has been issued: this is the shutdown stopping us (or a
         # cancel that came too late). Undoing the cordon now would hand the
@@ -120,11 +178,27 @@ on_signal() {
         wait "$child" 2>/dev/null || true
     fi
     undo
+    if [ -e "$SWITCHOVER" ]; then
+        log "the PostgreSQL primary switchover the handoff had asked of CloudNativePG still" \
+            "completes (the API pauses for a few seconds while the primary moves); the node" \
+            "stays up"
+    fi
     clear_marker
+    log "$ACTION cancelled"
+    # #3162 — end by the signal itself, not exit 1: the units list SIGTERM /
+    # SIGINT / SIGHUP in SuccessExitStatus=, so a cancel no longer leaves the
+    # unit failed, while a caller still reads a non-zero status (no reboot).
+    # The cleanup above has finished: the traps are reset first so the signal
+    # is not caught again. `exit 1` is reached only when it is ignored.
+    trap - TERM INT HUP
+    kill -s "$sig" "$$"
     exit 1
 }
-trap on_signal TERM INT HUP
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
 
+rm -f -- "$SWITCHOVER" 2>/dev/null || true
 printf '%s %s\n' "$$" "$ACTION" > "$MARKER" 2>/dev/null || true
 
 # fd 9 holds the lock for the life of this process; the children get it
@@ -145,10 +219,19 @@ if [ "$GRACE_S" -gt 0 ]; then
     child=""
 fi
 
+if [ -n "$SLOT_UNITS" ]; then
+    # In the background and waited for, so a stop is acted on at once.
+    wait_for_slot_switch 9>&- &
+    child=$!
+    wait "$child"
+    child=""
+fi
+
 if [ -x "$HANDOFF" ]; then
     # In the background and waited for, so a stop is acted on at once: bash
     # runs a trap only once a foreground command has finished.
-    timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 9>&- &
+    SPATIUM_HANDOFF_SWITCHOVER_FILE="$SWITCHOVER" \
+        timeout -k 10 "$HANDOFF_CAP_S" "$HANDOFF" --before-reboot 2>&1 9>&- &
     child=$!
     wait "$child"
     rc=$?
@@ -169,7 +252,7 @@ issued=1
 log "issuing systemctl $ACTION"
 if ! systemctl "$ACTION" 9>&-; then
     log "systemctl $ACTION failed: the node stays up, so the handoff's cordon is undone"
-    rm -f -- "$ISSUED" 2>/dev/null || true
+    rm -f -- "$ISSUED" "$SWITCHOVER" 2>/dev/null || true
     undo
     clear_marker
     exit 1

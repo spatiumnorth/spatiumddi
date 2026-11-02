@@ -27,7 +27,12 @@ and the MetalLB ``loadBalancerIPs`` annotation through
 ``server.service``, and this is what proves they reach the Service
 instead of being dropped by the template.
 
-Usage: chart-dns-agent-service.py [--require]
+``--expect-type TYPE`` is the default-render assertion (#3229): every
+checked Service must be that type (``ClusterIP``), because a LoadBalancer
+default becomes a hostPort-53 svclb pod on k3s that captures the node's own
+resolver stub and stops the install converging.
+
+Usage: chart-dns-agent-service.py [--require] [--expect-type TYPE]
            [--expect FIELD=VALUE ...] [--expect-annotation KEY=VALUE ...]
            <manifest.yaml> [<manifest.yaml> ...]
 """
@@ -62,6 +67,7 @@ def check(
     path: Path,
     expect: dict[str, str],
     expect_annotations: dict[str, str],
+    expect_type: str | None = None,
 ) -> tuple[list[str], int]:
     problems = []
     checked = 0
@@ -70,10 +76,20 @@ def check(
             continue
         meta = doc.get("metadata") or {}
         spec = doc.get("spec") or {}
-        if (spec.get("type") or "ClusterIP") != "LoadBalancer":
+        svc_type = spec.get("type") or "ClusterIP"
+        name = meta.get("name", "<unnamed>")
+        if expect_type is not None:
+            checked += 1
+            if svc_type != expect_type:
+                problems.append(
+                    f"{path}: Service {name!r} is type {svc_type}, expected "
+                    f"{expect_type} — the default must not be a LoadBalancer, "
+                    "k3s servicelb would bind hostPort 53 on every node (#3229)"
+                )
+            continue
+        if svc_type != "LoadBalancer":
             continue
         checked += 1
-        name = meta.get("name", "<unnamed>")
         policy = spec.get("externalTrafficPolicy")
         if policy != "Local":
             problems.append(
@@ -117,6 +133,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--expect-annotation", action="append", default=[], metavar="KEY=VALUE"
     )
+    parser.add_argument(
+        "--expect-type",
+        metavar="TYPE",
+        help="assert every DNS agent Service has this type (the default render, #3229)",
+    )
     args = parser.parse_args(argv)
 
     expect = _pairs(args.expect)
@@ -124,11 +145,11 @@ def main(argv: list[str]) -> int:
     problems: list[str] = []
     checked = 0
     for arg in args.files:
-        found, n = check(Path(arg), expect, expect_annotations)
+        found, n = check(Path(arg), expect, expect_annotations, args.expect_type)
         problems += found
         checked += n
     if args.require and not checked:
-        problems.append("no DNS agent LoadBalancer Service was checked")
+        problems.append("no DNS agent Service was checked")
     for problem in problems:
         print(f"FAIL {problem}", file=sys.stderr)
     if not problems:

@@ -79,6 +79,12 @@ CORDON_WAIT_S = float(os.environ.get("SPATIUM_CORDON_WAIT_S", "15"))
 #: doubles up to RETRY_MAX_S.
 RETRY_FIRST_S = float(os.environ.get("SPATIUM_RETRY_FIRST_S", "1"))
 RETRY_MAX_S = float(os.environ.get("SPATIUM_RETRY_MAX_S", "10"))
+#: --before-reboot (#3162): a file written just before the cordon, i.e. before
+#: CNPG is asked to switch over, and removed when no cordon came of it. Set by
+#: spatium-power-action, which keeps it when the reboot is cancelled: the
+#: switchover CNPG has begun completes whatever the cordon does next, and the
+#: console reads this to tell the operator so. Unset, nothing is written.
+SWITCHOVER_FILE = os.environ.get("SPATIUM_HANDOFF_SWITCHOVER_FILE", "")
 
 CORDON_ANNOTATION = "spatium.io/reboot-cordoned"
 CLUSTERS = "clusters.postgresql.cnpg.io"
@@ -132,6 +138,33 @@ def get_json(*args: str) -> tuple[dict | None, str]:
         return json.loads(out), ""
     except ValueError as ex:
         return None, f"unreadable answer: {ex}"
+
+
+def note_switchover(clusters: dict[str, str]) -> None:
+    """#3162 — record, before the cordon is sent, that CNPG is being asked to
+    switch these Clusters over. Written before the request and not after it, so
+    a cancel arriving while the patch is in flight is never told that nothing
+    was asked: saying a switchover may complete when it then does not is the
+    safe error, the other way round is not."""
+    if not SWITCHOVER_FILE:
+        return
+    try:
+        with open(SWITCHOVER_FILE, "w", encoding="utf-8") as fh:
+            fh.write("".join(f"{k} {v}\n" for k, v in sorted(clusters.items())))
+    except OSError as ex:
+        log(f"could not write {SWITCHOVER_FILE}: {ex}")
+
+
+def forget_switchover() -> None:
+    if not SWITCHOVER_FILE:
+        return
+    try:
+        os.unlink(SWITCHOVER_FILE)
+    except FileNotFoundError:
+        # nothing was noted: nothing to take back
+        pass
+    except OSError as ex:
+        log(f"could not remove {SWITCHOVER_FILE}: {ex}")
 
 
 def wait_api(budget_s: float) -> bool:
@@ -463,8 +496,10 @@ def before_reboot() -> int:
         return 0
 
     since = time.time()
+    note_switchover(held)
     outcome, detail = cordon(node, CORDON_WAIT_S)
     if outcome in ("gone", "failed"):
+        forget_switchover()
         log(f"{node}: could not cordon it ({detail}): nothing handed off")
         return 0
     said = {

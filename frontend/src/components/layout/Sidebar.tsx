@@ -21,6 +21,7 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { useSessionState } from "@/lib/useSessionState";
+import { safeLocalStorage } from "@/lib/safeStorage";
 import { BrandLogo } from "@/components/BrandLogo";
 import { UpdateCheckError } from "@/components/UpdateCheckError";
 import {
@@ -219,7 +220,7 @@ export function Sidebar({
   onMobileClose?: () => void;
 } = {}) {
   const [collapsed, setCollapsed] = useState(
-    () => localStorage.getItem("sidebar-collapsed") === "true",
+    () => safeLocalStorage.getItem("sidebar-collapsed") === "true",
   );
   const location = useLocation();
 
@@ -237,7 +238,7 @@ export function Sidebar({
   function toggle() {
     setCollapsed((v) => {
       const next = !v;
-      localStorage.setItem("sidebar-collapsed", String(next));
+      safeLocalStorage.setItem("sidebar-collapsed", String(next));
       return next;
     });
   }

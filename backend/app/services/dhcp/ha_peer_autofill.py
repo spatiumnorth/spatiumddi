@@ -1,7 +1,7 @@
 """Derive ``ha_peer_url`` for appliance-hosted Kea members (#2963).
 
 Kea's HA hook listens on the host:port of the member's own peer URL, and the
-config bundle renders HA only when every Kea member of a group has one. On an
+config bundle renders HA only between Kea members that have one. On an
 appliance the address is already known (the supervisor reports the node's
 k3s InternalIP(s)), so making the operator type ``http://<node IP>:8000/`` on
 both servers was a manual step with no product-side reason, and a pair
@@ -25,7 +25,9 @@ What is derived, and when it is NOT:
   take ``primary`` from a live pair, demoting both existing peers onto a
   server with an empty lease database. That is a decision for the operator,
   so the group reports the URL-less member in ``ha_peer_urls_missing`` with
-  the reason (``ha_autofill_skipped_reason``) instead.
+  the reason (``ha_autofill_skipped_reason``) instead. Meanwhile the pair
+  keeps running HA and the URL-less member is sidelined — no hook, no scopes
+  (#3151, ``services/dhcp/ha_members``).
 * **Only in an HA-mode group** (``hot-standby`` / ``load-balancing``). A
   ``standalone`` group (the UI's default for a new group) is the operator
   saying "no HA", and the config bundle does not consult the mode — it renders

@@ -86,8 +86,15 @@ spec:
                 - NET_RAW
           env:
             # Kea entrypoint env contract (agent/dhcp/images/kea/
-            # entrypoint.sh): SPATIUM_API_URL + SPATIUM_AGENT_KEY +
-            # AGENT_GROUP.
+            # entrypoint.sh): SPATIUM_API_URL + SPATIUM_AGENT_KEY.
+            # #3202: deliberately NO ``AGENT_GROUP``. This one pod
+            # template serves every node of a cluster, so a node's DHCP
+            # group in it is the group of whichever node wrote the shared
+            # chart last: a Fleet group move of ONE node re-rendered it and
+            # replaced the Kea pod on EVERY node, a working HA pair included.
+            # The agent needs a group only for the server row it registers,
+            # and the control plane places that row in the group its
+            # appliance is assigned (dhcp/agents.py ``agent_register``).
             # #292 / #409 — in-cluster API Service over HTTP by default;
             # prefer the supervisor-supplied external controlPlaneUrl when
             # set (Application appliance with its own k3s — no in-cluster
@@ -100,8 +107,6 @@ spec:
             {{- end }}
             - name: SPATIUM_AGENT_KEY
               value: {{ .Values.dhcpKea.agentKey | quote }}
-            - name: AGENT_GROUP
-              value: {{ .Values.dhcpKea.serverGroupName | quote }}
             {{- with .Values.global.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -16,8 +16,10 @@ Subcommands:
   rollback               — Set inactive slot as next boot (Phase 8c)
 
 The current slot is detected from /proc/cmdline's root=UUID=... by
-looking up the matching partition via blkid. Inactive slot is the
+looking up the matching partition via lsblk. Inactive slot is the
 OTHER partition carrying a root_a / root_b PARTLABEL on the same disk.
+On a mirrored install (#999) each slot is the md array its two
+root_a / root_b members belong to (#3172).
 
 Matched on the PARTLABEL, not the GPT type code — which is what makes
 it architecture-independent: the root type is 8304 on x86-64 and 8305
@@ -34,6 +36,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -72,9 +75,29 @@ def parse_cmdline_root_uuid() -> str | None:
 
 
 def find_slot_partitions() -> list[dict[str, str]]:
-    """Enumerate the A/B slot partitions on the active disk.
+    """Enumerate the A/B slots: one entry per slot, naming the device that
+    HOLDS its filesystem.
 
-    Returns a list of dicts: {device, uuid, partlabel, fslabel}.
+    Returns a list of dicts: {device, uuid, partlabel, fslabel}, plus
+    ``members`` on a mirrored install.
+
+    On a single disk that device is the slot partition itself. On a
+    mirrored install (#999) it is not: the partitions carrying the
+    ``root_A`` / ``root_B`` GPT names are raid1 MEMBERS, two per slot, and
+    a member's UUID is the ARRAY's UUID, not the filesystem's that
+    ``root=UUID=`` names. So a member resolves to the md array lsblk lists
+    as its child (``/dev/md/root_a`` → md125), and both members of one slot
+    collapse into a single entry (#3172). ``partlabel`` stays the GPT name
+    either way — the version keys and the GRUB entry names hang off it.
+
+    A member whose array is not assembled is never named in its place:
+    writing an image into one member of a mirror forks the data. It is
+    skipped (a member kicked out of a degraded array looks exactly like
+    that, and the slot is still its surviving array), so a slot whose
+    members ALL lack an array has no entry at all. Two members of one slot
+    resolving to different arrays (each half assembled on its own) is a
+    refusal too — which half is the slot is not a question this tool can
+    answer.
     """
     try:
         out = run(["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL,LABEL,PARTTYPE,FSTYPE"]).stdout
@@ -84,22 +107,71 @@ def find_slot_partitions() -> list[dict[str, str]]:
     data = json.loads(out)
 
     slots: list[dict[str, str]] = []
+    mirrored: dict[str, dict[str, str]] = {}
+    conflicted: set[str] = set()
 
     def walk(node: dict) -> None:
         partlabel = (node.get("partlabel") or "").lower()
         if partlabel in SLOT_PARTLABELS:
-            slots.append({
-                "device": node.get("path") or "",
-                "uuid": node.get("uuid") or "",
-                "partlabel": partlabel,
-                "fslabel": node.get("label") or "",
-            })
+            if (node.get("fstype") or "").lower() == "linux_raid_member":
+                _add_member(partlabel, node)
+            else:
+                slots.append({
+                    "device": node.get("path") or "",
+                    "uuid": node.get("uuid") or "",
+                    "partlabel": partlabel,
+                    "fslabel": node.get("label") or "",
+                })
         for child in node.get("children") or []:
             walk(child)
 
+    def _add_member(partlabel: str, node: dict) -> None:
+        array = next(
+            (
+                c for c in node.get("children") or []
+                if (c.get("fstype") or "").lower() not in ("", "linux_raid_member")
+            ),
+            None,
+        )
+        if array is None:
+            return  # not (or no longer) in an assembled array: see docstring
+        device = _md_device_name(array.get("path") or "", partlabel)
+        member = node.get("path") or ""
+        seen = mirrored.get(partlabel)
+        if seen is None:
+            mirrored[partlabel] = {
+                "device": device,
+                "uuid": array.get("uuid") or "",
+                "partlabel": partlabel,
+                "fslabel": array.get("label") or "",
+                "members": member,
+            }
+        elif seen["device"] != device:
+            conflicted.add(partlabel)
+        elif member and member not in seen["members"].split():
+            seen["members"] = f"{seen['members']} {member}".strip()
+
     for top in data.get("blockdevices") or []:
         walk(top)
+    for partlabel, slot in mirrored.items():
+        if partlabel not in conflicted:
+            slots.append(slot)
     return slots
+
+
+def _md_device_name(path: str, partlabel: str) -> str:
+    """``/dev/md/<slot>`` when that named-array link is this very array,
+    else lsblk's kernel path (``/dev/md125``). The kernel numbers md
+    devices in assembly order, so the name is the stable one to print and
+    log; the realpath check means a stale link can never redirect a write.
+    """
+    named = f"/dev/md/{partlabel}"
+    try:
+        if path and os.path.exists(named) and os.path.realpath(named) == os.path.realpath(path):
+            return named
+    except OSError:
+        pass  # unresolvable link: the kernel path below is just as correct
+    return path
 
 
 def detect_active_inactive() -> tuple[dict[str, str], dict[str, str]] | None:
@@ -761,6 +833,33 @@ def cmd_apply(args) -> int:
                 return 3
             print(f"  checksum OK: {actual}")
 
+        # #3172 — on a mirrored install the target is an md array, which is
+        # smaller than the image (see _SPILL_DM_NAME); write through a spill
+        # device that is big enough, then shrink the filesystem into the
+        # array before anything reads it.
+        write_dev = target_dev
+        spill_loop: str | None = None
+        array_bytes: int | None = None
+        prev_sigterm = None
+        if inactive.get("members"):
+            image_bytes = _xz_uncompressed_bytes(staged)
+            array_bytes = _device_bytes(target_dev)
+            if image_bytes is None or array_bytes is None:
+                msg = (f"could not size the image ({image_bytes}) or the "
+                       f"mirrored slot {target_dev} ({array_bytes}); nothing written")
+                print(f"ERROR: {msg}", file=sys.stderr)
+                _write_progress("failed", None, msg)
+                return 4
+            if image_bytes > array_bytes:
+                print(f"  mirrored slot: {target_dev} is {array_bytes} B, the image "
+                      f"{image_bytes} B — writing through a spill device, then "
+                      "shrinking the filesystem into the array")
+                # The unit's stop / TimeoutStartSec arrives as SIGTERM, whose
+                # default action skips every ``finally`` — and with it the
+                # spill teardown, leaving the mapping holding the array open.
+                prev_sigterm = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+                write_dev, spill_loop = _open_spill(target_dev, array_bytes, image_bytes)
+
         # Decompress + dd directly into the inactive partition. xz can
         # stream-decompress so we don't need disk space for an intermediate
         # uncompressed file.
@@ -779,35 +878,79 @@ def cmd_apply(args) -> int:
         _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
         print(f"  writing → {target_dev} (paced to "
               f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
-        xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
-                              stdout=subprocess.PIPE)
-        dd = subprocess.Popen(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
-                               "oflag=direct", "conv=fsync", "status=progress"],
-                              stdin=subprocess.PIPE)
+        xz: subprocess.Popen | None = None
+        dd: subprocess.Popen | None = None
         try:
-            _paced_copy(xz.stdout, dd.stdin)
-        except BrokenPipeError:
-            pass  # dd stopped reading; its exit status below says why
-        finally:
+            xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
+                                  stdout=subprocess.PIPE)
+            dd = subprocess.Popen(["dd", f"of={write_dev}", "bs=4M", "iflag=fullblock",
+                                   "oflag=direct", "conv=fsync", "status=progress"],
+                                  stdin=subprocess.PIPE)
             try:
-                dd.stdin.close()
+                _paced_copy(xz.stdout, dd.stdin)
             except BrokenPipeError:
-                pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
-        if dd.wait() != 0:
-            xz.kill()
+                pass  # dd stopped reading; its exit status below says why
+            finally:
+                try:
+                    dd.stdin.close()
+                except BrokenPipeError:
+                    pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
+            if dd.wait() != 0:
+                xz.kill()
+                xz.wait()
+                raise subprocess.CalledProcessError(dd.returncode, "dd")
             xz.wait()
-            raise subprocess.CalledProcessError(dd.returncode, "dd")
-        xz.wait()
-        if xz.returncode != 0:
-            print("ERROR: xz exited non-zero", file=sys.stderr)
+            if xz.returncode != 0:
+                print("ERROR: xz exited non-zero", file=sys.stderr)
+                return 4
+            if spill_loop is not None and array_bytes is not None:
+                failure = _shrink_into_array(write_dev, array_bytes)
+                if failure:
+                    print(f"ERROR: {failure}", file=sys.stderr)
+                    _write_progress("failed", None, failure)
+                    return 4
+        finally:
+            if spill_loop is not None:
+                # A writer still running (an exception or a signal cut the
+                # copy short) holds the mapping open: stop it first, or the
+                # teardown below cannot remove it.
+                for proc in (dd, xz):
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+            spill_gone = spill_loop is None or _close_spill(spill_loop)
+            if prev_sigterm is not None:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+        if not spill_gone:
+            msg = (f"could not remove the spill mapping /dev/mapper/{_SPILL_DM_NAME}; "
+                   f"it holds {target_dev} open. `dmsetup remove {_SPILL_DM_NAME}` "
+                   "and re-run the upgrade; the active slot is untouched")
+            print(f"ERROR: {msg}", file=sys.stderr)
+            _write_progress("failed", None, msg)
             return 4
+        if spill_loop is not None:
+            # Read back through the array alone: the spill device is gone,
+            # so a block the shrink left behind in it reads as corruption
+            # here, before the bootloader is ever pointed at the slot. The
+            # write reached the array through the mapping, never through the
+            # array's own page cache, so drop whatever that cache still holds
+            # of the old filesystem before anything reads or edits it.
+            subprocess.run(["blockdev", "--flushbufs", target_dev], check=False)
+            if subprocess.run(["e2fsck", "-f", "-n", target_dev], check=False).returncode != 0:
+                msg = (f"the filesystem on {target_dev} does not check clean after "
+                       "fitting it into the mirror; the active slot is untouched")
+                print(f"ERROR: {msg}", file=sys.stderr)
+                _write_progress("failed", None, msg)
+                return 4
     finally:
         staged.unlink(missing_ok=True)
         (workdir / "slot.sha256").unlink(missing_ok=True)
 
     _write_progress("bootloader", None, "updating bootloader + slot versions")
     print("  flushing kernel buffers + re-reading filesystem metadata…")
-    subprocess.run(["partprobe", _parent_disk(target_dev)], check=False)
+    if not inactive.get("members"):
+        # An md array has no partition table of its own to re-read (#3172).
+        subprocess.run(["partprobe", _parent_disk(target_dev)], check=False)
     subprocess.run(["udevadm", "settle"], check=False)
 
     # The dd overwrote the partition with the slot image's ext4
@@ -927,6 +1070,20 @@ def cmd_apply(args) -> int:
         _write_progress("failed", None, msg)
         return 5
 
+    # #3172 — the same last-line-of-defence position, for a mirror: the root
+    # filesystem is an md array, which only an initrd carrying mdadm can
+    # assemble. An image built before #999 put mdadm in the package set has
+    # none, and pointing GRUB at it is a node that stops in the initramfs.
+    if inactive.get("members") and _slot_has_mdadm(inactive) is False:
+        msg = (
+            f"the image written to {inactive['partlabel']} carries no mdadm, so "
+            "its initrd cannot assemble this mirrored root. Refusing to make it "
+            "bootable; the active slot is untouched."
+        )
+        print(f"ERROR: {msg}", file=sys.stderr)
+        _write_progress("failed", None, msg)
+        return 4
+
     # Sync the sidecar FIRST so the renderer reads correct per-slot labels
     # when it re-renders grub.cfg below. (Previously sync_slot_versions was
     # called last; it must now precede the render — #395.)
@@ -1010,13 +1167,21 @@ def cmd_apply(args) -> int:
 _PART_SUFFIX = ".part"
 
 
-def _install_atomically(src: Path, final: Path) -> None:
+def _install_atomically(src: Path, final: Path, *, fresh_mtime: bool = False) -> None:
     """Copy ``src`` to ``final`` so no reader ever sees a partial ``final``:
     copy (content + mtime, like ``copy2``) to a hidden ``.part`` sibling,
-    fsync it, then rename it over ``final`` (#1630)."""
+    fsync it, then rename it over ``final`` (#1630).
+
+    ``fresh_mtime`` stamps the copy with the current time instead of the
+    source's (#3169). It is set BEFORE the rename, so the watcher sees the
+    file once, under its real name, already carrying the new mtime — a
+    ``utime`` after the rename would be a second event and a second import.
+    """
     tmp = final.with_name(f".{final.name}{_PART_SUFFIX}")
     try:
         shutil.copy2(src, tmp)
+        if fresh_mtime:
+            os.utime(tmp, None)
         with open(tmp, "rb") as fh:
             os.fsync(fh.fileno())
         os.replace(tmp, final)
@@ -1025,10 +1190,27 @@ def _install_atomically(src: Path, final: Path) -> None:
         raise
 
 
-def _refresh_baked_images(target_dev: str) -> None:
+def _refresh_baked_images(target_dev: str, *, fresh_mtime: bool = False) -> int | None:
     """Copy the new slot's baked image tarballs to the persistent /var
     partition's k3s airgap-images dir. See cmd_apply for the
     architecture background.
+
+    Returns how many tarballs were copied, or None when the refresh could
+    not run (mount failure, a slot with no baked tarballs, copy error).
+
+    #3169 — ``fresh_mtime`` is the slot-SWITCH mode (rollback, set-default
+    or set-next-boot to the other slot). k3s's import cache re-imports a
+    tarball only when its size differs or its mtime is AFTER the cached one
+    (k3s ``pkg/agent/containerd/watcher.go``). The versionless names mean
+    the older slot's tarball usually replaces a newer one, so with the
+    source's mtime an equal-size file would be skipped and the target slot
+    would boot depending on containerd still holding its images. A fresh
+    mtime makes the running k3s re-import the target's set within seconds,
+    before the reboot, and the target's own k3s finds a cache that matches.
+    In that mode a tarball already identical to the target's (same size and
+    mtime — placed by copy2 from that very slot, as an apply does just
+    before ``set-next-boot``) is left alone: re-copying it would only make
+    the running k3s import the set a second time.
 
     #1630 — each tarball lands atomically (``_install_atomically``). The
     old slot's k3s keeps running through the apply and its image watcher
@@ -1056,19 +1238,26 @@ def _refresh_baked_images(target_dev: str) -> None:
         ).returncode
         if rc != 0:
             print(f"  WARN: couldn't mount {target_dev} to refresh baked images")
-            return
+            return None
         try:
             src = mountpoint / "var/lib/rancher/k3s/agent/images"
             if not src.is_dir():
                 print(f"  WARN: no baked-image dir at {src}")
-                return
+                return None
             dest.mkdir(parents=True, exist_ok=True)
             # A copy an earlier apply was killed in the middle of.
             for stale in dest.glob(f".*{_PART_SUFFIX}"):
                 stale.unlink(missing_ok=True)
+            tarballs = sorted(src.glob("*.tar.zst"))
+            if not tarballs:
+                print(f"  WARN: no baked tarballs in {src}")
+                return None
             copied = 0
-            for tarball in sorted(src.glob("*.tar.zst")):
-                _install_atomically(tarball, dest / tarball.name)
+            for tarball in tarballs:
+                final = dest / tarball.name
+                if fresh_mtime and _same_file_stat(tarball, final):
+                    continue
+                _install_atomically(tarball, final, fresh_mtime=fresh_mtime)
                 copied += 1
             # The renames must survive the reboot that follows the apply.
             dir_fd = os.open(dest, os.O_RDONLY)
@@ -1077,10 +1266,215 @@ def _refresh_baked_images(target_dev: str) -> None:
             finally:
                 os.close(dir_fd)
             print(f"  refreshed {copied} baked tarballs → {dest}")
+            return copied
         finally:
             subprocess.run(["umount", str(mountpoint)], check=False)
     except OSError as exc:
         print(f"  WARN: baked-image refresh skipped ({exc})", file=sys.stderr)
+        return None
+
+
+def _same_file_stat(src: Path, dest: Path) -> bool:
+    """True when ``dest`` has ``src``'s size and mtime — the key k3s's
+    import cache uses, and what ``copy2`` from ``src`` leaves behind."""
+    try:
+        a, b = src.stat(), dest.stat()
+    except OSError:
+        return False
+    return a.st_size == b.st_size and a.st_mtime_ns == b.st_mtime_ns
+
+
+def _recopy_slot_images_for_switch(target: dict[str, str]) -> None:
+    """Before a rollback / set-default / set-next-boot flips GRUB to another
+    slot, put THAT slot's baked tarballs in k3s's images dir (#3169).
+
+    /var/lib/rancher/k3s/agent/images is shared by both slots and holds the
+    set of whichever slot an upgrade last wrote; each slot's own copy sits
+    on its rootfs, hidden under the /var mount once it boots. Without this
+    a rolled-back slot imports nothing on boot and its pods
+    (``imagePullPolicy: Never``) start only if containerd kept its images —
+    which a cluster join/promote/demote on the newer slot (store wipe) or
+    kubelet image GC can have undone: ErrImageNeverPull.
+
+    Warn-and-continue on failure, deliberately. Rollback is the emergency
+    path, and a failed copy leaves the node exactly where it was before
+    this fix (each tarball lands atomically, so nothing is half-written):
+    the target slot then boots on whatever containerd still holds, which
+    is often everything. Refusing the GRUB flip would block an operator
+    backing out of a broken release over a missing tarball, which is
+    strictly worse. So the failure is logged loudly, with what it means
+    and how to recover, and the switch goes ahead.
+    """
+    label = target.get("partlabel", "?")
+    # #1026 — an apply refused at the architecture gate leaves the other
+    # arch's rootfs in the inactive slot ("a spare: the next apply
+    # overwrites it"). Copying ITS tarballs here would have the RUNNING
+    # k3s import them, and a tag they share with the running set would
+    # then name the wrong architecture for this node's next pod restart.
+    # Skip the copy; the switch itself is not this function's to refuse.
+    host_arch = host_architecture()
+    if host_arch:
+        slot_arch = (slot_release_fields(target) or {}).get("APPLIANCE_ARCH") or None
+        if slot_arch and slot_arch != host_arch:
+            print(
+                f"  WARNING: {label} holds an {slot_arch} image and this node is "
+                f"{host_arch} — NOT copying its baked images into k3s's images dir "
+                f"(#1026). {label} will not boot on this node.",
+                file=sys.stderr,
+            )
+            return
+    print(f"Re-copying {label}'s baked image tarballs into k3s's images dir (#3169)")
+    copied = _refresh_baked_images(target["device"], fresh_mtime=True)
+    if copied is None:
+        print(
+            f"  WARNING: could not re-copy {label}'s baked images (see the WARN above).\n"
+            f"  The switch continues. When {label} boots, its pods start only if\n"
+            f"  containerd still holds its images. If they come up\n"
+            f"  ErrImageNeverPull: mount {target['device']} read-only, copy its\n"
+            f"  var/lib/rancher/k3s/agent/images/*.tar.zst into\n"
+            f"  /var/lib/rancher/k3s/agent/images/, touch them, restart k3s\n"
+            f"  (docs/TROUBLESHOOTING.md, \"Pods stuck in ErrImageNeverPull after\n"
+            f"  a slot rollback\", covers a slot that carries no tarballs).",
+            file=sys.stderr,
+        )
+    elif copied == 0:
+        print(f"  {label}'s tarballs are already in place — nothing to re-import")
+
+
+# #3172 — a mirrored slot is a raid1 array, and the array is SMALLER than the
+# partition it is built from: metadata 1.2 keeps its data offset at the start
+# of each member (18432 sectors — 9 MiB — on an 8 GiB slot, measured with
+# mdadm on the installer's own geometry). The slot image is built for the bare
+# partition, so its filesystem is 9 MiB bigger than the array. dd'd straight
+# in it fails with ENOSPC at the very end, and had it been cut short instead
+# the kernel would refuse to mount it ("block count exceeds size of device").
+#
+# So the write goes to a device-mapper concatenation of the array plus a
+# small sparse file for the overflow (the "spill"), and resize2fs then moves
+# whatever landed past the array's end back inside it. Only the overflow is
+# staged — a few MiB — never the whole decompressed image, which would cost
+# gigabytes of the /var the cluster is running on.
+_SPILL_DM_NAME = "spatium-slot-write"
+_SPILL_TAIL_NAME = "slot-tail.raw"
+
+
+def _exit_on_sigterm(signum, _frame) -> None:
+    """Turn SIGTERM into SystemExit while the spill is mapped, so the
+    ``finally`` that tears it down runs."""
+    raise SystemExit(128 + signum)
+
+
+def _slot_has_mdadm(slot: dict[str, str]) -> bool | None:
+    """Does the slot's rootfs carry mdadm (and so an initrd that can
+    assemble an md root)? None when the slot cannot be mounted — the caller
+    refuses only on a definite no, like the #1026 check."""
+    mountpoint = Path(f"/run/spatium-slot-probe-{slot['partlabel']}")
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            run(["mount", "-o", "ro", slot["device"], str(mountpoint)])
+        except subprocess.CalledProcessError:
+            return None
+        return any((mountpoint / rel).exists() for rel in ("usr/sbin/mdadm", "sbin/mdadm"))
+    finally:
+        run(["umount", str(mountpoint)], check=False)
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            pass  # cosmetic: an empty dir under /run, a tmpfs
+
+
+def _xz_uncompressed_bytes(path: Path) -> int | None:
+    """The uncompressed size recorded in an .xz file's index, or None."""
+    proc = subprocess.run(["xz", "--robot", "--list", str(path)],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        if fields[0] == "totals" and len(fields) > 4:
+            try:
+                return int(fields[4])
+            except ValueError:
+                return None
+    return None
+
+
+def _device_bytes(device: str) -> int | None:
+    proc = subprocess.run(["blockdev", "--getsize64", device],
+                          capture_output=True, text=True, check=False)
+    try:
+        return int(proc.stdout.strip()) if proc.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def _open_spill(array_dev: str, array_bytes: int, image_bytes: int) -> tuple[str, str]:
+    """Map ``array_dev`` + a sparse overflow file as one device big enough for
+    the image. Returns ``(device to write, loop device)``; raises on failure
+    with nothing left mapped."""
+    _close_spill(None)  # whatever a killed earlier apply left behind
+    tail = _STAGING_DIR / _SPILL_TAIL_NAME
+    tail_sectors = -(-(image_bytes - array_bytes) // 512)
+    with open(tail, "wb") as fh:
+        fh.truncate(tail_sectors * 512)
+    loop = ""
+    try:
+        loop = run(["losetup", "--find", "--show", str(tail)]).stdout.strip()
+        array_sectors = array_bytes // 512
+        table = (f"0 {array_sectors} linear {array_dev} 0\n"
+                 f"{array_sectors} {tail_sectors} linear {loop} 0\n")
+        subprocess.run(["dmsetup", "create", _SPILL_DM_NAME], input=table,
+                       capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        _close_spill(loop or None)
+        raise
+    return f"/dev/mapper/{_SPILL_DM_NAME}", loop
+
+
+def _close_spill(loop: str | None) -> bool:
+    """Unmap the spill device and free its loop + file. Idempotent.
+
+    Returns whether the mapping is gone. It holds the array open, so while it
+    stays the slot cannot be mounted — the version probe, the image refresh
+    and the next boot's assembly all need it gone. The removal races udev,
+    which re-opens a device to probe it the moment a writer closes it (as
+    resize2fs just did), hence settle first and ``--retry``: measured, a bare
+    ``dmsetup remove`` straight after the shrink fails with the device busy.
+    """
+    subprocess.run(["udevadm", "settle"], capture_output=True, check=False)
+    subprocess.run(["dmsetup", "remove", "--retry", _SPILL_DM_NAME],
+                   capture_output=True, check=False)
+    gone = subprocess.run(["dmsetup", "info", _SPILL_DM_NAME],
+                          capture_output=True, check=False).returncode != 0
+    tail = _STAGING_DIR / _SPILL_TAIL_NAME
+    loops = [loop] if loop else []
+    if tail.exists():
+        proc = subprocess.run(["losetup", "-j", str(tail)],
+                              capture_output=True, text=True, check=False)
+        loops += [line.split(":", 1)[0] for line in proc.stdout.splitlines() if ":" in line]
+    for dev in dict.fromkeys(loops):
+        subprocess.run(["losetup", "-d", dev], capture_output=True, check=False)
+    tail.unlink(missing_ok=True)
+    return gone
+
+
+def _shrink_into_array(spill_dev: str, array_bytes: int) -> str | None:
+    """Shrink the filesystem on ``spill_dev`` to end inside the array.
+    Returns why it failed, or None. resize2fs refuses a filesystem that has
+    been mounted since its last full check, which an image built by mounting
+    and filling it always has, so the check comes first; e2fsck's 1 means it
+    fixed something, which leaves a filesystem resize2fs will take."""
+    print(f"  checking the written filesystem (e2fsck -f) on {spill_dev}…")
+    rc = subprocess.run(["e2fsck", "-f", "-y", spill_dev], check=False).returncode
+    if rc not in (0, 1):
+        return f"e2fsck exited {rc} on the written slot image; nothing made bootable"
+    print(f"  shrinking it to {array_bytes // 1024} KiB (resize2fs)…")
+    rc = subprocess.run(["resize2fs", spill_dev, f"{array_bytes // 1024}K"],
+                        check=False).returncode
+    if rc != 0:
+        return f"resize2fs exited {rc} fitting the slot image into the mirror"
+    return None
 
 
 def _parent_disk(part_dev: str) -> str:
@@ -1434,7 +1828,12 @@ GRUBENV = Path("/boot/efi/grub/grubenv")
 def _read_grubenv_default() -> str:
     """Return current saved_entry from grubenv (e.g. 'slot_a'). Falls
     back to 'slot_a' if grubenv is missing or unparseable."""
-    if not GRUBENV.exists():
+    try:
+        if not GRUBENV.exists():
+            return "slot_a"
+    except OSError:
+        # EACCES on an ESP directory we cannot traverse: same answer as
+        # missing. Path.exists() only swallows ENOENT-class errors.
         return "slot_a"
     try:
         proc = subprocess.run(
@@ -1447,6 +1846,11 @@ def _read_grubenv_default() -> str:
         if line.startswith("saved_entry="):
             return line.split("=", 1)[1].strip()
     return "slot_a"
+
+
+def _slot_entry(partlabel: str) -> str:
+    """The GRUB menu entry (``slot_a`` / ``slot_b``) for a root partlabel."""
+    return "slot_a" if partlabel == "root_a" else "slot_b"
 
 
 def cmd_set_next_boot(args) -> int:
@@ -1462,6 +1866,10 @@ def cmd_set_next_boot(args) -> int:
     new slot via `grub-set-default` once /health/live confirms the
     upgraded slot is healthy. Without that commit, even a successful
     boot reverts to the previous slot on next reboot.
+
+    #3169 — when the target is NOT the running slot, its baked image
+    tarballs are re-copied first, as ``rollback`` does. Straight after an
+    ``apply`` they are already in place, so the upgrade path copies nothing.
     """
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
@@ -1483,6 +1891,12 @@ def cmd_set_next_boot(args) -> int:
         target = "slot_b"
     else:
         target = "slot_a"
+
+    # #3169 — booting the other slot: give k3s that slot's tarballs first.
+    # Right after an apply (the upgrade runner's set-next-boot) they are
+    # already there and this copies nothing.
+    if _slot_entry(active["partlabel"]) != target:
+        _recopy_slot_images_for_switch(inactive)
 
     print(f"Setting next-boot to {target} (one-shot — will auto-revert if boot fails)")
     try:
@@ -1513,6 +1927,10 @@ def cmd_rollback(_args) -> int:
     so every future boot uses the new slot until another rollback or
     upgrade. Use this when you want to permanently revert to a known-
     good previous slot, not just try it once.
+
+    #3169 — first re-copies the target slot's baked image tarballs into
+    k3s's shared images dir, so the slot can rebuild its images on boot
+    whatever happened to containerd since it last ran.
     """
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
@@ -1524,6 +1942,7 @@ def cmd_rollback(_args) -> int:
         return 2
     active, inactive = pair
     target = "slot_a" if inactive["partlabel"] == "root_a" else "slot_b"
+    _recopy_slot_images_for_switch(inactive)
     print(f"Committing rollback: default boot → {target} ({inactive['device']})")
     try:
         subprocess.run(
@@ -1534,6 +1953,9 @@ def cmd_rollback(_args) -> int:
         print(f"ERROR: grub-set-default failed: {exc}", file=sys.stderr)
         return 3
     print(f"  grubenv saved_entry = {_read_grubenv_default()}")
+    # #999 / #3172 — grubenv lives on the ESP, which is NOT mirrored: without
+    # this the mirror member's ESP keeps booting the slot rolled back from.
+    _sync_mirror_esp()
     print()
     print(f"Run `reboot` when ready to switch.")
     return 0
@@ -1555,6 +1977,9 @@ def cmd_set_default(args) -> int:
 
     grub-set-default writes ``saved_entry`` to grubenv — survives
     reboots until another set-default / rollback / upgrade rewrites it.
+
+    #3169 — when the target is NOT the running slot, its baked image
+    tarballs are re-copied first, as ``rollback`` does.
     """
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
@@ -1571,6 +1996,18 @@ def cmd_set_default(args) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # #3169 — a durable switch to the OTHER slot re-copies its tarballs.
+    # Committing the running slot (a trial boot) copies nothing.
+    pair = detect_active_inactive()
+    if pair is None:
+        print(
+            "  WARNING: couldn't detect A/B slots — not re-copying baked images "
+            "(#3169); the GRUB default is still set",
+            file=sys.stderr,
+        )
+    elif _slot_entry(pair[0]["partlabel"]) != target:
+        _recopy_slot_images_for_switch(pair[1])
 
     print(f"Setting durable default boot to {target}")
     try:

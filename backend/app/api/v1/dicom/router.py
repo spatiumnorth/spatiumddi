@@ -67,6 +67,7 @@ from app.models.dicom import (
     DICOMPeer,
 )
 from app.models.ipam import IPAddress, IPSpace
+from app.services.api_token_scopes import read_only_post
 from app.services.dicom.importer import (
     MAX_IMPORT_ROWS,
     DICOMImportError,
@@ -1120,6 +1121,7 @@ def _rows_out(plan: list[PlannedRow]) -> list[DICOMAEImportRow]:
 
 
 @router.post("/aes/import/preview", response_model=DICOMAEImportPreviewResponse)
+@read_only_post
 async def import_preview(
     body: DICOMAEImportRequest, db: DB, user: CurrentUser
 ) -> DICOMAEImportPreviewResponse:

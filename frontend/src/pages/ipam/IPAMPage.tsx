@@ -51,6 +51,7 @@ import {
 } from "@dnd-kit/core";
 import {
   ipamApi,
+  settingsApi,
   dnsApi,
   dhcpApi,
   customFieldsApi,
@@ -91,6 +92,7 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -155,6 +157,7 @@ import {
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
+import { FilterModePicker } from "@/components/ui/filter-mode-picker";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
@@ -669,7 +672,11 @@ function InlineEditableText({
           if (e.key === "Enter") {
             e.preventDefault();
             commit();
-          } else if (e.key === "Escape") {
+          } else if (
+            e.key === "Escape" &&
+            !e.nativeEvent.isComposing &&
+            e.keyCode !== 229
+          ) {
             e.preventDefault();
             setDraft(value);
             setEditing(false);
@@ -3312,7 +3319,11 @@ function InlineStatusSelect({
         }}
         onBlur={() => setEditing(false)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") {
+          if (
+            e.key === "Escape" &&
+            !e.nativeEvent.isComposing &&
+            e.keyCode !== 229
+          ) {
             e.preventDefault();
             setEditing(false);
           }
@@ -4238,7 +4249,7 @@ interface BreadcrumbItem {
   onClick?: () => void;
 }
 
-function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
+export function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
   // Compress if more than 4 items
   let visible = items;
   if (items.length > 4) {
@@ -4249,7 +4260,7 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
     ];
   }
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-1">
+    <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1">
       {visible.map((item, i) => (
         <span key={i} className="contents">
           {item.label === "…" ? (
@@ -4258,8 +4269,9 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
             <button
               onClick={item.onClick}
               disabled={!item.onClick}
+              title={item.label}
               className={cn(
-                "rounded-full px-2 py-0.5 text-xs font-medium transition-colors",
+                "max-w-full min-w-0 truncate rounded-full px-2 py-0.5 text-xs font-medium transition-colors",
                 PILL_STYLES[item.variant],
               )}
             >
@@ -5153,7 +5165,6 @@ export function SubnetDetail({
   const [filterModes, setFilterModes] = useState<Record<string, FilterMode>>(
     {},
   );
-  const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   // Client-side sort of the IP table (issue #519). ``null`` = the API's
   // native inet order (which also keeps DHCP-pool / gap boundary rows
   // meaningful; those are suppressed under any custom sort).
@@ -5690,8 +5701,8 @@ export function SubnetDetail({
       {/* Header */}
       <div className="border-b">
         {/* Top bar: breadcrumb + actions */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
-          <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 pt-3 pb-2">
+          <div className="min-w-[12rem] flex-1">
             {spaceName &&
               (() => {
                 const crumbs: BreadcrumbItem[] = [
@@ -5735,7 +5746,7 @@ export function SubnetDetail({
               primary), so no regrouping needed here; ``flex-wrap`` is the
               other half of that issue's fix, so a narrow window moves the
               actions to a second line instead of clipping the last one. */}
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             <HeaderButton
               icon={RefreshCw}
               onClick={refreshSubnet}
@@ -6505,63 +6516,12 @@ export function SubnetDetail({
                                   aria-label="Filter"
                                   className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                                 />
-                                <div className="relative">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setOpenFilterMenu(
-                                        openFilterMenu === col ? null : col,
-                                      )
-                                    }
-                                    className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                                    title="Filter mode"
-                                  >
-                                    {filterModes[col] === "begins"
-                                      ? "^"
-                                      : filterModes[col] === "ends"
-                                        ? "$"
-                                        : filterModes[col] === "regex"
-                                          ? ".*"
-                                          : "⊂"}
-                                  </button>
-                                  {openFilterMenu === col && (
-                                    <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                      {(
-                                        [
-                                          "contains",
-                                          "begins",
-                                          "ends",
-                                          "regex",
-                                        ] as const
-                                      ).map((m) => (
-                                        <button
-                                          key={m}
-                                          type="button"
-                                          onClick={() => {
-                                            setFilterModes((p) => ({
-                                              ...p,
-                                              [col]: m,
-                                            }));
-                                            setOpenFilterMenu(null);
-                                          }}
-                                          className={cn(
-                                            "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                            filterModes[col] === m &&
-                                              "font-semibold text-primary",
-                                          )}
-                                        >
-                                          {m === "contains"
-                                            ? "⊂ Contains"
-                                            : m === "begins"
-                                              ? "^ Begins"
-                                              : m === "ends"
-                                                ? "$ Ends"
-                                                : ".* Regex"}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
+                                <FilterModePicker
+                                  value={filterModes[col] ?? "contains"}
+                                  onChange={(m) =>
+                                    setFilterModes((p) => ({ ...p, [col]: m }))
+                                  }
+                                />
                               </div>
                             )}
                           </td>
@@ -8151,15 +8111,37 @@ function DriftRow({
   );
 }
 
-export function EditSubnetModal({
-  subnet,
-  onClose,
-  onDeleted,
-}: {
+type EditSubnetModalProps = {
   subnet: Subnet;
   onClose: (updated?: Subnet) => void;
   onDeleted?: () => void;
-}) {
+};
+
+// Reads the subnet fresh on open (#3269): the row the page holds comes from a
+// cached list that may predate a change made elsewhere, and the form is seeded
+// once from it. Save then sends only what the operator changed.
+export function EditSubnetModal(props: EditSubnetModalProps) {
+  const fresh = useFreshRow(props.subnet, () =>
+    ipamApi.getSubnet(props.subnet.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Subnet"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={() => props.onClose()}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <EditSubnetModalForm {...props} subnet={fresh.row} />;
+}
+
+function EditSubnetModalForm({
+  subnet,
+  onClose,
+  onDeleted,
+}: EditSubnetModalProps) {
   const qc = useQueryClient();
   // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
   const canDeleteSubnet = usePermissions().can("delete", "subnet");
@@ -8370,7 +8352,7 @@ export function EditSubnetModal({
         autoAddresses !== null && autoAddresses !== hasAutoAddresses
           ? !autoAddresses // True = remove, False = add
           : undefined;
-      return ipamApi.updateSubnet(subnet.id, {
+      const body = {
         name: name || undefined,
         description,
         // Explicit null so the operator can clear the gateway (nullable
@@ -8415,10 +8397,67 @@ export function EditSubnetModal({
         subnet_role: subnetRole,
         customer_id: customerId,
         site_id: siteId,
-        ...(manageAuto !== undefined
-          ? { manage_auto_addresses: manageAuto }
-          : {}),
-      });
+      };
+      // Send only what the operator changed (#3269), so a dialog opened on an
+      // out-of-date subnet cannot write the old values back. Each inheriting
+      // family's own values are compared against the STORED inherit flag, not
+      // the form's: toggling inherit on then sends the explicit nulls that
+      // clear the subnet's own pins (as a full save did), and toggling it off
+      // sends the values shown, so the subnet's settings are stated, not
+      // assumed.
+      const storedDnsInherit = subnet.dns_inherit_settings ?? true;
+      const storedDhcpInherit = subnet.dhcp_inherit_settings ?? true;
+      const storedDdnsInherit = subnet.ddns_inherit_settings ?? true;
+      const was: Record<string, unknown> = {
+        name: subnet.name || undefined,
+        description: subnet.description ?? "",
+        gateway: subnet.gateway || null,
+        vlan_ref_id: subnet.vlan_ref_id ?? null,
+        vxlan_id: subnet.vxlan_id ?? null,
+        status: subnet.status,
+        custom_fields: subnet.custom_fields ?? {},
+        dns_inherit_settings: subnet.dns_inherit_settings ?? true,
+        dns_group_ids: storedDnsInherit ? null : (subnet.dns_group_ids ?? []),
+        dns_zone_id: storedDnsInherit ? null : (subnet.dns_zone_id ?? null),
+        dns_additional_zone_ids: storedDnsInherit
+          ? null
+          : (subnet.dns_additional_zone_ids ?? []),
+        dns_split_horizon: subnet.dns_split_horizon ?? false,
+        dhcp_inherit_settings: subnet.dhcp_inherit_settings ?? true,
+        dhcp_server_group_id: storedDhcpInherit
+          ? null
+          : (subnet.dhcp_server_group_id ?? null),
+        ddns_inherit_settings: subnet.ddns_inherit_settings ?? true,
+        ...(storedDdnsInherit
+          ? {}
+          : {
+              ddns_enabled: subnet.ddns_enabled ?? false,
+              ddns_hostname_policy:
+                subnet.ddns_hostname_policy ?? "client_or_generated",
+              ddns_domain_override: subnet.ddns_domain_override ?? null,
+              ddns_ttl: subnet.ddns_ttl ?? null,
+            }),
+        auto_profile_on_dhcp_lease: subnet.auto_profile_on_dhcp_lease ?? false,
+        auto_profile_preset: subnet.auto_profile_preset ?? "service_and_os",
+        auto_profile_refresh_days: subnet.auto_profile_refresh_days ?? 30,
+        discovery_enabled: subnet.discovery_enabled ?? false,
+        discovery_interval_minutes: subnet.discovery_interval_minutes ?? 360,
+        do_not_probe: subnet.do_not_probe ?? false,
+        do_not_probe_reason: subnet.do_not_probe_reason ?? "",
+        show_free_ranges: subnet.show_free_ranges ?? null,
+        pci_scope: subnet.pci_scope ?? false,
+        hipaa_scope: subnet.hipaa_scope ?? false,
+        internet_facing: subnet.internet_facing ?? false,
+        decom_date: subnet.decom_date || null,
+        subnet_role: subnet.subnet_role ?? null,
+        customer_id: subnet.customer_id ?? null,
+        site_id: subnet.site_id ?? null,
+      };
+      const diff = changedFields(was, body);
+      if (manageAuto !== undefined)
+        Object.assign(diff, { manage_auto_addresses: manageAuto });
+      if (Object.keys(diff).length === 0) return Promise.resolve(subnet);
+      return ipamApi.updateSubnet(subnet.id, diff);
     },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
@@ -13413,6 +13452,21 @@ function EditBlockModalForm({
 
 // ─── Recursive Block Tree Row ─────────────────────────────────────────────────
 
+/** True when the selected subnet or block lies strictly beneath `node`. */
+function subtreeHolds(
+  node: BlockNode,
+  subnetId: string | null,
+  blockId: string | null,
+): boolean {
+  if (!subnetId && !blockId) return false;
+  if (subnetId && node.subnets.some((s) => s.id === subnetId)) return true;
+  return node.children.some(
+    (c) =>
+      (blockId !== null && c.block.id === blockId) ||
+      subtreeHolds(c, subnetId, blockId),
+  );
+}
+
 export function BlockTreeRow({
   node,
   selectedSubnetId,
@@ -13444,9 +13498,29 @@ export function BlockTreeRow({
   // regardless of the operator's saved expand/collapse state.
   forceExpand?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  // Settings → IPAM "Default Expanded Depth" (#3290): a block opens by default
+  // only while its level (depth 0 = level 1) is within that depth. null means
+  // the operator has not toggled this row, so it keeps following the setting
+  // (which may arrive after first paint). The backend default is 2.
+  const { data: treeSettings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => settingsApi.get(),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const defaultDepth = treeSettings?.subnet_tree_default_expanded_depth ?? 2;
+  const [expanded, setExpanded] = useState<boolean | null>(null);
+  // A block past the default depth still opens when the selected subnet or
+  // block sits beneath it (a deep link, a search hit), or the selection would
+  // be hidden behind a collapsed row. Latched as an operator choice, so the
+  // row stays open when the selection later moves elsewhere.
+  const holdsSelection = subtreeHolds(node, selectedSubnetId, selectedBlockId);
+  useEffect(() => {
+    if (holdsSelection && expanded === null) setExpanded(true);
+  }, [holdsSelection, expanded]);
   const [showAllChildren, setShowAllChildren] = useState(false);
-  const isExpanded = forceExpand || expanded;
+  const isExpanded =
+    forceExpand || (expanded ?? (holdsSelection || depth < defaultDepth));
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
   const {
@@ -13494,7 +13568,7 @@ export function BlockTreeRow({
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  setExpanded((v) => !v);
+                  setExpanded(!isExpanded);
                 }}
                 className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
                 title={isExpanded ? "Collapse" : "Expand"}
@@ -13883,9 +13957,14 @@ export function BlockDetailView({
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b">
         {/* Top bar */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
-          <BreadcrumbPills items={crumbs} />
-          <div className="flex flex-shrink-0 items-center gap-2">
+        {/* #3213 — wraps rather than clips: the breadcrumb takes the line's
+            spare width (``min-w-0`` so its pills truncate) and the actions
+            drop to their own line once it would fall under 12rem. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 pt-3 pb-2">
+          <div className="min-w-[12rem] flex-1">
+            <BreadcrumbPills items={crumbs} />
+          </div>
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             {selectedCount > 0 ? (
               <>
                 {!hasBlocksSelected && (
@@ -14683,7 +14762,7 @@ export function BlockDetailView({
                               <RowTypeBadge kind="block" />
                             </span>
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground">
+                          <td className="min-w-[10rem] px-4 py-2 break-words text-muted-foreground">
                             {b.name || (
                               <span className="text-muted-foreground/40">
                                 —
@@ -14763,7 +14842,7 @@ export function BlockDetailView({
                               <RowTypeBadge kind="subnet" />
                             </span>
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground">
+                          <td className="min-w-[10rem] px-4 py-2 break-words text-muted-foreground">
                             {s.name || (
                               <span className="text-muted-foreground/40">
                                 —
@@ -15352,9 +15431,13 @@ export function SpaceTableView({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b px-6 py-3">
-        <div className="flex items-center justify-between gap-4 pb-2">
-          <BreadcrumbPills items={[{ label: space.name, variant: "space" }]} />
-          <div className="flex flex-shrink-0 items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 pb-2">
+          <div className="min-w-[12rem] flex-1">
+            <BreadcrumbPills
+              items={[{ label: space.name, variant: "space" }]}
+            />
+          </div>
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2">
             {selected.size > 0 && (
               <>
                 {!hasBlocksSelected && (
@@ -17321,7 +17404,12 @@ export function IPAMPage() {
   return (
     <div className="flex h-full">
       {/* ── Left tree panel ── */}
-      <div className="flex w-72 flex-shrink-0 flex-col border-r">
+      <ResizablePane
+        storageKey="ipam"
+        defaultWidth={288}
+        label="Resize IP spaces tree"
+        className="flex flex-col border-r"
+      >
         <div className="flex h-12 items-center justify-between border-b px-3">
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
@@ -17522,7 +17610,7 @@ export function IPAMPage() {
               </p>
             )}
         </div>
-      </div>
+      </ResizablePane>
 
       {/* ── Right detail panel ── */}
       <div className="flex flex-1 flex-col overflow-hidden">

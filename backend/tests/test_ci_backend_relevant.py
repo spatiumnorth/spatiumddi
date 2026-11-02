@@ -56,6 +56,10 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_nightly_upgrade_cleared_3026.py": (
         "agent/supervisor/spatium_supervisor/appliance_state.py"
     ),
+    # #3172 — the supervisor's booted-slot reader must agree with the api's.
+    "test_appliance_current_slot_mirror_3172.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py"
+    ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
     # #1465: runs the demo seeder's own template payloads through the API model.
@@ -97,6 +101,10 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_release_version_script.py": "scripts/release_version.py",
     "test_changelog_assemble.py": "scripts/changelog_assemble.py",
     "test_format_release_notes.py": "scripts/format_release_notes.py",
+    "test_check_contributors.py": (
+        ".github/scripts/check_contributors.py",
+        ".github/contributors-ignore.txt",
+    ),
     "test_release_tags_script.py": ".github/scripts/release-tags.sh",
     "test_trivy_scan_script.py": ("scripts/trivy-scan.sh", "Makefile"),
     "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",

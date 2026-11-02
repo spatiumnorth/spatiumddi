@@ -30,6 +30,8 @@ let stored: Record<string, unknown> = {};
 let settingsFails = false;
 let groups: Array<Record<string, unknown>> = [];
 
+let listedZones: unknown[] = [];
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -45,6 +47,7 @@ vi.mock("@/lib/api", async () => {
       ...actual.dnsApi,
       classifyZoneName: pending,
       listGroups: () => Promise.resolve(groups),
+      listZones: () => Promise.resolve(listedZones),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (g: string, d: Record<string, unknown>) => createZone(g, d),
@@ -136,6 +139,7 @@ describe("Add Zone", () => {
   it("shows an existing zone's own values, not the defaults", async () => {
     stored = { dns_default_zone_type: "forward", dns_default_ttl: 5400 };
     const zone = { name: "a.example.com.", zone_type: "primary", ttl: 300 };
+    listedZones = [zone];
     wrap(
       <ZoneModal
         groupId="g1"
@@ -144,8 +148,10 @@ describe("Add Zone", () => {
         onClose={() => {}}
       />,
     );
+    await waitFor(() =>
+      expect(control("Default TTL (seconds)").value).toBe("300"),
+    );
     expect(control("Type").value).toBe("primary");
-    expect(control("Default TTL (seconds)").value).toBe("300");
   });
 });
 

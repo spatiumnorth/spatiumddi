@@ -20,7 +20,7 @@ from app.core.session_idle import (
 )
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
-from app.services.api_token_scopes import scope_matches_request
+from app.services.api_token_scopes import is_read_only_post, scope_matches_request
 
 logger = structlog.get_logger(__name__)
 
@@ -135,9 +135,16 @@ async def _resolve_api_token(
     # vocabulary check happens at create time so we can trust the
     # stored values here.
     scopes = list(token.scopes or [])
-    if scopes and not scope_matches_request(scopes, request.method, request.url.path):
+    if scopes and not scope_matches_request(
+        scopes,
+        request.method,
+        request.url.path,
+        read_only_route=is_read_only_post(getattr(request.scope.get("route"), "endpoint", None)),
+    ):
+        # 403, not 401 (#3223): the credential is valid, it is just not allowed
+        # here. A 401 tells a client to re-authenticate or drop the token.
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="Token scope insufficient for this request",
         )
     if token.user_id is None:

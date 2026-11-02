@@ -17,15 +17,15 @@ import ipaddress
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.audit import AuditLog
-from app.models.dns import DNSServerGroup, DNSZone
-from app.models.ipam import Subnet
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.ipam import IPAddress, Subnet
 from app.services.dns.new_object_defaults import default_zone_ttl
 from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, reverse_zone_network re-exported
     _effective_dns,
@@ -503,7 +503,10 @@ async def retire_auto_reverse_zones(
       one deletion and a restore brings subnet and zone back together; without
       one (the permanent path) it is hard-deleted the way the zone-delete
       operation does it: agentless servers told, queued ops swept, records
-      deleted set-based, the zone row deleted.
+      deleted set-based, the zone row deleted — unless a trashed sibling's
+      records still sit in it (spatiumddi#3190): then it goes to the Trash in
+      that sibling's batch instead (``relinked``), so a permanent delete never
+      takes rows of another deletion with it.
 
     Returns ``(retired, relinked, dns_group_ids_to_wake)``; the caller wakes
     the groups after its commit so the agents re-render without waiting for
@@ -511,7 +514,6 @@ async def retire_auto_reverse_zones(
     """
     from sqlalchemy import delete as sa_delete  # noqa: PLC0415
 
-    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
     from app.services.soft_delete import add_to_batch  # noqa: PLC0415
 
@@ -545,6 +547,15 @@ async def retire_auto_reverse_zones(
             )
             continue
         await sweep_zone_ops(db, zone, zone.group_id)
+        heir = await _trashed_sharer(db, zone, exclude_ids | {subnet.id}) if batch is None else None
+        if heir is not None:
+            # #3190 — a trashed sibling's PTRs sit in the zone; deleting it would
+            # take them out of that sibling's batch. The zone goes to the Trash
+            # with the sibling instead, and comes back with its restore.
+            await _hand_over(db, zone, heir)
+            wake.add(zone.group_id)
+            relinked.append(zone)
+            continue
         if batch is not None:
             await add_to_batch(db, batch, zone)
         else:
@@ -586,11 +597,115 @@ async def retire_auto_reverse_zones_for_batch(
     return wake
 
 
+async def _trashed_sharer(
+    db: AsyncSession, zone: DNSZone, exclude_ids: frozenset[uuid.UUID]
+) -> Subnet | None:
+    """The trashed subnet, outside ``exclude_ids``, whose trashed records still
+    sit in ``zone`` under a batch other than the zone's own (spatiumddi#3190),
+    the most recently deleted first; or ``None``."""
+    stmt: Any = (
+        select(Subnet)
+        .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+        .join(DNSRecord, DNSRecord.ip_address_id == IPAddress.id)
+        .where(
+            DNSRecord.zone_id == zone.id,
+            DNSRecord.deleted_at.is_not(None),
+            DNSRecord.deletion_batch_id.is_distinct_from(zone.deletion_batch_id),
+            Subnet.deleted_at.is_not(None),
+            Subnet.deletion_batch_id.is_not(None),
+            Subnet.id.not_in(list(exclude_ids)),
+        )
+        .order_by(Subnet.deleted_at.desc(), Subnet.id)
+        .limit(1)
+        .execution_options(include_deleted=True)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def _hand_over(db: AsyncSession, zone: DNSZone, heir: Subnet) -> None:
+    """Re-link ``zone`` to the trashed ``heir`` and stamp it, with the records
+    riding it, into the heir's deletion batch (spatiumddi#3190).
+
+    The records that ride it: every live one when the zone is live (the
+    permanent-delete paths, which used to delete them with the zone), else the
+    ones carrying the zone's own batch, less any auto-generated record bound to
+    an address OUTSIDE the heir: that one was published for another subnet and
+    keeps its own batch, or the heir's restore would publish it. (Both callers
+    retract the purged subnets' own records first, so on the live path none of
+    those is left to move.)"""
+    if zone.deleted_at is None:
+        rides: Any = DNSRecord.deleted_at.is_(None)
+    elif zone.deletion_batch_id is not None:
+        rides = (DNSRecord.deletion_batch_id == zone.deletion_batch_id) & ~(
+            DNSRecord.auto_generated.is_(True)
+            & DNSRecord.ip_address_id.in_(
+                select(IPAddress.id).where(IPAddress.subnet_id != heir.id)
+            )
+        )
+    else:
+        rides = None
+    if rides is not None:
+        await db.execute(
+            update(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id, rides)
+            .values(
+                deleted_at=heir.deleted_at,
+                deleted_by_user_id=heir.deleted_by_user_id,
+                deletion_batch_id=heir.deletion_batch_id,
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+    zone.linked_subnet_id = heir.id
+    zone.deleted_at = heir.deleted_at
+    zone.deleted_by_user_id = heir.deleted_by_user_id
+    zone.deletion_batch_id = heir.deletion_batch_id
+    logger.info(
+        "reverse_zone_handed_over",
+        zone_id=str(zone.id),
+        name=zone.name,
+        subnet_id=str(heir.id),
+        reason="trashed records of another batch still live in the zone",
+    )
+
+
+async def hand_over_zone_to_trashed_sharer(
+    db: AsyncSession,
+    zone: DNSZone,
+    *,
+    exclude_ids: frozenset[uuid.UUID] = frozenset(),
+) -> Subnet | None:
+    """Keep a TRASHED auto reverse zone alive for another batch that still needs it
+    (spatiumddi#3190).
+
+    Two /25s share one /24 zone. The first one's delete re-links the zone to the
+    second; the second's delete then retires the zone into ITS batch, so the first
+    batch's PTRs sit in a zone owned by someone else's batch. Purging that zone
+    drops the first batch's PTRs through the zone's FK cascade, though the purge
+    dialog never named them, and the first subnet's restore then comes back with
+    no reverse zone and no PTRs.
+
+    When ``zone`` (trashed) still holds trashed records of an address of a trashed
+    subnet outside ``exclude_ids`` (the subnets going away in this purge), the zone
+    is not purged: it is handed over to that subnet's batch (re-linked to it, with
+    the records of the zone's own batch, see :func:`_hand_over`), so the subnet's
+    restore brings zone and PTRs back and its own purge takes them. Returns that
+    subnet, or ``None`` when nothing needs the zone and it may go.
+    """
+    if zone.deleted_at is None or not zone.is_auto_generated:
+        return None
+    heir = await _trashed_sharer(db, zone, exclude_ids)
+    if heir is None:
+        return None
+    await _hand_over(db, zone, heir)
+    return heir
+
+
 async def purge_auto_reverse_zones(
     db: AsyncSession,
     subnets: list[Subnet],
     *,
     audit: Callable[[DNSZone], None] | None = None,
+    audit_handover: Callable[[DNSZone, Subnet], None] | None = None,
 ) -> set[uuid.UUID]:
     """Take the auto-created reverse zones of subnets being purged from the
     Trash with them (spatiumddi#2734). Two shapes, both reached before the
@@ -605,8 +720,12 @@ async def purge_auto_reverse_zones(
       space deletes used to leave behind — is retired the way a permanent
       subnet delete does it (re-linked to a surviving sharer, else deleted).
 
+    A trashed zone still holding another trashed subnet's records is handed
+    to that subnet's batch instead of purged (spatiumddi#3190).
+
     The caller owns the commit; ``audit`` is called with each trashed zone
-    purged, for the caller's own audit row. Returns the group ids to wake."""
+    purged, and ``audit_handover`` with each one handed over and its new
+    subnet, for the caller's own audit rows. Returns the group ids to wake."""
     if not subnets:
         return set()
     from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
@@ -630,6 +749,12 @@ async def purge_auto_reverse_zones(
         .all()
     )
     for zone in trashed:
+        # #3190 — another trashed subnet's PTRs in a shared zone are not ours to take.
+        heir = await hand_over_zone_to_trashed_sharer(db, zone, exclude_ids=going)
+        if heir is not None:
+            if audit_handover is not None:
+                audit_handover(zone, heir)
+            continue
         await purge_trashed_zone(db, zone)
         if audit is not None:
             audit(zone)

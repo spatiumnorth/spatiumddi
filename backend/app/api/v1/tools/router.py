@@ -72,6 +72,7 @@ from app.models.audit import AuditLog
 from app.models.bgp_looking_glass import LookingGlassCollector
 from app.models.settings import PlatformSettings
 from app.services import wol
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance import agent_cmd
 from app.services.nettools import (
     inspect_tls_cert,
@@ -585,6 +586,7 @@ async def dns_propagation(body: PropagationRequest, _rl=RateLimitOffprem) -> Pro
 
 
 @router.post("/mac-vendor", response_model=MacVendorResult, dependencies=[_RequirePerm])
+@read_only_post
 async def mac_vendor(body: MacVendorRequest, db: DB, _rl=RateLimitDefault) -> MacVendorResult:
     """Resolve OUI vendor names for a batch of MACs.
 

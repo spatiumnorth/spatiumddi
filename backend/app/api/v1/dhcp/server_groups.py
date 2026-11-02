@@ -41,6 +41,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
+from app.services.dhcp.ha_members import kea_ha_members
 from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
 from app.services.dhcp.ha_peer_autofill import HA_GROUP_MODES, autofill_skipped_reason
 from app.services.dhcp.relay_vip import (
@@ -166,13 +167,21 @@ class GroupResponse(BaseModel):
     lease_cache_max_age: int | None
     kea_thread_pool_size: int
     kea_packet_logging: bool
-    # Computed: count of Kea servers currently in the group. ≥ 2 means
-    # the group renders the libdhcp_ha.so hook on every peer.
+    # Computed: count of Kea servers currently in the group. In an HA-mode
+    # group, the libdhcp_ha.so hook renders on the members that have a peer
+    # URL, once two or more do (``services/dhcp/ha_members``).
     kea_member_count: int = 0
     # #2963 - names of Kea members with no ``ha_peer_url`` in an HA-mode group
-    # of two or more: HA is NOT rendered while this is non-empty. Empty
-    # otherwise, including for a ``standalone`` group (no HA wanted).
+    # of two or more. Empty otherwise, including for a ``standalone`` group (no
+    # HA wanted). HA is not rendered at all while fewer than two members have
+    # a URL; otherwise the URL-less members are in ``ha_sidelined_members``.
     ha_peer_urls_missing: list[str] = []
+    # #3151 - URL-less Kea members of a group whose other Kea members DO run HA
+    # (two or more with a URL). They are left out of the relationship and
+    # serve none of the group's scopes, so the pair keeps running and nothing
+    # hands out the same pool uncoordinated. A subset of
+    # ``ha_peer_urls_missing``; empty when HA is not rendered.
+    ha_sidelined_members: list[str] = []
     # #2963 - when ``ha_peer_urls_missing`` is non-empty, why the control plane
     # did not derive the URL: ``bridged_network_mode`` or
     # ``more_than_two_kea_members`` (a 3rd+ member would become a Kea backup
@@ -197,6 +206,7 @@ class GroupResponse(BaseModel):
 
 def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
     kea = [s for s in (g.servers or []) if s.driver == "kea"]
+    ha = kea_ha_members(g.mode, g.servers or [])
     return GroupResponse(
         id=g.id,
         name=g.name,
@@ -218,14 +228,12 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
             if len(kea) >= 2 and g.mode in HA_GROUP_MODES
             else []
         ),
+        ha_sidelined_members=sorted(s.name for s in ha.sidelined),
         ha_autofill_skipped_reason=(
             autofill_skipped_reason(g, len(kea)) if any(not s.ha_peer_url for s in kea) else None
         ),
         ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
-        ha_peer_auth_active=g.mode in HA_MODES
-        and len(kea) >= 2
-        and all(s.ha_peer_url for s in kea)
-        and peer_auth_ready(g, kea),
+        ha_peer_auth_active=ha.renders_ha and peer_auth_ready(g, ha.participants),
         servers=[
             ServerSummary(
                 id=s.id,

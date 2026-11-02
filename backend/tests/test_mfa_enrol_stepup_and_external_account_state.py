@@ -99,6 +99,10 @@ async def _session_user(
         refresh_token_hash=f"t-{uuid.uuid4().hex}",
         auth_source=auth_source,
         created_at=signed_in,
+        # Signed in long ago but in use now: the step-up rules read the
+        # sign-in time, and the idle timeout (60 min by default, even with no
+        # settings row since #3203) must not end the session first.
+        last_seen_at=datetime.now(UTC),
         expires_at=datetime.now(UTC) + timedelta(days=1),
     )
     db.add(session)

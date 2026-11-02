@@ -121,9 +121,15 @@ async function confirmMoveToTrash() {
 
 async function walkDelete(openLabel: RegExp) {
   fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
-  fireEvent.click(screen.getByRole("button", { name: openLabel }));
+  // Permissions arrive asynchronously; a click on the still-disabled
+  // button is a silent no-op and the Continue lookup then fails.
+  const del = screen.getByRole("button", {
+    name: openLabel,
+  }) as HTMLButtonElement;
+  await waitFor(() => expect(del.disabled).toBe(false));
+  fireEvent.click(del);
   fireEvent.click(
-    within(topDialog()).getByRole("button", { name: "Continue" }),
+    await within(topDialog()).findByRole("button", { name: "Continue" }),
   );
   await confirmMoveToTrash();
 }
@@ -190,7 +196,16 @@ describe("a delete the approval queue took", () => {
 
   it("Edit Subnet says it in a status, not its error box", async () => {
     const deleteSubnet = vi.fn(() => QUEUED);
-    answers.ipamApi = { deleteSubnet };
+    const subnet = {
+      id: "sn-1",
+      space_id: "sp-1",
+      block_id: "b-1",
+      network: "10.73.5.0/24",
+    } as Subnet;
+    answers.ipamApi = {
+      deleteSubnet,
+      getSubnet: () => Promise.resolve(subnet),
+    };
     // #2571 — the Danger-zone Delete is gated on `delete` on `subnet`; this
     // test is about the 202 the approval queue answers, so sign in as a
     // superadmin who may press it.
@@ -200,20 +215,13 @@ describe("a delete the approval queue took", () => {
     const onDeleted = vi.fn();
     open(
       <EditSubnetModal
-        subnet={
-          {
-            id: "sn-1",
-            space_id: "sp-1",
-            block_id: "b-1",
-            network: "10.73.5.0/24",
-          } as Subnet
-        }
+        subnet={subnet}
         onClose={() => {}}
         onDeleted={onDeleted}
       />,
     );
     // Permissions arrive asynchronously; the button is disabled until then.
-    fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
     const del = screen.getByRole("button", {
       name: /^Delete this subnet/,
     }) as HTMLButtonElement;

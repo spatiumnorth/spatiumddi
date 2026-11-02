@@ -38,6 +38,13 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
+from app.services.ipam.orphan_aliases import (
+    is_withdrawn_alias,
+    orphan_record_owners,
+    orphan_record_reason,
+    refusal_reason,
+    withdrawn_alias_owners,
+)
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -162,6 +169,26 @@ def _purge_audit(current_user: Any, resource_type: str, row: Any) -> AuditLog:
         resource_display=_row_label(row),
         result="success",
         new_value={"purged_with": "parent"},
+    )
+
+
+def _handover_audit(current_user: Any, zone: Any, heir: Any) -> AuditLog:
+    """The auto reverse zone a subnet purge left in the Trash for another
+    trashed subnet whose records still sit in it (spatiumddi#3190)."""
+    return AuditLog(
+        user_id=current_user.id,
+        user_display_name=current_user.display_name,
+        auth_source=current_user.auth_source,
+        action="update",
+        resource_type="dns_zone",
+        resource_id=str(zone.id),
+        resource_display=_row_label(zone),
+        result="success",
+        new_value={
+            "handed_over_to_subnet": str(heir.id),
+            "deletion_batch_id": str(heir.deletion_batch_id),
+            "reason": "another trashed subnet's records still sit in the zone",
+        },
     )
 
 
@@ -343,7 +370,10 @@ async def _prepare_subnet_purge(
     from app.services.dns.reverse_zone import purge_auto_reverse_zones  # noqa: PLC0415
 
     groups = groups | await purge_auto_reverse_zones(
-        db, subnets, audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z))
+        db,
+        subnets,
+        audit=lambda z: db.add(_purge_audit(current_user, "dns_zone", z)),
+        audit_handover=lambda z, heir: db.add(_handover_audit(current_user, z, heir)),
     )
     return retracted, groups
 
@@ -378,6 +408,7 @@ async def list_trash(
     # so one trashed 250k-record zone meant 250k ORM objects per load, plus
     # a COUNT per batch per model. One UNION of light column selects now,
     # and the batch sizes for the page's rows only.
+    withdrawn = await withdrawn_alias_owners(db) if "dns_record" in types_to_query else {}
     branches = []
     for resource_type in types_to_query:
         model = TYPE_TO_MODEL[resource_type]
@@ -390,6 +421,10 @@ async def list_trash(
             model.deleted_by_user_id.label("deleted_by_user_id"),
             model.deletion_batch_id.label("deletion_batch_id"),
         ).where(model.deleted_at.is_not(None))
+        if model is DNSRecord and withdrawn:
+            # #3189 — an orphan's withdrawn aliases follow the address, not
+            # the Trash: restored or purged with it, never alone.
+            branch = branch.where(~is_withdrawn_alias(withdrawn))
         if since is not None:
             branch = branch.where(model.deleted_at >= since)
         if until is not None:
@@ -576,6 +611,23 @@ async def restore_row(
     if target is None:
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
 
+    if isinstance(target, DNSRecord):
+        orphan_address = (await withdrawn_alias_owners(db, [target.id])).get(target.id)
+        if orphan_address is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot restore {_row_label(target)}: {refusal_reason(orphan_address)}.",
+            )
+        # #3189 — a record trashed on its own, whose address was then marked
+        # as orphan. Its siblings in a bulk delete are refused by
+        # ``restore_batch``.
+        owner = (await orphan_record_owners(db, record_ids=[target.id])).get(target.id)
+        if owner is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot restore {_row_label(target)}: {orphan_record_reason(owner[2])}.",
+            )
+
     batch_id = target.deletion_batch_id
     if batch_id is None:
         # Defensive: stamp a fresh batch and restore just this row.
@@ -753,6 +805,14 @@ async def permanent_delete_from_trash(
     target = (await db.execute(stmt)).scalar_one_or_none()
     if target is None:
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
+
+    if isinstance(target, DNSRecord):
+        orphan_address = (await withdrawn_alias_owners(db, [target.id])).get(target.id)
+        if orphan_address is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot permanently delete {_row_label(target)}: {refusal_reason(orphan_address)}.",
+            )
 
     label = _row_label(target)
     records_retracted = 0

@@ -6,16 +6,20 @@ payloads with operator-supplied parameters substituted in.
 
 Templates can mark records ``skip_if_empty: ["param"]`` so optional fields
 (DKIM selector, AD site name, IPv6 origin) drop out cleanly when not
-filled in. ``{{__zone__}}`` is a built-in token that resolves to the new
-zone's name so apex aliases like ``www CNAME @`` can render as
-``www CNAME example.com.`` without extra parameters.
+filled in. ``skip_if_set: ["param"]`` is the inverse: a fallback record
+that is written only while the parameter is blank (the Email template's
+``p=none`` DMARC stub stands in for the ``rua=`` one, #3267). Every key
+either list names must be one of the template's parameters.
+``{{__zone__}}`` is a built-in token that resolves to the new zone's name
+so apex aliases like ``www CNAME @`` can render as ``www CNAME example.com.``
+without extra parameters.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -45,6 +49,7 @@ class TemplateRecord:
     weight: int | None
     port: int | None
     skip_if_empty: list[str]
+    skip_if_set: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -55,6 +60,14 @@ class ZoneTemplate:
     description: str
     parameters: list[TemplateParameter]
     records: list[TemplateRecord]
+
+    @property
+    def max_record_count(self) -> int:
+        """Records written with every parameter filled in — the catalog's
+        ``record_count``. A ``skip_if_set`` record is a fallback for one that
+        the filled-in parameter writes instead, so counting it would promise
+        a record no zone gets (#3267)."""
+        return sum(1 for r in self.records if not r.skip_if_set)
 
 
 @lru_cache(maxsize=1)
@@ -97,6 +110,7 @@ def list_templates() -> list[ZoneTemplate]:
                         weight=r.get("weight"),
                         port=r.get("port"),
                         skip_if_empty=list(r.get("skip_if_empty", [])),
+                        skip_if_set=list(r.get("skip_if_set", [])),
                     )
                     for r in t.get("records", [])
                 ],
@@ -125,7 +139,8 @@ def materialize(
     """Resolve ``template.records`` to concrete record-create payloads.
 
     Empty / missing parameters skip records that list them in
-    ``skip_if_empty``; all other placeholders that match nothing collapse
+    ``skip_if_empty``, and filled-in ones skip records that list them in
+    ``skip_if_set``; all other placeholders that match nothing collapse
     to "" (so a careless template authoring won't 500). The reserved
     ``__zone__`` token always resolves to the zone's name with the
     trailing dot preserved — useful for apex CNAME aliasing.
@@ -136,6 +151,10 @@ def materialize(
     out: list[dict[str, Any]] = []
     for r in template.records:
         if any(not full_params.get(k) for k in r.skip_if_empty):
+            continue
+        # ``skip_if_set`` is the inverse: a fallback record that stands in
+        # only while the optional parameter is blank (#3267).
+        if any(full_params.get(k) for k in r.skip_if_set):
             continue
         # Whitespace cleanup: SPF "v=spf1 mx  -all" → "v=spf1 mx -all"
         # when the optional includes string is empty.

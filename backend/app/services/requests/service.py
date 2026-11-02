@@ -49,6 +49,26 @@ PORTAL_REQUEST_TTL_HOURS = 336  # 14 days
 MAX_JUSTIFICATION_CHARS = 2000
 
 
+def _field_error(err: Any) -> dict[str, Any]:
+    """One Pydantic error as a FastAPI 422 entry (``type`` / ``loc`` / ``msg``).
+
+    The ``input`` is left out, and ``ctx`` keeps only plain values: a
+    validator's ``ctx.error`` is the exception object itself, which neither
+    serialises nor tells a client anything the ``msg`` does not.
+    """
+    out: dict[str, Any] = {
+        "type": err["type"],
+        "loc": ["body", "args", *err["loc"]],
+        "msg": err["msg"],
+    }
+    ctx = {
+        k: v for k, v in (err.get("ctx") or {}).items() if isinstance(v, (str, int, float, bool))
+    }
+    if ctx:
+        out["ctx"] = ctx
+    return out
+
+
 async def submit_request(
     db: AsyncSession,
     *,
@@ -60,13 +80,13 @@ async def submit_request(
 ) -> ChangeRequest:
     """Validate + persist a self-service request in ``pending``.
 
-    Raises ``HTTPException`` (400) when the kind is unknown, the args don't
-    validate against the operation's schema, or the operation's own
-    ``preview()`` rejects them. Refusing at *submit* time rather than at
-    approve time is deliberate: the requester is present to fix it, whereas an
-    approver hours later can only reject something that was never going to
-    work. It also keeps the ``failed`` terminal state for genuine
-    execute-time surprises rather than for typos.
+    Raises ``HTTPException`` when the kind is unknown (400), the args don't
+    validate against the operation's schema (422, field errors), or the
+    operation's own ``preview()`` rejects them (400). Refusing at *submit*
+    time rather than at approve time is deliberate: the requester is present
+    to fix it, whereas an approver hours later can only reject something that
+    was never going to work. It also keeps the ``failed`` terminal state for
+    genuine execute-time surprises rather than for typos.
     """
     resolved = resolve_operation(kind)
     if resolved is None:
@@ -81,15 +101,13 @@ async def submit_request(
     try:
         parsed = op.args_model.model_validate(args)
     except ValidationError as exc:
-        # Surface field-level errors (this is a requester-facing form, and the
-        # args model is the schema the form was built from) but not the raw
-        # Pydantic repr, which leaks model internals.
-        problems = "; ".join(
-            f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()[:8]
-        )
+        # Field-level errors in FastAPI's own 422 shape, located under
+        # ``body.args``, so the portal form can name each field as it labels it
+        # and word the refusal from the error ``type`` instead of parsing
+        # Pydantic's English (#3253).
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid request payload — {problems}",
+            status_code=422,
+            detail=[_field_error(e) for e in exc.errors(include_url=False)[:8]],
         ) from exc
 
     # The requester must be able to READ every resource the payload names

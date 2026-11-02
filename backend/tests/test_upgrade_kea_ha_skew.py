@@ -284,17 +284,20 @@ async def test_pair_with_a_docker_partner_names_it(db_session: AsyncSession) -> 
     assert servers[1] in r.message
 
 
-async def test_url_less_third_member_suppresses_ha(db_session: AsyncSession) -> None:
-    """The HA predicate is evaluated over every Kea member, as _resolve_failover
-    does: a third member with no peer URL means no HA hook is rendered, even
-    though both appliance members have one."""
+async def test_url_less_third_member_leaves_the_pair_in_place(db_session: AsyncSession) -> None:
+    """The HA predicate mirrors _resolve_failover (#3151): a third member with
+    no peer URL is sidelined, and the two appliance members that have one are
+    still an HA pair — here a skewed one, so it is reported."""
     a1, a2 = await _appliance(db_session), await _appliance(db_session)
-    await _real_group(
+    name, _ = await _real_group(
         db_session,
         [("2.6.5", a1, "host", _URL), ("3.0.3", a2, "host", _URL), ("3.0.3", None, "none", "")],
     )
     r = await check_kea_ha_version_skew()
-    assert r.level == "ok"
+    assert r.level == "warn"
+    assert r.detail["mixed_major"] == [name]
+    # The sidelined member is not part of the pair and is not named.
+    assert r.detail["off_appliance_members"] == []
 
 
 async def test_pending_appliance_does_not_claim_by_hostname(db_session: AsyncSession) -> None:

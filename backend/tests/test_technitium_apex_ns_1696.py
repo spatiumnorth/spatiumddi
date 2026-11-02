@@ -117,6 +117,6 @@ async def test_drift_on_a_fresh_technitium_api_zone_reads_in_sync(
     )
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
     (s,) = report.servers
-    assert s.status == "ok"
+    assert s.status == "drift"  # transferred; the delegation is extra on the server (#3198)
     # Only the delegation, which the operator may well have made on the server.
     assert [(r.name, r.record_type) for r in s.extra_on_server] == [("kid", "NS")]

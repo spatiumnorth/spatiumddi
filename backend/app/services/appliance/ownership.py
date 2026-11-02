@@ -212,6 +212,35 @@ async def owning_appliance_for_dns_agent(
     return matches[0]
 
 
+async def owning_appliance_for_dhcp_agent(db: AsyncSession, hostname: str) -> Appliance | None:
+    """The appliance a REGISTERING Kea agent runs on, or None (#3202).
+
+    :func:`owning_appliance_for_dns_agent`'s rule with DHCP's one engine: one
+    approved appliance whose normalised hostname is the agent's and that holds
+    the ``dhcp`` role. The bootstrap key is platform-wide, so the hostname is
+    the agent's only claim to an appliance; a hostname two approved appliances
+    share, or an appliance that no longer holds the role, claims nothing.
+    """
+    host = norm_host(hostname or "")
+    if not host:
+        return None
+    matches = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    hostname_sql(Appliance.hostname) == host,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(matches) != 1 or "dhcp" not in (matches[0].assigned_roles or []):
+        return None
+    return matches[0]
+
+
 async def owning_appliance_for_dhcp_server(db: AsyncSession, server: Any) -> Appliance | None:
     """The appliance that owns ``server`` (a DHCPServer), or None.
 

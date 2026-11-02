@@ -20,6 +20,7 @@ import {
   type SubnetRole,
   formatApiError,
 } from "@/lib/api";
+import { ResizablePane } from "@/components/ui/resizable-pane";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
@@ -126,7 +127,13 @@ export function VLANsPage() {
   return (
     <div className="flex h-[calc(100vh-3.5rem)]">
       {/* Sidebar */}
-      <aside className="w-72 flex-shrink-0 border-r bg-card overflow-y-auto">
+      <ResizablePane
+        storageKey="vlans"
+        defaultWidth={288}
+        label="Resize routers tree"
+        as="aside"
+        className="border-r bg-card overflow-y-auto"
+      >
         <div className="flex items-center justify-between px-3 py-2 border-b">
           <h2 className="text-sm font-semibold">Routers</h2>
           <div className="flex items-center gap-1">
@@ -172,7 +179,7 @@ export function VLANsPage() {
             />
           ))}
         </div>
-      </aside>
+      </ResizablePane>
 
       {/* Main detail */}
       <main className="flex-1 overflow-y-auto p-6">

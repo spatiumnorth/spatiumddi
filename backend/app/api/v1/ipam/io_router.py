@@ -22,6 +22,7 @@ from app.core.permissions import (
 )
 from app.core.responses import PdfResponse
 from app.models.auth import User
+from app.services.api_token_scopes import read_only_post
 from app.services.ipam.address_set_gate import (
     load_writable_set_ranges,
     user_can_write_ip,
@@ -93,6 +94,7 @@ async def _read_upload(file: UploadFile) -> bytes:
 
 
 @router.post("/import/preview")
+@read_only_post
 async def import_preview(
     current_user: CurrentUser,
     db: DB,
@@ -158,6 +160,7 @@ async def import_commit(
 
 
 @router.post("/import/preview-json")
+@read_only_post
 async def import_preview_json(
     current_user: CurrentUser,
     db: DB,
@@ -230,6 +233,7 @@ async def _address_import_write_gate(
 
 
 @router.post("/import/addresses/preview")
+@read_only_post
 async def import_addresses_preview(
     current_user: CurrentUser,
     db: DB,

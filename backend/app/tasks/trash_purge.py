@@ -28,12 +28,13 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
 from app.models.settings import PlatformSettings
 from app.services.dhcp.static_ipam import remove_ipam_for_static
+from app.services.ipam.orphan_aliases import is_withdrawn_alias, withdrawn_alias_owners
 
 logger = structlog.get_logger(__name__)
 
@@ -107,19 +108,11 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
     return len(statics)
 
 
-def _held_for_an_orphan() -> Any:
-    """Records the retention purge must leave alone (#2604): the aliases of an
-    address that is still an orphan. Mark as Orphan withdraws them so the
-    row's Restore can bring them back, and an orphan has no time limit, so
-    purging them after the retention window would make the restore partial.
-    Deleting the address for good deletes them with it."""
-    return and_(
-        DNSRecord.ip_alias.is_(True),
-        exists().where(
-            IPAddress.id == DNSRecord.ip_address_id,
-            IPAddress.status == "orphan",
-        ),
-    )
+async def _held_for_an_orphan(db: Any) -> Any:
+    """Records the retention purge must leave alone (#2604): the aliases an
+    address that is still an orphan withdrew, which its Restore brings back.
+    See :mod:`app.services.ipam.orphan_aliases`."""
+    return is_withdrawn_alias(await withdrawn_alias_owners(db))
 
 
 async def _retract_records_from_providers(
@@ -158,7 +151,7 @@ async def _retract_records_from_providers(
     stmt = select(DNSRecord).where(
         DNSRecord.deleted_at.is_not(None),
         DNSRecord.deleted_at < cutoff,
-        ~_held_for_an_orphan(),
+        ~(await _held_for_an_orphan(db)),
     )
     if purged_zone_ids:
         # Records inside a zone being purged this sweep ride the zone teardown;
@@ -207,7 +200,7 @@ async def _purge_dns_records(db: Any, cutoff: datetime, purged_zone_ids: set[Any
     stmt = delete(DNSRecord).where(
         DNSRecord.deleted_at.is_not(None),
         DNSRecord.deleted_at < cutoff,
-        ~_held_for_an_orphan(),
+        ~(await _held_for_an_orphan(db)),
     )
     if purged_zone_ids:
         stmt = stmt.where(DNSRecord.zone_id.notin_(purged_zone_ids))
@@ -244,6 +237,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     page's permanent delete goes through the same helper and fails the same
     way (#1830).
     """
+    from app.services.dns.reverse_zone import hand_over_zone_to_trashed_sharer  # noqa: PLC0415
     from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
@@ -255,6 +249,29 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     skipped = 0
     for zone in res.scalars().all():
         try:
+            # #3190 — a shared auto reverse zone holding the PTRs of a trashed
+            # subnet that has NOT expired is handed to that subnet's batch, not
+            # purged out from under it.
+            heir = await hand_over_zone_to_trashed_sharer(db, zone)
+            if heir is not None:
+                db.add(
+                    AuditLog(
+                        user_id=None,
+                        user_display_name="system",
+                        auth_source="system",
+                        action="update",
+                        resource_type="dns_zone",
+                        resource_id=str(zone.id),
+                        resource_display=zone.name,
+                        new_value={
+                            "handed_over_to_subnet": str(heir.id),
+                            "deletion_batch_id": str(heir.deletion_batch_id),
+                            "reason": "another trashed subnet's records still sit in the zone",
+                        },
+                        result="success",
+                    )
+                )
+                continue
             await purge_trashed_zone(db, zone)
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that

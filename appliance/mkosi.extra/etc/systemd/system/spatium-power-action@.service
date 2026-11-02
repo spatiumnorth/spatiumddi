@@ -20,4 +20,11 @@ TimeoutStartSec=infinity
 # before the api goes down (on a one-node install nothing else delays it).
 Environment=SPATIUM_POWER_ACTION_GRACE_S=10
 ExecStart=/usr/local/bin/spatium-power-action %i
+# #3162 — F9 (systemctl stop) is a cancel, not a failure: the wrapper ends by
+# the stop's own signal. For Type=oneshot systemd counts death by SIGTERM /
+# SIGINT / SIGHUP as a FAILURE (result 'signal') unless listed here, so
+# without this line the unit is left 'failed' exactly as with the old exit 1
+# (verified on systemd 257). Exit 1 (a failed systemctl reboot) stays a
+# failure.
+SuccessExitStatus=TERM INT HUP
 # No Install section — only started by spatium-console.

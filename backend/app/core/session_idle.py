@@ -68,15 +68,18 @@ async def get_session_timeout_minutes(db: AsyncSession) -> int:
     if now - _cache_loaded_at < _CACHE_TTL_S:
         return _cached_timeout_minutes
 
-    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.models.settings import PlatformSettings, platform_setting_default  # noqa: PLC0415
 
     value = (
         await db.execute(
             select(PlatformSettings.session_timeout_minutes).where(PlatformSettings.id == 1)
         )
     ).scalar_one_or_none()
-    # No settings row yet: nobody has configured a timeout, so none applies.
-    _cached_timeout_minutes = max(int(value or 0), 0)
+    # No settings row yet: the column default applies, as it will once the
+    # row is created (#3203). ``0`` stays "disabled" when explicitly stored.
+    if value is None:
+        value = platform_setting_default("session_timeout_minutes")
+    _cached_timeout_minutes = max(int(value), 0)
     _cache_loaded_at = now
     return _cached_timeout_minutes
 

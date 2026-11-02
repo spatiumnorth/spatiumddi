@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import stat
 import subprocess
 import time
@@ -30,11 +31,17 @@ BOOT = "11111111-2222-3333-4444-555555555555"
 
 
 def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "ok",
-         systemctl_sleep: float = 0, cap_s: int = 240, extra_env: dict | None = None):
+         systemctl_sleep: float = 0, cap_s: int = 240, extra_env: dict | None = None,
+         slot_units: str = "", slot_wait_cap_s: int = 900):
     log = tmp_path / "calls.log"
     handoff_sh = tmp_path / "handoff"
     # --undo always returns at once; only --before-reboot takes the body
-    body = {"ok": "exit 0", "crash": "exit 7", "hang": "exec sleep 30"}[handoff]
+    # "switch": the handoff got as far as asking CNPG for the switchover (it
+    # notes that just before its cordon, #3162), then waits for it
+    body = {"ok": "exit 0", "crash": "exit 7", "hang": "exec sleep 30",
+            "switch": 'echo "spatium/pg pg-1" > "$SPATIUM_HANDOFF_SWITCHOVER_FILE"\n'
+                      "exec sleep 30",
+            "noted": 'echo x > "$SPATIUM_HANDOFF_SWITCHOVER_FILE"\nexit 0'}[handoff]
     handoff_sh.write_text(
         f'#!/bin/bash\necho "handoff $*" >> {log}\n'
         f'[ "$1" = --undo ] && exit 0\n{body}\n'
@@ -45,8 +52,14 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
     sc = bindir / "systemctl"
     issued = tmp_path / "state" / "power-action-issued"
     # records what the issued marker held at the moment systemctl ran
+    # ``systemctl show -p ActiveState --value <unit>`` (#3169's slot-switch
+    # wait) answers from units/<unit> ("inactive" when absent) and is logged
+    # apart, so the call order the other tests assert on is unchanged.
+    (tmp_path / "units").mkdir(exist_ok=True)
     sc.write_text(
-        f'#!/bin/bash\necho "systemctl $*" >> {log}\n'
+        f'#!/bin/bash\nif [ "$1" = show ]; then echo "$5" >> {tmp_path}/show.log; '
+        f'cat {tmp_path}/units/"$5" 2>/dev/null || echo inactive; exit 0; fi\n'
+        f'echo "systemctl $*" >> {log}\n'
         f'cat {issued} > {tmp_path}/issued-at-systemctl 2>/dev/null\n'
         f'sleep {systemctl_sleep}\nexit {systemctl_rc}\n'
     )
@@ -60,7 +73,9 @@ def _run(tmp_path: Path, action: str, *, systemctl_rc: int = 0, handoff: str = "
            "SPATIUM_POWER_ACTION_LOCK": str(tmp_path / "state"),
            "SPATIUM_POWER_ACTION_ISSUED": str(issued),
            "SPATIUM_BOOT_ID_FILE": str(tmp_path / "boot_id"),
-           "SPATIUM_POWER_ACTION_HANDOFF_CAP_S": str(cap_s)}
+           "SPATIUM_POWER_ACTION_HANDOFF_CAP_S": str(cap_s),
+           "SPATIUM_POWER_ACTION_SLOT_UNITS": slot_units,
+           "SPATIUM_POWER_ACTION_SLOT_WAIT_CAP_S": str(slot_wait_cap_s)}
     proc = subprocess.Popen([str(SCRIPT), action], env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     return proc, log
@@ -104,7 +119,7 @@ def test_a_stop_during_the_handoff_undoes_the_cordon_and_never_reboots(tmp_path:
     assert marker.read_text().split() == [str(proc.pid), "reboot"]
     started = time.monotonic()
     proc.terminate()
-    assert proc.wait(20) == 1
+    assert proc.wait(20) == -signal.SIGTERM
     # acted on at once, not once the 30 s handoff has run out
     assert time.monotonic() - started < 10
     calls = _calls(log)
@@ -127,6 +142,59 @@ def test_a_handoff_past_the_cap_is_stopped_and_the_reboot_goes_on(tmp_path: Path
     assert proc.wait(30) == 0
     assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
     assert "did not finish within 1 s" in proc.stdout.read()
+
+
+SLOT_UNIT = "spatiumddi-slot-set-next-boot.service"
+
+
+def test_a_reboot_waits_for_a_running_slot_switch(tmp_path: Path) -> None:
+    """#3169 — a slot switch copies ~1 GB of image tarballs before it flips
+    GRUB. A reboot that lands mid-copy stops it and the node comes back on the
+    same slot, so the wrapper waits for the switch unit to finish."""
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / SLOT_UNIT).write_text("activating\n")
+    proc, log = _run(tmp_path, "reboot", slot_units=f"spatiumddi-slot-rollback.service {SLOT_UNIT}")
+    _wait_for(lambda: (tmp_path / "show.log").exists()
+              and (tmp_path / "show.log").read_text().count(SLOT_UNIT) >= 2)
+    assert _calls(log) == [], "the reboot went ahead while a slot switch was still running"
+    (units / SLOT_UNIT).write_text("inactive\n")
+    assert proc.wait(30) == 0
+    assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
+    assert "waiting for a slot switch to finish" in proc.stdout.read()
+
+
+def test_a_slot_switch_past_the_cap_does_not_hold_the_reboot(tmp_path: Path) -> None:
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / SLOT_UNIT).write_text("activating\n")
+    proc, log = _run(tmp_path, "reboot", slot_units=SLOT_UNIT, slot_wait_cap_s=2)
+    assert proc.wait(30) == 0
+    assert _calls(log) == ["handoff --before-reboot", "systemctl reboot"]
+    assert "still running after 2 s" in proc.stdout.read()
+
+
+def test_a_stop_while_waiting_for_a_slot_switch_never_reboots(tmp_path: Path) -> None:
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / SLOT_UNIT).write_text("activating\n")
+    proc, log = _run(tmp_path, "reboot", slot_units=SLOT_UNIT)
+    _wait_for(lambda: (tmp_path / "show.log").exists())
+    started = time.monotonic()
+    proc.terminate()
+    # Non-zero, not exactly 1: #3162 makes a cancel end by the signal it was
+    # stopped with. Either way the caller reads "no reboot".
+    assert proc.wait(20) != 0
+    assert time.monotonic() - started < 10
+    assert "systemctl reboot" not in _calls(log)
+
+
+def test_the_default_slot_units_are_the_three_switch_runners() -> None:
+    text = SCRIPT.read_text()
+    for unit in ("spatiumddi-slot-rollback.service", "spatiumddi-slot-set-default.service",
+                 "spatiumddi-slot-set-next-boot.service"):
+        assert unit in text
+        assert (EXTRA / "etc" / "systemd" / "system" / unit).is_file(), unit
 
 
 def test_an_unknown_action_does_nothing(tmp_path: Path) -> None:
@@ -198,7 +266,7 @@ def test_the_lock_the_api_reads_is_held_while_it_runs_and_freed_after(tmp_path: 
     _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
     assert _lock_held(tmp_path / "state")
     proc.terminate()
-    assert proc.wait(20) == 1
+    assert proc.wait(20) == -signal.SIGTERM
     assert not _lock_held(tmp_path / "state")
 
 
@@ -249,7 +317,7 @@ def test_a_probe_holding_the_lock_for_an_instant_does_not_cost_the_wrapper_it(
     _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
     _wait_for(lambda: _lock_held(tmp_path / "state"))
     proc.terminate()
-    assert proc.wait(20) == 1
+    assert proc.wait(20) == -signal.SIGTERM
     assert "going on regardless" not in (proc.stdout.read() if proc.stdout else "")
 
 
@@ -280,7 +348,7 @@ def test_a_stop_during_the_handoff_writes_no_issued_marker(tmp_path: Path) -> No
     proc, log = _run(tmp_path, "reboot", handoff="hang")
     _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
     proc.terminate()
-    assert proc.wait(20) == 1
+    assert proc.wait(20) == -signal.SIGTERM
     assert not (tmp_path / "state" / "power-action-issued").exists()
 
 
@@ -303,7 +371,7 @@ _CONSOLE_NAMES = {
     "_RELEASE_STATE_DIR", "FLEET_GRACE_MARKER", "BOOT_ID_FILE", "POWER_ACTION_MARKER",
     "POWER_ACTION_UNIT", "reboot_pending", "fleet_reboot_in_grace",
     "power_action_in_progress", "do_cancel_reboot", "REBOOT_CANCEL_MARKER",
-    "_record_reboot_cancel",
+    "_record_reboot_cancel", "POWER_ACTION_SWITCHOVER",
 }
 
 
@@ -334,6 +402,8 @@ def _console(state: Path, boot_id: Path, run) -> dict:
         def sleep(_s):
             return None
 
+        time = staticmethod(time.time)
+
     ns: dict = {"Path": Path, "os": os, "subprocess": _Sub, "time": _Time,
                 "confirm_modal": lambda _c, _q: True}
     mod = ast.Module(body=body, type_ignores=[])
@@ -344,6 +414,7 @@ def _console(state: Path, boot_id: Path, run) -> dict:
     ns["BOOT_ID_FILE"] = boot_id
     ns["REBOOT_CANCEL_MARKER"] = state / "reboot-cancelled"
     ns["POWER_ACTION_MARKER"] = state.parent / "no-power-action-marker"
+    ns["POWER_ACTION_SWITCHOVER"] = state.parent / "no-power-action-switchover"
     return ns
 
 
@@ -401,7 +472,7 @@ def test_f9_during_the_fleet_grace_cancels_the_reboot(tmp_path: Path) -> None:
         fc = _FakeConsole()
         con["do_cancel_reboot"](fc)
         assert any("Reboot cancelled" in line for line in fc.out), fc.out
-        assert proc.returncode == 1
+        assert proc.returncode == -signal.SIGTERM
         assert not (tmp_path / "wrapper-calls").exists()
         assert not (state / "reboot-fleet-grace").exists()
         assert con["reboot_pending"]() is False
@@ -462,7 +533,7 @@ def test_a_stop_during_the_grace_never_reboots(tmp_path: Path) -> None:
     time.sleep(0.3)
     started = time.monotonic()
     proc.terminate()
-    assert proc.wait(20) == 1
+    assert proc.wait(20) == -signal.SIGTERM
     assert time.monotonic() - started < 10
     assert "systemctl reboot" not in _calls(log)
     assert not (tmp_path / "marker").exists()
@@ -567,3 +638,199 @@ def test_a_flash_is_drawn_once_even_when_the_redraw_is_late() -> None:
     assert st.status_for_draw() == "Reboot cancelled"
     Clock.now += 1.5  # 5.5 s after the first draw
     assert st.status_for_draw() == ""
+
+
+# ---- #3162: a cancel after the handoff asked for the switchover ---------------
+
+def test_a_cancelled_power_action_ends_by_the_signal_not_as_a_failure(tmp_path: Path) -> None:
+    """An exit 1 left spatium-power-action@reboot.service "failed" after the
+    console's F9 (#3162). Death by the stop's signal is clean only because the
+    units list it in SuccessExitStatus= (see the unit test below). A caller
+    (the Fleet agent) still reads a non-zero status: no reboot."""
+    proc, log = _run(tmp_path, "reboot", handoff="hang")
+    _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
+    proc.terminate()
+    assert proc.wait(20) == -signal.SIGTERM
+    out = proc.stdout.read()
+    assert "reboot cancelled" in out
+    assert "systemctl reboot" not in _calls(log)
+
+
+def test_a_failed_systemctl_still_fails(tmp_path: Path) -> None:
+    proc, log = _run(tmp_path, "reboot", systemctl_rc=1)
+    assert proc.wait(30) == 1
+
+
+def test_a_cancel_inside_the_grace_never_reaches_the_handoff(tmp_path: Path) -> None:
+    """The console's 10 s grace runs before the handoff, so F9 inside it asks
+    CNPG for nothing: no switchover, and nothing to report."""
+    proc, log = _run(tmp_path, "reboot", handoff="switch",
+                     extra_env={"SPATIUM_POWER_ACTION_GRACE_S": "30"})
+    _wait_for(lambda: (tmp_path / "marker").exists())
+    time.sleep(0.3)
+    proc.terminate()
+    assert proc.wait(20) == -signal.SIGTERM
+    # only the undo, which finds no cordon of its own to take off
+    assert _calls(log) == ["handoff --undo"]
+    assert not (tmp_path / "marker-switchover").exists()
+    assert "switchover" not in proc.stdout.read()
+
+
+def test_a_cancel_once_the_switchover_was_asked_for_says_it_completes(tmp_path: Path) -> None:
+    proc, log = _run(tmp_path, "reboot", handoff="switch")
+    switchover = tmp_path / "marker-switchover"
+    _wait_for(switchover.exists)
+    proc.terminate()
+    assert proc.wait(20) == -signal.SIGTERM
+    assert _calls(log) == ["handoff --before-reboot", "handoff --undo"]
+    out = proc.stdout.read()
+    assert "switchover the handoff had asked of CloudNativePG still completes" in out
+    # kept for the console, which reads it once its stop has returned
+    assert switchover.read_text().split() == ["spatium/pg", "pg-1"]
+    assert not (tmp_path / "marker").exists()
+
+
+def test_a_cancel_before_the_switchover_was_asked_for_says_nothing_of_one(
+        tmp_path: Path) -> None:
+    (tmp_path / "marker-switchover").write_text("left by an earlier run\n")
+    proc, log = _run(tmp_path, "reboot", handoff="hang")
+    _wait_for(lambda: _calls(log) == ["handoff --before-reboot"])
+    # an earlier run's note is gone as soon as this one starts
+    assert not (tmp_path / "marker-switchover").exists()
+    proc.terminate()
+    assert proc.wait(20) == -signal.SIGTERM
+    assert "switchover" not in proc.stdout.read()
+
+
+def test_a_failed_systemctl_takes_the_switchover_note_down(tmp_path: Path) -> None:
+    """Else a later cancel of a web-UI reboot still in its grace (no wrapper
+    yet) would read a switchover that is long over."""
+    proc, log = _run(tmp_path, "reboot", systemctl_rc=1, handoff="noted")
+    assert proc.wait(30) == 1
+    assert _calls(log) == ["handoff --before-reboot", "systemctl reboot", "handoff --undo"]
+    assert not (tmp_path / "marker-switchover").exists()
+
+
+def test_the_console_cancel_says_a_begun_switchover_completes(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    (state / "reboot-pending").write_text("x")
+    note = tmp_path / "switchover"
+    stops: list[list[str]] = []
+
+    def run(argv):
+        # the wrapper, stopped, leaves the handoff's note behind
+        stops.append(argv)
+        note.write_text("spatium/pg pg-1\n")
+
+    con = _console(state, boot, run)
+    con["POWER_ACTION_SWITCHOVER"] = note
+    dash, fc = _FlashRecorder(), _FakeConsole()
+    con["do_cancel_reboot"](fc, dash)
+    assert stops and stops[0][:2] == ["systemctl", "stop"]
+    assert any("Reboot cancelled." in line for line in fc.out), fc.out
+    assert any("completes the switchover it started" in line for line in fc.out), fc.out
+    assert "switchover" in dash.flashes[-1]
+    assert not note.exists()
+
+
+def test_the_console_cancel_mentions_no_switchover_when_none_was_asked_for(
+        tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    (state / "reboot-pending").write_text("x")
+    con = _console(state, boot, lambda argv: None)
+    con["POWER_ACTION_SWITCHOVER"] = tmp_path / "switchover"
+    dash, fc = _FlashRecorder(), _FakeConsole()
+    con["do_cancel_reboot"](fc, dash)
+    assert not any("switchover" in line for line in fc.out), fc.out
+    assert dash.flashes[-1] == "Reboot cancelled"
+
+
+def test_the_console_reads_the_note_the_wrapper_keeps() -> None:
+    """The console's path and the wrapper's default are one file."""
+    assert 'POWER_ACTION_SWITCHOVER = Path("/run/spatium-power-action-switchover")' in \
+        CONSOLE.read_text()
+    text = SCRIPT.read_text()
+    assert 'MARKER="${SPATIUM_POWER_ACTION_MARKER:-/run/spatium-power-action}"' in text
+    assert 'SWITCHOVER="${SPATIUM_POWER_ACTION_SWITCHOVER:-${MARKER}-switchover}"' in text
+
+
+def _cancel_with_note(tmp_path: Path, *, note_age_s: float, wrapper_running: bool):
+    """F9 with a switchover note already on disk before the stop (the stop
+    itself writes nothing)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    boot = tmp_path / "boot_id"
+    boot.write_text(BOOT + "\n")
+    (state / "reboot-pending").write_text("x")
+    note = tmp_path / "switchover"
+    note.write_text("spatium/pg pg-1\n")
+    old = time.time() - note_age_s
+    os.utime(note, (old, old))
+    con = _console(state, boot, lambda argv: None)
+    con["POWER_ACTION_SWITCHOVER"] = note
+    if wrapper_running:
+        marker = tmp_path / "power-action-marker"
+        marker.write_text(f"{os.getpid()} reboot\n")  # a live pid
+        con["POWER_ACTION_MARKER"] = marker
+    dash, fc = _FlashRecorder(), _FakeConsole()
+    con["do_cancel_reboot"](fc, dash)
+    return note, dash, fc
+
+
+def test_the_console_cancel_ignores_a_note_left_by_an_earlier_run(tmp_path: Path) -> None:
+    """#3162 validation — a run stopped some other way (a manual systemctl stop)
+    keeps its note; F9 on a later web-UI / Fleet reboot still in its grace (no
+    wrapper yet, so nothing removed it) must not report that old switchover."""
+    note, dash, fc = _cancel_with_note(tmp_path, note_age_s=3600, wrapper_running=False)
+    assert not any("switchover" in line for line in fc.out), fc.out
+    assert dash.flashes[-1] == "Reboot cancelled"
+    assert not note.exists()
+
+
+def test_the_console_cancel_reports_the_running_wrappers_note(tmp_path: Path) -> None:
+    """The handoff noted the switchover a while before F9: the wrapper was
+    running when it was stopped, so the note is this run's."""
+    note, dash, fc = _cancel_with_note(tmp_path, note_age_s=60, wrapper_running=True)
+    assert any("completes the switchover it started" in line for line in fc.out), fc.out
+    assert "switchover" in dash.flashes[-1]
+    assert not note.exists()
+
+
+def test_the_console_cancel_does_not_claim_the_node_is_uncordoned(tmp_path: Path) -> None:
+    """--undo leaves a cordon it did not set (an operator's, an upgrade's) and
+    can run out of time on a slow API, so the console promises only that the
+    node stays up."""
+    _, _, fc = _cancel_with_note(tmp_path, note_age_s=1, wrapper_running=True)
+    assert any("This node stays up." in line for line in fc.out), fc.out
+    assert not any("uncordoned" in line for line in fc.out), fc.out
+
+
+_UNITS = EXTRA / "etc" / "systemd" / "system"
+
+
+@pytest.mark.parametrize("unit", [
+    "spatium-power-action@.service",
+    "spatiumddi-reboot.service",
+    "spatiumddi-reboot-agent.service",
+])
+def test_a_cancelled_run_leaves_its_unit_inactive_not_failed(unit: str) -> None:
+    """#3162 validation — for Type=oneshot, systemd counts the main process
+    dying by SIGTERM / SIGINT / SIGHUP as a FAILURE (result 'signal'): only
+    Type=simple and friends treat those as clean. Ending by the stop's signal
+    therefore leaves the unit failed just as the old exit 1 did, unless the
+    unit lists the signals in SuccessExitStatus= (checked on systemd 257)."""
+    lines = [ln.strip() for ln in (_UNITS / unit).read_text().splitlines()]
+    assert "Type=oneshot" in lines
+    listed: set[str] = set()
+    for ln in lines:
+        if ln.startswith("SuccessExitStatus="):
+            listed |= set(ln.split("=", 1)[1].split())
+    assert {"TERM", "INT", "HUP"} <= listed, listed
+    # a failed systemctl reboot (exit 1) must still fail the unit
+    assert "1" not in listed

@@ -26,11 +26,16 @@ import {
 } from "@/lib/api";
 import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { listReadErrorMessage } from "@/lib/refusal";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
-import { CustomerChip } from "@/components/ownership/pickers";
+import {
+  CustomerChip,
+  MissingCustomerOption,
+} from "@/components/ownership/pickers";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
@@ -252,7 +257,21 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // The read error per kind, so a picker over a refused read says so
+  // instead of offering an empty list (#3148).
+  const readErrors: Partial<Record<ServiceResourceKind, unknown>> = {
+    vrf: vrfs.error,
+    subnet: subnets.error,
+    ip_block: blocks.error,
+    site: sites.error,
+    circuit: circuits.error,
+    overlay_network: overlays.error,
+    dns_zone: dnsGroups.error ?? dnsZones.error,
+    dhcp_scope: dhcpGroups.error ?? dhcpScopes.error,
+  };
+
   return {
+    readErrors,
     vrf: vrfs.data ?? [],
     subnet: subnets.data ?? [],
     ip_block: blocks.data ?? [],
@@ -314,7 +333,7 @@ function resourceLabel(
 
 // ── Resources tab — attach / detach UI ─────────────────────────────
 
-function ResourcesTab({
+export function ResourcesTab({
   service,
   onChange,
 }: {
@@ -422,6 +441,7 @@ function ResourcesTab({
   };
 
   const options = optionsFor(addKind);
+  const kindReadError = pool.readErrors[addKind];
 
   return (
     <div className="space-y-4">
@@ -451,9 +471,20 @@ function ResourcesTab({
             className={inputCls}
             value={addId}
             onChange={(e) => setAddId(e.target.value)}
+            disabled={!!kindReadError}
+            title={
+              kindReadError
+                ? listReadErrorMessage(
+                    kindReadError,
+                    `${RESOURCE_KIND_LABELS[addKind]} resources`,
+                  )
+                : undefined
+            }
           >
             <option value="">
-              — select a {RESOURCE_KIND_LABELS[addKind]} —
+              {kindReadError
+                ? `— can't list ${RESOURCE_KIND_LABELS[addKind]} —`
+                : `— select a ${RESOURCE_KIND_LABELS[addKind]} —`}
             </option>
             {options.map((o) => (
               <option key={o.id} value={o.id}>
@@ -476,6 +507,14 @@ function ResourcesTab({
             {attach.isPending ? "Attaching…" : "Attach"}
           </button>
         </div>
+        {kindReadError != null && (
+          <p role="alert" className="mt-2 text-xs">
+            <ListReadError
+              error={kindReadError}
+              what={`${RESOURCE_KIND_LABELS[addKind]} resources`}
+            />
+          </p>
+        )}
         {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
         <p className="mt-2 text-[11px] text-muted-foreground/80">
           Common L3VPN roles: <code>primary</code> / <code>backup</code> /{" "}
@@ -747,7 +786,7 @@ function CustomSummaryView({ summary }: { summary: CustomGroupedSummary }) {
 
 type EditorTab = "general" | "resources" | "term" | "notes" | "summary";
 
-function ServiceEditorModal({
+export function ServiceEditorModal({
   existing,
   onClose,
 }: {
@@ -889,6 +928,10 @@ function ServiceEditorModal({
               onChange={(e) => setCustomerId(e.target.value)}
             >
               <option value="">— select —</option>
+              <MissingCustomerOption
+                customerId={customerId}
+                list={customersQ}
+              />
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}

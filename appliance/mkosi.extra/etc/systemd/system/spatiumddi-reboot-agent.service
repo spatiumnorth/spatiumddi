@@ -16,5 +16,12 @@ ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/releas
 # adds one): a timeout stops the wrapper, which takes it as a cancel.
 TimeoutStartSec=infinity
 ExecStart=/usr/local/bin/spatiumddi-reboot-agent
+# #3162 — F9 (systemctl stop) is a cancel, not a failure: the agent ends by
+# the stop's own signal. For Type=oneshot systemd counts death by SIGTERM /
+# SIGINT / SIGHUP as a FAILURE (result 'signal') unless listed here, so
+# without this line the unit is left 'failed' exactly as with the old exit 1
+# (verified on systemd 257). Exit 1 (a failed systemctl reboot) stays a
+# failure.
+SuccessExitStatus=TERM INT HUP
 # No Install section — only invoked by the matching .path unit, never
 # directly enabled at boot.

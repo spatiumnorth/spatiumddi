@@ -36,10 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
 from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.record_ops import retract_address_dns
 from app.services.integration_ownership import (
     INTEGRATION_OWNERSHIP_FKS,
     SpaceRelease,
     owned_addresses_in_space,
+    subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 
@@ -468,16 +470,12 @@ async def apply_subnets(
     for cidr, row in list(fw_subnets.items()):
         if cidr in desired:
             continue
-        surviving = await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .where(IPAddress.subnet_id == row.id)
-            .where(getattr(IPAddress, owner.fk_attr).is_(None))
-        )
+        surviving = await subnet_has_surviving_addresses(db, row.id, owner.fk_attr)
         if surviving:
             setattr(row, owner.fk_attr, None)
             summary.subnets_updated += 1
         else:
+            await retract_address_dns(db, subnet_ids=[row.id])
             await db.delete(row)
             summary.subnets_deleted += 1
 
@@ -580,6 +578,7 @@ async def apply_addresses(
             desired[ma.address] = ma
 
     dirty: set[Any] = set()
+    gone: list[IPAddress] = []
     for addr, row in current.items():
         if addr not in desired:
             dirty.add(row.subnet_id)
@@ -587,8 +586,12 @@ async def apply_addresses(
                 setattr(row, owner.fk_attr, None)
                 summary.addresses_updated += 1
             else:
-                await db.delete(row)
+                gone.append(row)
                 summary.addresses_deleted += 1
+    # #3200 — one retraction for the whole sweep, before the deletes flush.
+    await retract_address_dns(db, [r.id for r in gone])
+    for row in gone:
+        await db.delete(row)
 
     for addr, ma in desired.items():
         subnet = _find_subnet_for_ip(subnets, addr)

@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as _app_settings
 from app.core.crypto import decrypt_dict, decrypt_str
+from app.core.exc_text import describe_http_exc
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services.audit_redact import redact_audit_payload
 
@@ -140,7 +141,7 @@ async def _deliver_one(
             timeout=max(1, min(30, sub.timeout_seconds or 10)),
         )
     except httpx.HTTPError as exc:
-        return None, f"transport: {exc}"
+        return None, f"transport: {describe_http_exc(exc)}"
     except ValueError as exc:
         # A stored header httpx cannot encode (UnicodeEncodeError) saved
         # before the subscription schema refused it (#1913): a failed

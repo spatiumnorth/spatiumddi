@@ -23,6 +23,16 @@ without the protection:
                  ``--allow-no-priority``, so the decision is visible at the
                  call site and a NEW workload still fails the gate.
 
+  init resources every init container of a pod template declares ``resources``
+                 with a request or a limit (#3208). ``chart-no-besteffort.py``
+                 deliberately skips init containers (they finish before the pod
+                 serves, so their CFS weight starves nothing), but a namespace
+                 LimitRange or a "resources on every container" admission policy
+                 does not: it rejects the pod or fills in its own defaults. A
+                 NEW init container fails here until it carries resources.
+                 ``--allow-no-init-resources`` names a vendored subchart whose
+                 init containers take no values override.
+
 ``--allow-no-seccomp`` exists for the same reason and is used for exactly one
 thing: a vendored subchart whose templates expose no pod-securityContext knob,
 so no values override can supply a profile. Exempting it is strictly better
@@ -41,7 +51,7 @@ of output reports clean while the defect ships.
 
 Usage:
     chart-pod-posture.py [--require-priority] [--allow-no-priority a,b]
-                         [--allow-no-seccomp a,b] file...
+                         [--allow-no-seccomp a,b] [--allow-no-init-resources a,b] file...
 """
 
 from __future__ import annotations
@@ -99,13 +109,18 @@ def main(argv: list[str]) -> int:
     require_priority = "--require-priority" in argv
     exempt_priority: set[str] = set()
     exempt_seccomp: set[str] = set()
+    exempt_init: set[str] = set()
     args = argv[1:]
     files: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("--allow-no-priority", "--allow-no-seccomp"):
-            target = exempt_priority if a == "--allow-no-priority" else exempt_seccomp
+        if a in ("--allow-no-priority", "--allow-no-seccomp", "--allow-no-init-resources"):
+            target = {
+                "--allow-no-priority": exempt_priority,
+                "--allow-no-seccomp": exempt_seccomp,
+                "--allow-no-init-resources": exempt_init,
+            }[a]
             i += 1
             if i >= len(args):
                 print(f"{a} needs a comma-separated list", file=sys.stderr)
@@ -159,6 +174,17 @@ def main(argv: list[str]) -> int:
                 exempted.append(f"{name} (seccomp)")
             elif not dig(pod, ("securityContext", "seccompProfile", "type")):
                 problems.append(f"{where}: pod securityContext has no seccompProfile.type")
+
+            for ic in pod.get("initContainers") or []:
+                res = ic.get("resources") or {}
+                if _exempt(name, exempt_init):
+                    exempted.append(f"{name} (init resources)")
+                elif not (res.get("requests") or res.get("limits")):
+                    problems.append(
+                        f"{where}: init container {ic.get('name', '?')} has no resources "
+                        "(#3208: a LimitRange or a resources-required policy rejects it or "
+                        "overrides it with its own defaults)"
+                    )
 
             if require_priority:
                 if _exempt(name, exempt_priority):

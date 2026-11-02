@@ -659,6 +659,20 @@ beat:
   # tolerationSeconds so the gap is ~30s instead of the ~300s default.
   fastRescheduleSeconds: 30
 
+# ── Init containers ──────────────────────────────────────────────────────────
+# #3208 — resources of the ``wait-for-postgres`` / ``wait-for-migrate`` init
+# containers of the migrate Job and the api / worker / beat / slot-image-mirror
+# pods, and of the Redis sentinel pods' ``render-config`` init container. They
+# are a ``sleep 3`` loop (the migrate wait runs ``alembic`` once per
+# loop, so it needs the memory), sized as such. Without them a namespace
+# LimitRange or a policy that requires resources on every container, init
+# containers included, either rejects the pod or fills them in with its own
+# defaults.
+initContainers:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits:   { memory: 256Mi }
+
 # ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
 # Regular Job (named per Helm revision so each install/upgrade creates
 # a fresh one). The Job's pod has a wait-for-postgres init container; the
@@ -686,6 +700,18 @@ migrate:
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
+  # #3207 — placement of the Job's pod. UNSET (null) follows the api, so the
+  # Job runs where the api runs and is kept off the nodes the rest of the
+  # release is kept off: ``api.nodeSelector`` / ``api.tolerations`` /
+  # ``api.affinity.nodeAffinity`` (not the api's pod (anti-)affinity, which
+  # is about api pods and would keep the Job off the api's nodes), with
+  # ``global.controlPlaneNodeSelector`` merged into the
+  # selector as for every control-plane workload. Set to ``{}`` / ``[]`` to
+  # place the Job with no selector / toleration / affinity of its own (the
+  # global selector still applies to the selector).
+  nodeSelector:
+  tolerations:
+  affinity:
 
 # ── Ingress (for the frontend; API is routed through the frontend nginx) ─────
 ingress:
@@ -785,6 +811,18 @@ postgresql:
       operator: Exists
       effect: NoExecute
       tolerationSeconds: 20
+  # Standalone: rendered as the pod's whole ``affinity``. ``kind: cnpg``
+  # (#3205): only ``nodeAffinity`` is read, and lands in the Cluster's
+  # ``spec.affinity.nodeAffinity`` beside the ``nodeSelector`` / tolerations /
+  # pod anti-affinity settings (CNPG owns the pod anti-affinity), so Postgres
+  # can PREFER a node without being hard-pinned to it by ``nodeSelector``:
+  #   affinity:
+  #     nodeAffinity:
+  #       preferredDuringSchedulingIgnoredDuringExecution:
+  #         - weight: 100
+  #           preference:
+  #             matchExpressions:
+  #               - { key: kubernetes.io/hostname, operator: In, values: [node-a] }
   affinity: {}
   # CNPG-specific topology (only used when ``kind: cnpg``).
   cnpg:
@@ -960,7 +998,11 @@ postgresql:
     # CNPG-blessed pattern. Outside the upgrade window the PDB
     # prevents accidental simultaneous evictions taking the primary
     # offline (e.g. an operator running ``kubectl drain`` by hand).
-    enablePDB: true
+    # #3204: unset (null) = "auto": on when ``instances > 1``, off with a
+    # single instance, whose PDB allows 0 disruptions and makes the node
+    # undrainable while protecting nothing (no replica to fail over to). An
+    # explicit true / false always wins.
+    enablePDB:
     # Continuous WAL archiving to an object store. Defer beyond #272
     # Phase 2 — the existing pg_dump-based backup workflow already
     # covers the disaster-recovery story for v1. See CNPG docs for
@@ -1123,6 +1165,26 @@ dnsAgents:
     repository: ghcr.io/spatiumnorth/dns-bind9
     tag: ""                      # empty → use Chart.appVersion
     pullPolicy: IfNotPresent
+  # #3209 — name the StatefulSet / Service / headless Service
+  # ``<release fullname>-dns-<flavor>-<name>`` like every other object in the
+  # chart (and honour ``fullnameOverride``), so two releases in one namespace
+  # do not collide (a name over 52 characters is cut to 43 plus a hash of the
+  # whole, so it stays unique). FALSE keeps today's ``dns-<flavor>-<name>``. Changing it on
+  # a live install is NOT an in-place rename: the old StatefulSet is deleted
+  # and a new one created, with NEW PVCs (``<claim>-<new name>-0``) and a new
+  # pod name, which is the server's registered identity — the agent registers
+  # as a fresh server. Set it on a new install (see
+  # docs/deployment/KUBERNETES.md, "Naming of agent objects"). The default is
+  # expected to flip in a later release.
+  prefixWithFullname: false
+  # #3206 — StorageClass of both volume claims (agent-state, dns-state).
+  # Unset uses the cluster's default class. Per server: ``servers[].storageClass``.
+  # Changing it on a live StatefulSet is refused by Kubernetes (claim templates
+  # are immutable): run ``kubectl delete sts <name> --cascade=orphan`` first
+  # (pod and PVCs survive); ``helm upgrade`` says so. Existing PVCs keep the
+  # class they were created with; it applies to claims created after it is set.
+  # See README "Adopting storageClass on an existing install".
+  storageClass: ""
   # Per-driver image overrides (issue #127). Each key matches a
   # ``servers[].flavor`` value; missing keys fall back to
   # ``dnsAgents.image``. Add a ``powerdns`` server entry to enable
@@ -1148,6 +1210,10 @@ dnsAgents:
   startupProbe:
     periodSeconds: 10
     failureThreshold: 360
+  # Agent Services default to ClusterIP (#3229): set servers[].service.type
+  # to LoadBalancer (MetalLB / cloud LB) or NodePort to reach DNS from
+  # clients. k3s's bundled servicelb breaks the node's own resolver on :53;
+  # see the chart README, "Exposing DNS and DHCP to clients".
   servers: []
     # - name: ns1
     #   flavor: bind9            # bind9 (default) | powerdns | technitium
@@ -1158,6 +1224,17 @@ dnsAgents:
     #   # nodeSelector to keep one per node across drains.
     #   nodeSelector: { kubernetes.io/hostname: node-a }
     #   tolerations: []
+    #   # #3206 — a node affinity (say, PREFER node-a without pinning), MERGED
+    #   # with the chart's preferred one-per-node anti-affinity; only a
+    #   # podAntiAffinity of your own replaces that one.
+    #   affinity:
+    #     nodeAffinity:
+    #       preferredDuringSchedulingIgnoredDuringExecution:
+    #         - weight: 100
+    #           preference:
+    #             matchExpressions:
+    #               - { key: kubernetes.io/hostname, operator: In, values: [node-a] }
+    #   storageClass: fast-ssd   # overrides dnsAgents.storageClass
     #   service: { type: LoadBalancer }
     #   # LoadBalancer Services keep the client address by default
     #   # (externalTrafficPolicy: Local — each server is a single-replica
@@ -1211,6 +1288,15 @@ dhcpAgents:
     repository: ghcr.io/spatiumnorth/dhcp-kea
     tag: ""
     pullPolicy: IfNotPresent
+  # #3209 — same as ``dnsAgents.prefixWithFullname``: name the StatefulSet and
+  # Services ``<release fullname>-dhcp-<flavor>-<name>``. FALSE keeps
+  # ``dhcp-<flavor>-<name>``; flipping it on a live install recreates the
+  # StatefulSet with new PVCs and a new pod name (the server's identity).
+  prefixWithFullname: false
+  # #3206 — StorageClass of both volume claims; unset = the cluster default.
+  # Per server: ``servers[].storageClass``. On an existing install see README
+  # "Adopting storageClass on an existing install" (orphan-delete the sts first).
+  storageClass: ""
   agentKey:
     existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY
     value: ""
@@ -1219,11 +1305,18 @@ dhcpAgents:
     #   role: primary
     #   group: default
     #   storage: { agentState: 1Gi, keaState: 2Gi }
+    #   storageClass: fast-ssd   # overrides dhcpAgents.storageClass (#3206)
+    #   # Placement (#3206). ``affinity`` is merged with the chart's preferred
+    #   # one-per-node anti-affinity; only your own podAntiAffinity replaces it.
+    #   nodeSelector: { kubernetes.io/hostname: node-a }
+    #   tolerations: []
+    #   affinity: {}
     #   hostNetwork: false       # true binds the node's UDP/67 directly:
     #                            # broadcast clients work with no relay,
     #                            # and a relay reaches the node on 67
     #   service: { type: LoadBalancer }
-    #                            # the default. A DHCP relay (ip
+    #                            # opt-in (the default is ClusterIP, #3229;
+    #                            # not with k3s servicelb). A DHCP relay (ip
     #                            # helper-address) can only forward to
     #                            # UDP/67, so without hostNetwork point it
     #                            # at the LoadBalancer address. A pinned

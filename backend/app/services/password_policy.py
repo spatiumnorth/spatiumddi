@@ -29,7 +29,7 @@ import structlog
 
 from app.core.crypto import decrypt_str, encrypt_str
 from app.models.auth import User
-from app.models.settings import PlatformSettings
+from app.models.settings import PlatformSettings, platform_setting_default
 
 logger = structlog.get_logger(__name__)
 
@@ -50,17 +50,19 @@ class PasswordPolicy:
     @classmethod
     def from_row(cls, row: PlatformSettings | None) -> PasswordPolicy:
         if row is None:
-            # Pre-bootstrap fall-back — the singleton row exists in every
-            # real deployment, this is just defensive against tests that
-            # don't seed PlatformSettings.
+            # The singleton row is created lazily, so on a fresh install the
+            # first login runs before it exists. Fall back to the column
+            # defaults (derived, not copied) so the shipped policy applies
+            # to display and enforcement alike (#3203).
+            d = platform_setting_default
             return cls(
-                min_length=8,
-                require_uppercase=False,
-                require_lowercase=False,
-                require_digit=False,
-                require_symbol=False,
-                history_count=0,
-                max_age_days=0,
+                min_length=int(d("password_min_length")),
+                require_uppercase=bool(d("password_require_uppercase")),
+                require_lowercase=bool(d("password_require_lowercase")),
+                require_digit=bool(d("password_require_digit")),
+                require_symbol=bool(d("password_require_symbol")),
+                history_count=int(d("password_history_count")),
+                max_age_days=int(d("password_max_age_days")),
             )
         return cls(
             min_length=int(row.password_min_length),

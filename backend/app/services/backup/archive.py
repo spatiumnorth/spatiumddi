@@ -750,6 +750,34 @@ def preview_backup_archive(
     return manifest, resolve_dump_format(manifest, names), refusal
 
 
+def manifest_preview_payload(archive_bytes: bytes) -> dict[str, Any]:
+    """The manifest-preview response body for an archive's bytes.
+
+    One builder for the uploaded-archive preview and the destination
+    archive preview (#2222), so the two cannot answer differently about
+    the dump format a restore will act on. Raises
+    :class:`BackupArchiveError` for an archive that is not a readable zip.
+    """
+    manifest, dump_format, refusal = preview_backup_archive(archive_bytes)
+    return {
+        "manifest": manifest,
+        "archive_bytes": len(archive_bytes),
+        "format_recognised": manifest.get("format") == "spatiumddi-backup",
+        # The dump format the restore will act on, resolved by the same
+        # helper the restore uses (#2201). A selective restore needs
+        # ``custom``; the console reads ``selective_restore_supported``
+        # rather than inferring it from ``format_version``, which is 2 for
+        # an Exclude-secrets archive whose dump is plain SQL.
+        "dump_format": dump_format,
+        "selective_restore_supported": dump_format == "custom",
+        # Whether the restore would accept this archive at all, and if not
+        # why (#2949): the restore's own refusals for a missing dump, a
+        # missing secrets.enc, or a format_version this build cannot read.
+        "restorable": refusal is None,
+        "restore_refusal": refusal,
+    }
+
+
 def extract_archive_members(
     archive_bytes: bytes,
 ) -> tuple[dict[str, Any], bytes, str, bytes]:

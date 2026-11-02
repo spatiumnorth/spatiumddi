@@ -59,10 +59,16 @@ class _ConnectCounter:
 
 
 async def _backends(conn: asyncpg.Connection) -> int:
+    # Client backends only (#3259). ``pg_stat_activity`` also lists the
+    # autovacuum workers vacuuming or analysing this database, with its
+    # ``datname``; one starting during the burst counted as a connection the
+    # hooks held and failed the cap on CI. Every client connection still
+    # counts, from whichever engine.
     return int(
         await conn.fetchval(
             "SELECT count(*) FROM pg_stat_activity "
-            "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND backend_type = 'client backend'"
         )
     )
 

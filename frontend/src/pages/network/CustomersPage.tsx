@@ -357,7 +357,7 @@ export function CustomersPage() {
                 const ids = Array.from(selectedIds);
                 setConfirm({
                   title: "Delete customers",
-                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Subnets, zones and ASNs that name them are not changed and keep pointing at the hidden customer. They can be restored from Administration → Trash.`,
+                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Subnets, zones and ASNs that name them are not changed and keep pointing at the hidden customer. A superadmin can restore them from Administration → Trash.`,
                   confirmLabel: "Delete",
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
@@ -456,7 +456,7 @@ export function CustomersPage() {
                       onClick={() => {
                         setConfirm({
                           title: "Delete customer",
-                          message: `Soft-delete customer "${c.name}"? Anything that names it is not changed and keeps pointing at the hidden customer. It can be restored from Administration → Trash.`,
+                          message: `Soft-delete customer "${c.name}"? Anything that names it is not changed and keeps pointing at the hidden customer. A superadmin can restore it from Administration → Trash.`,
                           confirmLabel: "Delete",
                           onConfirm: () => removeOne.mutate(c.id),
                         });
