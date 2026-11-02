@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -37,6 +38,7 @@ from app.services.dhcp.lease_cleanup import (
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dns.record_ops import purge_trashed_address_records
 from app.services.feature_modules import is_module_enabled
+from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -71,6 +73,7 @@ async def _sweep() -> tuple[int, int]:
             )
         )
         cleaned = 0
+        touched_subnets: set[Any] = set()  # recounted once below (#3345)
         # Lazy-import the DDNS revoke to keep this task light when
         # DDNS is off. The helper itself no-ops when the subnet is not
         # ddns_enabled, so calling it unconditionally is cheap.
@@ -128,6 +131,7 @@ async def _sweep() -> tuple[int, int]:
                         )
                 await purge_trashed_address_records(db, [row.id])  # #3186
                 await db.delete(row)
+                touched_subnets.add(subnet_id)
                 cleaned += 1
 
         # Second pass — hard-delete leases that have sat in ``expired`` past the
@@ -147,6 +151,7 @@ async def _sweep() -> tuple[int, int]:
             await db.delete(lease)
             deleted += 1
 
+        await recount_subnets_and_blocks(db, touched_subnets)
         await db.commit()
         return cleaned, deleted
 
@@ -180,6 +185,7 @@ async def _remirror_live_leases() -> int:
             await db.rollback()
             return 0
         await db.flush()
+        await recount_subnets_and_blocks(db, {h.row.subnet_id for h in handovers})  # #3345
         await publish_handover_ddns(db, handovers)
         # A status change on an address is a mutation, and mutations are
         # audited (non-negotiable #4). One row per run, naming the addresses.

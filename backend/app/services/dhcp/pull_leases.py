@@ -94,6 +94,7 @@ from app.services.dhcp.windows_failover import (
     record_failover_observation,
     record_scope_observation,
 )
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 
 def _refresh_lease_owned_row(
@@ -243,6 +244,9 @@ async def _pull_leases_core(
     and would double-count.
     """
     result = PullLeasesResult()
+    # Subnets whose mirror rows this pull created or removed; recounted once
+    # at the end, never per lease (#3345).
+    touched_subnets: set[Any] = set()
 
     if not is_agentless(server.driver):
         result.errors.append(
@@ -482,6 +486,7 @@ async def _pull_leases_core(
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 if created:
                     result.ipam_created += 1
+                    touched_subnets.add(containing.id)
                 elif ipam_row.auto_from_lease:
                     # Lost the race to a lease-owned row — refresh it
                     # like the elif path below.
@@ -642,7 +647,9 @@ async def _pull_leases_core(
             # lease. Pass the subnet we already resolved so the helper keeps the
             # per-poll O(1) resolution. Same helper the delete_lease endpoint
             # and scope deletion use (DRY).
-            if await purge_lease(db, stale, subnet_id=stale_subnet_id, now=now):
+            if await purge_lease(
+                db, stale, subnet_id=stale_subnet_id, now=now, touched_subnets=touched_subnets
+            ):
                 result.ipam_revoked += 1
         elif stale_subnet_id is not None:
             # Dry-run (apply=False): count the mirror the purge WOULD remove,
@@ -662,6 +669,7 @@ async def _pull_leases_core(
 
     if apply:
         server.last_sync_at = now
+        await recount_subnets_and_blocks(db, touched_subnets)  # #3345
         await db.flush()
 
     return result
