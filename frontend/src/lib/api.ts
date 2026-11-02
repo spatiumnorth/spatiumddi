@@ -10809,12 +10809,7 @@ export const logsApi = {
  * = enforced at the auth layer BEFORE RBAC. Multiple scopes
  * union; ``read`` covers safe-method requests across the surface.
  */
-export type ApiTokenScope =
-  | "read"
-  | "ipam:write"
-  | "dns:write"
-  | "dhcp:write"
-  | "agent";
+export type ApiTokenScope = "read" | "ipam:write" | "dns:write" | "dhcp:write";
 
 export const API_TOKEN_SCOPES: {
   value: ApiTokenScope;
@@ -10840,11 +10835,6 @@ export const API_TOKEN_SCOPES: {
     value: "dhcp:write",
     label: "DHCP write",
     hint: "Mutate /dhcp/*. Excludes the agent surface.",
-  },
-  {
-    value: "agent",
-    label: "Agent",
-    hint: "Bootstrap + push for /dns/agents/* and /dhcp/agents/*.",
   },
 ];
 

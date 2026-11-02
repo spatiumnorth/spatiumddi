@@ -693,8 +693,13 @@ rejected with `422` rather than silently locking the operator out:
   (IP reputation lists) or `/api/v1/dns-threat/*` (threat analytics); a token
   that writes there needs an empty scope set, with RBAC as the gate.
 - `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
-- `agent` — allows only the agent push surface
-  (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
+
+There is no scope for the agent push surface (`/api/v1/dns/agents/*`,
+`/api/v1/dhcp/agents/*`): those routes authenticate with the agent's own JWT
+or pre-shared key and never accept an API token. An `agent` scope used to be
+offered and reached nothing; it is retired, and create / update refuse it
+with a 422. A token that already stores `agent` is still refused everywhere
+(a non-empty scope list that matches nothing is not "unrestricted").
 
 Prefixes match on a whole path segment, so `/api/v1/dns` covers
 `/api/v1/dns/...` and never `/api/v1/dnsbl/...`.
