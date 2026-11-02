@@ -2678,12 +2678,14 @@ The listeners serve a certificate from the existing
 `appliance_certificate` store — the same one behind the Web UI cert and
 the embedded ACME client (#438). Issue or upload once under
 Appliance → Fleet → Web UI Certificate, then point the group at it
-(`dns_server_options.tls_certificate_id`). That page exists only on an
-appliance-hosted control plane; on Docker Compose or Kubernetes the store
-is reached through the API instead — `POST /api/v1/appliance/tls/upload`
-(PEM + key), `POST /api/v1/appliance/tls/csr`, or
-`POST /api/v1/appliance/acme/issue` for Let's Encrypt — and the group's
-certificate picker lists whatever is stored there.
+(`dns_server_options.tls_certificate_id`). On Docker Compose or Kubernetes
+the same store is on Fleet as **TLS certificates** (upload / CSR / Let's
+Encrypt; only activating a certificate as the Web UI certificate is
+appliance-specific), and it is also reachable through the API —
+`POST /api/v1/appliance/tls/upload` (PEM + key),
+`POST /api/v1/appliance/tls/csr`, or `POST /api/v1/appliance/acme/issue`
+for Let's Encrypt. The group's certificate picker lists whatever is stored
+there.
 
 The FK is `ON DELETE SET NULL`, so deleting a certificate can never delete
 a group's options row. That leaves one state worth understanding: listener
