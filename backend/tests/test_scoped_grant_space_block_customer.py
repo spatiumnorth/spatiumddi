@@ -332,6 +332,34 @@ async def test_scoped_refusal_says_why_not_that_the_held_write_is_missing(
 
 
 @pytest.mark.asyncio
+async def test_scoped_pointer_refusal_on_site_and_provider_names_the_pointer(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#3338: a site's parent and a provider's default ASN are pointers, with
+    nothing under the row that inherits them, so the 403 says the grant does
+    not reach the pointer, not that the holder lacks the write it holds."""
+    site = Site(name=f"s-{uuid.uuid4().hex[:6]}")
+    other = Site(name=f"o-{uuid.uuid4().hex[:6]}")
+    prov = Provider(name=f"p-{uuid.uuid4().hex[:6]}")
+    db_session.add_all([site, other, prov])
+    await db_session.flush()
+    h = await _holder(db_session, _rw("site", site.id) + _rw("provider", prov.id))
+    await db_session.commit()
+
+    for url, field, value in (
+        (f"/api/v1/sites/{site.id}", "parent_site_id", str(other.id)),
+        (f"/api/v1/providers/{prov.id}", "default_asn_id", str(uuid.uuid4())),
+    ):
+        r = await client.put(url, json={field: value}, headers=h)
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        assert f"'{field}'" in detail
+        assert "every" in detail and "not only this one" in detail
+        assert "point it at another resource" in detail
+        assert "under it" not in detail
+
+
+@pytest.mark.asyncio
 async def test_type_level_grants_still_see_everything(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:

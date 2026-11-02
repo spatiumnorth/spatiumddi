@@ -14554,6 +14554,16 @@ export function BlockDetailView({
 
           return (
             <div className="overflow-x-auto">
+              {/* Child blocks read, subnets refused: the rows shown are not
+                  the whole block, so say so above them (#3337). */}
+              {readError != null && (
+                <p className="px-4 py-2 text-xs">
+                  <ListReadError
+                    error={readError}
+                    what="all of this block's contents"
+                  />
+                </p>
+              )}
               <table className="w-full min-w-[720px] text-sm">
                 <thead>
                   <tr className="border-b bg-muted/40 text-xs">
@@ -15608,6 +15618,20 @@ export function SpaceTableView({
           </p>
         ) : (
           <div className="overflow-x-auto">
+            {/* One of the two reads answered and the other was refused: the
+                rows shown are not the whole space (#3337). */}
+            {(blocksError != null || subnetsError != null) && (
+              <p className="px-6 py-2 text-xs">
+                <ListReadError
+                  error={blocksError ?? subnetsError}
+                  what={
+                    blocksError != null
+                      ? "this space's blocks"
+                      : "this space's subnets"
+                  }
+                />
+              </p>
+            )}
             <table className="w-full min-w-[720px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/40 text-xs">
@@ -16590,9 +16614,10 @@ export function SpaceSection({
 
             {/* Block tree (recursive) — filtered + force-expanded when a
                 quick-filter is active, and capped to TREE_GROUP_CAP top-level
-                rows with a reveal (never capped while filtering). */}
+                rows with a reveal (never capped while filtering). A refused
+                subnet read still draws the blocks it can see (#3337). */}
             {blocks &&
-              subnets &&
+              (subnets || subnetsError != null) &&
               (() => {
                 const top = buildBlockTree(treeBlocks, treeSubnets, null);
                 const capped =
@@ -16636,18 +16661,23 @@ export function SpaceSection({
                 );
               })()}
 
-            {/* A refused or failed read says so, not "No blocks yet" (#3337). */}
-            {!isLoading &&
-              !subnets?.length &&
-              !blocks?.length &&
-              (blocksError != null || subnetsError != null) && (
-                <p className="py-1 pl-2 text-xs">
-                  <ListReadError
-                    error={blocksError ?? subnetsError}
-                    what="this space's blocks and subnets"
-                  />
-                </p>
-              )}
+            {/* A refused or failed read says so, not "No blocks yet", and
+                beside the blocks it could read when only subnets were
+                refused (#3337). */}
+            {!isLoading && (blocksError != null || subnetsError != null) && (
+              <p className="py-1 pl-2 text-xs">
+                <ListReadError
+                  error={blocksError ?? subnetsError}
+                  what={
+                    blocksError != null && subnetsError != null
+                      ? "this space's blocks and subnets"
+                      : blocksError != null
+                        ? "this space's blocks"
+                        : "this space's subnets"
+                  }
+                />
+              </p>
+            )}
             {!isLoading &&
               !subnets?.length &&
               !blocks?.length &&

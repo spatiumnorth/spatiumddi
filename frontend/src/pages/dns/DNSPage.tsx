@@ -4253,7 +4253,11 @@ export function ZoneDetailView({
     if (recordSearch.trim()) p.search = recordSearch.trim();
     return p;
   }, [recordPage, recordSearch]);
-  const { data: recordsPage, isFetching } = useQuery({
+  const {
+    data: recordsPage,
+    isFetching,
+    error: recordsError,
+  } = useQuery({
     queryKey: ["dns-records", zone.id, recordParams],
     queryFn: () => dnsApi.listRecords(group.id, zone.id, recordParams),
   });
@@ -5086,9 +5090,16 @@ export function ZoneDetailView({
           {filtered.length === 0 && !isFetching && (
             <div className="flex flex-col items-center justify-center h-40">
               <p className="text-sm text-muted-foreground italic">
-                {hasRecFilter
-                  ? "No records match the current filter."
-                  : 'No records yet. Click "Add Record" to create one.'}
+                {recordsError != null ? (
+                  <ListReadError
+                    error={recordsError}
+                    what="this zone's records"
+                  />
+                ) : hasRecFilter ? (
+                  "No records match the current filter."
+                ) : (
+                  'No records yet. Click "Add Record" to create one.'
+                )}
               </p>
             </div>
           )}
@@ -8953,7 +8964,11 @@ function RecordsTab({
     if (groupRecordSearch.trim()) p.search = groupRecordSearch.trim();
     return p;
   }, [groupRecordPage, groupRecordSearch]);
-  const { data: groupRecordsPage, isLoading } = useQuery({
+  const {
+    data: groupRecordsPage,
+    isLoading,
+    error: groupRecordsError,
+  } = useQuery({
     queryKey: ["dns-group-records", group.id, groupRecordParams],
     queryFn: () => dnsApi.listGroupRecords(group.id, groupRecordParams),
   });
@@ -9250,9 +9265,16 @@ function RecordsTab({
                   colSpan={8}
                   className="px-4 py-8 text-center text-sm text-muted-foreground"
                 >
-                  {recordsTotal === 0
-                    ? "No records in this group yet."
-                    : "No records match the active filters."}
+                  {groupRecordsError != null ? (
+                    <ListReadError
+                      error={groupRecordsError}
+                      what="this group's records"
+                    />
+                  ) : recordsTotal === 0 ? (
+                    "No records in this group yet."
+                  ) : (
+                    "No records match the active filters."
+                  )}
                 </td>
               </tr>
             ) : (

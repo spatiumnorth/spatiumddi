@@ -73,8 +73,9 @@ vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({ ready: true, enabled: () => true }),
 }));
 
-const { DHCPPage, ServerScopesTab } = await import("@/pages/dhcp/DHCPPage");
-const { DNSPage } = await import("@/pages/dns/DNSPage");
+const { DHCPPage, ServerScopesTab, ServerPoolsOrStaticsTab } =
+  await import("@/pages/dhcp/DHCPPage");
+const { DNSPage, ZoneDetailView } = await import("@/pages/dns/DNSPage");
 const { IPAMPage, BlockDetailView } = await import("@/pages/ipam/IPAMPage");
 const { FreeSpaceBand } = await import("@/components/ipam/FreeSpaceBand");
 const { FreeSpaceTreemap } = await import("@/components/ipam/FreeSpaceTreemap");
@@ -280,5 +281,153 @@ describe("IPAM", () => {
       ).toHaveLength(2),
     );
     expect(screen.queryByText("No allocation data")).toBeNull();
+  });
+});
+
+// The related reads the issue's nine views lead to: the next type down from
+// a list the role can read (#3337 validation).
+function failed() {
+  return Object.assign(new Error("Request failed with status code 500"), {
+    isAxiosError: true,
+    response: { status: 500, data: { detail: "database unavailable" } },
+  });
+}
+
+describe("the next read down", () => {
+  it("a failure that is not a refusal is not called one", async () => {
+    answers.dhcpApi = {
+      listGroups: () => Promise.reject(failed()),
+      listServers: ok([]),
+    };
+    open(<DHCPPage />);
+    await screen.findByText(/Couldn't load DHCP server groups/);
+    expect(screen.queryByText(/permission/)).toBeNull();
+    expect(screen.queryByText("No server groups yet.")).toBeNull();
+  });
+
+  it("a DNS group's Zones and Records tabs say they were refused", async () => {
+    answers.dnsApi = {
+      listGroups: ok([group]),
+      listServers: ok([]),
+      listZones: no,
+      listViews: ok([]),
+      listGroupRecords: no,
+    };
+    open(<DNSPage />);
+    fireEvent.click(await screen.findByText("grp1"));
+    fireEvent.click(await screen.findByRole("button", { name: /^Zones/ }));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(/don't have permission to see this group's zones/)
+          .length,
+      ).toBe(2),
+    );
+    expect(screen.queryByText(/No zones yet/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Records/ }));
+    await screen.findByText(
+      /don't have permission to see this group's records/,
+    );
+    expect(screen.queryByText("No records in this group yet.")).toBeNull();
+  });
+
+  it("a zone's record list says it was refused", async () => {
+    answers.dnsApi = { listRecords: no };
+    open(
+      <ZoneDetailView
+        group={group as never}
+        zone={
+          {
+            id: "z1",
+            group_id: "g1",
+            name: "example.com.",
+            zone_type: "primary",
+            kind: "forward",
+          } as never
+        }
+        onDeleted={() => {}}
+      />,
+    );
+    await screen.findByText(/don't have permission to see this zone's records/);
+    expect(screen.queryByText(/No records yet/)).toBeNull();
+  });
+
+  it("a DHCP group's Pools and Statics tabs say they were refused", async () => {
+    const scope = { id: "sc1", name: "s", subnet_id: "sn1" };
+    answers.dhcpApi = {
+      listScopesByGroup: ok([scope]),
+      listPools: no,
+      listStatics: no,
+      scopePoolOccupancy: ok([]),
+    };
+    answers.ipamApi = { listSubnets: ok([]) };
+    open(<ServerPoolsOrStaticsTab groupId="g1" kind="pools" />);
+    await screen.findByText(/don't have permission to see this group's pools/);
+    expect(screen.queryByText("No pools yet.")).toBeNull();
+    cleanup();
+    open(<ServerPoolsOrStaticsTab groupId="g1" kind="statics" />);
+    await screen.findByText(
+      /don't have permission to see this group's static assignments/,
+    );
+    expect(screen.queryByText("No static assignments yet.")).toBeNull();
+  });
+
+  it("an empty readable pool list still says so", async () => {
+    answers.dhcpApi = {
+      listScopesByGroup: ok([{ id: "sc1", name: "s", subnet_id: "sn1" }]),
+      listPools: ok([]),
+      scopePoolOccupancy: ok([]),
+    };
+    answers.ipamApi = { listSubnets: ok([]) };
+    open(<ServerPoolsOrStaticsTab groupId="g1" kind="pools" />);
+    await screen.findByText("No pools yet.");
+  });
+
+  it("a block view showing child blocks says its subnets were refused", async () => {
+    answers.ipamApi = { blockFreeSpace: ok([]) };
+    const child = {
+      id: "b2",
+      space_id: "sp1",
+      network: "10.237.1.0/24",
+      name: "child",
+      parent_block_id: "b1",
+      utilization_percent: 0,
+    };
+    open(
+      <BlockDetailView
+        block={block}
+        spaceName="space1"
+        ancestors={[]}
+        allBlocks={[child] as never}
+        allSubnets={[]}
+        readError={refused()}
+        onSelectSpace={() => {}}
+        onSelectBlock={() => {}}
+        onSelectSubnet={() => {}}
+      />,
+    );
+    await screen.findByText(
+      /don't have permission to see all of this block's contents/,
+    );
+  });
+
+  it("IPAMPage hands the block view its refused subnet read", async () => {
+    answers.ipamApi = {
+      listSpaces: ok([space]),
+      listBlocks: ok([{ ...(block as object), utilization_percent: 0 }]),
+      listSubnets: no,
+      blockFreeSpace: ok([]),
+    };
+    open(<IPAMPage />);
+    fireEvent.click(await screen.findByText("space1"));
+    await screen.findByText(
+      /don't have permission to see this space's subnets/,
+    );
+    fireEvent.click((await screen.findAllByText(/^10\.237\.0\.0/))[0]!);
+    await screen.findByText(
+      /don't have permission to see this block's child blocks and subnets/,
+    );
+    expect(
+      screen.queryByText("This block has no child blocks or subnets yet."),
+    ).toBeNull();
   });
 });

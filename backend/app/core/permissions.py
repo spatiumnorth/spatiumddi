@@ -280,15 +280,23 @@ def is_effective_superadmin(user: User) -> bool:
     return user_has_permission(user, "*", "*")
 
 
-def scoped_grant_refusal(field: str, rtype: str) -> str:
+def scoped_grant_refusal(field: str, rtype: str, *, inherited: bool = True) -> str:
     """The 403 detail for a holder of a grant scoped to one ``rtype`` row who
     changes ``field``, a setting the items under that row inherit or a pointer
     at another resource (#3039). The holder does hold ``write`` on ``rtype``,
-    for this row, so the words say what the grant does not reach (#3338)."""
+    for this row, so the words say what the grant does not reach (#3338).
+
+    ``inherited=False`` is for a row with nothing under it that inherits the
+    field (a site's parent, a provider's default ASN): the sentence then names
+    only the pointer, not "the items under it"."""
+    reach = (
+        "change a setting the items under it inherit, or point it at another resource"
+        if inherited
+        else "point it at another resource"
+    )
     return (
         f"Permission denied: changing '{field}' needs 'write' on every '{rtype}', "
-        f"not only this one. A grant scoped to one '{rtype}' cannot change a "
-        "setting the items under it inherit, or point it at another resource."
+        f"not only this one. A grant scoped to one '{rtype}' cannot {reach}."
     )
 
 

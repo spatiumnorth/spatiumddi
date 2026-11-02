@@ -231,7 +231,7 @@ async def update_provider(
     ):
         raise HTTPException(
             status_code=403,
-            detail=scoped_grant_refusal("default_asn_id", "provider"),
+            detail=scoped_grant_refusal("default_asn_id", "provider", inherited=False),
         )
     if "default_asn_id" in changes:
         await _check_default_asn(db, changes["default_asn_id"])

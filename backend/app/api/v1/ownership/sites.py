@@ -268,7 +268,7 @@ async def update_site(site_id: uuid.UUID, body: SiteUpdate, db: DB, user: Curren
     ):
         raise HTTPException(
             status_code=403,
-            detail=scoped_grant_refusal("parent_site_id", "site"),
+            detail=scoped_grant_refusal("parent_site_id", "site", inherited=False),
         )
     if "parent_site_id" in changes:
         await _validate_parent(db, changes["parent_site_id"], site_id)
