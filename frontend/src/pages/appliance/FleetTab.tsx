@@ -5206,8 +5206,9 @@ export function ApplianceRoleAssignmentSection({
       <FirewallRefusalBanner row={row} />
 
       {/* #170 Wave D follow-up — outcome of the supervisor's last
-          docker-compose apply. Red banner with stderr-first-line on
-          failure. Green-tinted chip on ready. */}
+          role apply (since #183 Phase 7, the role HelmChart written
+          through the node's kube API). Red banner with the supervisor's
+          reason on failure (#3295). Green-tinted chip on ready. */}
       <RoleSwitchStateBanner row={row} />
 
       {/* #170 Wave C3 — firewall preview + operator-override textarea.
@@ -6478,10 +6479,10 @@ function RoleSwitchStateBanner({ row }: { row: ApplianceRow }) {
             Service lifecycle apply failed
           </p>
           <p className="mt-1 text-muted-foreground">
-            The supervisor's <code>docker compose</code> against the assigned
-            role(s) returned a non-zero exit. The previous container state
-            remains; SSH into the appliance to triage, or fix the underlying
-            cause + the next heartbeat will retry automatically.
+            The supervisor could not apply the assigned role(s) through this
+            appliance&apos;s Kubernetes API (k3s). It tries again on the next
+            heartbeat; if the reason below persists, SSH into the appliance to
+            check k3s.
           </p>
           {row.role_switch_reason && (
             <p className="mt-2 font-mono text-[11px] text-foreground">
