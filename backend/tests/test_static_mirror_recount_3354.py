@@ -98,3 +98,93 @@ async def test_trash_purge_release_recounts(db_session: AsyncSession) -> None:
     await db_session.commit()
 
     assert await _counts(db_session, subnet, block) == (0, 0)
+
+
+# ── the Windows topology poll (``pull_leases._merge_statics``) ─────────
+
+
+@pytest.mark.asyncio
+async def test_poll_removing_a_reservation_recounts(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reservation gone from the Windows wire loses its mirror, and the subnet
+    and block read one fewer allocated address after the poll commits."""
+    from app.services.dhcp import pull_leases as pl
+    from tests.test_dhcp_windows_scope_sync import (
+        MAC_A,
+        MAC_B,
+        _fixture,
+        _make_ui_reservation,
+        _patch,
+        wire_scope,
+        wire_static,
+    )
+
+    srv, scope, subnet = await _fixture(db_session)
+    await _make_ui_reservation(db_session, scope, mac=MAC_A, ip="10.20.0.10")
+    await _make_ui_reservation(db_session, scope, mac=MAC_B, ip="10.20.0.11")
+    await recount_subnets_and_blocks(db_session, [subnet.id])
+    await db_session.commit()
+    block = await db_session.get(IPBlock, subnet.block_id)
+    assert block is not None
+    await db_session.refresh(subnet)
+    await db_session.refresh(block)
+    assert subnet.allocated_ips == 2
+    block_before = block.allocated_ips
+
+    _patch(monkeypatch, [wire_scope(statics=[wire_static(mac=MAC_B, ip="10.20.0.11")])])
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+
+    assert result.statics_removed == 1
+    await db_session.refresh(subnet)
+    await db_session.refresh(block)
+    assert subnet.allocated_ips == 1
+    assert block.allocated_ips == block_before - 1
+
+
+@pytest.mark.asyncio
+async def test_poll_mirroring_a_windows_reservation_recounts(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reservation that only exists on the Windows box gets a mirror, and the
+    subnet counts it straight away rather than at the hourly recount."""
+    from app.services.dhcp import pull_leases as pl
+    from tests.test_dhcp_windows_scope_sync import _fixture, _patch, wire_scope, wire_static
+
+    srv, _scope, subnet = await _fixture(db_session)
+    await db_session.commit()
+
+    _patch(monkeypatch, [wire_scope(statics=[wire_static(ip="10.20.0.12")])])
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+
+    assert result.statics_synced == 1
+    await db_session.refresh(subnet)
+    assert subnet.allocated_ips == 1
+
+
+# ── several scopes at once: one recount covers all of them ─────────────
+
+
+@pytest.mark.asyncio
+async def test_scope_batch_teardown_recounts_every_scope_subnet(
+    db_session: AsyncSession,
+) -> None:
+    """The delete batch (subnet / block / space delete reaching several scopes)
+    frees each scope's mirrors and recounts every one of their subnets."""
+    from types import SimpleNamespace
+
+    from app.services.ai.operations_risky import _purge_leases_for_scope_batch
+
+    scope_a, subnet_a, block_a, _ = await _setup(db_session)
+    scope_b, subnet_b, _block_b, _ = await _setup(db_session)
+    await db_session.commit()
+
+    batch = SimpleNamespace(rows=[SimpleNamespace(obj=scope_a), SimpleNamespace(obj=scope_b)])
+    await _purge_leases_for_scope_batch(db_session, batch)
+    await db_session.commit()
+
+    assert await _counts(db_session, subnet_a, block_a) == (0, 0)
+    await db_session.refresh(subnet_b)
+    assert subnet_b.allocated_ips == 0

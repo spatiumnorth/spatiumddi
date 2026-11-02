@@ -188,11 +188,15 @@ async def _purge_leases_for_scope_batch(db: AsyncSession, batch: Any) -> None:
     from app.models.dhcp import DHCPScope  # noqa: PLC0415
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope  # noqa: PLC0415
     from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics  # noqa: PLC0415
+    from app.services.ipam.utilization import recount_subnets_and_blocks  # noqa: PLC0415
 
+    # One recount for every scope in the batch, not one per scope (#3354).
+    touched: set[UUID] = set()
     for row in batch.rows:
         if isinstance(row.obj, DHCPScope):
             await delete_leases_for_scope(db, row.obj.id)
-            await remove_ipam_for_scope_statics(db, row.obj.id)
+            await remove_ipam_for_scope_statics(db, row.obj.id, touched_subnets=touched)
+    await recount_subnets_and_blocks(db, touched)
 
 
 # ── delete_subnet ──────────────────────────────────────────────────────────
@@ -1217,10 +1221,14 @@ async def _apply_delete_group(
         .scalars()
         .all()
     )
+    from app.services.ipam.utilization import recount_subnets_and_blocks  # noqa: PLC0415
+
     released = 0
+    touched: set[UUID] = set()  # recounted once below, not per scope (#3354)
     for sc in group_scopes:
-        released += await remove_ipam_for_scope_statics(db, sc.id)
+        released += await remove_ipam_for_scope_statics(db, sc.id, touched_subnets=touched)
         await delete_leases_for_scope(db, sc.id)
+    await recount_subnets_and_blocks(db, touched)
 
     # One row per scope the group takes with it (#1957's convention, as the
     # Trash purge writes for a subnet's scopes): the scope rows go by FK

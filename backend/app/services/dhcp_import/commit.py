@@ -50,6 +50,7 @@ from app.services.dhcp.option_validation import canonical_domain_options, rekey_
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 from app.services.import_savepoint import entity_savepoint
 from app.services.ipam.resize import _total_ips
+from app.services.ipam.utilization import recount_subnets_and_blocks
 
 from .canonical import (
     ConflictAction,
@@ -384,6 +385,7 @@ async def _commit_one_scope(
     action: ConflictAction,
     current_user: User,
     now: datetime,
+    touched_subnets: set[uuid.UUID],
 ) -> CommitScopeResult:
     """Apply one parsed scope: resolve its IPAM subnet, honour the
     operator's skip/overwrite choice on an existing scope, then create
@@ -430,7 +432,7 @@ async def _commit_one_scope(
         # ``status="static_dhcp"`` pointing at rows Postgres has dropped (#618).
         # Delete the mirror rows (not just free them) so the IPs fold back into
         # free gaps in the subnet view.
-        await remove_ipam_for_scope_statics(db, existing.id)
+        await remove_ipam_for_scope_statics(db, existing.id, touched_subnets=touched_subnets)
         await db.delete(existing)
         await db.flush()
         overwrote = True
@@ -652,6 +654,10 @@ async def commit_import(
                 "options if they are needed"
             )
 
+    # Subnets whose reservation mirrors an overwrite removed; recounted once
+    # after every scope, not per scope (#3354). A scope whose savepoint rolled
+    # back may leave its subnet here: recounting an unchanged subnet is a no-op.
+    touched_subnets: set[uuid.UUID] = set()
     for parsed in preview.scopes:
         try:
             cidr = _canonical_cidr(parsed.subnet_cidr)
@@ -677,6 +683,7 @@ async def commit_import(
                     action=action,
                     current_user=current_user,
                     now=now,
+                    touched_subnets=touched_subnets,
                 )
         except Exception as exc:  # noqa: BLE001 — operator-facing error capture
             result = CommitScopeResult(
@@ -685,6 +692,7 @@ async def commit_import(
                 error=_scope_error(exc),
             )
         results.append(result)
+    await recount_subnets_and_blocks(db, touched_subnets)
 
     classes_created = await _commit_client_classes(
         db,
