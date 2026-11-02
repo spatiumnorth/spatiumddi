@@ -55,7 +55,10 @@ jobs:
       - name: Open, refresh or close the tracking issue
         run: |
           PREFIX="README Contributors: add "
-          existing="$(gh issue list --repo "$REPO" --state open --limit 100 \
+          # Search by title, not a page of open issues: the repo has far more
+          # than one page open, so a --limit scan would miss it and duplicate.
+          existing="$(gh issue list --repo "$REPO" --state open --limit 20 \
+            --search "\"${PREFIX}\" in:title" \
             --json number,title \
             --jq "[.[] | select(.title | startswith(\"${PREFIX}\"))] | .[0].number // empty")"
 
@@ -65,7 +68,9 @@ jobs:
             {
               echo "These people have opened a pull request but are not in the README Contributors table:"
               echo
-              cat report.txt
+              # Logins in code spans, never a bare @login: the issue is
+              # refreshed weekly and must not notify the people it names.
+              sed -E 's/^- @([A-Za-z0-9-]+)/- `\1`/' report.txt
               echo
               echo "Add a row for each in README.md under \`## Contributors\`, with an Area description of what they contributed. If someone should not be listed, add their login to \`.github/contributors-ignore.txt\`."
               echo
