@@ -72,6 +72,8 @@ vi.mock("@/hooks/useFeatureModules", () => ({
   }),
 }));
 
+let listedZones: unknown[] = [];
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -80,6 +82,7 @@ vi.mock("@/lib/api", async () => {
       ...actual.dnsApi,
       classifyZoneName: pending,
       listGroups: () => Promise.resolve([]),
+      listZones: () => Promise.resolve(listedZones),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (groupId: string, data: Record<string, unknown>) =>
@@ -137,6 +140,7 @@ function linkedZone(domainId: string | null): DNSZone {
 }
 
 function openZone(zone?: DNSZone) {
+  listedZones = zone ? [zone] : [];
   wrap(<ZoneModal groupId="grp-1" views={[]} zone={zone} onClose={() => {}} />);
 }
 
@@ -198,6 +202,7 @@ describe("Add Zone's Linked Domain read (#2926)", () => {
       ["write", "dns_zone"],
     ];
     openZone(linkedZone("dom-1"));
+    await screen.findByText("Zone Name (FQDN)");
     // Shown as linked, not as "auto-match".
     expect(linkedSelect().value).toBe("dom-1");
     expect(
@@ -208,10 +213,8 @@ describe("Add Zone's Linked Domain read (#2926)", () => {
     });
     fireEvent.submit(linkedSelect().form!);
     await waitFor(() => expect(updateZone).toHaveBeenCalledTimes(1));
-    expect(updateZone.mock.calls[0][2]).toMatchObject({
-      domain_id: "dom-1",
-      ttl: 600,
-    });
+    // Only the changed field is sent (#3269), so the link is left as stored.
+    expect(updateZone.mock.calls[0][2]).toEqual({ ttl: 600 });
     expect(listDomains).not.toHaveBeenCalled();
   });
 

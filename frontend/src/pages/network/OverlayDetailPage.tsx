@@ -35,6 +35,7 @@ import {
   type SimulateResponse,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { apiErrorStatus, isRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -214,7 +215,21 @@ function OverviewTab({ overlay }: { overlay: OverlayRead }) {
     enabled: !!overlay.customer_id,
     queryKey: ["customer", overlay.customer_id],
     queryFn: () => customersApi.get(overlay.customer_id!),
+    // A 404 (customer in the Trash) or a 403 does not heal by asking again;
+    // anything else may be transient.
+    retry: (n, err) => apiErrorStatus(err) !== 404 && !isRefused(err) && n < 2,
   });
+  // A trashed customer answers 404 (#3192); only that is "in Trash". A
+  // refusal or any other failure says so instead of mislabelling it.
+  const customerLabel = customerQ.data?.name
+    ? customerQ.data.name
+    : !customerQ.isError
+      ? "Loading…"
+      : apiErrorStatus(customerQ.error) === 404
+        ? "(customer in Trash)"
+        : isRefused(customerQ.error)
+          ? "(no permission to see the customer)"
+          : "(couldn't load the customer)";
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -228,9 +243,7 @@ function OverviewTab({ overlay }: { overlay: OverlayRead }) {
           {overlay.encryption_profile ?? "—"}
         </Card>
         <Card label="Customer">
-          {overlay.customer_id
-            ? customerQ.data?.name || "Loading…"
-            : "Internal / unattributed"}
+          {overlay.customer_id ? customerLabel : "Internal / unattributed"}
         </Card>
         <Card label="Sites">{overlay.site_count}</Card>
         <Card label="Policies">{overlay.policy_count}</Card>

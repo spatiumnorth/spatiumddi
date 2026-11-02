@@ -314,7 +314,7 @@ describe("Saving with DNS off keeps the stored DNS linkage", () => {
     expect(dnsCalls()).toEqual([]);
   });
 
-  it("Edit Subnet sends the stored DNS and DDNS settings back unchanged", async () => {
+  it("Edit Subnet leaves the stored DNS and DDNS settings alone", async () => {
     dnsOff();
     let body: Record<string, unknown> | undefined;
     answer("ipamApi", "updateSubnet", (_id, b) => {
@@ -343,23 +343,19 @@ describe("Saving with DNS off keeps the stored DNS linkage", () => {
       ddns_domain_override: "dyn.example.",
       ddns_ttl: 300,
     } as unknown as Subnet;
+    answer("ipamApi", "getSubnet", () => Promise.resolve(subnet));
     open(<EditSubnetModal subnet={subnet} onClose={() => {}} />);
     await screen.findByRole("button", { name: "General" });
     expect(screen.queryByRole("button", { name: "DNS" })).toBeNull();
     expect(screen.queryByRole("button", { name: "DDNS" })).toBeNull();
+    // An edit sends only what changed (#3269): change the name, and the
+    // stored DNS / DDNS linkage must not ride along (or be cleared).
+    fireEvent.change(screen.getByDisplayValue("lab"), {
+      target: { value: "lab2" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(body).toBeDefined());
-    expect(body).toMatchObject({
-      dns_inherit_settings: false,
-      dns_group_ids: ["g1"],
-      dns_zone_id: "z1",
-      dns_additional_zone_ids: ["z2"],
-      dns_split_horizon: true,
-      ddns_enabled: true,
-      ddns_hostname_policy: "client_provided",
-      ddns_domain_override: "dyn.example.",
-      ddns_ttl: 300,
-    });
+    expect(body).toEqual({ name: "lab2" });
     expect(dnsCalls()).toEqual([]);
   });
 });

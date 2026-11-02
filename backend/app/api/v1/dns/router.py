@@ -125,6 +125,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.api_token_scopes import read_only_post
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -6656,6 +6657,40 @@ async def update_zone(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # #3265 — a record's fqdn, the fqdn IPAM keeps on each address and every PTR
+    # value IPAM published are stored absolute under the zone's name, so a rename
+    # of a zone that holds records leaves all of them on the old name (and can put
+    # an A owner under an underscore label BIND refuses). The console disables the
+    # name in Edit Zone; the API now agrees. Empty the zone, or create the new zone
+    # and move the records. Records in the Trash count too: a restore brings a
+    # record back with the fqdn it was deleted under, i.e. on the old name.
+    if (
+        "name" in changes
+        and (changes["name"] or "").rstrip(".").lower() != zone.name.rstrip(".").lower()
+    ):
+        held, trashed = (
+            await db.execute(
+                select(
+                    func.count(),
+                    func.count().filter(DNSRecord.deleted_at.is_not(None)),
+                )
+                .select_from(DNSRecord)
+                .where(DNSRecord.zone_id == zone.id)
+                .execution_options(include_deleted=True)
+            )
+        ).one()
+        if held:
+            in_trash = f", {trashed} of them in the Trash" if trashed else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"zone {zone.name!r} holds {held} record(s){in_trash}, and a zone's name "
+                    "cannot be changed while it does: each record's name, the name IPAM keeps "
+                    "on its addresses and the PTR values it published would stay on the old "
+                    "name. Create a zone under the new name and move the records, or delete "
+                    "them first (and purge them from the Trash)."
+                ),
+            )
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
@@ -7820,6 +7855,7 @@ class ZoneMoveCommitResponse(ZoneMovePreviewResponse):
     "/groups/{group_id}/zones/{zone_id}/move/preview",
     response_model=ZoneMovePreviewResponse,
 )
+@read_only_post
 async def move_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -8048,7 +8084,7 @@ async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
                         }
                         for p in t.parameters
                     ],
-                    "record_count": len(t.records),
+                    "record_count": t.max_record_count,
                 }
                 for t in templates
             ]
@@ -8136,11 +8172,11 @@ async def create_zone_from_template(
         )
 
     # Every provider-refusal gate runs on the whole record set BEFORE the zone
-    # exists or is pushed anywhere, so a refusal is atomic (#3007).
-    record_payloads = materialize(template, body.zone_name, body.params)
-    for r in record_payloads:
-        if r["record_type"] in VALID_RECORD_TYPES:
-            await _check_driver_gated_record_type(r["record_type"], group_id, db)
+    # exists or is pushed anywhere, so a refusal is atomic (#3007); the
+    # per-type gate already ran in the loop above. This is the list checked
+    # there, whose owners were written back in the record API's stored form
+    # (#3266) — never re-materialise it from the raw parameters, or the rows
+    # below store the names as typed.
     await _check_driver_refusals(
         [(r["record_type"], r["value"], r["ttl"]) for r in record_payloads], group_id, db
     )
@@ -10033,6 +10069,7 @@ async def _queue_import_ops(
     response_model=ImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -10745,6 +10782,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
     response_model=SheetImportPreviewResponse,
     dependencies=[Depends(_dns_records_read)],
 )
+@read_only_post
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

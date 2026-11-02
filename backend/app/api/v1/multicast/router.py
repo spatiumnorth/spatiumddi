@@ -62,6 +62,7 @@ from app.models.multicast import (
 )
 from app.models.network import NetworkDevice
 from app.models.vrf import VRF
+from app.services.api_token_scopes import read_only_post
 from app.services.multicast.auto_block import ensure_enclosing_block
 from app.services.tags import apply_tag_filter
 
@@ -1136,6 +1137,7 @@ async def _build_bulk_candidates(
     "/groups/bulk-allocate/preview",
     response_model=MulticastBulkAllocatePreviewResponse,
 )
+@read_only_post
 async def bulk_allocate_preview(
     body: MulticastBulkAllocateRequest, db: DB, _: CurrentUser
 ) -> MulticastBulkAllocatePreviewResponse:

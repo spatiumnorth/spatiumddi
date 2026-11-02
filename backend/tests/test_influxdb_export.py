@@ -541,7 +541,7 @@ async def test_malformed_url_is_recorded_not_raised(db_session: AsyncSession) ->
 
     result = await push_target(db_session, row, now=datetime.now(UTC))
     assert not result.ok
-    assert "InvalidURL" in (row.last_push_error or "")
+    assert "Invalid URL" in (row.last_push_error or "")
     # The cursor must not have moved — nothing was delivered.
     assert row.last_dns_bucket_at is None
 

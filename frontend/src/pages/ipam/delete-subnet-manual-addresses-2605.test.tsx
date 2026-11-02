@@ -20,6 +20,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { Subnet } from "@/lib/api";
 
+const actualSubnet = () => ({
+  id: "sn-1",
+  space_id: "sp-1",
+  block_id: "b-1",
+  network: "10.73.5.0/24",
+  utilization_percent: 0,
+  allocated_ips: 0,
+  total_ips: 254,
+});
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});
@@ -30,7 +40,15 @@ vi.mock("@/lib/api", async () => {
         name,
         new Proxy(
           {},
-          { get: (_t, m) => (typeof m === "symbol" ? undefined : pending) },
+          {
+            get: (_t, m) =>
+              typeof m === "symbol"
+                ? undefined
+                : name === "ipamApi" && m === "getSubnet"
+                  ? // Edit Subnet reads the subnet fresh on open (#3269).
+                    () => Promise.resolve(actualSubnet())
+                  : pending,
+          },
         ),
       ]),
   );
@@ -74,7 +92,7 @@ const subnet = {
 } as Subnet;
 
 describe("Delete subnet, step 1", () => {
-  it("says manual addresses go to Trash, not that they are unaffected", () => {
+  it("says manual addresses go to Trash, not that they are unaffected", async () => {
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -89,7 +107,7 @@ describe("Delete subnet, step 1", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Danger zone" }));
     fireEvent.click(
       screen.getByRole("button", { name: /^Delete this subnet/ }),
     );
