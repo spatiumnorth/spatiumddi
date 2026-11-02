@@ -4188,7 +4188,11 @@ export function AddAddressModal({
           values={shownCustomFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         {pendingWarnings && (
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
@@ -9464,6 +9468,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
       qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
     },
+    onError: (e: unknown) => {
+      setError(formatDialogError(e, "Failed to delete alias"));
+    },
   });
 
   // #2135 — no zone reads while core.dns is off, so no zone picker either.
@@ -10021,7 +10028,11 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         {pendingWarnings && (
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
@@ -10321,7 +10332,7 @@ function NatMappingsForIpModal({
   );
 }
 
-function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
+export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
   const qc = useQueryClient();
   const { data: aliases = [], isLoading } = useQuery({
     queryKey: ["subnet-aliases", subnetId],
@@ -10427,6 +10438,11 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
           }
           onClose={() => setConfirmDel(null)}
           isPending={delAlias.isPending}
+          error={
+            delAlias.isError
+              ? formatDialogError(delAlias.error, "Failed to delete alias")
+              : undefined
+          }
         />
       )}
     </div>
@@ -10453,7 +10469,7 @@ function addressSetRangeLabel(s: AddressSet): string {
   return "—";
 }
 
-function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
+export function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
   const qc = useQueryClient();
   const perms = usePermissions();
   const { data: sets = [], isLoading } = useQuery({
@@ -10618,11 +10634,21 @@ function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
         confirmLabel="Delete"
         loading={delSet.isPending}
         message={
-          confirmDel
-            ? `Delete address set "${confirmDel.name}"? Any permissions ` +
-              `granted on this set will no longer match. The IP addresses ` +
-              `themselves are not removed.`
-            : ""
+          <>
+            {confirmDel
+              ? `Delete address set "${confirmDel.name}"? Any permissions ` +
+                `granted on this set will no longer match. The IP addresses ` +
+                `themselves are not removed.`
+              : ""}
+            {delSet.isError && (
+              <p role="alert" className="mt-2 text-destructive">
+                {formatDialogError(
+                  delSet.error,
+                  "Failed to delete address set",
+                )}
+              </p>
+            )}
+          </>
         }
         onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
         onClose={() => setConfirmDel(null)}
@@ -11388,7 +11414,11 @@ function BulkEditAddressesModal({
           </div>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -11528,7 +11558,11 @@ export function BulkDeleteAddressesModal({
         <p className="text-[11px] text-muted-foreground">
           System rows (network, broadcast) are always skipped.
         </p>
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -11682,6 +11716,7 @@ function ConfirmDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   title: string;
   message: string;
@@ -11689,11 +11724,17 @@ function ConfirmDeleteModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending?: boolean;
+  error?: string;
 }) {
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
         <p className="break-words text-sm text-muted-foreground">{message}</p>
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

@@ -9,6 +9,7 @@ import {
   type NATMappingWrite,
   type NATProtocol,
   formatApiError,
+  formatDialogError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -611,6 +612,11 @@ export function NATPage() {
               <span className="font-medium">{confirmDelete.name}</span>? This
               cannot be undone.
             </p>
+            {deleteMut.isError && (
+              <p role="alert" className="text-sm text-destructive">
+                {formatDialogError(deleteMut.error, "Failed to delete mapping")}
+              </p>
+            )}
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setConfirmDelete(null)}
