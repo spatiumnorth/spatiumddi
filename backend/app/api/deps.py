@@ -20,7 +20,11 @@ from app.core.session_idle import (
 )
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
-from app.services.api_token_scopes import is_read_only_post, scope_matches_request
+from app.services.api_token_scopes import (
+    is_read_only_post,
+    is_token_outbound,
+    scope_matches_request,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -135,18 +139,36 @@ async def _resolve_api_token(
     # vocabulary check happens at create time so we can trust the
     # stored values here.
     scopes = list(token.scopes or [])
+    endpoint = getattr(request.scope.get("route"), "endpoint", None)
+    outbound_route = is_token_outbound(endpoint)
     if scopes and not scope_matches_request(
         scopes,
         request.method,
         request.url.path,
-        read_only_route=is_read_only_post(getattr(request.scope.get("route"), "endpoint", None)),
+        read_only_route=is_read_only_post(endpoint),
+        outbound_route=outbound_route,
     ):
         # 403, not 401 (#3223): the credential is valid, it is just not allowed
         # here. A 401 tells a client to re-authenticate or drop the token.
+        if outbound_route and "read" in scopes:
+            # Say why (#3302): a read-only token would otherwise read this
+            # GET as covered and the bare message would look like a bug.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Token scope insufficient for this request: this endpoint makes "
+                    "SpatiumDDI contact another host, which a read-scoped token never "
+                    "does. Use a token whose write scope covers this path, or an "
+                    "unrestricted token."
+                ),
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Token scope insufficient for this request",
         )
+    # The MCP transport reads this to hide outbound tools from a read-only
+    # token (#3302); a session never sets it, so it keeps every tool.
+    request.state.api_token_scopes = scopes
     if token.user_id is None:
         # Scope "global" isn't wired through permissions yet — reject
         # until we add a synthetic service-account path. Today's UI

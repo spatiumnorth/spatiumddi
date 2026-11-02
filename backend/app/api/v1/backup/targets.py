@@ -32,6 +32,7 @@ from app.core.http_etag import etag_matches, format_etag
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
+from app.services.api_token_scopes import token_outbound
 from app.services.backup import node_local
 from app.services.backup.archive import MAX_ARCHIVE_BYTES
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
@@ -756,6 +757,7 @@ async def _set_listing_note(
 
 
 @router.get("/{target_id}/archives", response_model=list[ArchiveListingResponse])
+@token_outbound
 async def list_target_archives(
     target_id: uuid.UUID, db: DB, current_user: SuperAdmin, response: Response
 ) -> list[ArchiveListingResponse]:
@@ -796,6 +798,7 @@ async def list_target_archives(
     response_class=ZipResponse,
     responses={200: {"description": "Backup archive"}},
 )
+@token_outbound
 async def download_latest_target_archive(
     target_id: uuid.UUID,
     db: DB,
@@ -810,7 +813,9 @@ async def download_latest_target_archive(
 
     This is the pull-mode entry point (#989 item 4): an external backup
     tool (Veeam, Bacula, a cron ``curl``) fetches from here with an API
-    token restricted via ``allowed_paths`` to this one route.
+    token restricted via ``allowed_paths`` to this one route. The token
+    cannot be ``read``-scoped: reading the destination is outbound, which
+    ``@token_outbound`` refuses to ``read`` (#3302).
 
     It is conditional. Archive filenames are timestamped and the bytes
     under a given name never change, so the filename *is* a strong
@@ -909,6 +914,7 @@ async def download_latest_target_archive(
     response_class=ZipResponse,
     responses={200: {"description": "Backup archive"}},
 )
+@token_outbound
 async def download_target_archive(
     target_id: uuid.UUID,
     filename: str,
@@ -1006,6 +1012,7 @@ class ArchiveManifestPreviewResponse(BaseModel):
     "/{target_id}/archives/{filename}/manifest-preview",
     response_model=ArchiveManifestPreviewResponse,
 )
+@token_outbound
 async def preview_target_archive_manifest(
     target_id: uuid.UUID,
     filename: str,

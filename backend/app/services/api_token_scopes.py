@@ -4,8 +4,12 @@ Five well-known scopes that compose by union:
 
 * ``read`` — restricts the token to safe-method requests only
   (``GET`` / ``HEAD`` / ``OPTIONS``), plus the POST routes that carry
-  the :func:`read_only_post` marker (a filter / preview body, no mutation).
-  Any other mutation is refused.
+  the :func:`read_only_post` marker (a filter / preview body, no mutation),
+  plus the Operator Copilot MCP endpoint. Any other mutation is refused.
+  A ``read`` token never makes SpatiumDDI send traffic outward (#3302):
+  a GET carrying :func:`token_outbound` (a probe, a live pull from a
+  managed server, an off-prem lookup) is refused to it, and MCP hides the
+  tools registered ``outbound=True`` from a token with no write scope.
 * ``ipam:write`` — allows mutations under ``/api/v1/ipam``,
   ``/api/v1/vlans``, ``/api/v1/vrfs``, ``/api/v1/network-devices``.
   Read traffic anywhere is also allowed by ``read`` if combined.
@@ -46,6 +50,7 @@ from collections.abc import Callable
 from typing import Any
 
 _READ_ONLY_POST_ATTR = "__token_read_only_post__"
+_OUTBOUND_ATTR = "__token_outbound__"
 
 
 def read_only_post[F: Callable[..., Any]](fn: F) -> F:
@@ -67,6 +72,28 @@ def is_read_only_post(endpoint: object) -> bool:
     return bool(getattr(endpoint, _READ_ONLY_POST_ATTR, False))
 
 
+def token_outbound[F: Callable[..., Any]](fn: F) -> F:
+    """Mark a safe-method handler as making SpatiumDDI send traffic outward.
+
+    The counterpart of :func:`read_only_post` for the other direction: a
+    ``read``-scoped token never makes SpatiumDDI contact another host
+    (#3302), so the scope gate stops ``read`` covering a marked route even
+    though it is a GET. Use it for a handler that probes a host, pulls live
+    state from a managed server (AXFR, WinRM, a vendor or cloud API, a
+    backup destination, an appliance's kubeapi through the supervisor) or
+    looks something up off-prem (RIPEstat, PeeringDB, crt.sh). A write
+    scope whose prefix covers the path still admits it, as does an
+    unrestricted token; RBAC on the route is unchanged. Apply under the
+    ``@router.get(...)`` decorator.
+    """
+    setattr(fn, _OUTBOUND_ATTR, True)
+    return fn
+
+
+def is_token_outbound(endpoint: object) -> bool:
+    return bool(getattr(endpoint, _OUTBOUND_ATTR, False))
+
+
 # Vocabulary — values stored verbatim in ``api_token.scopes``. Any
 # new entry needs a matching branch in ``scope_matches_request``.
 TOKEN_SCOPE_VOCABULARY: frozenset[str] = frozenset(
@@ -80,6 +107,11 @@ TOKEN_SCOPE_VOCABULARY: frozenset[str] = frozenset(
 )
 
 _SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# The scopes that grant mutations. A scoped token holding none of them is
+# read-only, and a read-only token never makes SpatiumDDI send traffic
+# outward (#3302) — see :func:`scopes_allow_outbound`.
+_WRITE_SCOPES: frozenset[str] = frozenset({"ipam:write", "dns:write", "dhcp:write"})
 
 # Path-prefix vocabulary per scope. Prefixes are matched on a whole path
 # segment (see ``_path_under``) against the request path *with* the
@@ -100,8 +132,9 @@ _AGENT_PREFIXES: tuple[str, ...] = (
 )
 # Operator Copilot — MCP endpoint accepts POST under JSON-RPC, so it
 # doesn't fit the generic GET = read mapping. Tokens with ``read`` scope
-# may POST here because every Wave 2 tool is read-only. Phase 3 adds an
-# ``mcp:write`` scope to gate write-tool calls.
+# may POST here because the MCP transport never dispatches a write or
+# ``propose_*`` tool, and for a read-only token it also hides every tool
+# registered ``outbound=True`` (``app.api.v1.ai.mcp._mcp_tool_names``).
 _MCP_PREFIXES: tuple[str, ...] = ("/api/v1/ai/mcp",)
 
 
@@ -113,8 +146,22 @@ def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
     return any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
+def scopes_allow_outbound(scopes: list[str]) -> bool:
+    """Whether a token with these ``scopes`` may make SpatiumDDI send
+    traffic outward (#3302). Unrestricted (empty) or holding any write
+    scope: yes. A scoped token with no write scope is read-only: no.
+    A session (no token at all) is not subject to this.
+    """
+    return not scopes or any(s in _WRITE_SCOPES for s in scopes)
+
+
 def scope_matches_request(
-    scopes: list[str], method: str, path: str, *, read_only_route: bool = False
+    scopes: list[str],
+    method: str,
+    path: str,
+    *,
+    read_only_route: bool = False,
+    outbound_route: bool = False,
 ) -> bool:
     """Decide whether a token with these ``scopes`` can serve the
     request. Empty ``scopes`` always passes (no restriction).
@@ -125,6 +172,10 @@ def scope_matches_request(
     never lets ``read`` reach a PUT / PATCH / DELETE, even if the same
     function were ever registered for one.
 
+    ``outbound_route`` is True when the matched handler carries
+    :func:`token_outbound`; ``read`` then does NOT cover it, whatever the
+    method. A write scope whose prefix covers the path still does.
+
     Returns True on first match — scopes union, not intersect.
     """
     if not scopes:
@@ -133,10 +184,13 @@ def scope_matches_request(
     is_safe = method in _SAFE_METHODS
     read_only_post_request = read_only_route and method == "POST"
     for scope in scopes:
+        if scope == "read" and outbound_route:
+            continue
         if scope == "read" and (is_safe or read_only_post_request):
             return True
-        # MCP tools are read-only in Wave 2 — any safe method or a
-        # JSON-RPC POST to ``/api/v1/ai/mcp`` is fine under ``read``.
+        # The MCP transport dispatches no write / propose tool, and hides
+        # outbound tools from a read-only token — so a JSON-RPC POST to
+        # ``/api/v1/ai/mcp`` is fine under ``read``.
         if scope == "read" and _path_under(path, _MCP_PREFIXES):
             return True
         if scope == "ipam:write" and _path_under(path, _IPAM_PREFIXES):
@@ -222,8 +276,11 @@ __all__ = [
     "TOKEN_GRANT_RESOURCE_TYPES",
     "TOKEN_SCOPE_VOCABULARY",
     "is_read_only_post",
+    "is_token_outbound",
     "read_only_post",
     "scope_matches_request",
+    "scopes_allow_outbound",
+    "token_outbound",
     "validate_resource_grant_shape",
     "validate_scopes",
 ]

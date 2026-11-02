@@ -204,6 +204,7 @@ class ListBackupArchivesArgs(BaseModel):
 
 @register_tool(
     name="list_backup_archives_at_target",
+    outbound=True,
     permission="superadmin",
     description=(
         "List archives currently stored at a specific backup target "

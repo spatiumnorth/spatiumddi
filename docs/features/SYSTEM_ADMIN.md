@@ -711,6 +711,13 @@ Three things make this a least-privilege pull rather than a full API key:
   [What an archive exposes](#what-an-archive-exposes)), so protect the token and
   wherever the puller writes the archive as you would the install itself.
 
+**The token cannot be `read`-scoped.** Listing, downloading or previewing an
+archive reads it from the backup destination, and a `read` token never makes
+SpatiumDDI contact another host (#3302), so a `read`-only token gets `403` on
+every `/backup/targets/{id}/archives…` route. No write scope covers `/backup`
+either, so the puller needs an **unrestricted** token (empty scopes) belonging
+to a superadmin, which these routes require anyway.
+
 Two limits: a **destination must exist** — for a pull-only deployment make a
 `local_volume` target the staging destination, because a `GET` that triggers a
 `pg_dump` would be neither idempotent nor safe to expose; and a **write-only

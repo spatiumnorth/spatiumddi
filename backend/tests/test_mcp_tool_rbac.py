@@ -105,7 +105,7 @@ async def _call(db: AsyncSession, user: User, name: str, args: dict | None = Non
         "method": "tools/call",
         "params": {"name": name, "arguments": args or {}},
     }
-    return await mcp_mod._dispatch_one(frame, db, user)
+    return await mcp_mod._dispatch_one(frame, db, user, outbound_allowed=True)
 
 
 def _denied(resp: dict) -> bool:
@@ -123,7 +123,7 @@ def _payload(resp: dict) -> Any:
 
 async def _listed(db: AsyncSession, user: User) -> set[str]:
     resp = await mcp_mod._dispatch_one(
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, db, user
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, db, user, outbound_allowed=True
     )
     return {t["name"] for t in resp["result"]["tools"]}
 

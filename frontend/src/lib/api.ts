@@ -10823,7 +10823,7 @@ export const API_TOKEN_SCOPES: {
   {
     value: "read",
     label: "Read-only",
-    hint: "GET / HEAD / OPTIONS only — no mutations anywhere.",
+    hint: "GET / HEAD / OPTIONS and read-only POSTs (previews, log queries). Never makes SpatiumDDI contact another host: probes, live pulls and off-prem lookups are refused.",
   },
   {
     value: "ipam:write",

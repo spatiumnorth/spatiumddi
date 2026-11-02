@@ -551,6 +551,7 @@ class PingHostArgs(BaseModel):
 
 @register_tool(
     name="ping_host",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(

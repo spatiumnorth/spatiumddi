@@ -90,6 +90,7 @@ from app.core.responses import OctetStreamResponse
 from app.core.versions import is_installed_target
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
+from app.services.api_token_scopes import token_outbound
 from app.services.appliance import releases as releases_service
 from app.services.appliance import upgrade_image_catalog as catalog
 from app.services.appliance import upgrade_image_space
@@ -974,6 +975,7 @@ async def list_upgrade_images(current_user: SuperAdmin, db: DB) -> UpgradeImageL
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List GitHub releases carrying an importable appliance upgrade image",
 )
+@token_outbound
 async def list_available_upgrade_images(
     current_user: SuperAdmin,
     db: DB,

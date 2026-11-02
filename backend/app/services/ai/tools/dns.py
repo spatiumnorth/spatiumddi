@@ -530,6 +530,7 @@ class ForwardDnsArgs(BaseModel):
 
 @register_tool(
     name="forward_dns",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
@@ -613,6 +614,7 @@ class ReverseDnsArgs(BaseModel):
 
 @register_tool(
     name="reverse_dns",
+    outbound=True,
     rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
@@ -1215,6 +1217,7 @@ class FindZoneDriftArgs(BaseModel):
 
 @register_tool(
     name="find_dns_zone_drift",
+    outbound=True,
     honours_token_binding=True,
     permission=("read", "dns_record"),
     description=(

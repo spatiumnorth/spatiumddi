@@ -125,7 +125,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
-from app.services.api_token_scopes import read_only_post
+from app.services.api_token_scopes import read_only_post, token_outbound
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
@@ -6106,6 +6106,7 @@ class ZoneDriftResponse(BaseModel):
     "/groups/{group_id}/zones/{zone_id}/drift",
     response_model=ZoneDriftResponse,
 )
+@token_outbound
 async def get_zone_drift(
     group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> ZoneDriftResponse:

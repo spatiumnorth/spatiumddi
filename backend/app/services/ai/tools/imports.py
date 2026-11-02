@@ -39,6 +39,7 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
 
 @register_tool(
     name="find_dns_import_preview",
+    outbound=True,
     permission="superadmin",
     description=(
         "Preview what a DNS config import from a live source would bring "
@@ -88,6 +89,7 @@ async def find_dns_import_preview(
 
 @register_tool(
     name="find_dhcp_import_preview",
+    outbound=True,
     permission="superadmin",
     description=(
         "Preview what a DHCP config import from a live Windows DHCP "
@@ -132,6 +134,7 @@ async def find_dhcp_import_preview(
 
 @register_tool(
     name="find_netbox_import_preview",
+    outbound=True,
     permission="superadmin",
     description=(
         "Preview what a one-shot NetBox import would bring into IPAM "

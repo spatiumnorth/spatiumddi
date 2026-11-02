@@ -101,7 +101,7 @@ async def _mcp_call(db: AsyncSession, user: User, name: str, args: dict) -> dict
         "method": "tools/call",
         "params": {"name": name, "arguments": args},
     }
-    return await mcp_mod._dispatch_one(frame, db, user)
+    return await mcp_mod._dispatch_one(frame, db, user, outbound_allowed=True)
 
 
 def _result(resp: dict) -> tuple[bool, Any]:

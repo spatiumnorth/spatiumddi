@@ -290,6 +290,7 @@ class FindCTLogEntriesArgs(BaseModel):
 
 @register_tool(
     name="find_ct_log_entries",
+    outbound=True,
     # A caller-chosen name sent to a third party, like the RDAP lookups:
     # it spends the per-user off-prem network-tool budget.
     rate_limit="offprem",

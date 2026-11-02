@@ -32,6 +32,7 @@ from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
 from app.services.ai.chat import _STATIC_SYSTEM_PROMPT
 from app.services.ai.tools import REGISTRY
+from app.services.api_token_scopes import token_outbound
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -456,6 +457,7 @@ async def test_saved_provider(
     "/providers/{provider_id}/models",
     response_model=ListModelsResponse,
 )
+@token_outbound
 async def list_models(
     provider_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> ListModelsResponse:

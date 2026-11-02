@@ -44,6 +44,7 @@ class LookupWhoisIpArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_ip",
+    outbound=True,
     rate_limit="offprem",
     permission=("read", "use_network_tools"),
     description=(
@@ -94,6 +95,7 @@ class LookupWhoisAsnArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_asn",
+    outbound=True,
     rate_limit="offprem",
     permission=("read", "use_network_tools"),
     description=(
@@ -151,6 +153,7 @@ class LookupWhoisDomainArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_domain",
+    outbound=True,
     rate_limit="offprem",
     permission=("read", "use_network_tools"),
     description=(
