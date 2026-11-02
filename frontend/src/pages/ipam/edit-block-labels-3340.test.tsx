@@ -4,11 +4,11 @@
  * IPAM's Edit Block dialog: every visible label names its control (#3340).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { IPBlock } from "@/lib/api";
+import type { CustomField, IPBlock } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 /** Per API object, the calls a test answers. Anything else stays pending. */
@@ -97,5 +97,58 @@ describe("Edit Block labels (#3340)", () => {
       .filter((l) => !l.control && !l.querySelector("input,select,textarea"))
       .map((l) => l.textContent);
     expect(orphans).toEqual([]);
+  });
+
+  it("custom fields name their control, a checkbox included", async () => {
+    const cf = (over: Partial<CustomField>): CustomField =>
+      ({
+        id: `cf-${over.name}`,
+        resource_type: "ip_block",
+        field_type: "text",
+        options: null,
+        is_required: false,
+        is_searchable: false,
+        default_value: null,
+        display_order: 0,
+        description: "",
+        ...over,
+      }) as CustomField;
+    answer("ipamApi", "getBlock", () => Promise.resolve(stored));
+    answer("customFieldsApi", "list", () =>
+      Promise.resolve([
+        cf({ name: "owner", label: "Owner", description: "Who to call" }),
+        cf({
+          name: "tier",
+          label: "Tier",
+          field_type: "select",
+          options: ["gold", "silver"],
+          is_required: true,
+        }),
+        cf({ name: "pci", label: "PCI", field_type: "boolean" }),
+      ]),
+    );
+    open(<EditBlockModal block={stored} onClose={() => {}} />);
+    expect((await screen.findByLabelText("Owner")).tagName).toBe("INPUT");
+    // The Required asterisk stays part of the visible label.
+    expect(screen.getByLabelText("Tier *").tagName).toBe("SELECT");
+    const pci = screen.getByLabelText("PCI") as HTMLInputElement;
+    expect(pci.type).toBe("checkbox");
+  });
+
+  it("a picker component is named as a group, and no label points at a missing id", async () => {
+    answer("ipamApi", "getBlock", () => Promise.resolve(stored));
+    open(<EditBlockModal block={stored} onClose={() => {}} />);
+    await screen.findByLabelText("Name");
+    fireEvent.click(screen.getByRole("button", { name: "Networking" }));
+    for (const name of ["VRF", "Origin ASN (BGP)", "Customer", "Site"]) {
+      const group = screen.getByRole("group", { name });
+      expect(group.querySelector("select")).not.toBeNull();
+    }
+    const labels = Array.from(document.querySelectorAll("label[for]"));
+    for (const l of labels) {
+      expect(document.getElementById(l.getAttribute("for")!)).not.toBeNull();
+    }
+    const ids = Array.from(document.querySelectorAll("[id]")).map((e) => e.id);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
