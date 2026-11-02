@@ -1960,8 +1960,9 @@ advisory locks held through commit:
   re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
   are the safe union (true when any source has it, and the preview
   says so); sources that disagree on kind, customer or site are a
-  conflict; any other disagreeing setting (role, discovery, ...) is a
-  preview warning and the target's value is kept. Service in
+  conflict; any other disagreeing setting (role, discovery, tags, custom
+  fields, VXLAN ID, domain, DNS servers, ...) is a
+  preview warning naming each value and the target's value is kept. Service in
   `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the
