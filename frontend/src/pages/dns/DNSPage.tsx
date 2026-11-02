@@ -2646,10 +2646,17 @@ function DnssecCard({
             DS records — paste these at the parent registrar for{" "}
             <code className="font-mono">{zoneName.replace(/\.$/, "")}</code>
           </div>
+          {/* #3154: PowerDNS's sign op returns the DS at once. The BIND9
+              agent reports a key's DS only once BIND would publish it as CDS
+              (DSState rumoured or omnipresent, agent drivers/bind9.py
+              _DS_SUBMITTABLE_STATES): about a day after signing on the
+              default policy. */}
           {dsRecords.length === 0 ? (
             <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
-              Waiting for the agent to report DS records (typically &lt;30 s
-              after signing).
+              No DS records yet. PowerDNS reports them right after it signs the
+              zone. BIND9 offers a new key&apos;s DS only once the signed zone
+              has propagated, about a day after signing under the default
+              policy.
             </div>
           ) : (
             <ul className="space-y-1">
@@ -2685,19 +2692,43 @@ function DnssecCard({
 
 // ── Zone Modal (add / edit) ───────────────────────────────────────────────────
 
-export function ZoneModal({
-  groupId,
-  views,
-  zone,
-  initialName,
-  onClose,
-}: {
+type ZoneModalProps = {
   groupId: string;
   views: DNSView[];
   zone?: DNSZone;
   initialName?: string;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the zone fresh on open (#3269): the row the page holds comes
+// from a cached zone list that may predate a change made elsewhere, and the
+// form is seeded once from it. Save then sends only what the operator changed.
+export function ZoneModal(props: ZoneModalProps) {
+  const fresh = useFreshRow(props.zone, () =>
+    dnsApi
+      .listZones(props.groupId)
+      .then((zones) => zones.find((z) => z.id === props.zone!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit Zone"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ZoneModalForm {...props} zone={fresh.row} />;
+}
+
+function ZoneModalForm({
+  groupId,
+  views,
+  zone,
+  initialName,
+  onClose,
+}: ZoneModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
@@ -2944,7 +2975,36 @@ export function ZoneModal({
       }
       payload.masters = masters;
     }
-    mut.mutate(payload);
+    if (!zone) {
+      mut.mutate(payload);
+      return;
+    }
+    // Edit sends only what the operator changed (#3269), so a dialog opened
+    // on an out-of-date zone cannot write the old values back. The name is
+    // locked on edit and never rides an update.
+    const { name: _name, ...fields } = payload;
+    const was: Record<string, unknown> = {
+      zone_type: zone.zone_type,
+      kind: zone.kind,
+      view_id: zone.view_id ?? null,
+      primary_ns: zone.primary_ns ?? "",
+      admin_email: zone.admin_email ?? "",
+      ttl: zone.ttl ?? 3600,
+      color: zone.color ?? null,
+      domain_id: zone.domain_id ?? null,
+      customer_id: zone.customer_id ?? null,
+      forwarders: zone.forwarders ?? [],
+      forward_only: zone.forward_only ?? true,
+      forward_transport: zone.forward_transport ?? "do53",
+      forward_tls_hostname: zone.forward_tls_hostname ?? null,
+      masters: zone.masters ?? [],
+    };
+    const diff = changedFields(was, fields);
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    mut.mutate(diff);
   }
 
   return (
@@ -4163,7 +4223,7 @@ export function ZoneDetailView({
       delegationPreview.glue_records_to_create.length > 0);
 
   // "Sync with server" — bi-directional additive sync against the zone's
-  // primary authoritative server (today: Windows DNS). AXFR imports missing
+  // primary authoritative server (any driver that can pull a zone). AXFR imports missing
   // records into our DB, then every DB record not already on the wire is
   // pushed back via RFC 2136. Never deletes. Result shown in <SyncResultModal/>.
   const [syncResult, setSyncResult] = useState<SyncResultPayload | null>(null);
@@ -4355,6 +4415,8 @@ export function ZoneDetailView({
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
     // #2529 — the keyboard path must honour the same grant as the button.
+    // The ? sheet lists the key under ADD_DNS_RECORD.requires, which must
+    // name this same grant (#3167).
     if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -5576,6 +5638,7 @@ export function ZoneDetailView({
         <SyncResultModal
           zoneName={zone.name}
           result={syncResult}
+          drivers={group.server_drivers ?? []}
           onClose={() => setSyncResult(null)}
         />
       )}
@@ -5615,13 +5678,15 @@ type SyncResultPayload =
     }
   | { ok: false; error: string };
 
-function SyncResultModal({
+export function SyncResultModal({
   zoneName,
   result,
+  drivers,
   onClose,
 }: {
   zoneName: string;
   result: SyncResultPayload;
+  drivers: string[];
   onClose: () => void;
 }) {
   if (!result.ok) {
@@ -5632,10 +5697,10 @@ function SyncResultModal({
             {result.error}
           </div>
           <p className="text-xs text-muted-foreground">
-            Common causes: zone transfers not allowed from this host (DNS
-            Manager → zone → Properties → Zone Transfers), dynamic updates not
-            permitted, primary server unreachable, or the driver does not
-            support AXFR pull (only Windows DNS does today).
+            Common causes: zone transfers not allowed from this host, dynamic
+            updates not permitted, or the primary server unreachable.
+            {drivers.includes("windows_dns") &&
+              " On Windows DNS, check DNS Manager → zone → Properties → Zone Transfers."}
           </p>
           <div className="flex justify-end pt-1">
             <button
@@ -6481,15 +6546,33 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
  * strings are interpolated verbatim into named.conf, so the client checks
  * nothing it could be wrong about and simply renders the 422.
  */
-function ViewModal({
-  groupId,
-  view,
-  onClose,
-}: {
+type ViewModalProps = {
   groupId: string;
   view: DNSView | null;
   onClose: () => void;
-}) {
+};
+
+// Edit reads the view fresh on open (#3269), and Save sends only what changed.
+export function ViewModal(props: ViewModalProps) {
+  const fresh = useFreshRow(props.view ?? undefined, () =>
+    dnsApi
+      .listViews(props.groupId)
+      .then((views) => views.find((v) => v.id === props.view!.id)),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Edit View"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={props.onClose}
+      />
+    );
+  if (!fresh.ready) return null;
+  return <ViewModalForm {...props} view={fresh.row ?? null} />;
+}
+
+function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(view?.name ?? "");
   const [description, setDescription] = useState(view?.description ?? "");
@@ -6537,14 +6620,35 @@ function ViewModal({
       );
       return;
     }
-    saveMut.mutate({
+    const body = {
       name: name.trim(),
       description: description.trim(),
       order: Number(order) || 0,
       recursion,
       match_clients: clients,
       match_destinations: lines(matchDestinations),
-    });
+    };
+    if (!view) {
+      saveMut.mutate(body);
+      return;
+    }
+    // Edit sends only what the operator changed (#3269).
+    const diff = changedFields(
+      {
+        name: view.name,
+        description: view.description ?? "",
+        order: view.order ?? 0,
+        recursion: view.recursion ?? true,
+        match_clients: view.match_clients ?? ["any"],
+        match_destinations: view.match_destinations ?? [],
+      },
+      body,
+    );
+    if (Object.keys(diff).length === 0) {
+      onClose();
+      return;
+    }
+    saveMut.mutate(diff);
   }
 
   return (
@@ -7189,6 +7293,12 @@ export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
           title="Rotate TSIG Key"
           description={`Generate a new secret for "${confirmRotate.name}"? The old secret stops working immediately on the next BIND9 push — every consuming client must be updated with the new value.`}
           checkLabel={`I understand consumers of "${confirmRotate.name}" will break until reconfigured.`}
+          // A rotate deletes nothing: step 2 must not use the delete wording
+          // (#3277). The key stays and a new secret replaces the old one.
+          confirmTitle="Confirm TSIG Key Rotation"
+          warning="The old secret is replaced and stops working on the next config push."
+          confirmButtonLabel="Rotate key"
+          pendingLabel="Rotating…"
           onConfirm={() => rotateMut.mutate(confirmRotate.id)}
           onClose={() => setConfirmRotate(null)}
           isPending={rotateMut.isPending}

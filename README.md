@@ -1507,12 +1507,15 @@ Thanks to everyone who has opened a pull request against SpatiumDDI.
 | <img src="https://github.com/Cmonnich.png" width="48" alt=""> | [@Cmonnich](https://github.com/Cmonnich) | Technitium DNS driver |
 | <img src="https://github.com/waza-ari.png" width="48" alt=""> | [@waza-ari](https://github.com/waza-ari) | Agentless FortiGate cloud DHCP driver |
 | <img src="https://github.com/stefanriegel.png" width="48" alt=""> | [@stefanriegel](https://github.com/stefanriegel) | Multi-node appliance field testing and fixes: Technitium zone types and blocklists, cloud DNS health, DHCP server groups, blocklist feed memory, alert evaluator |
-| <img src="https://github.com/containerguy.png" width="48" alt=""> | [@containerguy](https://github.com/containerguy) | Hetzner DNS driver on the Hetzner Cloud API |
+| <img src="https://github.com/containerguy.png" width="48" alt=""> | [@containerguy](https://github.com/containerguy) | Hetzner DNS driver on the Hetzner Cloud API, Raspberry Pi 5 appliance profile |
+| <img src="https://github.com/AlexeyShalaev.png" width="48" alt=""> | [@AlexeyShalaev](https://github.com/AlexeyShalaev) | Time-partitioned query, activity and RPZ log tables |
 
 Opened a PR and not listed? That is an oversight, not a judgement — please
 say so on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)
-and it will be fixed. This list is maintained by hand, so it is added to as
-part of merging each contributor's first PR.
+and it will be fixed. The list is still written by hand, as part of merging
+each contributor's first PR; a weekly check
+(`.github/workflows/contributors-check.yml`) opens an issue when someone who
+has opened a PR is missing.
 
 ---
 
